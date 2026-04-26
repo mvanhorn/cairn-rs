@@ -396,6 +396,215 @@ fn is_claim_contention(msg: &str) -> bool {
     CONTENTION_CODES.contains(&code.trim())
 }
 
+/// Minimum-remaining lease budget for the pre-terminal renew.
+///
+/// Long enough that the terminal FCALL will not trip
+/// `validate_lease_and_mark_expired` on a clock-skew hair; short
+/// enough that `renew_lease_if_stale`'s in-place extension branch
+/// dominates the hot path (we want to extend, not reclaim).
+const F59_MIN_REMAINING_MS: u64 = 10_000;
+
+/// Pre-terminal-FCALL lease renew.
+///
+/// Idempotent on a fresh lease (snapshot read only). Tolerates the
+/// transient phase conflicts classified by
+/// `RuntimeError::is_transient_phase_conflict` — they indicate the
+/// execution is briefly in a non-`runnable` sub-phase (sibling FCALL
+/// mid-tool or mid-write), the existing lease is still valid, and the
+/// terminal FCALL will accept it. Hard errors (NotFound, permanent
+/// Conflicts, Store / Internal) propagate unchanged.
+///
+/// # Performance note
+///
+/// This issues its own `describe_execution` via
+/// `renew_lease_if_stale`; the terminal FCALL methods
+/// (`FabricRunService::{complete,fail,cancel}`) also do their own
+/// `describe_execution` to resolve the lease context. On the common
+/// hot path (lease still fresh, layer (a) no-ops) that is two
+/// snapshot reads per terminal FCALL. Consolidating them requires
+/// refactoring the FabricRunService method surface to accept a
+/// pre-resolved snapshot — an fabric-layer change outside this
+/// adapter's scope. The snapshot read is a single HGETALL on the
+/// execution hash (typical sub-ms on loopback Valkey); the
+/// orthogonal correctness win from renewing before the FCALL
+/// dominates the extra round-trip.
+async fn f59_prelude_renew(
+    fabric: &Arc<FabricServices>,
+    project: &ProjectKey,
+    session_id: &SessionId,
+    run_id: &RunId,
+    fcall: &'static str,
+) -> Result<(), RuntimeError> {
+    match fabric
+        .runs
+        .renew_lease_if_stale(project, session_id, run_id, F59_MIN_REMAINING_MS)
+        .await
+        .map_err(fabric_err_to_runtime)
+    {
+        Ok(_) => Ok(()),
+        Err(err) if err.is_transient_phase_conflict() => {
+            tracing::debug!(
+                run_id = %run_id,
+                fcall,
+                error = %err,
+                "F59: pre-terminal renew hit transient phase conflict; \
+                 continuing with existing lease"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// F59 layer (b) step 1: re-claim after a `lease_expired` rejection.
+///
+/// Precondition: the caller's terminal FCALL just rejected with
+/// `lease_expired`, so the execution is known to have no live lease
+/// (FF's `validate_lease_and_mark_expired` clears `current_lease_id`
+/// inside that rejection path). Recovery requires a FRESH lease.
+///
+/// `claim` is used instead of `ensure_active` because `ensure_active`
+/// short-circuits when the snapshot still carries
+/// `current_lease = Some(_)`, which is exactly the shape FF presents
+/// before the expiry scanner has cleared the pointer. Full `claim`
+/// unconditionally walks `issue_grant_and_claim`, minting a fresh
+/// lease and rotating the epoch.
+///
+/// Error handling:
+///
+/// * `Ok` → fresh lease in place; caller retries the terminal FCALL.
+/// * `is_transient_phase_conflict` → FF's eligibility gate rejected
+///   the claim (lifecycle_phase not `runnable` yet, e.g. the expiry
+///   transition is in flight). Retrying the terminal FCALL against
+///   the known-expired lease is guaranteed to fail with
+///   `lease_expired` again. Short-circuit to an `InvalidTransition`
+///   with the lease-expired operator hint instead of wasting the
+///   FCALL round-trip. This is the FF-upstream gap tracked in
+///   `docs/design/ff-upstream/ff-complete-run-lease-semantics.md`.
+/// * `RuntimeError::Internal` → re-map to `InvalidTransition`
+///   (SEC-007: no Internal FCALL strings in the response; F37: no
+///   500 on terminal-state conflicts).
+/// * Any other structured variant (`NotFound`, permanent `Conflict`,
+///   `Validation`, etc.) → propagate as-is; masking would lie to the
+///   caller about the actual failure class.
+async fn f59_reclaim_after_lease_expired(
+    fabric: &Arc<FabricServices>,
+    project: &ProjectKey,
+    session_id: &SessionId,
+    run_id: &RunId,
+    fcall: &'static str,
+    to: &'static str,
+    original_err: &RuntimeError,
+) -> Result<(), RuntimeError> {
+    tracing::warn!(
+        run_id = %run_id,
+        fcall,
+        error = %original_err,
+        "F59: terminal FCALL rejected with lease_expired; re-claiming \
+         and retrying once"
+    );
+    match fabric
+        .runs
+        .claim(project, session_id, run_id)
+        .await
+        .map_err(fabric_err_to_runtime)
+    {
+        Ok(_) => Ok(()),
+        Err(rc_err) if rc_err.is_transient_phase_conflict() => {
+            tracing::warn!(
+                run_id = %run_id,
+                fcall,
+                error = %rc_err,
+                "F59: re-claim rejected with transient phase conflict; \
+                 lease is known-expired so the retry would fail — \
+                 short-circuiting to lease_expired InvalidTransition"
+            );
+            Err(RuntimeError::InvalidTransition {
+                entity: "run",
+                from: "lease_expired".to_owned(),
+                to: to.to_owned(),
+            })
+        }
+        Err(rc_err) => {
+            tracing::error!(
+                run_id = %run_id,
+                fcall,
+                error = %rc_err,
+                "F59: re-claim during terminal-FCALL retry failed"
+            );
+            if matches!(rc_err, RuntimeError::Internal(_)) {
+                // F37: don't 500 on a terminal-FCALL state conflict.
+                // Re-shape as InvalidTransition so the operator gets
+                // the lease_expired hint.
+                Err(RuntimeError::InvalidTransition {
+                    entity: "run",
+                    from: "lease_expired".to_owned(),
+                    to: to.to_owned(),
+                })
+            } else {
+                // Structured variant — preserve it so the caller sees
+                // the accurate failure class (NotFound, permanent
+                // Conflict, Validation, etc.).
+                Err(rc_err)
+            }
+        }
+    }
+}
+
+/// F59 layer (b) step 2: classify the retry-attempt result.
+///
+/// * `Ok(record)` → terminal write succeeded on retry.
+/// * `Err(e)` where `e.is_lease_expired()` → bubble up unchanged;
+///   the `invalid_transition_hint` table renders the operator
+///   message. This is the "FF has no recovery path for this
+///   execution right now" state tracked in
+///   `docs/design/ff-upstream/ff-complete-run-lease-semantics.md`.
+/// * `Err(e)` where `e` is `RuntimeError::Internal(_)` → re-shape as
+///   `InvalidTransition { lease_expired → <to> }` to satisfy F37's
+///   no-500-on-terminal-conflict + SEC-007's no-internal-leak
+///   invariants.
+/// * Any other structured variant → propagate as-is; the retry
+///   revealed a legitimate state conflict (e.g.
+///   `execution_not_active` if the run became terminal mid-retry,
+///   or `NotFound` if it was deleted) and masking it would mislead
+///   the caller.
+fn f59_finalize_retry(
+    run_id: &RunId,
+    fcall: &'static str,
+    to: &'static str,
+    retry: Result<RunRecord, RuntimeError>,
+) -> Result<RunRecord, RuntimeError> {
+    match retry {
+        Ok(record) => {
+            tracing::info!(
+                run_id = %run_id,
+                fcall,
+                "F59: terminal FCALL succeeded on retry after re-claim"
+            );
+            Ok(record)
+        }
+        Err(retry_err) => {
+            tracing::error!(
+                run_id = %run_id,
+                fcall,
+                error = %retry_err,
+                "F59: terminal-FCALL retry after re-claim also rejected"
+            );
+            if retry_err.is_lease_expired() {
+                Err(retry_err)
+            } else if matches!(retry_err, RuntimeError::Internal(_)) {
+                Err(RuntimeError::InvalidTransition {
+                    entity: "run",
+                    from: "lease_expired".to_owned(),
+                    to: to.to_owned(),
+                })
+            } else {
+                Err(retry_err)
+            }
+        }
+    }
+}
+
 // ── RunService adapter ───────────────────────────────────────────────────────
 
 /// Adapter routing [`RunService`] calls to [`FabricServices::runs`].
@@ -490,11 +699,36 @@ impl RunService for FabricRunServiceAdapter {
         // different session in the projection); we fail loud rather
         // than silently minting a different ExecutionId.
         let project = resolve_run_project_checking_session(&self.store, run_id, session_id).await?;
-        self.fabric
+        f59_prelude_renew(&self.fabric, &project, session_id, run_id, "complete").await?;
+        let first = self
+            .fabric
             .runs
             .complete(&project, session_id, run_id)
             .await
-            .map_err(fabric_err_to_runtime)
+            .map_err(fabric_err_to_runtime);
+        match first {
+            Ok(record) => Ok(record),
+            Err(err) if err.is_lease_expired() => {
+                f59_reclaim_after_lease_expired(
+                    &self.fabric,
+                    &project,
+                    session_id,
+                    run_id,
+                    "complete",
+                    "completed",
+                    &err,
+                )
+                .await?;
+                let retry = self
+                    .fabric
+                    .runs
+                    .complete(&project, session_id, run_id)
+                    .await
+                    .map_err(fabric_err_to_runtime);
+                f59_finalize_retry(run_id, "complete", "completed", retry)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn fail(
@@ -504,11 +738,36 @@ impl RunService for FabricRunServiceAdapter {
         failure_class: FailureClass,
     ) -> Result<RunRecord, RuntimeError> {
         let project = resolve_run_project_checking_session(&self.store, run_id, session_id).await?;
-        self.fabric
+        f59_prelude_renew(&self.fabric, &project, session_id, run_id, "fail").await?;
+        let first = self
+            .fabric
             .runs
             .fail(&project, session_id, run_id, failure_class)
             .await
-            .map_err(fabric_err_to_runtime)
+            .map_err(fabric_err_to_runtime);
+        match first {
+            Ok(record) => Ok(record),
+            Err(err) if err.is_lease_expired() => {
+                f59_reclaim_after_lease_expired(
+                    &self.fabric,
+                    &project,
+                    session_id,
+                    run_id,
+                    "fail",
+                    "failed",
+                    &err,
+                )
+                .await?;
+                let retry = self
+                    .fabric
+                    .runs
+                    .fail(&project, session_id, run_id, failure_class)
+                    .await
+                    .map_err(fabric_err_to_runtime);
+                f59_finalize_retry(run_id, "fail", "failed", retry)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn cancel(
@@ -517,11 +776,36 @@ impl RunService for FabricRunServiceAdapter {
         run_id: &RunId,
     ) -> Result<RunRecord, RuntimeError> {
         let project = resolve_run_project_checking_session(&self.store, run_id, session_id).await?;
-        self.fabric
+        f59_prelude_renew(&self.fabric, &project, session_id, run_id, "cancel").await?;
+        let first = self
+            .fabric
             .runs
             .cancel(&project, session_id, run_id)
             .await
-            .map_err(fabric_err_to_runtime)
+            .map_err(fabric_err_to_runtime);
+        match first {
+            Ok(record) => Ok(record),
+            Err(err) if err.is_lease_expired() => {
+                f59_reclaim_after_lease_expired(
+                    &self.fabric,
+                    &project,
+                    session_id,
+                    run_id,
+                    "cancel",
+                    "cancelled",
+                    &err,
+                )
+                .await?;
+                let retry = self
+                    .fabric
+                    .runs
+                    .cancel(&project, session_id, run_id)
+                    .await
+                    .map_err(fabric_err_to_runtime);
+                f59_finalize_retry(run_id, "cancel", "cancelled", retry)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     async fn pause(

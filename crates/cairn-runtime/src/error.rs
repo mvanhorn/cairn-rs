@@ -142,6 +142,38 @@ impl RuntimeError {
             _ => false,
         }
     }
+
+    /// Returns `true` when this error represents an FF `lease_expired`
+    /// rejection on a terminal FCALL (`ff_complete_execution` /
+    /// `ff_fail_execution` / `ff_cancel_execution`).
+    ///
+    /// F59 (2026-04-26): `POST /v1/runs/:id/orchestrate` is a pull-model
+    /// driver. F51 added an entry-time `renew_lease_if_stale` call, but
+    /// the lease can still expire **between** the orchestrator's last
+    /// iteration and the final `complete_run` FCALL — the DECIDE →
+    /// EXECUTE → terminal-FCALL window can span seconds on loaded
+    /// workers, and the background renewer that ff-sdk spawns inside
+    /// `ClaimedTask` does not cover the cairn-side control plane.
+    ///
+    /// Callers wrapping the terminal-FCALL service methods
+    /// (`RunService::complete` / `fail` / `cancel`) use this
+    /// classifier to decide whether to attempt a single re-claim +
+    /// retry (F59's retry-once fallback). A permanent `lease_revoked`
+    /// would NOT return `true` here — re-claim-then-retry is only
+    /// legal when the expiry was a TTL miss, not an operator
+    /// revocation.
+    ///
+    /// The fabric adapter maps `lease_expired` from the FF ScriptError
+    /// taxonomy to `InvalidTransition { from: "lease_expired", to }`
+    /// via `is_terminal_state_conflict` in
+    /// `cairn_app::fabric_adapter::fabric_err_to_runtime`. Match on
+    /// that shape exactly.
+    pub fn is_lease_expired(&self) -> bool {
+        matches!(
+            self,
+            RuntimeError::InvalidTransition { from, .. } if from == "lease_expired"
+        )
+    }
 }
 
 /// Map a FF / cairn state-transition rejection code to an operator-
@@ -374,6 +406,59 @@ mod tests {
             id: "execution_not_eligible".into(),
         }
         .is_transient_phase_conflict());
+    }
+
+    #[test]
+    fn is_lease_expired_matches_terminal_fcall_classifier_shape() {
+        // F59: only the `InvalidTransition { from: "lease_expired", .. }`
+        // shape the fabric adapter emits for terminal FCALLs must
+        // classify as lease-expired. Any other combination must return
+        // false so reclaim-retry logic does not fire on unrelated
+        // transitions.
+        for to in ["completed", "failed", "cancelled"] {
+            let err = RuntimeError::InvalidTransition {
+                entity: "run",
+                from: "lease_expired".to_owned(),
+                to: to.to_owned(),
+            };
+            assert!(
+                err.is_lease_expired(),
+                "expected is_lease_expired for transition to {to}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_lease_expired_excludes_other_codes() {
+        for code in [
+            "execution_not_active",
+            "lease_revoked",
+            "stale_lease",
+            "fence_required",
+            "partial_fence_triple",
+            "totally_novel_code",
+        ] {
+            let err = RuntimeError::InvalidTransition {
+                entity: "run",
+                from: code.to_owned(),
+                to: "completed".to_owned(),
+            };
+            assert!(
+                !err.is_lease_expired(),
+                "expected NOT lease_expired for code {code}"
+            );
+        }
+        // Non-InvalidTransition variants never classify as lease-expired.
+        assert!(!RuntimeError::Conflict {
+            entity: "execution",
+            id: "lease_expired".into(),
+        }
+        .is_lease_expired());
+        assert!(!RuntimeError::LeaseExpired {
+            task_id: "t".into()
+        }
+        .is_lease_expired());
+        assert!(!RuntimeError::Internal("lease_expired".into()).is_lease_expired());
     }
 
     #[test]
