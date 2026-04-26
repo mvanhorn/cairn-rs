@@ -102,6 +102,48 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+impl RuntimeError {
+    /// Returns `true` when this error represents a **transient** FF
+    /// execution-phase conflict — the execution exists and is not
+    /// terminal, but is temporarily in a lifecycle sub-phase (e.g.
+    /// mid-approval, resume-in-flight, tool-execution aftermath) that
+    /// does not accept the `ff_renew_lease` / grant-fallback FCALL.
+    ///
+    /// Callers that hold an already-valid lease (the mid-run
+    /// orchestrate handler being the canonical case — F58) can treat
+    /// this class as "keep going with the existing lease; FF will
+    /// flip the phase back on the next cycle" rather than surfacing a
+    /// 409 to the operator. The orchestrator loop has its own
+    /// `is_lease_healthy()` gate that catches an actually-dead lease.
+    ///
+    /// # Scope — narrow on purpose
+    ///
+    /// This matches only the two FF codes known to fire transiently
+    /// against an otherwise-live execution during a healthy run:
+    ///
+    /// * `execution_not_eligible` — FF's grant gate rejects when
+    ///   `lifecycle_phase != "runnable"`. Tool invocations (esp.
+    ///   `write`) move the phase to `running` transiently; the next
+    ///   loop cycle flips it back. (flowfabric.lua lines 3585–3590.)
+    /// * `execution_not_eligible_for_attempt` — same class, attempt
+    ///   axis. Emitted when the attempt counter moved under us.
+    ///
+    /// Codes that represent a **permanent** failure (the execution
+    /// is terminal, does not exist, or the lease is revoked) are
+    /// deliberately excluded — tolerating those would swallow real
+    /// errors. In particular `execution_not_active`, `lease_expired`,
+    /// `lease_revoked`, `execution_not_found` all stay as hard 409s.
+    pub fn is_transient_phase_conflict(&self) -> bool {
+        match self {
+            RuntimeError::Conflict { entity, id } if *entity == "execution" => matches!(
+                id.as_str(),
+                "execution_not_eligible" | "execution_not_eligible_for_attempt"
+            ),
+            _ => false,
+        }
+    }
+}
+
 /// Map a FF / cairn state-transition rejection code to an operator-
 /// actionable prose hint.
 ///
@@ -265,6 +307,73 @@ mod tests {
             msg,
             "invalid task transition: totally_novel_code -> completed"
         );
+    }
+
+    #[test]
+    fn is_transient_phase_conflict_matches_eligibility_codes() {
+        // F58: the two codes FF's grant gate emits when an execution
+        // is briefly in a non-`runnable` phase (mid-approval, resume,
+        // tool-invocation aftermath) must be classified transient.
+        for code in [
+            "execution_not_eligible",
+            "execution_not_eligible_for_attempt",
+        ] {
+            let err = RuntimeError::Conflict {
+                entity: "execution",
+                id: code.to_owned(),
+            };
+            assert!(
+                err.is_transient_phase_conflict(),
+                "expected `{code}` to be classified transient"
+            );
+        }
+    }
+
+    #[test]
+    fn is_transient_phase_conflict_excludes_permanent_codes() {
+        // Permanent failures MUST NOT be tolerated — swallowing them
+        // would mask real 409s (terminal execution, deleted run,
+        // revoked lease).
+        for code in [
+            "execution_not_active",
+            "lease_expired",
+            "lease_revoked",
+            "execution_not_found",
+            "grant_already_exists",
+            "stale_lease",
+        ] {
+            let err = RuntimeError::Conflict {
+                entity: "execution",
+                id: code.to_owned(),
+            };
+            assert!(
+                !err.is_transient_phase_conflict(),
+                "expected `{code}` NOT to be classified transient"
+            );
+        }
+    }
+
+    #[test]
+    fn is_transient_phase_conflict_excludes_non_conflict_variants() {
+        assert!(!RuntimeError::NotFound {
+            entity: "run",
+            id: "x".into()
+        }
+        .is_transient_phase_conflict());
+        assert!(!RuntimeError::Internal("something".into()).is_transient_phase_conflict());
+        assert!(!RuntimeError::InvalidTransition {
+            entity: "run",
+            from: "execution_not_eligible".into(),
+            to: "active".into(),
+        }
+        .is_transient_phase_conflict());
+        // Conflict on a different entity (not `execution`) is out of
+        // scope — only executions have the phase-gated FCALLs.
+        assert!(!RuntimeError::Conflict {
+            entity: "task",
+            id: "execution_not_eligible".into(),
+        }
+        .is_transient_phase_conflict());
     }
 
     #[test]

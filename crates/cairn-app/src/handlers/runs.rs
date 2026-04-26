@@ -2383,6 +2383,58 @@ pub(crate) async fn orchestrate_run_handler(
             .await
         {
             Ok(record) => record,
+            // F58 (2026-04-26): tolerate FF's transient phase-conflict
+            // codes. After a tool invocation lands (esp. `write`), FF
+            // moves the execution's `lifecycle_phase` off `runnable`
+            // briefly while the invocation is recorded; the next
+            // orchestrate call catches the phase mid-flip and the
+            // grant gate rejects with `execution_not_eligible`. The
+            // existing lease is still valid, and the orchestrate loop
+            // has its own `is_lease_healthy()` gate that will fail
+            // cleanly if the lease is actually dead. Log at WARN with
+            // structured fields so we retain visibility, then fall
+            // through with the projection record. Narrow by design —
+            // `is_transient_phase_conflict` excludes permanent
+            // failures (terminal, deleted, revoked) so real 409s
+            // still propagate. See
+            // `docs/design/ff-upstream/ff-execution-phase-probe.md`
+            // for the root-cause discussion and the FF-side probe we
+            // need to retire this tolerate path.
+            Err(err) if err.is_transient_phase_conflict() => {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    session_id = %run.session_id,
+                    error = %err,
+                    f58 = "tolerate_transient_renew_conflict",
+                    "F58: renew_lease_if_stale rejected with a transient FF \
+                     phase-conflict code; proceeding into orchestrate loop \
+                     with the existing lease. The loop's is_lease_healthy() \
+                     gate will catch an actually-dead lease."
+                );
+                // Mirror F57's pending-approvals branch: do a read-only FF
+                // snapshot so the subsequent terminal-state guard stays
+                // authoritative. Falling back to `run.clone()` directly
+                // (the projection record) would reintroduce the F51 race
+                // where FF finalizes the run between `load_run_visible_to_tenant`
+                // and here. `runtime.runs.get` walks
+                // `read_run_record -> describe_execution` (a pure FF read,
+                // no FCALL, no lifecycle mutation) so it's safe even though
+                // the renew just failed.
+                match state.runtime.runs.get(&run.run_id).await {
+                    Ok(Some(ff_record)) => ff_record,
+                    Ok(None) => run.clone(),
+                    Err(snap_err) => {
+                        tracing::warn!(
+                            run_id = %run.run_id,
+                            error = %snap_err,
+                            "F58: FF snapshot read failed during \
+                             tolerate-transient branch; falling back to \
+                             projection record"
+                        );
+                        run.clone()
+                    }
+                }
+            }
             Err(err) => {
                 tracing::error!(
                     run_id = %run.run_id,
