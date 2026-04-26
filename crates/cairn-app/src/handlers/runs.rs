@@ -872,6 +872,30 @@ pub(crate) async fn get_run_telemetry_handler(
                     tool_name, ..
                 } => tool_name.as_str(),
             };
+            // F55: thread args + output preview into the telemetry
+            // payload so RunDetailPage can show "what cairn ran" and
+            // "what cairn got back" inline on the tool-invocation row.
+            //
+            // Strip the truncation marker from `output_preview` here too
+            // so the UI can rely on `output_truncated` as the sole source
+            // of truth for "(truncated)" badges.
+            let raw_preview = t.output_preview.as_deref();
+            let output_truncated = raw_preview
+                .map(|p| {
+                    p.ends_with(cairn_domain::tool_invocation::TOOL_OUTPUT_PREVIEW_TRUNCATED_SUFFIX)
+                })
+                .unwrap_or(false);
+            let output_preview = raw_preview.map(|p| {
+                if output_truncated {
+                    p.strip_suffix(
+                        cairn_domain::tool_invocation::TOOL_OUTPUT_PREVIEW_TRUNCATED_SUFFIX,
+                    )
+                    .unwrap_or(p)
+                    .to_owned()
+                } else {
+                    p.to_owned()
+                }
+            });
             serde_json::json!({
                 "invocation_id": t.invocation_id.as_str(),
                 "tool_name": tool_name,
@@ -879,6 +903,10 @@ pub(crate) async fn get_run_telemetry_handler(
                 "started_at_ms": t.started_at_ms.unwrap_or(0),
                 "finished_at_ms": t.finished_at_ms.unwrap_or(0),
                 "duration_ms": duration_ms,
+                "args": t.args_json.as_ref(),
+                "output_preview": output_preview,
+                "output_truncated": output_truncated,
+                "error_message": t.error_message.as_deref(),
             })
         })
         .collect();

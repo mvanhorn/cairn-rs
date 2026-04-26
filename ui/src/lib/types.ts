@@ -1648,6 +1648,24 @@ export interface RunTelemetryToolInvocation {
   started_at_ms: number;
   finished_at_ms: number;
   duration_ms: number;
+  /** F55: structured tool args captured at dispatch time. The backend
+   *  always serializes the key — `null` on pre-F55 events, a JSON value
+   *  otherwise. Declared optional to keep existing test fixtures and
+   *  mocks (which predate F55 and don't set the field) compiling. */
+  args?: unknown | null;
+  /** F55: truncated UTF-8 preview of the tool output (capped around
+   *  8 KiB). `null` when the tool produced no output or the event is
+   *  pre-F55; the backend always serializes the key. The trailing
+   *  truncation marker is stripped server-side — clients should rely
+   *  on `output_truncated` instead of parsing the suffix. */
+  output_preview?: string | null;
+  /** F55: true when the preview was truncated at the backend cap.
+   *  UIs that render `output_preview` should use this boolean and avoid
+   *  parsing any sentinel suffix. */
+  output_truncated?: boolean;
+  /** F55: error message from a failed invocation (mirrors the durable
+   *  projection field). `null` for successful invocations. */
+  error_message?: string | null;
 }
 
 export interface RunTelemetryTotals {

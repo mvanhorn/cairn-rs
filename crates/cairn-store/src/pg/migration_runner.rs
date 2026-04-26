@@ -155,6 +155,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_tool_invocation_cache_hits",
         include_str!("migrations/V028__create_tool_invocation_cache_hits.sql"),
     ),
+    (
+        29,
+        "tool_invocation_args_output",
+        include_str!("migrations/V029__tool_invocation_args_output.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.
