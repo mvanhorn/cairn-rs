@@ -9,6 +9,25 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Upgraded FlowFabric 0.10.0 -> 0.11.0 (Wave 9 Postgres parity; no
+  cairn consumer-facing changes).** FF 0.11 flips 12 Postgres
+  `Unavailable` trait methods to concrete impls (cancel/revoke/replay
+  execution, change_priority, read_execution_info/state,
+  get_execution_result, budget_admin, quota_admin,
+  list_pending_waitpoints, cancel_flow_header, ack_cancel_member) plus
+  ships five additive pg migrations (0010-0014) and a new
+  `ff_operator_event` LISTEN/NOTIFY channel. Per upstream's
+  `docs/CONSUMER_MIGRATION_0.11.md`, there are zero Rust API changes,
+  zero wire-format changes, and zero Valkey-backend behaviour changes.
+  cairn runs on the Valkey backend today, so the bump is purely a
+  lockfile + `Cargo.toml` pin move (`flowfabric`, `ff-observability`,
+  `ff-core` test-fixtures, `ferriskey` from `"0.10"` to `"0.11"`).
+  Workspace `cargo check`, `cargo clippy -D warnings`, `cairn-fabric`
+  lib tests (292/0), and `cairn-app` lib tests (149/0) are all green
+  on the bump; UI `npm run build` also clean.
+
 ### Added
 
 - **`DELETE /v1/admin/tenants/:t/sessions/:s` admin soft-delete (closes

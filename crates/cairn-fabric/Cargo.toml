@@ -23,7 +23,7 @@ test-harness = ["dep:testcontainers", "dep:url"]
 # `ff-observability` pin stays direct because the umbrella does not
 # re-export it — `Engine::start_with_completions` takes an
 # `Arc<ff_observability::Metrics>` and cairn wires that type through.
-flowfabric = { version = "0.10", features = ["engine", "scheduler-internals"] }
+flowfabric = { version = "0.11", features = ["engine", "scheduler-internals"] }
 # Needed for `Engine::start_with_completions` which takes an
 # `Arc<ff_observability::Metrics>`. The flowfabric umbrella does not
 # re-export ff-observability.
@@ -33,7 +33,7 @@ flowfabric = { version = "0.10", features = ["engine", "scheduler-internals"] }
 # and no FF metrics surface on cairn-app's `/metrics` endpoint. The
 # shim exists for no-observability embedded builds; cairn is never
 # that, so we always want the real backend.
-ff-observability = { version = "0.10", features = ["enabled"] }
+ff-observability = { version = "0.11", features = ["enabled"] }
 # ferriskey 0.10 ships alongside FF 0.10 family. Still a direct pin
 # because cairn's Lua-glue control-plane path (signal_bridge, helpers,
 # version_check) constructs FCALL ARGV directly against
@@ -48,7 +48,7 @@ ff-observability = { version = "0.10", features = ["enabled"] }
 #     (all legacy Lua FCALLs except suspend, which moved to typed).
 # Do not add new direct ferriskey usage; route through the engine
 # traits instead.
-ferriskey = "0.10"
+ferriskey = "0.11"
 
 # Cairn crates
 cairn-domain = { path = "../cairn-domain" }
@@ -96,4 +96,4 @@ futures = "0.3"
 # synthesise a pre-Wave-1c handle byte buffer and assert the 0.9+
 # decode compat path still accepts it. The `test-fixtures` feature is
 # dev-only on ff-core — production binaries never link it.
-ff-core = { version = "0.10", features = ["test-fixtures"] }
+ff-core = { version = "0.11", features = ["test-fixtures"] }
