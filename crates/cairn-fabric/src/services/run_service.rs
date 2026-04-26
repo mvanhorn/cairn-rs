@@ -466,12 +466,23 @@ impl FabricRunService {
                     id: run_id.to_string(),
                 })?;
 
-        // No active lease: fall back to a full re-claim so the caller
-        // can proceed with terminal FCALLs. This is the "inter-call
-        // expiry" case that motivated F51 — FF's expiry scanner has
-        // already cleared `current_lease_id`. Reuse the snapshot we
-        // just read rather than bouncing through `self.claim`, which
-        // would `describe_execution` again.
+        // Terminal executions (Completed / Failed / Canceled) are
+        // immutable in FF: `ff_renew_lease` and `ff_claim_execution`
+        // both reject them with `execution_not_eligible`. Return the
+        // final record without an FCALL; the caller surfaces the
+        // terminal state through its own projection view.
+        if ff_public_state_to_run_state(&snapshot).is_terminal() {
+            return build_run_record(&snapshot, project, run_id);
+        }
+
+        // No lease: re-claim. This is the "inter-call expiry" path
+        // (FF's expiry scanner already cleared `current_lease_id`) AND
+        // the "fresh execution" path (`ff_create_execution` leaves
+        // `lifecycle_phase = "runnable"` with no lease). Both require
+        // a full `issue_grant_and_claim` to reach `active`, which is
+        // the only phase in which terminal FCALLs are accepted.
+        // Reuse the snapshot we just read rather than bouncing
+        // through `self.claim`, which would re-`describe_execution`.
         let Some(lease) = snapshot.current_lease.as_ref() else {
             return self
                 .claim_with_snapshot(project, session_id, run_id, eid.clone(), &snapshot)

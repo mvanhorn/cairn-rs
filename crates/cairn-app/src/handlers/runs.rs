@@ -2197,6 +2197,40 @@ pub(crate) async fn orchestrate_run_handler(
         Err(response) => return response,
     };
 
+    // Terminal runs (Completed / Failed / Canceled) must short-circuit
+    // before the orchestration loop. Re-entering the loop on a finalized
+    // FF execution would dispatch a second terminal FCALL and FF would
+    // reject it as `execution_not_active` — surfacing a false
+    // `termination=failed` for a run that had actually succeeded.
+    //
+    // The authoritative FF snapshot state is re-verified downstream by
+    // `renew_lease_if_stale` via its terminal branch; this projection
+    // read is a fast-path that lets the handler skip the workspace +
+    // defaults plumbing entirely when the run is already terminal.
+    if run.state.is_terminal() {
+        let termination = match run.state {
+            cairn_domain::RunState::Completed => "completed",
+            cairn_domain::RunState::Failed => "failed",
+            cairn_domain::RunState::Canceled => "canceled",
+            // `is_terminal()` covers exactly the three arms above today.
+            // Using `unreachable!` rather than a wildcard keeps
+            // exhaustiveness checks honest: any future terminal variant
+            // added to the domain enum will trip this at test time
+            // instead of silently reporting as "completed".
+            other => unreachable!(
+                "RunState::is_terminal returned true for non-terminal variant {other:?}"
+            ),
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "termination": termination,
+                "run_state": run.state,
+            })),
+        )
+            .into_response();
+    }
+
     // Transition run to Running if it's still Pending
     if run.state == cairn_domain::RunState::Pending {
         use cairn_domain::{RunState, RunStateChanged, RuntimeEvent, StateTransition};
@@ -2272,18 +2306,46 @@ pub(crate) async fn orchestrate_run_handler(
     // aborts orchestration before we burn provider budget on a run
     // that can't terminate.
     const F51_MIN_REMAINING_MS: u64 = 10_000;
-    if let Err(err) = state
+    let refreshed = match state
         .runtime
         .runs
         .renew_lease_if_stale(&run.session_id, &run.run_id, F51_MIN_REMAINING_MS)
         .await
     {
-        tracing::error!(
-            run_id = %run.run_id,
-            error = %err,
-            "F51: failed to refresh run lease before orchestrate loop"
-        );
-        return runtime_error_response(err);
+        Ok(record) => record,
+        Err(err) => {
+            tracing::error!(
+                run_id = %run.run_id,
+                error = %err,
+                "F51: failed to refresh run lease before orchestrate loop"
+            );
+            return runtime_error_response(err);
+        }
+    };
+
+    // Second terminal-state check against the authoritative FF snapshot.
+    // The projection-backed check above can be stale if another process
+    // (scheduler cron, sibling handler, resume path) finalized this run
+    // between the projection read and here; `renew_lease_if_stale`
+    // returns the fresh FF record, which is the definitive source of
+    // truth for lifecycle state.
+    if refreshed.state.is_terminal() {
+        let termination = match refreshed.state {
+            cairn_domain::RunState::Completed => "completed",
+            cairn_domain::RunState::Failed => "failed",
+            cairn_domain::RunState::Canceled => "canceled",
+            other => unreachable!(
+                "RunState::is_terminal returned true for non-terminal variant {other:?}"
+            ),
+        };
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "termination": termination,
+                "run_state": refreshed.state,
+            })),
+        )
+            .into_response();
     }
 
     let now_ms = std::time::SystemTime::now()
