@@ -20,9 +20,9 @@ use cairn_runtime::{
     MailboxService, NotificationService, RunCostAlertService, RunSlaService, RuntimeError,
 };
 use cairn_store::projections::{
-    AuditLogReadModel, CheckpointReadModel, OperatorInterventionReadModel, PauseScheduleReadModel,
-    RecoveryEscalationReadModel, RunCostReadModel, RunReadModel, SessionCostReadModel,
-    TaskReadModel,
+    ApprovalReadModel, AuditLogReadModel, CheckpointReadModel, OperatorInterventionReadModel,
+    PauseScheduleReadModel, RecoveryEscalationReadModel, RunCostReadModel, RunReadModel,
+    SessionCostReadModel, TaskReadModel,
 };
 use cairn_store::{EntityRef, EventLog, EventPosition, StoredEvent};
 use utoipa::ToSchema;
@@ -2305,21 +2305,92 @@ pub(crate) async fn orchestrate_run_handler(
     // A failure here (runtime-level 5xx, tenant visibility issue)
     // aborts orchestration before we burn provider budget on a run
     // that can't terminate.
+    //
+    // F57 (2026-04-26): skip `renew_lease_if_stale` entirely when the
+    // run has unresolved pending approvals. Mid-approval executions
+    // sit in FF's suspended/waiting-approval sub-phases where
+    // `ff_renew_lease` rejects with `execution_not_active` (from
+    // lease-gate) or the claim fallback rejects with
+    // `execution_not_eligible` (from the grant gate's
+    // `lifecycle_phase == "runnable"` requirement — a suspended
+    // execution fails this). The orchestrator's approval-drain path
+    // inside the loop doesn't need a renewed lease to answer the
+    // caller: it reads the pending approvals from the projection,
+    // returns `termination=waiting_approval`, and leaves the FF
+    // execution alone. Renewing the lease on a mid-approval
+    // execution is not just wasteful — it's the exact FCALL that was
+    // 409-ing callers mid-run on F56's dbd52180.
+    //
+    // `has_pending_for_run` is a projection read (single SQL row on
+    // pg/sqlite, HashMap scan in-memory); it's safe to do on every
+    // orchestrate call. If the projection read itself fails, we fall
+    // back to the original renew path — masking a pending-approvals
+    // miss would be worse than an extra FF round-trip.
+    let has_pending =
+        ApprovalReadModel::has_pending_for_run(state.runtime.store.as_ref(), &run.run_id)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    error = %err,
+                    "F57: pending-approvals projection read failed; \
+                     proceeding with renew_lease_if_stale"
+                );
+                false
+            });
+
     const F51_MIN_REMAINING_MS: u64 = 10_000;
-    let refreshed = match state
-        .runtime
-        .runs
-        .renew_lease_if_stale(&run.session_id, &run.run_id, F51_MIN_REMAINING_MS)
-        .await
-    {
-        Ok(record) => record,
-        Err(err) => {
-            tracing::error!(
-                run_id = %run.run_id,
-                error = %err,
-                "F51: failed to refresh run lease before orchestrate loop"
-            );
-            return runtime_error_response(err);
+    let refreshed = if has_pending {
+        tracing::debug!(
+            run_id = %run.run_id,
+            "F57: pending approvals present; skipping renew_lease_if_stale \
+             to avoid FF mid-approval-phase rejection"
+        );
+        // Skip the renew/claim FCALLs (they 409 on mid-approval
+        // executions) but STILL do a read-only FF snapshot so the
+        // terminal-state guard below stays authoritative. The
+        // projection record from `load_run_visible_to_tenant` is
+        // fast but may lag FF if a scheduler cron or sibling
+        // handler finalized the run between its read and here —
+        // that's the exact race the F51 "second terminal-state
+        // check" was added to close, and we don't want to regress
+        // it just because we're skipping the lease renewal.
+        //
+        // `runtime.runs.get` walks `read_run_record -> describe_execution`,
+        // which is a pure FF read (no FCALL, no lifecycle mutation).
+        // A `NotFound` return at this point means the run was
+        // deleted mid-flight; propagate via the projection record
+        // so the subsequent terminal-state guard still fires on a
+        // finalized local state.
+        match state.runtime.runs.get(&run.run_id).await {
+            Ok(Some(ff_record)) => ff_record,
+            Ok(None) => run.clone(),
+            Err(err) => {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    error = %err,
+                    "F57: FF snapshot read failed during pending-approvals skip; \
+                     falling back to projection record"
+                );
+                run.clone()
+            }
+        }
+    } else {
+        match state
+            .runtime
+            .runs
+            .renew_lease_if_stale(&run.session_id, &run.run_id, F51_MIN_REMAINING_MS)
+            .await
+        {
+            Ok(record) => record,
+            Err(err) => {
+                tracing::error!(
+                    run_id = %run.run_id,
+                    error = %err,
+                    "F51: failed to refresh run lease before orchestrate loop"
+                );
+                return runtime_error_response(err);
+            }
         }
     };
 
