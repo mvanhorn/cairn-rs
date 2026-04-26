@@ -1485,6 +1485,34 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
           />
         </div>
 
+        {/* F62: terminal-write deadlock banner. The fabric rejected both
+            the terminal FCALL and the lease re-claim; artifacts produced
+            by earlier tool calls may still be on disk, but the run can
+            only be closed once the upstream fabric fix lands. */}
+        {run?.failure_class === "terminal_write_deadlock" && (
+          <div className="flex items-start gap-2 px-4 py-3 rounded-lg border border-red-300 dark:border-red-800/60 bg-red-50 dark:bg-red-950/30">
+            <AlertTriangle size={14} className="text-red-500 dark:text-red-400 shrink-0 mt-0.5" />
+            <div className="text-[12px] text-red-700 dark:text-red-300 space-y-1">
+              <div className="font-medium">Terminal-write deadlock</div>
+              <div>
+                The orchestrator produced artifacts successfully but the fabric refuses both the
+                terminal write and the lease re-claim. Files written by earlier tool calls may still
+                be visible on the operator's filesystem, but the run cannot be closed without an
+                upstream fabric fix. Tracked at{" "}
+                <a
+                  href="https://github.com/avifenesh/FlowFabric/issues/371"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:no-underline"
+                >
+                  FlowFabric#371
+                </a>
+                .
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Trigger origin badge */}
         {run?.created_by_trigger_id && (
           <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg border border-amber-800/40 bg-amber-950/20">

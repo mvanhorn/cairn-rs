@@ -223,6 +223,23 @@ fn invalid_transition_hint(from: &str, to: &str, entity: &str) -> Option<&'stati
              running runs, or retry after re-claiming via POST \
              /v1/runs/:id/claim",
         ),
+        // F62: the fabric_adapter F59 short-circuit fires this sentinel
+        // when BOTH the terminal FCALL rejected with `lease_expired`
+        // AND the recovery `claim` rejected with
+        // `execution_not_eligible` / `execution_not_eligible_for_attempt`.
+        // FF has no cairn-reachable path out of this state today, so
+        // the run is wedged. The hint names the symptom (artifacts may
+        // already exist on disk from the tool calls that ran before the
+        // lease died) and points at the tracked FF upstream issue so
+        // operators can correlate.
+        "terminal_write_deadlock" => Some(
+            "the orchestrator produced artifacts successfully but the \
+             fabric refuses both the terminal write and the lease \
+             re-claim. Files written by earlier tool calls may still \
+             be visible on the operator's filesystem, but the run \
+             cannot be closed without an upstream fabric fix. Tracked \
+             at https://github.com/avifenesh/FlowFabric/issues/371",
+        ),
         "lease_revoked" => Some(
             "the execution's lease was revoked by an operator or \
              scanner before this request completed. Check the run's \
@@ -459,6 +476,37 @@ mod tests {
         }
         .is_lease_expired());
         assert!(!RuntimeError::Internal("lease_expired".into()).is_lease_expired());
+    }
+
+    /// F62: the `terminal_write_deadlock` sentinel must render an
+    /// operator-actionable message that:
+    ///   * names the symptom (artifacts may still be on disk from
+    ///     earlier tool calls that ran before the lease died)
+    ///   * links the tracked FF upstream issue so the operator can
+    ///     correlate the deadlock against known history
+    ///   * preserves the sentinel in the `code=` suffix for log grep
+    #[test]
+    fn invalid_transition_terminal_write_deadlock_points_at_artifacts_and_upstream_issue() {
+        for to in ["completed", "failed", "cancelled"] {
+            let err = RuntimeError::InvalidTransition {
+                entity: "run",
+                from: "terminal_write_deadlock".to_owned(),
+                to: to.to_owned(),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("artifacts") || msg.contains("filesystem"),
+                "F62: missing artifact-preservation hint for to={to}: {msg}"
+            );
+            assert!(
+                msg.contains("FlowFabric/issues/371"),
+                "F62: missing FF upstream issue link for to={to}: {msg}"
+            );
+            assert!(
+                msg.contains("code=terminal_write_deadlock"),
+                "F62: missing code suffix for log grep (to={to}): {msg}"
+            );
+        }
     }
 
     #[test]

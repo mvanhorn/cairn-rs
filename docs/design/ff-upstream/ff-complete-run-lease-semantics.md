@@ -1,10 +1,14 @@
 # FF upstream ask: terminal-FCALL behavior on lease-expired executions
 
 **Status**: DRAFT. Cairn ships a two-layer workaround in
-`FabricRunService::complete`'s adapter (F59, this PR). This doc captures
-the underlying contract question for FF maintainers.
+`FabricRunService::complete`'s adapter (F59). When both layers fail
+(dual-door deadlock — `lease_expired` on FCALL + `execution_not_eligible`
+on re-claim), F62 flips the run to `Failed(TerminalWriteDeadlock)` and
+surfaces the operator-actionable message with the upstream link. Filed
+upstream as [FlowFabric#371](https://github.com/avifenesh/FlowFabric/issues/371).
+This doc captures the underlying contract question for FF maintainers.
 
-**Cairn version**: main @ F59
+**Cairn version**: main @ F62
 **FF version**: 0.11
 
 ## Problem

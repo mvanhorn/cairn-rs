@@ -228,5 +228,6 @@ fn failure_label(fc: cairn_domain::lifecycle::FailureClass) -> &'static str {
         FailureClass::ExecutionError => "execution_error",
         FailureClass::LeaseExpired => "lease_expired",
         FailureClass::CanceledByOperator => "canceled_by_operator",
+        FailureClass::TerminalWriteDeadlock => "terminal_write_deadlock",
     }
 }

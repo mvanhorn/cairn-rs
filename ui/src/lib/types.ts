@@ -339,7 +339,14 @@ export type FailureClass =
   | "policy_denied"
   | "timeout"
   | "internal_error"
-  | "approval_rejected";
+  | "approval_rejected"
+  /**
+   * F62: terminal FCALL deadlocked against the fabric — the orchestrator
+   * produced artifacts but the fabric rejects both the terminal write and
+   * the lease re-claim. Tracked upstream at
+   * https://github.com/avifenesh/FlowFabric/issues/371.
+   */
+  | "terminal_write_deadlock";
 
 /** GET /v1/runs — array of RunRecord */
 export interface RunRecord {

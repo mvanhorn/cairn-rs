@@ -27,6 +27,7 @@ use cairn_domain::{
     ApprovalDecision, FailureClass, PauseReason, ProjectKey, ResumeTrigger, RunId, RunResumeTarget,
     SessionId, TaskId, TaskResumeTarget, TaskState,
 };
+use cairn_fabric::event_bridge::BridgeEvent;
 use cairn_fabric::{FabricError, FabricServices};
 use cairn_runtime::error::RuntimeError;
 use cairn_runtime::runs::RunService;
@@ -477,10 +478,15 @@ async fn f59_prelude_renew(
 ///   the claim (lifecycle_phase not `runnable` yet, e.g. the expiry
 ///   transition is in flight). Retrying the terminal FCALL against
 ///   the known-expired lease is guaranteed to fail with
-///   `lease_expired` again. Short-circuit to an `InvalidTransition`
-///   with the lease-expired operator hint instead of wasting the
-///   FCALL round-trip. This is the FF-upstream gap tracked in
-///   `docs/design/ff-upstream/ff-complete-run-lease-semantics.md`.
+///   `lease_expired` again — this is the F62 dual-door deadlock.
+///   Emit `BridgeEvent::ExecutionFailed { TerminalWriteDeadlock }` so
+///   the run flips `state=failed` with an actionable `failure_class`
+///   (not a zombie `running` row), then short-circuit to an
+///   `InvalidTransition { from: "terminal_write_deadlock", .. }` whose
+///   rendered prose links the tracked FF upstream issue
+///   (https://github.com/avifenesh/FlowFabric/issues/371) and names the
+///   artifact-preservation symptom so the operator can correlate.
+///   Design notes: `docs/design/ff-upstream/ff-complete-run-lease-semantics.md`.
 /// * `RuntimeError::Internal` → re-map to `InvalidTransition`
 ///   (SEC-007: no Internal FCALL strings in the response; F37: no
 ///   500 on terminal-state conflicts).
@@ -489,6 +495,7 @@ async fn f59_prelude_renew(
 ///   caller about the actual failure class.
 async fn f59_reclaim_after_lease_expired(
     fabric: &Arc<FabricServices>,
+    store: &Arc<InMemoryStore>,
     project: &ProjectKey,
     session_id: &SessionId,
     run_id: &RunId,
@@ -511,17 +518,69 @@ async fn f59_reclaim_after_lease_expired(
     {
         Ok(_) => Ok(()),
         Err(rc_err) if rc_err.is_transient_phase_conflict() => {
+            // F62: dual-door deadlock. Lease is expired AND the
+            // execution's lifecycle_phase is not `runnable`, so neither
+            // the terminal FCALL nor a fresh claim can land. FF has no
+            // cairn-reachable recovery path today
+            // (https://github.com/avifenesh/FlowFabric/issues/371).
+            //
+            // Mark the run `Failed` with `TerminalWriteDeadlock` so
+            // operators see a terminal state (not a zombie `running`
+            // row) and return an operator-actionable InvalidTransition
+            // carrying the artifact-preservation hint + upstream link.
             tracing::warn!(
                 run_id = %run_id,
                 fcall,
                 error = %rc_err,
-                "F59: re-claim rejected with transient phase conflict; \
-                 lease is known-expired so the retry would fail — \
-                 short-circuiting to lease_expired InvalidTransition"
+                upstream_issue = "https://github.com/avifenesh/FlowFabric/issues/371",
+                "F62: terminal-write deadlock — lease_expired on FCALL AND \
+                 execution_not_eligible on re-claim; flipping run to \
+                 Failed(TerminalWriteDeadlock) and surfacing upstream link"
             );
+            // `prev_state` is a best-effort enrichment for the
+            // emitted `RunStateChanged.transition.from` — the event is
+            // still emitted (and the run still flips to `Failed`) even
+            // if the projection lookup misses, so we do not fail the
+            // operator-facing response on a store hiccup. But surface
+            // both variants explicitly so schema drift / store
+            // outages show up in logs instead of being silently dropped
+            // (no SEC-007 leak: the error is only logged, not returned).
+            let prev_state = match RunReadModel::get(store.as_ref(), run_id).await {
+                Ok(Some(record)) => Some(record.state),
+                Ok(None) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        fcall,
+                        "F62: run not found in projection while emitting \
+                         ExecutionFailed(TerminalWriteDeadlock); \
+                         prev_state will be None"
+                    );
+                    None
+                }
+                Err(store_err) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        fcall,
+                        error = %store_err,
+                        "F62: store error reading prev_state for \
+                         ExecutionFailed(TerminalWriteDeadlock); \
+                         emitting with prev_state=None"
+                    );
+                    None
+                }
+            };
+            fabric
+                .bridge
+                .emit(BridgeEvent::ExecutionFailed {
+                    run_id: run_id.clone(),
+                    project: project.clone(),
+                    failure_class: FailureClass::TerminalWriteDeadlock,
+                    prev_state,
+                })
+                .await;
             Err(RuntimeError::InvalidTransition {
                 entity: "run",
-                from: "lease_expired".to_owned(),
+                from: "terminal_write_deadlock".to_owned(),
                 to: to.to_owned(),
             })
         }
@@ -711,6 +770,7 @@ impl RunService for FabricRunServiceAdapter {
             Err(err) if err.is_lease_expired() => {
                 f59_reclaim_after_lease_expired(
                     &self.fabric,
+                    &self.store,
                     &project,
                     session_id,
                     run_id,
@@ -750,6 +810,7 @@ impl RunService for FabricRunServiceAdapter {
             Err(err) if err.is_lease_expired() => {
                 f59_reclaim_after_lease_expired(
                     &self.fabric,
+                    &self.store,
                     &project,
                     session_id,
                     run_id,
@@ -788,6 +849,7 @@ impl RunService for FabricRunServiceAdapter {
             Err(err) if err.is_lease_expired() => {
                 f59_reclaim_after_lease_expired(
                     &self.fabric,
+                    &self.store,
                     &project,
                     session_id,
                     run_id,

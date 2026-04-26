@@ -62,6 +62,7 @@ pub fn failure_class_category(failure_class: FailureClass) -> &'static str {
         FailureClass::ExecutionError => "execution",
         FailureClass::LeaseExpired => "lease",
         FailureClass::CanceledByOperator => "operator",
+        FailureClass::TerminalWriteDeadlock => "deadlock",
     }
 }
 
@@ -80,6 +81,7 @@ pub fn failure_class_reason(failure_class: FailureClass) -> &'static str {
         FailureClass::ExecutionError => "execution_error",
         FailureClass::LeaseExpired => "lease_expired",
         FailureClass::CanceledByOperator => "canceled_by_operator",
+        FailureClass::TerminalWriteDeadlock => "terminal_write_deadlock",
     }
 }
 

@@ -60,6 +60,17 @@ pub enum FailureClass {
     ExecutionError,
     LeaseExpired,
     CanceledByOperator,
+    /// F62: terminal FCALL (`complete` / `fail` / `cancel`) could not be
+    /// written because the FF execution was simultaneously out of lease
+    /// (`lease_expired` on the FCALL) AND out of `runnable` phase
+    /// (`execution_not_eligible` on the retry re-claim). Neither of FF's
+    /// documented recovery paths applies in this state; the execution is
+    /// wedged until FF lands the upstream fix tracked in
+    /// [FlowFabric#371](https://github.com/avifenesh/FlowFabric/issues/371).
+    /// Cairn marks the run `Failed` with this class so operators see
+    /// the deadlock as a terminal state (rather than a zombie `running`
+    /// row) and can correlate against the upstream issue.
+    TerminalWriteDeadlock,
 }
 
 /// Canonical pause reasons in v1.
