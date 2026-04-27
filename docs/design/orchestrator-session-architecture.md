@@ -334,9 +334,15 @@ The outer orchestrator LLM has a separate tool whitelist from sub-session LLMs:
 
 `memory_search` is whitelisted read-only — the orchestrator benefits from prior-Session memory when deciding retry strategy. Implementation is gated on the external memory crate stabilizing (see CLAUDE memory note); for now the wire-up expects a `RetrievalService` trait that returns `Vec<MemoryHit>`.
 
+**`read` / `grep` / `glob` are verification tools, not default inputs.** The orchestrator should rely on the compacted `SessionOutcome.compacted_summary` and `final_state` from the prior attempt to decide next steps. Reading the workspace directly is permitted as a **fallback** when (a) the summary is missing, incomplete, or contradicts observed telemetry, OR (b) the orchestrator needs to verify a specific claim from the summary before re-dispatching with a narrower goal. Default-reading the workspace every iteration wastes tokens and defeats the point of compaction.
+
 System-prompt contract for the orchestrator (shape, not final copy):
 
-> You are an orchestrator. You do not edit code. You read the workspace, you read prior attempt summaries, you spawn bounded sub-agent attempts, and you decide when the Session goal is reached. You have `max_attempts` root-Run attempts per Session. Use them deliberately. Each attempt has its own circuit breakers (round cap, token cap, wall-clock cap, no-tool-use streak) and you will see an 80%-of-limit warning event before any breaker trips.
+> You are an orchestrator. You do not edit code. Your primary inputs are the compacted summaries and final-state reports from prior bounded attempts; you spawn new bounded sub-agent attempts, and you decide when the Session goal is reached.
+>
+> You have `read`, `grep`, `glob`, and `memory_search` available, but treat them as **verification tools**, not default inputs. Prefer the compacted summary. Reach for `read`/`grep`/`glob` only when the summary is missing, contradicts what the tests or telemetry say, or when you need to confirm a specific claim before re-dispatching with a narrower goal. Avoid re-reading files the sub-agent already described unless its summary left you uncertain.
+>
+> You have `max_attempts` root-Run attempts per Session. Use them deliberately. Each attempt has its own circuit breakers (round cap, token cap, wall-clock cap, no-tool-use streak) and you will see an 80%-of-limit warning event before any breaker trips. When an attempt terminates with a non-`Completed` reason, you have its `Checkpoint` and `WorkspaceSnapshot` — continue from the checkpoint when the sub-agent was on the right track and just ran out of runway, retry from scratch when the approach itself was wrong, abort when the goal is unreachable under the Session's remaining budget.
 
 The `spawn_attempt` tool accepts:
 ```
