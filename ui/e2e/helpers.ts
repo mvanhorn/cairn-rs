@@ -6,11 +6,61 @@
 import { expect, type Page, type APIRequestContext } from "@playwright/test";
 
 export const TOKEN = "dev-admin-token";
-// Honour PLAYWRIGHT_BASE_URL so the helpers point at the same cairn-app
-// instance configured in playwright.config.ts (e.g. :3002 on dev hosts
-// where :3000 is held by a running prod binary). Trailing slashes are
-// stripped so `${BASE}${path}` never produces `//v1/...`.
-export const BASE = (process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000").replace(/\/+$/, "");
+
+/**
+ * API base URL for APIRequestContext calls. Mirrors the precedence rule in
+ * `playwright.config.ts` so `PLAYWRIGHT_BASE_URL` / `CAIRN_E2E_BASE_URL` /
+ * `CAIRN_E2E_PORT` all override the Rust API calls these helpers make (not
+ * just the browser baseURL). Without this, specs using
+ * `apiPost/apiGet/...` would hit :3000 even when Playwright is pointed
+ * elsewhere.
+ *
+ * Precedence (first non-empty wins):
+ *   1. `PLAYWRIGHT_BASE_URL` — canonical override consumed by
+ *      `playwright.config.ts`. We just trim + strip trailing slashes;
+ *      strict validation lives in the config.
+ *   2. `CAIRN_E2E_BASE_URL`  — relaxed variant: port-less localhost URLs
+ *      get the port from CAIRN_E2E_PORT / DEFAULT.
+ *   3. `CAIRN_E2E_PORT`      — numeric port override only; BASE becomes
+ *      `http://localhost:<port>`.
+ *   4. Default               — `http://localhost:3000`.
+ *
+ * Trailing slashes are stripped so `${BASE}${path}` never produces
+ * `//v1/...`.
+ */
+function resolveApiBase(): string {
+  const strip = (s: string) => s.replace(/\/+$/, "");
+
+  const pwBase = process.env.PLAYWRIGHT_BASE_URL?.trim();
+  if (pwBase) return strip(pwBase);
+
+  const envBase = process.env.CAIRN_E2E_BASE_URL?.trim();
+  const DEFAULT_PORT = 3000;
+
+  const rawPort = process.env.CAIRN_E2E_PORT?.trim();
+  let port = DEFAULT_PORT;
+  if (rawPort) {
+    const n = Number(rawPort);
+    if (Number.isFinite(n) && Number.isInteger(n) && n > 0 && n <= 65_535) {
+      port = n;
+    }
+  }
+
+  if (envBase) {
+    try {
+      const u = new URL(envBase);
+      if (u.hostname === "localhost" || u.hostname === "127.0.0.1") {
+        return strip(u.port ? u.origin : `${u.protocol}//${u.hostname}:${port}`);
+      }
+      return strip(u.origin);
+    } catch {
+      // fall through to default
+    }
+  }
+  return `http://localhost:${port}`;
+}
+
+export const BASE = resolveApiBase();
 export const HDR = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
 export const DEFAULT_SCOPE = {
   tenant_id: "default_tenant",

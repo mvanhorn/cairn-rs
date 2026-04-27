@@ -12,10 +12,7 @@
  * Requires cairn-app on :3000 with a live LLM provider (Bedrock).
  */
 import { test, expect, type Page, type APIRequestContext } from "@playwright/test";
-
-const TOKEN = "dev-admin-token";
-const BASE = "http://localhost:3000";
-const HDR = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+import { BASE, TOKEN, HDR } from "./helpers";
 const scope = { tenant_id: "default_tenant", workspace_id: "default_workspace", project_id: "default_project" };
 
 async function post(r: APIRequestContext, path: string, data: object) {

@@ -8,12 +8,9 @@
  * and a live LLM provider (Bedrock or OpenRouter) for orchestration tests.
  */
 import { test, expect, type Page, type APIRequestContext } from "@playwright/test";
+import { BASE, TOKEN, HDR } from "./helpers";
 
 test.use({ actionTimeout: 10_000 });
-
-const TOKEN = "dev-admin-token";
-const BASE = "http://localhost:3000";
-const HDR = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
 const scope = { tenant_id: "default_tenant", workspace_id: "default_workspace", project_id: "default_project" };
 const projectRef = `${scope.tenant_id}/${scope.workspace_id}/${scope.project_id}`;
 

@@ -14,11 +14,30 @@
 
 import { useState, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Calculator, ChevronDown, ChevronUp, Coins, Info } from "lucide-react";
+import {
+  Calculator,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Coins,
+  Copy,
+  Info,
+  RotateCcw,
+} from "lucide-react";
 import { clsx } from "clsx";
 import { defaultApi } from "../lib/api";
 import { ErrorFallback } from "../components/ErrorFallback";
+import { useClipboard } from "../hooks/useClipboard";
 import type { ModelCatalogEntry } from "../lib/types";
+
+// Initial-form defaults — used at first load and on Reset.
+const DEFAULT_TOKENS_IN  = 10_000;
+const DEFAULT_TOKENS_OUT = 2_000;
+/** Preferred default model ID when available in the catalog. Matches the
+ *  namespaced form used by the router/registry so cost estimates are non-zero
+ *  on first load. If the catalog doesn't contain it, we fall back to the
+ *  first model with non-zero pricing (see `pickDefaultModelId`). */
+const PREFERRED_DEFAULT_MODEL_ID = "openai/gpt-4o-mini";
 
 // ── Types + helpers ──────────────────────────────────────────────────────────
 
@@ -37,6 +56,21 @@ interface ModelRow {
    *  advertises this model ID. Purely informational — the price is the
    *  catalog price either way. */
   configured:   boolean;
+}
+
+/** Pick a sensible default model from the catalog rows:
+ *    1. The preferred ID (`openai/gpt-4o-mini`) if present.
+ *    2. Otherwise the first row with non-zero input or output pricing
+ *       (so the initial estimate isn't misleadingly $0.00).
+ *    3. Otherwise `rows[0]` — the catalog might be free-only on this deploy.
+ *    4. Empty string if the catalog is empty. */
+function pickDefaultModelId(rows: ModelRow[]): string {
+  if (rows.length === 0) return "";
+  const preferred = rows.find(r => r.id === PREFERRED_DEFAULT_MODEL_ID);
+  if (preferred) return preferred.id;
+  const paid = rows.find(r => r.inputPer1M > 0 || r.outputPer1M > 0);
+  if (paid) return paid.id;
+  return rows[0]!.id;
 }
 
 function catalogToRows(
@@ -88,10 +122,11 @@ const TOKEN_PRESETS = [
 
 // ── Token input ───────────────────────────────────────────────────────────────
 
-function TokenInput({ label, value, onChange }: {
+function TokenInput({ label, value, onChange, testId }: {
   label: string;
   value: number;
   onChange: (n: number) => void;
+  testId?: string;
 }) {
   return (
     <div>
@@ -102,6 +137,7 @@ function TokenInput({ label, value, onChange }: {
           min={0}
           value={value}
           onChange={e => onChange(Math.max(0, parseInt(e.target.value, 10) || 0))}
+          data-testid={testId}
           className="w-full rounded border border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-900 text-[14px] text-gray-900 dark:text-zinc-100
                      font-mono px-3 py-2 focus:outline-none focus:border-indigo-500 transition-colors
                      [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none
@@ -162,9 +198,12 @@ function FilterChip({ label, active, onToggle }: { label: string; active: boolea
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export function CostCalculatorPage() {
-  const [tokensIn,       setTokensIn]       = useState(10_000);
-  const [tokensOut,      setTokensOut]      = useState(2_000);
-  const [selectedId,     setSelectedId]     = useState("gpt-4o-mini");
+  const [tokensIn,       setTokensIn]       = useState(DEFAULT_TOKENS_IN);
+  const [tokensOut,      setTokensOut]      = useState(DEFAULT_TOKENS_OUT);
+  // Empty string means "use the computed default once the catalog loads."
+  // The real default is chosen in `pickDefaultModelId` so it always lands on
+  // a model with non-zero pricing when one exists.
+  const [selectedId,     setSelectedId]     = useState("");
   const [sortBy,         setSortBy]         = useState<"cost" | "provider" | "name">("cost");
   const [sortAsc,        setSortAsc]        = useState(true);
   const [filterProvider, setFilterProvider] = useState<string>("all");
@@ -172,6 +211,13 @@ export function CostCalculatorPage() {
   const [toolsOnly,      setToolsOnly]      = useState(false);
   const [reasoningOnly,  setReasoningOnly]  = useState(false);
   const [configuredOnly, setConfiguredOnly] = useState(false);
+  // `copied` flips true only on a SUCCESSFUL copy and auto-resets after
+  // 1.5 s — we mirror that in the button label below so a failed copy
+  // (denied permission, HTTP context without clipboard API, etc.) doesn't
+  // silently show "Copied". The failure toast is surfaced by the hook.
+  const { copy: copyToClipboard, copied: resultCopied } = useClipboard({
+    successMessage: "Copied to clipboard",
+  });
 
   // ── Fetch provider registry (for the "configured" badge only) ───────────
   const { data: registry } = useQuery({
@@ -211,7 +257,17 @@ export function CostCalculatorPage() {
     [MODELS],
   );
 
-  const selected = MODELS.find(m => m.id === selectedId) ?? MODELS[0];
+  // Computed default that prefers a paid, namespaced model so the initial
+  // estimate isn't $0.00 on first load. Recomputes when the catalog changes.
+  const defaultModelId = useMemo(() => pickDefaultModelId(MODELS), [MODELS]);
+
+  // Effective selection: explicit user choice wins; otherwise fall back to
+  // the computed default (which itself falls back to `MODELS[0]` only when
+  // no paid model exists on this deployment).
+  const effectiveId = selectedId || defaultModelId;
+  const selected = MODELS.find(m => m.id === effectiveId)
+                ?? MODELS.find(m => m.id === defaultModelId)
+                ?? MODELS[0];
   const selectedCost = selected ? calcCost(selected, tokensIn, tokensOut) : 0;
   const inputCost  = selected ? (tokensIn  / 1_000_000) * selected.inputPer1M  : 0;
   const outputCost = selected ? (tokensOut / 1_000_000) * selected.outputPer1M : 0;
@@ -239,6 +295,30 @@ export function CostCalculatorPage() {
   function toggleSort(col: typeof sortBy) {
     if (sortBy === col) setSortAsc(v => !v);
     else { setSortBy(col); setSortAsc(true); }
+  }
+
+  /** Clear token inputs and model selection back to the computed defaults.
+   *  The model reverts to `pickDefaultModelId(MODELS)` by clearing the
+   *  explicit selection — we don't touch filters/sort because those aren't
+   *  part of the form the task brief calls out. */
+  function handleReset() {
+    setTokensIn(DEFAULT_TOKENS_IN);
+    setTokensOut(DEFAULT_TOKENS_OUT);
+    setSelectedId("");
+  }
+
+  /** Copy a human-readable summary of the estimate to the clipboard. Matches
+   *  the in-page result layout: provider/name, token counts, per-line and
+   *  total costs. `useClipboard` surfaces the success/failure toast and flips
+   *  `resultCopied` only on success. */
+  async function handleCopyResult() {
+    if (!selected) return;
+    const summary =
+      `${selected.provider} · ${selected.name} (${selected.id})\n` +
+      `Input:  ${fmtTokens(tokensIn)} tokens → ${fmtUSD(inputCost)}\n` +
+      `Output: ${fmtTokens(tokensOut)} tokens → ${fmtUSD(outputCost)}\n` +
+      `Total:  ${fmtUSD(selectedCost)}`;
+    await copyToClipboard(summary);
   }
 
   const SortIcon = ({ col }: { col: typeof sortBy }) =>
@@ -277,13 +357,14 @@ export function CostCalculatorPage() {
         <div className="rounded-xl border border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-900 p-5 space-y-5">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
             {/* Token inputs */}
-            <TokenInput label="Input tokens"  value={tokensIn}  onChange={setTokensIn}  />
-            <TokenInput label="Output tokens" value={tokensOut} onChange={setTokensOut} />
+            <TokenInput label="Input tokens"  value={tokensIn}  onChange={setTokensIn}  testId="costcalc-tokens-in"  />
+            <TokenInput label="Output tokens" value={tokensOut} onChange={setTokensOut} testId="costcalc-tokens-out" />
 
             {/* Model selector */}
             <div>
               <label className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wider block mb-2">Model</label>
-              <select value={selectedId} onChange={e => setSelectedId(e.target.value)}
+              <select value={effectiveId} onChange={e => setSelectedId(e.target.value)}
+                data-testid="costcalc-model-select"
                 className="w-full rounded border border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-900 text-[13px] text-gray-800 dark:text-zinc-200
                            px-3 py-2 focus:outline-none focus:border-indigo-500 transition-colors">
                 {PROVIDERS.map(prov => (
@@ -302,12 +383,12 @@ export function CostCalculatorPage() {
           {/* Result */}
           {selected && (
             <div className="rounded-lg border border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 divide-y divide-gray-200 dark:divide-zinc-800">
-              <div className="flex items-center justify-between px-4 py-3">
-                <div className="flex items-center gap-3">
+              <div className="flex items-center justify-between px-4 py-3 gap-3">
+                <div className="flex items-center gap-3 min-w-0">
                   <span className="text-[11px] font-medium text-gray-500 dark:text-zinc-400">
                     {selected.provider}
                   </span>
-                  <span className="text-[14px] font-medium text-gray-800 dark:text-zinc-200">{selected.name}</span>
+                  <span className="text-[14px] font-medium text-gray-800 dark:text-zinc-200 truncate">{selected.name}</span>
                   {selected.reasoning && (
                     <span className="text-[10px] bg-violet-600/20 text-violet-300 rounded px-1.5 py-0.5">reasoning</span>
                   )}
@@ -318,11 +399,38 @@ export function CostCalculatorPage() {
                     <span className="text-[10px] text-gray-400 dark:text-zinc-600 bg-gray-100 dark:bg-zinc-800 rounded px-1.5 py-0.5">not configured</span>
                   )}
                 </div>
-                <div className="text-right">
-                  <p className="text-[22px] font-semibold text-gray-900 dark:text-zinc-100 tabular-nums leading-none">
-                    {fmtUSD(selectedCost)}
-                  </p>
-                  <p className="text-[10px] text-gray-400 dark:text-zinc-600 mt-0.5">estimated total</p>
+                <div className="flex items-center gap-2 shrink-0">
+                  <div className="text-right">
+                    <p
+                      data-testid="costcalc-total-cost"
+                      className="text-[22px] font-semibold text-gray-900 dark:text-zinc-100 tabular-nums leading-none"
+                    >
+                      {fmtUSD(selectedCost)}
+                    </p>
+                    <p className="text-[10px] text-gray-400 dark:text-zinc-600 mt-0.5">estimated total</p>
+                  </div>
+                  <div className="flex items-center gap-1.5 pl-2 border-l border-gray-200 dark:border-zinc-800">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyResult()}
+                      data-testid="costcalc-copy-btn"
+                      title="Copy estimate to clipboard"
+                      className="flex items-center gap-1.5 rounded-md bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 px-2.5 py-1.5 text-[11px] text-gray-500 dark:text-zinc-400 hover:text-gray-700 dark:hover:text-zinc-200 hover:border-gray-400 dark:hover:border-zinc-600 transition-colors"
+                    >
+                      {resultCopied
+                        ? <><Check size={11} className="text-emerald-400" /> Copied</>
+                        : <><Copy  size={11} /> Copy</>}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleReset}
+                      data-testid="costcalc-reset-btn"
+                      title="Reset to defaults"
+                      className="flex items-center gap-1.5 rounded-md bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 px-2.5 py-1.5 text-[11px] text-gray-500 dark:text-zinc-400 hover:text-gray-700 dark:hover:text-zinc-200 hover:border-gray-400 dark:hover:border-zinc-600 transition-colors"
+                    >
+                      <RotateCcw size={11} /> Reset
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -408,7 +516,7 @@ export function CostCalculatorPage() {
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-zinc-800/50">
                 {tableRows.map((m, i) => {
-                  const isSelected = m.id === selectedId;
+                  const isSelected = m.id === effectiveId;
                   return (
                     <tr key={m.id}
                       onClick={() => setSelectedId(m.id)}
