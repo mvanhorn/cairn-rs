@@ -397,6 +397,40 @@ fn is_claim_contention(msg: &str) -> bool {
     CONTENTION_CODES.contains(&code.trim())
 }
 
+/// F64 backoff schedule (milliseconds) for the bounded terminal-write
+/// recovery loop. Each entry is the sleep BEFORE the corresponding
+/// re-claim + FCALL retry probe. The first probe runs immediately
+/// (0ms) so a system that self-heals between the initial lease_expired
+/// and this loop entry doesn't pay a mandatory 2s latency tax. The
+/// subsequent entries follow the 2/4/8/16s geometric backoff —
+/// total wall-clock cap is ~30s (0 + 2 + 4 + 8 + 16) before the F62
+/// `TerminalWriteDeadlock` fallback fires.
+const F64_BACKOFF_MS: [u64; 5] = [0, 2_000, 4_000, 8_000, 16_000];
+
+/// F64 aggressive healing env-var. Currently enables a log-only
+/// breadcrumb inside the recovery loop's deadlock branch — useful for
+/// confirming the hook fires against real incidents before committing
+/// to mutating side-effects. The target end-state is a proactive
+/// approval-cancel (FF's approval-resolution handlers can push the
+/// execution phase forward), but wiring that requires an
+/// ApprovalService handle on the adapter and is intentionally
+/// deferred.
+///
+/// Default OFF — set to `1` / `true` / `yes` / `on` (case-insensitive)
+/// to enable the current placeholder branch; the truthy set matches
+/// the convention used by `otlp_config_from_env` et al. Enable
+/// selectively (e.g. M1-v2 dogfood re-runs) when you need the
+/// breadcrumb; leave off in production until the cancel path ships.
+const F64_AGGRESSIVE_HEAL_ENV: &str = "CAIRN_F64_AGGRESSIVE_HEAL";
+
+fn f64_aggressive_heal_enabled() -> bool {
+    std::env::var(F64_AGGRESSIVE_HEAL_ENV)
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Minimum-remaining lease budget for the pre-terminal renew.
 ///
 /// Long enough that the terminal FCALL will not trip
@@ -457,43 +491,39 @@ async fn f59_prelude_renew(
     }
 }
 
-/// F59 layer (b) step 1: re-claim after a `lease_expired` rejection.
+/// F64: bounded terminal-write recovery loop.
 ///
-/// Precondition: the caller's terminal FCALL just rejected with
-/// `lease_expired`, so the execution is known to have no live lease
-/// (FF's `validate_lease_and_mark_expired` clears `current_lease_id`
-/// inside that rejection path). Recovery requires a FRESH lease.
+/// Replaces F59's single-shot short-circuit on
+/// `lease_expired` + re-claim `NotEligible` with a backoff-driven retry.
+/// FF often self-heals the not-eligible phase within a few seconds
+/// (scanner cycles advance execution state; lease reaper clears stale
+/// claims), so giving up after one re-claim attempt throws away runs
+/// that would have completed with a brief wait. This helper keeps
+/// retrying (re-claim + terminal-FCALL retry) on each backoff step
+/// until:
 ///
-/// `claim` is used instead of `ensure_active` because `ensure_active`
-/// short-circuits when the snapshot still carries
-/// `current_lease = Some(_)`, which is exactly the shape FF presents
-/// before the expiry scanner has cleared the pointer. Full `claim`
-/// unconditionally walks `issue_grant_and_claim`, minting a fresh
-/// lease and rotating the epoch.
+/// * a retry succeeds (`outcome = "recovered"`), OR
+/// * the backoff schedule is exhausted (`outcome = "deadlocked"`), at
+///   which point F62's TerminalWriteDeadlock fallback fires — the run
+///   flips `Failed(TerminalWriteDeadlock)` with the upstream-link
+///   hint, and the operator-facing response becomes
+///   `InvalidTransition { terminal_write_deadlock → <to> }`.
 ///
-/// Error handling:
+/// Regardless of the outcome, a `TerminalRecoveryAttempted` bridge
+/// event is emitted at the end of the loop with the attempt count,
+/// wall-clock duration, and outcome, so operators see on
+/// `GET /v1/runs/:id` whether recovery fired and whether it saved the
+/// run.
 ///
-/// * `Ok` → fresh lease in place; caller retries the terminal FCALL.
-/// * `is_transient_phase_conflict` → FF's eligibility gate rejected
-///   the claim (lifecycle_phase not `runnable` yet, e.g. the expiry
-///   transition is in flight). Retrying the terminal FCALL against
-///   the known-expired lease is guaranteed to fail with
-///   `lease_expired` again — this is the F62 dual-door deadlock.
-///   Emit `BridgeEvent::ExecutionFailed { TerminalWriteDeadlock }` so
-///   the run flips `state=failed` with an actionable `failure_class`
-///   (not a zombie `running` row), then short-circuit to an
-///   `InvalidTransition { from: "terminal_write_deadlock", .. }` whose
-///   rendered prose links the tracked FF upstream issue
-///   (https://github.com/avifenesh/FlowFabric/issues/371) and names the
-///   artifact-preservation symptom so the operator can correlate.
-///   Design notes: `docs/design/ff-upstream/ff-complete-run-lease-semantics.md`.
-/// * `RuntimeError::Internal` → re-map to `InvalidTransition`
-///   (SEC-007: no Internal FCALL strings in the response; F37: no
-///   500 on terminal-state conflicts).
-/// * Any other structured variant (`NotFound`, permanent `Conflict`,
-///   `Validation`, etc.) → propagate as-is; masking would lie to the
-///   caller about the actual failure class.
-async fn f59_reclaim_after_lease_expired(
+/// Removable once FF#371 lands upstream.
+///
+/// Error shaping on non-transient failures mirrors the previous F59
+/// contract (SEC-007 / F37): `RuntimeError::Internal` is re-shaped to
+/// `InvalidTransition { lease_expired → <to> }`; structured variants
+/// (`NotFound`, permanent `Conflict`, `Validation`, …) propagate
+/// unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn f64_terminal_recovery_loop<F, Fut>(
     fabric: &Arc<FabricServices>,
     store: &Arc<InMemoryStore>,
     project: &ProjectKey,
@@ -502,165 +532,317 @@ async fn f59_reclaim_after_lease_expired(
     fcall: &'static str,
     to: &'static str,
     original_err: &RuntimeError,
-) -> Result<(), RuntimeError> {
+    mut attempt_fcall: F,
+) -> Result<RunRecord, RuntimeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<RunRecord, RuntimeError>>,
+{
     tracing::warn!(
         run_id = %run_id,
         fcall,
         error = %original_err,
-        "F59: terminal FCALL rejected with lease_expired; re-claiming \
-         and retrying once"
+        "F64: terminal FCALL rejected with lease_expired; entering bounded \
+         recovery loop (immediate probe + 2s/4s/8s/16s backoff, ~30s cap)"
     );
-    match fabric
-        .runs
-        .claim(project, session_id, run_id)
-        .await
-        .map_err(fabric_err_to_runtime)
-    {
-        Ok(_) => Ok(()),
-        Err(rc_err) if rc_err.is_transient_phase_conflict() => {
-            // F62: dual-door deadlock. Lease is expired AND the
-            // execution's lifecycle_phase is not `runnable`, so neither
-            // the terminal FCALL nor a fresh claim can land. FF has no
-            // cairn-reachable recovery path today
-            // (https://github.com/avifenesh/FlowFabric/issues/371).
-            //
-            // Mark the run `Failed` with `TerminalWriteDeadlock` so
-            // operators see a terminal state (not a zombie `running`
-            // row) and return an operator-actionable InvalidTransition
-            // carrying the artifact-preservation hint + upstream link.
-            tracing::warn!(
-                run_id = %run_id,
-                fcall,
-                error = %rc_err,
-                upstream_issue = "https://github.com/avifenesh/FlowFabric/issues/371",
-                "F62: terminal-write deadlock — lease_expired on FCALL AND \
-                 execution_not_eligible on re-claim; flipping run to \
-                 Failed(TerminalWriteDeadlock) and surfacing upstream link"
-            );
-            // `prev_state` is a best-effort enrichment for the
-            // emitted `RunStateChanged.transition.from` — the event is
-            // still emitted (and the run still flips to `Failed`) even
-            // if the projection lookup misses, so we do not fail the
-            // operator-facing response on a store hiccup. But surface
-            // both variants explicitly so schema drift / store
-            // outages show up in logs instead of being silently dropped
-            // (no SEC-007 leak: the error is only logged, not returned).
-            let prev_state = match RunReadModel::get(store.as_ref(), run_id).await {
-                Ok(Some(record)) => Some(record.state),
-                Ok(None) => {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        fcall,
-                        "F62: run not found in projection while emitting \
-                         ExecutionFailed(TerminalWriteDeadlock); \
-                         prev_state will be None"
-                    );
-                    None
+
+    if f64_aggressive_heal_enabled() {
+        // Placeholder: when aggressive-heal is enabled, operators opt
+        // into proactive healing side-effects. Current shipped surface
+        // is a structured log breadcrumb so the hook is observable +
+        // ready to be wired to an approval-cancel path once the
+        // adapter grows an ApprovalService handle. Keep this as a
+        // named line rather than a noop so grep against real logs
+        // shows whether the env var reached a subprocess.
+        tracing::warn!(
+            run_id = %run_id,
+            fcall,
+            env = F64_AGGRESSIVE_HEAL_ENV,
+            "F64: aggressive-heal enabled; proactive approval-cancel \
+             would fire here (shipped: log-only hook, wire via \
+             AppState ApprovalService handle when needed)"
+        );
+    }
+
+    let start = std::time::Instant::now();
+    let mut attempts: u32 = 0;
+    let mut last_err: RuntimeError = clone_runtime_error(original_err);
+
+    for (step, backoff_ms) in F64_BACKOFF_MS.iter().enumerate() {
+        attempts = attempts.saturating_add(1);
+        tokio::time::sleep(std::time::Duration::from_millis(*backoff_ms)).await;
+
+        // Re-claim after backoff. On transient phase conflict, keep
+        // looping; FF may clear the not-eligible phase on the NEXT
+        // scanner cycle. On any other error, short-circuit.
+        match fabric
+            .runs
+            .claim(project, session_id, run_id)
+            .await
+            .map_err(fabric_err_to_runtime)
+        {
+            Ok(_) => {
+                // Re-claim succeeded; FF minted a fresh lease. Retry
+                // the terminal FCALL.
+                tracing::info!(
+                    run_id = %run_id,
+                    fcall,
+                    attempt = attempts,
+                    step = step + 1,
+                    backoff_ms,
+                    "F64: re-claim succeeded after backoff; retrying terminal FCALL"
+                );
+                match attempt_fcall().await {
+                    Ok(record) => {
+                        let wall_ms =
+                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        tracing::info!(
+                            run_id = %run_id,
+                            fcall,
+                            attempts,
+                            wall_time_ms = wall_ms,
+                            "F64: terminal FCALL recovered after backoff retry"
+                        );
+                        emit_recovery_attempt(
+                            fabric,
+                            project,
+                            run_id,
+                            fcall,
+                            attempts,
+                            wall_ms,
+                            "recovered",
+                        )
+                        .await;
+                        return Ok(record);
+                    }
+                    Err(retry_err) => {
+                        if retry_err.is_lease_expired() {
+                            // Fresh lease expired inside the FCALL
+                            // (the TTL window we just minted still
+                            // lost the race). Keep looping.
+                            tracing::warn!(
+                                run_id = %run_id,
+                                fcall,
+                                attempt = attempts,
+                                error = %retry_err,
+                                "F64: terminal FCALL retry hit lease_expired again; \
+                                 continuing recovery loop"
+                            );
+                            last_err = retry_err;
+                            continue;
+                        }
+                        // Non-transient retry error — operator sees
+                        // accurate failure class. Still emit the
+                        // recovery-attempted event so the attempt is
+                        // visible.
+                        let wall_ms =
+                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        emit_recovery_attempt(
+                            fabric,
+                            project,
+                            run_id,
+                            fcall,
+                            attempts,
+                            wall_ms,
+                            "non_transient_retry_error",
+                        )
+                        .await;
+                        return Err(shape_terminal_retry_error(retry_err, to));
+                    }
                 }
-                Err(store_err) => {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        fcall,
-                        error = %store_err,
-                        "F62: store error reading prev_state for \
-                         ExecutionFailed(TerminalWriteDeadlock); \
-                         emitting with prev_state=None"
-                    );
-                    None
-                }
-            };
-            fabric
-                .bridge
-                .emit(BridgeEvent::ExecutionFailed {
-                    run_id: run_id.clone(),
-                    project: project.clone(),
-                    failure_class: FailureClass::TerminalWriteDeadlock,
-                    prev_state,
-                })
+            }
+            Err(rc_err) if rc_err.is_transient_phase_conflict() => {
+                tracing::info!(
+                    run_id = %run_id,
+                    fcall,
+                    attempt = attempts,
+                    step = step + 1,
+                    backoff_ms,
+                    error = %rc_err,
+                    "F64: re-claim still rejected with transient phase conflict; \
+                     continuing backoff"
+                );
+                last_err = rc_err;
+                continue;
+            }
+            Err(rc_err) => {
+                // Non-transient re-claim error — operator sees the
+                // accurate failure class. Emit recovery-attempted so
+                // the incident is auditable.
+                tracing::error!(
+                    run_id = %run_id,
+                    fcall,
+                    attempt = attempts,
+                    error = %rc_err,
+                    "F64: re-claim failed with non-transient error; exiting loop"
+                );
+                let wall_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                emit_recovery_attempt(
+                    fabric,
+                    project,
+                    run_id,
+                    fcall,
+                    attempts,
+                    wall_ms,
+                    "non_transient_reclaim_error",
+                )
                 .await;
-            Err(RuntimeError::InvalidTransition {
-                entity: "run",
-                from: "terminal_write_deadlock".to_owned(),
-                to: to.to_owned(),
-            })
-        }
-        Err(rc_err) => {
-            tracing::error!(
-                run_id = %run_id,
-                fcall,
-                error = %rc_err,
-                "F59: re-claim during terminal-FCALL retry failed"
-            );
-            if matches!(rc_err, RuntimeError::Internal(_)) {
-                // F37: don't 500 on a terminal-FCALL state conflict.
-                // Re-shape as InvalidTransition so the operator gets
-                // the lease_expired hint.
-                Err(RuntimeError::InvalidTransition {
-                    entity: "run",
-                    from: "lease_expired".to_owned(),
-                    to: to.to_owned(),
-                })
-            } else {
-                // Structured variant — preserve it so the caller sees
-                // the accurate failure class (NotFound, permanent
-                // Conflict, Validation, etc.).
-                Err(rc_err)
+                // Single SEC-007 / F37 shaping path shared with the
+                // retry-side non-transient branch — never leak an
+                // Internal variant's message into the HTTP response.
+                return Err(shape_terminal_retry_error(rc_err, to));
             }
         }
     }
-}
 
-/// F59 layer (b) step 2: classify the retry-attempt result.
-///
-/// * `Ok(record)` → terminal write succeeded on retry.
-/// * `Err(e)` where `e.is_lease_expired()` → bubble up unchanged;
-///   the `invalid_transition_hint` table renders the operator
-///   message. This is the "FF has no recovery path for this
-///   execution right now" state tracked in
-///   `docs/design/ff-upstream/ff-complete-run-lease-semantics.md`.
-/// * `Err(e)` where `e` is `RuntimeError::Internal(_)` → re-shape as
-///   `InvalidTransition { lease_expired → <to> }` to satisfy F37's
-///   no-500-on-terminal-conflict + SEC-007's no-internal-leak
-///   invariants.
-/// * Any other structured variant → propagate as-is; the retry
-///   revealed a legitimate state conflict (e.g.
-///   `execution_not_active` if the run became terminal mid-retry,
-///   or `NotFound` if it was deleted) and masking it would mislead
-///   the caller.
-fn f59_finalize_retry(
-    run_id: &RunId,
-    fcall: &'static str,
-    to: &'static str,
-    retry: Result<RunRecord, RuntimeError>,
-) -> Result<RunRecord, RuntimeError> {
-    match retry {
-        Ok(record) => {
-            tracing::info!(
+    // Backoff schedule exhausted — F62 TerminalWriteDeadlock fallback.
+    let wall_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::warn!(
+        run_id = %run_id,
+        fcall,
+        attempts,
+        wall_time_ms = wall_ms,
+        upstream_issue = "https://github.com/avifenesh/FlowFabric/issues/371",
+        last_error = %last_err,
+        "F62/F64: recovery loop exhausted — dual-door deadlock. Flipping \
+         run to Failed(TerminalWriteDeadlock) with upstream link"
+    );
+    let prev_state = match RunReadModel::get(store.as_ref(), run_id).await {
+        Ok(Some(record)) => Some(record.state),
+        Ok(None) => {
+            tracing::warn!(
                 run_id = %run_id,
                 fcall,
-                "F59: terminal FCALL succeeded on retry after re-claim"
+                "F62: run not found in projection while emitting \
+                 ExecutionFailed(TerminalWriteDeadlock); prev_state will be None"
             );
-            Ok(record)
+            None
         }
-        Err(retry_err) => {
+        Err(store_err) => {
+            tracing::warn!(
+                run_id = %run_id,
+                fcall,
+                error = %store_err,
+                "F62: store error reading prev_state for \
+                 ExecutionFailed(TerminalWriteDeadlock); emitting with prev_state=None"
+            );
+            None
+        }
+    };
+    fabric
+        .bridge
+        .emit(BridgeEvent::ExecutionFailed {
+            run_id: run_id.clone(),
+            project: project.clone(),
+            failure_class: FailureClass::TerminalWriteDeadlock,
+            prev_state,
+        })
+        .await;
+    emit_recovery_attempt(
+        fabric,
+        project,
+        run_id,
+        fcall,
+        attempts,
+        wall_ms,
+        "deadlocked",
+    )
+    .await;
+    Err(RuntimeError::InvalidTransition {
+        entity: "run",
+        from: "terminal_write_deadlock".to_owned(),
+        to: to.to_owned(),
+    })
+}
+
+/// F64: re-shape a retry error that came back from the terminal FCALL
+/// after a successful re-claim. Retains the SEC-007 / F37 invariants
+/// (no Internal leak; no 500 on terminal-state conflicts).
+fn shape_terminal_retry_error(retry_err: RuntimeError, to: &'static str) -> RuntimeError {
+    if retry_err.is_lease_expired() {
+        retry_err
+    } else if matches!(retry_err, RuntimeError::Internal(_)) {
+        RuntimeError::InvalidTransition {
+            entity: "run",
+            from: "lease_expired".to_owned(),
+            to: to.to_owned(),
+        }
+    } else {
+        retry_err
+    }
+}
+
+/// F64: emit the `TerminalRecoveryAttempted` bridge event. Centralised
+/// so the three call sites (complete/fail/cancel via
+/// `f64_terminal_recovery_loop`) share one write. `outcome` is an
+/// open-enum string; the `"recovered"` and `"deadlocked"` values
+/// appear on the operator surface, and the extra strings
+/// (`"non_transient_retry_error"`, `"non_transient_reclaim_error"`)
+/// are auditable via event-log replay.
+async fn emit_recovery_attempt(
+    fabric: &Arc<FabricServices>,
+    project: &ProjectKey,
+    run_id: &RunId,
+    fcall: &'static str,
+    attempts: u32,
+    wall_time_ms: u64,
+    outcome: &str,
+) {
+    // Fail loudly if the system clock reports a time before UNIX_EPOCH
+    // or past u64::MAX ms. These are hardware/schema-drift shapes, not
+    // recoverable states — log with full context and skip emission
+    // rather than silently falling back to `0` (which would make the
+    // audit row look like it occurred in 1970 and mislead operators).
+    let occurred_at_ms = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+    {
+        Some(ms) => ms,
+        None => {
             tracing::error!(
                 run_id = %run_id,
                 fcall,
-                error = %retry_err,
-                "F59: terminal-FCALL retry after re-claim also rejected"
+                outcome,
+                attempts,
+                wall_time_ms,
+                "F64: system clock before UNIX_EPOCH or past u64::MAX ms; \
+                 skipping TerminalRecoveryAttempted emission (hardware/clock fault)"
             );
-            if retry_err.is_lease_expired() {
-                Err(retry_err)
-            } else if matches!(retry_err, RuntimeError::Internal(_)) {
-                Err(RuntimeError::InvalidTransition {
-                    entity: "run",
-                    from: "lease_expired".to_owned(),
-                    to: to.to_owned(),
-                })
-            } else {
-                Err(retry_err)
-            }
+            return;
         }
+    };
+    fabric
+        .bridge
+        .emit(BridgeEvent::TerminalRecoveryAttempted {
+            run_id: run_id.clone(),
+            project: project.clone(),
+            fcall: fcall.to_owned(),
+            attempts,
+            wall_time_ms,
+            outcome: outcome.to_owned(),
+            occurred_at_ms,
+        })
+        .await;
+}
+
+/// F64: shallow clone of a `RuntimeError` by value. `RuntimeError`
+/// doesn't derive `Clone` across all variants (the Internal/Store
+/// wrappers own non-Clone payloads), so we reconstruct the variants we
+/// care about preserving and fall back to the Display string for the
+/// rest. Used to keep the original `lease_expired` error as the
+/// `last_err` for logging after we consume it by-ref in the loop.
+fn clone_runtime_error(err: &RuntimeError) -> RuntimeError {
+    match err {
+        RuntimeError::InvalidTransition { entity, from, to } => RuntimeError::InvalidTransition {
+            entity,
+            from: from.clone(),
+            to: to.clone(),
+        },
+        RuntimeError::LeaseExpired { task_id } => RuntimeError::LeaseExpired {
+            task_id: task_id.clone(),
+        },
+        other => RuntimeError::Internal(format!("{other}")),
     }
 }
 
@@ -768,7 +950,7 @@ impl RunService for FabricRunServiceAdapter {
         match first {
             Ok(record) => Ok(record),
             Err(err) if err.is_lease_expired() => {
-                f59_reclaim_after_lease_expired(
+                f64_terminal_recovery_loop(
                     &self.fabric,
                     &self.store,
                     &project,
@@ -777,15 +959,15 @@ impl RunService for FabricRunServiceAdapter {
                     "complete",
                     "completed",
                     &err,
+                    || async {
+                        self.fabric
+                            .runs
+                            .complete(&project, session_id, run_id)
+                            .await
+                            .map_err(fabric_err_to_runtime)
+                    },
                 )
-                .await?;
-                let retry = self
-                    .fabric
-                    .runs
-                    .complete(&project, session_id, run_id)
-                    .await
-                    .map_err(fabric_err_to_runtime);
-                f59_finalize_retry(run_id, "complete", "completed", retry)
+                .await
             }
             Err(err) => Err(err),
         }
@@ -808,7 +990,7 @@ impl RunService for FabricRunServiceAdapter {
         match first {
             Ok(record) => Ok(record),
             Err(err) if err.is_lease_expired() => {
-                f59_reclaim_after_lease_expired(
+                f64_terminal_recovery_loop(
                     &self.fabric,
                     &self.store,
                     &project,
@@ -817,15 +999,15 @@ impl RunService for FabricRunServiceAdapter {
                     "fail",
                     "failed",
                     &err,
+                    || async {
+                        self.fabric
+                            .runs
+                            .fail(&project, session_id, run_id, failure_class)
+                            .await
+                            .map_err(fabric_err_to_runtime)
+                    },
                 )
-                .await?;
-                let retry = self
-                    .fabric
-                    .runs
-                    .fail(&project, session_id, run_id, failure_class)
-                    .await
-                    .map_err(fabric_err_to_runtime);
-                f59_finalize_retry(run_id, "fail", "failed", retry)
+                .await
             }
             Err(err) => Err(err),
         }
@@ -847,7 +1029,7 @@ impl RunService for FabricRunServiceAdapter {
         match first {
             Ok(record) => Ok(record),
             Err(err) if err.is_lease_expired() => {
-                f59_reclaim_after_lease_expired(
+                f64_terminal_recovery_loop(
                     &self.fabric,
                     &self.store,
                     &project,
@@ -856,15 +1038,15 @@ impl RunService for FabricRunServiceAdapter {
                     "cancel",
                     "cancelled",
                     &err,
+                    || async {
+                        self.fabric
+                            .runs
+                            .cancel(&project, session_id, run_id)
+                            .await
+                            .map_err(fabric_err_to_runtime)
+                    },
                 )
-                .await?;
-                let retry = self
-                    .fabric
-                    .runs
-                    .cancel(&project, session_id, run_id)
-                    .await
-                    .map_err(fabric_err_to_runtime);
-                f59_finalize_retry(run_id, "cancel", "cancelled", retry)
+                .await
             }
             Err(err) => Err(err),
         }

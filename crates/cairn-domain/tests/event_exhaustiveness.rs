@@ -608,6 +608,11 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
             assert_ne!(proj.tenant_id.as_str(), "_system");
             assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
         }
+        // F64: run-scoped terminal-write recovery annotation.
+        RuntimeEvent::TerminalRecoveryAttempted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
     }
 }
 
@@ -1736,6 +1741,16 @@ fn all_variants() -> Vec<RuntimeEvent> {
             verification: cairn_domain::CompletionVerification::default(),
             occurred_at_ms: ts,
         }),
+        // F64: terminal-write recovery loop annotation.
+        RuntimeEvent::TerminalRecoveryAttempted(cairn_domain::events::TerminalRecoveryAttempted {
+            project: p(),
+            run_id: cairn_domain::RunId::new("run_test"),
+            fcall: "complete".to_owned(),
+            attempts: 2,
+            wall_time_ms: 6_000,
+            outcome: "recovered".to_owned(),
+            occurred_at_ms: ts,
+        }),
     ]
 }
 
@@ -1753,8 +1768,8 @@ fn all_runtime_event_variants_covered_count() {
     // F40: ProviderConnectionDeleted).
     assert_eq!(
         variants.len(),
-        142,
-        "all_variants() must construct exactly 142 RuntimeEvent instances"
+        143,
+        "all_variants() must construct exactly 143 RuntimeEvent instances"
     );
 }
 

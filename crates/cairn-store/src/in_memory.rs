@@ -406,6 +406,7 @@ impl InMemoryStore {
                         completion_summary: None,
                         completion_verification: None,
                         completion_annotated_at_ms: None,
+                        terminal_write_recovery: None,
                     },
                 );
                 // Update run quota counter
@@ -2075,6 +2076,25 @@ impl InMemoryStore {
                     rec.completion_summary = Some(e.summary.clone());
                     rec.completion_verification = Some(e.verification.clone());
                     rec.completion_annotated_at_ms = Some(e.occurred_at_ms);
+                    rec.version += 1;
+                    rec.updated_at = now;
+                }
+            }
+            // F64: record the terminal-write recovery attempt on the run
+            // row. Silent no-op on missing row mirrors the
+            // `RunCompletionAnnotated` handler above — an orphan
+            // TerminalRecoveryAttempted is a malformed log, not a
+            // projection error.
+            RuntimeEvent::TerminalRecoveryAttempted(e) => {
+                if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
+                    rec.terminal_write_recovery =
+                        Some(crate::projections::TerminalRecoveryRecord {
+                            fcall: e.fcall.clone(),
+                            attempts: e.attempts,
+                            wall_time_ms: e.wall_time_ms,
+                            outcome: e.outcome.clone(),
+                            occurred_at_ms: e.occurred_at_ms,
+                        });
                     rec.version += 1;
                     rec.updated_at = now;
                 }

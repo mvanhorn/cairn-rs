@@ -481,7 +481,10 @@ impl<P: GraphProjection> EventProjector<P> {
             // verification sidecar. The runs node already exists from
             // RunCreated; annotation is stored on the cairn-store
             // projection, not the graph. No edges to add here.
-            | RuntimeEvent::RunCompletionAnnotated(_) => {}
+            | RuntimeEvent::RunCompletionAnnotated(_)
+            // F64: terminal-write recovery annotation is stored on the
+            // cairn-store projection, not the graph. No edges to add.
+            | RuntimeEvent::TerminalRecoveryAttempted(_) => {}
 
             RuntimeEvent::EvalRunStarted(e) => {
                 self.add_node(

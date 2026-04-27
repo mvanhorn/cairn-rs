@@ -72,8 +72,29 @@ pub const OPENAPI_JSON: &str = r##"{
           "failure_class": { "type": "string", "nullable": true },
           "version":       { "type": "integer" },
           "created_at":    { "type": "integer" },
-          "updated_at":    { "type": "integer" }
+          "updated_at":    { "type": "integer" },
+          "terminal_write_recovery": {
+            "$ref": "#/components/schemas/TerminalRecoveryRecord",
+            "nullable": true,
+            "description": "F64: present only when the cairn-side terminal-write recovery loop fired for this run (the bridge workaround for FF#371). Omitted on the hot path."
+          }
         }
+      },
+      "TerminalRecoveryRecord": {
+        "type": "object",
+        "description": "F64: summary of the most recent terminal-write recovery loop, if one fired for this run. Bridge workaround for the FF#371 dual-door deadlock. Retained for historical audit even after the upstream fix lands — only the active retry-loop code retires at that point; the schema + OpenAPI field stay so existing annotations remain inspectable.",
+        "properties": {
+          "fcall":         { "type": "string", "description": "Which terminal FCALL the loop wrapped: `complete`, `fail`, or `cancel`." },
+          "attempts":      { "type": "integer", "description": "Number of re-claim + retry attempts (>= 1)." },
+          "wall_time_ms":  { "type": "integer", "description": "Milliseconds spent in the recovery loop (sum of backoff sleeps + FCALL round-trips)." },
+          "outcome":       {
+            "type": "string",
+            "description": "Machine-readable recovery result. `recovered` = retry succeeded. `deadlocked` = schedule exhausted, F62 TerminalWriteDeadlock fallback fired. `non_transient_retry_error` / `non_transient_reclaim_error` = audit-only diagnostic strings for non-transient errors inside the loop. Dashboards should surface `recovered` + `deadlocked` prominently.",
+            "enum": ["recovered", "deadlocked", "non_transient_retry_error", "non_transient_reclaim_error"]
+          },
+          "occurred_at_ms":{ "type": "integer", "description": "Wall-clock ms when the loop finished." }
+        },
+        "required": ["fcall", "attempts", "wall_time_ms", "outcome", "occurred_at_ms"]
       },
       "CommandOutcome": {
         "type": "object",

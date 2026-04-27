@@ -160,6 +160,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "tool_invocation_args_output",
         include_str!("migrations/V029__tool_invocation_args_output.sql"),
     ),
+    (
+        30,
+        "add_terminal_write_recovery",
+        include_str!("migrations/V030__add_terminal_write_recovery.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

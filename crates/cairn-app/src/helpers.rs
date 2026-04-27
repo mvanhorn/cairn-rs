@@ -1040,6 +1040,8 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::RecoverySummaryEmitted(_) => "recovery_summary",
         // F47 PR2
         RuntimeEvent::RunCompletionAnnotated(_) => "run_completion_annotated",
+        // F64: terminal-write recovery loop outcome (FF#371 bridge).
+        RuntimeEvent::TerminalRecoveryAttempted(_) => "terminal_recovery_attempted",
     }
 }
 
@@ -1613,6 +1615,17 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
             format!(
                 "Plan revision requested for run {} (new run {})",
                 p.original_plan_run_id, p.new_plan_run_id
+            )
+        }
+        // F64: terminal-write recovery outcome breadcrumb for SSE / audit.
+        RuntimeEvent::TerminalRecoveryAttempted(e) => {
+            format!(
+                "Terminal-write recovery ({}) for run {}: {} after {} attempts in {} ms",
+                sanitize_for_event_message(&e.fcall),
+                e.run_id,
+                sanitize_for_event_message(&e.outcome),
+                e.attempts,
+                e.wall_time_ms,
             )
         }
     }

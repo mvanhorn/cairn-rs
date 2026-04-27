@@ -1055,6 +1055,11 @@ fn build_run_record(
         completion_summary: None,
         completion_verification: None,
         completion_annotated_at_ms: None,
+        // F64: fabric snapshots come from FF state, never from the
+        // cairn-store projection that carries the recovery annotation.
+        // Always `None`; callers who want the field read from the
+        // cairn-store RunReadModel projection.
+        terminal_write_recovery: None,
     })
 }
 

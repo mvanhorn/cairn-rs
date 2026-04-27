@@ -1153,6 +1153,34 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
+            // F64: persist the terminal-write recovery outcome on the
+            // runs row so operators see it on `GET /v1/runs/:id`. Silent
+            // no-op on missing row mirrors `RunCompletionAnnotated` —
+            // an orphan recovery event cannot mint a run.
+            RuntimeEvent::TerminalRecoveryAttempted(e) => {
+                let record = crate::projections::TerminalRecoveryRecord {
+                    fcall: e.fcall.clone(),
+                    attempts: e.attempts,
+                    wall_time_ms: e.wall_time_ms,
+                    outcome: e.outcome.clone(),
+                    occurred_at_ms: e.occurred_at_ms,
+                };
+                let json = serde_json::to_string(&record)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "UPDATE runs
+                        SET terminal_write_recovery_json = $1,
+                            version                     = version + 1,
+                            updated_at                   = $2
+                      WHERE run_id = $3",
+                )
+                .bind(json)
+                .bind(now)
+                .bind(e.run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::DecisionCacheWarmup(e) => {
                 let warmed_at = i64::try_from(e.warmed_at).map_err(|_| {
                     StoreError::Internal(format!(

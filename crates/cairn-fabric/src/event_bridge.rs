@@ -122,6 +122,21 @@ pub enum BridgeEvent {
         dependency_kind: cairn_domain::DependencyKind,
         data_passing_ref: Option<String>,
     },
+    /// F64: terminal-write recovery loop outcome. Emitted once per
+    /// complete/fail/cancel that entered the recovery loop, regardless
+    /// of whether the loop recovered or timed out. Persisted as
+    /// `RuntimeEvent::TerminalRecoveryAttempted` on the event log +
+    /// `runs.terminal_write_recovery_json` on the projection so
+    /// operators see the attempt summary on the run detail page.
+    TerminalRecoveryAttempted {
+        run_id: RunId,
+        project: ProjectKey,
+        fcall: String,
+        attempts: u32,
+        wall_time_ms: u64,
+        outcome: String,
+        occurred_at_ms: u64,
+    },
 }
 
 pub struct EventBridge {
@@ -277,6 +292,7 @@ fn bridge_event_type_name(event: &BridgeEvent) -> &'static str {
         BridgeEvent::SessionCreated { .. } => "SessionCreated",
         BridgeEvent::SessionArchived { .. } => "SessionArchived",
         BridgeEvent::TaskDependencyAdded { .. } => "TaskDependencyAdded",
+        BridgeEvent::TerminalRecoveryAttempted { .. } => "TerminalRecoveryAttempted",
     }
 }
 
@@ -479,6 +495,25 @@ fn bridge_event_to_runtime_event(event: &BridgeEvent) -> RuntimeEvent {
             dependency_kind: *dependency_kind,
             data_passing_ref: data_passing_ref.clone(),
         }),
+        BridgeEvent::TerminalRecoveryAttempted {
+            run_id,
+            project,
+            fcall,
+            attempts,
+            wall_time_ms,
+            outcome,
+            occurred_at_ms,
+        } => RuntimeEvent::TerminalRecoveryAttempted(
+            cairn_domain::events::TerminalRecoveryAttempted {
+                project: project.clone(),
+                run_id: run_id.clone(),
+                fcall: fcall.clone(),
+                attempts: *attempts,
+                wall_time_ms: *wall_time_ms,
+                outcome: outcome.clone(),
+                occurred_at_ms: *occurred_at_ms,
+            },
+        ),
     }
 }
 

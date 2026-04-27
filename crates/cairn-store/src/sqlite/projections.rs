@@ -985,6 +985,31 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
+            // F64: mirror PG projection for TerminalRecoveryAttempted.
+            RuntimeEvent::TerminalRecoveryAttempted(e) => {
+                let record = crate::projections::TerminalRecoveryRecord {
+                    fcall: e.fcall.clone(),
+                    attempts: e.attempts,
+                    wall_time_ms: e.wall_time_ms,
+                    outcome: e.outcome.clone(),
+                    occurred_at_ms: e.occurred_at_ms,
+                };
+                let json = serde_json::to_string(&record)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "UPDATE runs
+                        SET terminal_write_recovery_json = ?,
+                            version                     = version + 1,
+                            updated_at                   = ?
+                      WHERE run_id = ?",
+                )
+                .bind(json)
+                .bind(now)
+                .bind(e.run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::DecisionCacheWarmup(e) => {
                 let warmed_at = i64::try_from(e.warmed_at).map_err(|_| {
                     StoreError::Internal(format!(

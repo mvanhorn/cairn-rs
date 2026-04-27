@@ -122,7 +122,8 @@ impl RunReadModel for PgAdapter {
         let row = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE run_id = $1",
         )
@@ -143,7 +144,8 @@ impl RunReadModel for PgAdapter {
         let rows = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE session_id = $1
              ORDER BY created_at ASC, run_id ASC
@@ -182,7 +184,8 @@ impl RunReadModel for PgAdapter {
         let row = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE session_id = $1 AND parent_run_id IS NULL
              ORDER BY created_at DESC, run_id DESC
@@ -204,7 +207,8 @@ impl RunReadModel for PgAdapter {
         let rows = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE state = $1
              ORDER BY created_at ASC, run_id ASC
@@ -227,7 +231,8 @@ impl RunReadModel for PgAdapter {
         let rows = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
                AND state NOT IN ('completed', 'failed', 'canceled', 'dead_lettered')
@@ -254,7 +259,8 @@ impl RunReadModel for PgAdapter {
         let rows = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE parent_run_id = $1
              ORDER BY created_at ASC, run_id ASC
@@ -846,6 +852,10 @@ struct RunRow {
     completion_summary: Option<String>,
     completion_verification_json: Option<String>,
     completion_annotated_at_ms: Option<i64>,
+    // F64: nullable terminal-write recovery annotation (JSON). Absent
+    // on the hot path; populated by the TerminalRecoveryAttempted
+    // projection when the cairn-side recovery loop fires.
+    terminal_write_recovery_json: Option<String>,
 }
 
 impl RunRow {
@@ -895,6 +905,12 @@ impl RunRow {
             completion_summary: self.completion_summary,
             completion_verification,
             completion_annotated_at_ms,
+            terminal_write_recovery: self
+                .terminal_write_recovery_json
+                .as_deref()
+                .map(serde_json::from_str::<crate::projections::TerminalRecoveryRecord>)
+                .transpose()
+                .map_err(|e| StoreError::Serialization(e.to_string()))?,
         })
     }
 }

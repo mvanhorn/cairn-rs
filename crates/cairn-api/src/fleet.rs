@@ -139,6 +139,7 @@ mod tests {
             completion_summary: None,
             completion_verification: None,
             completion_annotated_at_ms: None,
+            terminal_write_recovery: None,
         }
     }
 

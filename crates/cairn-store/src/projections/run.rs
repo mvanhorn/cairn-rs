@@ -60,6 +60,35 @@ pub struct RunRecord {
     /// `skip_serializing_if`: see `completion_summary` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_annotated_at_ms: Option<u64>,
+    /// F64: summary of the most recent terminal-write recovery loop, if
+    /// one fired for this run. `None` on the hot path (no recovery
+    /// needed). Populated by the `TerminalRecoveryAttempted` event
+    /// projection and stored as JSON alongside the run row.
+    ///
+    /// This is a supported optional API field on `RunRecord` — it
+    /// appears in the OpenAPI spec and is intended for operator +
+    /// audit inspection of runs that hit the recovery path. The
+    /// underlying bridge loop retires when FF#371 lands upstream; at
+    /// that point writes stop, but existing annotations remain
+    /// queryable and the column/event variant stay in the schema.
+    ///
+    /// `skip_serializing_if`: runs that never hit the recovery path
+    /// stay silent in the response body — no noisy
+    /// `terminal_write_recovery: null` on every run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_write_recovery: Option<TerminalRecoveryRecord>,
+}
+
+/// F64: projection shape for the latest terminal-write recovery attempt.
+/// Mirrors `cairn_domain::events::TerminalRecoveryAttempted` minus the
+/// ProjectKey + RunId (already carried by the parent `RunRecord`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalRecoveryRecord {
+    pub fcall: String,
+    pub attempts: u32,
+    pub wall_time_ms: u64,
+    pub outcome: String,
+    pub occurred_at_ms: u64,
 }
 
 /// Read-model for run current state.

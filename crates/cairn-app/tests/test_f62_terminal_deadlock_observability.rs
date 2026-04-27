@@ -240,8 +240,18 @@ async fn provision_session_and_run(h: &LiveHarness, suffix: &str) -> (String, St
 }
 
 async fn orchestrate(h: &LiveHarness, run_id: &str, goal: &str) -> (u16, Value) {
-    let r = h
-        .client()
+    // F64: the recovery loop can add up to ~30s on the deadlock path
+    // (backoff schedule 2+4+8+16s). The harness default 60s client
+    // timeout was tight enough that it sometimes fired before the
+    // loop + TerminalWriteDeadlock fallback landed, converting a
+    // correct 409 into a reqwest::TimedOut panic. Use a dedicated
+    // 120s client for this test so the assertion about operator-
+    // actionable response shape still runs against the real wire body.
+    let long_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("long-timeout reqwest client");
+    let r = long_client
         .post(format!("{}/v1/runs/{}/orchestrate", h.base_url, run_id))
         .bearer_auth(&h.admin_token)
         .json(&json!({

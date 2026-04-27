@@ -51,7 +51,13 @@ CREATE TABLE IF NOT EXISTS runs (
     -- JSON-over-TEXT pattern used by route_policies.rules etc.
     completion_summary            TEXT,
     completion_verification_json  TEXT,
-    completion_annotated_at_ms    INTEGER
+    completion_annotated_at_ms    INTEGER,
+    -- F64: nullable JSON sidecar capturing the most recent
+    -- terminal-write recovery loop outcome (bridge for FF#371).
+    -- Retained for historical audit/backward-compat even after the
+    -- upstream fix lands; only the active recovery-loop code becomes
+    -- dead at that point — no schema-removal migration is planned.
+    terminal_write_recovery_json  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tasks (

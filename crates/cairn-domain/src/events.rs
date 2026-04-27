@@ -280,6 +280,20 @@ pub enum RuntimeEvent {
     /// nullable columns, so event logs written before F47 PR2 deserialize
     /// cleanly and surface `completion: None` at the REST boundary.
     RunCompletionAnnotated(RunCompletionAnnotated),
+    /// F64: emitted when the cairn-side terminal-write recovery loop
+    /// runs (the bridge workaround for the FF#371 dual-door deadlock).
+    /// Carries the attempts, wall-time, and outcome so operators can
+    /// see whether recovery saved the run or whether F62's
+    /// `TerminalWriteDeadlock` fallback fired.
+    ///
+    /// Once FF#371 lands upstream, the active cairn-side recovery loop
+    /// retires — no new events are emitted — but the variant itself
+    /// stays on `RuntimeEvent` (and its projection on `runs`) so
+    /// historical event logs + audit rows continue to deserialize
+    /// cleanly. Do NOT remove this variant when the upstream fix
+    /// ships; deleting it would break replay of any log containing
+    /// legacy recovery attempts.
+    TerminalRecoveryAttempted(TerminalRecoveryAttempted),
 }
 
 impl RuntimeEvent {
@@ -345,6 +359,7 @@ impl RuntimeEvent {
             RuntimeEvent::PlanRevisionRequested(event) => &event.project,
             RuntimeEvent::DecisionRecorded(event) => &event.project,
             RuntimeEvent::RunCompletionAnnotated(event) => &event.project,
+            RuntimeEvent::TerminalRecoveryAttempted(event) => &event.project,
             RuntimeEvent::TriggerCreated(event) => &event.project,
             RuntimeEvent::TriggerEnabled(event) => &event.project,
             RuntimeEvent::TriggerDisabled(event) => &event.project,
@@ -684,6 +699,9 @@ impl RuntimeEvent {
             | RuntimeEvent::DecisionRecorded(_)
             | RuntimeEvent::DecisionCacheWarmup(_) => None,
             RuntimeEvent::RunCompletionAnnotated(event) => Some(RuntimeEntityRef::Run {
+                run_id: event.run_id.clone(),
+            }),
+            RuntimeEvent::TerminalRecoveryAttempted(event) => Some(RuntimeEntityRef::Run {
                 run_id: event.run_id.clone(),
             }),
         }
@@ -2530,6 +2548,46 @@ pub struct RunCompletionAnnotated {
     pub summary: String,
     #[serde(default)]
     pub verification: crate::orchestrator::CompletionVerification,
+    pub occurred_at_ms: u64,
+}
+
+/// F64: outcome of a single terminal-write recovery loop (the cairn-side
+/// bridge for the FF#371 dual-door deadlock). Emitted once per complete/
+/// fail/cancel call that enters the recovery loop, regardless of whether
+/// the loop recovers or times out. Absent for the hot path (no recovery
+/// needed) — the field on `RunRecord` stays `None` for normal runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalRecoveryAttempted {
+    pub project: crate::tenancy::ProjectKey,
+    pub run_id: crate::ids::RunId,
+    /// Which terminal FCALL the recovery loop was wrapping: `"complete"`,
+    /// `"fail"`, or `"cancel"`.
+    pub fcall: String,
+    /// Number of re-claim + retry attempts the loop made. `>= 1`.
+    pub attempts: u32,
+    /// Wall-clock milliseconds spent inside the recovery loop (sum of
+    /// backoff sleeps + FCALL round-trips).
+    pub wall_time_ms: u64,
+    /// Machine-readable recovery result. Kept as `String` (not a typed
+    /// enum) so the audit log can carry less-common post-mortem
+    /// shapes without a schema migration. Currently emitted values:
+    ///
+    /// * `"recovered"` — a retry inside the loop succeeded; the run
+    ///   completed normally.
+    /// * `"deadlocked"` — the backoff schedule exhausted and the F62
+    ///   `TerminalWriteDeadlock` fallback fired.
+    /// * `"non_transient_retry_error"` — the re-claim succeeded but
+    ///   the terminal FCALL retry returned a non-transient error
+    ///   (e.g. `NotFound`, permanent `Conflict`, `Validation`).
+    /// * `"non_transient_reclaim_error"` — the re-claim itself
+    ///   returned a non-transient error; the loop short-circuited.
+    ///
+    /// Operator dashboards should surface `"recovered"` and
+    /// `"deadlocked"` prominently and treat the two non-transient
+    /// strings as audit-only diagnostics.
+    pub outcome: String,
+    /// Wall-clock ms when the loop finished. Lets operator dashboards
+    /// plot recovery incidents over time.
     pub occurred_at_ms: u64,
 }
 

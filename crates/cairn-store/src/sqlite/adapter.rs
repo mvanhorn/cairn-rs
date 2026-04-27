@@ -110,6 +110,8 @@ impl DbAdapter for SqliteAdapter {
             ("completion_summary", "TEXT"),
             ("completion_verification_json", "TEXT"),
             ("completion_annotated_at_ms", "INTEGER"),
+            // F64: sidecar for terminal-write recovery loop annotations.
+            ("terminal_write_recovery_json", "TEXT"),
         ] {
             let exists = sqlx::query_scalar::<_, i64>(
                 "SELECT 1 FROM pragma_table_info('runs') WHERE name = ? LIMIT 1",
@@ -218,7 +220,8 @@ impl RunReadModel for SqliteAdapter {
         let row = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE run_id = $1",
         )
@@ -239,7 +242,8 @@ impl RunReadModel for SqliteAdapter {
         let rows = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE session_id = $1
              ORDER BY created_at ASC, run_id ASC
@@ -278,7 +282,8 @@ impl RunReadModel for SqliteAdapter {
         let row = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE session_id = $1 AND parent_run_id IS NULL
              ORDER BY created_at DESC, run_id DESC
@@ -304,7 +309,8 @@ impl RunReadModel for SqliteAdapter {
         let rows = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE state = $1
              ORDER BY created_at ASC
@@ -334,7 +340,8 @@ impl RunReadModel for SqliteAdapter {
         let sql = format!(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
                AND state NOT IN ({placeholders})
@@ -368,7 +375,8 @@ impl RunReadModel for SqliteAdapter {
         let rows = sqlx::query_as::<_, RunRow>(
             "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
                     state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
              FROM runs
              WHERE parent_run_id = $1
              ORDER BY created_at ASC, run_id ASC
@@ -885,6 +893,8 @@ struct RunRow {
     completion_summary: Option<String>,
     completion_verification_json: Option<String>,
     completion_annotated_at_ms: Option<i64>,
+    // F64: nullable terminal-write recovery annotation (serde-JSON).
+    terminal_write_recovery_json: Option<String>,
 }
 
 impl RunRow {
@@ -932,6 +942,12 @@ impl RunRow {
             completion_summary: self.completion_summary,
             completion_verification,
             completion_annotated_at_ms,
+            terminal_write_recovery: self
+                .terminal_write_recovery_json
+                .as_deref()
+                .map(serde_json::from_str::<crate::projections::TerminalRecoveryRecord>)
+                .transpose()
+                .map_err(|e| StoreError::Serialization(e.to_string()))?,
         })
     }
 }
