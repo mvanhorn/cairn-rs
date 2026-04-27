@@ -21,14 +21,34 @@ export async function signIn(page: Page) {
   await page.waitForLoadState("domcontentloaded");
   const sidebar = page.getByTestId("sidebar");
 
+  // Resolve the current page state before deciding what to do: either
+  // we landed on the sidebar (already signed in), the login form, or
+  // the app is still mounting. Without this poll the helper would race
+  // early React mounts on cold starts.
+  await expect
+    .poll(async () => {
+      if (await sidebar.isVisible().catch(() => false)) return "sidebar";
+      if (await page.getByTestId("login-token-input").isVisible().catch(() => false)) return "login";
+      return "loading";
+    }, { timeout: 10_000 })
+    .not.toBe("loading");
+
   // Already signed in (localStorage token persisted from prior test in same context)
-  if (await sidebar.isVisible({ timeout: 2000 }).catch(() => false)) return;
+  if (await sidebar.isVisible({ timeout: 1000 }).catch(() => false)) return;
 
-  const tokenInput = page.getByTestId("login-token-input");
-  if (!(await tokenInput.isVisible({ timeout: 3000 }).catch(() => false))) return;
+  const input = page.getByTestId("login-token-input");
 
-  await tokenInput.fill(TOKEN);
-  // Wait for React to enable the submit button
+  // Use `pressSequentially` rather than `fill()`. React 19's
+  // controlled-input onChange handler occasionally does not observe
+  // the single-shot value set by `.fill()` under Playwright, which
+  // leaves the Sign In button disabled and the test hung. Typing each
+  // character produces the InputEvent sequence React expects and is
+  // the pattern used elsewhere in the suite (real-scenarios.spec.ts).
+  await input.click();
+  await input.fill("");
+  await input.pressSequentially(TOKEN, { delay: 10 });
+  await expect.poll(() => input.inputValue(), { timeout: 5_000 }).toBe(TOKEN);
+
   const submitBtn = page.getByTestId("login-submit-btn");
   await expect(submitBtn).toBeEnabled({ timeout: 3000 });
   await submitBtn.click({ timeout: 5000 });

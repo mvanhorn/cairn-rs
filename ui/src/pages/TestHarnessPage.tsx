@@ -97,14 +97,21 @@ async function waitForPausableState(
     }
     // Interruptible sleep: resolve early on abort so Stop tears down
     // within one poll interval instead of sitting on a dead setTimeout.
+    // Clean up both timers on either exit path so we don't leak handles
+    // (React strict-mode warning) or let a stale setTimeout fire after
+    // the loop has moved on.
     await new Promise<void>(res => {
-      const t = setInterval(() => {
-        if (shouldAbort()) {
-          clearInterval(t);
-          res();
-        }
+      let poll: ReturnType<typeof setInterval> | null = null;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const done = () => {
+        if (poll !== null) clearInterval(poll);
+        if (timer !== null) clearTimeout(timer);
+        res();
+      };
+      poll = setInterval(() => {
+        if (shouldAbort()) done();
       }, 25);
-      setTimeout(() => { clearInterval(t); res(); }, pollIntervalMs);
+      timer = setTimeout(done, pollIntervalMs);
     });
   }
   throw new Error(`Run did not reach pausable state in ${Math.round(timeoutMs / 1000)}s (last state: ${last})`);
@@ -401,7 +408,10 @@ function StepRow({
   }[s];
 
   return (
-    <div className={clsx("rounded-lg border overflow-hidden transition-colors",
+    <div
+      data-testid={`step-${step.id}`}
+      data-status={s}
+      className={clsx("rounded-lg border overflow-hidden transition-colors",
       s === "fail"    ? "border-red-900/50"     :
       s === "pass"    ? "border-emerald-900/40"  :
       s === "running" ? "border-indigo-800/40"   :
@@ -426,7 +436,11 @@ function StepRow({
             </span>
           )}
           {result?.status === "fail" && result.error && (
-            <span className="text-[11px] text-red-400 font-mono max-w-[200px] truncate" title={result.error}>
+            <span
+              data-testid={`step-${step.id}-error`}
+              className="text-[11px] text-red-400 font-mono max-w-[200px] truncate"
+              title={result.error}
+            >
               {result.error}
             </span>
           )}
@@ -585,7 +599,11 @@ function ScenarioCard({
   }[overallStatus];
 
   return (
-    <div className={clsx("bg-gray-50 dark:bg-zinc-900 rounded-xl border overflow-hidden", borderColor)}>
+    <div
+      data-testid={`scenario-${scenario.id}`}
+      data-status={overallStatus}
+      className={clsx("bg-gray-50 dark:bg-zinc-900 rounded-xl border overflow-hidden", borderColor)}
+    >
       {/* Card header */}
       <div className="flex items-start gap-3 px-4 py-3">
         <div className={clsx(
@@ -661,6 +679,7 @@ function ScenarioCard({
             </button>
           )}
           <button
+            data-testid={`scenario-${scenario.id}-run-btn`}
             onClick={runningCount > 0 ? () => { abortRef.current = true; } : runScenario}
             disabled={running && runningCount === 0}
             className={clsx(
