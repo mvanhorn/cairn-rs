@@ -193,3 +193,117 @@ jobs:
         run: npm run build
       - name: vitest
         run: npx vitest run
+
+  # ── 7. Smoke (release gatekeeper) ───────────────────────────────────────────
+  # The HTTP smoke suite at `scripts/smoke-test.sh` is CLAUDE.md's named
+  # "release gatekeeper" — 95 end-to-end checks against a running cairn-app.
+  # This job enforces the gate on every PR so a smoke regression blocks
+  # merge the same way a failing `cargo test` does.
+  #
+  # Architecture:
+  # - Valkey 8 runs as a GitHub Actions service container (NOT testcontainers;
+  #   the smoke gate drives the production `cairn-app` binary, not a test
+  #   binary, so it needs a sidecar rather than an in-process harness).
+  # - `cairn-app` is built in release mode + backgrounded on 127.0.0.1:3000.
+  # - `/health/ready` is polled until 200, then `scripts/smoke-test.sh`
+  #   runs with `CAIRN_TOKEN` + `CAIRN_URL` pointed at the live binary.
+  # - On failure, the backgrounded binary's stdout/stderr is uploaded as a
+  #   workflow artifact so operators can diagnose without re-running CI.
+  smoke:
+    name: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping || redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+            ${{ runner.os }}-cargo-
+
+      - name: Build cairn-app + smoke_worker (release)
+        # Release mode matches what `scripts/smoke-test.sh`'s claim-then-
+        # operate fixture expects — it auto-detects `target/release/smoke_worker`
+        # and falls back to `cargo run` only if neither release nor debug is
+        # built. Building both binaries up front keeps the launch step fast.
+        run: cargo build -p cairn-app --release --bin cairn-app --bin smoke_worker
+        timeout-minutes: 15
+
+      - name: Launch cairn-app
+        # Team mode exercises the full Fabric boot path (HMAC seed, FCALL
+        # registration, lease-history subscriber); local mode would short-
+        # circuit those and miss regressions the gatekeeper must catch.
+        # `--db memory` avoids needing a Postgres sidecar; the in-memory
+        # store is the same backing that Fabric's EventBridge writes to
+        # when running with the non-durable backend, so projection reads
+        # stay coherent for the full smoke surface.
+        run: |
+          set -euo pipefail
+          export CAIRN_ADMIN_TOKEN="dev-admin-token"
+          export CAIRN_FABRIC_WAITPOINT_HMAC_SECRET="$(openssl rand -hex 32)"
+          export CAIRN_FABRIC_WAITPOINT_HMAC_KID="ci-smoke"
+          export CAIRN_FABRIC_HOST="127.0.0.1"
+          export CAIRN_FABRIC_PORT="6379"
+          export RUST_LOG="warn"
+          nohup ./target/release/cairn-app \
+            --addr 127.0.0.1 --port 3000 \
+            --mode team --db memory \
+            > /tmp/cairn-rs-smoke.log 2>&1 &
+          echo $! > /tmp/cairn-rs-smoke.pid
+          echo "cairn-app launched (pid=$(cat /tmp/cairn-rs-smoke.pid))"
+
+      - name: Wait for /health/ready
+        # 60s total — release build boots in <5s on GH runners; the buffer
+        # covers Fabric seed (FF_ROTATE_WAITPOINT_HMAC_SECRET RTT) plus
+        # projection warmup. Fail fast if the process died before ready
+        # rather than wait out the full timeout.
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            pid="$(cat /tmp/cairn-rs-smoke.pid 2>/dev/null || echo '')"
+            if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::cairn-app exited before /health/ready returned 200"
+              tail -n 120 /tmp/cairn-rs-smoke.log || true
+              exit 1
+            fi
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/health/ready || echo 000)"
+            if [ "$code" = "200" ]; then
+              echo "ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::cairn-app did not reach /health/ready within 60s"
+          tail -n 120 /tmp/cairn-rs-smoke.log || true
+          exit 1
+
+      - name: Run smoke-test.sh
+        env:
+          CAIRN_TOKEN: dev-admin-token
+          CAIRN_URL: http://127.0.0.1:3000
+        run: ./scripts/smoke-test.sh
+
+      - name: Upload cairn-app log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cairn-app-smoke-log
+          path: /tmp/cairn-rs-smoke.log
+          if-no-files-found: warn
