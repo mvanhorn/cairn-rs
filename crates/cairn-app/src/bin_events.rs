@@ -271,7 +271,14 @@ pub(crate) async fn append_events_handler(
             }
         }
         // Always write to InMemory: updates projections + broadcasts to SSE subscribers.
-        match state.runtime.store.append(&[envelope]).await {
+        // Use `from_ref` so `envelope` stays borrowable for the
+        // service-layer sync below without needing a clone.
+        match state
+            .runtime
+            .store
+            .append(std::slice::from_ref(&envelope))
+            .await
+        {
             Ok(positions) => {
                 results.push(AppendResult {
                     event_id,
@@ -281,7 +288,144 @@ pub(crate) async fn append_events_handler(
             }
             Err(e) => return Err(internal_error(e.to_string())),
         }
+
+        // ── Service-layer sync (split-brain guard) ─────────────────────────
+        //
+        // `/v1/events/append` is a projection-level write seam. It updates
+        // the event log and the cairn-store projections but does NOT, by
+        // default, populate FF state (the FabricTaskService / RunService /
+        // SessionService durably own their state in Valkey via FCALL, not
+        // in the cairn-store projection). For creation events that have a
+        // service counterpart — `TaskCreated`, `RunCreated`, `SessionCreated`
+        // — projection-only writes drift from service state: a subsequent
+        // `POST /v1/tasks/:id/claim` hits FF, FF has no record of the task,
+        // and the claim returns 404 even though `GET /v1/tasks` shows the
+        // task in the projection.
+        //
+        // To keep the two views in sync we best-effort invoke the service
+        // `submit` / `start` / `create` method after the log append
+        // succeeds. The service-layer methods are idempotent on their
+        // primary key — if FF already has the execution (normal replay
+        // case), the call is a no-op and the bridge does not emit a
+        // duplicate event. If FF does not have the execution (the
+        // smoke_worker / backdoor / projection-repair case), the service
+        // populates FF and the bridge emits its own canonical creation
+        // event which the projection upserts without corruption.
+        //
+        // The sync is best-effort: the log write is the source of truth, so
+        // a service-layer failure is logged but does not 5xx the response.
+        // Callers who want a hard guarantee must use the service-layer
+        // HTTP endpoints (`POST /v1/sessions`, `POST /v1/runs`,
+        // `POST /v1/tasks`) — events/append is explicitly documented as a
+        // projection-repair seam.
+        sync_service_for_creation_event(&state, &envelope.payload).await;
     }
 
     Ok((StatusCode::CREATED, Json(results)))
+}
+
+/// Best-effort re-drive service-layer state from a freshly-appended
+/// creation event. See the long-form comment at the call site for why
+/// this is a best-effort, idempotent sync rather than a hard write
+/// through the service.
+async fn sync_service_for_creation_event(state: &AppState, payload: &cairn_domain::RuntimeEvent) {
+    use cairn_domain::RuntimeEvent as E;
+    match payload {
+        E::SessionCreated(e) => {
+            if let Err(err) = state
+                .runtime
+                .sessions
+                .create(&e.project, e.session_id.clone())
+                .await
+            {
+                // `AlreadyExists` on the service side is the expected
+                // idempotent-replay outcome; everything else is a real
+                // sync gap an operator should know about.
+                if !is_already_exists(&err) {
+                    tracing::warn!(
+                        target: "cairn_app::events_append_sync",
+                        session_id = %e.session_id,
+                        err = %err,
+                        "events/append SessionCreated service sync failed (best-effort)",
+                    );
+                }
+            }
+        }
+        E::RunCreated(e) => {
+            if let Err(err) = state
+                .runtime
+                .runs
+                .start(
+                    &e.project,
+                    &e.session_id,
+                    e.run_id.clone(),
+                    e.parent_run_id.clone(),
+                )
+                .await
+            {
+                if !is_already_exists(&err) {
+                    tracing::warn!(
+                        target: "cairn_app::events_append_sync",
+                        run_id = %e.run_id,
+                        err = %err,
+                        "events/append RunCreated service sync failed (best-effort)",
+                    );
+                }
+            }
+        }
+        E::TaskCreated(e) => {
+            // The TaskService trait requires `Option<&SessionId>`; pass
+            // whatever the event carried and let the adapter derive from
+            // `parent_run_id → run.session_id` when absent.
+            let session_id = e.session_id.as_ref();
+            if let Err(err) = state
+                .runtime
+                .tasks
+                .submit(
+                    &e.project,
+                    session_id,
+                    e.task_id.clone(),
+                    e.parent_run_id.clone(),
+                    e.parent_task_id.clone(),
+                    0,
+                )
+                .await
+            {
+                if !is_already_exists(&err) {
+                    tracing::warn!(
+                        target: "cairn_app::events_append_sync",
+                        task_id = %e.task_id,
+                        err = %err,
+                        "events/append TaskCreated service sync failed (best-effort)",
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Classify a `RuntimeError` as a benign duplicate-create outcome that
+/// the best-effort sync should swallow without logging. The goal of the
+/// sync is to make FF state catch up when missing, so replay of the
+/// same creation event is the expected no-op path, not an incident.
+///
+/// Scoped narrowly on purpose:
+/// * We do NOT match `RuntimeError::Conflict { .. }` blindly. The
+///   Fabric adapter also maps FF claim-contention races to
+///   `Conflict { entity: "execution", id: <code> }` via
+///   `fabric_err_to_runtime::is_claim_contention`, so a bare
+///   `Conflict` match would hide real contention bugs from the log.
+///   The Conflict variant we care about here — "row already exists"
+///   from an in-memory service impl — carries a message text with
+///   `"already exists"` / `"duplicate"`, so the string match below
+///   covers it without the over-broad variant match.
+/// * String matching is tight: only `"already exists"`,
+///   `"already_exists"`, and `"duplicate"` — NOT just `"exists"`, so
+///   orthogonal errors like `"parent session does not exist"` still
+///   surface as real sync gaps (per SEC-007 — do not over-match on
+///   internal strings).
+fn is_already_exists(err: &cairn_runtime::error::RuntimeError) -> bool {
+    let s = err.to_string().to_ascii_lowercase();
+    s.contains("already exists") || s.contains("already_exists") || s.contains("duplicate")
 }
