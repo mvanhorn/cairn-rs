@@ -10,7 +10,7 @@ import { ErrorFallback } from "../components/ErrorFallback";
 import { useToast } from "../components/Toast";
 import { useScope } from "../hooks/useScope";
 import { sectionLabel } from "../lib/design-system";
-import { defaultApi, ApiError } from "../lib/api";
+import { defaultApi } from "../lib/api";
 import type { ProjectRepoEntry } from "../lib/types";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -31,12 +31,7 @@ function parseRepoId(repoId: string): { owner: string; repo: string } | null {
 }
 
 function errorMessage(e: unknown, fallback: string): string {
-  // `apiFetch` normalizes both `{code, message}` and `{error: string}` body
-  // shapes into `ApiError.message`, so the decoded backend reason is
-  // available here regardless of which envelope `repo_routes.rs` emits.
-  if (e instanceof ApiError) return e.message || fallback;
-  if (e instanceof Error) return e.message || fallback;
-  return fallback;
+  return e instanceof Error ? e.message || fallback : fallback;
 }
 
 // ── Clone status pill ────────────────────────────────────────────────────────
