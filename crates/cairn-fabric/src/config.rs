@@ -13,6 +13,41 @@ pub struct FabricConfig {
     pub worker_id: WorkerId,
     pub worker_instance_id: WorkerInstanceId,
     pub namespace: Namespace,
+    /// Lease TTL in milliseconds applied to every FF execution lease
+    /// cairn claims. Overridable via `CAIRN_FABRIC_LEASE_TTL_MS`.
+    ///
+    /// **Default: `180_000` (3 minutes).**
+    ///
+    /// # Tradeoff
+    ///
+    /// * **Shorter TTL** → faster stuck-run recovery. When a worker
+    ///   genuinely crashes, the lease expires sooner and FF's
+    ///   `LeaseExpiryScanner` promotes the execution back to
+    ///   `eligible` for re-claim. Recovery latency ≈ TTL.
+    /// * **Longer TTL** → fewer spurious `lease_expired` failures on
+    ///   pull-mode drivers. `POST /v1/runs/:id/orchestrate` runs one
+    ///   iteration per HTTP call and returns; between calls nobody
+    ///   renews the lease. Operator-paced approval flows + LLM tail
+    ///   latency + tool execution routinely exceed short TTLs.
+    ///
+    /// # Why 180_000 (3 min)
+    ///
+    /// F63 dogfood (2026-04-27) on the F62 binary showed the previous
+    /// `30_000` default routinely expired between orchestrate calls:
+    /// LLM tail (~30 s) + operator approval think-time (~60 s) + tool
+    /// exec (~30 s) easily exceeded 30 s. Every expiry tripped F62's
+    /// `TerminalWriteDeadlock` path and lost the LLM's productive work.
+    ///
+    /// `180_000` covers the typical end-to-end iteration (LLM plus
+    /// human plus tools) with headroom, while keeping recovery latency
+    /// on the rare actual-crash path bounded (3 min vs the 600 s
+    /// workaround previously reverted in F43 triage — that one 20×'d
+    /// zombie recovery and bloated the `worker_leases` index).
+    ///
+    /// FF's dual-door deadlock (the upstream root cause this default
+    /// mitigates) is tracked at
+    /// <https://github.com/avifenesh/FlowFabric/issues/371>. Once FF
+    /// ships the fix we can revisit this default downward.
     pub lease_ttl_ms: u64,
     pub grant_ttl_ms: u64,
     pub max_concurrent_tasks: usize,
@@ -83,10 +118,12 @@ impl FabricConfig {
         let namespace = Namespace::new(
             std::env::var("CAIRN_FABRIC_NAMESPACE").unwrap_or_else(|_| "cairn".into()),
         );
+        // Default 180_000 (3 min) — see `lease_ttl_ms` field docs for
+        // the F63 rationale and the upstream FF#371 cross-reference.
         let lease_ttl_ms = std::env::var("CAIRN_FABRIC_LEASE_TTL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(30_000);
+            .unwrap_or(180_000);
         let grant_ttl_ms = std::env::var("CAIRN_FABRIC_GRANT_TTL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -289,7 +326,7 @@ mod tests {
         assert!(!config.tls);
         assert!(!config.cluster);
         assert_eq!(config.lane_id.as_str(), "cairn");
-        assert_eq!(config.lease_ttl_ms, 30_000);
+        assert_eq!(config.lease_ttl_ms, 180_000);
         assert_eq!(config.max_concurrent_tasks, 4);
     }
 

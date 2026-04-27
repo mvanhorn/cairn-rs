@@ -59,7 +59,7 @@ unsupported (FF is the only correctness-guaranteed path).
 | `CAIRN_FABRIC_WAITPOINT_HMAC_KID` | `k1` when secret set | env var | Kid for the HMAC secret. Must be non-empty and free of `:` (FF field-name delimiter). |
 | `CAIRN_FABRIC_WORKER_CAPABILITIES` | empty set | env var | Comma-separated capability tokens. Passed to `ff_scheduler::Scheduler::claim_for_worker`. Empty = matches only executions with no capability requirements. |
 | `CAIRN_FABRIC_HOST` / `_PORT` / `_TLS` / `_CLUSTER` | `localhost` / `6379` / off / off | env var | Valkey connection. `_CLUSTER=1` uses cluster mode; all FCALL KEYS on a single `{p:N}` hash tag so this is cluster-safe without extra wiring. |
-| `CAIRN_FABRIC_LEASE_TTL_MS` / `_GRANT_TTL_MS` | `30_000` / `5_000` | env var | Timing knobs. |
+| `CAIRN_FABRIC_LEASE_TTL_MS` / `_GRANT_TTL_MS` | `180_000` / `5_000` | env var | Timing knobs. Lease default bumped 30s → 180s in F63 to match pull-mode orchestrate cadence (operator approvals + LLM tail + tool exec routinely exceed 30s); see [FF#371](https://github.com/avifenesh/FlowFabric/issues/371) for the upstream dual-door-deadlock root cause this default mitigates. |
 
 ---
 

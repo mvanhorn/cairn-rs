@@ -410,8 +410,9 @@ impl FabricRunService {
     /// tool-call, or while a human-paced agent clicks through 5–10
     /// tool-calls in a dashboard), no one is renewing the FF lease.
     ///
-    /// The default `CAIRN_FABRIC_LEASE_TTL_MS = 30_000` (30 s) is easily
-    /// exceeded by any operator-paced workflow. When the next
+    /// Even with the F63 default `CAIRN_FABRIC_LEASE_TTL_MS = 180_000`
+    /// (3 min), long approval chains + slow LLMs can exceed the TTL.
+    /// When the next
     /// `/orchestrate` call arrives the lease is already expired, and the
     /// run's terminal FCALL (`ff_complete_execution`) rejects with
     /// `lease_expired`. The operator-visible symptom was

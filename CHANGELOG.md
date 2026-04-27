@@ -11,6 +11,19 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **F63: default `CAIRN_FABRIC_LEASE_TTL_MS` raised `30_000` → `180_000`
+  (30 s → 3 min).** The previous 30 s default routinely expired between
+  `POST /v1/runs/:id/orchestrate` calls on pull-mode, operator-paced
+  workflows (typical iteration: LLM tail ~30 s + human approval
+  ~60 s + tool exec ~30 s). Every expiry tripped F62's
+  `TerminalWriteDeadlock` path and lost the LLM's productive work.
+  180 s covers the typical iteration with headroom while keeping
+  stuck-run recovery latency bounded (vs the previously-tried 600 s
+  workaround, reverted in F43 triage for 20× zombie-recovery delay
+  + `worker_leases` bloat). The underlying FF dual-door-deadlock root
+  cause is tracked upstream at
+  <https://github.com/avifenesh/FlowFabric/issues/371>; once FF ships
+  the fix this default can be revisited.
 - **Upgraded FlowFabric 0.10.0 -> 0.11.0 (Wave 9 Postgres parity; no
   cairn consumer-facing changes).** FF 0.11 flips 12 Postgres
   `Unavailable` trait methods to concrete impls (cancel/revoke/replay
