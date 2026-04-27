@@ -390,14 +390,17 @@ pub(crate) async fn get_task_handler(
     tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.runtime.tasks.get(&TaskId::new(id)).await {
-        Ok(Some(task)) if task.project.tenant_id == *tenant_scope.tenant_id() => {
-            (StatusCode::OK, Json(task)).into_response()
-        }
-        Ok(Some(_)) | Ok(None) => {
-            AppApiError::new(StatusCode::NOT_FOUND, "not_found", "task not found").into_response()
-        }
-        Err(err) => runtime_error_response(err),
+    // T6a-C3: use the shared helper so admin bypass + cross-tenant 404
+    // match every other task endpoint. The hand-rolled match here used
+    // to miss `is_admin`, causing admin-token cross-tenant reads to 404
+    // even though same-tenant reads, plus `list` and `claim` for the
+    // same id, returned 200. The PR #50 audit applied the helper to
+    // every mutation endpoint but overlooked this read path. See the
+    // sibling `list_task_dependencies_handler`.
+    let task_id = TaskId::new(id);
+    match load_task_visible_to_tenant(state.as_ref(), &tenant_scope, &task_id).await {
+        Ok(task) => (StatusCode::OK, Json(task)).into_response(),
+        Err(response) => response,
     }
 }
 
