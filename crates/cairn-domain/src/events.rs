@@ -294,6 +294,22 @@ pub enum RuntimeEvent {
     /// ships; deleting it would break replay of any log containing
     /// legacy recovery attempts.
     TerminalRecoveryAttempted(TerminalRecoveryAttempted),
+    /// F65 PR-1: orchestrator session redesign foundation. The variants
+    /// below carry durable observability of session attempts, breaker trips,
+    /// checkpoint + workspace-snapshot lifecycle, and the rich terminal
+    /// session outcome. PR-1 only adds the shapes — they are not emitted
+    /// from the runtime yet; PR-2/3/6 wire emission.
+    SessionAttemptStarted(SessionAttemptStarted),
+    SessionAttemptCompleted(SessionAttemptCompleted),
+    CircuitBreakerTripped(CircuitBreakerTripped),
+    BudgetThresholdCrossed(BudgetThresholdCrossed),
+    CheckpointPersisted(CheckpointPersisted),
+    WorkspaceSnapshotCreated(WorkspaceSnapshotCreated),
+    WorkspaceSnapshotReaped(WorkspaceSnapshotReaped),
+    SessionOutcomeEmitted(SessionOutcomeEmitted),
+    OrchestratorDecisionMade(OrchestratorDecisionMade),
+    SummarizerFallback(SummarizerFallback),
+    WorkspaceBackendDegraded(WorkspaceBackendDegraded),
 }
 
 impl RuntimeEvent {
@@ -360,6 +376,20 @@ impl RuntimeEvent {
             RuntimeEvent::DecisionRecorded(event) => &event.project,
             RuntimeEvent::RunCompletionAnnotated(event) => &event.project,
             RuntimeEvent::TerminalRecoveryAttempted(event) => &event.project,
+            // F65 PR-1: orchestrator session redesign events are all
+            // project-scoped — they route through the operator-facing
+            // session UI and cost rollups.
+            RuntimeEvent::SessionAttemptStarted(event) => &event.project,
+            RuntimeEvent::SessionAttemptCompleted(event) => &event.project,
+            RuntimeEvent::CircuitBreakerTripped(event) => &event.project,
+            RuntimeEvent::BudgetThresholdCrossed(event) => &event.project,
+            RuntimeEvent::CheckpointPersisted(event) => &event.project,
+            RuntimeEvent::WorkspaceSnapshotCreated(event) => &event.project,
+            RuntimeEvent::WorkspaceSnapshotReaped(event) => &event.project,
+            RuntimeEvent::SessionOutcomeEmitted(event) => &event.project,
+            RuntimeEvent::OrchestratorDecisionMade(event) => &event.project,
+            RuntimeEvent::SummarizerFallback(event) => &event.project,
+            RuntimeEvent::WorkspaceBackendDegraded(event) => &event.project,
             RuntimeEvent::TriggerCreated(event) => &event.project,
             RuntimeEvent::TriggerEnabled(event) => &event.project,
             RuntimeEvent::TriggerDisabled(event) => &event.project,
@@ -703,6 +733,48 @@ impl RuntimeEvent {
             }),
             RuntimeEvent::TerminalRecoveryAttempted(event) => Some(RuntimeEntityRef::Run {
                 run_id: event.run_id.clone(),
+            }),
+            // F65 PR-1: orchestrator session redesign foundation.
+            // Session-lifecycle + orchestrator-level events (attempt
+            // start/complete, outcome, decision, summarizer fallback,
+            // workspace-backend degraded) resolve back to the session.
+            // Breaker / budget trips drill down to the active run so
+            // operator attention lands on the specific failing run,
+            // while the checkpoint variant points at the checkpoint
+            // it just persisted. Workspace-snapshot events have no
+            // matching `RuntimeEntityRef` variant yet (extension deferred
+            // to PR-2 with the projection).
+            RuntimeEvent::SessionAttemptStarted(event) => Some(RuntimeEntityRef::Session {
+                session_id: event.session_id.clone(),
+            }),
+            RuntimeEvent::SessionAttemptCompleted(event) => Some(RuntimeEntityRef::Session {
+                session_id: event.session_id.clone(),
+            }),
+            RuntimeEvent::CircuitBreakerTripped(event) => Some(RuntimeEntityRef::Run {
+                run_id: event.run_id.clone(),
+            }),
+            RuntimeEvent::BudgetThresholdCrossed(event) => Some(RuntimeEntityRef::Run {
+                run_id: event.run_id.clone(),
+            }),
+            RuntimeEvent::CheckpointPersisted(event) => Some(RuntimeEntityRef::Checkpoint {
+                checkpoint_id: event.checkpoint_id.clone(),
+            }),
+            // Workspace snapshot events: no current RuntimeEntityRef variant
+            // covers snapshots. Extending the enum is deferred to PR-2 when
+            // the projection lands and operator drill-down requires it.
+            RuntimeEvent::WorkspaceSnapshotCreated(_) => None,
+            RuntimeEvent::WorkspaceSnapshotReaped(_) => None,
+            RuntimeEvent::SessionOutcomeEmitted(event) => Some(RuntimeEntityRef::Session {
+                session_id: event.session_id.clone(),
+            }),
+            RuntimeEvent::OrchestratorDecisionMade(event) => Some(RuntimeEntityRef::Session {
+                session_id: event.session_id.clone(),
+            }),
+            RuntimeEvent::SummarizerFallback(event) => Some(RuntimeEntityRef::Session {
+                session_id: event.session_id.clone(),
+            }),
+            RuntimeEvent::WorkspaceBackendDegraded(event) => Some(RuntimeEntityRef::Session {
+                session_id: event.session_id.clone(),
             }),
         }
     }
@@ -2589,6 +2661,180 @@ pub struct TerminalRecoveryAttempted {
     /// Wall-clock ms when the loop finished. Lets operator dashboards
     /// plot recovery incidents over time.
     pub occurred_at_ms: u64,
+}
+
+// ── F65: orchestrator session redesign (PR-1 foundation) ─────────────────────
+//
+// These event variants persist the observable milestones of an orchestrated
+// session. PR-1 adds the shapes only; PR-2 begins wiring projection writers,
+// PR-3 emits them from the circuit breaker path, PR-6 wires the summarizer.
+//
+// Every struct is `#[derive(..., Serialize, Deserialize)]` to match the
+// existing convention. New fields here (and on existing extended shapes)
+// carry `#[serde(default)]` so legacy event logs continue to replay cleanly.
+
+/// F65: a new session attempt started.
+///
+/// Emitted each time the orchestrator begins executing a session — on
+/// initial start and on every retry up to `max_attempts`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttemptStarted {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    pub root_run_id: crate::ids::RunId,
+    /// 1-based attempt number within the session.
+    pub attempt_number: u32,
+    /// Configured max attempts at the time this attempt started. Captured on
+    /// each attempt so log replay is resilient to later config changes.
+    pub max_attempts: u32,
+    pub at_ms: u64,
+}
+
+/// F65: a session attempt finished (terminal or retrying).
+///
+/// `outcome_kind` mirrors the `TerminationReason` discriminator as a string so
+/// the event log remains stable even if the enum grows; the rich outcome is
+/// emitted via [`SessionOutcomeEmitted`] when the entire session closes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionAttemptCompleted {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    pub root_run_id: crate::ids::RunId,
+    /// Machine-readable discriminator of the [`crate::session_orchestration::TerminationReason`].
+    /// Example values: `complete_run`, `circuit_breaker_tripped`, `lease_lost`,
+    /// `provider_error`, `operator_cancel`, `crashed`.
+    pub outcome_kind: String,
+    pub at_ms: u64,
+}
+
+/// F65: a circuit breaker fired.
+///
+/// May or may not cause the session attempt to terminate — the orchestrator
+/// decides based on the breaker kind and session policy. When it does, the
+/// trip also appears inside [`SessionOutcomeEmitted`] via `TerminationReason`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CircuitBreakerTripped {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    pub run_id: crate::ids::RunId,
+    pub trip: crate::session_orchestration::CircuitBreakerTrip,
+    pub at_ms: u64,
+}
+
+/// F65: operator-warning-level budget notification.
+///
+/// Emitted before a breaker actually trips when a configurable warning
+/// threshold is crossed (e.g. 80 % of the token cap). Non-terminal: the
+/// session continues to run. PR-3 wires the emission; PR-1 defines the shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetThresholdCrossed {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    pub run_id: crate::ids::RunId,
+    /// Which breaker the threshold relates to (see [`crate::session_orchestration::BreakerKind`]).
+    pub which_breaker: crate::session_orchestration::BreakerKind,
+    pub measured: u64,
+    pub limit: u64,
+    /// Fraction of the limit that was measured, expressed in **basis points**
+    /// (0-10_000 spans 0 %–100 %). Integer storage keeps the event `Eq`-able
+    /// and avoids NaN-flavoured equality issues on replay.
+    pub ratio_bps: u32,
+    pub at_ms: u64,
+}
+
+/// F65: a checkpoint was persisted by the orchestrator.
+///
+/// The body of the checkpoint lives outside the event payload (in the
+/// checkpoint projection); the event carries only identity + iteration so
+/// consumers can correlate without loading large blobs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointPersisted {
+    pub project: crate::tenancy::ProjectKey,
+    pub checkpoint_id: crate::ids::CheckpointId,
+    pub session_id: crate::ids::SessionId,
+    pub root_run_id: crate::ids::RunId,
+    pub iteration: u32,
+    pub at_ms: u64,
+}
+
+/// F65: a workspace filesystem snapshot was created.
+///
+/// The event intentionally does **not** carry `snapshot_path` — that is host-
+/// local filesystem detail that belongs to the workspace projection, not the
+/// portable event log. Readers who need the path resolve it via
+/// [`crate::session_orchestration::WorkspaceSnapshot`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSnapshotCreated {
+    pub project: crate::tenancy::ProjectKey,
+    pub snapshot_id: crate::ids::WorkspaceSnapshotId,
+    pub workspace_id: crate::ids::WorkspaceId,
+    pub session_id: crate::ids::SessionId,
+    pub at_ms: u64,
+}
+
+/// F65: a workspace snapshot was reaped by the GC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSnapshotReaped {
+    pub project: crate::tenancy::ProjectKey,
+    pub snapshot_id: crate::ids::WorkspaceSnapshotId,
+    pub at_ms: u64,
+}
+
+/// F65: the session's rich terminal outcome was emitted.
+///
+/// One per session (not per attempt). Downstream consumers (summarizer chain,
+/// operator UI, next-session seeder) read this off the event log without
+/// coordinating with in-flight services.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOutcomeEmitted {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    pub root_run_id: crate::ids::RunId,
+    pub outcome: crate::session_orchestration::SessionOutcome,
+    pub at_ms: u64,
+}
+
+/// F65: the orchestrator made a high-level control-plane decision.
+///
+/// Used to record the "should I retry, checkpoint, stop?" signal the
+/// orchestrator emits at end-of-attempt, separate from the attempt's
+/// termination reason. `decision` is a short string tag (`retry`, `stop`,
+/// `checkpoint_only`, `escalate`) to keep the payload shape stable across
+/// future policy changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestratorDecisionMade {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    pub decision: String,
+    pub at_ms: u64,
+}
+
+/// F65: the LLM-backed summarizer was unavailable at outcome time and the
+/// orchestrator fell back to a deterministic summary. Surfaced to operators
+/// so the provenance of `compacted_summary` is auditable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummarizerFallback {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    /// Short machine-readable reason code (e.g. `provider_unavailable`,
+    /// `budget_exceeded`, `configuration_missing`).
+    pub reason: String,
+    pub at_ms: u64,
+}
+
+/// F65: the workspace backend picked a degraded mode (e.g. ext4 copy fallback
+/// when overlayfs + reflink were unavailable) for the session's snapshots.
+/// Operator-visible so capacity and performance regressions are explainable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBackendDegraded {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    /// Backend selected after degradation (e.g. `ext4_copy`).
+    pub backend: String,
+    /// Reason for the downgrade (e.g. `overlayfs_unavailable`,
+    /// `reflink_unsupported_fs`).
+    pub reason: String,
+    pub at_ms: u64,
 }
 
 #[cfg(test)]

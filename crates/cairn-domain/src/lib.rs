@@ -36,6 +36,7 @@ pub mod research;
 pub mod resource_sharing;
 pub mod scheduled_task;
 pub mod selectors;
+pub mod session_orchestration;
 pub mod signal;
 pub mod skills;
 pub mod sla;
@@ -78,6 +79,10 @@ pub use research::*;
 pub use resource_sharing::*;
 pub use scheduled_task::*;
 pub use selectors::*;
+pub use session_orchestration::{
+    BreakerKind, Checkpoint, CircuitBreakerTrip, IssueBudget, SessionOutcome, TerminationReason,
+    WorkspaceSnapshot,
+};
 pub use signal::*;
 pub use skills::*;
 pub use sla::*;

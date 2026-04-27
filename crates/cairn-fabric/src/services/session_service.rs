@@ -133,6 +133,14 @@ impl FabricSessionService {
             version: 0,
             created_at: now_ms,
             updated_at: now_ms,
+            // F65 PR-1: additive fields on SessionRecord. PR-2 wires
+            // operator-supplied goal / budget / attempt-cap plumbing; until
+            // then fresh sessions get the same defaults serde would apply
+            // on legacy-shape replay.
+            goal_title: None,
+            issue_budget: None,
+            max_attempts: cairn_store::projections::session::DEFAULT_MAX_ATTEMPTS,
+            attempts_used: 0,
         })
     }
 
@@ -256,6 +264,14 @@ fn build_session_record(
         version: snapshot.graph_revision,
         created_at: snapshot.created_at.0 as u64,
         updated_at: snapshot.last_mutation_at.0 as u64,
+        // F65 PR-1: FF snapshots have no goal / budget / attempt state yet.
+        // PR-2 will read these from FF flow tags (once the orchestrator
+        // writes them); until then mirror the defaults applied on replay
+        // so the fabric read-through matches the in-memory projection.
+        goal_title: None,
+        issue_budget: None,
+        max_attempts: cairn_store::projections::session::DEFAULT_MAX_ATTEMPTS,
+        attempts_used: 0,
     }
 }
 

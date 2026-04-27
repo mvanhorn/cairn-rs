@@ -484,7 +484,21 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::RunCompletionAnnotated(_)
             // F64: terminal-write recovery annotation is stored on the
             // cairn-store projection, not the graph. No edges to add.
-            | RuntimeEvent::TerminalRecoveryAttempted(_) => {}
+            | RuntimeEvent::TerminalRecoveryAttempted(_)
+            // F65 PR-1: orchestrator session redesign events. PR-1 ships
+            // types + variants only; graph edges for sessions → checkpoints
+            // → snapshots land in PR-2 alongside projection writers.
+            | RuntimeEvent::SessionAttemptStarted(_)
+            | RuntimeEvent::SessionAttemptCompleted(_)
+            | RuntimeEvent::CircuitBreakerTripped(_)
+            | RuntimeEvent::BudgetThresholdCrossed(_)
+            | RuntimeEvent::CheckpointPersisted(_)
+            | RuntimeEvent::WorkspaceSnapshotCreated(_)
+            | RuntimeEvent::WorkspaceSnapshotReaped(_)
+            | RuntimeEvent::SessionOutcomeEmitted(_)
+            | RuntimeEvent::OrchestratorDecisionMade(_)
+            | RuntimeEvent::SummarizerFallback(_)
+            | RuntimeEvent::WorkspaceBackendDegraded(_) => {}
 
             RuntimeEvent::EvalRunStarted(e) => {
                 self.add_node(

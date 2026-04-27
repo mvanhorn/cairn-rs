@@ -1042,6 +1042,18 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::RunCompletionAnnotated(_) => "run_completion_annotated",
         // F64: terminal-write recovery loop outcome (FF#371 bridge).
         RuntimeEvent::TerminalRecoveryAttempted(_) => "terminal_recovery_attempted",
+        // F65 PR-1: orchestrator session redesign foundation.
+        RuntimeEvent::SessionAttemptStarted(_) => "session_attempt_started",
+        RuntimeEvent::SessionAttemptCompleted(_) => "session_attempt_completed",
+        RuntimeEvent::CircuitBreakerTripped(_) => "circuit_breaker_tripped",
+        RuntimeEvent::BudgetThresholdCrossed(_) => "budget_threshold_crossed",
+        RuntimeEvent::CheckpointPersisted(_) => "checkpoint_persisted",
+        RuntimeEvent::WorkspaceSnapshotCreated(_) => "workspace_snapshot_created",
+        RuntimeEvent::WorkspaceSnapshotReaped(_) => "workspace_snapshot_reaped",
+        RuntimeEvent::SessionOutcomeEmitted(_) => "session_outcome_emitted",
+        RuntimeEvent::OrchestratorDecisionMade(_) => "orchestrator_decision_made",
+        RuntimeEvent::SummarizerFallback(_) => "summarizer_fallback",
+        RuntimeEvent::WorkspaceBackendDegraded(_) => "workspace_backend_degraded",
     }
 }
 
@@ -1628,7 +1640,78 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
                 e.wall_time_ms,
             )
         }
+        // F65 PR-1: orchestrator session redesign breadcrumbs.
+        RuntimeEvent::SessionAttemptStarted(e) => format!(
+            "Session {} attempt {}/{} started",
+            e.session_id, e.attempt_number, e.max_attempts
+        ),
+        RuntimeEvent::SessionAttemptCompleted(e) => format!(
+            "Session {} attempt completed ({})",
+            e.session_id,
+            sanitize_for_event_message(&e.outcome_kind),
+        ),
+        RuntimeEvent::CircuitBreakerTripped(e) => format!(
+            "Circuit breaker {} tripped on run {} (measured {}, limit {})",
+            // Use the serde snake_case rendering (matches the enum
+            // discriminator operators see in the event stream) rather
+            // than Debug's PascalCase for consistency with other
+            // messages in this module.
+            sanitize_for_event_message(&breaker_kind_label(e.trip.which)),
+            e.run_id,
+            e.trip.measured,
+            e.trip.limit
+        ),
+        RuntimeEvent::BudgetThresholdCrossed(e) => format!(
+            "Budget threshold crossed on run {}: {} at {} / {}",
+            e.run_id,
+            sanitize_for_event_message(&breaker_kind_label(e.which_breaker)),
+            e.measured,
+            e.limit
+        ),
+        RuntimeEvent::CheckpointPersisted(e) => format!(
+            "Checkpoint {} persisted for session {} iteration {}",
+            e.checkpoint_id, e.session_id, e.iteration
+        ),
+        RuntimeEvent::WorkspaceSnapshotCreated(e) => format!(
+            "Workspace snapshot {} created for workspace {}",
+            e.snapshot_id, e.workspace_id
+        ),
+        RuntimeEvent::WorkspaceSnapshotReaped(e) => {
+            format!("Workspace snapshot {} reaped", e.snapshot_id)
+        }
+        RuntimeEvent::SessionOutcomeEmitted(e) => {
+            format!("Session {} outcome emitted", e.session_id)
+        }
+        RuntimeEvent::OrchestratorDecisionMade(e) => format!(
+            "Orchestrator decision {} for session {}",
+            sanitize_for_event_message(&e.decision),
+            e.session_id
+        ),
+        RuntimeEvent::SummarizerFallback(e) => format!(
+            "Summarizer fallback ({}) for session {}",
+            sanitize_for_event_message(&e.reason),
+            e.session_id
+        ),
+        RuntimeEvent::WorkspaceBackendDegraded(e) => format!(
+            "Workspace backend degraded to {} for session {} ({})",
+            sanitize_for_event_message(&e.backend),
+            e.session_id,
+            sanitize_for_event_message(&e.reason)
+        ),
     }
+}
+
+/// F65: render a [`cairn_domain::BreakerKind`] as its `serde` snake_case
+/// label so event-message text matches the over-the-wire discriminator
+/// operators see on the event stream.
+fn breaker_kind_label(kind: cairn_domain::BreakerKind) -> String {
+    match kind {
+        cairn_domain::BreakerKind::Round => "round",
+        cairn_domain::BreakerKind::Tokens => "tokens",
+        cairn_domain::BreakerKind::NoToolUseConsecutive => "no_tool_use_consecutive",
+        cairn_domain::BreakerKind::WallClock => "wall_clock",
+    }
+    .to_owned()
 }
 
 /// Sanitize a user / operator-provided string before embedding it into a
@@ -1857,6 +1940,340 @@ mod tests {
         // Sentinel: none of these fall through to "unknown".
         for ev in [&proposed, &approved, &rejected, &revision, &injected] {
             assert_ne!(event_message(ev), "unknown");
+        }
+    }
+
+    /// F65 PR-1: event-message mappings for the new session-orchestration
+    /// variants. Covers snake_case rendering of `BreakerKind` and basic
+    /// non-empty formatting so we do not silently fall back to `"unknown"`.
+    #[test]
+    fn f65_event_messages_render_in_snake_case() {
+        use cairn_domain::events::{
+            BudgetThresholdCrossed, CheckpointPersisted, CircuitBreakerTripped,
+            OrchestratorDecisionMade, SessionAttemptCompleted, SessionAttemptStarted,
+            SessionOutcomeEmitted, SummarizerFallback, WorkspaceBackendDegraded,
+            WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
+        };
+        use cairn_domain::session_orchestration::{
+            BreakerKind, CircuitBreakerTrip, SessionOutcome, TerminationReason,
+        };
+        use cairn_domain::{CheckpointId, RunId, SessionId, WorkspaceId, WorkspaceSnapshotId};
+
+        let project = project_key();
+        let session_id = SessionId::new("s_msg");
+        let run_id = RunId::new("r_msg");
+        let ws = WorkspaceId::new("w_msg");
+
+        let started = RuntimeEvent::SessionAttemptStarted(SessionAttemptStarted {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            root_run_id: run_id.clone(),
+            attempt_number: 2,
+            max_attempts: 5,
+            at_ms: 0,
+        });
+        assert_eq!(event_message(&started), "Session s_msg attempt 2/5 started");
+
+        let completed = RuntimeEvent::SessionAttemptCompleted(SessionAttemptCompleted {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            root_run_id: run_id.clone(),
+            outcome_kind: "complete_run".to_owned(),
+            at_ms: 0,
+        });
+        assert_eq!(
+            event_message(&completed),
+            "Session s_msg attempt completed (complete_run)"
+        );
+
+        // BreakerKind renders as its serde snake_case label, not PascalCase.
+        let tripped = RuntimeEvent::CircuitBreakerTripped(CircuitBreakerTripped {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            trip: CircuitBreakerTrip {
+                which: BreakerKind::NoToolUseConsecutive,
+                measured: 10,
+                limit: 5,
+                at_iteration: 9,
+            },
+            at_ms: 0,
+        });
+        let tripped_msg = event_message(&tripped);
+        assert!(
+            tripped_msg.contains("no_tool_use_consecutive"),
+            "expected snake_case label, got {tripped_msg}"
+        );
+        assert!(
+            !tripped_msg.contains("NoToolUseConsecutive"),
+            "unexpected PascalCase label in {tripped_msg}"
+        );
+
+        let budget = RuntimeEvent::BudgetThresholdCrossed(BudgetThresholdCrossed {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            which_breaker: BreakerKind::Tokens,
+            measured: 80_000,
+            limit: 100_000,
+            ratio_bps: 8_000,
+            at_ms: 0,
+        });
+        let budget_msg = event_message(&budget);
+        assert!(budget_msg.contains("tokens"), "got {budget_msg}");
+        assert!(!budget_msg.contains("Tokens"), "got {budget_msg}");
+
+        let ckpt = RuntimeEvent::CheckpointPersisted(CheckpointPersisted {
+            project: project.clone(),
+            checkpoint_id: CheckpointId::new("ckpt_msg"),
+            session_id: session_id.clone(),
+            root_run_id: run_id.clone(),
+            iteration: 4,
+            at_ms: 0,
+        });
+        assert_eq!(
+            event_message(&ckpt),
+            "Checkpoint ckpt_msg persisted for session s_msg iteration 4"
+        );
+
+        let snap_created = RuntimeEvent::WorkspaceSnapshotCreated(WorkspaceSnapshotCreated {
+            project: project.clone(),
+            snapshot_id: WorkspaceSnapshotId::new("snap_msg"),
+            workspace_id: ws.clone(),
+            session_id: session_id.clone(),
+            at_ms: 0,
+        });
+        assert_eq!(
+            event_message(&snap_created),
+            "Workspace snapshot snap_msg created for workspace w_msg"
+        );
+
+        let snap_reaped = RuntimeEvent::WorkspaceSnapshotReaped(WorkspaceSnapshotReaped {
+            project: project.clone(),
+            snapshot_id: WorkspaceSnapshotId::new("snap_msg"),
+            at_ms: 0,
+        });
+        assert_eq!(
+            event_message(&snap_reaped),
+            "Workspace snapshot snap_msg reaped"
+        );
+
+        let outcome = RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            root_run_id: run_id.clone(),
+            outcome: SessionOutcome {
+                session_id: session_id.clone(),
+                root_run_id: run_id.clone(),
+                project: project.clone(),
+                checkpoint_id: CheckpointId::new("ckpt_msg"),
+                workspace_snapshot_id: None,
+                termination_reason: TerminationReason::CompleteRun,
+                compacted_summary: String::new(),
+                next_step_hint: None,
+                cost_micros: 0,
+                emitted_at: 0,
+            },
+            at_ms: 0,
+        });
+        assert_eq!(event_message(&outcome), "Session s_msg outcome emitted");
+
+        // Injection defense: reason/decision/backend/ CR-LF neutralized.
+        let decision = RuntimeEvent::OrchestratorDecisionMade(OrchestratorDecisionMade {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            decision: "retry\nFAKE".to_owned(),
+            at_ms: 0,
+        });
+        assert!(!event_message(&decision).contains('\n'));
+
+        let fallback = RuntimeEvent::SummarizerFallback(SummarizerFallback {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            reason: "provider_unavailable\rEVIL".to_owned(),
+            at_ms: 0,
+        });
+        assert!(!event_message(&fallback).contains('\r'));
+
+        let degraded = RuntimeEvent::WorkspaceBackendDegraded(WorkspaceBackendDegraded {
+            project,
+            session_id,
+            backend: "ext4_copy\nBAD".to_owned(),
+            reason: "overlayfs_unavailable".to_owned(),
+            at_ms: 0,
+        });
+        let degraded_msg = event_message(&degraded);
+        assert!(!degraded_msg.contains('\n'));
+
+        // Sentinel: none of these fall through to "unknown".
+        for ev in [
+            &started,
+            &completed,
+            &tripped,
+            &budget,
+            &ckpt,
+            &snap_created,
+            &snap_reaped,
+            &outcome,
+            &decision,
+            &fallback,
+            &degraded,
+        ] {
+            assert_ne!(event_message(ev), "unknown");
+        }
+    }
+
+    /// F65 PR-1: event_type_name returns stable snake_case strings for
+    /// every new variant. Lets operator dashboards filter by event kind
+    /// without drift between the enum discriminator and the label.
+    #[test]
+    fn f65_event_type_names_stable_snake_case() {
+        use cairn_domain::events::{
+            BudgetThresholdCrossed, CheckpointPersisted, CircuitBreakerTripped,
+            OrchestratorDecisionMade, SessionAttemptCompleted, SessionAttemptStarted,
+            SessionOutcomeEmitted, SummarizerFallback, WorkspaceBackendDegraded,
+            WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
+        };
+        use cairn_domain::session_orchestration::{
+            BreakerKind, CircuitBreakerTrip, SessionOutcome, TerminationReason,
+        };
+        use cairn_domain::{CheckpointId, RunId, SessionId, WorkspaceId, WorkspaceSnapshotId};
+
+        let project = project_key();
+        let session_id = SessionId::new("s");
+        let run_id = RunId::new("r");
+
+        let pairs: [(RuntimeEvent, &str); 11] = [
+            (
+                RuntimeEvent::SessionAttemptStarted(SessionAttemptStarted {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    root_run_id: run_id.clone(),
+                    attempt_number: 1,
+                    max_attempts: 5,
+                    at_ms: 0,
+                }),
+                "session_attempt_started",
+            ),
+            (
+                RuntimeEvent::SessionAttemptCompleted(SessionAttemptCompleted {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    root_run_id: run_id.clone(),
+                    outcome_kind: "complete_run".to_owned(),
+                    at_ms: 0,
+                }),
+                "session_attempt_completed",
+            ),
+            (
+                RuntimeEvent::CircuitBreakerTripped(CircuitBreakerTripped {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    trip: CircuitBreakerTrip {
+                        which: BreakerKind::Round,
+                        measured: 1,
+                        limit: 1,
+                        at_iteration: 0,
+                    },
+                    at_ms: 0,
+                }),
+                "circuit_breaker_tripped",
+            ),
+            (
+                RuntimeEvent::BudgetThresholdCrossed(BudgetThresholdCrossed {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    which_breaker: BreakerKind::Tokens,
+                    measured: 0,
+                    limit: 0,
+                    ratio_bps: 0,
+                    at_ms: 0,
+                }),
+                "budget_threshold_crossed",
+            ),
+            (
+                RuntimeEvent::CheckpointPersisted(CheckpointPersisted {
+                    project: project.clone(),
+                    checkpoint_id: CheckpointId::new("ckpt"),
+                    session_id: session_id.clone(),
+                    root_run_id: run_id.clone(),
+                    iteration: 0,
+                    at_ms: 0,
+                }),
+                "checkpoint_persisted",
+            ),
+            (
+                RuntimeEvent::WorkspaceSnapshotCreated(WorkspaceSnapshotCreated {
+                    project: project.clone(),
+                    snapshot_id: WorkspaceSnapshotId::new("snap"),
+                    workspace_id: WorkspaceId::new("w"),
+                    session_id: session_id.clone(),
+                    at_ms: 0,
+                }),
+                "workspace_snapshot_created",
+            ),
+            (
+                RuntimeEvent::WorkspaceSnapshotReaped(WorkspaceSnapshotReaped {
+                    project: project.clone(),
+                    snapshot_id: WorkspaceSnapshotId::new("snap"),
+                    at_ms: 0,
+                }),
+                "workspace_snapshot_reaped",
+            ),
+            (
+                RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    root_run_id: run_id.clone(),
+                    outcome: SessionOutcome {
+                        session_id: session_id.clone(),
+                        root_run_id: run_id.clone(),
+                        project: project.clone(),
+                        checkpoint_id: CheckpointId::new("ckpt"),
+                        workspace_snapshot_id: None,
+                        termination_reason: TerminationReason::CompleteRun,
+                        compacted_summary: String::new(),
+                        next_step_hint: None,
+                        cost_micros: 0,
+                        emitted_at: 0,
+                    },
+                    at_ms: 0,
+                }),
+                "session_outcome_emitted",
+            ),
+            (
+                RuntimeEvent::OrchestratorDecisionMade(OrchestratorDecisionMade {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    decision: "retry".to_owned(),
+                    at_ms: 0,
+                }),
+                "orchestrator_decision_made",
+            ),
+            (
+                RuntimeEvent::SummarizerFallback(SummarizerFallback {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    reason: "x".to_owned(),
+                    at_ms: 0,
+                }),
+                "summarizer_fallback",
+            ),
+            (
+                RuntimeEvent::WorkspaceBackendDegraded(WorkspaceBackendDegraded {
+                    project,
+                    session_id,
+                    backend: "ext4".to_owned(),
+                    reason: "y".to_owned(),
+                    at_ms: 0,
+                }),
+                "workspace_backend_degraded",
+            ),
+        ];
+        for (ev, expected) in &pairs {
+            assert_eq!(event_type_name(ev), *expected, "{expected}");
         }
     }
 }

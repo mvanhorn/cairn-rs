@@ -1205,6 +1205,19 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
+            // F65 PR-1: orchestrator session redesign events. PR-1 ships
+            // types + variants only; projection writers land in PR-2.
+            RuntimeEvent::SessionAttemptStarted(_) => log_stub("SessionAttemptStarted"),
+            RuntimeEvent::SessionAttemptCompleted(_) => log_stub("SessionAttemptCompleted"),
+            RuntimeEvent::CircuitBreakerTripped(_) => log_stub("CircuitBreakerTripped"),
+            RuntimeEvent::BudgetThresholdCrossed(_) => log_stub("BudgetThresholdCrossed"),
+            RuntimeEvent::CheckpointPersisted(_) => log_stub("CheckpointPersisted"),
+            RuntimeEvent::WorkspaceSnapshotCreated(_) => log_stub("WorkspaceSnapshotCreated"),
+            RuntimeEvent::WorkspaceSnapshotReaped(_) => log_stub("WorkspaceSnapshotReaped"),
+            RuntimeEvent::SessionOutcomeEmitted(_) => log_stub("SessionOutcomeEmitted"),
+            RuntimeEvent::OrchestratorDecisionMade(_) => log_stub("OrchestratorDecisionMade"),
+            RuntimeEvent::SummarizerFallback(_) => log_stub("SummarizerFallback"),
+            RuntimeEvent::WorkspaceBackendDegraded(_) => log_stub("WorkspaceBackendDegraded"),
         }
 
         Ok(())

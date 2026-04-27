@@ -613,6 +613,55 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
             assert_ne!(proj.tenant_id.as_str(), "_system");
             assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
         }
+        // F65 PR-1: orchestrator session redesign foundation.
+        // Session-lifecycle events resolve back to the session.
+        RuntimeEvent::SessionAttemptStarted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::SessionAttemptCompleted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        // Breaker / budget events drill down to the active run.
+        RuntimeEvent::CircuitBreakerTripped(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
+        RuntimeEvent::BudgetThresholdCrossed(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
+        RuntimeEvent::CheckpointPersisted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Checkpoint { .. })));
+        }
+        // Workspace snapshots have no RuntimeEntityRef variant yet — the
+        // entity lands in PR-2 when the projection table is introduced.
+        RuntimeEvent::WorkspaceSnapshotCreated(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::WorkspaceSnapshotReaped(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::SessionOutcomeEmitted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::OrchestratorDecisionMade(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::SummarizerFallback(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::WorkspaceBackendDegraded(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
     }
 }
 
@@ -1751,6 +1800,104 @@ fn all_variants() -> Vec<RuntimeEvent> {
             outcome: "recovered".to_owned(),
             occurred_at_ms: ts,
         }),
+        // F65 PR-1: orchestrator session redesign foundation. One row per
+        // new RuntimeEvent variant so the exhaustiveness matrix stays
+        // tight against the enum.
+        RuntimeEvent::SessionAttemptStarted(cairn_domain::events::SessionAttemptStarted {
+            project: p(),
+            session_id: sess(),
+            root_run_id: run(),
+            attempt_number: 1,
+            max_attempts: 5,
+            at_ms: ts,
+        }),
+        RuntimeEvent::SessionAttemptCompleted(cairn_domain::events::SessionAttemptCompleted {
+            project: p(),
+            session_id: sess(),
+            root_run_id: run(),
+            outcome_kind: "complete_run".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::CircuitBreakerTripped(cairn_domain::events::CircuitBreakerTripped {
+            project: p(),
+            session_id: sess(),
+            run_id: run(),
+            trip: cairn_domain::session_orchestration::CircuitBreakerTrip {
+                which: cairn_domain::session_orchestration::BreakerKind::Round,
+                measured: 60,
+                limit: 50,
+                at_iteration: 59,
+            },
+            at_ms: ts,
+        }),
+        RuntimeEvent::BudgetThresholdCrossed(cairn_domain::events::BudgetThresholdCrossed {
+            project: p(),
+            session_id: sess(),
+            run_id: run(),
+            which_breaker: cairn_domain::session_orchestration::BreakerKind::Tokens,
+            measured: 80_000,
+            limit: 100_000,
+            ratio_bps: 8_000,
+            at_ms: ts,
+        }),
+        RuntimeEvent::CheckpointPersisted(cairn_domain::events::CheckpointPersisted {
+            project: p(),
+            checkpoint_id: cairn_domain::CheckpointId::new("ckpt_exh"),
+            session_id: sess(),
+            root_run_id: run(),
+            iteration: 3,
+            at_ms: ts,
+        }),
+        RuntimeEvent::WorkspaceSnapshotCreated(cairn_domain::events::WorkspaceSnapshotCreated {
+            project: p(),
+            snapshot_id: cairn_domain::WorkspaceSnapshotId::new("snap_exh"),
+            workspace_id: WorkspaceId::new("w_exh"),
+            session_id: sess(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::WorkspaceSnapshotReaped(cairn_domain::events::WorkspaceSnapshotReaped {
+            project: p(),
+            snapshot_id: cairn_domain::WorkspaceSnapshotId::new("snap_exh"),
+            at_ms: ts,
+        }),
+        RuntimeEvent::SessionOutcomeEmitted(cairn_domain::events::SessionOutcomeEmitted {
+            project: p(),
+            session_id: sess(),
+            root_run_id: run(),
+            outcome: cairn_domain::session_orchestration::SessionOutcome {
+                session_id: sess(),
+                root_run_id: run(),
+                project: p(),
+                checkpoint_id: cairn_domain::CheckpointId::new("ckpt_exh"),
+                workspace_snapshot_id: None,
+                termination_reason:
+                    cairn_domain::session_orchestration::TerminationReason::CompleteRun,
+                compacted_summary: String::new(),
+                next_step_hint: None,
+                cost_micros: 0,
+                emitted_at: ts,
+            },
+            at_ms: ts,
+        }),
+        RuntimeEvent::OrchestratorDecisionMade(cairn_domain::events::OrchestratorDecisionMade {
+            project: p(),
+            session_id: sess(),
+            decision: "retry".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::SummarizerFallback(cairn_domain::events::SummarizerFallback {
+            project: p(),
+            session_id: sess(),
+            reason: "provider_unavailable".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::WorkspaceBackendDegraded(cairn_domain::events::WorkspaceBackendDegraded {
+            project: p(),
+            session_id: sess(),
+            backend: "ext4_copy".to_owned(),
+            reason: "overlayfs_unavailable".to_owned(),
+            at_ms: ts,
+        }),
     ]
 }
 
@@ -1759,17 +1906,16 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 140 variants in the RuntimeEvent enum (130 baseline + RFC 020 Track 3:
-    // ToolInvocationCacheHit, ToolRecoveryPaused + RFC 020 decision-cache
-    // survival pair from PR #85: DecisionRecorded, DecisionCacheWarmup +
-    // RFC 020 Track 4: RecoverySummaryEmitted + issue #218: WorkspaceArchived +
-    // PR BP-1 tool-call approval foundation: ToolCallProposed,
-    // ToolCallApproved, ToolCallRejected, ToolCallAmended +
-    // F40: ProviderConnectionDeleted).
+    // 154 variants in the RuntimeEvent enum (143 baseline + F65 PR-1
+    // orchestrator session redesign foundation: SessionAttemptStarted,
+    // SessionAttemptCompleted, CircuitBreakerTripped, BudgetThresholdCrossed,
+    // CheckpointPersisted, WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
+    // SessionOutcomeEmitted, OrchestratorDecisionMade, SummarizerFallback,
+    // WorkspaceBackendDegraded — 11 new variants).
     assert_eq!(
         variants.len(),
-        143,
-        "all_variants() must construct exactly 143 RuntimeEvent instances"
+        154,
+        "all_variants() must construct exactly 154 RuntimeEvent instances"
     );
 }
 

@@ -1067,7 +1067,20 @@ impl PgSyncProjection {
             // RFC 005 approval policies — no durable table yet
             | RuntimeEvent::ApprovalPolicyCreated(_)
             // RFC 001 gradual rollout — state tracked via prompt_releases table
-            | RuntimeEvent::PromptRolloutStarted(_) => {}
+            | RuntimeEvent::PromptRolloutStarted(_)
+            // F65 PR-1: orchestrator session redesign events. PR-1 ships
+            // types + variants only; projection writers land in PR-2.
+            | RuntimeEvent::SessionAttemptStarted(_)
+            | RuntimeEvent::SessionAttemptCompleted(_)
+            | RuntimeEvent::CircuitBreakerTripped(_)
+            | RuntimeEvent::BudgetThresholdCrossed(_)
+            | RuntimeEvent::CheckpointPersisted(_)
+            | RuntimeEvent::WorkspaceSnapshotCreated(_)
+            | RuntimeEvent::WorkspaceSnapshotReaped(_)
+            | RuntimeEvent::SessionOutcomeEmitted(_)
+            | RuntimeEvent::OrchestratorDecisionMade(_)
+            | RuntimeEvent::SummarizerFallback(_)
+            | RuntimeEvent::WorkspaceBackendDegraded(_) => {}
             // F39: RFC 019 / RFC 020 decision-cache projection. The
             // in-memory cache is still rebuilt from the event log at boot
             // (see cairn-app warmup); these tables give operator tooling

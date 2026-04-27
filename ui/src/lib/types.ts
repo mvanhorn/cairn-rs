@@ -310,7 +310,75 @@ export interface WorkspaceRecord {
 /** Session lifecycle state — mirrors cairn_domain::SessionState */
 export type SessionState = "open" | "completed" | "failed" | "archived";
 
-/** GET /v1/sessions — array of SessionRecord */
+/**
+ * F65: per-session budget envelope. Every field is optional — null means
+ * "unlimited at this layer"; the orchestrator's circuit breaker (PR-3) falls
+ * back to per-run defaults when a field is absent.
+ */
+export interface IssueBudget {
+  max_tokens?: number | null;
+  /** Cap on total provider cost, in USD micros (1 USD = 1_000_000). */
+  max_cost_micros?: number | null;
+  max_wall_seconds?: number | null;
+}
+
+/** F65: kinds of circuit breakers enforced by the orchestrator in PR-3. */
+export type BreakerKind =
+  | "round"
+  | "tokens"
+  | "no_tool_use_consecutive"
+  | "wall_clock";
+
+/** F65: one circuit-breaker trip event. */
+export interface CircuitBreakerTrip {
+  which: BreakerKind;
+  measured: number;
+  limit: number;
+  /** 0-based iteration number at which the trip was observed. */
+  at_iteration: number;
+}
+
+/**
+ * F65: exhaustive classification of why a session attempt ended.
+ * `kind` is the serde-tag discriminator. Fields beyond `kind` are
+ * only present on the matching variant.
+ */
+export type TerminationReason =
+  | { kind: "complete_run" }
+  | ({ kind: "circuit_breaker_tripped" } & CircuitBreakerTrip)
+  | { kind: "lease_lost" }
+  | { kind: "provider_error"; message: string }
+  | { kind: "operator_cancel" }
+  | { kind: "crashed"; message: string };
+
+/**
+ * F65: rich terminal envelope emitted once per session when it closes.
+ * PR-1 defines the shape; PR-6 wires the LLM summarizer that populates
+ * `compacted_summary` and `next_step_hint`.
+ */
+export interface SessionOutcome {
+  session_id: string;
+  root_run_id: string;
+  project: ProjectKey;
+  checkpoint_id: string;
+  workspace_snapshot_id?: string | null;
+  termination_reason: TerminationReason;
+  /** JSON-encoded summary produced by the LLM summarizer in PR-6. */
+  compacted_summary: string;
+  next_step_hint?: string | null;
+  /** Total provider cost in USD micros (1 USD = 1_000_000). */
+  cost_micros: number;
+  /** Unix-epoch ms. */
+  emitted_at: number;
+}
+
+/**
+ * GET /v1/sessions — array of SessionRecord.
+ *
+ * F65 PR-1 adds `goal_title`, `issue_budget`, `max_attempts`, and
+ * `attempts_used`. All are additive and optional on responses from servers
+ * predating the PR (serde defaults apply on replay).
+ */
 export interface SessionRecord {
   session_id: string;
   project: ProjectKey;
@@ -318,6 +386,14 @@ export interface SessionRecord {
   version: number;
   created_at: number; // unix ms
   updated_at: number; // unix ms
+  /** F65: operator-visible short title describing the session's goal. */
+  goal_title?: string | null;
+  /** F65: per-session budget envelope. */
+  issue_budget?: IssueBudget | null;
+  /** F65: maximum session attempts. Defaults to 5 on legacy shapes. */
+  max_attempts?: number;
+  /** F65: count of attempts used so far within the session. */
+  attempts_used?: number;
 }
 
 // ── Runs ──────────────────────────────────────────────────────────────────────

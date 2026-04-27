@@ -91,6 +91,8 @@ define_id!(ToolInvocationId);
 define_id!(TriggerId);
 define_id!(WorkerId);
 define_id!(WorkspaceId);
+// F65: workspace-filesystem snapshots used by the orchestrator session redesign.
+define_id!(WorkspaceSnapshotId);
 
 #[cfg(test)]
 mod tests {

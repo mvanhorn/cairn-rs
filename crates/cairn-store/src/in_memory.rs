@@ -371,6 +371,13 @@ impl InMemoryStore {
                         version: 1,
                         created_at: now,
                         updated_at: now,
+                        // F65 PR-1: additive fields are populated by PR-2
+                        // projection writers. Initial in-memory rows get
+                        // the same defaults serde would apply on replay.
+                        goal_title: None,
+                        issue_budget: None,
+                        max_attempts: crate::projections::session::DEFAULT_MAX_ATTEMPTS,
+                        attempts_used: 0,
                     },
                 );
                 if is_fresh {
@@ -2099,6 +2106,19 @@ impl InMemoryStore {
                     rec.updated_at = now;
                 }
             }
+            // F65 PR-1: orchestrator session redesign events. PR-1 ships
+            // types + variants only; projection writers land in PR-2.
+            RuntimeEvent::SessionAttemptStarted(_)
+            | RuntimeEvent::SessionAttemptCompleted(_)
+            | RuntimeEvent::CircuitBreakerTripped(_)
+            | RuntimeEvent::BudgetThresholdCrossed(_)
+            | RuntimeEvent::CheckpointPersisted(_)
+            | RuntimeEvent::WorkspaceSnapshotCreated(_)
+            | RuntimeEvent::WorkspaceSnapshotReaped(_)
+            | RuntimeEvent::SessionOutcomeEmitted(_)
+            | RuntimeEvent::OrchestratorDecisionMade(_)
+            | RuntimeEvent::SummarizerFallback(_)
+            | RuntimeEvent::WorkspaceBackendDegraded(_) => {}
         }
     }
 }

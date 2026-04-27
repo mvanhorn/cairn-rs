@@ -829,6 +829,14 @@ impl SessionRow {
             version: self.version as u64,
             created_at: self.created_at as u64,
             updated_at: self.updated_at as u64,
+            // F65 PR-1: projection columns for goal_title / issue_budget /
+            // max_attempts / attempts_used land in PR-2. Until then this
+            // adapter returns defaults so existing rows continue to project
+            // cleanly.
+            goal_title: None,
+            issue_budget: None,
+            max_attempts: crate::projections::session::DEFAULT_MAX_ATTEMPTS,
+            attempts_used: 0,
         })
     }
 }

@@ -49,14 +49,84 @@ pub const OPENAPI_JSON: &str = r##"{
       },
       "SessionRecord": {
         "type": "object",
+        "description": "Current-state projection of a session. F65 PR-1 adds `goal_title`, `issue_budget`, `max_attempts`, and `attempts_used`; all are additive and carry serde defaults so legacy event logs deserialize cleanly.",
         "properties": {
           "session_id":  { "type": "string" },
           "project":     { "$ref": "#/components/schemas/ProjectKey" },
           "state":       { "type": "string", "enum": ["open","completed","failed","archived"] },
           "version":     { "type": "integer" },
           "created_at":  { "type": "integer", "description": "Unix ms" },
-          "updated_at":  { "type": "integer" }
+          "updated_at":  { "type": "integer" },
+          "goal_title":     { "type": "string", "nullable": true, "description": "F65: operator-visible short title describing the session's goal. Empty on legacy-shape replay." },
+          "issue_budget":   { "$ref": "#/components/schemas/IssueBudget", "nullable": true, "description": "F65: per-session budget envelope. Null means no session-level override." },
+          "max_attempts":   { "type": "integer", "description": "F65: maximum session attempts. Defaults to 5 when absent on replay." },
+          "attempts_used":  { "type": "integer", "description": "F65: count of attempts used so far within the session." }
         }
+      },
+      "IssueBudget": {
+        "type": "object",
+        "description": "F65: per-session budget envelope. Every field is optional — `null` at any field means 'unlimited at this layer'; circuit-breaker enforcement (PR-3) falls back to per-run defaults when a field is absent.",
+        "properties": {
+          "max_tokens":       { "type": "integer", "nullable": true, "description": "Cap on total LLM tokens (input + output) spent across the session." },
+          "max_cost_micros":  { "type": "integer", "nullable": true, "description": "Cap on total provider cost, in USD micros (1 USD = 1_000_000). Integer-valued to match the codebase-wide cost convention." },
+          "max_wall_seconds": { "type": "integer", "nullable": true, "description": "Cap on wall-clock seconds elapsed from first attempt start to terminal outcome." }
+        }
+      },
+      "BreakerKind": {
+        "type": "string",
+        "description": "F65: kinds of circuit breakers enforced by the orchestrator in PR-3.",
+        "enum": ["round", "tokens", "no_tool_use_consecutive", "wall_clock"]
+      },
+      "CircuitBreakerTrip": {
+        "type": "object",
+        "description": "F65: one circuit-breaker trip event.",
+        "properties": {
+          "which":        { "$ref": "#/components/schemas/BreakerKind" },
+          "measured":     { "type": "integer", "description": "Measured value that crossed the limit." },
+          "limit":        { "type": "integer", "description": "Configured limit that was exceeded." },
+          "at_iteration": { "type": "integer", "description": "0-based iteration number at which the trip was observed." }
+        },
+        "required": ["which", "measured", "limit", "at_iteration"]
+      },
+      "TerminationReason": {
+        "type": "object",
+        "description": "F65: exhaustive classification of why a session attempt ended. `kind` is the discriminator; the payload fields depend on the kind.",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "complete_run",
+              "circuit_breaker_tripped",
+              "lease_lost",
+              "provider_error",
+              "operator_cancel",
+              "crashed"
+            ]
+          },
+          "which":        { "$ref": "#/components/schemas/BreakerKind", "description": "Present only when `kind == circuit_breaker_tripped`." },
+          "measured":     { "type": "integer", "description": "Present only when `kind == circuit_breaker_tripped`." },
+          "limit":        { "type": "integer", "description": "Present only when `kind == circuit_breaker_tripped`." },
+          "at_iteration": { "type": "integer", "description": "Present only when `kind == circuit_breaker_tripped`." },
+          "message":      { "type": "string", "description": "Present when `kind` is `provider_error` or `crashed`." }
+        },
+        "required": ["kind"]
+      },
+      "SessionOutcome": {
+        "type": "object",
+        "description": "F65: rich terminal envelope emitted once per session when it closes. PR-1 defines the shape; PR-6 wires the summarizer that populates `compacted_summary` and `next_step_hint`.",
+        "properties": {
+          "session_id":            { "type": "string" },
+          "root_run_id":           { "type": "string" },
+          "project":               { "$ref": "#/components/schemas/ProjectKey" },
+          "checkpoint_id":         { "type": "string" },
+          "workspace_snapshot_id": { "type": "string", "nullable": true, "description": "Workspace snapshot captured for this outcome. Null on ephemeral backends." },
+          "termination_reason":    { "$ref": "#/components/schemas/TerminationReason" },
+          "compacted_summary":     { "type": "string", "description": "JSON-encoded summary produced by the LLM summarizer in PR-6. Empty-string placeholder on pre-PR-6 outcomes." },
+          "next_step_hint":        { "type": "string", "nullable": true },
+          "cost_micros":           { "type": "integer", "description": "Total provider cost in USD micros (1 USD = 1_000_000)." },
+          "emitted_at":            { "type": "integer", "description": "Unix-epoch ms." }
+        },
+        "required": ["session_id", "root_run_id", "project", "checkpoint_id", "termination_reason", "compacted_summary", "cost_micros", "emitted_at"]
       },
       "RunRecord": {
         "type": "object",
