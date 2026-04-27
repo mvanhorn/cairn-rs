@@ -565,6 +565,41 @@ test.describe("13. Provider Performance", () => {
     await nav(page, "metrics");
     expect((await page.textContent("body"))!.length).toBeGreaterThan(20);
   });
+
+  // Invariant: browser anchor navigation does not attach the
+  // `Authorization: Bearer` header, so the Prometheus button must embed
+  // the stored token as a `?token=<encoded>` query-param. The auth
+  // middleware falls back to that query-param (same trick used by the SSE
+  // EventSource + useWebSocket). Regression for #256.
+  test("#256 Prometheus button embeds token query param and returns exposition text", async ({
+    page,
+    request,
+  }) => {
+    await signIn(page);
+    await nav(page, "metrics");
+
+    const prom = page.getByRole("link", { name: /Prometheus/i });
+    await expect(prom).toBeVisible({ timeout: 10_000 });
+
+    // The link must point at /v1/metrics/prometheus with a URL-encoded token.
+    const href = await prom.getAttribute("href");
+    expect(href).toBeTruthy();
+    expect(href!).toContain("/v1/metrics/prometheus");
+    expect(href!).toContain(`token=${encodeURIComponent(TOKEN)}`);
+    await expect(prom).toHaveAttribute("target", "_blank");
+
+    // Hitting that URL without any auth header must return 200 + Prometheus
+    // exposition (the `?token=` fallback stands in for the missing header).
+    const url = href!.startsWith("http") ? href! : `${BASE}${href}`;
+    const resp = await request.get(url);
+    expect(resp.status()).toBe(200);
+    const body = await resp.text();
+    // `cairn_http_requests_total` is the counter emitted by
+    // `metrics_prometheus_handler` in crates/cairn-app/src/bin_handlers.rs.
+    expect(body).toContain("cairn_http_requests_total");
+    const ct = resp.headers()["content-type"] ?? "";
+    expect(ct.toLowerCase()).toContain("text/plain");
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
