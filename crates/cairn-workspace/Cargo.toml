@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+tempfile = "3"
 
 [lints]
 workspace = true

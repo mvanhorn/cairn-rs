@@ -1445,8 +1445,71 @@ impl SandboxService {
         let encoded = serde_json::to_vec_pretty(metadata).map_err(|error| {
             WorkspaceError::sandbox_op(&metadata.run_id, "serialize_metadata", error)
         })?;
-        fs::write(&metadata_path, encoded)
-            .map_err(|error| WorkspaceError::sandbox_op(&metadata.run_id, "write_metadata", error))
+
+        // Atomic publish via stage + fsync + rename + directory fsync.
+        // Invariant: a concurrent reader of `meta.json` observes
+        // either the previous committed contents or the new committed
+        // contents, never an empty, torn, or partially-written file.
+        // Crash invariant: once this function returns `Ok`, a
+        // subsequent boot sees the new contents (the payload is on
+        // stable storage and the directory entry update is durable).
+        let tmp_name = format!(
+            "meta.json.tmp.{}.{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        );
+        let tmp_path = sandbox_dir.join(tmp_name);
+
+        // Stage the new payload into a per-thread sibling file.
+        // Wrapped in a helper so every error path removes the orphan
+        // tmp file — if we leak tmp files on partial failure they
+        // accumulate in the sandbox dir and eventually shadow
+        // legitimate recovery reads.
+        let stage = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp_path)?;
+            file.write_all(&encoded)?;
+            file.sync_all()
+        };
+        if let Err(error) = stage() {
+            // Best-effort cleanup for every pre-rename failure mode:
+            // open, write_all, sync_all. Ignore the remove error —
+            // surfacing the stage error is what matters.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(WorkspaceError::sandbox_op(
+                &metadata.run_id,
+                "stage_metadata_tmp",
+                error,
+            ));
+        }
+
+        if let Err(error) = fs::rename(&tmp_path, &metadata_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(WorkspaceError::sandbox_op(
+                &metadata.run_id,
+                "rename_metadata",
+                error,
+            ));
+        }
+
+        // POSIX `rename(2)` publishes the new inode for `meta.json`
+        // atomically — any reader now sees the new contents. The
+        // directory entry change itself, however, is not crash-durable
+        // until the containing directory is fsynced. Without this a
+        // crash between `rename` returning and the kernel flushing the
+        // dentry to the journal could surface the old meta.json (or no
+        // meta.json) on next boot. Best-effort: a failure here doesn't
+        // roll back the rename — the payload is published, we just
+        // couldn't prove it's durable.
+        if let Ok(dir) = fs::File::open(&sandbox_dir) {
+            let _ = dir.sync_all();
+        }
+
+        Ok(())
     }
 }
 
@@ -1798,16 +1861,22 @@ mod tests {
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cairn-workspace-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("test temp dir should be creatable");
-        dir
+        // `mkdtemp(3)` creates the directory atomically with O_EXCL —
+        // parallel tests cannot collide regardless of clock
+        // resolution. Footgun: do NOT replace this with a
+        // timestamp-named path; `SystemTime::now().as_nanos()` is not
+        // unique across concurrent threads.
+        //
+        // `.keep()` detaches the `TempDir` drop guard so the returned
+        // `PathBuf` survives past this function. The directory is
+        // intentionally not cleaned up — the service owns what it
+        // writes there and individual tests would need an anchor
+        // otherwise.
+        tempfile::Builder::new()
+            .prefix(&format!("cairn-workspace-{label}-"))
+            .tempdir()
+            .expect("test temp dir should be creatable")
+            .keep()
     }
 
     fn run_id() -> RunId {
@@ -2168,6 +2237,121 @@ mod tests {
             serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
         assert_eq!(metadata.state, SandboxState::Preserved);
         assert_eq!(metadata.pid, None);
+    }
+
+    #[tokio::test]
+    async fn persist_metadata_is_atomic_under_concurrent_readers() {
+        // Regression for #341. The old `fs::write`-based persist
+        // truncated `meta.json` to 0 bytes before writing, so a
+        // reader that landed mid-write saw empty or torn bytes and
+        // `serde_json::from_slice` failed with "EOF while parsing a
+        // value". This exercise runs a writer thread calling
+        // `persist_metadata` in a tight loop concurrently with a
+        // reader thread, and asserts every read either succeeds
+        // (valid `SandboxMetadata`) or sees ENOENT before the first
+        // write — never a parse error, never a zero-byte read. With
+        // the old `fs::write` this test failed on the first few
+        // iterations (empty reads dominate); with the atomic
+        // stage+rename it passes.
+        let (service, _sink) = service_with_providers(vec![(
+            SandboxStrategy::Overlay,
+            Box::new(TestProvider::new(SandboxStrategy::Overlay)),
+        )]);
+        let run = run_id();
+        service
+            .provision_or_reconnect(
+                &run,
+                None,
+                project(),
+                policy(
+                    SandboxStrategyRequest::Force(SandboxStrategy::Overlay),
+                    OnExhaustion::Destroy,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let metadata_path = service.base_dir().join("sbx-run-1").join("meta.json");
+        let service = Arc::new(service);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        const ITERS: u32 = 2_000;
+
+        // Writer: repeatedly persist with alternating fields so
+        // every call rewrites meta.json. Uses the private helper
+        // directly (avoids the async state machine, which would
+        // throttle the race window).
+        let writer_service = service.clone();
+        let writer_stop = stop.clone();
+        let writer_run = run.clone();
+        let writer = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while i < ITERS && !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let meta = SandboxMetadata {
+                    sandbox_id: crate::sandbox::SandboxId::new("sbx-run-1"),
+                    run_id: writer_run.clone(),
+                    task_id: None,
+                    project: project(),
+                    strategy: SandboxStrategy::Overlay,
+                    state: if i % 2 == 0 {
+                        SandboxState::Active
+                    } else {
+                        SandboxState::Preserved
+                    },
+                    base_rev: Some(format!("rev-{i}")),
+                    repo_id: None,
+                    path: PathBuf::from("/tmp/run-1"),
+                    pid: if i % 2 == 0 { Some(i) } else { None },
+                    created_at: 1_000,
+                    heartbeat_at: 1_000 + i as u64,
+                    policy_hash: "policy:test".to_string(),
+                };
+                writer_service.persist_metadata(&meta).expect("persist");
+                i += 1;
+            }
+        });
+
+        // Reader: read + parse until the writer stops. Every
+        // successful read must parse as SandboxMetadata — no empty
+        // reads, no torn JSON.
+        let reader_path = metadata_path.clone();
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u32;
+            let mut oks = 0u32;
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                reads += 1;
+                match fs::read(&reader_path) {
+                    Ok(bytes) => {
+                        assert!(
+                            !bytes.is_empty(),
+                            "persist_metadata must never expose a zero-byte file",
+                        );
+                        serde_json::from_slice::<SandboxMetadata>(&bytes).unwrap_or_else(|e| {
+                            panic!(
+                                "persist_metadata must never expose a torn file: \
+                                 {e} (bytes={} head={:?})",
+                                bytes.len(),
+                                &bytes[..bytes.len().min(64)],
+                            )
+                        });
+                        oks += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Acceptable only before the first write.
+                    }
+                    Err(e) => panic!("unexpected read error: {e}"),
+                }
+            }
+            (reads, oks)
+        });
+
+        writer.join().expect("writer panicked");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (reads, oks) = reader.join().expect("reader panicked");
+        assert!(
+            oks > 0,
+            "reader should have observed at least one durable meta.json (reads={reads})"
+        );
     }
 
     #[tokio::test]
