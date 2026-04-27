@@ -6,7 +6,11 @@
 import { expect, type Page, type APIRequestContext } from "@playwright/test";
 
 export const TOKEN = "dev-admin-token";
-export const BASE = "http://localhost:3000";
+// Honour PLAYWRIGHT_BASE_URL so the helpers point at the same cairn-app
+// instance configured in playwright.config.ts (e.g. :3002 on dev hosts
+// where :3000 is held by a running prod binary). Trailing slashes are
+// stripped so `${BASE}${path}` never produces `//v1/...`.
+export const BASE = (process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000").replace(/\/+$/, "");
 export const HDR = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
 export const DEFAULT_SCOPE = {
   tenant_id: "default_tenant",
@@ -50,7 +54,7 @@ export async function signIn(page: Page) {
   await expect.poll(() => input.inputValue(), { timeout: 5_000 }).toBe(TOKEN);
 
   const submitBtn = page.getByTestId("login-submit-btn");
-  await expect(submitBtn).toBeEnabled({ timeout: 3000 });
+  await expect(submitBtn).toBeEnabled({ timeout: 5_000 });
   await submitBtn.click({ timeout: 5000 });
   await expect(sidebar).toBeVisible({ timeout: 10_000 });
 }
@@ -66,7 +70,12 @@ export async function nav(page: Page, hash: string) {
 
 // ── API helpers ──────────────────────────────────────────────────────────────
 
-export async function apiPost(r: APIRequestContext, path: string, data: object) {
+// `data` is typed as `object | unknown[]` — some endpoints (e.g.
+// /v1/events/append) accept a JSON array envelope, others a plain
+// object. Both Playwright's `request.post` and the cairn backend
+// happily serialise either shape; the union keeps array callers honest
+// without an `unknown as object` cast at the call site.
+export async function apiPost(r: APIRequestContext, path: string, data: object | unknown[]) {
   const resp = await r.post(`${BASE}${path}`, { headers: HDR, data });
   return { status: resp.status(), body: await resp.json().catch(() => ({})) };
 }

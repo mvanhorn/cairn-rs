@@ -537,9 +537,10 @@ interface ActionBtnProps {
   label: string;
   variant?: "default" | "danger" | "primary";
   title?: string;
+  testId?: string;
 }
 
-function ActionBtn({ onClick, disabled, pending, icon, label, variant = "default", title }: ActionBtnProps) {
+function ActionBtn({ onClick, disabled, pending, icon, label, variant = "default", title, testId }: ActionBtnProps) {
   const base = "flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed";
   const variants = {
     default: "border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:text-gray-900 dark:hover:text-zinc-100 hover:border-zinc-500 bg-gray-50 dark:bg-zinc-900",
@@ -547,7 +548,14 @@ function ActionBtn({ onClick, disabled, pending, icon, label, variant = "default
     danger:  "border border-red-200 dark:border-red-800/60 text-red-600 dark:text-red-300 hover:text-red-700 dark:hover:text-red-200 bg-red-50 dark:bg-red-950/30",
   };
   return (
-    <button onClick={onClick} disabled={disabled || pending} title={title ?? label} className={clsx(base, variants[variant])}>
+    <button
+      onClick={onClick}
+      disabled={disabled || pending}
+      title={title ?? label}
+      className={clsx(base, variants[variant])}
+      data-testid={testId}
+      data-pending={pending ? "true" : undefined}
+    >
       {pending ? <Loader2 size={12} className="animate-spin" /> : icon}
       {label}
     </button>
@@ -853,6 +861,7 @@ function OperatorActions({ runId, run }: { runId: string; run?: RunRecord }) {
           disabled={isTerminal}
           pending={orchestrateMut.isPending}
           title={isTerminal ? stateGateTooltip("orchestrate", state) : "Drive the orchestration loop one step"}
+          testId="run-orchestrate-btn"
         />
         <ActionBtn
           icon={<Stethoscope size={12} />}
