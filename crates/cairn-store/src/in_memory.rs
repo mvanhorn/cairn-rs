@@ -153,6 +153,19 @@ struct State {
     /// `invocation_id` so replay + second-boot reads converge to the same
     /// set. Mirrors the pg/sqlite `tool_invocation_cache_hits` table.
     tool_invocation_cache_hits: HashMap<String, crate::projections::ToolInvocationCacheHitRecord>,
+    /// F65 PR-2: orchestrator-session outcomes, keyed by `root_run_id`
+    /// (the primary key of the pg/sqlite `session_outcomes` table).
+    session_outcomes: HashMap<String, crate::projections::SessionOutcomeRecord>,
+    /// F65 PR-2: workspace snapshot rows, keyed by `snapshot_id`.
+    workspace_snapshots: HashMap<String, crate::projections::WorkspaceSnapshotRecord>,
+    /// F65 PR-2: workspace registry (live overlayfs mount tracking),
+    /// keyed by `workspace_id`.
+    workspace_registry: HashMap<String, crate::projections::WorkspaceRegistryRecord>,
+    /// F65 PR-2: orchestrator-resumable checkpoint bodies, keyed by
+    /// `checkpoint_id`. Distinct from `checkpoints` above — that map
+    /// holds the RFC 005 per-run checkpoint metadata; this one holds the
+    /// F65 body + schema version + session lineage.
+    f65_checkpoints: HashMap<String, crate::projections::F65CheckpointRecord>,
 }
 
 pub struct InMemoryStore {
@@ -253,6 +266,10 @@ impl InMemoryStore {
                 resource_shares: HashMap::new(),
                 ff_lease_history_cursors: HashMap::new(),
                 tool_invocation_cache_hits: HashMap::new(),
+                session_outcomes: HashMap::new(),
+                workspace_snapshots: HashMap::new(),
+                workspace_registry: HashMap::new(),
+                f65_checkpoints: HashMap::new(),
                 tenants: HashMap::new(),
                 workspaces: HashMap::new(),
                 projects: HashMap::new(),
@@ -2106,19 +2123,160 @@ impl InMemoryStore {
                     rec.updated_at = now;
                 }
             }
-            // F65 PR-1: orchestrator session redesign events. PR-1 ships
-            // types + variants only; projection writers land in PR-2.
-            RuntimeEvent::SessionAttemptStarted(_)
-            | RuntimeEvent::SessionAttemptCompleted(_)
-            | RuntimeEvent::CircuitBreakerTripped(_)
-            | RuntimeEvent::BudgetThresholdCrossed(_)
-            | RuntimeEvent::CheckpointPersisted(_)
-            | RuntimeEvent::WorkspaceSnapshotCreated(_)
-            | RuntimeEvent::WorkspaceSnapshotReaped(_)
-            | RuntimeEvent::SessionOutcomeEmitted(_)
-            | RuntimeEvent::OrchestratorDecisionMade(_)
-            | RuntimeEvent::SummarizerFallback(_)
-            | RuntimeEvent::WorkspaceBackendDegraded(_) => {}
+            // ── F65 PR-2: orchestrator session redesign projections ────────
+            //
+            // Each event maps to a specific projection write. The pg/sqlite
+            // equivalents live in `pg/projections.rs` / `sqlite/projections.rs`
+            // and use the same idempotency contract: replaying the same
+            // event bumps `version` but leaves the operator-observable
+            // fields unchanged.
+            RuntimeEvent::SessionAttemptStarted(e) => {
+                // Bump attempts_used on the session row. Replay-safe: we
+                // only ever advance the counter to `attempt_number` rather
+                // than incrementing blindly — repeated delivery of the same
+                // event leaves the row idempotent.
+                if let Some(rec) = state.sessions.get_mut(e.session_id.as_str()) {
+                    if e.attempt_number > rec.attempts_used {
+                        rec.attempts_used = e.attempt_number;
+                    }
+                    // max_attempts carries the config captured at attempt
+                    // start. Keep the row in sync if the captured value is
+                    // higher (config bumped post-attempt) — but never lower,
+                    // since that would let a later event silently shrink
+                    // operator-visible capacity.
+                    if e.max_attempts > rec.max_attempts {
+                        rec.max_attempts = e.max_attempts;
+                    }
+                    rec.version += 1;
+                    rec.updated_at = now;
+                }
+            }
+            // Attempt-completed is observable via SessionOutcomeEmitted and
+            // the event log. No projection row to update beyond the event
+            // log itself; leaving the session row unchanged is intentional.
+            RuntimeEvent::SessionAttemptCompleted(_) => {}
+            // Breaker trips are forensic — recorded on the event log, and
+            // mirrored into the session outcome row when the trip
+            // terminates the attempt. No dedicated projection table.
+            RuntimeEvent::CircuitBreakerTripped(_) => {}
+            // Budget-threshold-crossed is purely observability (SSE) — no
+            // projection row.
+            RuntimeEvent::BudgetThresholdCrossed(_) => {}
+            RuntimeEvent::CheckpointPersisted(e) => {
+                // F65 projection row (orchestrator-resumable shape).
+                // Pg/sqlite use `ON CONFLICT DO UPDATE` that preserves the
+                // original `created_at` and only touches the F65-extended
+                // fields. In-memory matches: insert-once, overwrite only
+                // the session/schema/iteration fields on replay.
+                state
+                    .f65_checkpoints
+                    .entry(e.checkpoint_id.as_str().to_owned())
+                    .and_modify(|rec| {
+                        rec.session_id = e.session_id.clone();
+                        rec.schema_version = 1;
+                        rec.iteration = e.iteration;
+                    })
+                    .or_insert_with(|| crate::projections::F65CheckpointRecord {
+                        checkpoint_id: e.checkpoint_id.clone(),
+                        project: e.project.clone(),
+                        session_id: e.session_id.clone(),
+                        root_run_id: e.root_run_id.clone(),
+                        schema_version: 1,
+                        body: String::new(),
+                        body_size_bytes: 0,
+                        iteration: e.iteration,
+                        created_at: e.at_ms,
+                    });
+                // Shared RFC 005 checkpoint row. The pg/sqlite backends
+                // both write this row from the same event (see
+                // `pg/projections.rs` and `sqlite/projections.rs`) so the
+                // in-memory backend must match to keep
+                // `CheckpointReadModel::get` cross-backend consistent.
+                // `data = None` + `version = 1` mirrors the SQL path's
+                // INSERT with empty body + version 1. Disposition is
+                // Latest because F65 only persists the most-recent
+                // orchestrator-resumable state. Replay preserves the
+                // first-seen `created_at` — matching the pg path.
+                state
+                    .checkpoints
+                    .entry(e.checkpoint_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::CheckpointRecord {
+                        checkpoint_id: e.checkpoint_id.clone(),
+                        project: e.project.clone(),
+                        run_id: e.root_run_id.clone(),
+                        disposition: cairn_domain::CheckpointDisposition::Latest,
+                        data: None,
+                        version: 1,
+                        created_at: e.at_ms,
+                    });
+            }
+            RuntimeEvent::WorkspaceSnapshotCreated(e) => {
+                // SQL backends use `ON CONFLICT (snapshot_id) DO NOTHING`,
+                // so a replayed event must not overwrite the existing
+                // row (or its `created_at`). Use `entry().or_insert_with`
+                // for the same create-only semantics.
+                state
+                    .workspace_snapshots
+                    .entry(e.snapshot_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::WorkspaceSnapshotRecord {
+                        snapshot_id: e.snapshot_id.clone(),
+                        project: e.project.clone(),
+                        session_id: e.session_id.clone(),
+                        workspace_id: e.workspace_id.clone(),
+                        parent_snapshot_id: None,
+                        snapshot_path: String::new(),
+                        bytes: 0,
+                        reflink_used: false,
+                        created_at: e.at_ms,
+                        reaped_at: None,
+                    });
+            }
+            RuntimeEvent::WorkspaceSnapshotReaped(e) => {
+                if let Some(rec) = state.workspace_snapshots.get_mut(e.snapshot_id.as_str()) {
+                    rec.reaped_at = Some(e.at_ms);
+                }
+            }
+            RuntimeEvent::SessionOutcomeEmitted(e) => {
+                let outcome = &e.outcome;
+                // Pg/sqlite upsert preserves the original `created_at` and
+                // updates only the mutable fields (workspace_snapshot_id,
+                // termination_reason, compacted_summary, next_step_hint,
+                // cost_micros). Mirror that: insert with the event's
+                // `emitted_at` on first delivery, and only touch the
+                // enrichable fields on replay.
+                state
+                    .session_outcomes
+                    .entry(outcome.root_run_id.as_str().to_owned())
+                    .and_modify(|rec| {
+                        rec.workspace_snapshot_id = outcome.workspace_snapshot_id.clone();
+                        rec.termination_reason = outcome.termination_reason.clone();
+                        rec.compacted_summary = outcome.compacted_summary.clone();
+                        rec.next_step_hint = outcome.next_step_hint.clone();
+                        rec.cost_micros = outcome.cost_micros;
+                    })
+                    .or_insert_with(|| crate::projections::SessionOutcomeRecord {
+                        root_run_id: outcome.root_run_id.clone(),
+                        project: outcome.project.clone(),
+                        session_id: outcome.session_id.clone(),
+                        checkpoint_id: outcome.checkpoint_id.clone(),
+                        workspace_snapshot_id: outcome.workspace_snapshot_id.clone(),
+                        termination_reason: outcome.termination_reason.clone(),
+                        compacted_summary: outcome.compacted_summary.clone(),
+                        next_step_hint: outcome.next_step_hint.clone(),
+                        cost_micros: outcome.cost_micros,
+                        created_at: outcome.emitted_at,
+                    });
+            }
+            // Orchestrator decisions are operator observability surfaces
+            // (SSE + audit); no projection table.
+            RuntimeEvent::OrchestratorDecisionMade(_) => {}
+            // Summarizer fallback is audit-only (provenance of
+            // compacted_summary). The fact is captured on the event log;
+            // no projection row is needed.
+            RuntimeEvent::SummarizerFallback(_) => {}
+            // Workspace-backend-degraded fires at sandbox init time. No
+            // projection row — operator alerts via SSE + metrics (PR-4).
+            RuntimeEvent::WorkspaceBackendDegraded(_) => {}
         }
     }
 }
@@ -5011,6 +5169,159 @@ impl crate::projections::FfLeaseHistoryCursorStore for InMemoryStore {
             .ff_lease_history_cursors
             .remove(&(partition_id.to_owned(), execution_id.to_owned()));
         Ok(())
+    }
+}
+
+// ── F65 PR-2: orchestrator-session read models ────────────────────────────
+
+#[async_trait]
+impl crate::projections::SessionOutcomeReadModel for InMemoryStore {
+    async fn get_by_root_run(
+        &self,
+        root_run_id: &RunId,
+    ) -> Result<Option<crate::projections::SessionOutcomeRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.session_outcomes.get(root_run_id.as_str()).cloned())
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::SessionOutcomeRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::SessionOutcomeRecord> = state
+            .session_outcomes
+            .values()
+            .filter(|o| o.session_id == *session_id)
+            .cloned()
+            .collect();
+        // sort_by with a two-key comparator avoids the per-comparison
+        // String allocation that `sort_by_key` would require for
+        // tuples containing `String`.
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.root_run_id.as_str().cmp(b.root_run_id.as_str()))
+        });
+        Ok(results)
+    }
+}
+
+#[async_trait]
+impl crate::projections::WorkspaceSnapshotReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        snapshot_id: &WorkspaceSnapshotId,
+    ) -> Result<Option<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.workspace_snapshots.get(snapshot_id.as_str()).cloned())
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::WorkspaceSnapshotRecord> = state
+            .workspace_snapshots
+            .values()
+            .filter(|s| s.session_id == *session_id)
+            .cloned()
+            .collect();
+        // sort_by avoids the per-comparison String allocation that
+        // sort_by_key would need here. See the matching rationale on
+        // `SessionOutcomeReadModel::list_by_session` above.
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.snapshot_id.as_str().cmp(b.snapshot_id.as_str()))
+        });
+        Ok(results)
+    }
+
+    async fn lineage(
+        &self,
+        start: &WorkspaceSnapshotId,
+    ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut chain: Vec<crate::projections::WorkspaceSnapshotRecord> = Vec::new();
+        let mut cursor = Some(start.as_str().to_owned());
+        // Bound the walk to table size so a cycle in the lineage chain
+        // cannot spin forever. The pg FK on `parent_snapshot_id` makes
+        // cycles unreachable in practice, but the in-memory store has no
+        // such guardrail — be defensive.
+        let cap = state.workspace_snapshots.len() + 1;
+        for _ in 0..cap {
+            let Some(id) = cursor.take() else {
+                break;
+            };
+            let Some(rec) = state.workspace_snapshots.get(&id) else {
+                break;
+            };
+            chain.push(rec.clone());
+            cursor = rec
+                .parent_snapshot_id
+                .as_ref()
+                .map(|p| p.as_str().to_owned());
+        }
+        Ok(chain)
+    }
+}
+
+#[async_trait]
+impl crate::projections::WorkspaceRegistryReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.workspace_registry.get(workspace_id.as_str()).cloned())
+    }
+
+    async fn get_by_root_run(
+        &self,
+        root_run_id: &RunId,
+    ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .workspace_registry
+            .values()
+            .find(|w| w.root_run_id == *root_run_id)
+            .cloned())
+    }
+}
+
+#[async_trait]
+impl crate::projections::F65CheckpointReadModel for InMemoryStore {
+    async fn get_f65(
+        &self,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<Option<crate::projections::F65CheckpointRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.f65_checkpoints.get(checkpoint_id.as_str()).cloned())
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::F65CheckpointRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::F65CheckpointRecord> = state
+            .f65_checkpoints
+            .values()
+            .filter(|c| c.session_id == *session_id)
+            .cloned()
+            .collect();
+        // sort_by avoids allocating a String per comparison (same
+        // rationale as the matching SessionOutcomeReadModel /
+        // WorkspaceSnapshotReadModel impls above).
+        results.sort_by(|a, b| {
+            a.iteration
+                .cmp(&b.iteration)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.checkpoint_id.as_str().cmp(b.checkpoint_id.as_str()))
+        });
+        Ok(results)
     }
 }
 

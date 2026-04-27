@@ -485,9 +485,13 @@ impl<P: GraphProjection> EventProjector<P> {
             // F64: terminal-write recovery annotation is stored on the
             // cairn-store projection, not the graph. No edges to add.
             | RuntimeEvent::TerminalRecoveryAttempted(_)
-            // F65 PR-1: orchestrator session redesign events. PR-1 ships
-            // types + variants only; graph edges for sessions → checkpoints
-            // → snapshots land in PR-2 alongside projection writers.
+            // F65 PR-2: orchestrator session redesign events are persisted
+            // through the store projection layer (`cairn_store::session_outcome`,
+            // `workspace_snapshots`, `workspace_registry`, F65 checkpoint cols).
+            // They do not seed graph nodes or edges — the provenance graph
+            // models code/document lineage, not orchestration-state lifecycle.
+            // Later PRs (PR-6 summarizer → memory ingest) may surface outcome
+            // content as nodes; that wiring lives in cairn-memory, not here.
             | RuntimeEvent::SessionAttemptStarted(_)
             | RuntimeEvent::SessionAttemptCompleted(_)
             | RuntimeEvent::CircuitBreakerTripped(_)

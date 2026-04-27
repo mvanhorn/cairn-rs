@@ -1068,19 +1068,218 @@ impl PgSyncProjection {
             | RuntimeEvent::ApprovalPolicyCreated(_)
             // RFC 001 gradual rollout — state tracked via prompt_releases table
             | RuntimeEvent::PromptRolloutStarted(_)
-            // F65 PR-1: orchestrator session redesign events. PR-1 ships
-            // types + variants only; projection writers land in PR-2.
-            | RuntimeEvent::SessionAttemptStarted(_)
+            // F65 PR-2: events without a dedicated projection table.
+            // `SessionAttemptCompleted` is visible via the event log +
+            // the subsequent `SessionOutcomeEmitted` row; the breaker/
+            // threshold/decision/fallback/degraded events are operator
+            // observability surfaces (SSE + metrics) with no read-model.
             | RuntimeEvent::SessionAttemptCompleted(_)
             | RuntimeEvent::CircuitBreakerTripped(_)
             | RuntimeEvent::BudgetThresholdCrossed(_)
-            | RuntimeEvent::CheckpointPersisted(_)
-            | RuntimeEvent::WorkspaceSnapshotCreated(_)
-            | RuntimeEvent::WorkspaceSnapshotReaped(_)
-            | RuntimeEvent::SessionOutcomeEmitted(_)
             | RuntimeEvent::OrchestratorDecisionMade(_)
             | RuntimeEvent::SummarizerFallback(_)
             | RuntimeEvent::WorkspaceBackendDegraded(_) => {}
+
+            // F65 PR-2: bump attempts_used on the session row. Replay-safe
+            // via `GREATEST(...)` — we only ever advance the counter, so
+            // repeated delivery leaves the row idempotent. Missing row is
+            // silently ignored (follows the same contract as
+            // `RunCompletionAnnotated` above).
+            RuntimeEvent::SessionAttemptStarted(e) => {
+                let attempt = i32::try_from(e.attempt_number).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SessionAttemptStarted.attempt_number {} exceeds i32::MAX",
+                        e.attempt_number
+                    ))
+                })?;
+                let max_attempts = i32::try_from(e.max_attempts).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SessionAttemptStarted.max_attempts {} exceeds i32::MAX",
+                        e.max_attempts
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE sessions
+                        SET attempts_used = GREATEST(attempts_used, $1),
+                            max_attempts  = GREATEST(max_attempts, $2),
+                            version       = version + 1,
+                            updated_at    = $3
+                      WHERE session_id = $4",
+                )
+                .bind(attempt)
+                .bind(max_attempts)
+                .bind(now)
+                .bind(e.session_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+
+            // F65 PR-2: F65 checkpoint extension. Inserts a new checkpoints
+            // row keyed by checkpoint_id. `run_id` is the root-Run pointer
+            // (satisfies the RFC 005 FK on checkpoints.run_id) and the F65
+            // columns carry the orchestrator-resumable shape. Pre-F65
+            // rows continue to live alongside with NULL F65 columns. The
+            // `ON CONFLICT DO UPDATE` path keeps replay idempotent while
+            // preserving the original created_at.
+            RuntimeEvent::CheckpointPersisted(e) => {
+                let schema_version: i32 = 1;
+                let iteration = i32::try_from(e.iteration).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "CheckpointPersisted.iteration {} exceeds i32::MAX",
+                        e.iteration
+                    ))
+                })?;
+                let at_ms = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "CheckpointPersisted.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO checkpoints (
+                         checkpoint_id, tenant_id, workspace_id, project_id,
+                         run_id, disposition, version, created_at,
+                         session_id, schema_version, body, body_size_bytes, iteration
+                     )
+                     VALUES ($1, $2, $3, $4, $5, 'latest', 1, $6, $7, $8, '', 0, $9)
+                     ON CONFLICT (checkpoint_id) DO UPDATE SET
+                         session_id = EXCLUDED.session_id,
+                         schema_version = EXCLUDED.schema_version,
+                         iteration = EXCLUDED.iteration",
+                )
+                .bind(e.checkpoint_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.root_run_id.as_str())
+                .bind(at_ms)
+                .bind(e.session_id.as_str())
+                .bind(schema_version)
+                .bind(iteration)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+
+            // F65 PR-2: insert the snapshot row. `snapshot_path`, `bytes`,
+            // and `parent_snapshot_id` are left at empty-string / 0 / NULL
+            // on PR-2 — the sandbox runtime in PR-4/PR-5 fills them when
+            // it persists the actual reflink. `reflink_used` defaults to
+            // FALSE until PR-4 writes it through a dedicated service call.
+            RuntimeEvent::WorkspaceSnapshotCreated(e) => {
+                let at_ms = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "WorkspaceSnapshotCreated.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO workspace_snapshots (
+                         snapshot_id, tenant_id, workspace_scope, project_id,
+                         session_id, workspace_id, parent_snapshot_id,
+                         snapshot_path, bytes, reflink_used, created_at
+                     )
+                     VALUES ($1, $2, $3, $4, $5, $6, NULL, '', 0, FALSE, $7)
+                     ON CONFLICT (snapshot_id) DO NOTHING",
+                )
+                .bind(e.snapshot_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.session_id.as_str())
+                .bind(e.workspace_id.as_str())
+                .bind(at_ms)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+
+            // F65 PR-2: mark the snapshot reaped in-place. Replay is
+            // stable: setting `reaped_at` twice leaves it at the last
+            // delivered value (no earlier-wins semantics needed —
+            // reaping is terminal).
+            RuntimeEvent::WorkspaceSnapshotReaped(e) => {
+                let at_ms = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "WorkspaceSnapshotReaped.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE workspace_snapshots
+                        SET reaped_at = $1
+                      WHERE snapshot_id = $2",
+                )
+                .bind(at_ms)
+                .bind(e.snapshot_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+
+            // F65 PR-2: persist the rich outcome row. `workspace_snapshot_id`
+            // is nullable (arch doc §6.3 — legacy runs predating the sandbox).
+            // `compacted_summary` stays empty on pre-PR-6 outcomes; PR-6
+            // back-fills it when the summarizer ships. Idempotent on
+            // replay via `ON CONFLICT (root_run_id) DO UPDATE` — the later
+            // copy wins for the summarizer / next_step_hint columns
+            // (summarizer retry can enrich).
+            RuntimeEvent::SessionOutcomeEmitted(e) => {
+                let outcome = &e.outcome;
+                let termination_kind =
+                    crate::projections::termination_reason_kind(&outcome.termination_reason);
+                // Full payload as JSON-as-TEXT so readers can rehydrate
+                // the `ProviderError.message` / `CircuitBreakerTripped.trip`
+                // / `Crashed.message` fields without walking the event log.
+                let termination_reason_json = serde_json::to_string(&outcome.termination_reason)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let cost_micros = i64::try_from(outcome.cost_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SessionOutcome.cost_micros {} exceeds i64::MAX",
+                        outcome.cost_micros
+                    ))
+                })?;
+                let created_at = i64::try_from(outcome.emitted_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SessionOutcome.emitted_at {} exceeds i64::MAX",
+                        outcome.emitted_at
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO session_outcomes (
+                         root_run_id, tenant_id, workspace_scope, project_id,
+                         session_id, checkpoint_id, workspace_snapshot_id,
+                         termination_reason, termination_reason_json,
+                         compacted_summary, next_step_hint,
+                         cost_micros, created_at
+                     )
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     ON CONFLICT (root_run_id) DO UPDATE SET
+                         workspace_snapshot_id   = EXCLUDED.workspace_snapshot_id,
+                         termination_reason      = EXCLUDED.termination_reason,
+                         termination_reason_json = EXCLUDED.termination_reason_json,
+                         compacted_summary       = EXCLUDED.compacted_summary,
+                         next_step_hint          = EXCLUDED.next_step_hint,
+                         cost_micros             = EXCLUDED.cost_micros",
+                )
+                .bind(outcome.root_run_id.as_str())
+                .bind(outcome.project.tenant_id.as_str())
+                .bind(outcome.project.workspace_id.as_str())
+                .bind(outcome.project.project_id.as_str())
+                .bind(outcome.session_id.as_str())
+                .bind(outcome.checkpoint_id.as_str())
+                .bind(outcome.workspace_snapshot_id.as_ref().map(|id| id.as_str()))
+                .bind(termination_kind)
+                .bind(&termination_reason_json)
+                .bind(&outcome.compacted_summary)
+                .bind(outcome.next_step_hint.as_deref())
+                .bind(cost_micros)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // F39: RFC 019 / RFC 020 decision-cache projection. The
             // in-memory cache is still rebuilt from the event log at boot
             // (see cairn-app warmup); these tables give operator tooling

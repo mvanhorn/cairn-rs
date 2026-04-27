@@ -153,22 +153,134 @@ impl DbAdapter for SqliteAdapter {
             }
         }
 
+        // F65 PR-2: add the session-extension columns (goal / budget /
+        // attempt cap) to pre-F65 databases. We fetch `pragma_table_info`
+        // once and check column presence in memory — gemini-code-assist
+        // flagged the per-column pragma query as N+1. The column shapes
+        // must match SCHEMA_SQL exactly; a parity test enforces it.
+        // Mirrors the pg V031 migration; see schema.rs for the SQLite type
+        // mapping.
+        let existing_session_cols: std::collections::HashSet<String> =
+            sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('sessions')")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Migration(format!("pragma sessions: {e}")))?
+                .into_iter()
+                .collect();
+        for (column, kind) in [
+            ("goal_title", "TEXT"),
+            ("max_attempts", "INTEGER NOT NULL DEFAULT 5"),
+            ("attempts_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("wall_clock_ms_cap", "INTEGER"),
+            ("wall_clock_ms_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("token_cap", "INTEGER"),
+            ("tokens_used", "INTEGER NOT NULL DEFAULT 0"),
+            ("cost_usd_cap", "REAL"),
+            ("cost_usd_used", "REAL NOT NULL DEFAULT 0.0"),
+        ] {
+            if !existing_session_cols.contains(column) {
+                let stmt = format!("ALTER TABLE sessions ADD COLUMN {column} {kind}");
+                sqlx::query(&stmt)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| StoreError::Migration(format!("{stmt}: {e}")))?;
+            }
+        }
+
+        // F65 PR-2 §6.3 back-compat: backfill attempts_used = 1 for any
+        // session that already has at least one root run — identical
+        // semantics to the Postgres V031 UPDATE. In-flight runs at
+        // migration time are treated as single-attempt legacy root-Runs
+        // (arch-doc §6.3). Sessions with no runs stay at 0.
+        sqlx::query(
+            "UPDATE sessions
+                SET attempts_used = 1
+              WHERE attempts_used = 0
+                AND EXISTS (
+                    SELECT 1 FROM runs r
+                     WHERE r.session_id = sessions.session_id
+                       AND r.parent_run_id IS NULL
+                )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Migration(format!("f65 attempts_used backfill: {e}")))?;
+
+        // F65 PR-2: add the orchestrator-resumable extension columns to
+        // the existing `checkpoints` table. Same single-pragma-fetch
+        // strategy as the session columns above. Shape mirrors SCHEMA_SQL
+        // and the pg V032 migration; all nullable so legacy RFC 005
+        // checkpoint rows remain valid.
+        let existing_checkpoint_cols: std::collections::HashSet<String> =
+            sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('checkpoints')")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Migration(format!("pragma checkpoints: {e}")))?
+                .into_iter()
+                .collect();
+        for (column, kind) in [
+            ("session_id", "TEXT"),
+            ("schema_version", "INTEGER"),
+            ("body", "TEXT"),
+            ("body_size_bytes", "INTEGER"),
+            ("iteration", "INTEGER"),
+        ] {
+            if !existing_checkpoint_cols.contains(column) {
+                let stmt = format!("ALTER TABLE checkpoints ADD COLUMN {column} {kind}");
+                sqlx::query(&stmt)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| StoreError::Migration(format!("{stmt}: {e}")))?;
+            }
+        }
+
+        // F65 PR-2 follow-up: `termination_reason_json` was added after
+        // the initial session_outcomes CREATE to carry the full
+        // TerminationReason payload alongside the short discriminator.
+        // Pre-existing databases may have created the table without
+        // the column; add it here using the same pragma pattern.
+        let existing_outcome_cols: std::collections::HashSet<String> =
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM pragma_table_info('session_outcomes')",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Migration(format!("pragma session_outcomes: {e}")))?
+            .into_iter()
+            .collect();
+        if !existing_outcome_cols.is_empty()
+            && !existing_outcome_cols.contains("termination_reason_json")
+        {
+            let stmt = "ALTER TABLE session_outcomes ADD COLUMN termination_reason_json TEXT";
+            sqlx::query(stmt)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StoreError::Migration(format!("{stmt}: {e}")))?;
+        }
+
         Ok(())
     }
 }
 
+/// F65 PR-2: SQLite-side column list for session reads. Mirrors
+/// `SESSION_SELECT_COLS` in the pg adapter; kept as a module-private
+/// constant so the three `SessionReadModel` queries don't drift.
+const SESSION_SELECT_COLS: &str = "session_id, tenant_id, workspace_id, project_id, state, \
+     version, created_at, updated_at, \
+     goal_title, max_attempts, attempts_used, \
+     wall_clock_ms_cap, wall_clock_ms_used, \
+     token_cap, tokens_used, \
+     cost_usd_cap, cost_usd_used";
+
 #[async_trait]
 impl SessionReadModel for SqliteAdapter {
     async fn get(&self, session_id: &SessionId) -> Result<Option<SessionRecord>, StoreError> {
-        let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT session_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at
-             FROM sessions
-             WHERE session_id = $1",
-        )
-        .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!("SELECT {SESSION_SELECT_COLS} FROM sessions WHERE session_id = $1");
+        let row = sqlx::query_as::<_, SessionRow>(&sql)
+            .bind(session_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         row.map(SessionRow::into_record).transpose()
     }
@@ -179,37 +291,41 @@ impl SessionReadModel for SqliteAdapter {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SessionRecord>, StoreError> {
-        let rows = sqlx::query_as::<_, SessionRow>(
-            "SELECT session_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at
-             FROM sessions
+        let sql = format!(
+            "SELECT {SESSION_SELECT_COLS} FROM sessions
              WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
              ORDER BY created_at ASC, session_id ASC
-             LIMIT $4 OFFSET $5",
-        )
-        .bind(project.tenant_id.as_str())
-        .bind(project.workspace_id.as_str())
-        .bind(project.project_id.as_str())
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+             LIMIT $4 OFFSET $5"
+        );
+        let rows = sqlx::query_as::<_, SessionRow>(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         rows.into_iter().map(SessionRow::into_record).collect()
     }
 
     async fn list_active(&self, limit: usize) -> Result<Vec<SessionRecord>, StoreError> {
-        let rows = sqlx::query_as::<_, SessionRow>(
-            "SELECT session_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at
-             FROM sessions
+        // Tie-break on session_id to match the pg ORDER BY and give a
+        // stable cross-backend order when two sessions share the same
+        // updated_at (timestamps can collide at millisecond resolution
+        // under rapid-fire projection updates).
+        let sql = format!(
+            "SELECT {SESSION_SELECT_COLS} FROM sessions
              WHERE state = 'open'
-             ORDER BY updated_at DESC
-             LIMIT $1",
-        )
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+             ORDER BY updated_at DESC, session_id ASC
+             LIMIT $1"
+        );
+        let rows = sqlx::query_as::<_, SessionRow>(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
         rows.into_iter().map(SessionRow::into_record).collect()
     }
 }
@@ -857,11 +973,44 @@ struct SessionRow {
     version: i64,
     created_at: i64,
     updated_at: i64,
+    // F65 PR-2: session-extension columns. SQLite stores the same logical
+    // values the pg V031 migration uses — integers and REAL instead of
+    // BIGINT + DOUBLE PRECISION. All carry DEFAULTs at the schema level,
+    // so rows from pre-F65 databases project cleanly via the pragma-driven
+    // ALTER path in `migrate`.
+    goal_title: Option<String>,
+    max_attempts: i64,
+    attempts_used: i64,
+    wall_clock_ms_cap: Option<i64>,
+    wall_clock_ms_used: i64,
+    token_cap: Option<i64>,
+    tokens_used: i64,
+    cost_usd_cap: Option<f64>,
+    cost_usd_used: f64,
 }
 
 impl SessionRow {
     fn into_record(self) -> Result<SessionRecord, StoreError> {
         let project = project_key_from_parts(self.tenant_id, self.workspace_id, self.project_id);
+        let budget = if self.wall_clock_ms_cap.is_some()
+            || self.token_cap.is_some()
+            || self.cost_usd_cap.is_some()
+        {
+            Some(cairn_domain::IssueBudget {
+                max_tokens: self.token_cap.map(|v| v.max(0) as u64),
+                max_cost_micros: self
+                    .cost_usd_cap
+                    .map(|usd| (usd.max(0.0) * 1_000_000.0).round() as u64),
+                max_wall_seconds: self.wall_clock_ms_cap.map(|ms| (ms.max(0) as u64) / 1_000),
+            })
+        } else {
+            None
+        };
+        let _ = (
+            self.wall_clock_ms_used,
+            self.tokens_used,
+            self.cost_usd_used,
+        );
         Ok(SessionRecord {
             session_id: SessionId::new(self.session_id),
             project,
@@ -869,14 +1018,10 @@ impl SessionRow {
             version: self.version as u64,
             created_at: self.created_at as u64,
             updated_at: self.updated_at as u64,
-            // F65 PR-1: projection columns for goal_title / issue_budget /
-            // max_attempts / attempts_used land in PR-2. Until then this
-            // adapter returns defaults so existing rows continue to project
-            // cleanly.
-            goal_title: None,
-            issue_budget: None,
-            max_attempts: crate::projections::session::DEFAULT_MAX_ATTEMPTS,
-            attempts_used: 0,
+            goal_title: self.goal_title,
+            issue_budget: budget,
+            max_attempts: self.max_attempts.max(0) as u32,
+            attempts_used: self.attempts_used.max(0) as u32,
         })
     }
 }
@@ -1404,6 +1549,396 @@ impl ToolCallApprovalReadModel for SqliteAdapter {
         rows.into_iter()
             .map(SqliteToolCallApprovalRow::into_record)
             .collect()
+    }
+}
+
+// ── F65 PR-2: orchestrator-session read models (SQLite) ───────────────────
+
+const F65_SESSION_OUTCOME_SELECT: &str =
+    "SELECT root_run_id, tenant_id, workspace_scope, project_id, \
+     session_id, checkpoint_id, workspace_snapshot_id, \
+     termination_reason, termination_reason_json, \
+     compacted_summary, next_step_hint, \
+     cost_micros, created_at FROM session_outcomes";
+
+#[derive(sqlx::FromRow)]
+struct F65SessionOutcomeRow {
+    root_run_id: String,
+    tenant_id: String,
+    workspace_scope: String,
+    project_id: String,
+    session_id: String,
+    checkpoint_id: String,
+    workspace_snapshot_id: Option<String>,
+    termination_reason: String,
+    termination_reason_json: Option<String>,
+    compacted_summary: String,
+    next_step_hint: Option<String>,
+    cost_micros: i64,
+    created_at: i64,
+}
+
+impl F65SessionOutcomeRow {
+    fn into_record(self) -> Result<crate::projections::SessionOutcomeRecord, StoreError> {
+        // Rehydrate the full TerminationReason from the JSON sidecar
+        // column so payload fields (`ProviderError.message`,
+        // `CircuitBreakerTripped.trip.*`, `Crashed.message`) round-trip
+        // through the DB. Falls back to the short discriminator on
+        // legacy rows written before the column existed (or when JSON
+        // is malformed — operator filters keep working from the kind).
+        let reason = crate::projections::rehydrate_termination_reason(
+            self.termination_reason.as_str(),
+            self.termination_reason_json.as_deref(),
+        )?;
+        Ok(crate::projections::SessionOutcomeRecord {
+            root_run_id: RunId::new(self.root_run_id),
+            project: project_key_from_parts(self.tenant_id, self.workspace_scope, self.project_id),
+            session_id: SessionId::new(self.session_id),
+            checkpoint_id: CheckpointId::new(self.checkpoint_id),
+            workspace_snapshot_id: self
+                .workspace_snapshot_id
+                .map(cairn_domain::WorkspaceSnapshotId::new),
+            termination_reason: reason,
+            compacted_summary: self.compacted_summary,
+            next_step_hint: self.next_step_hint,
+            cost_micros: self.cost_micros.max(0) as u64,
+            created_at: self.created_at.max(0) as u64,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::projections::SessionOutcomeReadModel for SqliteAdapter {
+    async fn get_by_root_run(
+        &self,
+        root_run_id: &RunId,
+    ) -> Result<Option<crate::projections::SessionOutcomeRecord>, StoreError> {
+        let sql = format!("{F65_SESSION_OUTCOME_SELECT} WHERE root_run_id = ?");
+        let row = sqlx::query_as::<_, F65SessionOutcomeRow>(&sql)
+            .bind(root_run_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(F65SessionOutcomeRow::into_record).transpose()
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::SessionOutcomeRecord>, StoreError> {
+        let sql = format!(
+            "{F65_SESSION_OUTCOME_SELECT} WHERE session_id = ? \
+             ORDER BY created_at ASC, root_run_id ASC"
+        );
+        let rows = sqlx::query_as::<_, F65SessionOutcomeRow>(&sql)
+            .bind(session_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(F65SessionOutcomeRow::into_record)
+            .collect()
+    }
+}
+
+const F65_WORKSPACE_SNAPSHOT_SELECT: &str =
+    "SELECT snapshot_id, tenant_id, workspace_scope, project_id, \
+     session_id, workspace_id, parent_snapshot_id, snapshot_path, \
+     bytes, reflink_used, created_at, reaped_at FROM workspace_snapshots";
+
+#[derive(sqlx::FromRow)]
+struct F65WorkspaceSnapshotRow {
+    snapshot_id: String,
+    tenant_id: String,
+    workspace_scope: String,
+    project_id: String,
+    session_id: String,
+    workspace_id: String,
+    parent_snapshot_id: Option<String>,
+    snapshot_path: String,
+    bytes: i64,
+    // SQLite stores booleans as INTEGER 0/1.
+    reflink_used: i64,
+    created_at: i64,
+    reaped_at: Option<i64>,
+}
+
+impl F65WorkspaceSnapshotRow {
+    fn into_record(self) -> crate::projections::WorkspaceSnapshotRecord {
+        crate::projections::WorkspaceSnapshotRecord {
+            snapshot_id: cairn_domain::WorkspaceSnapshotId::new(self.snapshot_id),
+            project: project_key_from_parts(self.tenant_id, self.workspace_scope, self.project_id),
+            session_id: SessionId::new(self.session_id),
+            workspace_id: cairn_domain::WorkspaceId::new(self.workspace_id),
+            parent_snapshot_id: self
+                .parent_snapshot_id
+                .map(cairn_domain::WorkspaceSnapshotId::new),
+            snapshot_path: self.snapshot_path,
+            bytes: self.bytes.max(0) as u64,
+            reflink_used: self.reflink_used != 0,
+            created_at: self.created_at.max(0) as u64,
+            reaped_at: self.reaped_at.map(|v| v.max(0) as u64),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::projections::WorkspaceSnapshotReadModel for SqliteAdapter {
+    async fn get(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+    ) -> Result<Option<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        let sql = format!("{F65_WORKSPACE_SNAPSHOT_SELECT} WHERE snapshot_id = ?");
+        let row = sqlx::query_as::<_, F65WorkspaceSnapshotRow>(&sql)
+            .bind(snapshot_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(F65WorkspaceSnapshotRow::into_record))
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        let sql = format!(
+            "{F65_WORKSPACE_SNAPSHOT_SELECT} WHERE session_id = ? \
+             ORDER BY created_at ASC, snapshot_id ASC"
+        );
+        let rows = sqlx::query_as::<_, F65WorkspaceSnapshotRow>(&sql)
+            .bind(session_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(F65WorkspaceSnapshotRow::into_record)
+            .collect())
+    }
+
+    async fn lineage(
+        &self,
+        start: &cairn_domain::WorkspaceSnapshotId,
+    ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        // Iterative walk. A recursive CTE would be faster but is not
+        // supported in every SQLite build we target — stick to the
+        // portable subset (per project memory `feedback_no_db_specific_features`).
+        let mut chain: Vec<crate::projections::WorkspaceSnapshotRecord> = Vec::new();
+        let mut cursor = Some(start.as_str().to_owned());
+        // Bound the walk to avoid spinning on cycles. Even though the FK
+        // makes cycles unreachable in normal operation, we still defend
+        // against hand-edited rows in dev DBs.
+        const MAX_DEPTH: usize = 1024;
+        for _ in 0..MAX_DEPTH {
+            let Some(id) = cursor.take() else {
+                break;
+            };
+            let Some(rec) = <Self as crate::projections::WorkspaceSnapshotReadModel>::get(
+                self,
+                &cairn_domain::WorkspaceSnapshotId::new(id.clone()),
+            )
+            .await?
+            else {
+                break;
+            };
+            cursor = rec
+                .parent_snapshot_id
+                .as_ref()
+                .map(|p| p.as_str().to_owned());
+            chain.push(rec);
+        }
+        Ok(chain)
+    }
+}
+
+#[async_trait]
+impl crate::projections::WorkspaceRegistryReadModel for SqliteAdapter {
+    async fn get(
+        &self,
+        workspace_id: &cairn_domain::WorkspaceId,
+    ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT workspace_id, tenant_id, workspace_scope, project_id, \
+             root_run_id, fs_root, status, created_at, reaped_at \
+             FROM workspace_registry WHERE workspace_id = ?",
+        )
+        .bind(workspace_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(tuple_to_workspace_registry).transpose()
+    }
+
+    async fn get_by_root_run(
+        &self,
+        root_run_id: &RunId,
+    ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT workspace_id, tenant_id, workspace_scope, project_id, \
+             root_run_id, fs_root, status, created_at, reaped_at \
+             FROM workspace_registry WHERE root_run_id = ? \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(root_run_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(tuple_to_workspace_registry).transpose()
+    }
+}
+
+fn tuple_to_workspace_registry(
+    t: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+    ),
+) -> Result<crate::projections::WorkspaceRegistryRecord, StoreError> {
+    let (
+        workspace_id,
+        tenant_id,
+        ws_scope,
+        project_id,
+        root_run_id,
+        fs_root,
+        status,
+        created_at,
+        reaped_at,
+    ) = t;
+    // Fail loud on unknown status — silently defaulting masks schema
+    // drift or data corruption per `feedback_no_silent_fallbacks`.
+    let parsed_status = status.parse()?;
+    Ok(crate::projections::WorkspaceRegistryRecord {
+        workspace_id: cairn_domain::WorkspaceId::new(workspace_id),
+        project: project_key_from_parts(tenant_id, ws_scope, project_id),
+        root_run_id: RunId::new(root_run_id),
+        fs_root,
+        status: parsed_status,
+        created_at: created_at.max(0) as u64,
+        reaped_at: reaped_at.map(|v| v.max(0) as u64),
+    })
+}
+
+#[async_trait]
+impl crate::projections::F65CheckpointReadModel for SqliteAdapter {
+    async fn get_f65(
+        &self,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<Option<crate::projections::F65CheckpointRecord>, StoreError> {
+        // Single-query SELECT: include `session_id` (NOT-NULL-gated by the
+        // WHERE clause so legacy RFC 005 rows without F65 state still
+        // return None) and the project parts in one round-trip.
+        // Previously we did two queries — the second was redundant.
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT checkpoint_id, session_id, tenant_id, workspace_id, project_id, \
+             run_id, body, body_size_bytes, schema_version, iteration, created_at \
+             FROM checkpoints \
+             WHERE checkpoint_id = ? AND session_id IS NOT NULL",
+        )
+        .bind(checkpoint_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let Some((cid, sid, tenant, ws, proj, run_id, body, body_size, schema_ver, it, ts)) = row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(crate::projections::F65CheckpointRecord {
+            checkpoint_id: CheckpointId::new(cid),
+            project: project_key_from_parts(tenant, ws, proj),
+            session_id: SessionId::new(sid),
+            root_run_id: RunId::new(run_id),
+            schema_version: schema_ver.unwrap_or(1).max(0) as u32,
+            body: body.unwrap_or_default(),
+            body_size_bytes: body_size.unwrap_or(0).max(0) as u64,
+            iteration: it.unwrap_or(0).max(0) as u32,
+            created_at: ts.max(0) as u64,
+        }))
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::F65CheckpointRecord>, StoreError> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT checkpoint_id, tenant_id, workspace_id, project_id, \
+             run_id, session_id, body, body_size_bytes, schema_version, iteration, created_at \
+             FROM checkpoints \
+             WHERE session_id = ? \
+             ORDER BY iteration ASC, created_at ASC, checkpoint_id ASC",
+        )
+        .bind(session_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(cid, tenant, ws, proj, run_id, sid, body, body_size, schema_ver, it, ts)| {
+                    crate::projections::F65CheckpointRecord {
+                        checkpoint_id: CheckpointId::new(cid),
+                        project: project_key_from_parts(tenant, ws, proj),
+                        session_id: SessionId::new(sid),
+                        root_run_id: RunId::new(run_id),
+                        schema_version: schema_ver.unwrap_or(1).max(0) as u32,
+                        body: body.unwrap_or_default(),
+                        body_size_bytes: body_size.unwrap_or(0).max(0) as u64,
+                        iteration: it.unwrap_or(0).max(0) as u32,
+                        created_at: ts.max(0) as u64,
+                    }
+                },
+            )
+            .collect())
     }
 }
 

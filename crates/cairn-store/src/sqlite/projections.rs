@@ -1205,19 +1205,175 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            // F65 PR-1: orchestrator session redesign events. PR-1 ships
-            // types + variants only; projection writers land in PR-2.
-            RuntimeEvent::SessionAttemptStarted(_) => log_stub("SessionAttemptStarted"),
-            RuntimeEvent::SessionAttemptCompleted(_) => log_stub("SessionAttemptCompleted"),
-            RuntimeEvent::CircuitBreakerTripped(_) => log_stub("CircuitBreakerTripped"),
-            RuntimeEvent::BudgetThresholdCrossed(_) => log_stub("BudgetThresholdCrossed"),
-            RuntimeEvent::CheckpointPersisted(_) => log_stub("CheckpointPersisted"),
-            RuntimeEvent::WorkspaceSnapshotCreated(_) => log_stub("WorkspaceSnapshotCreated"),
-            RuntimeEvent::WorkspaceSnapshotReaped(_) => log_stub("WorkspaceSnapshotReaped"),
-            RuntimeEvent::SessionOutcomeEmitted(_) => log_stub("SessionOutcomeEmitted"),
-            RuntimeEvent::OrchestratorDecisionMade(_) => log_stub("OrchestratorDecisionMade"),
-            RuntimeEvent::SummarizerFallback(_) => log_stub("SummarizerFallback"),
-            RuntimeEvent::WorkspaceBackendDegraded(_) => log_stub("WorkspaceBackendDegraded"),
+            // ── F65 PR-2: orchestrator session redesign projections ────
+            // SQLite mirrors the pg writers in `pg/projections.rs`. Column
+            // placeholders use SQLite's `?` syntax. Monotonic
+            // attempt-count advancement is enforced inline with SQLite's
+            // scalar `MAX(a, b)` in the SET clause — `MAX(attempts_used, ?)`
+            // keeps the existing counter when a replay arrives with an
+            // older attempt number, so replay cannot shrink either
+            // counter. Other replay/idempotency properties match the pg
+            // path (ON CONFLICT ... DO UPDATE).
+            RuntimeEvent::SessionAttemptStarted(e) => {
+                // u32 always fits in i64 — infallible conversion.
+                let attempt: i64 = e.attempt_number.into();
+                let max_attempts: i64 = e.max_attempts.into();
+                sqlx::query(
+                    "UPDATE sessions
+                        SET attempts_used = MAX(attempts_used, ?),
+                            max_attempts  = MAX(max_attempts, ?),
+                            version       = version + 1,
+                            updated_at    = ?
+                      WHERE session_id = ?",
+                )
+                .bind(attempt)
+                .bind(max_attempts)
+                .bind(now)
+                .bind(e.session_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // No dedicated projection (operator observability only). See
+            // the matching pg arm for the rationale.
+            RuntimeEvent::SessionAttemptCompleted(_) => {}
+            RuntimeEvent::CircuitBreakerTripped(_) => {}
+            RuntimeEvent::BudgetThresholdCrossed(_) => {}
+            RuntimeEvent::CheckpointPersisted(e) => {
+                let schema_version: i64 = 1;
+                // u32 → i64 is infallible.
+                let iteration: i64 = e.iteration.into();
+                let at_ms = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "CheckpointPersisted.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO checkpoints (
+                         checkpoint_id, tenant_id, workspace_id, project_id,
+                         run_id, disposition, version, created_at,
+                         session_id, schema_version, body, body_size_bytes, iteration
+                     )
+                     VALUES (?, ?, ?, ?, ?, 'latest', 1, ?, ?, ?, '', 0, ?)
+                     ON CONFLICT (checkpoint_id) DO UPDATE SET
+                         session_id = excluded.session_id,
+                         schema_version = excluded.schema_version,
+                         iteration = excluded.iteration",
+                )
+                .bind(e.checkpoint_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.root_run_id.as_str())
+                .bind(at_ms)
+                .bind(e.session_id.as_str())
+                .bind(schema_version)
+                .bind(iteration)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::WorkspaceSnapshotCreated(e) => {
+                let at_ms = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "WorkspaceSnapshotCreated.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO workspace_snapshots (
+                         snapshot_id, tenant_id, workspace_scope, project_id,
+                         session_id, workspace_id, parent_snapshot_id,
+                         snapshot_path, bytes, reflink_used, created_at
+                     )
+                     VALUES (?, ?, ?, ?, ?, ?, NULL, '', 0, 0, ?)
+                     ON CONFLICT (snapshot_id) DO NOTHING",
+                )
+                .bind(e.snapshot_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.session_id.as_str())
+                .bind(e.workspace_id.as_str())
+                .bind(at_ms)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::WorkspaceSnapshotReaped(e) => {
+                let at_ms = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "WorkspaceSnapshotReaped.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE workspace_snapshots
+                        SET reaped_at = ?
+                      WHERE snapshot_id = ?",
+                )
+                .bind(at_ms)
+                .bind(e.snapshot_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::SessionOutcomeEmitted(e) => {
+                let outcome = &e.outcome;
+                let termination_kind =
+                    crate::projections::termination_reason_kind(&outcome.termination_reason);
+                let termination_reason_json = serde_json::to_string(&outcome.termination_reason)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let cost_micros = i64::try_from(outcome.cost_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SessionOutcome.cost_micros {} exceeds i64::MAX",
+                        outcome.cost_micros
+                    ))
+                })?;
+                let created_at = i64::try_from(outcome.emitted_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SessionOutcome.emitted_at {} exceeds i64::MAX",
+                        outcome.emitted_at
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO session_outcomes (
+                         root_run_id, tenant_id, workspace_scope, project_id,
+                         session_id, checkpoint_id, workspace_snapshot_id,
+                         termination_reason, termination_reason_json,
+                         compacted_summary, next_step_hint,
+                         cost_micros, created_at
+                     )
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (root_run_id) DO UPDATE SET
+                         workspace_snapshot_id   = excluded.workspace_snapshot_id,
+                         termination_reason      = excluded.termination_reason,
+                         termination_reason_json = excluded.termination_reason_json,
+                         compacted_summary       = excluded.compacted_summary,
+                         next_step_hint          = excluded.next_step_hint,
+                         cost_micros             = excluded.cost_micros",
+                )
+                .bind(outcome.root_run_id.as_str())
+                .bind(outcome.project.tenant_id.as_str())
+                .bind(outcome.project.workspace_id.as_str())
+                .bind(outcome.project.project_id.as_str())
+                .bind(outcome.session_id.as_str())
+                .bind(outcome.checkpoint_id.as_str())
+                .bind(outcome.workspace_snapshot_id.as_ref().map(|id| id.as_str()))
+                .bind(termination_kind)
+                .bind(&termination_reason_json)
+                .bind(&outcome.compacted_summary)
+                .bind(outcome.next_step_hint.as_deref())
+                .bind(cost_micros)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::OrchestratorDecisionMade(_) => {}
+            RuntimeEvent::SummarizerFallback(_) => {}
+            RuntimeEvent::WorkspaceBackendDegraded(_) => {}
         }
 
         Ok(())

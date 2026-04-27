@@ -165,6 +165,16 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "add_terminal_write_recovery",
         include_str!("migrations/V030__add_terminal_write_recovery.sql"),
     ),
+    (
+        31,
+        "f65_session_extensions",
+        include_str!("migrations/V031__f65_session_extensions.sql"),
+    ),
+    (
+        32,
+        "f65_orchestrator_projections",
+        include_str!("migrations/V032__f65_orchestrator_projections.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

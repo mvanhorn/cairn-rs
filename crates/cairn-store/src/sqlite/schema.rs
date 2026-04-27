@@ -29,7 +29,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     state        TEXT NOT NULL DEFAULT 'open',
     version      INTEGER NOT NULL DEFAULT 1,
     created_at   INTEGER NOT NULL,
-    updated_at   INTEGER NOT NULL
+    updated_at   INTEGER NOT NULL,
+    -- F65 PR-2: goal + per-session budget + attempt cap. Columns mirror
+    -- the Postgres V031 migration exactly. SQLite uses INTEGER and REAL
+    -- where Postgres uses BIGINT and DOUBLE PRECISION — equivalent storage
+    -- shape (see schema_parity test). All NOT NULL columns carry DEFAULTs
+    -- so in-place ALTER works on pre-F65 rows.
+    goal_title          TEXT,
+    max_attempts        INTEGER NOT NULL DEFAULT 5,
+    attempts_used       INTEGER NOT NULL DEFAULT 0,
+    wall_clock_ms_cap   INTEGER,
+    wall_clock_ms_used  INTEGER NOT NULL DEFAULT 0,
+    token_cap           INTEGER,
+    tokens_used         INTEGER NOT NULL DEFAULT 0,
+    cost_usd_cap        REAL,
+    cost_usd_used       REAL NOT NULL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -143,8 +157,86 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     run_id        TEXT NOT NULL REFERENCES runs(run_id),
     disposition   TEXT NOT NULL DEFAULT 'latest',
     version       INTEGER NOT NULL DEFAULT 1,
-    created_at    INTEGER NOT NULL
+    created_at    INTEGER NOT NULL,
+    -- F65 PR-2: orchestrator-resumable state. Nullable alongside the
+    -- RFC 005 fields so existing CheckpointRecorded rows stay valid.
+    -- `body` is canonical-serialised JSON stored as TEXT (no JSONB in
+    -- SQLite; matches the pg V032 migration contract).
+    session_id      TEXT,
+    schema_version  INTEGER,
+    body            TEXT,
+    body_size_bytes INTEGER,
+    iteration       INTEGER
 );
+CREATE INDEX IF NOT EXISTS idx_checkpoints_session_iteration
+    ON checkpoints (session_id, iteration)
+    WHERE session_id IS NOT NULL;
+
+-- F65 PR-2: workspace_registry — live workspace id → host path mapping.
+-- Shape mirrors pg V032; see that file for the column-level rationale.
+CREATE TABLE IF NOT EXISTS workspace_registry (
+    workspace_id    TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    workspace_scope TEXT NOT NULL,
+    project_id      TEXT NOT NULL,
+    root_run_id     TEXT NOT NULL,
+    fs_root         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      INTEGER NOT NULL,
+    reaped_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_registry_root_run
+    ON workspace_registry (root_run_id);
+CREATE INDEX IF NOT EXISTS idx_workspace_registry_status
+    ON workspace_registry (status);
+
+-- F65 PR-2: workspace_snapshots — immutable reflinked workspace trees.
+CREATE TABLE IF NOT EXISTS workspace_snapshots (
+    snapshot_id         TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL,
+    workspace_scope     TEXT NOT NULL,
+    project_id          TEXT NOT NULL,
+    session_id          TEXT NOT NULL,
+    workspace_id        TEXT NOT NULL,
+    parent_snapshot_id  TEXT REFERENCES workspace_snapshots(snapshot_id),
+    snapshot_path       TEXT NOT NULL,
+    bytes               INTEGER NOT NULL DEFAULT 0,
+    reflink_used        INTEGER NOT NULL DEFAULT 0,
+    created_at          INTEGER NOT NULL,
+    reaped_at           INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_snapshots_session
+    ON workspace_snapshots (session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_workspace_snapshots_parent
+    ON workspace_snapshots (parent_snapshot_id)
+    WHERE parent_snapshot_id IS NOT NULL;
+
+-- F65 PR-2: session_outcomes — one rich outcome per root-Run terminal.
+-- `workspace_snapshot_id` is nullable to tolerate legacy runs predating
+-- the sandbox (arch-doc §6.3). `termination_reason` carries the short
+-- discriminator for cheap index-based filtering;
+-- `termination_reason_json` carries the full payload (provider error
+-- messages, breaker trip detail, crash metadata). Both live here so
+-- readers get the full picture without walking the event log.
+CREATE TABLE IF NOT EXISTS session_outcomes (
+    root_run_id            TEXT PRIMARY KEY,
+    tenant_id              TEXT NOT NULL,
+    workspace_scope        TEXT NOT NULL,
+    project_id             TEXT NOT NULL,
+    session_id             TEXT NOT NULL,
+    checkpoint_id          TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
+    workspace_snapshot_id  TEXT REFERENCES workspace_snapshots(snapshot_id),
+    termination_reason     TEXT NOT NULL,
+    termination_reason_json TEXT,
+    compacted_summary      TEXT NOT NULL DEFAULT '',
+    next_step_hint         TEXT,
+    cost_micros            INTEGER NOT NULL DEFAULT 0,
+    created_at             INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_outcomes_session
+    ON session_outcomes (session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_session_outcomes_termination
+    ON session_outcomes (termination_reason);
 
 CREATE TABLE IF NOT EXISTS mailbox_messages (
     message_id   TEXT PRIMARY KEY,

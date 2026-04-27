@@ -47,6 +47,7 @@ pub mod run;
 pub mod run_sla;
 pub mod scheduled_task;
 pub mod session;
+pub mod session_outcome;
 pub mod sharing;
 pub mod signal;
 pub mod signal_subscription;
@@ -92,6 +93,12 @@ pub use run::*;
 pub use run_sla::*;
 pub use scheduled_task::ScheduledTaskReadModel;
 pub use session::*;
+pub use session_outcome::{
+    rehydrate_termination_reason, termination_reason_kind, F65CheckpointReadModel,
+    F65CheckpointRecord, SessionOutcomeReadModel, SessionOutcomeRecord, WorkspaceRegistryReadModel,
+    WorkspaceRegistryRecord, WorkspaceRegistryStatus, WorkspaceSnapshotReadModel,
+    WorkspaceSnapshotRecord,
+};
 pub use sharing::*;
 pub use signal::*;
 pub use signal_subscription::{SignalSubscriptionReadModel, SignalSubscriptionRecord};
