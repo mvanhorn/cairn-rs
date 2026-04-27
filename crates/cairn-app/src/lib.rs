@@ -31,6 +31,7 @@ pub(crate) mod tracing_emitter;
 pub mod trigger_routes;
 pub mod triggers;
 pub mod validate;
+pub mod webhook_validation;
 
 // Re-exports for backward compatibility
 pub use bootstrap::{parse_args, parse_args_from, run_bootstrap};

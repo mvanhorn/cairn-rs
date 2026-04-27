@@ -29,10 +29,14 @@ use cairn_runtime::{
 };
 use cairn_store::projections::{AuditLogReadModel, QuotaReadModel, RetentionPolicyReadModel};
 
-use crate::errors::{require_feature, runtime_error_response, store_error_response, AppApiError};
+use crate::errors::{
+    require_feature, runtime_error_response, store_error_response, validation_error_response,
+    AppApiError,
+};
 use crate::extractors::{AdminRoleGuard, TenantScope};
 use crate::state::AppState;
 use crate::tokens::RequestLogEntry;
+use crate::webhook_validation::{insecure_webhooks_allowed, validate_channels};
 #[allow(unused_imports)]
 use crate::{ProjectRecordDoc, RunListResponseDoc, TenantRecordDoc, WorkspaceRecordDoc};
 
@@ -1309,6 +1313,14 @@ pub(crate) async fn set_operator_notifications_handler(
     Path(operator_id): Path<String>,
     Json(body): Json<SetNotificationPreferencesRequest>,
 ) -> impl IntoResponse {
+    // Validate channel targets up front so typos (`not-a-url`) round-trip as
+    // an actionable 422, not a latent delivery failure (#235). The dispatcher
+    // layer would otherwise happily persist the preference and silently drop
+    // every future delivery attempt.
+    let allow_insecure = insecure_webhooks_allowed(&state.config);
+    if let Err(msg) = validate_channels(&body.channels, allow_insecure) {
+        return validation_error_response(msg);
+    }
     let tenant_id = TenantId::new(body.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT_ID));
     match state
         .runtime
