@@ -1171,9 +1171,76 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Evals"],
         "summary": "List eval runs",
+        "description": "Lists eval runs for the active project scope. Archived runs are excluded by default; pass `include_archived=true` to surface soft-deleted runs (issue #244).",
         "operationId": "listEvalRuns",
-        "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } }],
+        "parameters": [
+          { "name": "tenant_id",        "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id",     "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",       "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",            "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",           "in": "query", "schema": { "type": "integer", "default": 0 } },
+          { "name": "include_archived", "in": "query", "schema": { "type": "boolean", "default": false } }
+        ],
         "responses": { "200": { "description": "Eval run list" } }
+      },
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Create an eval run",
+        "description": "Creates a new eval run. Duplicate `eval_run_id` returns 409 Conflict (issue #244).",
+        "operationId": "createEvalRun",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "type": "object" } }
+          }
+        },
+        "responses": {
+          "201": { "description": "Eval run created" },
+          "404": { "description": "Referenced dataset/rubric/baseline not found or not in tenant" },
+          "409": { "description": "Duplicate eval_run_id — the id already exists (same or cross-project)" }
+        }
+      }
+    },
+    "/v1/evals/runs/{id}": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Get an eval run",
+        "operationId": "getEvalRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Eval run record" },
+          "404": { "description": "Eval run not found" }
+        }
+      },
+      "delete": {
+        "tags": ["Evals"],
+        "summary": "Soft-delete an eval run (issue #244)",
+        "description": "Archives the run via an `EvalRunArchived` event so audit trails remain intact. Project scope must match — cross-project DELETE returns 404. Already-archived runs return 204 (idempotent). The default list view hides archived rows; pass `include_archived=true` on `GET /v1/evals/runs` to surface them.",
+        "operationId": "deleteEvalRun",
+        "parameters": [
+          { "name": "id",           "in": "path",  "required": true,  "schema": { "type": "string" } },
+          { "name": "tenant_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",   "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "204": { "description": "Archived (or already archived — idempotent)" },
+          "404": { "description": "Eval run not found in this project scope" }
+        }
+      }
+    },
+    "/v1/evals/scorecards": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "List scorecard summaries (issue #244)",
+        "description": "One row per `(project, prompt_asset_id)` with at least one completed, non-archived eval run whose `prompt_release_id`/`prompt_version_id` are set. Sorted by `best_task_success_rate` descending. Populates the EvalsPage scorecard picker.",
+        "operationId": "listEvalScorecards",
+        "parameters": [
+          { "name": "tenant_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",   "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Scorecard summary list" } }
       }
     },
     "/v1/evals/rubrics": {

@@ -432,6 +432,7 @@ impl SqliteSyncProjection {
             RuntimeEvent::IngestJobCompleted(_) => log_stub("IngestJobCompleted"),
             RuntimeEvent::EvalRunStarted(_) => log_stub("EvalRunStarted"),
             RuntimeEvent::EvalRunCompleted(_) => log_stub("EvalRunCompleted"),
+            RuntimeEvent::EvalRunArchived(_) => log_stub("EvalRunArchived"),
             RuntimeEvent::PromptAssetCreated(e) => {
                 sqlx::query(
                     "INSERT INTO prompt_assets

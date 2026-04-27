@@ -1456,7 +1456,14 @@ impl AppBootstrap {
             )
             .route("/v1/evals/baselines/:id", get(get_eval_baseline_handler))
             .route("/v1/evals/rubrics/:id", get(get_eval_rubric_handler))
-            .route("/v1/evals/runs/:id", get(get_eval_run_handler))
+            // Issue #244: GET + DELETE share the dynamic-param chain because
+            // the catalog-fold arm never fires for `/v1/evals/runs/:id`
+            // (no catalog entry). Attaching `.delete()` here puts both verbs
+            // on the same matchit node so axum can route DELETE correctly.
+            .route(
+                "/v1/evals/runs/:id",
+                get(get_eval_run_handler).delete(delete_eval_run_handler),
+            )
             .route(
                 "/v1/evals/runs/:id/score-rubric",
                 post(score_eval_run_with_rubric_handler),
@@ -1466,6 +1473,12 @@ impl AppBootstrap {
                 post(compare_eval_run_baseline_handler),
             )
             .route("/v1/evals/scorecard/:asset_id", get(get_scorecard_handler))
+            // Issue #244: scorecard summary list for the EvalsPage picker.
+            // Registered here directly rather than through the catalog fold;
+            // `/v1/evals/scorecards` is a distinct static route from
+            // `/v1/evals/scorecard/:asset_id` (different second segment, no
+            // ordering dependency).
+            .route("/v1/evals/scorecards", get(list_scorecards_handler))
             .route(
                 "/v1/evals/assets/:asset_id/report",
                 get(get_eval_asset_report_handler),

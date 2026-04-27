@@ -976,6 +976,7 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::EvalBaselineLocked(_) => "eval_baseline_locked",
         RuntimeEvent::EvalRunStarted(_) => "eval_run_started",
         RuntimeEvent::EvalRunCompleted(_) => "eval_run_completed",
+        RuntimeEvent::EvalRunArchived(_) => "eval_run_archived",
         RuntimeEvent::PromptAssetCreated(_) => "prompt_asset_created",
         RuntimeEvent::PromptVersionCreated(_) => "prompt_version_created",
         RuntimeEvent::PromptReleaseCreated(_) => "prompt_release_created",
@@ -1366,6 +1367,9 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         }
         RuntimeEvent::EvalRunCompleted(eval_run) => {
             format!("Eval run {} completed", eval_run.eval_run_id)
+        }
+        RuntimeEvent::EvalRunArchived(eval_run) => {
+            format!("Eval run {} archived", eval_run.eval_run_id)
         }
         RuntimeEvent::PromptAssetCreated(asset) => {
             format!("Prompt asset {} created", asset.prompt_asset_id)

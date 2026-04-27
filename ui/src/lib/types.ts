@@ -1191,6 +1191,28 @@ export interface EvalCompareResponse {
   }>;
 }
 
+/**
+ * One row from GET /v1/evals/scorecards (issue #244). A scorecard summary
+ * represents one `(project, prompt_asset_id)` pair with at least one eval
+ * run that BOTH (a) has terminated with `status == Completed` and (b) has
+ * `prompt_release_id` and `prompt_version_id` set. Runs missing either id
+ * don't contribute an entry because the scorecard is keyed by release +
+ * version. Archived runs are always excluded. `best_task_success_rate` is
+ * the max `task_success_rate` across the included entries, used by the
+ * EvalsPage modal picker to show a single headline number without
+ * fetching the full scorecard.
+ *
+ * Mirrors `crates/cairn-app/src/handlers/evals.rs::ScorecardSummary` and
+ * `EvalRunService::build_scorecard` predicate. Keep in sync whenever the
+ * server shape changes (CLAUDE.md reminder).
+ */
+export interface ScorecardSummary {
+  project_id: string;
+  prompt_asset_id: string;
+  entry_count: number;
+  best_task_success_rate: number | null;
+}
+
 // ── Plugins ───────────────────────────────────────────────────────────────────
 
 /** Discriminated union matching cairn_tools::PluginCapability */

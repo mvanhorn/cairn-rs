@@ -7,6 +7,7 @@ DELETE	/v1/admin/workspaces/:id/shares/:share_id	preserve	-	-
 DELETE	/v1/admin/workspaces/:workspace_id/members/:id	preserve	-	-
 DELETE	/v1/auth/tokens/:id	preserve	-	-
 DELETE	/v1/config/:key	preserve	path param: key	{ ok }
+DELETE	/v1/evals/runs/:id	preserve	-	-
 DELETE	/v1/integrations/:integration_id	preserve	-	-
 DELETE	/v1/integrations/:integration_id/overrides	preserve	-	-
 DELETE	/v1/mailbox/:id	preserve	-	-
@@ -104,6 +105,7 @@ GET	/v1/evals/rubrics/:id	preserve	-	-
 GET	/v1/evals/runs	preserve	query: limit?	{ items }
 GET	/v1/evals/runs/:id	preserve	-	-
 GET	/v1/evals/scorecard/:asset_id	preserve	-	-
+GET	/v1/evals/scorecards	preserve	-	-
 GET	/v1/events	preserve	-	-
 GET	/v1/events/recent	preserve	-	-
 GET	/v1/export/:format	preserve	path param: format	exported bundle

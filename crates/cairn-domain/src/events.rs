@@ -138,6 +138,9 @@ pub enum RuntimeEvent {
     IngestJobCompleted(IngestJobCompleted),
     EvalRunStarted(EvalRunStarted),
     EvalRunCompleted(EvalRunCompleted),
+    /// Issue #244: eval run soft-deleted. The run record is preserved for
+    /// audit/history; list endpoints filter it out by default.
+    EvalRunArchived(EvalRunArchived),
     PromptAssetCreated(PromptAssetCreated),
     PromptVersionCreated(PromptVersionCreated),
     ApprovalPolicyCreated(ApprovalPolicyCreated),
@@ -351,6 +354,7 @@ impl RuntimeEvent {
             RuntimeEvent::IngestJobCompleted(event) => &event.project,
             RuntimeEvent::EvalRunStarted(event) => &event.project,
             RuntimeEvent::EvalRunCompleted(event) => &event.project,
+            RuntimeEvent::EvalRunArchived(event) => &event.project,
             RuntimeEvent::PromptAssetCreated(event) => &event.project,
             RuntimeEvent::PromptVersionCreated(event) => &event.project,
             RuntimeEvent::ApprovalPolicyCreated(event) => &event.project,
@@ -598,6 +602,9 @@ impl RuntimeEvent {
                 eval_run_id: event.eval_run_id.clone(),
             }),
             RuntimeEvent::EvalRunCompleted(event) => Some(RuntimeEntityRef::EvalRun {
+                eval_run_id: event.eval_run_id.clone(),
+            }),
+            RuntimeEvent::EvalRunArchived(event) => Some(RuntimeEntityRef::EvalRun {
                 eval_run_id: event.eval_run_id.clone(),
             }),
             RuntimeEvent::OutcomeRecorded(event) => Some(RuntimeEntityRef::Run {
@@ -1398,6 +1405,17 @@ pub struct EvalRunStarted {
     /// Baseline id attached at run-create time (issue #223).
     #[serde(default)]
     pub baseline_id: Option<String>,
+}
+
+/// Emitted when an eval run is soft-deleted (archived). The run record is
+/// preserved for audit/history so scorecard/matrix views stay intact; list
+/// endpoints filter it out by default. Mirrors `WorkspaceArchived` (#218).
+/// Issue #244.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalRunArchived {
+    pub project: ProjectKey,
+    pub eval_run_id: EvalRunId,
+    pub archived_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -745,6 +745,7 @@ impl AppState {
 
         let mut created: u32 = 0;
         let mut completed: u32 = 0;
+        let mut archived: u32 = 0;
 
         for stored in &events {
             match &stored.envelope.payload {
@@ -825,12 +826,29 @@ impl AppState {
                         }
                     }
                 }
+                // Issue #244: re-apply soft-delete state on restart so
+                // archived runs stay hidden from the default list and
+                // DELETE stays idempotent across process boots. Runs the
+                // event sees but doesn't yet have an in-memory record for
+                // are a no-op — `archive` returns NotFound.
+                cairn_domain::RuntimeEvent::EvalRunArchived(e) => {
+                    if let Err(err) = self.evals.archive(&e.eval_run_id, e.archived_at) {
+                        tracing::warn!(
+                            eval_run_id = %e.eval_run_id,
+                            "eval replay: EvalRunArchived apply failed: {err}",
+                        );
+                    } else {
+                        archived += 1;
+                    }
+                }
                 _ => {}
             }
         }
 
-        if created > 0 || completed > 0 {
-            tracing::info!("eval replay: restored {created} runs ({completed} completed)");
+        if created > 0 || completed > 0 || archived > 0 {
+            tracing::info!(
+                "eval replay: restored {created} runs ({completed} completed, {archived} archived)"
+            );
         }
     }
 

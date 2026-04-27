@@ -431,6 +431,52 @@ test.describe("9. Evaluations", () => {
     await nav(page, "evals");
     expect((await page.textContent("body"))!.length).toBeGreaterThan(10);
   });
+
+  // Issue #244 — the EvalsPage New Eval Run modal must expose a scorecard
+  // picker populated from GET /v1/evals/scorecards. Before #244 there was
+  // no picker at all; operators had to type `prompt_asset_id` by hand.
+  //
+  // The test both asserts the picker is wired AND that the
+  // /v1/evals/scorecards request reaches the server successfully, so a
+  // regression that silently 404s the endpoint is caught. The "— none —"
+  // default option is always present — counting options >= 1 would pass
+  // even when the endpoint is broken — so we additionally listen for the
+  // scorecards request and assert a 2xx response before expanding the
+  // <select> cardinality check.
+  test("new eval run modal shows scorecard picker populated from server (issue #244)", async ({ page }) => {
+    await signIn(page);
+    await nav(page, "evals");
+
+    // Prime: wait until the scorecards fetch succeeds so we know the
+    // endpoint is live before asserting the UI. `waitForResponse` is
+    // matched against the URL pattern that `listEvalScorecards()` builds
+    // (it appends tenant/workspace/project as querystring).
+    const scorecardsResponse = page.waitForResponse(
+      (resp) => resp.url().includes("/v1/evals/scorecards") && resp.request().method() === "GET",
+      { timeout: 10_000 },
+    );
+
+    // Click "+ New" to open the modal. The button copy varies across
+    // themes, so locate it by role+text fragment.
+    const newBtn = page.getByRole("button", { name: /new/i }).first();
+    await newBtn.click({ timeout: 5_000 });
+
+    // Scorecards endpoint must have returned 200 — a regression that
+    // silently 404s the route is caught here (would have sneaked past the
+    // old "options >= 1" check because the hard-coded `— none —` option
+    // keeps the count ≥ 1 regardless of the server response).
+    const resp = await scorecardsResponse;
+    expect(resp.status()).toBe(200);
+
+    const picker = page.getByTestId("scorecard-select");
+    await expect(picker).toBeVisible({ timeout: 5_000 });
+
+    // At minimum the `— none —` default is present. On a fresh project
+    // the server list may be empty so we don't assert options > 1, but we
+    // do assert the fallback exists so the field is actually optional.
+    const noneOption = picker.locator('option[value=""]');
+    await expect(noneOption).toHaveCount(1);
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════

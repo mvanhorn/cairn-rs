@@ -1374,6 +1374,39 @@ export function createApiClient(config: ApiClientConfig) {
       return get(`/v1/evals/compare?${qs}`);
     },
 
+    /**
+     * GET /v1/evals/scorecards — scorecard summaries for the active project
+     * scope (issue #244). Populates the EvalsPage scorecard picker so
+     * operators can pre-select a scorecard at eval-run create time instead
+     * of having to guess prompt asset ids up front. Returned sorted by
+     * `best_task_success_rate` descending.
+     */
+    listEvalScorecards: async (): Promise<import("./types").ScorecardSummary[]> => {
+      const merged = withScope();
+      const qs = new URLSearchParams();
+      if (merged.tenant_id)    qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)   qs.set("project_id",   merged.project_id);
+      return getList<import("./types").ScorecardSummary>(
+        `/v1/evals/scorecards${qs.toString() ? `?${qs}` : ""}`,
+      );
+    },
+
+    /**
+     * DELETE /v1/evals/runs/:id — soft-delete an eval run (issue #244).
+     * The backend archives via `EvalRunArchived`; list queries exclude
+     * archived rows by default. Idempotent: re-deleting an already-archived
+     * run still returns 204.
+     */
+    deleteEvalRun: async (evalRunId: string): Promise<void> => {
+      const merged = withScope();
+      const qs = new URLSearchParams();
+      if (merged.tenant_id)    qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)   qs.set("project_id",   merged.project_id);
+      await del(`/v1/evals/runs/${encodeURIComponent(evalRunId)}${qs.toString() ? `?${qs}` : ""}`);
+    },
+
     // ── Audit Log ────────────────────────────────────────────────────────────
 
     /** GET /v1/admin/audit-log — list audit log entries (most recent first). */

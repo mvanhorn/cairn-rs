@@ -1963,6 +1963,7 @@ impl InMemoryStore {
                         error_message: None,
                         started_at: e.started_at,
                         completed_at: None,
+                        archived_at: None,
                     },
                 );
             }
@@ -1971,6 +1972,21 @@ impl InMemoryStore {
                     rec.success = Some(e.success);
                     rec.error_message = e.error_message.clone();
                     rec.completed_at = Some(e.completed_at);
+                }
+            }
+            // Issue #244: soft-delete. Preserve the record so audit/scorecard
+            // views keep their history; `list_by_project` on the eval service
+            // filters archived entries out by default. Earliest-wins: only
+            // set `archived_at` when it's currently None so a racing second
+            // `EvalRunArchived` event (two concurrent DELETEs) doesn't bump
+            // the timestamp to the later attempt. Matches
+            // `EvalRunService::archive`'s idempotency rule (Copilot review
+            // on PR #336).
+            RuntimeEvent::EvalRunArchived(e) => {
+                if let Some(rec) = state.eval_runs.get_mut(e.eval_run_id.as_str()) {
+                    if rec.archived_at.is_none() {
+                        rec.archived_at = Some(e.archived_at);
+                    }
                 }
             }
             RuntimeEvent::OutcomeRecorded(e) => {

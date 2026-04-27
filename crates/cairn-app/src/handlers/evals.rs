@@ -14,7 +14,7 @@ use cairn_domain::{
     WorkspaceKey, EVAL_MATRICES,
 };
 use cairn_evals::{
-    EvalMetrics, EvalRun as ProductEvalRun, EvalSubjectKind, GuardrailMatrix,
+    EvalMetrics, EvalRun as ProductEvalRun, EvalRunStatus, EvalSubjectKind, GuardrailMatrix,
     PromptComparisonMatrix, ProviderRoutingMatrix, ProviderRoutingRow, RubricDimension,
     SkillHealthMatrix,
 };
@@ -108,6 +108,18 @@ pub(crate) struct CreateEvalRubricRequest {
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct ListEvalDatasetsQuery {
     tenant_id: Option<String>,
+}
+
+/// Query parameters for `GET /v1/evals/runs`. Combines the standard
+/// project scope (tenant/workspace/project/limit/offset) with the
+/// `include_archived` flag introduced for issue #244. Defaults to false so
+/// existing clients continue to see only active runs without opting in.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct ListEvalRunsQuery {
+    #[serde(flatten)]
+    pub scope: OptionalProjectScopedQuery,
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -355,12 +367,17 @@ pub(crate) fn eval_metric_rows(run_ids: &[String], runs: &[ProductEvalRun]) -> V
 
 pub(crate) async fn list_eval_runs_handler(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<OptionalProjectScopedQuery>,
+    Query(query): Query<ListEvalRunsQuery>,
 ) -> impl IntoResponse {
-    let project_id = query.project().project_id;
-    let limit = query.limit.unwrap_or(100);
-    let offset = query.offset.unwrap_or(0);
-    let mut items = state.evals.list_by_project(&project_id);
+    let project_id = query.scope.project().project_id;
+    let limit = query.scope.limit.unwrap_or(100);
+    let offset = query.scope.offset.unwrap_or(0);
+    // Issue #244: archived runs are excluded by default so the EvalsPage
+    // doesn't show soft-deleted rows. `?include_archived=true` surfaces them
+    // for audit and admin recovery flows.
+    let mut items = state
+        .evals
+        .list_by_project_include_archived(&project_id, query.include_archived);
     let has_more = items.len() > offset.saturating_add(limit);
     items = items.into_iter().skip(offset).take(limit).collect();
     (StatusCode::OK, Json(ListResponse { has_more, items })).into_response()
@@ -375,6 +392,108 @@ pub(crate) async fn get_eval_run_handler(
         None => AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
             .into_response(),
     }
+}
+
+/// `DELETE /v1/evals/runs/:id` — soft-delete an eval run (issue #244).
+/// Mirrors PR #225 (workspace) / PR #249 (session): archive the record via
+/// an `EvalRunArchived` event so audit trails and scorecard/matrix views
+/// stay intact, then flip the in-memory `archived_at` marker so the default
+/// list hides it. Already-archived runs return 204 (idempotent). Missing or
+/// cross-project runs return 404.
+pub(crate) async fn delete_eval_run_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OptionalProjectScopedQuery>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let eval_run_id = EvalRunId::new(id);
+    let project_key = query.project();
+    let project_id_domain = ProjectId::new(project_key.project_id.as_str());
+
+    let existing = match state.evals.get(&eval_run_id) {
+        Some(run) => run,
+        None => {
+            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                .into_response();
+        }
+    };
+
+    // Enforce project ownership: an id collision across projects is a
+    // tenant-isolation bug (see `create_eval_run_handler`); a DELETE from
+    // the wrong scope must not silently archive another project's run.
+    if existing.project_id != project_id_domain {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+            .into_response();
+    }
+
+    // Already-archived → 204 idempotent, no new event (mirrors
+    // `WorkspaceServiceImpl::archive`). Keeps the event log free of
+    // duplicate archive events on repeated DELETE calls.
+    if existing.archived_at.is_some() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Event-log-first write ordering: if the append fails, in-memory state
+    // must not diverge. We use a *collision-resistant* unique event_id
+    // (`eval_archive_<id>_<ts_ms>_<uuid7>`) rather than a deterministic one —
+    // two concurrent DELETEs can both observe `archived_at.is_none()`
+    // above, and if both tried to append `eval_archive_<id>` the second
+    // would hit UNIQUE(event_id) and the handler would 500 instead of
+    // staying 204 idempotent. Two requests landing in the same millisecond
+    // would collide on `_<ts_ms>` alone (Copilot review on PR #336),
+    // so a UUIDv7 suffix provides the random entropy needed to guarantee
+    // uniqueness per attempt. The workspace-archive path in
+    // `workspace_impl.rs` uses the same "unique id + pre-check" shape via
+    // `next_event_id()`.
+    let ev = EventEnvelope::for_runtime_event(
+        EventId::new(format!(
+            "eval_archive_{}_{}_{}",
+            eval_run_id.as_str(),
+            now,
+            uuid::Uuid::now_v7().simple(),
+        )),
+        EventSource::Runtime,
+        cairn_domain::RuntimeEvent::EvalRunArchived(cairn_domain::events::EvalRunArchived {
+            project: project_key,
+            eval_run_id: eval_run_id.clone(),
+            archived_at: now,
+        }),
+    );
+    if let Err(e) = state.runtime.store.append(&[ev]).await {
+        // Log the raw error for operator forensics; client sees an opaque
+        // message so store/DB internals don't leak across the tenant
+        // boundary (SEC-007 — Cursor Bugbot rule "Error mappers must strip
+        // internal details from client-facing response bodies").
+        tracing::error!(
+            %eval_run_id,
+            "failed to persist EvalRunArchived event: {e}"
+        );
+        return AppApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "failed to archive eval run",
+        )
+        .into_response();
+    }
+
+    if let Err(err) = state.evals.archive(&eval_run_id, now) {
+        tracing::error!(
+            %eval_run_id,
+            "in-memory archive failed after event-log append: {err}"
+        );
+        return AppApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "failed to archive eval run",
+        )
+        .into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub(crate) async fn list_eval_datasets_handler(
@@ -591,26 +710,27 @@ pub(crate) async fn create_eval_run_handler(
         body.project_id.as_str(),
     );
 
-    // Idempotency guard (Copilot review on PR #227): the EvalRunStarted event
-    // is persisted with a deterministic event_id (`eval_create_<run_id>`), so
-    // the event_log's UNIQUE(event_id) constraint would 500 on every legitimate
-    // client retry. Detect the duplicate upfront and return the existing run
-    // (200). Critically: scope the match by project — a bare eval_run_id is
-    // just a string and could collide across tenants, so we refuse to return
-    // another tenant's run.
+    // Duplicate guard (issues #229 sessions / #217 credentials / #244 evals):
+    // reject re-POSTing an existing `eval_run_id` with 409 Conflict instead of
+    // silently returning 201 or masquerading as a validation failure (422).
+    // Matching sessions PR #249: duplicate eval_run_id is a programming error,
+    // not a well-formed idempotent retry — surface it so clients see the
+    // collision. The event_log has a UNIQUE(event_id) constraint on
+    // `eval_create_<run_id>`, so without this pre-check the append path would
+    // 500; this check also keeps the error story consistent whether the run
+    // collides in the same project or across projects (the cross-project case
+    // returns a distinct message because it implies a tenant-isolation bug,
+    // not a client retry).
     if let Some(existing) = state.evals.get(&eval_run_id) {
-        if existing.project_id == project_id_domain {
-            return (StatusCode::OK, Json(existing)).into_response();
-        }
-        return AppApiError::new(
-            StatusCode::CONFLICT,
-            "conflict",
+        let message = if existing.project_id == project_id_domain {
+            format!("eval_run_id {} already exists", eval_run_id.as_str())
+        } else {
             format!(
                 "eval_run_id {} already exists in another project",
                 eval_run_id.as_str()
-            ),
-        )
-        .into_response();
+            )
+        };
+        return AppApiError::new(StatusCode::CONFLICT, "conflict", message).into_response();
     }
 
     // Build the EvalRunStarted event and persist it to the event log FIRST.
@@ -1186,6 +1306,102 @@ pub(crate) async fn get_scorecard_handler(
         .evals
         .build_scorecard(&query.project().project_id, &PromptAssetId::new(asset_id));
     (StatusCode::OK, Json(scorecard)).into_response()
+}
+
+/// Summary row for `GET /v1/evals/scorecards` (issue #244). Scorecards are
+/// derived views keyed by `(project, prompt_asset_id)`, so this list
+/// surfaces one entry per asset that has at least one completed eval run.
+/// The UI EvalsPage modal uses this to populate a scorecard picker without
+/// having to guess prompt asset ids up front.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct ScorecardSummary {
+    pub project_id: String,
+    pub prompt_asset_id: String,
+    /// Number of ScorecardEntry rows (completed runs with
+    /// prompt_release_id + prompt_version_id) that feed this scorecard.
+    pub entry_count: usize,
+    /// Best task_success_rate across the scorecard's entries, when at
+    /// least one run reported the metric. Gives the UI a single number
+    /// to display in the picker without fetching the full scorecard.
+    pub best_task_success_rate: Option<f64>,
+}
+
+/// `GET /v1/evals/scorecards` — list scorecard summaries for the active
+/// project scope (issue #244). One row per `(project, prompt_asset_id)`
+/// pair with at least one completed eval run whose
+/// `prompt_release_id`/`prompt_version_id` are set. Sorted by
+/// `best_task_success_rate` descending so the top-performing assets
+/// surface first in the UI picker. Archived runs are excluded from the
+/// aggregation to match the rest of the eval list contract.
+pub(crate) async fn list_scorecards_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<OptionalProjectScopedQuery>,
+) -> impl IntoResponse {
+    let project_id = query.project().project_id;
+
+    // Single-pass aggregation over the project's non-archived runs (Gemini
+    // review on PR #336). The previous shape looped over unique asset_ids
+    // and re-invoked `build_scorecard` per asset, which re-traversed the
+    // runs list each time — O(Assets * Runs). Now we walk the runs once,
+    // replicating `build_scorecard`'s entry-predicate inline so the
+    // summary's `entry_count` and `best_task_success_rate` stay consistent
+    // with `GET /v1/evals/scorecard/:asset_id`:
+    //   - run.status == Completed
+    //   - run.prompt_asset_id.is_some()
+    //   - run.prompt_release_id.is_some() + prompt_version_id.is_some()
+    //   - run.archived_at.is_none() (already enforced by list_by_project)
+    let runs = state.evals.list_by_project(&project_id);
+    let mut by_asset: std::collections::HashMap<String, ScorecardSummary> =
+        std::collections::HashMap::new();
+
+    for run in &runs {
+        if run.status != EvalRunStatus::Completed {
+            continue;
+        }
+        let Some(asset_id) = run.prompt_asset_id.as_ref() else {
+            continue;
+        };
+        // Scorecard entries require BOTH release + version — matches the
+        // filter_map in `EvalRunService::build_scorecard`.
+        if run.prompt_release_id.is_none() || run.prompt_version_id.is_none() {
+            continue;
+        }
+
+        let key = asset_id.as_str().to_owned();
+        let entry = by_asset.entry(key.clone()).or_insert(ScorecardSummary {
+            project_id: project_id.as_str().to_owned(),
+            prompt_asset_id: key,
+            entry_count: 0,
+            best_task_success_rate: None,
+        });
+        entry.entry_count += 1;
+        if let Some(rate) = run.metrics.task_success_rate {
+            entry.best_task_success_rate =
+                Some(entry.best_task_success_rate.map_or(rate, |best| {
+                    if rate > best {
+                        rate
+                    } else {
+                        best
+                    }
+                }));
+        }
+    }
+
+    let mut summaries: Vec<ScorecardSummary> = by_asset.into_values().collect();
+    summaries.sort_by(|a, b| {
+        let ax = a.best_task_success_rate.unwrap_or(f64::NEG_INFINITY);
+        let bx = b.best_task_success_rate.unwrap_or(f64::NEG_INFINITY);
+        bx.partial_cmp(&ax).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    (
+        StatusCode::OK,
+        Json(ListResponse {
+            has_more: false,
+            items: summaries,
+        }),
+    )
+        .into_response()
 }
 
 pub(crate) async fn get_eval_asset_trend_handler(

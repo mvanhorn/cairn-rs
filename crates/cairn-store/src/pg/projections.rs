@@ -395,6 +395,7 @@ impl PgSyncProjection {
             RuntimeEvent::IngestJobCompleted(_) => log_stub("IngestJobCompleted"),
             RuntimeEvent::EvalRunStarted(_) => log_stub("EvalRunStarted"),
             RuntimeEvent::EvalRunCompleted(_) => log_stub("EvalRunCompleted"),
+            RuntimeEvent::EvalRunArchived(_) => log_stub("EvalRunArchived"),
             RuntimeEvent::OutcomeRecorded(_) => log_stub("OutcomeRecorded"),
             RuntimeEvent::ScheduledTaskCreated(_) => log_stub("ScheduledTaskCreated"),
             RuntimeEvent::PlanProposed(_) => log_stub("PlanProposed"),

@@ -77,6 +77,11 @@ pub struct EvalRun {
     pub created_by: Option<OperatorId>,
     pub created_at: u64,
     pub completed_at: Option<u64>,
+    /// Issue #244: soft-delete marker. `Some(ts)` when archived via
+    /// `DELETE /v1/evals/runs/:id`; list endpoints filter archived runs out
+    /// by default but surface them when `?include_archived=true` is set.
+    #[serde(default)]
+    pub archived_at: Option<u64>,
 }
 
 /// A scorecard aggregates eval results for a prompt asset across

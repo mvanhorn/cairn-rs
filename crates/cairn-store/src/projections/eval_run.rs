@@ -15,6 +15,11 @@ pub struct EvalRunRecord {
     pub error_message: Option<String>,
     pub started_at: u64,
     pub completed_at: Option<u64>,
+    /// Issue #244: `Some(ts)` when the run has been soft-deleted. `None` for
+    /// active runs. `#[serde(default)]` so event-log entries persisted before
+    /// the column existed still deserialise.
+    #[serde(default)]
+    pub archived_at: Option<u64>,
 }
 
 /// Read-model for eval run current state.

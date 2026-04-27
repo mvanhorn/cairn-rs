@@ -314,10 +314,16 @@ export function EvalsPage() {
   const [showNewForm, setShowNewForm]   = useState(false);
   const [newEvalType, setNewEvalType]   = useState<string>(EVALUATOR_TYPES[0]);
   const [newSubject, setNewSubject]     = useState<string>(SUBJECT_KINDS[0]);
-  const [newDatasetId, setNewDatasetId]   = useState<string>("");
-  const [newRubricId, setNewRubricId]     = useState<string>("");
-  const [newBaselineId, setNewBaselineId] = useState<string>("");
-  const [newReleaseId, setNewReleaseId]   = useState<string>("");
+  const [newDatasetId, setNewDatasetId]     = useState<string>("");
+  const [newRubricId, setNewRubricId]       = useState<string>("");
+  const [newBaselineId, setNewBaselineId]   = useState<string>("");
+  const [newReleaseId, setNewReleaseId]     = useState<string>("");
+  // Issue #244: scorecard picker — lets operators target an existing
+  // scorecard (i.e. a prompt_asset_id that already has completed runs)
+  // instead of typing the asset id by hand. Selecting a scorecard
+  // pre-fills `prompt_asset_id` on the submitted run so the new run lands
+  // on the same scorecard track.
+  const [selectedPromptAssetId, setSelectedPromptAssetId] = useState<string>("");
   const qc = useQueryClient();
   const toast = useToast();
   // Scope goes into every cache key so that switching tenant/workspace/project
@@ -358,10 +364,23 @@ export function EvalsPage() {
     enabled:  showNewForm && newSubject === "prompt_release",
     staleTime: 60_000,
   });
+  // Issue #244: scorecards are derived per-(project, prompt_asset_id), so
+  // the picker is scoped by the active project (not tenant) and stale-cached
+  // while the form is open.
+  const scorecardsQ = useQuery({
+    queryKey: ["evals", "scorecards", ...scopeKey],
+    queryFn:  () => defaultApi.listEvalScorecards(),
+    enabled:  showNewForm,
+    staleTime: 60_000,
+  });
 
   const createEval = useMutation({
     mutationFn: () => {
       const id = `eval_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      // Issue #244: selected scorecard maps to `prompt_asset_id` on the new
+      // run so it aggregates into the chosen scorecard. The picker stores
+      // the `prompt_asset_id` (not an opaque scorecard id) because
+      // scorecards are derived from `(project, prompt_asset_id)`.
       return defaultApi.createEvalRun({
         eval_run_id:       id,
         subject_kind:      newSubject,
@@ -370,6 +389,7 @@ export function EvalsPage() {
         rubric_id:         newRubricId   || undefined,
         baseline_id:       newBaselineId || undefined,
         prompt_release_id: newSubject === "prompt_release" && newReleaseId ? newReleaseId : undefined,
+        prompt_asset_id:   selectedPromptAssetId || undefined,
       });
     },
     onSuccess: () => {
@@ -379,6 +399,7 @@ export function EvalsPage() {
       setNewRubricId("");
       setNewBaselineId("");
       setNewReleaseId("");
+      setSelectedPromptAssetId("");
       toast.success("Eval run created");
     },
     onError: (e: unknown) =>
@@ -519,6 +540,40 @@ export function EvalsPage() {
                     </select>
                   </label>
                 )}
+
+                <label className="block" data-testid="scorecard-picker-label">
+                  <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">
+                    Scorecard (optional)
+                    {scorecardsQ.isLoading && <span className="ml-1 normal-case text-gray-400">loading…</span>}
+                  </span>
+                  <select
+                    data-testid="scorecard-select"
+                    value={selectedPromptAssetId}
+                    onChange={e => setSelectedPromptAssetId(e.target.value)}
+                    className="mt-1 w-full rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-950 text-gray-700 dark:text-zinc-300 text-[12px] px-2 py-1.5 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="">— none —</option>
+                    {(scorecardsQ.data ?? []).map(sc => {
+                      const best = sc.best_task_success_rate;
+                      const label = `${sc.prompt_asset_id.slice(0, 18)}${sc.prompt_asset_id.length > 18 ? "…" : ""}`
+                        + ` (${sc.entry_count} runs`
+                        + (best !== null && best !== undefined
+                            ? `, best ${(best * 100).toFixed(1)}%`
+                            : "")
+                        + ")";
+                      return (
+                        <option key={sc.prompt_asset_id} value={sc.prompt_asset_id}>
+                          {label}
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {(scorecardsQ.data ?? []).length === 0 && !scorecardsQ.isLoading && (
+                    <span className="mt-1 block text-[10px] text-gray-400 dark:text-zinc-600">
+                      No scorecards yet. One appears per prompt asset once a run completes with prompt release + version set.
+                    </span>
+                  )}
+                </label>
 
                 <label className="block">
                   <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">

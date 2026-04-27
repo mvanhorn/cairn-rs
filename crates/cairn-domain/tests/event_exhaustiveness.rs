@@ -32,18 +32,19 @@ use cairn_domain::{
     CheckpointRecorded, CheckpointRestored, CheckpointStrategySet, CredentialId,
     CredentialKeyRotated, CredentialRevoked, CredentialStored, DecisionId, DefaultSettingCleared,
     DefaultSettingSet, EntitlementOverrideSet, EvalBaselineLocked, EvalBaselineSet,
-    EvalDatasetCreated, EvalDatasetEntryAdded, EvalRubricCreated, EvalRunCompleted, EvalRunId,
-    EvalRunStarted, EventEnvelope, EventId, EventLogCompacted, EventSource, ExecutionClass,
-    ExternalWorkerReactivated, ExternalWorkerRegistered, ExternalWorkerReported,
-    ExternalWorkerSuspended, GuardrailPolicyCreated, GuardrailPolicyEvaluated, IngestJobCompleted,
-    IngestJobId, IngestJobStarted, LicenseActivated, MailboxMessageAppended, MailboxMessageId,
-    NotificationPreferenceSet, NotificationSent, OperatorId, OperatorIntervention,
-    OperatorProfileCreated, OperatorProfileUpdated, PauseScheduled, PermissionDecisionRecorded,
-    ProjectCreated, ProjectKey, PromptAssetCreated, PromptAssetId, PromptReleaseCreated,
-    PromptReleaseId, PromptReleaseTransitioned, PromptRolloutStarted, PromptVersionCreated,
-    PromptVersionId, ProviderBindingCreated, ProviderBindingId, ProviderBindingStateChanged,
-    ProviderBudgetAlertTriggered, ProviderBudgetExceeded, ProviderBudgetSet, ProviderCallCompleted,
-    ProviderCallId, ProviderConnectionId, ProviderConnectionRegistered, ProviderHealthChecked,
+    EvalDatasetCreated, EvalDatasetEntryAdded, EvalRubricCreated, EvalRunArchived,
+    EvalRunCompleted, EvalRunId, EvalRunStarted, EventEnvelope, EventId, EventLogCompacted,
+    EventSource, ExecutionClass, ExternalWorkerReactivated, ExternalWorkerRegistered,
+    ExternalWorkerReported, ExternalWorkerSuspended, GuardrailPolicyCreated,
+    GuardrailPolicyEvaluated, IngestJobCompleted, IngestJobId, IngestJobStarted, LicenseActivated,
+    MailboxMessageAppended, MailboxMessageId, NotificationPreferenceSet, NotificationSent,
+    OperatorId, OperatorIntervention, OperatorProfileCreated, OperatorProfileUpdated,
+    PauseScheduled, PermissionDecisionRecorded, ProjectCreated, ProjectKey, PromptAssetCreated,
+    PromptAssetId, PromptReleaseCreated, PromptReleaseId, PromptReleaseTransitioned,
+    PromptRolloutStarted, PromptVersionCreated, PromptVersionId, ProviderBindingCreated,
+    ProviderBindingId, ProviderBindingStateChanged, ProviderBudgetAlertTriggered,
+    ProviderBudgetExceeded, ProviderBudgetSet, ProviderCallCompleted, ProviderCallId,
+    ProviderConnectionId, ProviderConnectionRegistered, ProviderHealthChecked,
     ProviderHealthScheduleSet, ProviderHealthScheduleTriggered, ProviderMarkedDegraded,
     ProviderModelId, ProviderModelRegistered, ProviderPoolConnectionAdded,
     ProviderPoolConnectionRemoved, ProviderPoolCreated, ProviderRecovered, ProviderRetryPolicySet,
@@ -238,6 +239,9 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
             assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
         }
         RuntimeEvent::EvalRunCompleted(_) => {
+            assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
+        }
+        RuntimeEvent::EvalRunArchived(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
         }
 
@@ -973,6 +977,11 @@ fn all_variants() -> Vec<RuntimeEvent> {
             error_message: None,
             subject_node_id: None,
             completed_at: ts,
+        }),
+        RuntimeEvent::EvalRunArchived(EvalRunArchived {
+            project: p(),
+            eval_run_id: EvalRunId::new("er1"),
+            archived_at: ts,
         }),
         RuntimeEvent::OutcomeRecorded(cairn_domain::OutcomeRecorded {
             project: p(),
@@ -1906,16 +1915,16 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 154 variants in the RuntimeEvent enum (143 baseline + F65 PR-1
+    // 155 variants in the RuntimeEvent enum (143 baseline + F65 PR-1
     // orchestrator session redesign foundation: SessionAttemptStarted,
     // SessionAttemptCompleted, CircuitBreakerTripped, BudgetThresholdCrossed,
     // CheckpointPersisted, WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
     // SessionOutcomeEmitted, OrchestratorDecisionMade, SummarizerFallback,
-    // WorkspaceBackendDegraded — 11 new variants).
+    // WorkspaceBackendDegraded — 11 new variants, plus #244's EvalRunArchived).
     assert_eq!(
         variants.len(),
-        154,
-        "all_variants() must construct exactly 154 RuntimeEvent instances"
+        155,
+        "all_variants() must construct exactly 155 RuntimeEvent instances"
     );
 }
 
