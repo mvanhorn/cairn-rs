@@ -1,9 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cairn_domain::RuntimeEvent;
+use cairn_domain::{EventEnvelope, RuntimeEvent};
 
 use crate::error::StoreError;
-use crate::event_log::StoredEvent;
 
 /// SQLite-backed synchronous projection applier for local-mode deploys.
 ///
@@ -39,16 +38,20 @@ fn log_stub(variant: &'static str) {
 
 impl SqliteSyncProjection {
     /// Async projection application within a SQLite transaction.
+    ///
+    /// Takes the envelope by reference (not a full `StoredEvent`) so the
+    /// hot append path does not need to clone the potentially-large
+    /// payload on every event — see #498.
     pub async fn apply_async(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        event: &StoredEvent,
+        envelope: &EventEnvelope<RuntimeEvent>,
     ) -> Result<(), StoreError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
 
-        match &event.envelope.payload {
+        match &envelope.payload {
             RuntimeEvent::SessionCreated(e) => {
                 // Idempotent: a second SessionCreated event for the same id
                 // must not blow up the transaction. The event log is the
@@ -389,7 +392,7 @@ impl SqliteSyncProjection {
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(event_id) DO NOTHING",
                 )
-                .bind(event.envelope.event_id.as_str())
+                .bind(envelope.event_id.as_str())
                 .bind(e.project.tenant_id.as_str())
                 .bind(e.project.workspace_id.as_str())
                 .bind(e.project.project_id.as_str())
@@ -410,7 +413,7 @@ impl SqliteSyncProjection {
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(event_id) DO NOTHING",
                 )
-                .bind(event.envelope.event_id.as_str())
+                .bind(envelope.event_id.as_str())
                 .bind(e.project.tenant_id.as_str())
                 .bind(e.project.workspace_id.as_str())
                 .bind(e.project.project_id.as_str())

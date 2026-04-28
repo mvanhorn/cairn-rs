@@ -1,9 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cairn_domain::{tool_invocation::ToolInvocationOutcomeKind, RuntimeEvent};
+use cairn_domain::{tool_invocation::ToolInvocationOutcomeKind, EventEnvelope, RuntimeEvent};
 
 use crate::error::StoreError;
-use crate::event_log::StoredEvent;
 
 /// Postgres-backed synchronous projection applier.
 ///
@@ -14,18 +13,21 @@ pub struct PgSyncProjection;
 impl PgSyncProjection {
     /// Async projection application within a transaction.
     ///
-    /// This is the real implementation used by PgEventLog when it
-    /// appends events within a transaction.
+    /// This is the real implementation used by `PgEventLog::append` when it
+    /// appends events within a transaction. Takes the envelope by reference
+    /// (not a full `StoredEvent`) so the hot append path does not need to
+    /// clone the potentially-large payload (CheckpointCreated snapshots can
+    /// be hundreds of KB per event) — see #497.
     pub async fn apply_async(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        event: &StoredEvent,
+        envelope: &EventEnvelope<RuntimeEvent>,
     ) -> Result<(), StoreError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
 
-        match &event.envelope.payload {
+        match &envelope.payload {
             RuntimeEvent::SessionCreated(e) => {
                 sqlx::query(
                     "INSERT INTO sessions (session_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at)
@@ -355,7 +357,7 @@ impl PgSyncProjection {
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                      ON CONFLICT (event_id) DO NOTHING",
                 )
-                .bind(event.envelope.event_id.as_str())
+                .bind(envelope.event_id.as_str())
                 .bind(e.project.tenant_id.as_str())
                 .bind(e.project.workspace_id.as_str())
                 .bind(e.project.project_id.as_str())
@@ -376,7 +378,7 @@ impl PgSyncProjection {
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                      ON CONFLICT (event_id) DO NOTHING",
                 )
-                .bind(event.envelope.event_id.as_str())
+                .bind(envelope.event_id.as_str())
                 .bind(e.project.tenant_id.as_str())
                 .bind(e.project.workspace_id.as_str())
                 .bind(e.project.project_id.as_str())

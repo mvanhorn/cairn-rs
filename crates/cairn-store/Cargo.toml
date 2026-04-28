@@ -21,7 +21,8 @@ version = "1"
 features = ["sync"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = "3"
 
 [features]
 default = []

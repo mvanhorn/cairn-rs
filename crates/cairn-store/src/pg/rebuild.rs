@@ -79,7 +79,7 @@ impl ProjectionRebuilder {
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
 
             for event in &events {
-                match PgSyncProjection::apply_async(&mut tx, event).await {
+                match PgSyncProjection::apply_async(&mut tx, &event.envelope).await {
                     Ok(()) => {}
                     Err(_e) => {
                         total_errors += 1;
@@ -132,7 +132,7 @@ impl ProjectionRebuilder {
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
 
             for event in &events {
-                match PgSyncProjection::apply_async(&mut tx, event).await {
+                match PgSyncProjection::apply_async(&mut tx, &event.envelope).await {
                     Ok(()) => {}
                     Err(_e) => {
                         total_errors += 1;

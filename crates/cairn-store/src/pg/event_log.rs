@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::PgPool;
+use sqlx::{PgPool, QueryBuilder};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cairn_domain::{EventEnvelope, RuntimeEvent};
@@ -7,6 +7,24 @@ use cairn_domain::{EventEnvelope, RuntimeEvent};
 use super::projections::PgSyncProjection;
 use crate::error::StoreError;
 use crate::event_log::{EntityRef, EventLog, EventPosition, StoredEvent};
+
+/// Maximum events per multi-row `INSERT`. Keeps the total host-parameter
+/// count conservatively below backend limits:
+///
+/// - Postgres caps query parameters at 65535 (i16); 100 events × 8 columns =
+///   800, giving ~80× headroom.
+/// - SQLite defaults to 32766 on modern builds (≥ 3.32) but historically
+///   999. 100 × 8 = 800 stays under the legacy 999 limit too so the same
+///   chunk size works identically on both backends — important because
+///   the SQL shape has to stay portable per the "no DB-specific
+///   features" rule.
+///
+/// For bursts of ≤ 100 events (almost all production traffic — a
+/// checkpoint flush, a tool-result fanout, a recovery replay batch)
+/// this is still a single round trip. For mega-bursts the insert
+/// stays in one transaction; we just loop the INSERT statement inside
+/// the existing tx.
+const BATCH_INSERT_CHUNK: usize = 100;
 
 /// Postgres-backed append-only event log.
 ///
@@ -37,55 +55,155 @@ impl EventLog for PgEventLog {
             .unwrap_or_default()
             .as_millis() as i64;
 
+        // Pre-serialize JSON columns so the transaction-holding code path
+        // touches zero allocation hot spots after we start the tx. Any
+        // serialization failure is a caller bug (event payloads are always
+        // serializable) but we still surface it cleanly.
+        struct Row<'a> {
+            event_id: &'a str,
+            source_type: &'static str,
+            source_meta: serde_json::Value,
+            ownership: serde_json::Value,
+            causation_id: Option<&'a str>,
+            correlation_id: Option<&'a str>,
+            payload: serde_json::Value,
+        }
+
+        // Reject duplicate event_ids *before* touching the database so the
+        // caller gets a clear domain error instead of a cryptic
+        // `duplicate key value violates unique constraint` from Postgres.
+        // The schema's `event_id TEXT NOT NULL UNIQUE` (V001) is the
+        // ultimate guard — this check is a defense in depth that also
+        // prevents the client-side reorder HashMap (below) from aliasing
+        // two input slots to the same position when an upstream bug
+        // somehow produces a duplicate. Gemini flagged the HashMap's
+        // unique-key assumption on the first review pass (#539); this
+        // is the explicit, auditable version of that invariant.
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(events.len());
+        for event in events {
+            if !seen.insert(event.event_id.as_str()) {
+                return Err(StoreError::Internal(format!(
+                    "duplicate event_id {} in single append batch",
+                    event.event_id.as_str()
+                )));
+            }
+        }
+
+        let mut rows: Vec<Row<'_>> = Vec::with_capacity(events.len());
+        for event in events {
+            rows.push(Row {
+                event_id: event.event_id.as_str(),
+                source_type: source_type_str(&event.source),
+                source_meta: serde_json::to_value(&event.source)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?,
+                ownership: serde_json::to_value(&event.ownership)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?,
+                causation_id: event.causation_id.as_ref().map(|id| id.as_str()),
+                correlation_id: event.correlation_id.as_deref(),
+                payload: serde_json::to_value(&event.payload)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?,
+            });
+        }
+
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
 
+        // ── Batched multi-row INSERT ──────────────────────────────────────
+        //
+        // Invariants enforced by this block:
+        //
+        // 1. **One transaction per call.** All chunks commit together;
+        //    partial batches must never be observable.
+        // 2. **Portable SQL shape.** `INSERT ... VALUES (…),(…),… RETURNING
+        //    position, event_id` works identically on Postgres and SQLite;
+        //    no JSONB / array / backend-specific DML.
+        // 3. **Client-side reorder via `event_id`.** The SQL spec does
+        //    not guarantee RETURNING row order, so we match each input
+        //    event's event_id against the returned set. Both pg and
+        //    sqlite currently preserve insertion order but tests must
+        //    not rely on that.
+        // 4. **Chunk size ≤ `BATCH_INSERT_CHUNK`.** Keeps the host-
+        //    parameter count below every supported backend's cap
+        //    (Postgres 65535, legacy SQLite 999). All chunks share the
+        //    enclosing transaction; projection atomicity is unchanged.
+        let mut all_returned: Vec<(i64, String)> = Vec::with_capacity(events.len());
+
+        for chunk in rows.chunks(BATCH_INSERT_CHUNK) {
+            let mut builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                "INSERT INTO event_log (event_id, source_type, source_meta, ownership, causation_id, correlation_id, payload, stored_at) ",
+            );
+            builder.push_values(chunk.iter(), |mut b, row| {
+                b.push_bind(row.event_id)
+                    .push_bind(row.source_type)
+                    .push_bind(&row.source_meta)
+                    .push_bind(&row.ownership)
+                    .push_bind(row.causation_id)
+                    .push_bind(row.correlation_id)
+                    .push_bind(&row.payload)
+                    .push_bind(now);
+            });
+            builder.push(" RETURNING position, event_id");
+
+            let returned: Vec<(i64, String)> = builder
+                .build_query_as()
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+            if returned.len() != chunk.len() {
+                return Err(StoreError::Internal(format!(
+                    "event_log batch INSERT returned {} rows for {} events in chunk",
+                    returned.len(),
+                    chunk.len()
+                )));
+            }
+
+            all_returned.extend(returned);
+        }
+
+        if all_returned.len() != events.len() {
+            return Err(StoreError::Internal(format!(
+                "event_log batch INSERT returned {} rows for {} events",
+                all_returned.len(),
+                events.len()
+            )));
+        }
+
+        // Re-order returned (position, event_id) to match the input event
+        // order. Input uniqueness has been verified above, so every input
+        // event_id has exactly one entry in the returned set.
+        let mut by_event_id: std::collections::HashMap<&str, i64> =
+            std::collections::HashMap::with_capacity(all_returned.len());
+        for (pos, eid) in &all_returned {
+            by_event_id.insert(eid.as_str(), *pos);
+        }
+
         let mut positions = Vec::with_capacity(events.len());
-
         for event in events {
-            let event_id = event.event_id.as_str();
-            let source_type = source_type_str(&event.source);
-            let source_meta = serde_json::to_value(&event.source)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let ownership = serde_json::to_value(&event.ownership)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let payload = serde_json::to_value(&event.payload)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let pos = by_event_id.get(event.event_id.as_str()).ok_or_else(|| {
+                StoreError::Internal(format!(
+                    "event_log batch INSERT did not return event_id {}",
+                    event.event_id.as_str()
+                ))
+            })?;
+            positions.push(EventPosition(*pos as u64));
+        }
 
-            let row: (i64,) = sqlx::query_as(
-                "INSERT INTO event_log (event_id, source_type, source_meta, ownership, causation_id, correlation_id, payload, stored_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                 RETURNING position",
-            )
-            .bind(event_id)
-            .bind(source_type)
-            .bind(source_meta)
-            .bind(ownership)
-            .bind(event.causation_id.as_ref().map(|id| id.as_str()))
-            .bind(event.correlation_id.as_deref())
-            .bind(payload)
-            .bind(now)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-            let pos = EventPosition(row.0 as u64);
-
-            // Apply synchronous projections within the same transaction.
-            // This guarantees that current-state tables (sessions, runs, tasks, …)
-            // are always consistent with the event log — reads can never see a
-            // position that hasn't been projected yet.
-            let stored = StoredEvent {
-                position: pos,
-                envelope: event.clone(),
-                stored_at: now as u64,
-            };
-            PgSyncProjection::apply_async(&mut tx, &stored).await?;
-
-            positions.push(pos);
+        // Apply synchronous projections within the same transaction.
+        // This guarantees current-state tables (sessions, runs, tasks,
+        // …) are always consistent with the event log — reads can never
+        // observe a position that has not been projected.
+        //
+        // Iteration is over the borrowed input slice; `apply_async`
+        // takes `&EventEnvelope` so no clone of the potentially large
+        // payload (e.g. CheckpointCreated snapshots) is needed on the
+        // hot append path.
+        for event in events {
+            PgSyncProjection::apply_async(&mut tx, event).await?;
         }
 
         tx.commit()
