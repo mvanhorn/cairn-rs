@@ -2108,6 +2108,13 @@ export function createApiClient(config: ApiClientConfig) {
     importSession: (exportData: unknown): Promise<import("./types").SessionRecord> =>
       post("/v1/sessions/import", exportData),
 
+    /** DELETE /v1/sessions/:id/snapshots — F65 PR-5 admin-only reap of all
+     * workspace snapshots for a session. Returns `{reaped, at_ms}`. */
+    deleteSessionSnapshots: (
+      sessionId: string,
+    ): Promise<import("./types").SnapshotReapResponse> =>
+      del(`/v1/sessions/${encodeURIComponent(sessionId)}/snapshots`),
+
     // ── Notifications ─────────────────────────────────────────────────────────
 
     /** GET /v1/notifications?limit=50 — list recent notifications with unread count. */

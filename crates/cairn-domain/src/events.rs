@@ -313,6 +313,9 @@ pub enum RuntimeEvent {
     OrchestratorDecisionMade(OrchestratorDecisionMade),
     SummarizerFallback(SummarizerFallback),
     WorkspaceBackendDegraded(WorkspaceBackendDegraded),
+    /// F65 PR-5 (#359): crash-recovery sweep successfully unmounted a
+    /// dangling overlay mount the previous cairn-app process left behind.
+    SandboxCrashRecovered(SandboxCrashRecovered),
 }
 
 impl RuntimeEvent {
@@ -394,6 +397,7 @@ impl RuntimeEvent {
             RuntimeEvent::OrchestratorDecisionMade(event) => &event.project,
             RuntimeEvent::SummarizerFallback(event) => &event.project,
             RuntimeEvent::WorkspaceBackendDegraded(event) => &event.project,
+            RuntimeEvent::SandboxCrashRecovered(event) => &event.project,
             RuntimeEvent::TriggerCreated(event) => &event.project,
             RuntimeEvent::TriggerEnabled(event) => &event.project,
             RuntimeEvent::TriggerDisabled(event) => &event.project,
@@ -781,6 +785,9 @@ impl RuntimeEvent {
                 session_id: event.session_id.clone(),
             }),
             RuntimeEvent::WorkspaceBackendDegraded(event) => Some(RuntimeEntityRef::Session {
+                session_id: event.session_id.clone(),
+            }),
+            RuntimeEvent::SandboxCrashRecovered(event) => Some(RuntimeEntityRef::Session {
                 session_id: event.session_id.clone(),
             }),
         }
@@ -2852,6 +2859,24 @@ pub struct WorkspaceBackendDegraded {
     /// Reason for the downgrade (e.g. `overlayfs_unavailable`,
     /// `reflink_unsupported_fs`).
     pub reason: String,
+    pub at_ms: u64,
+}
+
+/// F65 PR-5 (#359): the crash-recovery sweep detected a dangling overlayfs
+/// mount whose owning cairn-app process did not cleanly unmount it before
+/// exiting, and successfully unmounted it via `umount2(MNT_DETACH)`.
+///
+/// Emitted exactly once per recovered mount so operators get a distinct
+/// alerting surface for crash-derived state (orthogonal to
+/// `WorkspaceBackendDegraded`, which signals per-snapshot FS quality
+/// degradation). The bound `session_id` / `run_id` come from the recovery
+/// registry sidecar; operators see which session's mount survived the
+/// crash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxCrashRecovered {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    pub run_id: crate::ids::RunId,
     pub at_ms: u64,
 }
 

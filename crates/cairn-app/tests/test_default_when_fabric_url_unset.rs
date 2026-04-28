@@ -35,6 +35,10 @@ async fn default_to_localhost_6379_when_cairn_fabric_url_unset() {
         .arg("127.0.0.1")
         .arg("--db")
         .arg("memory")
+        // F65 PR-5: CI runners block unprivileged userns; skip the
+        // probe gate so this test can exercise FabricConfig defaults
+        // without the boot probe refusing to start.
+        .arg("--allow-missing-sandbox-primitives")
         // Explicitly remove any inherited CAIRN_FABRIC_URL so the
         // default-path arm in `FabricConfig::from_env` fires.
         .env_remove("CAIRN_FABRIC_URL")

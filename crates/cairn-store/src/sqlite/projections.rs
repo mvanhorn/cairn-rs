@@ -1375,6 +1375,10 @@ impl SqliteSyncProjection {
             RuntimeEvent::OrchestratorDecisionMade(_) => {}
             RuntimeEvent::SummarizerFallback(_) => {}
             RuntimeEvent::WorkspaceBackendDegraded(_) => {}
+            // F65 PR-5 (#359): crash-recovery umount sweep is an operator
+            // observability surface (SSE + metrics) with no projection
+            // table — the event log itself is the audit trail.
+            RuntimeEvent::SandboxCrashRecovered(_) => {}
         }
 
         Ok(())

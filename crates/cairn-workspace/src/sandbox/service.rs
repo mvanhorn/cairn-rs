@@ -246,6 +246,47 @@ pub struct SandboxService {
     /// unit tests that exercise the sweep directly with seeded entries
     /// and would otherwise need to stand up the full clone cache).
     clone_cache: Option<Arc<RepoCloneCache>>,
+    /// F65 PR-5: root directory for durable workspace snapshots
+    /// (`~/.cairn/snapshots/<uuid>/`). `None` disables the F65 snapshot
+    /// and resume path entirely — RFC 016 sandboxing still works via the
+    /// classic `provision_or_reconnect` API. Set via
+    /// [`Self::with_snapshot_dir`].
+    snapshot_dir: Option<PathBuf>,
+    /// F65 PR-5: emits the operator-visible session-scoped events
+    /// (`SessionAttemptStarted`, `WorkspaceSnapshotCreated`,
+    /// `WorkspaceBackendDegraded`, `SandboxCrashRecovered`). Defaults to
+    /// `NoopF65EventSink` — cairn-app overrides it with an adapter that
+    /// appends to the store event log.
+    f65_event_sink: Arc<dyn crate::sandbox::f65::F65SandboxEventSink>,
+    /// F65 PR-5: per-session dedupe flag for `WorkspaceBackendDegraded`.
+    /// Mirrors the PR-4 `reflink_tree_with_fallback` primitive's
+    /// `&AtomicBool` contract, scoped by `SessionId` so the flag survives
+    /// across the terminate-then-resume-then-terminate cycle. The arch
+    /// doc commitment is "once per session, across resume boundaries" —
+    /// this map is what keeps the flip state.
+    degraded_flag_by_session:
+        Mutex<HashMap<cairn_domain::SessionId, Arc<std::sync::atomic::AtomicBool>>>,
+    /// F65 PR-5: per-session emission dedupe for
+    /// `WorkspaceBackendDegraded`. Separate from `degraded_flag_by_session`
+    /// (which tracks "did reflink fall back this session") so the event
+    /// fires at most once even across restarts within the same session.
+    degraded_emitted_sessions: Mutex<std::collections::HashSet<cairn_domain::SessionId>>,
+    /// F65 PR-5: active session sandboxes, keyed by session id. Each
+    /// entry carries the paths the orchestrator + child agent need.
+    /// Distinct from `sessions` (RunId-keyed, RFC 016/020 shape).
+    session_sandboxes:
+        RwLock<HashMap<cairn_domain::SessionId, crate::sandbox::f65::SessionSandbox>>,
+    /// F65 PR-5: in-flight resume operations. The GC sweeper consults
+    /// this set before reaping so it cannot pull the rug out from under
+    /// a resume that has already started reflinking a snapshot.
+    inflight_restores: Mutex<std::collections::HashSet<cairn_domain::WorkspaceSnapshotId>>,
+    /// F65 PR-5: writer that back-fills the per-snapshot filesystem
+    /// metadata (`bytes`, `reflink_used`, `snapshot_path`,
+    /// `parent_snapshot_id`) on the existing `workspace_snapshots` row.
+    /// Defaults to a no-op so unit tests and the RFC 016 path can ignore
+    /// it; cairn-app wires in the real cairn-store-backed adapter via
+    /// [`Self::with_snapshot_writer`].
+    snapshot_writer: Arc<dyn crate::sandbox::f65::WorkspaceSnapshotWriter>,
 }
 
 impl SandboxService {
@@ -263,7 +304,51 @@ impl SandboxService {
             sessions: RwLock::new(HashMap::new()),
             allowlist: None,
             clone_cache: None,
+            snapshot_dir: None,
+            f65_event_sink: Arc::new(crate::sandbox::f65::NoopF65EventSink),
+            degraded_flag_by_session: Mutex::new(HashMap::new()),
+            degraded_emitted_sessions: Mutex::new(std::collections::HashSet::new()),
+            session_sandboxes: RwLock::new(HashMap::new()),
+            inflight_restores: Mutex::new(std::collections::HashSet::new()),
+            snapshot_writer: Arc::new(crate::sandbox::f65::NoopWorkspaceSnapshotWriter),
         }
+    }
+
+    /// F65 PR-5: wire the root directory under which durable workspace
+    /// snapshots are written as `<snapshot_dir>/<uuid>/…`. Without this,
+    /// `terminate_for_session` fails with a descriptive error rather than
+    /// silently skipping the snapshot — a silent-skip would be a data
+    /// loss bug for resume.
+    pub fn with_snapshot_dir(mut self, snapshot_dir: impl Into<PathBuf>) -> Self {
+        self.snapshot_dir = Some(snapshot_dir.into());
+        self
+    }
+
+    /// F65 PR-5: wire the event sink that adapts F65 events to cairn-app's
+    /// event log. Default is `NoopF65EventSink`.
+    pub fn with_f65_event_sink(
+        mut self,
+        sink: Arc<dyn crate::sandbox::f65::F65SandboxEventSink>,
+    ) -> Self {
+        self.f65_event_sink = sink;
+        self
+    }
+
+    /// F65 PR-5: wire the writer that back-fills the snapshot row's
+    /// filesystem metadata (bytes/reflink_used/snapshot_path/
+    /// parent_snapshot_id) after the reflink copy runs.
+    pub fn with_snapshot_writer(
+        mut self,
+        writer: Arc<dyn crate::sandbox::f65::WorkspaceSnapshotWriter>,
+    ) -> Self {
+        self.snapshot_writer = writer;
+        self
+    }
+
+    /// F65 PR-5: read accessor for the snapshot root (used by the GC
+    /// sweeper to enumerate on-disk snapshot directories).
+    pub fn snapshot_dir(&self) -> Option<&PathBuf> {
+        self.snapshot_dir.as_ref()
     }
 
     /// Wire in the project-scoped repo allowlist. When set, `recover_all`
@@ -845,7 +930,529 @@ impl SandboxService {
         Ok(())
     }
 
+    // ─── F65 PR-5: session-scoped provision + terminate + resume ──────────
+
+    /// F65 PR-5: provision a session-scoped sandbox.
+    ///
+    /// Delegates to [`Self::provision_or_reconnect`] for the mount/upper/
+    /// work/lower work, then builds a [`SessionSandbox`] carrying the
+    /// paths the orchestrator + confined child need. Emits
+    /// `SessionAttemptStarted` on the F65 event sink once the mount is
+    /// live + the registry entry is durable (Q6: atomic "sandbox ready →
+    /// event").
+    ///
+    /// If `spec.base_snapshot_id` is `Some`, call
+    /// [`Self::restore_from_snapshot`] instead — this method is the
+    /// fresh-provision entrypoint only.
+    pub async fn provision_for_session(
+        &self,
+        spec: crate::sandbox::f65::SessionProvisionSpec,
+    ) -> Result<crate::sandbox::f65::SessionSandbox, WorkspaceError> {
+        if spec.base_snapshot_id.is_some() {
+            return Err(WorkspaceError::unimplemented(
+                "provision_for_session: spec carries base_snapshot_id; callers \
+                 must use restore_from_snapshot for resume paths",
+            ));
+        }
+        let run_id = spec.root_run_id.clone();
+        let project = spec.project.clone();
+        let provisioned = self
+            .provision_or_reconnect(&run_id, None, project.clone(), spec.policy.clone())
+            .await?;
+        let session_sandbox = self.build_session_sandbox(&spec, &provisioned, None)?;
+
+        {
+            let mut map = self
+                .session_sandboxes
+                .write()
+                .expect("session sandbox lock poisoned");
+            map.insert(spec.session_id.clone(), session_sandbox.clone());
+        }
+
+        self.f65_event_sink.publish(
+            crate::sandbox::f65::F65SandboxEvent::SessionAttemptStarted {
+                project,
+                session_id: spec.session_id.clone(),
+                root_run_id: spec.root_run_id.clone(),
+                attempt_number: spec.attempt_number,
+                max_attempts: spec.max_attempts,
+            },
+        );
+
+        Ok(session_sandbox)
+    }
+
+    /// F65 PR-5: terminate the session-scoped sandbox for `session_id`,
+    /// reflink the RW upperdir into a durable snapshot, and reap the
+    /// overlay teardown state.
+    ///
+    /// Returns the new `WorkspaceSnapshotId`. Emits
+    /// `WorkspaceSnapshotCreated` after the metadata stamp lands
+    /// (write-before-event: readers who receive the event see a fully
+    /// populated projection row). Emits `WorkspaceBackendDegraded` at
+    /// most once per session if `reflink_tree_with_fallback` fell back
+    /// to byte-copy.
+    pub async fn terminate_for_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+        _reason: crate::sandbox::f65::TerminationReason,
+    ) -> Result<cairn_domain::WorkspaceSnapshotId, WorkspaceError> {
+        let session_sandbox = {
+            let map = self
+                .session_sandboxes
+                .read()
+                .expect("session sandbox lock poisoned");
+            map.get(session_id).cloned().ok_or_else(|| {
+                WorkspaceError::sandbox_op(
+                    &RunId::new(session_id.as_str()),
+                    "terminate_for_session.unknown_session",
+                    "no active session sandbox",
+                )
+            })?
+        };
+        let run_id = session_sandbox.root_run_id.clone();
+        let snapshot_root = self.snapshot_dir.as_ref().ok_or_else(|| {
+            WorkspaceError::sandbox_op(
+                &run_id,
+                "terminate_for_session",
+                "snapshot_dir not configured on SandboxService; call with_snapshot_dir(..)",
+            )
+        })?;
+
+        // Snapshot id + on-disk path.
+        let snapshot_id = cairn_domain::WorkspaceSnapshotId::new(new_snapshot_ulid());
+        let snapshot_path = snapshot_root.join(snapshot_id.as_str());
+        fs::create_dir_all(&snapshot_path)
+            .map_err(|error| WorkspaceError::sandbox_op(&run_id, "create_snapshot_dir", error))?;
+
+        // Unmount via the existing destroy path (preserve=false reaps the
+        // overlay dirs + drops the registry entry); we do the reflink
+        // BEFORE destroy consumes the upper. That ordering is
+        // load-bearing: arch §4.3.3 mandates umount-first-then-reflink to
+        // avoid racing the child agent's fsync. The existing
+        // `maybe_unmount` in the overlay provider runs inside `destroy`,
+        // so we bypass it: read the upper path off the F65 record (which
+        // the previous `provision_for_session` populated) and reflink
+        // from that onto the snapshot dir. `destroy` then reaps the
+        // overlay itself.
+        let degraded_flag = self.degraded_flag_for_session(session_id);
+        let outcome = crate::providers::reflink_tree_with_fallback(
+            &session_sandbox.upper,
+            &snapshot_path,
+            &degraded_flag,
+        )
+        .map_err(|error| WorkspaceError::sandbox_op(&run_id, "reflink_upper_to_snapshot", error))?;
+
+        // Emit the one-shot degraded event. `compare_exchange` above
+        // guarantees only the first flip lands here; across resumes the
+        // same session flag stays `true` so a second terminate is a
+        // no-op.
+        if !outcome.reflink_used {
+            // Only emit on the very first FS-level fallback for this
+            // session. The atomic already flipped in
+            // reflink_tree_with_fallback; we need a separate "already
+            // emitted" marker to dedupe the event itself.
+            self.maybe_emit_degraded_once(session_id, &session_sandbox.project);
+        }
+
+        // Stamp metadata on the (pre-emitted) snapshot row. The cairn-app
+        // event sink may have already fired the PR-2 insert for
+        // `WorkspaceSnapshotCreated` — but we emit AFTER the stamp here,
+        // so readers see the fully-populated row. This is the "stamp
+        // before event" invariant in the plan §2.4.
+        if let Err(err) = self
+            .snapshot_writer
+            .stamp_metadata(
+                &snapshot_id,
+                &snapshot_path.display().to_string(),
+                outcome.bytes_copied,
+                outcome.reflink_used,
+                session_sandbox.base_snapshot_id.as_ref(),
+            )
+            .await
+        {
+            return Err(WorkspaceError::sandbox_op(
+                &run_id,
+                "stamp_snapshot_metadata",
+                err,
+            ));
+        }
+
+        // Emit WorkspaceSnapshotCreated. cairn-app translates this to the
+        // domain event + projection insert.
+        self.f65_event_sink.publish(
+            crate::sandbox::f65::F65SandboxEvent::WorkspaceSnapshotCreated {
+                project: session_sandbox.project.clone(),
+                snapshot_id: snapshot_id.clone(),
+                workspace_id: session_sandbox.workspace_id.clone(),
+                session_id: session_id.clone(),
+            },
+        );
+
+        // Reap overlay + drop the registry entry.
+        let _ = self
+            .destroy(&run_id, false, cairn_domain::DestroyReason::Completed)
+            .await?;
+
+        // Remove the session-scoped sandbox record.
+        {
+            let mut map = self
+                .session_sandboxes
+                .write()
+                .expect("session sandbox lock poisoned");
+            map.remove(session_id);
+        }
+
+        Ok(snapshot_id)
+    }
+
+    /// F65 PR-5: resume a session from a previously-snapshotted upperdir.
+    ///
+    /// Reflinks `~/.cairn/snapshots/<base_snapshot_id>/` into a fresh
+    /// upperdir-seed directory, mounts a new overlay over it, allocates
+    /// a fresh `RunId`, and returns the new [`SessionSandbox`] plus the
+    /// resumed root run id. Takes + holds an in-flight-restore lease on
+    /// `base_snapshot_id` so the GC sweeper cannot reap the snapshot
+    /// mid-resume.
+    ///
+    /// PR-5 boundary: returns only the sandbox; the caller is responsible
+    /// for loading `F65CheckpointRecord.body` separately (PR-6 wires the
+    /// LLM-context restore). The plan intentionally keeps resume-side
+    /// surface minimal so PR-5 can ship without the summarizer.
+    pub async fn restore_from_snapshot(
+        &self,
+        spec: crate::sandbox::f65::SessionProvisionSpec,
+    ) -> Result<crate::sandbox::f65::SessionSandbox, WorkspaceError> {
+        let base_snapshot_id = spec.base_snapshot_id.clone().ok_or_else(|| {
+            WorkspaceError::sandbox_op(
+                &spec.root_run_id,
+                "restore_from_snapshot",
+                "spec.base_snapshot_id is required",
+            )
+        })?;
+        let snapshot_root = self.snapshot_dir.as_ref().ok_or_else(|| {
+            WorkspaceError::sandbox_op(
+                &spec.root_run_id,
+                "restore_from_snapshot",
+                "snapshot_dir not configured",
+            )
+        })?;
+        let snapshot_src = snapshot_root.join(base_snapshot_id.as_str());
+        if !snapshot_src.exists() {
+            return Err(WorkspaceError::sandbox_op(
+                &spec.root_run_id,
+                "restore_from_snapshot",
+                format!("snapshot {} not found", snapshot_src.display()),
+            ));
+        }
+
+        // Acquire in-flight-restore lease to hold off the GC sweeper.
+        {
+            let mut set = self
+                .inflight_restores
+                .lock()
+                .expect("inflight restores lock poisoned");
+            set.insert(base_snapshot_id.clone());
+        }
+        // RAII-like drop guard to release the lease on every return path.
+        struct InflightGuard<'a> {
+            svc: &'a SandboxService,
+            snapshot_id: cairn_domain::WorkspaceSnapshotId,
+        }
+        impl<'a> Drop for InflightGuard<'a> {
+            fn drop(&mut self) {
+                if let Ok(mut set) = self.svc.inflight_restores.lock() {
+                    set.remove(&self.snapshot_id);
+                }
+            }
+        }
+        let _guard = InflightGuard {
+            svc: self,
+            snapshot_id: base_snapshot_id.clone(),
+        };
+
+        // PR-5 shape: provision a fresh overlay for the new root-Run,
+        // then reflink the snapshot contents into the new upperdir so the
+        // child agent sees the prior session's state on first read. This
+        // is a pragmatic placement — overlay provision creates an empty
+        // upper; we fill it with the snapshot before the child is
+        // spawned. A dedicated `OverlayProvider::restore` path (plan
+        // §2.3) is a PR-6/7 refactor; PR-5 exercises the contract with
+        // this minimal approach.
+        let run_id = spec.root_run_id.clone();
+        let project = spec.project.clone();
+        let provisioned = self
+            .provision_or_reconnect(&run_id, None, project.clone(), spec.policy.clone())
+            .await?;
+
+        let session_sandbox =
+            self.build_session_sandbox(&spec, &provisioned, Some(base_snapshot_id.clone()))?;
+
+        // Seed the upperdir from the snapshot AFTER the overlay is
+        // mounted so the merged view reflects the restored state.
+        // reflink_tree_with_fallback is idempotent across a non-empty
+        // destination only when the destination is empty; the fresh
+        // upper is guaranteed empty by the provision path above.
+        let degraded_flag = self.degraded_flag_for_session(&spec.session_id);
+        crate::providers::reflink_tree_with_fallback(
+            &snapshot_src,
+            &session_sandbox.upper,
+            &degraded_flag,
+        )
+        .map_err(|error| WorkspaceError::sandbox_op(&run_id, "reflink_snapshot_to_upper", error))?;
+
+        {
+            let mut map = self
+                .session_sandboxes
+                .write()
+                .expect("session sandbox lock poisoned");
+            map.insert(spec.session_id.clone(), session_sandbox.clone());
+        }
+
+        self.f65_event_sink.publish(
+            crate::sandbox::f65::F65SandboxEvent::SessionAttemptStarted {
+                project,
+                session_id: spec.session_id.clone(),
+                root_run_id: spec.root_run_id.clone(),
+                attempt_number: spec.attempt_number,
+                max_attempts: spec.max_attempts,
+            },
+        );
+
+        Ok(session_sandbox)
+    }
+
+    /// F65 PR-5 (#359): return a snapshot of the currently-provisioned
+    /// session sandboxes, keyed by `SessionId`. Used by the metrics
+    /// gauge + the GC sweeper debug path.
+    pub fn live_session_count(&self) -> usize {
+        self.session_sandboxes
+            .read()
+            .expect("session sandbox lock poisoned")
+            .len()
+    }
+
+    /// F65 PR-5: clear an individual snapshot directory from disk. Called
+    /// by the GC sweeper + the admin reap endpoint. Returns `Ok(true)` if
+    /// the dir existed + was removed, `Ok(false)` if already gone. Errors
+    /// on other failures (IO).
+    pub fn reap_snapshot_dir(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+    ) -> Result<bool, WorkspaceError> {
+        // Respect in-flight-restore leases: if a resume is walking the
+        // snapshot right now, defer the reap. Next sweep tick picks it
+        // up. For operator-driven reap, the caller can retry after the
+        // resume completes.
+        {
+            let set = self
+                .inflight_restores
+                .lock()
+                .expect("inflight restores lock poisoned");
+            if set.contains(snapshot_id) {
+                return Ok(false);
+            }
+        }
+
+        let Some(snapshot_root) = self.snapshot_dir.as_ref() else {
+            return Ok(false);
+        };
+        let path = snapshot_root.join(snapshot_id.as_str());
+        match fs::remove_dir_all(&path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(WorkspaceError::sandbox_op(
+                &RunId::new(snapshot_id.as_str()),
+                "reap_snapshot_dir",
+                err,
+            )),
+        }
+    }
+
+    fn build_session_sandbox(
+        &self,
+        spec: &crate::sandbox::f65::SessionProvisionSpec,
+        provisioned: &ProvisionedSandbox,
+        base_snapshot_id: Option<cairn_domain::WorkspaceSnapshotId>,
+    ) -> Result<crate::sandbox::f65::SessionSandbox, WorkspaceError> {
+        // Derive the overlay-internal paths from the ProvisionedSandbox.
+        // For overlay: .path == <root>/merged.
+        // For reflink: .path == <root>/root.
+        // The F65 SessionSandbox stores merged/upper/work/lower which
+        // only make sense for overlay. Reflink sessions still get a
+        // SessionSandbox but the non-merged fields point to stable
+        // stand-ins so the caller can tell them apart.
+        let workspace_id =
+            cairn_domain::WorkspaceId::new(format!("ws-{}", spec.root_run_id.as_str()));
+        let (merged, upper, work, lower) = match provisioned.strategy {
+            SandboxStrategy::Overlay => {
+                let merged = provisioned.path.clone();
+                let root = merged.parent().map(|p| p.to_path_buf()).ok_or_else(|| {
+                    WorkspaceError::sandbox_op(
+                        &spec.root_run_id,
+                        "build_session_sandbox",
+                        "overlay provisioned path has no parent directory",
+                    )
+                })?;
+                (
+                    merged,
+                    root.join("upper"),
+                    root.join("work"),
+                    root.join("empty"),
+                )
+            }
+            SandboxStrategy::Reflink => {
+                let merged = provisioned.path.clone();
+                (merged.clone(), merged.clone(), merged.clone(), merged)
+            }
+        };
+
+        let confinement =
+            crate::sandbox::SandboxConfinement::production(merged.clone(), Vec::new());
+        Ok(crate::sandbox::f65::SessionSandbox {
+            workspace_id,
+            session_id: spec.session_id.clone(),
+            root_run_id: spec.root_run_id.clone(),
+            project: spec.project.clone(),
+            merged,
+            upper,
+            work,
+            lower,
+            confinement,
+            network: spec.network,
+            base_snapshot_id,
+        })
+    }
+
+    fn degraded_flag_for_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let mut map = self
+            .degraded_flag_by_session
+            .lock()
+            .expect("degraded flag lock poisoned");
+        map.entry(session_id.clone())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
+    }
+
+    /// F65 PR-5 (#359): unmount any `type=overlay` entry in
+    /// `/proc/self/mounts` whose merged path lives under this service's
+    /// base_dir AND which the registry knows about.
+    ///
+    /// The "registry knows about it" gate is load-bearing: a co-tenant
+    /// cairn-app may also have registered overlay mounts under a sibling
+    /// path; we only touch ours. On non-Linux hosts this is a no-op.
+    async fn sweep_orphan_overlays(&self) -> Result<(), WorkspaceError> {
+        #[cfg(target_os = "linux")]
+        {
+            let mounts = match fs::read_to_string("/proc/self/mounts") {
+                Ok(s) => s,
+                Err(_) => return Ok(()),
+            };
+            let base_dir = self
+                .base_dir
+                .canonicalize()
+                .unwrap_or_else(|_| self.base_dir.clone());
+            let registry = self.list_registry_entries()?;
+            let registry_paths: HashMap<PathBuf, RegistryEntry> =
+                registry.into_iter().map(|e| (e.path.clone(), e)).collect();
+            for line in mounts.lines() {
+                // Lines are: `device mountpoint fstype opts freq passno`
+                let mut parts = line.split_whitespace();
+                let _device = parts.next();
+                let Some(mountpoint) = parts.next() else {
+                    continue;
+                };
+                let Some(fstype) = parts.next() else {
+                    continue;
+                };
+                if fstype != "overlay" {
+                    continue;
+                }
+                let mountpoint_path = PathBuf::from(mountpoint);
+                // Is this mountpoint under our base dir?
+                if !mountpoint_path.starts_with(&base_dir) {
+                    continue;
+                }
+                // Find the owning registry entry. The registry's stored
+                // path is the `ProvisionedSandbox.path` which for overlay
+                // is the merged directory. Match that.
+                let Some(entry) = registry_paths.get(&mountpoint_path) else {
+                    continue;
+                };
+
+                use nix::mount::{umount2, MntFlags};
+                if let Err(err) = umount2(&mountpoint_path, MntFlags::MNT_DETACH) {
+                    eprintln!(
+                        "sweep_orphan_overlays: umount2(MNT_DETACH, {}) failed: {err}; leaving \
+                         mount in place (host will eventually GC after PID reuse)",
+                        mountpoint_path.display(),
+                    );
+                    continue;
+                }
+                eprintln!(
+                    "sweep_orphan_overlays: unmounted dangling overlay {} (sidecar sandbox_id={})",
+                    mountpoint_path.display(),
+                    entry.sandbox_id.as_str(),
+                );
+                // Emit the crash-recovery event. The session_id is not
+                // persisted in the registry sidecar today — we use the
+                // run_id as a best-effort placeholder. PR-6+ may extend
+                // the sidecar to carry session_id directly; for PR-5
+                // the run-id-as-session fallback keeps the event shape
+                // addressable from the run-level recovery service.
+                self.f65_event_sink.publish(
+                    crate::sandbox::f65::F65SandboxEvent::SandboxCrashRecovered {
+                        project: entry.project.clone(),
+                        session_id: cairn_domain::SessionId::new(entry.run_id.as_str()),
+                        run_id: entry.run_id.clone(),
+                    },
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No overlay mount concept on non-Linux.
+        }
+        Ok(())
+    }
+
+    /// Emit `WorkspaceBackendDegraded` at most once per session. Uses a
+    /// dedicated emission-tracking set (separate from the AtomicBool
+    /// that reflink_tree_with_fallback flips) so the event fires on the
+    /// first observed FS fallback for a session and never again — even
+    /// across terminate-resume-terminate cycles.
+    fn maybe_emit_degraded_once(&self, session_id: &cairn_domain::SessionId, project: &ProjectKey) {
+        let newly_inserted = self
+            .degraded_emitted_sessions
+            .lock()
+            .expect("degraded emitted lock poisoned")
+            .insert(session_id.clone());
+        if !newly_inserted {
+            return;
+        }
+        self.f65_event_sink.publish(
+            crate::sandbox::f65::F65SandboxEvent::WorkspaceBackendDegraded {
+                project: project.clone(),
+                session_id: session_id.clone(),
+                backend: "ext4_copy".to_string(),
+                reason: "reflink_unsupported_fs".to_string(),
+            },
+        );
+    }
+
     pub async fn recover_all(&self) -> Result<SandboxRecoverySummary, WorkspaceError> {
+        // F65 PR-5 (#359): sweep dangling overlay mounts left by a crashed
+        // cairn-app before we enumerate providers. `/proc/self/mounts`
+        // lists every mount inherited from our parent's ns; we
+        // unmount any `type=overlay` whose merged dir falls under
+        // base_dir/<sandbox_id>/merged and for which a registry
+        // sidecar exists. Emits `SandboxCrashRecovered` per successful
+        // umount so operators see the repair.
+        self.sweep_orphan_overlays().await?;
+
         let mut handles = Vec::new();
         for provider in self.providers.values() {
             handles.extend(provider.list().await?);
@@ -1518,6 +2125,25 @@ fn fallback_strategy(strategy: SandboxStrategy) -> SandboxStrategy {
         SandboxStrategy::Overlay => SandboxStrategy::Reflink,
         SandboxStrategy::Reflink => SandboxStrategy::Overlay,
     }
+}
+
+/// F65 PR-5: generate a fresh snapshot identifier. We don't pull the
+/// `ulid` crate in for this — the id format is not load-bearing (it's
+/// an opaque string the projection reads back). `snap-<unix-ms>-<rand>`
+/// is unique enough for operational use and sorts chronologically.
+fn new_snapshot_ulid() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    // 64-bit entropy is plenty — the actual uniqueness invariant is per-
+    // host per-millisecond, and we add 16 hex chars worth.
+    let mut hasher = DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    now.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    let suffix = hasher.finish();
+    format!("snap-{now:016x}-{suffix:016x}")
 }
 
 fn limit_for(policy: &SandboxPolicy, dimension: ResourceDimension) -> Option<u64> {

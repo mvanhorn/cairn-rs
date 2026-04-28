@@ -20,6 +20,7 @@ DELETE	/v1/projects/:project/run-templates/:template_id	preserve	-	-
 DELETE	/v1/projects/:project/triggers/:trigger_id	preserve	-	-
 DELETE	/v1/providers/connections/:id	preserve	-	-
 DELETE	/v1/providers/pools/:id/connections/:conn_id	preserve	-	-
+DELETE	/v1/sessions/:id/snapshots	preserve	-	-
 DELETE	/v1/settings/defaults/:scope/:scope_id/:key	preserve	-	-
 DELETE	/v1/signals/subscriptions/:id	preserve	-	-
 DELETE	/v1/sources/:id	preserve	-	-

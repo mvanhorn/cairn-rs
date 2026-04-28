@@ -1683,6 +1683,41 @@ impl F65WorkspaceSnapshotRow {
 }
 
 #[async_trait]
+impl crate::projections::WorkspaceSnapshotWriter for SqliteAdapter {
+    async fn stamp_metadata(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+        snapshot_path: &str,
+        bytes: u64,
+        reflink_used: bool,
+        parent_snapshot_id: Option<&cairn_domain::WorkspaceSnapshotId>,
+    ) -> Result<(), StoreError> {
+        let bytes_i64 = i64::try_from(bytes).map_err(|_| {
+            StoreError::Internal(format!(
+                "WorkspaceSnapshotWriter.stamp_metadata.bytes {bytes} exceeds i64::MAX"
+            ))
+        })?;
+        sqlx::query(
+            "UPDATE workspace_snapshots
+                SET snapshot_path     = ?,
+                    bytes             = ?,
+                    reflink_used      = ?,
+                    parent_snapshot_id = ?
+              WHERE snapshot_id = ?",
+        )
+        .bind(snapshot_path)
+        .bind(bytes_i64)
+        .bind(i64::from(reflink_used))
+        .bind(parent_snapshot_id.map(|p| p.as_str().to_owned()))
+        .bind(snapshot_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl crate::projections::WorkspaceSnapshotReadModel for SqliteAdapter {
     async fn get(
         &self,

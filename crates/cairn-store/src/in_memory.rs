@@ -2293,6 +2293,10 @@ impl InMemoryStore {
             // Workspace-backend-degraded fires at sandbox init time. No
             // projection row — operator alerts via SSE + metrics (PR-4).
             RuntimeEvent::WorkspaceBackendDegraded(_) => {}
+            // F65 PR-5 (#359): crash-recovery umount sweep observability.
+            // No projection row — operator alerts via SSE + metrics; the
+            // event log itself is the audit trail.
+            RuntimeEvent::SandboxCrashRecovered(_) => {}
         }
     }
 }
@@ -5220,6 +5224,61 @@ impl crate::projections::SessionOutcomeReadModel for InMemoryStore {
                 .then_with(|| a.root_run_id.as_str().cmp(b.root_run_id.as_str()))
         });
         Ok(results)
+    }
+}
+
+impl InMemoryStore {
+    /// F65 PR-5: enumerate every `workspace_snapshots` row that is
+    /// past-TTL AND belongs to a session in a terminal state.
+    ///
+    /// Lives directly on `InMemoryStore` (not a trait) because it
+    /// iterates two read models at once and the trait-based approach
+    /// requires an "enumerate all" method on `SessionReadModel` /
+    /// `WorkspaceSnapshotReadModel` that is not portable to pg/sqlite
+    /// without introducing a dialect-specific OFFSET/LIMIT pagination
+    /// plus a session-status join. The single-node in-memory store
+    /// has full visibility into both tables; the GC sweeper uses that.
+    pub fn list_snapshots_for_gc(
+        &self,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Vec<crate::projections::WorkspaceSnapshotRecord> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .workspace_snapshots
+            .values()
+            .filter(|s| s.reaped_at.is_none())
+            .filter(|s| now_ms.saturating_sub(s.created_at) >= ttl_ms)
+            .filter(|s| {
+                state
+                    .sessions
+                    .get(s.session_id.as_str())
+                    .map(|r| !matches!(r.state, cairn_domain::SessionState::Open))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait]
+impl crate::projections::WorkspaceSnapshotWriter for InMemoryStore {
+    async fn stamp_metadata(
+        &self,
+        snapshot_id: &WorkspaceSnapshotId,
+        snapshot_path: &str,
+        bytes: u64,
+        reflink_used: bool,
+        parent_snapshot_id: Option<&WorkspaceSnapshotId>,
+    ) -> Result<(), StoreError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rec) = state.workspace_snapshots.get_mut(snapshot_id.as_str()) {
+            rec.snapshot_path = snapshot_path.to_owned();
+            rec.bytes = bytes;
+            rec.reflink_used = reflink_used;
+            rec.parent_snapshot_id = parent_snapshot_id.cloned();
+        }
+        Ok(())
     }
 }
 

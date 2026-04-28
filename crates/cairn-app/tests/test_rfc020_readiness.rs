@@ -63,6 +63,9 @@ impl DelayedHarness {
             .arg("127.0.0.1")
             .arg("--db")
             .arg("memory")
+            // F65 PR-5: skip sandbox probe gate on CI (AppArmor blocks
+            // unprivileged userns in default GH runner configuration).
+            .arg("--allow-missing-sandbox-primitives")
             .env(
                 "CAIRN_FABRIC_URL",
                 format!("valkey://{valkey_host}:{valkey_port}"),

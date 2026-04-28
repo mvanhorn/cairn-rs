@@ -1055,6 +1055,7 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::OrchestratorDecisionMade(_) => "orchestrator_decision_made",
         RuntimeEvent::SummarizerFallback(_) => "summarizer_fallback",
         RuntimeEvent::WorkspaceBackendDegraded(_) => "workspace_backend_degraded",
+        RuntimeEvent::SandboxCrashRecovered(_) => "sandbox_crash_recovered",
     }
 }
 
@@ -1701,6 +1702,10 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
             sanitize_for_event_message(&e.backend),
             e.session_id,
             sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::SandboxCrashRecovered(e) => format!(
+            "Crash-recovery unmounted dangling overlay for session {} (run {})",
+            e.session_id, e.run_id
         ),
     }
 }

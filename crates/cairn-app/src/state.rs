@@ -1094,6 +1094,18 @@ impl AppState {
             runtime.store.clone(),
             Arc::new(cairn_workspace::BufferedSandboxEventSink::default()),
         ));
+        // F65 PR-5: bridge the cairn-workspace F65 event sink to the
+        // real cairn-store event log. Fire-and-forget tokio::spawn
+        // delivery per `sandbox_f65_bridges::StoreF65EventSink`.
+        let f65_event_sink: Arc<dyn cairn_workspace::sandbox::f65::F65SandboxEventSink> = Arc::new(
+            crate::sandbox_f65_bridges::StoreF65EventSink::new(runtime.store.clone()),
+        );
+        // F65 PR-5: bridge the workspace-local WorkspaceSnapshotWriter
+        // trait to the cairn-store impl on InMemoryStore.
+        let f65_snapshot_writer: Arc<dyn cairn_workspace::sandbox::f65::WorkspaceSnapshotWriter> =
+            Arc::new(crate::sandbox_f65_bridges::StoreSnapshotWriter::new(
+                runtime.store.clone(),
+            ));
         let sandbox_service = Arc::new(
             cairn_workspace::SandboxService::new(
                 HashMap::from([
@@ -1128,7 +1140,15 @@ impl AppState {
             // and emit `SandboxBaseRevisionDrift` when the clone moved
             // between provisioning and recovery. Overlay-only; reflink
             // sandboxes are exempt per RFC 016 (physically independent).
-            .with_clone_cache(repo_clone_cache.clone()),
+            .with_clone_cache(repo_clone_cache.clone())
+            // F65 PR-5: wire snapshot root + F65 event sink + snapshot
+            // writer. The snapshot root is configurable via
+            // `CAIRN_SNAPSHOT_DIR` (plan §2.1) with a sensible default
+            // under the process temp dir for dev/CI; production sets
+            // it to `~/.cairn/snapshots`.
+            .with_snapshot_dir(default_snapshot_dir())
+            .with_f65_event_sink(f65_event_sink)
+            .with_snapshot_writer(f65_snapshot_writer),
         );
         // RFC 015: marketplace service wrapping the plugin host.
         let marketplace = {
@@ -1405,6 +1425,24 @@ fn default_sandbox_base_dir() -> PathBuf {
         }
     }
     std::env::temp_dir().join("cairn-workspace-sandboxes")
+}
+
+/// F65 PR-5: resolve the snapshot root for durable workspace snapshots.
+/// Production default: `~/.cairn/snapshots`. Override via
+/// `CAIRN_SNAPSHOT_DIR` for dev / integration tests. Falls back to
+/// temp_dir()/cairn-snapshots when HOME is unset.
+pub(crate) fn default_snapshot_dir() -> PathBuf {
+    if let Ok(override_path) = std::env::var("CAIRN_SNAPSHOT_DIR") {
+        if !override_path.is_empty() {
+            return PathBuf::from(override_path);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".cairn").join("snapshots");
+        }
+    }
+    std::env::temp_dir().join("cairn-snapshots")
 }
 
 /// Build the runtime aggregate.

@@ -503,7 +503,8 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::SessionOutcomeEmitted(_)
             | RuntimeEvent::OrchestratorDecisionMade(_)
             | RuntimeEvent::SummarizerFallback(_)
-            | RuntimeEvent::WorkspaceBackendDegraded(_) => {}
+            | RuntimeEvent::WorkspaceBackendDegraded(_)
+            | RuntimeEvent::SandboxCrashRecovered(_) => {}
 
             RuntimeEvent::EvalRunStarted(e) => {
                 self.add_node(

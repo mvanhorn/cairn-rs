@@ -192,6 +192,38 @@ pub trait SessionOutcomeReadModel: Send + Sync {
     ) -> Result<Vec<SessionOutcomeRecord>, StoreError>;
 }
 
+/// F65 PR-5: back-fill the `bytes`, `reflink_used`, `snapshot_path`, and
+/// `parent_snapshot_id` columns on an existing `workspace_snapshots` row
+/// after the overlay-to-reflink copy runs.
+///
+/// PR-2 shipped the insert path that zero-fills those columns (the domain
+/// event [`cairn_domain::WorkspaceSnapshotCreated`] intentionally carries
+/// only identity, so it's portable across log replay). PR-5 stamps the
+/// filesystem-observed metadata via this writer — called by
+/// [`cairn_workspace::SandboxService::terminate_for_session`] **before** it
+/// emits `WorkspaceSnapshotCreated` so readers who pick up the event see
+/// the fully-populated row.
+///
+/// Idempotent: the UPDATE overwrites the columns unconditionally, so a
+/// replay or a stamper retry leaves the row consistent. `reap_for_session`
+/// marks every still-live snapshot row for a session as reaped — the
+/// admin endpoint in cairn-app calls this after walking the read model
+/// and emitting `WorkspaceSnapshotReaped` per row.
+#[async_trait]
+pub trait WorkspaceSnapshotWriter: Send + Sync {
+    /// Stamp filesystem metadata onto an existing `workspace_snapshots`
+    /// row. No-op if the row doesn't exist (the caller is responsible
+    /// for emitting `WorkspaceSnapshotCreated` first).
+    async fn stamp_metadata(
+        &self,
+        snapshot_id: &WorkspaceSnapshotId,
+        snapshot_path: &str,
+        bytes: u64,
+        reflink_used: bool,
+        parent_snapshot_id: Option<&WorkspaceSnapshotId>,
+    ) -> Result<(), StoreError>;
+}
+
 /// Reader for the `workspace_snapshots` projection.
 #[async_trait]
 pub trait WorkspaceSnapshotReadModel: Send + Sync {

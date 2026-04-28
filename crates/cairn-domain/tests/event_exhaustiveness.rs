@@ -666,6 +666,10 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
             assert_ne!(proj.tenant_id.as_str(), "_system");
             assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
         }
+        RuntimeEvent::SandboxCrashRecovered(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
     }
 }
 
@@ -1907,6 +1911,12 @@ fn all_variants() -> Vec<RuntimeEvent> {
             reason: "overlayfs_unavailable".to_owned(),
             at_ms: ts,
         }),
+        RuntimeEvent::SandboxCrashRecovered(cairn_domain::events::SandboxCrashRecovered {
+            project: p(),
+            session_id: sess(),
+            run_id: run(),
+            at_ms: ts,
+        }),
     ]
 }
 
@@ -1915,16 +1925,17 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 155 variants in the RuntimeEvent enum (143 baseline + F65 PR-1
+    // 156 variants in the RuntimeEvent enum (143 baseline + F65 PR-1
     // orchestrator session redesign foundation: SessionAttemptStarted,
     // SessionAttemptCompleted, CircuitBreakerTripped, BudgetThresholdCrossed,
     // CheckpointPersisted, WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
     // SessionOutcomeEmitted, OrchestratorDecisionMade, SummarizerFallback,
-    // WorkspaceBackendDegraded — 11 new variants, plus #244's EvalRunArchived).
+    // WorkspaceBackendDegraded — 11 new variants, plus #244's EvalRunArchived,
+    // plus F65 PR-5's SandboxCrashRecovered (#359 umount sweep)).
     assert_eq!(
         variants.len(),
-        155,
-        "all_variants() must construct exactly 155 RuntimeEvent instances"
+        156,
+        "all_variants() must construct exactly 156 RuntimeEvent instances"
     );
 }
 

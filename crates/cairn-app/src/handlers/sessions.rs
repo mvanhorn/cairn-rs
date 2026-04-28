@@ -570,6 +570,105 @@ pub(crate) async fn create_session_handler(
     }
 }
 
+/// `DELETE /v1/sessions/:id/snapshots` — F65 PR-5 admin endpoint that
+/// immediately reaps every workspace snapshot belonging to a session.
+/// Admin-only per Q4 locked decision. Returns
+/// `{"reaped": <n>, "at_ms": <now>}` on success.
+#[derive(Clone, Debug, serde::Serialize, ToSchema)]
+pub(crate) struct SnapshotReapResponse {
+    pub reaped: u32,
+    pub at_ms: u64,
+}
+
+pub(crate) async fn delete_session_snapshots_handler(
+    State(state): State<Arc<AppState>>,
+    _role: AdminRoleGuard,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let trimmed = session_id.trim().to_owned();
+    if trimmed.is_empty() {
+        return bad_request_response("session_id must not be empty");
+    }
+    if trimmed.len() > SESSION_ID_MAX_LEN {
+        return bad_request_response(format!(
+            "session_id exceeds max length {SESSION_ID_MAX_LEN}"
+        ));
+    }
+    let session_id = SessionId::new(trimmed);
+
+    // Enumerate via the read model so we only reap rows that actually
+    // exist + are still live (skipping already-reaped rows is idempotent).
+    let snapshots = match <cairn_store::InMemoryStore as cairn_store::projections::WorkspaceSnapshotReadModel>::list_by_session(
+        state.runtime.store.as_ref(),
+        &session_id,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => return store_error_response(err),
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+
+    let mut reaped = 0u32;
+    for snap in snapshots {
+        if snap.reaped_at.is_some() {
+            continue;
+        }
+        // Reap the on-disk directory via SandboxService (honours in-
+        // flight restore leases).
+        match state.sandbox_service.reap_snapshot_dir(&snap.snapshot_id) {
+            Ok(_) => {}
+            Err(err) => {
+                return crate::errors::AppApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    format!("reap snapshot dir failed: {err}"),
+                )
+                .into_response();
+            }
+        }
+        // Emit the reap event via the store append path. Operators see
+        // `reason="operator_cleared"` on metrics + telemetry; the domain
+        // event shape intentionally doesn't carry the reason (plan §5).
+        let envelope = cairn_domain::EventEnvelope::for_runtime_event(
+            cairn_domain::EventId::new(format!(
+                "evt_snap_reap_{}_{now_ms}",
+                snap.snapshot_id.as_str()
+            )),
+            cairn_domain::EventSource::Runtime,
+            cairn_domain::RuntimeEvent::WorkspaceSnapshotReaped(
+                cairn_domain::WorkspaceSnapshotReaped {
+                    project: snap.project.clone(),
+                    snapshot_id: snap.snapshot_id.clone(),
+                    at_ms: now_ms,
+                },
+            ),
+        );
+        if let Err(err) = state
+            .runtime
+            .store
+            .append(std::slice::from_ref(&envelope))
+            .await
+        {
+            return store_error_response(err);
+        }
+        reaped += 1;
+    }
+
+    (
+        StatusCode::OK,
+        Json(SnapshotReapResponse {
+            reaped,
+            at_ms: now_ms,
+        }),
+    )
+        .into_response()
+}
+
 /// `DELETE /v1/admin/tenants/:tenant_id/sessions/:session_id` — admin
 /// soft-delete. Mirrors PR BB's workspace pattern exactly: archive the
 /// session via `SessionService::archive`, which issues the fabric-side

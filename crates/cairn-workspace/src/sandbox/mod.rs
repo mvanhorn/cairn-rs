@@ -4,6 +4,7 @@ pub mod f65;
 pub mod metadata;
 pub mod policy;
 pub mod service;
+pub mod snapshot_gc;
 pub mod spawn;
 pub mod types;
 
@@ -26,6 +27,12 @@ pub use confinement::{
 };
 
 pub use f65::{
-    BufferedF65EventSink, F65SandboxEvent, F65SandboxEventSink, NetworkPolicy, NoopF65EventSink,
-    SessionSandbox, SharedF65EventSink, TerminationReason,
+    BufferedF65EventSink, BufferedStamp, BufferedWorkspaceSnapshotWriter, F65SandboxEvent,
+    F65SandboxEventSink, NetworkPolicy, NoopF65EventSink, NoopWorkspaceSnapshotWriter,
+    SessionProvisionSpec, SessionSandbox, SharedF65EventSink, TerminationReason,
+    WorkspaceSnapshotWriter,
+};
+pub use snapshot_gc::{
+    NoopSnapshotGcSource, ReapReason, SnapshotGcCandidate, SnapshotGcPolicy, SnapshotGcSource,
+    SnapshotGcSweeper,
 };

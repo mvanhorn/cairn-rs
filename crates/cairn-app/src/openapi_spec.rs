@@ -583,6 +583,30 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "200": { "description": "Run list" } }
       }
     },
+    "/v1/sessions/{id}/snapshots": {
+      "delete": {
+        "tags": ["Sessions"],
+        "summary": "F65 PR-5: admin-only immediate reap of all workspace snapshots belonging to a session",
+        "description": "Walks workspace_snapshots for the session and reaps each live row (on-disk directory removal + WorkspaceSnapshotReaped event emission). Admin-only per locked Q4. Returns {reaped: u32, at_ms: u64}.",
+        "operationId": "deleteSessionSnapshots",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": {
+            "description": "Reap result",
+            "content": { "application/json": { "schema": {
+              "type": "object",
+              "properties": {
+                "reaped": { "type": "integer", "description": "Count of snapshots reaped in this call" },
+                "at_ms":  { "type": "integer", "description": "Unix-ms timestamp of the reap" }
+              },
+              "required": ["reaped", "at_ms"]
+            }}}
+          },
+          "401": { "description": "Unauthorized (admin token required)" },
+          "403": { "description": "Forbidden (non-admin token)" }
+        }
+      }
+    },
     "/v1/sessions/{id}/events": {
       "get": {
         "tags": ["Sessions"],

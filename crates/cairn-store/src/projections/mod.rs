@@ -97,7 +97,7 @@ pub use session_outcome::{
     rehydrate_termination_reason, termination_reason_kind, F65CheckpointReadModel,
     F65CheckpointRecord, SessionOutcomeReadModel, SessionOutcomeRecord, WorkspaceRegistryReadModel,
     WorkspaceRegistryRecord, WorkspaceRegistryStatus, WorkspaceSnapshotReadModel,
-    WorkspaceSnapshotRecord,
+    WorkspaceSnapshotRecord, WorkspaceSnapshotWriter,
 };
 pub use sharing::*;
 pub use signal::*;

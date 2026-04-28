@@ -1414,6 +1414,10 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
+            // F65 PR-5 (#359): crash-recovery umount sweep is an operator
+            // observability surface (SSE + metrics) with no projection
+            // table — the event log itself is the audit trail.
+            RuntimeEvent::SandboxCrashRecovered(_) => {}
         }
 
         Ok(())

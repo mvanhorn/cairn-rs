@@ -264,6 +264,7 @@ jobs:
           nohup ./target/release/cairn-app \
             --addr 127.0.0.1 --port 3000 \
             --mode team --db memory \
+            --allow-missing-sandbox-primitives \
             > /tmp/cairn-rs-smoke.log 2>&1 &
           echo $! > /tmp/cairn-rs-smoke.pid
           echo "cairn-app launched (pid=$(cat /tmp/cairn-rs-smoke.pid))"

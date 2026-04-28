@@ -998,6 +998,11 @@ impl AppBootstrap {
             )
             .route("/v1/sessions/:id", get(get_session_handler))
             .route("/v1/sessions/:id/cost", get(get_session_cost_handler))
+            // F65 PR-5: admin snapshot reap. Admin-only per Q4 locked.
+            .route(
+                "/v1/sessions/:id/snapshots",
+                delete(delete_session_snapshots_handler),
+            )
             // F29 CD-2: project / workspace cost rollups for the observability panel.
             .route(
                 "/v1/projects/:tenant/:workspace/:project/costs",

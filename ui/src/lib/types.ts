@@ -311,6 +311,17 @@ export interface WorkspaceRecord {
 export type SessionState = "open" | "completed" | "failed" | "archived";
 
 /**
+ * F65 PR-5: response shape for `DELETE /v1/sessions/:id/snapshots`.
+ * Emitted by the admin-only snapshot reap endpoint.
+ */
+export interface SnapshotReapResponse {
+  /** Count of snapshots reaped in this call. */
+  reaped: number;
+  /** Unix-ms timestamp when the reap landed. */
+  at_ms: number;
+}
+
+/**
  * F65: per-session budget envelope. Every field is optional — null means
  * "unlimited at this layer"; the orchestrator's circuit breaker (PR-3) falls
  * back to per-run defaults when a field is absent.

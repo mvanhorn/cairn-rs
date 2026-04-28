@@ -249,6 +249,65 @@ fn parse_args() -> BootstrapConfig {
     config
 }
 
+/// F65 PR-5: detect the `--allow-missing-sandbox-primitives` CLI flag.
+/// Pulled out of BootstrapConfig because the flag is sandbox-specific
+/// and its presence is only consulted at startup for the probe gate.
+/// Loud startup WARN when set. Locked Q7: no env-var counterpart to
+/// avoid "forgotten in docker-compose" footgun.
+fn allow_missing_sandbox_primitives_flag() -> bool {
+    std::env::args().any(|a| a == "--allow-missing-sandbox-primitives")
+}
+
+/// F65 PR-5: run the kernel-primitive probe and assert the REQUIRED
+/// ones pass. Fail-loud on FAIL unless the operator passed
+/// `--allow-missing-sandbox-primitives`. When the flag is set, emit a
+/// loud WARN + continue (the sandbox is advisory-only in that mode).
+fn assert_sandbox_primitives_or_exit() {
+    // Allow integration tests to inject a fixture markdown path so they
+    // can drive the FAIL path without a real kernel.
+    let findings = if let Ok(path) = std::env::var("CAIRN_F65_PROBE_OVERRIDE_MARKDOWN") {
+        match cairn_workspace::sandbox::confinement::probe::ProbeFindings::load_from_markdown(
+            std::path::Path::new(&path),
+        ) {
+            Ok(f) => f,
+            Err(err) => {
+                eprintln!(
+                    "F65 kernel probe: override markdown load failed: {err}; \
+                     falling back to live probe"
+                );
+                cairn_workspace::sandbox::confinement::probe::run_live_probe()
+            }
+        }
+    } else {
+        cairn_workspace::sandbox::confinement::probe::run_live_probe()
+    };
+    match findings.assert_required() {
+        Ok(()) => {
+            eprintln!(
+                "F65 kernel probe: all REQUIRED primitives pass (kernel {})",
+                findings.kernel_version
+            );
+        }
+        Err(err) => {
+            if allow_missing_sandbox_primitives_flag() {
+                eprintln!(
+                    "⚠ F65 kernel probe: REQUIRED primitive FAIL — continuing because \
+                     `--allow-missing-sandbox-primitives` was set.\n\
+                     Sandbox isolation is NOT enforced in this mode.\n\
+                     Error: {err}"
+                );
+            } else {
+                eprintln!(
+                    "FATAL: F65 kernel probe failed: {err}\n\n\
+                     Pass `--allow-missing-sandbox-primitives` to start anyway with \
+                     sandbox disabled (dev / CI only; sandbox isolation will be a no-op)."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -441,6 +500,12 @@ async fn real_main() {
     }
 
     let config = parse_args();
+
+    // F65 PR-5 locked Q7: refuse to start if REQUIRED sandbox primitives
+    // FAIL unless the operator passed --allow-missing-sandbox-primitives.
+    // Runs BEFORE token registry so an AppArmor-blocked boot surfaces
+    // a named-primitive error instead of a confusing auth failure.
+    assert_sandbox_primitives_or_exit();
 
     // ── Token registry ────────────────────────────────────────────────────────
     // Priority: CAIRN_ADMIN_TOKEN_FILE > CAIRN_ADMIN_TOKEN > default dev token.
@@ -1611,6 +1676,41 @@ async fn real_main() {
             tracing::info!("cairn-app readiness: /health/ready now returns 200");
         });
 
+        // ── F65 PR-5: snapshot GC sweeper ────────────────────────────────────
+        // Hourly-default TTL sweep over workspace_snapshots. Defaults:
+        // TTL = 7 days (`CAIRN_SNAPSHOT_TTL_DAYS`), cadence = 1 hour
+        // (`CAIRN_SNAPSHOT_GC_CADENCE_MS`). Tests use 50ms cadence +
+        // TestClock. Worker-only + memory-db modes still spawn the
+        // sweeper unless CAIRN_GC_DISABLED is set.
+        let gc_handle: Option<tokio::task::JoinHandle<()>> =
+            if std::env::var("CAIRN_GC_DISABLED").ok().as_deref() == Some("1") {
+                eprintln!("F65 snapshot GC disabled by CAIRN_GC_DISABLED=1");
+                None
+            } else {
+                let svc = lib_state.sandbox_service.clone();
+                let store = lib_state.runtime.store.clone();
+                let source: Arc<dyn cairn_workspace::sandbox::snapshot_gc::SnapshotGcSource> =
+                    Arc::new(cairn_app::sandbox_f65_bridges::StoreSnapshotGcSource::new(
+                        store.clone(),
+                    ));
+                let f65_sink: Arc<dyn cairn_workspace::sandbox::f65::F65SandboxEventSink> =
+                    Arc::new(cairn_app::sandbox_f65_bridges::StoreF65EventSink::new(
+                        store.clone(),
+                    ));
+                let policy =
+                    cairn_workspace::sandbox::snapshot_gc::SnapshotGcPolicy::from_env_or_default(
+                        Arc::new(cairn_workspace::SystemClock),
+                    );
+                eprintln!(
+                    "F65 snapshot GC: TTL={}ms cadence={}ms",
+                    policy.ttl_ms, policy.sweep_cadence_ms
+                );
+                let sweeper = cairn_workspace::sandbox::snapshot_gc::SnapshotGcSweeper::new(
+                    svc, source, f65_sink, policy,
+                );
+                Some(tokio::spawn(sweeper.run_forever()))
+            };
+
         // ── Test-only: SIGUSR1 arms the injected append-failure hook ────────
         // Chaos integration tests send SIGUSR1 after the subprocess is
         // healthy so startup appends (tenant seed, projections bootstrap)
@@ -1669,6 +1769,12 @@ async fn real_main() {
             .unwrap_or_else(|e| eprintln!("server error: {e}"));
 
         watchdog.abort();
+        // F65 PR-5: abort the GC sweeper so graceful shutdown doesn't
+        // hang on a mid-sweep reaper. The sweeper's tokio::time::sleep
+        // is cancel-safe; abort() simply poisons its JoinHandle.
+        if let Some(h) = gc_handle.as_ref() {
+            h.abort();
+        }
         eprintln!("shutdown: all connections drained");
         flush_state_to_disk(&state_for_flush).await;
         eprintln!("shutdown: complete");

@@ -1423,6 +1423,45 @@ impl F65WorkspaceSnapshotRowPg {
 }
 
 #[async_trait]
+impl crate::projections::WorkspaceSnapshotWriter for PgAdapter {
+    async fn stamp_metadata(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+        snapshot_path: &str,
+        bytes: u64,
+        reflink_used: bool,
+        parent_snapshot_id: Option<&cairn_domain::WorkspaceSnapshotId>,
+    ) -> Result<(), StoreError> {
+        // UPDATE is idempotent under replay. If the snapshot row doesn't
+        // exist yet, no-op — the caller is responsible for emitting
+        // `WorkspaceSnapshotCreated` first (which projects the initial
+        // row via the zero-filled INSERT path in pg/projections.rs).
+        let bytes_i64 = i64::try_from(bytes).map_err(|_| {
+            StoreError::Internal(format!(
+                "WorkspaceSnapshotWriter.stamp_metadata.bytes {bytes} exceeds i64::MAX"
+            ))
+        })?;
+        sqlx::query(
+            "UPDATE workspace_snapshots
+                SET snapshot_path     = $1,
+                    bytes             = $2,
+                    reflink_used      = $3,
+                    parent_snapshot_id = $4
+              WHERE snapshot_id = $5",
+        )
+        .bind(snapshot_path)
+        .bind(bytes_i64)
+        .bind(reflink_used)
+        .bind(parent_snapshot_id.map(|p| p.as_str().to_owned()))
+        .bind(snapshot_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl crate::projections::WorkspaceSnapshotReadModel for PgAdapter {
     async fn get(
         &self,

@@ -22,6 +22,7 @@ pub mod middleware;
 pub mod repo_routes;
 pub mod router;
 pub mod sandbox;
+pub mod sandbox_f65_bridges;
 pub mod sse_hooks;
 pub mod state;
 pub mod telemetry_routes;

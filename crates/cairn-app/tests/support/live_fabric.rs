@@ -378,6 +378,12 @@ fn spawn_subprocess_internal(
         .arg("127.0.0.1")
         .arg("--db")
         .arg(storage.db_arg())
+        // F65 PR-5: CI runners + integration test hosts typically have
+        // AppArmor blocking unprivileged userns (same posture as the
+        // Graviton production host in docs/design/f65-kernel-probe-findings.md).
+        // LiveHarness subprocesses must skip the boot-probe gate;
+        // sandbox isolation is not under test here.
+        .arg("--allow-missing-sandbox-primitives")
         .env(
             "CAIRN_FABRIC_URL",
             format!("valkey://{valkey_host}:{valkey_port}"),

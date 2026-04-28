@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use cairn_domain::{ProjectKey, RunId, SessionId, WorkspaceId, WorkspaceSnapshotId};
 
-use crate::sandbox::SandboxConfinement;
+use crate::sandbox::{SandboxConfinement, SandboxPolicy};
 
 /// Network-namespace policy per session.
 ///
@@ -83,6 +83,35 @@ pub struct SessionSandbox {
     pub confinement: SandboxConfinement,
     /// Network policy applied to this session.
     pub network: NetworkPolicy,
+    /// Populated on resume paths: points to the snapshot directory the
+    /// upperdir was seeded from. `None` for a fresh provision. PR-5
+    /// carries this field so `terminate_for_session` can record the
+    /// snapshot lineage (parent_snapshot_id) when the new snapshot
+    /// derives from a previous one.
+    pub base_snapshot_id: Option<WorkspaceSnapshotId>,
+}
+
+/// Per-session provision request passed into
+/// [`super::service::SandboxService::provision_for_session`].
+///
+/// Carries everything the PR-5 provision path needs to mount a fresh
+/// overlay OR (when `base_snapshot_id` is `Some`) seed the upperdir from
+/// a prior snapshot. The service dispatches internally — callers use the
+/// public `provision_for_session` + `restore_from_snapshot` pair (the
+/// service disambiguates on `base_snapshot_id.is_some()`).
+#[derive(Clone, Debug)]
+pub struct SessionProvisionSpec {
+    pub session_id: SessionId,
+    pub root_run_id: RunId,
+    pub project: ProjectKey,
+    pub policy: SandboxPolicy,
+    pub network: NetworkPolicy,
+    pub attempt_number: u32,
+    pub max_attempts: u32,
+    /// When `Some`, the service reflinks the named snapshot into a fresh
+    /// upperdir-seed and mounts the overlay over that. Used by the resume
+    /// path. `None` = regular fresh provision.
+    pub base_snapshot_id: Option<WorkspaceSnapshotId>,
 }
 
 /// Events the F65 session path emits. The adapter in cairn-app translates
@@ -103,11 +132,28 @@ pub enum F65SandboxEvent {
         workspace_id: WorkspaceId,
         session_id: SessionId,
     },
+    /// F65 PR-5: a snapshot has been reaped either by the GC sweeper
+    /// (`reason = "ttl_expired"`) or by the admin DELETE endpoint
+    /// (`reason = "operator_cleared"`). `reason` rides on the cairn-workspace
+    /// event shape; the domain event shape shipped in PR-1 carries only
+    /// identity so the reason surfaces on telemetry spans + metrics labels.
+    WorkspaceSnapshotReaped {
+        project: ProjectKey,
+        snapshot_id: WorkspaceSnapshotId,
+        reason: String,
+    },
     WorkspaceBackendDegraded {
         project: ProjectKey,
         session_id: SessionId,
         backend: String,
         reason: String,
+    },
+    /// F65 PR-5 (#359): crash-recovery successfully unmounted a dangling
+    /// overlay left by a previous cairn-app exit.
+    SandboxCrashRecovered {
+        project: ProjectKey,
+        session_id: SessionId,
+        run_id: RunId,
     },
 }
 
@@ -115,6 +161,105 @@ pub enum F65SandboxEvent {
 /// log. cairn-workspace holds only `Arc<dyn F65SandboxEventSink>`.
 pub trait F65SandboxEventSink: Send + Sync + 'static {
     fn publish(&self, event: F65SandboxEvent);
+}
+
+/// F65 PR-5 writer hook: back-fill the `bytes`, `reflink_used`,
+/// `snapshot_path`, and `parent_snapshot_id` columns on an existing
+/// `workspace_snapshots` projection row.
+///
+/// Declared in cairn-workspace (not cairn-store) so the workspace crate
+/// keeps its "no store dependency" posture (architecture order:
+/// domain → store → runtime → workspace). cairn-app bridges this to the
+/// real `cairn_store::projections::WorkspaceSnapshotWriter` via a thin
+/// adapter. A `NoopWorkspaceSnapshotWriter` default keeps tests
+/// decoupled from the store.
+#[async_trait::async_trait]
+pub trait WorkspaceSnapshotWriter: Send + Sync + 'static {
+    async fn stamp_metadata(
+        &self,
+        snapshot_id: &WorkspaceSnapshotId,
+        snapshot_path: &str,
+        bytes: u64,
+        reflink_used: bool,
+        parent_snapshot_id: Option<&WorkspaceSnapshotId>,
+    ) -> Result<(), String>;
+}
+
+/// Drop-on-the-floor default when no store writer is wired. Matches the
+/// [`NoopF65EventSink`] pattern: the service still functions, metadata
+/// stamp just doesn't land.
+#[derive(Debug, Default)]
+pub struct NoopWorkspaceSnapshotWriter;
+
+#[async_trait::async_trait]
+impl WorkspaceSnapshotWriter for NoopWorkspaceSnapshotWriter {
+    async fn stamp_metadata(
+        &self,
+        _snapshot_id: &WorkspaceSnapshotId,
+        _snapshot_path: &str,
+        _bytes: u64,
+        _reflink_used: bool,
+        _parent_snapshot_id: Option<&WorkspaceSnapshotId>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// In-memory writer that records the metadata stamps for test assertions.
+/// Equivalent of [`BufferedF65EventSink`] for the stamp side.
+#[derive(Debug, Default)]
+pub struct BufferedWorkspaceSnapshotWriter {
+    stamps: std::sync::Mutex<Vec<BufferedStamp>>,
+}
+
+/// A single recorded metadata stamp captured by
+/// [`BufferedWorkspaceSnapshotWriter`].
+#[derive(Debug, Clone)]
+pub struct BufferedStamp {
+    pub snapshot_id: WorkspaceSnapshotId,
+    pub snapshot_path: String,
+    pub bytes: u64,
+    pub reflink_used: bool,
+    pub parent_snapshot_id: Option<WorkspaceSnapshotId>,
+}
+
+impl BufferedWorkspaceSnapshotWriter {
+    pub fn drain(&self) -> Vec<BufferedStamp> {
+        let mut guard = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    }
+
+    pub fn len(&self) -> usize {
+        self.stamps.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkspaceSnapshotWriter for BufferedWorkspaceSnapshotWriter {
+    async fn stamp_metadata(
+        &self,
+        snapshot_id: &WorkspaceSnapshotId,
+        snapshot_path: &str,
+        bytes: u64,
+        reflink_used: bool,
+        parent_snapshot_id: Option<&WorkspaceSnapshotId>,
+    ) -> Result<(), String> {
+        self.stamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(BufferedStamp {
+                snapshot_id: snapshot_id.clone(),
+                snapshot_path: snapshot_path.to_owned(),
+                bytes,
+                reflink_used,
+                parent_snapshot_id: parent_snapshot_id.cloned(),
+            });
+        Ok(())
+    }
 }
 
 /// An event sink that drops everything — useful for tests and for the path
