@@ -36,7 +36,7 @@ use crate::errors::{
 use crate::extractors::{AdminRoleGuard, TenantScope};
 use crate::state::AppState;
 use crate::tokens::RequestLogEntry;
-use crate::webhook_validation::{insecure_webhooks_allowed, validate_channels};
+use crate::webhook_validation::{validate_channels, WebhookValidationPolicy};
 #[allow(unused_imports)]
 use crate::{ProjectRecordDoc, RunListResponseDoc, TenantRecordDoc, WorkspaceRecordDoc};
 
@@ -1317,8 +1317,13 @@ pub(crate) async fn set_operator_notifications_handler(
     // an actionable 422, not a latent delivery failure (#235). The dispatcher
     // layer would otherwise happily persist the preference and silently drop
     // every future delivery attempt.
-    let allow_insecure = insecure_webhooks_allowed(&state.config);
-    if let Err(msg) = validate_channels(&body.channels, allow_insecure) {
+    //
+    // #451 / #452: the policy now also governs SSRF — webhooks must not be
+    // allowed to target IMDS, RFC 1918, or loopback unless the operator
+    // explicitly opts in via `CAIRN_ALLOW_INTERNAL_WEBHOOKS=1` (or Local
+    // mode).
+    let policy = WebhookValidationPolicy::from_config(&state.config);
+    if let Err(msg) = validate_channels(&body.channels, policy).await {
         return validation_error_response(msg);
     }
     let tenant_id = TenantId::new(body.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT_ID));

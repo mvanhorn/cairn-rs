@@ -141,7 +141,8 @@ jobs:
   fabric-integration:
     name: fabric-integration
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Job cap must exceed the sum of step timeouts below (15 + 18 + cache/overhead)
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -158,7 +159,7 @@ jobs:
             ${{ runner.os }}-cargo-
       - name: cargo test --test integration (default — parallel)
         run: cargo test -p cairn-fabric --test integration
-        timeout-minutes: 10
+        timeout-minutes: 15
       # HTTP-lifecycle integration tests: launch the real cairn-app
       # binary per harness on an ephemeral port, drive via reqwest,
       # share the Valkey testcontainer. Same runtime constraints as
@@ -168,9 +169,16 @@ jobs:
       # so test_rfc011_colocation can assert partition placement.
       # Production/release builds MUST NOT enable this feature; see
       # SECURITY.md for the threat model.
+      #
+      # Timeout raised from 10 to 18 minutes — see #357. Observation on
+      # recent main runs: cargo finishes compiling + runs ~15 test
+      # binaries and gets SIGKILLed at exactly 10:00 while a final test
+      # binary is still mid-execution (test_rfc020_readiness on the
+      # 2026-04-28 main run). Tests themselves are healthy — it's raw
+      # compile + serial run time that spills past the cap.
       - name: cargo test -p cairn-app --tests --features debug-endpoints
         run: cargo test -p cairn-app --tests --features debug-endpoints --
-        timeout-minutes: 10
+        timeout-minutes: 18
 
   # ── 6. UI Build + Type Check + Component Tests ──────────────────────────────
   ui:

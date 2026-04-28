@@ -2113,10 +2113,14 @@ for line in sys.stdin:
 #[tokio::test]
 async fn plugin_eval_score_route_returns_exact_match_score() {
     let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    // #453: plugin install now requires admin. Use the `admin`
+    // ServiceAccount shape (matches `is_admin_principal`) so this
+    // test continues to exercise the full register → score round
+    // trip. The prior `Operator` principal would 403 at the guard.
     state.service_tokens.register(
         "test-token".to_string(),
-        AuthPrincipal::Operator {
-            operator_id: OperatorId::new("test_op"),
+        AuthPrincipal::ServiceAccount {
+            name: "admin".to_string(),
             tenant: TenantKey::new("default_tenant"),
         },
     );
@@ -2168,10 +2172,18 @@ async fn plugin_eval_score_route_returns_exact_match_score() {
 #[tokio::test]
 async fn middleware_adds_request_id_limits_body_and_enables_local_cors() {
     let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    // #453 post-fix: the `POST /v1/plugins` request in this test is
+    // the oversized-body vehicle — the PAYLOAD_TOO_LARGE check fires
+    // during body extraction, so the caller must get past the
+    // `AdminRoleGuard` first. Use admin ServiceAccount so the body
+    // limit is what the test ends up asserting on, not the auth
+    // layer. (Without this the guard 403s the oversized body before
+    // the 10 MiB limit fires, hiding the middleware behavior the
+    // test exists to pin down.)
     state.service_tokens.register(
         "test-token".to_string(),
-        AuthPrincipal::Operator {
-            operator_id: OperatorId::new("test_op"),
+        AuthPrincipal::ServiceAccount {
+            name: "admin".to_string(),
             tenant: TenantKey::new("default_tenant"),
         },
     );
