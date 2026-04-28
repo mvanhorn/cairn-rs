@@ -254,9 +254,13 @@ where
             if matches!(session.state, SessionState::Open) {
                 continue;
             }
+            // WorkspaceSnapshotReadModel::list_by_session gained a
+            // required `&ProjectKey` in #438. The session record we
+            // just resolved carries the authoritative project scope
+            // for this session.
             let snapshots = self
                 .snapshots
-                .list_by_session(session_id)
+                .list_by_session(&session.project, session_id)
                 .await
                 .map_err(|e| e.to_string())?;
             for snap in snapshots {

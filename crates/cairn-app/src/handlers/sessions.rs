@@ -183,7 +183,12 @@ pub(crate) async fn get_session_handler(
     tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.runtime.sessions.get(&SessionId::new(id)).await {
+    match state
+        .runtime
+        .sessions
+        .lookup_any_admin(&SessionId::new(id))
+        .await
+    {
         // Admin tokens bypass the per-tenant scope check so they can
         // view sessions across any tenant (mirrors the pattern in
         // `tasks.rs`/`runs.rs`/`approvals.rs`). Without this, admin
@@ -222,7 +227,7 @@ pub(crate) async fn get_session_activity_handler(
 ) -> impl IntoResponse {
     let session_id = SessionId::new(id.clone());
 
-    match state.runtime.sessions.get(&session_id).await {
+    match state.runtime.sessions.lookup_any_admin(&session_id).await {
         Ok(Some(s))
             if tenant_scope.is_admin || s.project.tenant_id == *tenant_scope.tenant_id() => {}
         Ok(Some(_)) | Ok(None) => {
@@ -322,7 +327,7 @@ pub(crate) async fn get_session_active_runs_handler(
 ) -> impl IntoResponse {
     let session_id = SessionId::new(id.clone());
 
-    match state.runtime.sessions.get(&session_id).await {
+    match state.runtime.sessions.lookup_any_admin(&session_id).await {
         Ok(Some(s))
             if tenant_scope.is_admin || s.project.tenant_id == *tenant_scope.tenant_id() => {}
         Ok(Some(_)) | Ok(None) => {
@@ -403,7 +408,7 @@ pub(crate) async fn get_session_cost_handler(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let session_id = SessionId::new(id);
-    match state.runtime.sessions.get(&session_id).await {
+    match state.runtime.sessions.lookup_any_admin(&session_id).await {
         Ok(Some(session))
             if tenant_scope.is_admin || session.project.tenant_id == *tenant_scope.tenant_id() =>
         {
@@ -456,7 +461,7 @@ pub(crate) async fn get_session_llm_traces_handler(
 
     // Verify the session exists and belongs to the requesting tenant
     // (admin tokens bypass the scope check).
-    match state.runtime.sessions.get(&session_id).await {
+    match state.runtime.sessions.lookup_any_admin(&session_id).await {
         Ok(Some(s))
             if tenant_scope.is_admin || s.project.tenant_id == *tenant_scope.tenant_id() => {}
         Ok(Some(_)) | Ok(None) => {
@@ -485,7 +490,7 @@ pub(crate) async fn list_session_events_handler(
     Query(query): Query<EventsPageQuery>,
 ) -> impl IntoResponse {
     let session_id = SessionId::new(id);
-    let session = match state.runtime.sessions.get(&session_id).await {
+    let session = match state.runtime.sessions.lookup_any_admin(&session_id).await {
         Ok(Some(session))
             if tenant_scope.is_admin || session.project.tenant_id == *tenant_scope.tenant_id() =>
         {
@@ -583,10 +588,20 @@ pub(crate) async fn create_session_handler(
     }
 
     let session_id = SessionId::new(trimmed);
+    let project = CreateSessionRequest::project(&body);
 
     // Reject duplicates with 409 instead of silently returning 201
     // (closes #229). Mirrors `CredentialServiceImpl::store`.
-    match state.runtime.sessions.get(&session_id).await {
+    //
+    // Scoped get (#439, Gemini review on #554): use the project-scoped
+    // service method rather than `lookup_any_admin`. A session that
+    // exists in a different tenant MUST NOT surface as a 409 here — a
+    // cross-tenant 409 would leak the existence of foreign session
+    // ids to unauthenticated probers (SEC-007 pattern). The scoped
+    // `get` returns `None` for foreign ids so the create path
+    // proceeds, FabricSessionService then fails atomically if the
+    // fabric-side id really collides.
+    match state.runtime.sessions.get(&project, &session_id).await {
         Ok(Some(_)) => {
             return AppApiError::new(
                 StatusCode::CONFLICT,
@@ -599,12 +614,7 @@ pub(crate) async fn create_session_handler(
         Err(err) => return runtime_error_response(err),
     }
 
-    match state
-        .runtime
-        .sessions
-        .create(&CreateSessionRequest::project(&body), session_id)
-        .await
-    {
+    match state.runtime.sessions.create(&project, session_id).await {
         Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
         Err(err) => runtime_error_response(err),
     }
@@ -636,10 +646,26 @@ pub(crate) async fn delete_session_snapshots_handler(
     }
     let session_id = SessionId::new(trimmed);
 
+    // Resolve the session's project scope first. The
+    // `WorkspaceSnapshotReadModel::list_by_session` trait now requires
+    // a `&ProjectKey` per issue #438 (defence-in-depth tenant guard at
+    // the query layer). Admin-only endpoint, so returning NOT_FOUND
+    // on a missing session is correct — admins who can reach this
+    // handler can still target any tenant by supplying its SessionId.
+    let session = match state.runtime.sessions.lookup_any_admin(&session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "session not found")
+                .into_response();
+        }
+        Err(err) => return runtime_error_response(err),
+    };
+
     // Enumerate via the read model so we only reap rows that actually
     // exist + are still live (skipping already-reaped rows is idempotent).
     let snapshots = match <cairn_store::InMemoryStore as cairn_store::projections::WorkspaceSnapshotReadModel>::list_by_session(
         state.runtime.store.as_ref(),
+        &session.project,
         &session_id,
     )
     .await
@@ -739,16 +765,28 @@ pub(crate) async fn delete_session_admin_handler(
     // Enforce tenant-ownership: admin token may address any tenant, but
     // the URL's :tenant_id must actually own the session. Prevents a
     // mistyped path from silently archiving the wrong tenant's session.
-    match state.runtime.sessions.get(&session_id).await {
-        Ok(Some(record)) if record.project.tenant_id.as_str() == tenant_id => {}
+    //
+    // Issue #439: resolve the session's full project scope via
+    // `lookup_any_admin` (admin cross-tenant intent is explicit in the
+    // method name) and pass the authoritative scope through to
+    // `archive`. The service layer re-checks that the stored project
+    // equals the one we just observed, so a race that moves the
+    // session to a new project between the two calls would be caught.
+    let session_record = match state.runtime.sessions.lookup_any_admin(&session_id).await {
+        Ok(Some(record)) if record.project.tenant_id.as_str() == tenant_id => record,
         Ok(Some(_)) | Ok(None) => {
             return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "session not found")
                 .into_response();
         }
         Err(err) => return runtime_error_response(err),
-    }
+    };
 
-    match state.runtime.sessions.archive(&session_id).await {
+    match state
+        .runtime
+        .sessions
+        .archive(&session_record.project, &session_id)
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => runtime_error_response(err),
     }

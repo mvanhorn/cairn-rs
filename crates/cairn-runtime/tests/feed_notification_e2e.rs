@@ -87,7 +87,7 @@ async fn mark_read_sets_is_read_true_for_target_item() {
     store.push_item(item("a", "slack"));
     store.push_item(item("b", "rss"));
 
-    store.mark_read("a").await.unwrap();
+    store.mark_read(&project(), "a").await.unwrap();
 
     let result = store.list(&project(), &FeedQuery::default()).await.unwrap();
     let a = result.items.iter().find(|i| i.id == "a").unwrap();
@@ -105,7 +105,7 @@ async fn read_status_persists_across_multiple_list_calls() {
     store.push_item(item("x", "api"));
     store.push_item(item("y", "api"));
 
-    store.mark_read("x").await.unwrap();
+    store.mark_read(&project(), "x").await.unwrap();
 
     // First read.
     let r1 = store.list(&project(), &FeedQuery::default()).await.unwrap();
@@ -130,7 +130,7 @@ async fn read_all_marks_every_unread_item_and_returns_count() {
     store.push_item(item("3", "github"));
 
     // Mark item 1 read manually — read_all should only count the remaining 2.
-    store.mark_read("1").await.unwrap();
+    store.mark_read(&project(), "1").await.unwrap();
 
     let changed = store.read_all(&project()).await.unwrap();
     assert_eq!(
@@ -211,7 +211,7 @@ async fn unread_filter_excludes_read_items() {
     store.push_item(item("u2", "api"));
     store.push_item(item("u3", "api"));
 
-    store.mark_read("u2").await.unwrap();
+    store.mark_read(&project(), "u2").await.unwrap();
 
     let unread = store
         .list(
@@ -266,7 +266,7 @@ async fn mark_read_on_unknown_id_returns_error() {
     let store = FeedStore::new();
     store.push_item(item("known", "api"));
 
-    let result = store.mark_read("does_not_exist").await;
+    let result = store.mark_read(&project(), "does_not_exist").await;
     assert!(
         result.is_err(),
         "mark_read on unknown ID must return an error"

@@ -133,8 +133,15 @@ pub(crate) async fn list_feed_handler(
 pub(crate) async fn mark_feed_item_read_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<OptionalProjectScopedQuery>,
 ) -> impl IntoResponse {
-    match state.feed.mark_read(&id).await {
+    // `FeedEndpoints::mark_read` gained a required `&ProjectKey` per
+    // Gemini review on #554 (tenant-isolation invariant locked by
+    // #438/#439 extended to the full FeedEndpoints surface). We pull
+    // the project from the same optional query-param extractor the
+    // sibling `mark_all_feed_items_read_handler` already uses — an
+    // explicit scope is required, not inferred.
+    match state.feed.mark_read(&query.project(), &id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(err) => AppApiError::new(StatusCode::NOT_FOUND, "not_found", err).into_response(),
     }

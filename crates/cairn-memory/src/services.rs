@@ -81,8 +81,10 @@ impl Default for InMemoryServices {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_api::feed::FeedEndpoints;
-    use cairn_api::memory_api::{CreateMemoryRequest, MemoryEndpoints, MemorySearchQuery};
+    use cairn_api_contracts::feed::FeedEndpoints;
+    use cairn_api_contracts::memory_api::{
+        CreateMemoryRequest, MemoryEndpoints, MemorySearchQuery,
+    };
     use cairn_domain::{KnowledgeDocumentId, ProjectKey, SourceId};
 
     use crate::deep_search::DeepSearchRequest;
@@ -152,7 +154,7 @@ mod tests {
         assert!(!deep.merged_results.is_empty());
 
         // Feed.
-        use cairn_api::feed::{FeedItem, FeedQuery};
+        use cairn_api_contracts::feed::{FeedItem, FeedQuery};
         services.feed.push_item(FeedItem {
             id: "f1".to_owned(),
             source: "rss".to_owned(),

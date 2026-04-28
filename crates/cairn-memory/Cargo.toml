@@ -10,7 +10,14 @@ path = "src/lib.rs"
 
 [dependencies]
 cairn-domain = { path = "../cairn-domain" }
-cairn-api = { path = "../cairn-api" }
+# cairn-api-contracts replaces the former cairn-api production dep
+# (#440): keeps the layer ordering unidirectional — cairn-memory sits
+# below cairn-api in the `domain -> store -> runtime -> memory -> api`
+# stack per CLAUDE.md, so a cairn-api production dep here inverted the
+# ordering and left a latent cycle risk. The contracts crate holds only
+# pure trait + DTO types that both cairn-api (consumer) and
+# cairn-memory (implementor) need.
+cairn-api-contracts = { path = "../cairn-api-contracts" }
 cairn-graph = { path = "../cairn-graph" }
 cairn-store = { path = "../cairn-store" }
 serde = { version = "1.0", features = ["derive"] }

@@ -486,11 +486,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cairn-agent",
+ "cairn-api-contracts",
  "cairn-channels",
  "cairn-domain",
  "cairn-evals",
  "cairn-graph",
- "cairn-memory",
  "cairn-runtime",
  "cairn-signal",
  "cairn-store",
@@ -499,6 +499,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "utoipa",
+]
+
+[[package]]
+name = "cairn-api-contracts"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cairn-domain",
+ "serde",
+ "serde_json",
  "utoipa",
 ]
 
@@ -697,7 +708,7 @@ name = "cairn-memory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "cairn-api",
+ "cairn-api-contracts",
  "cairn-domain",
  "cairn-graph",
  "cairn-signal",

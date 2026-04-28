@@ -606,9 +606,14 @@ pub(crate) async fn create_run_handler(
         return response;
     }
     let session_id = SessionId::new(body.session_id.clone());
-    match state.runtime.sessions.get(&session_id).await {
-        Ok(Some(session)) if session.project == project => {}
-        Ok(Some(_)) | Ok(None) => {
+    // Scoped get (#439): `project` is already known from the request
+    // body's HasProjectScope extractor, so route the lookup through the
+    // service-layer scope check rather than the admin-only unchecked
+    // path. A mismatched project returns `None` indistinguishable from
+    // "unknown id", so no explicit post-check is needed.
+    match state.runtime.sessions.get(&project, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
             return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "session not found")
                 .into_response();
         }
@@ -2049,9 +2054,18 @@ pub(crate) async fn spawn_subagent_run_handler(
     };
 
     let child_session_id = SessionId::new(body.session_id);
-    match state.runtime.sessions.get(&child_session_id).await {
-        Ok(Some(session)) if session.project == parent_run.project => {}
-        Ok(Some(_)) | Ok(None) => {
+    // Scoped get (#439): the parent run's project is authoritative
+    // here, so the child session must live in the same scope. The
+    // service-layer scope check returns `None` for a cross-project
+    // id, so no explicit post-check is needed.
+    match state
+        .runtime
+        .sessions
+        .get(&parent_run.project, &child_session_id)
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
             return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "session not found")
                 .into_response();
         }

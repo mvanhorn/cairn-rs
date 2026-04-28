@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use cairn_api::feed::{FeedEndpoints, FeedItem, FeedQuery};
-use cairn_api::http::ListResponse;
+use cairn_api_contracts::feed::{FeedEndpoints, FeedItem, FeedQuery};
+use cairn_api_contracts::http::ListResponse;
 use cairn_domain::ProjectKey;
 
 /// In-memory feed store that signal pollers can push into.
@@ -97,7 +97,16 @@ impl FeedEndpoints for FeedStore {
         })
     }
 
-    async fn mark_read(&self, item_id: &str) -> Result<(), Self::Error> {
+    async fn mark_read(&self, _project: &ProjectKey, item_id: &str) -> Result<(), Self::Error> {
+        // `_project` is accepted to honour the trait contract (Gemini
+        // review on #554 locked the scope-tuple shape across all
+        // FeedEndpoints methods). This in-memory backend is
+        // single-tenant by construction — `FeedItem` does not carry a
+        // project field and the store is shared — so we cannot enforce
+        // the scope here. The production backend that replaces this
+        // stub MUST filter on the project tuple before the mutation
+        // lands; see the trait doc for the "item-outside-scope ⇒
+        // not-found" contract.
         let mut items = self.items.lock().unwrap();
         if let Some(item) = items.get_mut(item_id) {
             item.is_read = true;
@@ -209,9 +218,9 @@ mod tests {
         store.push_item(make_item("f2", "rss", false));
         store.push_item(make_item("f3", "rss", false));
 
-        store.mark_read("f1").await.unwrap();
-
         let project = ProjectKey::new("t", "w", "p");
+        store.mark_read(&project, "f1").await.unwrap();
+
         let count = store.read_all(&project).await.unwrap();
         assert_eq!(count, 2); // f2 and f3 were unread.
 

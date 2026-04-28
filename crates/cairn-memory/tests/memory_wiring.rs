@@ -1,7 +1,14 @@
 //! Integration test proving MemoryApiImpl wires correctly through
-//! the cairn-api MemoryEndpoints trait boundary.
+//! the `cairn-api-contracts` MemoryEndpoints trait boundary.
+//!
+//! Relocated from `cairn-api/tests/memory_wiring.rs` in #440 to
+//! eliminate the cairn-api -> cairn-memory dev-dep that inverted the
+//! layer ordering. The test lives in cairn-memory now because both
+//! the implementation under test and the test helpers belong to
+//! cairn-memory; cairn-api-contracts provides the trait surface both
+//! sides agree on.
 
-use cairn_api::memory_api::{CreateMemoryRequest, MemoryEndpoints, MemoryStatus};
+use cairn_api_contracts::memory_api::{CreateMemoryRequest, MemoryEndpoints, MemoryStatus};
 use cairn_domain::tenancy::ProjectKey;
 use cairn_memory::api_impl::MemoryApiImpl;
 use cairn_memory::in_memory::{InMemoryDocumentStore, InMemoryRetrieval};
@@ -42,7 +49,10 @@ async fn create_and_list_memory() {
 
     // List memories
     let list = api
-        .list(&project(), &cairn_api::endpoints::ListQuery::default())
+        .list(
+            &project(),
+            &cairn_api_contracts::endpoints::ListQuery::default(),
+        )
         .await
         .unwrap();
 
@@ -84,7 +94,10 @@ async fn accept_and_reject_memory() {
     api.reject(&project(), &item2.id).await.unwrap();
 
     let list = api
-        .list(&project(), &cairn_api::endpoints::ListQuery::default())
+        .list(
+            &project(),
+            &cairn_api_contracts::endpoints::ListQuery::default(),
+        )
         .await
         .unwrap();
 
@@ -115,7 +128,7 @@ async fn search_returns_results() {
     let results = api
         .search(
             &project(),
-            &cairn_api::memory_api::MemorySearchQuery {
+            &cairn_api_contracts::memory_api::MemorySearchQuery {
                 q: "deploy".to_owned(),
                 limit: Some(5),
             },
@@ -124,5 +137,5 @@ async fn search_returns_results() {
         .unwrap();
 
     // InMemoryRetrieval doesn't do real search, but the trait call succeeds
-    assert!(results.is_empty() || !results.is_empty());
+    let _ = results;
 }

@@ -88,7 +88,30 @@ impl SessionService for FakeFabricSessions {
         Err(readonly("sessions.create"))
     }
 
-    async fn get(&self, session_id: &SessionId) -> Result<Option<SessionRecord>, RuntimeError> {
+    async fn get(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionRecord>, RuntimeError> {
+        // Scope-checked path (issue #439): fetch the stored record and
+        // compare projects; a mismatch is indistinguishable from an
+        // unknown id so non-admin callers cannot enumerate foreign ids.
+        let Some(record) = SessionReadModel::get(self.store.as_ref(), session_id).await? else {
+            return Ok(None);
+        };
+        if record.project != *project {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    async fn lookup_any_admin(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionRecord>, RuntimeError> {
+        // Admin-only cross-tenant lookup (issue #439). Caller is
+        // responsible for the admin-role gate; the test harness
+        // mirrors the fabric adapter's plain lookup shape.
         Ok(SessionReadModel::get(self.store.as_ref(), session_id).await?)
     }
 
@@ -101,7 +124,11 @@ impl SessionService for FakeFabricSessions {
         Ok(SessionReadModel::list_by_project(self.store.as_ref(), project, limit, offset).await?)
     }
 
-    async fn archive(&self, _session_id: &SessionId) -> Result<SessionRecord, RuntimeError> {
+    async fn archive(
+        &self,
+        _project: &ProjectKey,
+        _session_id: &SessionId,
+    ) -> Result<SessionRecord, RuntimeError> {
         Err(readonly("sessions.archive"))
     }
 }

@@ -186,13 +186,17 @@ mod f65_sqlite {
             mem.append(std::slice::from_ref(&evt)).await.unwrap();
         }
 
-        let sqlite_list =
-            F65CheckpointReadModel::list_by_session(&adapter, &SessionId::new(session_id))
+        let sqlite_list = F65CheckpointReadModel::list_by_session(
+            &adapter,
+            &project(),
+            &SessionId::new(session_id),
+        )
+        .await
+        .unwrap();
+        let mem_list =
+            F65CheckpointReadModel::list_by_session(&mem, &project(), &SessionId::new(session_id))
                 .await
                 .unwrap();
-        let mem_list = F65CheckpointReadModel::list_by_session(&mem, &SessionId::new(session_id))
-            .await
-            .unwrap();
         assert_eq!(sqlite_list.len(), 3, "sqlite checkpoint count");
         assert_eq!(mem_list.len(), 3, "in-memory checkpoint count");
         // Returned in iteration-ascending order.
@@ -206,12 +210,13 @@ mod f65_sqlite {
         }
 
         // Single-id lookup.
-        let sqlite_hit = F65CheckpointReadModel::get_f65(&adapter, &CheckpointId::new("ck_1"))
-            .await
-            .unwrap()
-            .expect("ck_1 present");
+        let sqlite_hit =
+            F65CheckpointReadModel::get_f65(&adapter, &project(), &CheckpointId::new("ck_1"))
+                .await
+                .unwrap()
+                .expect("ck_1 present");
         assert_eq!(sqlite_hit.iteration, 1);
-        let mem_hit = F65CheckpointReadModel::get_f65(&mem, &CheckpointId::new("ck_1"))
+        let mem_hit = F65CheckpointReadModel::get_f65(&mem, &project(), &CheckpointId::new("ck_1"))
             .await
             .unwrap()
             .expect("ck_1 present");
@@ -275,10 +280,13 @@ mod f65_sqlite {
         // assurance via the `WorkspaceSnapshotReadModel` trait contract
         // (see `list_by_session` below which does run cross-backend).
 
-        let sqlite_lineage =
-            WorkspaceSnapshotReadModel::lineage(&adapter, &WorkspaceSnapshotId::new("snap_leaf"))
-                .await
-                .unwrap();
+        let sqlite_lineage = WorkspaceSnapshotReadModel::lineage(
+            &adapter,
+            &project(),
+            &WorkspaceSnapshotId::new("snap_leaf"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             sqlite_lineage
                 .iter()
@@ -288,26 +296,39 @@ mod f65_sqlite {
         );
 
         // List-by-session returns all three in created_at order.
-        let sqlite_list =
-            WorkspaceSnapshotReadModel::list_by_session(&adapter, &SessionId::new(session_id))
-                .await
-                .unwrap();
+        let sqlite_list = WorkspaceSnapshotReadModel::list_by_session(
+            &adapter,
+            &project(),
+            &SessionId::new(session_id),
+        )
+        .await
+        .unwrap();
         assert_eq!(sqlite_list.len(), 3);
 
-        let mem_list =
-            WorkspaceSnapshotReadModel::list_by_session(&mem, &SessionId::new(session_id))
-                .await
-                .unwrap();
+        let mem_list = WorkspaceSnapshotReadModel::list_by_session(
+            &mem,
+            &project(),
+            &SessionId::new(session_id),
+        )
+        .await
+        .unwrap();
         assert_eq!(mem_list.len(), 3);
 
         // Single-id lookup works cross-backend.
-        let sqlite_hit =
-            WorkspaceSnapshotReadModel::get(&adapter, &WorkspaceSnapshotId::new("snap_root"))
-                .await
-                .unwrap();
-        let mem_hit = WorkspaceSnapshotReadModel::get(&mem, &WorkspaceSnapshotId::new("snap_root"))
-            .await
-            .unwrap();
+        let sqlite_hit = WorkspaceSnapshotReadModel::get(
+            &adapter,
+            &project(),
+            &WorkspaceSnapshotId::new("snap_root"),
+        )
+        .await
+        .unwrap();
+        let mem_hit = WorkspaceSnapshotReadModel::get(
+            &mem,
+            &project(),
+            &WorkspaceSnapshotId::new("snap_root"),
+        )
+        .await
+        .unwrap();
         assert!(sqlite_hit.is_some());
         assert!(mem_hit.is_some());
     }
@@ -334,11 +355,14 @@ mod f65_sqlite {
         mem.append(std::slice::from_ref(&created)).await.unwrap();
 
         // Pre-reap: reaped_at is NULL.
-        let before =
-            WorkspaceSnapshotReadModel::get(&adapter, &WorkspaceSnapshotId::new("snap_to_reap"))
-                .await
-                .unwrap()
-                .unwrap();
+        let before = WorkspaceSnapshotReadModel::get(
+            &adapter,
+            &project(),
+            &WorkspaceSnapshotId::new("snap_to_reap"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(before.reaped_at.is_none());
 
         let reaped = env(RuntimeEvent::WorkspaceSnapshotReaped(
@@ -351,16 +375,22 @@ mod f65_sqlite {
         log.append(std::slice::from_ref(&reaped)).await.unwrap();
         mem.append(std::slice::from_ref(&reaped)).await.unwrap();
 
-        let sqlite_after =
-            WorkspaceSnapshotReadModel::get(&adapter, &WorkspaceSnapshotId::new("snap_to_reap"))
-                .await
-                .unwrap()
-                .unwrap();
-        let mem_after =
-            WorkspaceSnapshotReadModel::get(&mem, &WorkspaceSnapshotId::new("snap_to_reap"))
-                .await
-                .unwrap()
-                .unwrap();
+        let sqlite_after = WorkspaceSnapshotReadModel::get(
+            &adapter,
+            &project(),
+            &WorkspaceSnapshotId::new("snap_to_reap"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mem_after = WorkspaceSnapshotReadModel::get(
+            &mem,
+            &project(),
+            &WorkspaceSnapshotId::new("snap_to_reap"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(sqlite_after.reaped_at, Some(9_999));
         assert_eq!(mem_after.reaped_at, Some(9_999));
     }
@@ -435,15 +465,19 @@ mod f65_sqlite {
             .await
             .unwrap();
 
-        let sqlite_hit =
-            SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
+        let sqlite_hit = SessionOutcomeReadModel::get_by_root_run(
+            &adapter,
+            &project(),
+            &RunId::new(root_run_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mem_hit =
+            SessionOutcomeReadModel::get_by_root_run(&mem, &project(), &RunId::new(root_run_id))
                 .await
                 .unwrap()
                 .unwrap();
-        let mem_hit = SessionOutcomeReadModel::get_by_root_run(&mem, &RunId::new(root_run_id))
-            .await
-            .unwrap()
-            .unwrap();
 
         for rec in [&sqlite_hit, &mem_hit] {
             assert_eq!(rec.session_id.as_str(), session_id);
@@ -475,10 +509,13 @@ mod f65_sqlite {
             }
         }
 
-        let sqlite_by_session =
-            SessionOutcomeReadModel::list_by_session(&adapter, &SessionId::new(session_id))
-                .await
-                .unwrap();
+        let sqlite_by_session = SessionOutcomeReadModel::list_by_session(
+            &adapter,
+            &project(),
+            &SessionId::new(session_id),
+        )
+        .await
+        .unwrap();
         assert_eq!(sqlite_by_session.len(), 1);
     }
 
@@ -537,15 +574,19 @@ mod f65_sqlite {
             .await
             .unwrap();
 
-        let sqlite_hit =
-            SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
+        let sqlite_hit = SessionOutcomeReadModel::get_by_root_run(
+            &adapter,
+            &project(),
+            &RunId::new(root_run_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mem_hit =
+            SessionOutcomeReadModel::get_by_root_run(&mem, &project(), &RunId::new(root_run_id))
                 .await
                 .unwrap()
                 .unwrap();
-        let mem_hit = SessionOutcomeReadModel::get_by_root_run(&mem, &RunId::new(root_run_id))
-            .await
-            .unwrap()
-            .unwrap();
 
         assert!(sqlite_hit.workspace_snapshot_id.is_none());
         assert!(mem_hit.workspace_snapshot_id.is_none());
@@ -614,10 +655,14 @@ mod f65_sqlite {
             .await
             .unwrap();
 
-        let rec = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
-            .await
-            .unwrap()
-            .unwrap();
+        let rec = SessionOutcomeReadModel::get_by_root_run(
+            &adapter,
+            &project(),
+            &RunId::new(root_run_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         match &rec.termination_reason {
             TerminationReason::CircuitBreakerTripped { trip } => {
                 assert_eq!(trip, &original_trip, "trip payload must round-trip intact");
@@ -643,12 +688,16 @@ mod f65_sqlite {
         .execute(adapter.pool())
         .await
         .unwrap();
-        let err = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
-            .await
-            .expect_err(
-                "NULL termination_reason_json for kind=circuit_breaker_tripped \
+        let err = SessionOutcomeReadModel::get_by_root_run(
+            &adapter,
+            &project(),
+            &RunId::new(root_run_id),
+        )
+        .await
+        .expect_err(
+            "NULL termination_reason_json for kind=circuit_breaker_tripped \
                  must error, not silently fabricate a zero-valued trip",
-            );
+        );
         let msg = err.to_string();
         assert!(
             msg.contains("circuit_breaker_tripped") && msg.contains("termination_reason_json"),
@@ -740,10 +789,14 @@ mod f65_sqlite {
                 .unwrap();
 
             // Baseline: full round-trip with json present works.
-            let rec = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
-                .await
-                .unwrap()
-                .unwrap();
+            let rec = SessionOutcomeReadModel::get_by_root_run(
+                &adapter,
+                &project(),
+                &RunId::new(root_run_id),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(rec.termination_reason, reason);
 
             // Simulate data corruption / pre-column legacy row: NULL the
@@ -757,11 +810,15 @@ mod f65_sqlite {
             .await
             .unwrap();
 
-            let err = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
-                .await
-                .expect_err(&format!(
-                    "NULL termination_reason_json for kind={discriminator} must error"
-                ));
+            let err = SessionOutcomeReadModel::get_by_root_run(
+                &adapter,
+                &project(),
+                &RunId::new(root_run_id),
+            )
+            .await
+            .expect_err(&format!(
+                "NULL termination_reason_json for kind={discriminator} must error"
+            ));
             let msg = err.to_string();
             assert!(
                 msg.contains(discriminator),
@@ -850,10 +907,14 @@ mod f65_sqlite {
             .await
             .unwrap();
 
-            let rec = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
-                .await
-                .expect("NULL json is fine for payload-less variants")
-                .expect("row exists");
+            let rec = SessionOutcomeReadModel::get_by_root_run(
+                &adapter,
+                &project(),
+                &RunId::new(root_run_id),
+            )
+            .await
+            .expect("NULL json is fine for payload-less variants")
+            .expect("row exists");
             assert_eq!(
                 rec.termination_reason, reason,
                 "payload-less variant must round-trip from discriminator alone"
@@ -916,9 +977,13 @@ mod f65_sqlite {
         .await
         .unwrap();
 
-        let err = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
-            .await
-            .expect_err("malformed json must error");
+        let err = SessionOutcomeReadModel::get_by_root_run(
+            &adapter,
+            &project(),
+            &RunId::new(root_run_id),
+        )
+        .await
+        .expect_err("malformed json must error");
         let msg = err.to_string();
         assert!(
             msg.contains("could not be parsed"),
@@ -1008,10 +1073,14 @@ mod f65_sqlite {
             .await
             .unwrap();
 
-            let rec = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
-                .await
-                .expect("malformed json is fine for payload-less variants")
-                .expect("row exists");
+            let rec = SessionOutcomeReadModel::get_by_root_run(
+                &adapter,
+                &project(),
+                &RunId::new(root_run_id),
+            )
+            .await
+            .expect("malformed json is fine for payload-less variants")
+            .expect("row exists");
             assert_eq!(
                 rec.termination_reason, reason,
                 "payload-less variant must round-trip from discriminator even when json column is garbage"
@@ -1083,10 +1152,14 @@ mod f65_sqlite {
                 .unwrap();
         assert_eq!(rows.0, 1, "upsert must not duplicate row");
 
-        let rec = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
-            .await
-            .unwrap()
-            .unwrap();
+        let rec = SessionOutcomeReadModel::get_by_root_run(
+            &adapter,
+            &project(),
+            &RunId::new(root_run_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(rec.compacted_summary, "v2-enriched");
         assert_eq!(rec.cost_micros, 42);
     }

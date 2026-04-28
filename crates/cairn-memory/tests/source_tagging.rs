@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use cairn_api::memory_api::{AddSourceTagsRequest, SourceTagsEndpoints};
+use cairn_api_contracts::memory_api::{AddSourceTagsRequest, SourceTagsEndpoints};
 use cairn_domain::{KnowledgeDocumentId, ProjectKey, SourceId};
 use cairn_memory::api_impl::SourceTagsApiImpl;
 use cairn_memory::in_memory::{InMemoryDocumentStore, InMemoryRetrieval};
@@ -157,7 +157,7 @@ async fn source_tagging_api_add_and_get_source_tags() {
         .unwrap();
 
     // Before tagging — GET returns empty list.
-    let before = api.get_source_tags("src_ops").await.unwrap();
+    let before = api.get_source_tags(&project(), "src_ops").await.unwrap();
     assert!(
         before.tags.is_empty(),
         "source should have no tags initially"
@@ -166,6 +166,7 @@ async fn source_tagging_api_add_and_get_source_tags() {
     // POST tags to the source.
     let added = api
         .add_source_tags(
+            &project(),
             "src_ops",
             &AddSourceTagsRequest {
                 tags: vec!["ops".to_owned(), "critical".to_owned()],
@@ -177,7 +178,7 @@ async fn source_tagging_api_add_and_get_source_tags() {
     assert!(added.tags.contains(&"critical".to_owned()));
 
     // GET now returns the new tags.
-    let after = api.get_source_tags("src_ops").await.unwrap();
+    let after = api.get_source_tags(&project(), "src_ops").await.unwrap();
     assert_eq!(after.source_id, "src_ops");
     assert!(after.tags.contains(&"ops".to_owned()));
     assert!(after.tags.contains(&"critical".to_owned()));
@@ -204,6 +205,7 @@ async fn source_tagging_add_tags_is_idempotent() {
     let api = SourceTagsApiImpl::new(store.clone());
 
     api.add_source_tags(
+        &project(),
         "src_idem",
         &AddSourceTagsRequest {
             tags: vec!["env:prod".to_owned()],
@@ -213,6 +215,7 @@ async fn source_tagging_add_tags_is_idempotent() {
     .unwrap();
 
     api.add_source_tags(
+        &project(),
         "src_idem",
         &AddSourceTagsRequest {
             tags: vec!["env:prod".to_owned()],
@@ -221,7 +224,7 @@ async fn source_tagging_add_tags_is_idempotent() {
     .await
     .unwrap();
 
-    let result = api.get_source_tags("src_idem").await.unwrap();
+    let result = api.get_source_tags(&project(), "src_idem").await.unwrap();
     assert_eq!(
         result.tags.iter().filter(|t| *t == "env:prod").count(),
         1,

@@ -5300,21 +5300,33 @@ impl crate::projections::FfLeaseHistoryCursorStore for InMemoryStore {
 impl crate::projections::SessionOutcomeReadModel for InMemoryStore {
     async fn get_by_root_run(
         &self,
+        project: &ProjectKey,
         root_run_id: &RunId,
     ) -> Result<Option<crate::projections::SessionOutcomeRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state.session_outcomes.get(root_run_id.as_str()).cloned())
+        // Defence-in-depth per issue #438: filter on the project tuple
+        // even though the row also has a unique id, so a caller that
+        // forgets to pre-check the tenant cannot return a foreign
+        // outcome. Returning None (not NotFound) is intentional: it
+        // mirrors the pg/sqlite `AND tenant_id/workspace_scope/project_id`
+        // WHERE clause which also yields an empty row-set.
+        Ok(state
+            .session_outcomes
+            .get(root_run_id.as_str())
+            .filter(|o| o.project == *project)
+            .cloned())
     }
 
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<crate::projections::SessionOutcomeRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut results: Vec<crate::projections::SessionOutcomeRecord> = state
             .session_outcomes
             .values()
-            .filter(|o| o.session_id == *session_id)
+            .filter(|o| o.project == *project && o.session_id == *session_id)
             .cloned()
             .collect();
         // sort_by with a two-key comparator avoids the per-comparison
@@ -5388,21 +5400,27 @@ impl crate::projections::WorkspaceSnapshotWriter for InMemoryStore {
 impl crate::projections::WorkspaceSnapshotReadModel for InMemoryStore {
     async fn get(
         &self,
+        project: &ProjectKey,
         snapshot_id: &WorkspaceSnapshotId,
     ) -> Result<Option<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state.workspace_snapshots.get(snapshot_id.as_str()).cloned())
+        Ok(state
+            .workspace_snapshots
+            .get(snapshot_id.as_str())
+            .filter(|s| s.project == *project)
+            .cloned())
     }
 
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut results: Vec<crate::projections::WorkspaceSnapshotRecord> = state
             .workspace_snapshots
             .values()
-            .filter(|s| s.session_id == *session_id)
+            .filter(|s| s.project == *project && s.session_id == *session_id)
             .cloned()
             .collect();
         // sort_by avoids the per-comparison String allocation that
@@ -5418,6 +5436,7 @@ impl crate::projections::WorkspaceSnapshotReadModel for InMemoryStore {
 
     async fn lineage(
         &self,
+        project: &ProjectKey,
         start: &WorkspaceSnapshotId,
     ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -5435,11 +5454,18 @@ impl crate::projections::WorkspaceSnapshotReadModel for InMemoryStore {
             let Some(rec) = state.workspace_snapshots.get(&id) else {
                 break;
             };
-            chain.push(rec.clone());
+            // Issue #438: a lineage chain is always within one project
+            // by construction (parent/child rows share the same scope at
+            // insert time). A boundary crossing therefore means writer
+            // corruption — stop walking rather than leak a foreign row.
+            if rec.project != *project {
+                break;
+            }
             cursor = rec
                 .parent_snapshot_id
                 .as_ref()
                 .map(|p| p.as_str().to_owned());
+            chain.push(rec.clone());
         }
         Ok(chain)
     }
@@ -5449,21 +5475,27 @@ impl crate::projections::WorkspaceSnapshotReadModel for InMemoryStore {
 impl crate::projections::WorkspaceRegistryReadModel for InMemoryStore {
     async fn get(
         &self,
+        project: &ProjectKey,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state.workspace_registry.get(workspace_id.as_str()).cloned())
+        Ok(state
+            .workspace_registry
+            .get(workspace_id.as_str())
+            .filter(|w| w.project == *project)
+            .cloned())
     }
 
     async fn get_by_root_run(
         &self,
+        project: &ProjectKey,
         root_run_id: &RunId,
     ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Ok(state
             .workspace_registry
             .values()
-            .find(|w| w.root_run_id == *root_run_id)
+            .find(|w| w.project == *project && w.root_run_id == *root_run_id)
             .cloned())
     }
 }
@@ -5472,21 +5504,27 @@ impl crate::projections::WorkspaceRegistryReadModel for InMemoryStore {
 impl crate::projections::F65CheckpointReadModel for InMemoryStore {
     async fn get_f65(
         &self,
+        project: &ProjectKey,
         checkpoint_id: &CheckpointId,
     ) -> Result<Option<crate::projections::F65CheckpointRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state.f65_checkpoints.get(checkpoint_id.as_str()).cloned())
+        Ok(state
+            .f65_checkpoints
+            .get(checkpoint_id.as_str())
+            .filter(|c| c.project == *project)
+            .cloned())
     }
 
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<crate::projections::F65CheckpointRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut results: Vec<crate::projections::F65CheckpointRecord> = state
             .f65_checkpoints
             .values()
-            .filter(|c| c.session_id == *session_id)
+            .filter(|c| c.project == *project && c.session_id == *session_id)
             .cloned()
             .collect();
         // sort_by avoids allocating a String per comparison (same

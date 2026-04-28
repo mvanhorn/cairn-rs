@@ -14,6 +14,7 @@ members = [
     "crates/cairn-signal",
     "crates/cairn-channels",
     "crates/cairn-api",
+    "crates/cairn-api-contracts",
     "crates/cairn-plugin-catalog",
     "crates/cairn-plugin-proto",
     "crates/cairn-app",

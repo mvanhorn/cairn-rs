@@ -177,17 +177,39 @@ pub struct F65CheckpointRecord {
 ///
 /// One outcome per terminal attempt. Tests + UI + orchestrator all use this
 /// to enumerate a session's outcomes without walking the event log.
+///
+/// ## Tenant-isolation (issue #438)
+///
+/// Every method takes a required `project: &ProjectKey` that becomes an
+/// `AND tenant_id = ? AND workspace_scope = ? AND project_id = ?` SQL
+/// guard at the query layer. This is defence-in-depth on top of the
+/// handler-level scope check — a handler that forgets to pre-check the
+/// tenant cannot return a row belonging to a different tenant, because
+/// the scope tuple is part of the lookup key. Matches the #185
+/// LeaseHistorySubscriber root-cause fix and stops the F65 PR-5+
+/// handlers from repeating the same mistake.
 #[async_trait]
 pub trait SessionOutcomeReadModel: Send + Sync {
     /// Fetch the outcome for a specific root-Run (primary key).
+    ///
+    /// Returns `None` when the row does not exist **or** when it exists
+    /// but belongs to a different project scope — callers cannot
+    /// distinguish the two, by design: leaking the distinction would
+    /// reveal which ids exist in other tenants.
     async fn get_by_root_run(
         &self,
+        project: &ProjectKey,
         root_run_id: &RunId,
     ) -> Result<Option<SessionOutcomeRecord>, StoreError>;
 
     /// List all outcomes for a session in chronological order (oldest first).
+    ///
+    /// Only rows matching `project` are returned. A cross-tenant
+    /// `session_id` clash (ids are globally unique today, but this is
+    /// belt-and-braces) is filtered out silently.
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<SessionOutcomeRecord>, StoreError>;
 }
@@ -225,39 +247,61 @@ pub trait WorkspaceSnapshotWriter: Send + Sync {
 }
 
 /// Reader for the `workspace_snapshots` projection.
+///
+/// ## Tenant-isolation (issue #438)
+///
+/// Every method takes a required `project: &ProjectKey` — see the
+/// `SessionOutcomeReadModel` doc for the full rationale. Rows
+/// belonging to a different project scope are filtered at the query
+/// layer so a handler that forgets to pre-check the tenant still
+/// cannot surface a foreign snapshot.
 #[async_trait]
 pub trait WorkspaceSnapshotReadModel: Send + Sync {
     async fn get(
         &self,
+        project: &ProjectKey,
         snapshot_id: &WorkspaceSnapshotId,
     ) -> Result<Option<WorkspaceSnapshotRecord>, StoreError>;
 
     /// List all snapshots for a session in chronological order (oldest first).
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<WorkspaceSnapshotRecord>, StoreError>;
 
     /// Walk the parent-snapshot chain for a snapshot, newest first, stopping
     /// at the root. The returned vector starts with `start` itself and ends
-    /// at the lineage root. Returns an empty vector if `start` doesn't exist.
+    /// at the lineage root. Returns an empty vector if `start` doesn't exist
+    /// **or** if the starting row is scoped outside `project`. The walker
+    /// stops if a parent crosses the scope boundary — lineage chains are
+    /// always within a single project by construction, so a boundary
+    /// crossing indicates writer-side corruption.
     async fn lineage(
         &self,
+        project: &ProjectKey,
         start: &WorkspaceSnapshotId,
     ) -> Result<Vec<WorkspaceSnapshotRecord>, StoreError>;
 }
 
 /// Reader for the `workspace_registry` projection.
+///
+/// ## Tenant-isolation (issue #438)
+///
+/// Every method takes a required `project: &ProjectKey` — see the
+/// `SessionOutcomeReadModel` doc for the full rationale.
 #[async_trait]
 pub trait WorkspaceRegistryReadModel: Send + Sync {
     async fn get(
         &self,
+        project: &ProjectKey,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<WorkspaceRegistryRecord>, StoreError>;
 
     /// Look up the live workspace row belonging to a root-Run, if any.
     async fn get_by_root_run(
         &self,
+        project: &ProjectKey,
         root_run_id: &RunId,
     ) -> Result<Option<WorkspaceRegistryRecord>, StoreError>;
 }
@@ -505,16 +549,23 @@ fn is_payloadless_kind(kind: &str) -> bool {
 /// Rows written before PR-2 (legacy RFC 005 checkpoints) have NULL F65
 /// columns and return `None` from `get_f65` — callers use the RFC 005
 /// `CheckpointReadModel` for those.
+///
+/// ## Tenant-isolation (issue #438)
+///
+/// Every method takes a required `project: &ProjectKey` — see the
+/// `SessionOutcomeReadModel` doc for the full rationale.
 #[async_trait]
 pub trait F65CheckpointReadModel: Send + Sync {
     async fn get_f65(
         &self,
+        project: &ProjectKey,
         checkpoint_id: &CheckpointId,
     ) -> Result<Option<F65CheckpointRecord>, StoreError>;
 
     /// List checkpoints for a session in iteration order (ascending).
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<F65CheckpointRecord>, StoreError>;
 }

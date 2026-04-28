@@ -1405,11 +1405,22 @@ impl F65SessionOutcomeRowPg {
 impl crate::projections::SessionOutcomeReadModel for PgAdapter {
     async fn get_by_root_run(
         &self,
+        project: &ProjectKey,
         root_run_id: &RunId,
     ) -> Result<Option<crate::projections::SessionOutcomeRecord>, StoreError> {
-        let sql = format!("{F65_SESSION_OUTCOME_SELECT_PG} WHERE root_run_id = $1");
+        // Tenant-isolation (issue #438): scope-tuple guard runs at the
+        // query layer so a handler that forgets to pre-check cannot
+        // leak a foreign row. Matches pg/sqlite row layout which
+        // always stores `tenant_id`, `workspace_scope`, `project_id`.
+        let sql = format!(
+            "{F65_SESSION_OUTCOME_SELECT_PG} WHERE root_run_id = $1 \
+             AND tenant_id = $2 AND workspace_scope = $3 AND project_id = $4"
+        );
         let row = sqlx::query_as::<_, F65SessionOutcomeRowPg>(&sql)
             .bind(root_run_id.as_str())
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -1418,14 +1429,19 @@ impl crate::projections::SessionOutcomeReadModel for PgAdapter {
 
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<crate::projections::SessionOutcomeRecord>, StoreError> {
         let sql = format!(
             "{F65_SESSION_OUTCOME_SELECT_PG} WHERE session_id = $1 \
+             AND tenant_id = $2 AND workspace_scope = $3 AND project_id = $4 \
              ORDER BY created_at ASC, root_run_id ASC"
         );
         let rows = sqlx::query_as::<_, F65SessionOutcomeRowPg>(&sql)
             .bind(session_id.as_str())
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -1518,11 +1534,18 @@ impl crate::projections::WorkspaceSnapshotWriter for PgAdapter {
 impl crate::projections::WorkspaceSnapshotReadModel for PgAdapter {
     async fn get(
         &self,
+        project: &ProjectKey,
         snapshot_id: &cairn_domain::WorkspaceSnapshotId,
     ) -> Result<Option<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
-        let sql = format!("{F65_WORKSPACE_SNAPSHOT_SELECT_PG} WHERE snapshot_id = $1");
+        let sql = format!(
+            "{F65_WORKSPACE_SNAPSHOT_SELECT_PG} WHERE snapshot_id = $1 \
+             AND tenant_id = $2 AND workspace_scope = $3 AND project_id = $4"
+        );
         let row = sqlx::query_as::<_, F65WorkspaceSnapshotRowPg>(&sql)
             .bind(snapshot_id.as_str())
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -1531,14 +1554,19 @@ impl crate::projections::WorkspaceSnapshotReadModel for PgAdapter {
 
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
         let sql = format!(
             "{F65_WORKSPACE_SNAPSHOT_SELECT_PG} WHERE session_id = $1 \
+             AND tenant_id = $2 AND workspace_scope = $3 AND project_id = $4 \
              ORDER BY created_at ASC, snapshot_id ASC"
         );
         let rows = sqlx::query_as::<_, F65WorkspaceSnapshotRowPg>(&sql)
             .bind(session_id.as_str())
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -1550,6 +1578,7 @@ impl crate::projections::WorkspaceSnapshotReadModel for PgAdapter {
 
     async fn lineage(
         &self,
+        project: &ProjectKey,
         start: &cairn_domain::WorkspaceSnapshotId,
     ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
         // Iterative walk rather than a recursive CTE — SQLite-parity
@@ -1557,6 +1586,11 @@ impl crate::projections::WorkspaceSnapshotReadModel for PgAdapter {
         // (project memory `feedback_no_db_specific_features`). A cycle in
         // the parent chain would be an FK bug upstream; we still cap the
         // walk defensively.
+        //
+        // Issue #438: every hop re-checks the project scope via the
+        // per-row `get` above, so a chain that crosses tenants (writer
+        // corruption) stops at the boundary instead of leaking the
+        // foreign row.
         let mut chain: Vec<crate::projections::WorkspaceSnapshotRecord> = Vec::new();
         let mut cursor = Some(start.as_str().to_owned());
         const MAX_DEPTH: usize = 1024;
@@ -1566,6 +1600,7 @@ impl crate::projections::WorkspaceSnapshotReadModel for PgAdapter {
             };
             let Some(rec) = <Self as crate::projections::WorkspaceSnapshotReadModel>::get(
                 self,
+                project,
                 &cairn_domain::WorkspaceSnapshotId::new(id),
             )
             .await?
@@ -1586,6 +1621,7 @@ impl crate::projections::WorkspaceSnapshotReadModel for PgAdapter {
 impl crate::projections::WorkspaceRegistryReadModel for PgAdapter {
     async fn get(
         &self,
+        project: &ProjectKey,
         workspace_id: &cairn_domain::WorkspaceId,
     ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
         let row: Option<(
@@ -1601,9 +1637,13 @@ impl crate::projections::WorkspaceRegistryReadModel for PgAdapter {
         )> = sqlx::query_as(
             "SELECT workspace_id, tenant_id, workspace_scope, project_id, \
              root_run_id, fs_root, status, created_at, reaped_at \
-             FROM workspace_registry WHERE workspace_id = $1",
+             FROM workspace_registry WHERE workspace_id = $1 \
+             AND tenant_id = $2 AND workspace_scope = $3 AND project_id = $4",
         )
         .bind(workspace_id.as_str())
+        .bind(project.tenant_id.as_str())
+        .bind(project.workspace_id.as_str())
+        .bind(project.project_id.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -1612,6 +1652,7 @@ impl crate::projections::WorkspaceRegistryReadModel for PgAdapter {
 
     async fn get_by_root_run(
         &self,
+        project: &ProjectKey,
         root_run_id: &RunId,
     ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
         let row: Option<(
@@ -1628,9 +1669,13 @@ impl crate::projections::WorkspaceRegistryReadModel for PgAdapter {
             "SELECT workspace_id, tenant_id, workspace_scope, project_id, \
              root_run_id, fs_root, status, created_at, reaped_at \
              FROM workspace_registry WHERE root_run_id = $1 \
+             AND tenant_id = $2 AND workspace_scope = $3 AND project_id = $4 \
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(root_run_id.as_str())
+        .bind(project.tenant_id.as_str())
+        .bind(project.workspace_id.as_str())
+        .bind(project.project_id.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -1680,6 +1725,7 @@ fn tuple_to_workspace_registry_pg(
 impl crate::projections::F65CheckpointReadModel for PgAdapter {
     async fn get_f65(
         &self,
+        project: &ProjectKey,
         checkpoint_id: &CheckpointId,
     ) -> Result<Option<crate::projections::F65CheckpointRecord>, StoreError> {
         let row: Option<(
@@ -1698,9 +1744,13 @@ impl crate::projections::F65CheckpointReadModel for PgAdapter {
             "SELECT checkpoint_id, tenant_id, workspace_id, project_id, \
              run_id, session_id, body, body_size_bytes, schema_version, iteration, created_at \
              FROM checkpoints \
-             WHERE checkpoint_id = $1 AND session_id IS NOT NULL",
+             WHERE checkpoint_id = $1 AND session_id IS NOT NULL \
+             AND tenant_id = $2 AND workspace_id = $3 AND project_id = $4",
         )
         .bind(checkpoint_id.as_str())
+        .bind(project.tenant_id.as_str())
+        .bind(project.workspace_id.as_str())
+        .bind(project.project_id.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -1723,6 +1773,7 @@ impl crate::projections::F65CheckpointReadModel for PgAdapter {
 
     async fn list_by_session(
         &self,
+        project: &ProjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<crate::projections::F65CheckpointRecord>, StoreError> {
         let rows: Vec<(
@@ -1742,9 +1793,13 @@ impl crate::projections::F65CheckpointReadModel for PgAdapter {
              run_id, session_id, body, body_size_bytes, schema_version, iteration, created_at \
              FROM checkpoints \
              WHERE session_id = $1 \
+             AND tenant_id = $2 AND workspace_id = $3 AND project_id = $4 \
              ORDER BY iteration ASC, created_at ASC, checkpoint_id ASC",
         )
         .bind(session_id.as_str())
+        .bind(project.tenant_id.as_str())
+        .bind(project.workspace_id.as_str())
+        .bind(project.project_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;

@@ -1,7 +1,14 @@
 //! Integration test proving FeedStore from cairn-memory wires correctly
-//! through the cairn-api FeedEndpoints trait boundary.
+//! through the `cairn-api-contracts` FeedEndpoints trait boundary.
+//!
+//! Relocated from `cairn-api/tests/feed_wiring.rs` in #440 to eliminate
+//! the cairn-api -> cairn-memory dev-dep that inverted the layer
+//! ordering. The SSE payload-shape assertion that lived here previously
+//! stays in cairn-api's own tests (see
+//! `crates/cairn-api/tests/feed_sse_payload.rs`) because it only needs
+//! cairn-api, not cairn-memory.
 
-use cairn_api::feed::{FeedEndpoints, FeedItem, FeedQuery};
+use cairn_api_contracts::feed::{FeedEndpoints, FeedItem, FeedQuery};
 use cairn_domain::tenancy::ProjectKey;
 use cairn_memory::feed_impl::FeedStore;
 
@@ -44,7 +51,7 @@ async fn mark_read_and_read_all() {
     store.push_item(make_item("1", "slack", false));
     store.push_item(make_item("2", "rss", false));
 
-    store.mark_read("1").await.unwrap();
+    store.mark_read(&project(), "1").await.unwrap();
 
     let result = store.list(&project(), &FeedQuery::default()).await.unwrap();
     let item1 = result.items.iter().find(|i| i.id == "1").unwrap();
@@ -52,16 +59,4 @@ async fn mark_read_and_read_all() {
 
     let changed = store.read_all(&project()).await.unwrap();
     assert!(changed >= 1);
-}
-
-#[tokio::test]
-async fn feed_update_sse_from_feed_item() {
-    let item = make_item("101", "slack", false);
-
-    let frame = cairn_api::sse_payloads::build_feed_update_frame(item, None).unwrap();
-    assert_eq!(frame.event, cairn_api::sse::SseEventName::FeedUpdate);
-    assert_eq!(frame.data["item"]["id"], "101");
-    assert_eq!(frame.data["item"]["source"], "slack");
-    assert_eq!(frame.data["item"]["isRead"], false);
-    assert_eq!(frame.data["item"]["kind"], "message");
 }

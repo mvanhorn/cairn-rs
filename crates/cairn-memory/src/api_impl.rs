@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cairn_api::endpoints::ListQuery;
-use cairn_api::http::ListResponse;
-use cairn_api::memory_api::{
+use cairn_api_contracts::endpoints::ListQuery;
+use cairn_api_contracts::http::ListResponse;
+use cairn_api_contracts::memory_api::{
     CreateMemoryRequest, MemoryEndpoints, MemoryItem, MemorySearchQuery, MemoryStatus,
 };
 use cairn_domain::{ChunkId, KnowledgeDocumentId, ProjectKey, SourceId};
@@ -326,7 +326,7 @@ impl<R: RetrievalService + 'static> MemoryEndpoints for MemoryApiImpl<R> {
 // Corpus management implementation (RFC 003)
 // ---------------------------------------------------------------------------
 
-use cairn_api::memory_api::{
+use cairn_api_contracts::memory_api::{
     AddDocumentToCorpusRequest, AddSourceTagsRequest, CorpusEndpoints, CorpusRecord,
     CreateCorpusRequest, SourceTagsEndpoints, SourceTagsResponse,
 };
@@ -381,35 +381,46 @@ impl CorpusEndpoints for CorpusApiImpl {
         })
     }
 
-    async fn get_corpus(&self, corpus_id: &str) -> Result<Option<CorpusRecord>, Self::Error> {
+    async fn get_corpus(
+        &self,
+        project: &ProjectKey,
+        corpus_id: &str,
+    ) -> Result<Option<CorpusRecord>, Self::Error> {
         let corpora = self.corpora.lock().unwrap();
-        Ok(corpora.iter().find(|c| c.corpus_id == corpus_id).map(|c| {
-            // Count documents: both directly added and those ingested with this corpus_id.
-            let chunks = self.store.all_current_chunks();
-            let ingested_doc_ids: std::collections::HashSet<String> = chunks
-                .iter()
-                .filter(|ch| {
-                    ch.provenance_metadata
-                        .as_ref()
-                        .and_then(|m| m.get("corpus_id"))
-                        .and_then(|v| v.as_str())
-                        == Some(corpus_id)
-                })
-                .map(|ch| ch.document_id.as_str().to_owned())
-                .collect();
+        // Defence-in-depth per the trait contract (#438/#439 pattern):
+        // a corpus whose stored project does not match `project` is
+        // indistinguishable from "not found" — stops cross-tenant
+        // enumeration via known corpus_ids.
+        Ok(corpora
+            .iter()
+            .find(|c| c.corpus_id == corpus_id && &c.project == project)
+            .map(|c| {
+                // Count documents: both directly added and those ingested with this corpus_id.
+                let chunks = self.store.all_current_chunks();
+                let ingested_doc_ids: std::collections::HashSet<String> = chunks
+                    .iter()
+                    .filter(|ch| {
+                        ch.provenance_metadata
+                            .as_ref()
+                            .and_then(|m| m.get("corpus_id"))
+                            .and_then(|v| v.as_str())
+                            == Some(corpus_id)
+                    })
+                    .map(|ch| ch.document_id.as_str().to_owned())
+                    .collect();
 
-            let mut all_doc_ids: std::collections::HashSet<String> = ingested_doc_ids;
-            for did in &c.document_ids {
-                all_doc_ids.insert(did.clone());
-            }
+                let mut all_doc_ids: std::collections::HashSet<String> = ingested_doc_ids;
+                for did in &c.document_ids {
+                    all_doc_ids.insert(did.clone());
+                }
 
-            CorpusRecord {
-                corpus_id: c.corpus_id.clone(),
-                name: c.name.clone(),
-                description: c.description.clone(),
-                document_count: all_doc_ids.len() as u32,
-            }
-        }))
+                CorpusRecord {
+                    corpus_id: c.corpus_id.clone(),
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                    document_count: all_doc_ids.len() as u32,
+                }
+            }))
     }
 
     async fn list_corpora(&self, project: &ProjectKey) -> Result<Vec<CorpusRecord>, Self::Error> {
@@ -428,13 +439,18 @@ impl CorpusEndpoints for CorpusApiImpl {
 
     async fn add_document_to_corpus(
         &self,
+        project: &ProjectKey,
         corpus_id: &str,
         request: &AddDocumentToCorpusRequest,
     ) -> Result<(), Self::Error> {
         let mut corpora = self.corpora.lock().unwrap();
+        // Scope-check at the service layer: a caller supplying a
+        // `project` that does not own `corpus_id` receives the same
+        // "corpus not found" shape as an unknown id, so a foreign
+        // corpus cannot be mutated from another tenant.
         let corpus = corpora
             .iter_mut()
-            .find(|c| c.corpus_id == corpus_id)
+            .find(|c| c.corpus_id == corpus_id && &c.project == project)
             .ok_or_else(|| format!("corpus not found: {corpus_id}"))?;
 
         if !corpus.document_ids.contains(&request.document_id) {
@@ -484,7 +500,18 @@ impl SourceTagsApiImpl {
 impl SourceTagsEndpoints for SourceTagsApiImpl {
     type Error = String;
 
-    async fn get_source_tags(&self, source_id: &str) -> Result<SourceTagsResponse, Self::Error> {
+    async fn get_source_tags(
+        &self,
+        _project: &ProjectKey,
+        source_id: &str,
+    ) -> Result<SourceTagsResponse, Self::Error> {
+        // `_project` accepted to honour the trait contract (Gemini
+        // review on #554 locked the scope-tuple shape across all
+        // SourceTagsEndpoints methods). This in-memory backend groups
+        // tags by `source_id` with no project column — the production
+        // backend that replaces this stub MUST filter on the project
+        // tuple before the read. Tracked alongside the FeedStore stub
+        // limitation in `feed_impl.rs`.
         let tags = self.tags.lock().unwrap();
         let source_tags = tags.get(source_id).cloned().unwrap_or_default();
         Ok(SourceTagsResponse {
@@ -495,6 +522,7 @@ impl SourceTagsEndpoints for SourceTagsApiImpl {
 
     async fn add_source_tags(
         &self,
+        _project: &ProjectKey,
         source_id: &str,
         request: &AddSourceTagsRequest,
     ) -> Result<SourceTagsResponse, Self::Error> {

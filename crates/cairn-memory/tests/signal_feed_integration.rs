@@ -5,7 +5,7 @@
 //! FeedItems and pushed into FeedStore, which serves them through
 //! the FeedEndpoints trait.
 
-use cairn_api::feed::{FeedEndpoints, FeedItem, FeedQuery};
+use cairn_api_contracts::feed::{FeedEndpoints, FeedItem, FeedQuery};
 use cairn_domain::{ProjectKey, SourceId};
 use cairn_memory::feed_impl::FeedStore;
 use cairn_signal::pollers::{PollResult, SignalSource, SourceKind, SourcePoller};
@@ -110,7 +110,7 @@ async fn signal_poll_flows_through_to_feed_endpoint() {
     assert!(rss_only.items.iter().all(|i| i.source == "Tech News RSS"));
 
     // Mark one read, verify unread filter.
-    feed.mark_read(&all.items[0].id).await.unwrap();
+    feed.mark_read(&project, &all.items[0].id).await.unwrap();
     let unread = feed
         .list(
             &project,

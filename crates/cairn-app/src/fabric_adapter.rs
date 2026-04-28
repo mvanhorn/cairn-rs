@@ -1819,7 +1819,43 @@ impl SessionService for FabricSessionServiceAdapter {
         Ok(record)
     }
 
-    async fn get(&self, session_id: &SessionId) -> Result<Option<SessionRecord>, RuntimeError> {
+    async fn get(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionRecord>, RuntimeError> {
+        // Scope check at the service layer (issue #439): previously this
+        // adapter resolved the session's project via the store and
+        // trusted the caller to tenant-match after the fetch. That left
+        // every new handler one forgotten comparison away from a
+        // #185-shape cross-tenant leak. Now the caller must assert the
+        // expected project up front; if the stored row's scope does not
+        // match, we return `None` (indistinguishable from "unknown id"
+        // on purpose — leaking the distinction reveals ids that exist
+        // in other tenants).
+        let stored_project = match resolve_project_from_session_id(&self.store, session_id).await? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if stored_project != *project {
+            return Ok(None);
+        }
+        self.fabric
+            .sessions
+            .get(project, session_id)
+            .await
+            .map_err(fabric_err_to_runtime)
+    }
+
+    async fn lookup_any_admin(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionRecord>, RuntimeError> {
+        // Admin-only cross-tenant lookup (issue #439). The caller is
+        // responsible for guarding this with an AdminRoleGuard /
+        // TenantScope::is_admin check — the service layer cannot
+        // authenticate; it only owns the shape of "return the record
+        // regardless of project."
         let project = match resolve_project_from_session_id(&self.store, session_id).await? {
             Some(p) => p,
             None => return Ok(None),
@@ -1845,11 +1881,25 @@ impl SessionService for FabricSessionServiceAdapter {
             .map_err(RuntimeError::from)
     }
 
-    async fn archive(&self, session_id: &SessionId) -> Result<SessionRecord, RuntimeError> {
-        let project = resolve_session_project(&self.store, session_id).await?;
+    async fn archive(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+    ) -> Result<SessionRecord, RuntimeError> {
+        // Scope check at the service layer (issue #439): mirror the
+        // `get` guard — an archive call with a mismatched project is
+        // treated as "session not found" rather than routing the
+        // tenant-A id through to the fabric under tenant-B's scope.
+        let stored_project = resolve_session_project(&self.store, session_id).await?;
+        if stored_project != *project {
+            return Err(RuntimeError::NotFound {
+                entity: "session",
+                id: session_id.as_str().to_owned(),
+            });
+        }
         self.fabric
             .sessions
-            .archive(&project, session_id)
+            .archive(project, session_id)
             .await
             .map_err(fabric_err_to_runtime)
     }

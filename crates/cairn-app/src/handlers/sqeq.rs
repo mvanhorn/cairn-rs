@@ -201,9 +201,18 @@ pub(crate) async fn sqeq_submit_handler(
         }
 
         let session_id = SessionId::new(params.session_id.clone());
-        match state.runtime.sessions.get(&session_id).await {
-            Ok(Some(session)) if session.project == binding.project => {}
-            Ok(Some(_)) | Ok(None) => {
+        // Scoped get (#439): the binding's project is authoritative;
+        // delegate the scope check to the service layer so a session
+        // that exists in another tenant surfaces as "not found"
+        // without revealing its existence via a post-fetch comparison.
+        match state
+            .runtime
+            .sessions
+            .get(&binding.project, &session_id)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
                 return sqeq_ack_response(
                     StatusCode::NOT_FOUND,
                     false,
