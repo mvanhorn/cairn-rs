@@ -258,15 +258,24 @@ impl EntitlementService {
 
     /// Assign a plan tier to a tenant.
     pub fn set_plan(&self, tenant_id: &str, tier: PlanTier) {
+        // Poison-tolerant: the inner value (a HashMap keyed by tenant_id) is
+        // per-tenant independent — a writer panic mid-insert leaves at worst a
+        // partial entry for one tenant, not a broken invariant. We recover the
+        // inner value and keep serving. Mirrors the approved pattern in
+        // `sandbox/f65.rs::BufferedF65EventSink`.
         self.plans
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(tenant_id.to_owned(), tier);
     }
 
     /// Get the plan tier for a tenant.
     pub fn get_plan(&self, tenant_id: &str) -> Option<PlanTier> {
-        self.plans.read().unwrap().get(tenant_id).copied()
+        self.plans
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tenant_id)
+            .copied()
     }
 
     /// Get the plan limits for a tenant. Returns `None` if no plan assigned.
@@ -335,7 +344,7 @@ impl EntitlementService {
             return Ok(());
         }
 
-        let mut map = self.usage.write().unwrap();
+        let mut map = self.usage.write().unwrap_or_else(|e| e.into_inner());
         let usage = map.entry(tenant_id.to_owned()).or_default();
         maybe_reset_daily(usage);
 
@@ -366,7 +375,7 @@ impl EntitlementService {
             return Ok(());
         }
 
-        let mut map = self.usage.write().unwrap();
+        let mut map = self.usage.write().unwrap_or_else(|e| e.into_inner());
         let usage = map.entry(tenant_id.to_owned()).or_default();
         maybe_reset_monthly(usage);
 
@@ -386,14 +395,14 @@ impl EntitlementService {
 
     /// Record a session creation.
     pub fn record_session(&self, tenant_id: &str) {
-        let mut map = self.usage.write().unwrap();
+        let mut map = self.usage.write().unwrap_or_else(|e| e.into_inner());
         let usage = map.entry(tenant_id.to_owned()).or_default();
         usage.sessions_created += 1;
     }
 
     /// Record a run start.
     pub fn record_run(&self, tenant_id: &str) {
-        let mut map = self.usage.write().unwrap();
+        let mut map = self.usage.write().unwrap_or_else(|e| e.into_inner());
         let usage = map.entry(tenant_id.to_owned()).or_default();
         maybe_reset_daily(usage);
         usage.runs_today += 1;
@@ -401,7 +410,7 @@ impl EntitlementService {
 
     /// Record token consumption.
     pub fn record_tokens(&self, tenant_id: &str, tokens: u64) {
-        let mut map = self.usage.write().unwrap();
+        let mut map = self.usage.write().unwrap_or_else(|e| e.into_inner());
         let usage = map.entry(tenant_id.to_owned()).or_default();
         maybe_reset_monthly(usage);
         usage.tokens_this_month = usage.tokens_this_month.saturating_add(tokens);
@@ -412,7 +421,7 @@ impl EntitlementService {
     fn get_usage_counters(&self, tenant_id: &str) -> TenantUsage {
         self.usage
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(tenant_id)
             .cloned()
             .unwrap_or_default()
@@ -805,5 +814,164 @@ mod tests {
         let report = svc.get_usage("t1").unwrap();
         assert_eq!(report.tier, PlanTier::Pro);
         assert_eq!(report.max_sessions, 100);
+    }
+
+    // ── Lock-poison recovery (issue #462) ────────────────────────────────
+    //
+    // `EntitlementService` is wired into `AppState` via `Arc` and used on
+    // the hot path of `session_create`, `run_start`, and token recording.
+    // Before the fix every guard used `.read().unwrap()` /
+    // `.write().unwrap()`. A single panic in a writer task would poison
+    // the `RwLock` and take down every subsequent entitlement check —
+    // HTTP handlers gated on entitlements would start 500'ing until the
+    // process restarted.
+    //
+    // The fix is `unwrap_or_else(|e| e.into_inner())` on every guard,
+    // mirroring the approved `BufferedF65EventSink` pattern in
+    // `crates/cairn-workspace/src/sandbox/f65.rs`. The `HashMap`s the
+    // locks protect are keyed by tenant_id — independent per tenant — so
+    // a partial insert from a panicking writer leaves at worst one
+    // tenant entry half-written, not a broken invariant.
+    //
+    // These tests spawn a real panicking writer on `Arc<EntitlementService>`
+    // and assert every read/write path still serves afterwards. The tests
+    // live in-module so they can poison the private `plans` and `usage`
+    // locks directly — there is no public API that panics under a write
+    // guard on its own.
+
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Poisons the `plans` write lock on `svc`. Panics on the spawning
+    /// thread; the `JoinHandle::join` on the caller side returns `Err`
+    /// (unwinding propagates across the thread boundary).
+    fn poison_plans_lock(svc: &EntitlementService) {
+        let _guard = svc.plans.write().unwrap_or_else(|e| e.into_inner());
+        panic!("test-induced panic while holding plans write guard");
+    }
+
+    /// Poisons the `usage` write lock on `svc`.
+    fn poison_usage_lock(svc: &EntitlementService) {
+        let _guard = svc.usage.write().unwrap_or_else(|e| e.into_inner());
+        panic!("test-induced panic while holding usage write guard");
+    }
+
+    #[test]
+    fn plans_rwlock_survives_writer_panic() {
+        let svc = Arc::new(EntitlementService::new());
+        svc.set_plan("tenant_a", PlanTier::Free);
+
+        let svc_clone = Arc::clone(&svc);
+        let writer = thread::spawn(move || poison_plans_lock(&svc_clone));
+        assert!(writer.join().is_err(), "writer thread should have panicked");
+
+        // After the poison, all `plans`-reader paths must still serve —
+        // this is the whole point of the fix. Before #462 these `.read().unwrap()`
+        // calls would themselves panic on the poisoned guard.
+        svc.check_entitlement("tenant_a", "runtime_core")
+            .expect("check_entitlement must survive plans-lock poison");
+        assert_eq!(svc.get_plan("tenant_a"), Some(PlanTier::Free));
+        assert!(svc.get_limits("tenant_a").is_some());
+
+        // Subsequent writes on the same lock still land.
+        svc.set_plan("tenant_c", PlanTier::Enterprise);
+        assert_eq!(svc.get_plan("tenant_c"), Some(PlanTier::Enterprise));
+    }
+
+    #[test]
+    fn usage_rwlock_survives_writer_panic() {
+        let svc = Arc::new(EntitlementService::new());
+        svc.set_plan("tenant_a", PlanTier::Pro);
+
+        let svc_clone = Arc::clone(&svc);
+        let writer = thread::spawn(move || poison_usage_lock(&svc_clone));
+        assert!(writer.join().is_err(), "writer thread should have panicked");
+
+        // Every `usage`-path read/write must still land. Before #462 the
+        // `.write().unwrap()` inside `record_session` would panic on the
+        // poisoned guard, cascading DoS into every HTTP handler.
+        svc.record_session("tenant_a");
+        svc.record_run("tenant_a");
+        svc.record_tokens("tenant_a", 1_000);
+
+        svc.check_run_limit("tenant_a")
+            .expect("check_run_limit must survive usage-lock poison");
+        svc.check_token_limit("tenant_a", 500)
+            .expect("check_token_limit must survive usage-lock poison");
+
+        let report = svc
+            .get_usage("tenant_a")
+            .expect("get_usage must survive usage-lock poison");
+        assert_eq!(report.sessions_used, 1);
+        assert_eq!(report.runs_today, 1);
+        assert_eq!(report.tokens_this_month, 1_000);
+        assert_eq!(report.tier, PlanTier::Pro);
+    }
+
+    #[test]
+    fn both_rwlocks_survive_combined_writer_panic() {
+        let svc = Arc::new(EntitlementService::new());
+        svc.set_plan("tenant_a", PlanTier::Enterprise);
+
+        let svc_clone = Arc::clone(&svc);
+        let writer1 = thread::spawn(move || poison_plans_lock(&svc_clone));
+        let svc_clone = Arc::clone(&svc);
+        let writer2 = thread::spawn(move || poison_usage_lock(&svc_clone));
+        assert!(writer1.join().is_err());
+        assert!(writer2.join().is_err());
+
+        svc.check_entitlement("tenant_a", "runtime_core")
+            .expect("plans-lock poison must not block feature check");
+        svc.check_session_limit("tenant_a")
+            .expect("usage-lock poison must not block session-limit check");
+        svc.record_session("tenant_a");
+
+        let report = svc.get_usage("tenant_a").expect("get_usage after poison");
+        assert_eq!(report.tier, PlanTier::Enterprise);
+        assert_eq!(report.sessions_used, 1);
+    }
+
+    /// Concurrent readers + a panicking writer. Models the production
+    /// scenario: many HTTP handlers checking entitlements in parallel,
+    /// one of them panics while holding a guard. The survivors must
+    /// continue without being dragged down.
+    #[test]
+    fn concurrent_readers_survive_writer_panic() {
+        let svc = Arc::new(EntitlementService::new());
+        svc.set_plan("tenant_a", PlanTier::Pro);
+
+        // Fire off 8 reader threads that will each poll the service
+        // repeatedly. Each reader exits cleanly when it observes the
+        // post-poison state.
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let svc = Arc::clone(&svc);
+                thread::spawn(move || {
+                    for _ in 0..64 {
+                        let _ = svc.check_entitlement("tenant_a", "runtime_core");
+                        let _ = svc.get_usage("tenant_a");
+                    }
+                })
+            })
+            .collect();
+
+        // Poison both locks from dedicated writer threads.
+        let svc_clone = Arc::clone(&svc);
+        let writer1 = thread::spawn(move || poison_plans_lock(&svc_clone));
+        let svc_clone = Arc::clone(&svc);
+        let writer2 = thread::spawn(move || poison_usage_lock(&svc_clone));
+        assert!(writer1.join().is_err());
+        assert!(writer2.join().is_err());
+
+        // All readers must complete without panicking.
+        for (i, reader) in readers.into_iter().enumerate() {
+            reader
+                .join()
+                .unwrap_or_else(|_| panic!("reader {i} panicked after lock poison"));
+        }
+
+        // Final sanity: service still serves.
+        svc.check_entitlement("tenant_a", "runtime_core")
+            .expect("service must still serve after poison + concurrent readers");
     }
 }

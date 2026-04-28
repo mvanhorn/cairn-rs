@@ -625,9 +625,16 @@ mod f65_sqlite {
             other => panic!("expected CircuitBreakerTripped, got {other:?}"),
         }
 
-        // Legacy row with no json — must still return the right kind (with
-        // empty payload) so operator filters keep working. Simulate via a
-        // direct update that NULLs the json column.
+        // Issue #465 no-silent-fallback regression: a NULL json column
+        // for a payload-bearing kind (`circuit_breaker_tripped`,
+        // `provider_error`, `crashed`) must fail clearly rather than
+        // return a fabricated zero-valued record. Previously the reader
+        // would silently return `CircuitBreakerTripped { which: Round,
+        // measured: 0, limit: 0, at_iteration: 0 }` — indistinguishable
+        // from a real trip whose counters happened to be zero, which
+        // undermines every operator dashboard that filters by breaker
+        // kind. Simulate a NULL via a direct UPDATE and assert the read
+        // surfaces `Err(Serialization)` with an actionable message.
         sqlx::query(
             "UPDATE session_outcomes SET termination_reason_json = NULL \
              WHERE root_run_id = ?",
@@ -636,15 +643,380 @@ mod f65_sqlite {
         .execute(adapter.pool())
         .await
         .unwrap();
-        let rec_legacy =
-            SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
+        let err = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
+            .await
+            .expect_err(
+                "NULL termination_reason_json for kind=circuit_breaker_tripped \
+                 must error, not silently fabricate a zero-valued trip",
+            );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("circuit_breaker_tripped") && msg.contains("termination_reason_json"),
+            "error must name the corrupt column and the affected kind; got: {msg}"
+        );
+        assert!(
+            msg.contains("re-emit SessionOutcomeEmitted") || msg.contains("UPDATE"),
+            "error must suggest a remediation; got: {msg}"
+        );
+    }
+
+    // ── Issue #465: no-silent-fallback on NULL payload json ────────────────
+
+    /// All three payload-bearing `TerminationReason` variants must error
+    /// on NULL `termination_reason_json` rather than silently fabricate
+    /// a zero-valued / empty-message record. Covers CircuitBreakerTripped,
+    /// ProviderError, and Crashed end-to-end through the SQLite adapter.
+    #[tokio::test]
+    async fn test_issue_465_null_json_fails_closed_for_all_payload_variants() {
+        let (adapter, log) = fresh_sqlite().await;
+        let session_id = "sess_465_payload_variants";
+        seed_session(&log, session_id).await;
+
+        // Three rows, one per payload-bearing kind.
+        let cases = [
+            (
+                "run_465_breaker",
+                "ck_465_breaker",
+                TerminationReason::CircuitBreakerTripped {
+                    trip: CircuitBreakerTrip {
+                        which: BreakerKind::WallClock,
+                        measured: 900,
+                        limit: 600,
+                        at_iteration: 9,
+                    },
+                },
+                "circuit_breaker_tripped",
+            ),
+            (
+                "run_465_provider",
+                "ck_465_provider",
+                TerminationReason::ProviderError {
+                    message: "upstream 502 from anthropic".to_owned(),
+                },
+                "provider_error",
+            ),
+            (
+                "run_465_crashed",
+                "ck_465_crashed",
+                TerminationReason::Crashed {
+                    message: "panic: index out of bounds".to_owned(),
+                },
+                "crashed",
+            ),
+        ];
+
+        for (root_run_id, checkpoint_id, reason, discriminator) in cases {
+            seed_run(&log, session_id, root_run_id).await;
+            let ck = env(RuntimeEvent::CheckpointPersisted(CheckpointPersisted {
+                project: project(),
+                checkpoint_id: CheckpointId::new(checkpoint_id),
+                session_id: SessionId::new(session_id),
+                root_run_id: RunId::new(root_run_id),
+                iteration: 0,
+                at_ms: 100,
+            }));
+            log.append(std::slice::from_ref(&ck)).await.unwrap();
+
+            let outcome_evt = env(RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {
+                project: project(),
+                session_id: SessionId::new(session_id),
+                root_run_id: RunId::new(root_run_id),
+                outcome: SessionOutcome {
+                    session_id: SessionId::new(session_id),
+                    root_run_id: RunId::new(root_run_id),
+                    project: project(),
+                    checkpoint_id: CheckpointId::new(checkpoint_id),
+                    workspace_snapshot_id: None,
+                    termination_reason: reason.clone(),
+                    compacted_summary: String::new(),
+                    next_step_hint: None,
+                    cost_micros: 0,
+                    emitted_at: 200,
+                },
+                at_ms: 200,
+            }));
+            log.append(std::slice::from_ref(&outcome_evt))
+                .await
+                .unwrap();
+
+            // Baseline: full round-trip with json present works.
+            let rec = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
                 .await
                 .unwrap()
                 .unwrap();
-        assert!(matches!(
-            rec_legacy.termination_reason,
-            TerminationReason::CircuitBreakerTripped { .. }
-        ));
+            assert_eq!(rec.termination_reason, reason);
+
+            // Simulate data corruption / pre-column legacy row: NULL the
+            // json column.
+            sqlx::query(
+                "UPDATE session_outcomes SET termination_reason_json = NULL \
+                 WHERE root_run_id = ?",
+            )
+            .bind(root_run_id)
+            .execute(adapter.pool())
+            .await
+            .unwrap();
+
+            let err = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
+                .await
+                .expect_err(&format!(
+                    "NULL termination_reason_json for kind={discriminator} must error"
+                ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(discriminator),
+                "error must name the affected kind '{discriminator}'; got: {msg}"
+            );
+            assert!(
+                msg.contains("termination_reason_json"),
+                "error must name the corrupt column; got: {msg}"
+            );
+            assert!(
+                msg.contains("NULL"),
+                "error must state the failure mode (NULL); got: {msg}"
+            );
+            assert!(
+                msg.contains("re-emit SessionOutcomeEmitted") || msg.contains("UPDATE"),
+                "error must suggest a remediation (re-emit or manual UPDATE); got: {msg}"
+            );
+        }
+    }
+
+    /// The payload-less variants (`CompleteRun`, `LeaseLost`,
+    /// `OperatorCancel`) have no data beyond their discriminator — NULL
+    /// json is LEGITIMATE for them (legacy rows pre-date the column) and
+    /// must still round-trip cleanly. This guards against over-fitting
+    /// the #465 fix and breaking pre-column backcompat.
+    #[tokio::test]
+    async fn test_issue_465_null_json_is_fine_for_payload_less_variants() {
+        let (adapter, log) = fresh_sqlite().await;
+        let session_id = "sess_465_payload_less";
+        seed_session(&log, session_id).await;
+
+        let cases = [
+            (
+                "run_465_complete",
+                "ck_465_complete",
+                TerminationReason::CompleteRun,
+            ),
+            ("run_465_lost", "ck_465_lost", TerminationReason::LeaseLost),
+            (
+                "run_465_cancel",
+                "ck_465_cancel",
+                TerminationReason::OperatorCancel,
+            ),
+        ];
+
+        for (root_run_id, checkpoint_id, reason) in cases {
+            seed_run(&log, session_id, root_run_id).await;
+            let ck = env(RuntimeEvent::CheckpointPersisted(CheckpointPersisted {
+                project: project(),
+                checkpoint_id: CheckpointId::new(checkpoint_id),
+                session_id: SessionId::new(session_id),
+                root_run_id: RunId::new(root_run_id),
+                iteration: 0,
+                at_ms: 100,
+            }));
+            log.append(std::slice::from_ref(&ck)).await.unwrap();
+
+            let outcome_evt = env(RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {
+                project: project(),
+                session_id: SessionId::new(session_id),
+                root_run_id: RunId::new(root_run_id),
+                outcome: SessionOutcome {
+                    session_id: SessionId::new(session_id),
+                    root_run_id: RunId::new(root_run_id),
+                    project: project(),
+                    checkpoint_id: CheckpointId::new(checkpoint_id),
+                    workspace_snapshot_id: None,
+                    termination_reason: reason.clone(),
+                    compacted_summary: String::new(),
+                    next_step_hint: None,
+                    cost_micros: 0,
+                    emitted_at: 200,
+                },
+                at_ms: 200,
+            }));
+            log.append(std::slice::from_ref(&outcome_evt))
+                .await
+                .unwrap();
+
+            sqlx::query(
+                "UPDATE session_outcomes SET termination_reason_json = NULL \
+                 WHERE root_run_id = ?",
+            )
+            .bind(root_run_id)
+            .execute(adapter.pool())
+            .await
+            .unwrap();
+
+            let rec = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
+                .await
+                .expect("NULL json is fine for payload-less variants")
+                .expect("row exists");
+            assert_eq!(
+                rec.termination_reason, reason,
+                "payload-less variant must round-trip from discriminator alone"
+            );
+        }
+    }
+
+    /// Malformed (non-NULL but unparseable) json for a payload kind
+    /// must also fail clearly. Covers the case where a bad writer or
+    /// manual UPDATE corrupts the column with garbage text.
+    #[tokio::test]
+    async fn test_issue_465_malformed_json_fails_closed() {
+        let (adapter, log) = fresh_sqlite().await;
+        let session_id = "sess_465_garbage";
+        let root_run_id = "run_465_garbage";
+        seed_session(&log, session_id).await;
+        seed_run(&log, session_id, root_run_id).await;
+
+        let ck = env(RuntimeEvent::CheckpointPersisted(CheckpointPersisted {
+            project: project(),
+            checkpoint_id: CheckpointId::new("ck_465_garbage"),
+            session_id: SessionId::new(session_id),
+            root_run_id: RunId::new(root_run_id),
+            iteration: 0,
+            at_ms: 100,
+        }));
+        log.append(std::slice::from_ref(&ck)).await.unwrap();
+
+        let outcome_evt = env(RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {
+            project: project(),
+            session_id: SessionId::new(session_id),
+            root_run_id: RunId::new(root_run_id),
+            outcome: SessionOutcome {
+                session_id: SessionId::new(session_id),
+                root_run_id: RunId::new(root_run_id),
+                project: project(),
+                checkpoint_id: CheckpointId::new("ck_465_garbage"),
+                workspace_snapshot_id: None,
+                termination_reason: TerminationReason::ProviderError {
+                    message: "real message".to_owned(),
+                },
+                compacted_summary: String::new(),
+                next_step_hint: None,
+                cost_micros: 0,
+                emitted_at: 200,
+            },
+            at_ms: 200,
+        }));
+        log.append(std::slice::from_ref(&outcome_evt))
+            .await
+            .unwrap();
+
+        // Corrupt the json column with a non-NULL garbage value.
+        sqlx::query(
+            "UPDATE session_outcomes SET termination_reason_json = 'not-json-at-all' \
+             WHERE root_run_id = ?",
+        )
+        .bind(root_run_id)
+        .execute(adapter.pool())
+        .await
+        .unwrap();
+
+        let err = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
+            .await
+            .expect_err("malformed json must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not be parsed"),
+            "error must name the parse failure; got: {msg}"
+        );
+        assert!(
+            msg.contains("provider_error"),
+            "error must name the affected kind; got: {msg}"
+        );
+    }
+
+    /// Regression guard for the cursor-bugbot #544 finding: malformed
+    /// JSON for a payload-LESS variant (`complete_run`, `lease_lost`,
+    /// `operator_cancel`) must NOT fail — the discriminator column
+    /// already carries the full meaning, so JSON corruption on a
+    /// redundant column is not information loss. The function doc
+    /// states this explicitly ("NULL / missing / malformed JSON is
+    /// fine; the returned value carries no payload") so the behaviour
+    /// must match the contract.
+    #[tokio::test]
+    async fn test_issue_465_malformed_json_is_fine_for_payload_less_variants() {
+        let (adapter, log) = fresh_sqlite().await;
+        let session_id = "sess_465_garbage_payloadless";
+        seed_session(&log, session_id).await;
+
+        let cases = [
+            (
+                "run_465_cr_garbage",
+                "ck_465_cr_garbage",
+                TerminationReason::CompleteRun,
+            ),
+            (
+                "run_465_ll_garbage",
+                "ck_465_ll_garbage",
+                TerminationReason::LeaseLost,
+            ),
+            (
+                "run_465_oc_garbage",
+                "ck_465_oc_garbage",
+                TerminationReason::OperatorCancel,
+            ),
+        ];
+
+        for (root_run_id, checkpoint_id, reason) in cases {
+            seed_run(&log, session_id, root_run_id).await;
+            let ck = env(RuntimeEvent::CheckpointPersisted(CheckpointPersisted {
+                project: project(),
+                checkpoint_id: CheckpointId::new(checkpoint_id),
+                session_id: SessionId::new(session_id),
+                root_run_id: RunId::new(root_run_id),
+                iteration: 0,
+                at_ms: 100,
+            }));
+            log.append(std::slice::from_ref(&ck)).await.unwrap();
+
+            let outcome_evt = env(RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {
+                project: project(),
+                session_id: SessionId::new(session_id),
+                root_run_id: RunId::new(root_run_id),
+                outcome: SessionOutcome {
+                    session_id: SessionId::new(session_id),
+                    root_run_id: RunId::new(root_run_id),
+                    project: project(),
+                    checkpoint_id: CheckpointId::new(checkpoint_id),
+                    workspace_snapshot_id: None,
+                    termination_reason: reason.clone(),
+                    compacted_summary: String::new(),
+                    next_step_hint: None,
+                    cost_micros: 0,
+                    emitted_at: 200,
+                },
+                at_ms: 200,
+            }));
+            log.append(std::slice::from_ref(&outcome_evt))
+                .await
+                .unwrap();
+
+            // Corrupt the json column with garbage. For payload-less
+            // variants this must NOT error — the discriminator column
+            // already carries the full answer.
+            sqlx::query(
+                "UPDATE session_outcomes SET termination_reason_json = '{bogus-not-json' \
+                 WHERE root_run_id = ?",
+            )
+            .bind(root_run_id)
+            .execute(adapter.pool())
+            .await
+            .unwrap();
+
+            let rec = SessionOutcomeReadModel::get_by_root_run(&adapter, &RunId::new(root_run_id))
+                .await
+                .expect("malformed json is fine for payload-less variants")
+                .expect("row exists");
+            assert_eq!(
+                rec.termination_reason, reason,
+                "payload-less variant must round-trip from discriminator even when json column is garbage"
+            );
+        }
     }
 
     // ── outcome replay is idempotent (no row duplication) ──────────────────

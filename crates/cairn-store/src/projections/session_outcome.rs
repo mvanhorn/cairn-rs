@@ -294,57 +294,209 @@ pub fn termination_reason_kind(r: &cairn_domain::TerminationReason) -> &'static 
 /// `Crashed.message`) carry their real fields instead of empty/zeroed
 /// placeholders that would mislead callers.
 ///
-/// Falls back to the discriminator with an empty/zeroed payload when the
-/// JSON column is NULL (legacy/hand-inserted rows) or cannot be parsed;
-/// on parse failure the kind still comes from the canonical discriminator
-/// so operator filters keep working.
+/// # Failure modes (issue #465, no silent fallbacks)
+///
+/// Payload-bearing variants require the JSON column — their meaning is
+/// not captured by the discriminator alone. If the JSON is NULL or
+/// malformed we return `Err(StoreError::Serialization)` with an
+/// actionable message instead of fabricating a zero-valued record. A
+/// silent fabrication (e.g. `CircuitBreakerTripped` with `measured=0,
+/// limit=0`) is indistinguishable from a real trip whose counters
+/// happened to be zero, which undermines every operator dashboard that
+/// filters by breaker kind. Per `feedback_no_silent_fallbacks.md`:
+/// fail clearly, never silently substitute.
+///
+/// Variants mapped:
+/// - `complete_run`, `lease_lost`, `operator_cancel` — discriminator
+///   fully describes the reason. NULL / missing / malformed JSON is
+///   fine; the returned value carries no payload.
+/// - `provider_error`, `crashed` — `message: String` payload. JSON is
+///   required; NULL or malformed returns `Err`.
+/// - `circuit_breaker_tripped` — `trip: CircuitBreakerTrip` payload
+///   (which kind, measured, limit, at_iteration). JSON is required;
+///   NULL or malformed returns `Err`.
+///
+/// One cross-kind corruption mode always errs regardless of payload
+/// presence: JSON parses cleanly but its serde tag does not match the
+/// discriminator column. The two columns disagreeing is real
+/// corruption that no reader can resolve; surface it so the writer
+/// can be investigated.
+///
+/// The error message names the column, root_run_id-equivalent context
+/// the caller must supply, and suggests a remediation (backfill via
+/// writer replay or manual SQL UPDATE) so operators have a runbook.
 pub fn rehydrate_termination_reason(
     kind: &str,
     json: Option<&str>,
 ) -> Result<cairn_domain::TerminationReason, StoreError> {
-    // Prefer the JSON payload when present and the parse succeeds. The
-    // discriminator is authoritative for the kind; we only accept the
-    // JSON if its serde tag matches. This guards against the (unlikely)
-    // case where the two columns are inconsistent.
-    if let Some(raw) = json.filter(|s| !s.is_empty()) {
-        match serde_json::from_str::<cairn_domain::TerminationReason>(raw) {
-            Ok(full) => {
-                if termination_reason_kind(&full) == kind {
-                    return Ok(full);
-                }
-                // Kind mismatch — fall through to discriminator-only.
-                // This should never happen in practice because the
-                // writer serializes the same value as it derives the
-                // kind from; silently preferring the discriminator is
-                // the safer choice for operator tooling.
-            }
-            Err(_) => {
-                // Parse failure — fall through to discriminator.
-            }
+    // Step 1: try to honour the JSON column. A present-and-consistent
+    // JSON value is the authoritative shape for the variant payload.
+    // Mismatches between the two columns are always data corruption
+    // (writer bug or manual tampering) and fail closed regardless of
+    // kind — no reader can meaningfully resolve them.
+    match parse_json_column(kind, json)? {
+        JsonColumnOutcome::Full(full) => return Ok(full),
+        JsonColumnOutcome::PayloadlessFallthrough => {
+            // Safe to fall through — payload-less variants carry no
+            // data beyond the discriminator, so NULL/empty/malformed
+            // JSON is not information loss. See rehydrate_from_kind
+            // below.
         }
     }
+
+    // Step 2: discriminator-only path. Payload-less variants succeed;
+    // payload-bearing variants fail because the JSON column is the
+    // only place the payload lives (step 1 already confirmed the JSON
+    // is unusable). Per feedback_no_silent_fallbacks.md we must not
+    // fabricate a zero-valued record here.
+    rehydrate_from_kind(kind)
+}
+
+/// Outcome of consulting the `termination_reason_json` column.
+enum JsonColumnOutcome {
+    /// JSON parsed cleanly and its serde tag matches `kind` — return it.
+    Full(cairn_domain::TerminationReason),
+    /// JSON is NULL/empty, OR malformed for a payload-less variant
+    /// (where the kind alone fully describes the reason). Caller should
+    /// fall through to the discriminator path.
+    PayloadlessFallthrough,
+}
+
+/// Returns `Ok(JsonColumnOutcome::Full)` when the JSON is usable,
+/// `Ok(JsonColumnOutcome::PayloadlessFallthrough)` when the JSON is
+/// absent/unusable but the `kind` is payload-less (discriminator is
+/// enough), or `Err(StoreError::Serialization)` for all other
+/// corruption cases (inconsistent columns, malformed JSON for a
+/// payload-bearing kind, or malformed JSON whose remediation depends
+/// on the actual payload).
+fn parse_json_column(kind: &str, json: Option<&str>) -> Result<JsonColumnOutcome, StoreError> {
+    let Some(raw) = json.filter(|s| !s.is_empty()) else {
+        // NULL or empty json. Caller handles the discriminator path —
+        // payload-less kinds succeed there, payload-bearing ones Err
+        // with the dedicated NULL message.
+        return Ok(JsonColumnOutcome::PayloadlessFallthrough);
+    };
+
+    match serde_json::from_str::<cairn_domain::TerminationReason>(raw) {
+        Ok(full) if termination_reason_kind(&full) == kind => Ok(JsonColumnOutcome::Full(full)),
+        Ok(full) => {
+            // Kind mismatch — the two columns disagree. This is data
+            // corruption, not a legacy row, and applies to every kind
+            // (payload-less or payload-bearing) because no reader can
+            // decide which column to believe. Fail clearly so
+            // operators can investigate the writer.
+            Err(StoreError::Serialization(format!(
+                "session_outcomes row has inconsistent termination_reason: \
+                 discriminator column = '{kind}', but \
+                 termination_reason_json deserialises to '{}' — writer bug \
+                 or manual tampering. Inspect the affected row and re-emit \
+                 SessionOutcomeEmitted to overwrite both columns.",
+                termination_reason_kind(&full)
+            )))
+        }
+        Err(err) if is_payloadless_kind(kind) => {
+            // Malformed JSON for a payload-less variant is still not
+            // information loss: the discriminator column alone carries
+            // the full meaning. Accept the corruption on this column,
+            // fall through to the discriminator. Matches the function
+            // doc: "NULL / missing / malformed JSON is fine; the
+            // returned value carries no payload."
+            //
+            // We deliberately swallow the parse error here — if we
+            // returned it the operator would be forced to triage a
+            // non-actionable corruption on a column whose value is
+            // redundant. Future: if this becomes a signal operators
+            // want, expose it via telemetry rather than the Result.
+            let _ = err;
+            Ok(JsonColumnOutcome::PayloadlessFallthrough)
+        }
+        Err(err) => {
+            // Malformed JSON for a payload-bearing variant. The
+            // payload is gone; the kind alone (e.g. "provider_error")
+            // is not enough to triage. Fail closed with the parse
+            // error so operators can debug the writer.
+            Err(StoreError::Serialization(format!(
+                "session_outcomes.termination_reason_json for kind='{kind}' \
+                 could not be parsed: {err}. The payload for this variant \
+                 is load-bearing for operator triage. Row is corrupt — \
+                 re-emit SessionOutcomeEmitted to overwrite the column, \
+                 or UPDATE session_outcomes SET termination_reason_json = … \
+                 with the correct payload."
+            )))
+        }
+    }
+}
+
+/// Map a discriminator string to its `TerminationReason` when no JSON
+/// payload is available. Payload-less kinds succeed because their
+/// meaning is fully captured by the discriminator; payload-bearing
+/// kinds return `Err` with a per-kind remediation hint rather than
+/// fabricating a zero-valued record.
+fn rehydrate_from_kind(kind: &str) -> Result<cairn_domain::TerminationReason, StoreError> {
     match kind {
+        // Payload-less variants: the discriminator fully describes the
+        // outcome. NULL / missing / malformed json is expected for
+        // pre-column legacy rows and for these variants carries no
+        // information loss.
         "complete_run" => Ok(cairn_domain::TerminationReason::CompleteRun),
         "lease_lost" => Ok(cairn_domain::TerminationReason::LeaseLost),
         "operator_cancel" => Ok(cairn_domain::TerminationReason::OperatorCancel),
-        "provider_error" => Ok(cairn_domain::TerminationReason::ProviderError {
-            message: String::new(),
-        }),
-        "crashed" => Ok(cairn_domain::TerminationReason::Crashed {
-            message: String::new(),
-        }),
-        "circuit_breaker_tripped" => Ok(cairn_domain::TerminationReason::CircuitBreakerTripped {
-            trip: cairn_domain::CircuitBreakerTrip {
-                which: cairn_domain::BreakerKind::Round,
-                measured: 0,
-                limit: 0,
-                at_iteration: 0,
-            },
-        }),
+
+        // Payload-bearing variants: fail closed. Returning a zero-valued
+        // record here would silently mislead operators ("breaker tripped
+        // with measured=0/limit=0" is nonsensical; "provider_error with
+        // empty message" is untriageable). Per the no-silent-fallbacks
+        // rule we surface the data-corruption explicitly.
+        "provider_error" => Err(StoreError::Serialization(
+            "session_outcomes row has kind='provider_error' but \
+             termination_reason_json is NULL — writer always populates \
+             this column on new writes (pg/projections.rs + \
+             sqlite/projections.rs), so NULL means either a pre-column \
+             legacy row or a writer regression. The ProviderError.message \
+             is load-bearing for operator triage; returning an empty \
+             placeholder would silently mislead the dashboard. Fix: \
+             re-emit SessionOutcomeEmitted for the affected root_run_id, \
+             or UPDATE session_outcomes SET termination_reason_json = … \
+             with the correct payload."
+                .to_owned(),
+        )),
+        "crashed" => Err(StoreError::Serialization(
+            "session_outcomes row has kind='crashed' but \
+             termination_reason_json is NULL — writer always populates \
+             this column on new writes, so NULL means either a pre-column \
+             legacy row or a writer regression. The Crashed.message \
+             carries the crash details and is load-bearing for operator \
+             triage. Fix: re-emit SessionOutcomeEmitted for the affected \
+             root_run_id, or UPDATE session_outcomes SET \
+             termination_reason_json = … with the correct payload."
+                .to_owned(),
+        )),
+        "circuit_breaker_tripped" => Err(StoreError::Serialization(
+            "session_outcomes row has kind='circuit_breaker_tripped' but \
+             termination_reason_json is NULL — writer always populates \
+             this column on new writes, so NULL means either a pre-column \
+             legacy row or a writer regression. The CircuitBreakerTrip \
+             payload (which kind: Round/Tokens/NoToolUseConsecutive/\
+             WallClock; measured; limit; at_iteration) is load-bearing \
+             for operator triage; fabricating a zero-valued record is \
+             indistinguishable from a real trip whose counters happened \
+             to be zero. Fix: re-emit SessionOutcomeEmitted for the \
+             affected root_run_id, or UPDATE session_outcomes SET \
+             termination_reason_json = … with the correct payload."
+                .to_owned(),
+        )),
+
         other => Err(StoreError::Serialization(format!(
             "unknown session_outcomes.termination_reason '{other}'"
         ))),
     }
+}
+
+/// True when `kind` maps to a `TerminationReason` variant that has no
+/// payload beyond the discriminator itself. These variants can round-
+/// trip cleanly from the discriminator column alone.
+fn is_payloadless_kind(kind: &str) -> bool {
+    matches!(kind, "complete_run" | "lease_lost" | "operator_cancel")
 }
 
 /// Reader for F65-style `checkpoints` rows (the extended columns on the

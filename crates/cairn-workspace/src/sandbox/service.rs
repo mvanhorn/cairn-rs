@@ -45,8 +45,13 @@ pub struct BufferedSandboxEventSink {
 }
 
 impl BufferedSandboxEventSink {
+    /// Poison-tolerant — a panic in a thread holding the lock must not
+    /// cascade into the event-sink path. Losing observability because one
+    /// thread panicked would be monumentally unhelpful, so we recover the
+    /// inner value from the poisoned mutex and continue. Mirrors the
+    /// approved pattern in `crate::sandbox::f65::BufferedF65EventSink`.
     pub fn drain(&self) -> Vec<SandboxEvent> {
-        let mut guard = self.events.lock().expect("sandbox event buffer poisoned");
+        let mut guard = self.events.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *guard)
     }
 }
@@ -55,7 +60,7 @@ impl SandboxEventSink for BufferedSandboxEventSink {
     fn publish(&self, event: SandboxEvent) {
         self.events
             .lock()
-            .expect("sandbox event buffer poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(event);
     }
 }
@@ -440,10 +445,25 @@ impl SandboxService {
         self.write_registry_entry(&entry)
     }
 
+    // ── Lock-poison recovery (issue #463) ───────────────────────────────
+    //
+    // Every guard in this impl uses `.unwrap_or_else(|e| e.into_inner())`
+    // rather than `.expect(…)`. F65 PR-4 put sandbox confinement on the
+    // critical path of every orchestrator session: a single panicking
+    // thread holding one of these guards would poison the lock and every
+    // subsequent sandbox op would panic on the unwrap, cascading into a
+    // full-process DoS.
+    //
+    // We recover the inner value and continue. The inner state is a
+    // `HashMap` keyed by `RunId` / `SessionId` / `WorkspaceSnapshotId` —
+    // per-key independent, so a partial insert from a panicking writer
+    // leaves at most one half-written entry, never a broken invariant.
+    // Mirrors the approved pattern in
+    // `crate::sandbox::f65::BufferedF65EventSink`.
     pub fn state_for(&self, run_id: &RunId) -> Option<SandboxState> {
         self.sessions
             .read()
-            .expect("sandbox session lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(run_id)
             .map(|session| session.state)
     }
@@ -451,7 +471,7 @@ impl SandboxService {
     pub fn metadata_for(&self, run_id: &RunId) -> Option<SandboxMetadata> {
         self.sessions
             .read()
-            .expect("sandbox session lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(run_id)
             .and_then(|session| session.metadata.clone())
     }
@@ -470,10 +490,7 @@ impl SandboxService {
         let resolution = self.resolve_strategy(&policy.strategy)?;
         let started_at = self.clock.now_millis();
         let (sandbox_id, run_id_owned) = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = sessions.entry(run_id.clone()).or_insert_with(|| {
                 SandboxSession::new(run_id, task_id.clone(), project.clone(), policy.clone())
             });
@@ -527,10 +544,7 @@ impl SandboxService {
                 };
 
                 {
-                    let mut sessions = self
-                        .sessions
-                        .write()
-                        .expect("sandbox session lock poisoned");
+                    let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
                     let session = sessions
                         .get_mut(run_id)
                         .expect("sandbox session must exist after provisioning");
@@ -561,10 +575,7 @@ impl SandboxService {
                 if let Err(error) = self.write_registry_entry(&registry_entry) {
                     let failed_at = self.clock.now_millis();
                     {
-                        let mut sessions = self
-                            .sessions
-                            .write()
-                            .expect("sandbox session lock poisoned");
+                        let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
                         if let Some(session) = sessions.get_mut(run_id) {
                             session.state = SandboxState::Failed;
                         }
@@ -583,10 +594,7 @@ impl SandboxService {
                 if let Err(error) = self.persist_metadata(&metadata) {
                     let failed_at = self.clock.now_millis();
                     {
-                        let mut sessions = self
-                            .sessions
-                            .write()
-                            .expect("sandbox session lock poisoned");
+                        let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
                         if let Some(session) = sessions.get_mut(run_id) {
                             session.state = SandboxState::Failed;
                         }
@@ -620,10 +628,7 @@ impl SandboxService {
             Err(error) => {
                 let failed_at = self.clock.now_millis();
                 {
-                    let mut sessions = self
-                        .sessions
-                        .write()
-                        .expect("sandbox session lock poisoned");
+                    let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(session) = sessions.get_mut(run_id) {
                         session.state = SandboxState::Failed;
                     }
@@ -650,10 +655,7 @@ impl SandboxService {
     ) -> Result<ProvisionedSandbox, WorkspaceError> {
         let activated_at = self.clock.now_millis();
         let (sandbox_id, sandbox, metadata) = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             let resumed = matches!(
                 session.state,
@@ -695,7 +697,7 @@ impl SandboxService {
 
     pub async fn heartbeat(&self, run_id: &RunId) -> Result<(), WorkspaceError> {
         let strategy = {
-            let sessions = self.sessions.read().expect("sandbox session lock poisoned");
+            let sessions = self.sessions.read().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get(run_id)
                 .ok_or_else(|| WorkspaceError::SandboxNotFound {
@@ -721,10 +723,7 @@ impl SandboxService {
 
         let heartbeat_at = self.clock.now_millis();
         let (sandbox_id, metadata) = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             if let Some(metadata) = session.metadata.as_mut() {
                 metadata.heartbeat_at = heartbeat_at;
@@ -754,10 +753,7 @@ impl SandboxService {
         let checkpointed_at = self.clock.now_millis();
 
         let metadata = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             self.transition(session, SandboxState::Checkpointed)?;
             if let Some(metadata) = session.metadata.as_mut() {
@@ -788,10 +784,7 @@ impl SandboxService {
     ) -> Result<(), WorkspaceError> {
         let preserved_at = self.clock.now_millis();
         let (sandbox_id, metadata) = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             self.transition(session, SandboxState::Preserved)?;
             if let Some(metadata) = session.metadata.as_mut() {
@@ -822,10 +815,7 @@ impl SandboxService {
     ) -> Result<DestroyResult, WorkspaceError> {
         let strategy = self.sandbox_strategy(run_id)?;
         {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             self.transition(session, SandboxState::Destroying)?;
             if let Some(metadata) = session.metadata.as_mut() {
@@ -846,10 +836,7 @@ impl SandboxService {
         }
 
         {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             self.transition(session, SandboxState::Destroyed)?;
             if let Some(metadata) = session.metadata.as_mut() {
@@ -876,7 +863,7 @@ impl SandboxService {
         observed: u64,
     ) -> Result<(), WorkspaceError> {
         let (sandbox_id, policy) = {
-            let sessions = self.sessions.read().expect("sandbox session lock poisoned");
+            let sessions = self.sessions.read().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get(run_id)
                 .ok_or_else(|| WorkspaceError::SandboxNotFound {
@@ -965,7 +952,7 @@ impl SandboxService {
             let mut map = self
                 .session_sandboxes
                 .write()
-                .expect("session sandbox lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             map.insert(spec.session_id.clone(), session_sandbox.clone());
         }
 
@@ -1001,7 +988,7 @@ impl SandboxService {
             let map = self
                 .session_sandboxes
                 .read()
-                .expect("session sandbox lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             map.get(session_id).cloned().ok_or_else(|| {
                 WorkspaceError::sandbox_op(
                     &RunId::new(session_id.as_str()),
@@ -1099,7 +1086,7 @@ impl SandboxService {
             let mut map = self
                 .session_sandboxes
                 .write()
-                .expect("session sandbox lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             map.remove(session_id);
         }
 
@@ -1151,19 +1138,28 @@ impl SandboxService {
             let mut set = self
                 .inflight_restores
                 .lock()
-                .expect("inflight restores lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             set.insert(base_snapshot_id.clone());
         }
         // RAII-like drop guard to release the lease on every return path.
+        // Matches the #463 poison-recovery policy: recover the inner
+        // set even across a poisoned lock so the release still lands.
+        // A silently-skipped release (the pre-#463 `if let Ok(..)`
+        // pattern) would leave the set holding a stale snapshot id
+        // forever, blocking the GC sweeper from reaping a snapshot
+        // that no thread is actually walking.
         struct InflightGuard<'a> {
             svc: &'a SandboxService,
             snapshot_id: cairn_domain::WorkspaceSnapshotId,
         }
         impl<'a> Drop for InflightGuard<'a> {
             fn drop(&mut self) {
-                if let Ok(mut set) = self.svc.inflight_restores.lock() {
-                    set.remove(&self.snapshot_id);
-                }
+                let mut set = self
+                    .svc
+                    .inflight_restores
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                set.remove(&self.snapshot_id);
             }
         }
         let _guard = InflightGuard {
@@ -1205,7 +1201,7 @@ impl SandboxService {
             let mut map = self
                 .session_sandboxes
                 .write()
-                .expect("session sandbox lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             map.insert(spec.session_id.clone(), session_sandbox.clone());
         }
 
@@ -1228,7 +1224,7 @@ impl SandboxService {
     pub fn live_session_count(&self) -> usize {
         self.session_sandboxes
             .read()
-            .expect("session sandbox lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .len()
     }
 
@@ -1248,7 +1244,7 @@ impl SandboxService {
             let set = self
                 .inflight_restores
                 .lock()
-                .expect("inflight restores lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             if set.contains(snapshot_id) {
                 return Ok(false);
             }
@@ -1331,7 +1327,7 @@ impl SandboxService {
         let mut map = self
             .degraded_flag_by_session
             .lock()
-            .expect("degraded flag lock poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         map.entry(session_id.clone())
             .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
             .clone()
@@ -1428,7 +1424,7 @@ impl SandboxService {
         let newly_inserted = self
             .degraded_emitted_sessions
             .lock()
-            .expect("degraded emitted lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(session_id.clone());
         if !newly_inserted {
             return;
@@ -1842,7 +1838,7 @@ impl SandboxService {
     ) {
         self.sessions
             .write()
-            .expect("sandbox session lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(
                 metadata.run_id.clone(),
                 SandboxSession {
@@ -1900,7 +1896,7 @@ impl SandboxService {
         &self,
         run_id: &RunId,
     ) -> Result<Option<ProvisionedSandbox>, WorkspaceError> {
-        let sessions = self.sessions.read().expect("sandbox session lock poisoned");
+        let sessions = self.sessions.read().unwrap_or_else(|e| e.into_inner());
         let Some(session) = sessions.get(run_id) else {
             return Ok(None);
         };
@@ -1923,7 +1919,7 @@ impl SandboxService {
     fn sandbox_strategy(&self, run_id: &RunId) -> Result<SandboxStrategy, WorkspaceError> {
         self.sessions
             .read()
-            .expect("sandbox session lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(run_id)
             .and_then(|session| session.sandbox.as_ref().map(|sandbox| sandbox.strategy))
             .ok_or_else(|| WorkspaceError::SandboxNotFound {
@@ -2216,7 +2212,7 @@ mod tests {
         ResourceDimension, RunId,
     };
 
-    use super::{BufferedSandboxEventSink, Clock, SandboxService};
+    use super::{BufferedSandboxEventSink, Clock, SandboxEventSink, SandboxService};
     use crate::error::WorkspaceError;
     use crate::providers::SandboxProvider;
     use crate::sandbox::{
@@ -3587,5 +3583,210 @@ mod tests {
                 .any(|e| matches!(e, SandboxEvent::SandboxBaseRevisionDrift { .. })),
             "clone-missing must not emit SandboxBaseRevisionDrift; got {events:?}",
         );
+    }
+
+    // ── Lock-poison recovery (issue #463) ────────────────────────────────
+    //
+    // Before the fix, `SandboxService` had 18 `.expect("… lock poisoned")`
+    // call sites across `sessions`, `session_sandboxes`, `inflight_restores`,
+    // `degraded_flag_by_session`, `degraded_emitted_sessions`, and the
+    // `BufferedSandboxEventSink::events` buffer. A panic holding any of
+    // those guards (e.g. an OOM inside `HashMap::insert`, a `policy_hash`
+    // hit overflow, a failing path canonicalisation in nested helpers)
+    // would poison the lock and take down every subsequent sandbox op —
+    // and since F65 PR-4 put sandbox confinement on the critical path of
+    // every orchestrator session, this was a full-process DoS vector.
+    //
+    // The tests below spawn real threads that panic WHILE HOLDING the
+    // write guard and assert that every reader/writer path still serves
+    // afterwards. They exercise the production service (not a mock)
+    // through its public API; the panic is induced by reaching into the
+    // private lock field, which is visible inside this `#[cfg(test)]`
+    // module by design.
+
+    #[test]
+    fn sessions_rwlock_survives_writer_panic() {
+        let (service, _sink) = service_with_providers(vec![]);
+        let service = Arc::new(service);
+
+        // Seed a session the readers will look up post-poison. Use the
+        // test-only `remember_recovered_session` helper (private but
+        // in-module) to avoid needing a real provider — we just need a
+        // present entry.
+        let rid = run_id();
+        let metadata = recovery_metadata(&rid, SandboxState::Preserved);
+        service.remember_recovered_session(
+            metadata,
+            None,
+            policy(
+                SandboxStrategyRequest::Preferred(SandboxStrategy::Overlay),
+                OnExhaustion::Destroy,
+            ),
+        );
+
+        // Poison the `sessions` RwLock from a dedicated writer thread.
+        let svc_clone = service.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = svc_clone
+                .sessions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            panic!("test-induced panic while holding sessions write guard");
+        });
+        assert!(writer.join().is_err(), "writer thread should have panicked");
+
+        // After the poison, every `sessions` reader path must still serve.
+        // Before #463 these `.read().expect("sandbox session lock poisoned")`
+        // calls would themselves panic on the poisoned guard.
+        assert_eq!(service.state_for(&rid), Some(SandboxState::Preserved));
+        assert!(service.metadata_for(&rid).is_some());
+
+        // A subsequent write must still land.
+        let rid2 = RunId::new("run-2");
+        let metadata2 = recovery_metadata(&rid2, SandboxState::Ready);
+        service.remember_recovered_session(
+            metadata2,
+            None,
+            policy(
+                SandboxStrategyRequest::Preferred(SandboxStrategy::Overlay),
+                OnExhaustion::Destroy,
+            ),
+        );
+        assert_eq!(service.state_for(&rid2), Some(SandboxState::Ready));
+    }
+
+    #[test]
+    fn session_sandboxes_rwlock_survives_writer_panic() {
+        let (service, _sink) = service_with_providers(vec![]);
+        let service = Arc::new(service);
+
+        let svc_clone = service.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = svc_clone
+                .session_sandboxes
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            panic!("test-induced panic while holding session_sandboxes write guard");
+        });
+        assert!(writer.join().is_err(), "writer thread should have panicked");
+
+        // `live_session_count` reads `session_sandboxes`. Before #463
+        // this would panic on the poisoned lock.
+        assert_eq!(service.live_session_count(), 0);
+    }
+
+    #[test]
+    fn inflight_restores_mutex_survives_writer_panic() {
+        let (service, _sink) = service_with_providers(vec![]);
+        let service = Arc::new(service);
+
+        let svc_clone = service.clone();
+        let writer = std::thread::spawn(move || {
+            let mut guard = svc_clone
+                .inflight_restores
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.insert(cairn_domain::WorkspaceSnapshotId::new("snap-poison"));
+            panic!("test-induced panic while holding inflight_restores guard");
+        });
+        assert!(writer.join().is_err());
+
+        // `reap_snapshot_dir` consults `inflight_restores`; it must not
+        // panic on the poisoned guard. The insert from the panicking
+        // writer IS observable — it defers the reap. That is the correct
+        // outcome: a partial insert from a panicking writer leaves the
+        // set consistent, and our poison-recovery pattern preserves it.
+        let reaped = service
+            .reap_snapshot_dir(&cairn_domain::WorkspaceSnapshotId::new("snap-poison"))
+            .expect("reap_snapshot_dir must survive inflight_restores poison");
+        assert!(!reaped, "in-flight snapshot must defer reap");
+
+        // A snapshot NOT held in-flight still reaps (noop for missing
+        // dir + no snapshot_dir configured → returns Ok(false)).
+        let reaped_other = service
+            .reap_snapshot_dir(&cairn_domain::WorkspaceSnapshotId::new("snap-other"))
+            .expect("reap_snapshot_dir must survive inflight_restores poison");
+        assert!(!reaped_other);
+    }
+
+    #[test]
+    fn sandbox_event_buffer_survives_writer_panic() {
+        let sink = Arc::new(BufferedSandboxEventSink::default());
+
+        // Publish one event so `drain` has content to return.
+        sink.publish(SandboxEvent::SandboxHeartbeat {
+            sandbox_id: crate::sandbox::SandboxId::new("sbx-x"),
+            run_id: RunId::new("run-x"),
+            heartbeat_at: 1,
+        });
+
+        // Poison the `events` mutex from a writer thread.
+        let sink_clone = sink.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = sink_clone.events.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("test-induced panic while holding events mutex");
+        });
+        assert!(writer.join().is_err());
+
+        // Both public methods must survive. Before #463 they were
+        // `.expect("sandbox event buffer poisoned")`.
+        sink.publish(SandboxEvent::SandboxHeartbeat {
+            sandbox_id: crate::sandbox::SandboxId::new("sbx-y"),
+            run_id: RunId::new("run-y"),
+            heartbeat_at: 2,
+        });
+        let events = sink.drain();
+        assert_eq!(events.len(), 2);
+    }
+
+    /// Concurrent readers + a panicking writer on the real sandbox
+    /// service. Models the production failure mode: many orchestrator
+    /// threads reading sandbox state in parallel, one panicking writer,
+    /// survivors must keep serving.
+    #[test]
+    fn concurrent_readers_survive_sandbox_writer_panic() {
+        let (service, _sink) = service_with_providers(vec![]);
+        let service = Arc::new(service);
+
+        let rid = run_id();
+        service.remember_recovered_session(
+            recovery_metadata(&rid, SandboxState::Preserved),
+            None,
+            policy(
+                SandboxStrategyRequest::Preferred(SandboxStrategy::Overlay),
+                OnExhaustion::Destroy,
+            ),
+        );
+
+        let readers: Vec<_> = (0..6)
+            .map(|_| {
+                let svc = service.clone();
+                let rid = rid.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..32 {
+                        let _ = svc.state_for(&rid);
+                        let _ = svc.metadata_for(&rid);
+                        let _ = svc.live_session_count();
+                    }
+                })
+            })
+            .collect();
+
+        let svc_clone = service.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = svc_clone
+                .sessions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            panic!("poison sessions under reader load");
+        });
+        assert!(writer.join().is_err());
+
+        for (i, r) in readers.into_iter().enumerate() {
+            r.join()
+                .unwrap_or_else(|_| panic!("reader {i} panicked after lock poison"));
+        }
+
+        assert_eq!(service.state_for(&rid), Some(SandboxState::Preserved));
     }
 }
