@@ -328,6 +328,40 @@ impl cairn_orchestrator::OrchestratorEventEmitter for SseOrchestratorEmitter {
         }));
     }
 
+    async fn on_breaker_tripped(
+        &self,
+        ctx: &cairn_orchestrator::OrchestrationContext,
+        trip: &cairn_domain::session_orchestration::CircuitBreakerTrip,
+    ) {
+        self.emit(serde_json::json!({
+            "event":        "breaker_tripped",
+            "run_id":       ctx.run_id,
+            "iteration":    trip.at_iteration,
+            "which":        trip.which,
+            "measured":     trip.measured,
+            "limit":        trip.limit,
+        }));
+    }
+
+    async fn on_budget_threshold_crossed(
+        &self,
+        ctx: &cairn_orchestrator::OrchestrationContext,
+        which: cairn_domain::session_orchestration::BreakerKind,
+        measured: u64,
+        limit: u64,
+        ratio_bps: u32,
+    ) {
+        self.emit(serde_json::json!({
+            "event":        "budget_threshold_crossed",
+            "run_id":       ctx.run_id,
+            "iteration":    ctx.iteration,
+            "which":        which,
+            "measured":     measured,
+            "limit":        limit,
+            "ratio_bps":    ratio_bps,
+        }));
+    }
+
     async fn on_finished(
         &self,
         ctx: &cairn_orchestrator::OrchestrationContext,
@@ -359,11 +393,27 @@ impl cairn_orchestrator::OrchestratorEventEmitter for SseOrchestratorEmitter {
                 ("waiting_subagent", None)
             }
             cairn_orchestrator::LoopTermination::PlanProposed { .. } => ("plan_proposed", None),
+            // F65 PR-3: breaker-trip terminations carry a structured
+            // payload on the domain side (`RuntimeEvent::CircuitBreakerTripped`);
+            // the SSE `orchestrate_finished` frame surfaces only the
+            // coarse termination string so dashboards can render a
+            // distinct badge. `detail` is `None` so it serialises as
+            // `"detail": null` on the wire (matching non-completed
+            // terminations such as `max_iterations_reached` /
+            // `timed_out`); dashboards that need the structured trip
+            // payload should consume the dedicated `breaker_tripped`
+            // SSE event emitted a few frames earlier via
+            // `on_breaker_tripped`.
+            cairn_orchestrator::LoopTermination::BreakerTripped { .. } => ("breaker_tripped", None),
         };
-        // Build the payload conditionally so the field is absent (not
-        // `null`) for non-Completed terminations. Matches the wire shape
-        // of `OrchestratorEvent::Finished` where the field is
-        // `skip_serializing_if = "Option::is_none"`.
+        // `detail` serialises as `null` when the termination carries
+        // no human-readable summary (e.g. `max_iterations_reached`,
+        // `timed_out`, `breaker_tripped`) and as a string otherwise
+        // (completed-with-summary, failed-with-reason, etc.). The
+        // `completion_verification` field below uses a conditional
+        // insert so it stays ABSENT (not null) for non-Completed
+        // terminations — matching the `skip_serializing_if` contract
+        // on `OrchestratorEvent::Finished`.
         let mut payload = serde_json::json!({
             "event":       "orchestrate_finished",
             "run_id":      ctx.run_id,

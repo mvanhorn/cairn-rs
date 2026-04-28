@@ -428,6 +428,32 @@ pub(crate) struct OrchestrateRequest {
     /// still honoured as long as the decision arrives inside the window.
     #[serde(default)]
     pub(crate) approval_timeout_ms: Option<u64>,
+    /// F65 PR-3: per-run circuit-breaker overrides. Any subset of the
+    /// four breakers may be tightened below the operator-configured
+    /// defaults resolved via `RuntimeConfig` (store → env → default).
+    ///
+    /// Tighten-only: overrides that exceed the configured defaults are
+    /// rejected with HTTP 400 `invalid_breaker_override`. This keeps
+    /// per-run requests from bypassing operator-wide safety caps.
+    #[serde(default)]
+    pub(crate) breaker_overrides: Option<BreakerOverrides>,
+}
+
+/// F65 PR-3: subset of breaker caps a caller may tighten on a single run.
+///
+/// All fields are optional. An unset field inherits the operator-configured
+/// default resolved via `RuntimeConfig`. Present fields MUST be tighter
+/// (lower) than the corresponding default — HTTP 400 otherwise.
+#[derive(serde::Deserialize, Debug, Clone, Default, utoipa::ToSchema)]
+pub(crate) struct BreakerOverrides {
+    #[serde(default)]
+    pub(crate) round_cap: Option<u32>,
+    #[serde(default)]
+    pub(crate) token_cap: Option<u64>,
+    #[serde(default)]
+    pub(crate) no_tool_use_streak: Option<u32>,
+    #[serde(default)]
+    pub(crate) wall_clock_ms: Option<u64>,
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -2076,6 +2102,63 @@ pub(crate) async fn list_child_runs_handler(
 /// (provider errors, lease-expiry diagnostics, tool failures, …), so we
 /// substring-match the obvious cases and fall back to `ExecutionError`
 /// so operators can still filter failed runs by class.
+/// F65 PR-3: merge per-run `BreakerOverrides` into the operator-configured
+/// default `BreakerConfig`. Overrides are tighten-only — every explicit
+/// override field must be less than or equal to the corresponding default.
+/// Any loosening is rejected with a specific error message suitable for
+/// HTTP 400 `invalid_breaker_override` (operator-readable: mentions the
+/// exact field and both values).
+fn resolve_breaker_overrides(
+    default_cfg: &cairn_orchestrator::BreakerConfig,
+    overrides: Option<&BreakerOverrides>,
+) -> Result<cairn_orchestrator::BreakerConfig, String> {
+    let Some(over) = overrides else {
+        return Ok(default_cfg.clone());
+    };
+    let mut out = default_cfg.clone();
+    if let Some(v) = over.round_cap {
+        if v > default_cfg.round_cap {
+            return Err(format!(
+                "round_cap override {v} exceeds configured default {}; \
+                 breaker overrides must tighten (lower) caps, never loosen them",
+                default_cfg.round_cap
+            ));
+        }
+        out.round_cap = v;
+    }
+    if let Some(v) = over.token_cap {
+        if v > default_cfg.token_cap {
+            return Err(format!(
+                "token_cap override {v} exceeds configured default {}; \
+                 breaker overrides must tighten (lower) caps, never loosen them",
+                default_cfg.token_cap
+            ));
+        }
+        out.token_cap = v;
+    }
+    if let Some(v) = over.no_tool_use_streak {
+        if v > default_cfg.no_tool_use_streak {
+            return Err(format!(
+                "no_tool_use_streak override {v} exceeds configured default {}; \
+                 breaker overrides must tighten (lower) caps, never loosen them",
+                default_cfg.no_tool_use_streak
+            ));
+        }
+        out.no_tool_use_streak = v;
+    }
+    if let Some(v) = over.wall_clock_ms {
+        if v > default_cfg.wall_clock_ms {
+            return Err(format!(
+                "wall_clock_ms override {v} exceeds configured default {}; \
+                 breaker overrides must tighten (lower) caps, never loosen them",
+                default_cfg.wall_clock_ms
+            ));
+        }
+        out.wall_clock_ms = v;
+    }
+    Ok(out)
+}
+
 fn classify_failed_reason(reason: &str) -> cairn_domain::FailureClass {
     let lower = reason.to_ascii_lowercase();
     if lower.contains("lease") && (lower.contains("expir") || lower.contains("lost")) {
@@ -2946,6 +3029,41 @@ pub(crate) async fn orchestrate_run_handler(
         cfg.timeout_ms = t;
     }
 
+    // F65 PR-3: resolve the default breaker caps via the RuntimeConfig
+    // 3-layer fallback (store → env → hardcoded default), then apply
+    // per-run overrides from the request body. Overrides are
+    // tighten-only — any loosening request is rejected with HTTP 400
+    // so a caller can never bypass operator-configured safety caps.
+    let default_breakers = cairn_orchestrator::BreakerConfig {
+        round_cap: state.runtime.runtime_config.orchestrator_round_cap().await,
+        token_cap: state.runtime.runtime_config.orchestrator_token_cap().await,
+        no_tool_use_streak: state
+            .runtime
+            .runtime_config
+            .orchestrator_no_tool_use_streak()
+            .await,
+        wall_clock_ms: state
+            .runtime
+            .runtime_config
+            .orchestrator_wall_clock_ms()
+            .await,
+    };
+    let breakers =
+        match resolve_breaker_overrides(&default_breakers, body.breaker_overrides.as_ref()) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error_code": "invalid_breaker_override",
+                        "message": e,
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    cfg.breakers = breakers;
+
     // Build RuntimeExecutePhase from the shared runtime store.
     // All service impls share the same Arc<InMemoryStore> so writes from one
     // service are immediately visible to reads from another.
@@ -3004,6 +3122,9 @@ pub(crate) async fn orchestrate_run_handler(
         store: std::sync::Arc<cairn_store::InMemoryStore>,
         exporter: std::sync::Arc<cairn_runtime::telemetry::OtlpExporter>,
         fatal_error: std::sync::Mutex<Option<String>>,
+        /// F65 PR-3: metrics sink for breaker trip / warning counters +
+        /// per-kind measured-at-trip histograms.
+        metrics: std::sync::Arc<crate::metrics::AppMetrics>,
     }
     #[async_trait::async_trait]
     impl cairn_orchestrator::OrchestratorEventEmitter for TracingEmitter {
@@ -3061,6 +3182,87 @@ pub(crate) async fn orchestrate_run_handler(
         ) {
             self.inner.on_step_completed(ctx, d, e).await;
         }
+        async fn on_breaker_tripped(
+            &self,
+            ctx: &cairn_orchestrator::OrchestrationContext,
+            trip: &cairn_domain::session_orchestration::CircuitBreakerTrip,
+        ) {
+            // Forward to SSE for live dashboards.
+            self.inner.on_breaker_tripped(ctx, trip).await;
+            // F65 PR-3: append RuntimeEvent::CircuitBreakerTripped to the
+            // durable event log so projections (session_outcome, UI) see
+            // the trip alongside the SessionOutcomeEmitted that PR-4+ will
+            // wire. Failures here are logged; the loop still returns
+            // `LoopTermination::BreakerTripped` so the operator-visible
+            // HTTP response is unaffected.
+            use cairn_domain::{CircuitBreakerTripped, EventEnvelope, EventId, EventSource};
+            use cairn_store::EventLog;
+            let at_ms = crate::errors::now_ms();
+            let envelope = EventEnvelope::for_runtime_event(
+                EventId::new(format!("evt_breaker_tripped_{}", uuid::Uuid::new_v4())),
+                EventSource::System,
+                cairn_domain::RuntimeEvent::CircuitBreakerTripped(CircuitBreakerTripped {
+                    project: ctx.project.clone(),
+                    session_id: ctx.session_id.clone(),
+                    run_id: ctx.run_id.clone(),
+                    trip: trip.clone(),
+                    at_ms,
+                }),
+            );
+            if let Err(e) = self.store.append(&[envelope]).await {
+                tracing::warn!(
+                    run_id = %ctx.run_id,
+                    error = %e,
+                    "F65 PR-3: failed to append CircuitBreakerTripped event — \
+                     SSE/dashboard still reflect the trip, durable event log missed it"
+                );
+            }
+            // Observability: increment trip counter + measured-at-trip
+            // histogram so dashboards can track how often each breaker
+            // fires and how far past the threshold runs are actually
+            // landing. `NoToolUseConsecutive` skips the histogram (no
+            // distribution to learn from — it always trips at exactly
+            // the cap).
+            crate::metrics::record_breaker_trip(self.metrics.as_ref(), trip.which, trip.measured);
+        }
+        async fn on_budget_threshold_crossed(
+            &self,
+            ctx: &cairn_orchestrator::OrchestrationContext,
+            which: cairn_domain::session_orchestration::BreakerKind,
+            measured: u64,
+            limit: u64,
+            ratio_bps: u32,
+        ) {
+            self.inner
+                .on_budget_threshold_crossed(ctx, which, measured, limit, ratio_bps)
+                .await;
+            use cairn_domain::{BudgetThresholdCrossed, EventEnvelope, EventId, EventSource};
+            use cairn_store::EventLog;
+            let at_ms = crate::errors::now_ms();
+            let envelope = EventEnvelope::for_runtime_event(
+                EventId::new(format!("evt_budget_crossed_{}", uuid::Uuid::new_v4())),
+                EventSource::System,
+                cairn_domain::RuntimeEvent::BudgetThresholdCrossed(BudgetThresholdCrossed {
+                    project: ctx.project.clone(),
+                    session_id: ctx.session_id.clone(),
+                    run_id: ctx.run_id.clone(),
+                    which_breaker: which,
+                    measured,
+                    limit,
+                    ratio_bps,
+                    at_ms,
+                }),
+            );
+            if let Err(e) = self.store.append(&[envelope]).await {
+                tracing::warn!(
+                    run_id = %ctx.run_id,
+                    error = %e,
+                    "F65 PR-3: failed to append BudgetThresholdCrossed event — \
+                     warning surfaced on SSE but not persisted"
+                );
+            }
+            crate::metrics::record_breaker_threshold_warn(self.metrics.as_ref(), which);
+        }
         async fn on_finished(
             &self,
             ctx: &cairn_orchestrator::OrchestrationContext,
@@ -3079,6 +3281,7 @@ pub(crate) async fn orchestrate_run_handler(
             store: state.runtime.store.clone(),
             exporter: state.otlp_exporter.clone(),
             fatal_error: std::sync::Mutex::new(None),
+            metrics: state.metrics.clone(),
         });
 
     // RFC 020 Track 4 — dual checkpoint hook. Wires the orchestrator loop
@@ -3234,6 +3437,36 @@ pub(crate) async fn orchestrate_run_handler(
             })),
         )
             .into_response(),
+        Ok(LoopTermination::BreakerTripped { trip }) => {
+            // F65 PR-3: a circuit breaker tripped mid-run. The loop
+            // already emitted `RuntimeEvent::CircuitBreakerTripped` via
+            // the emitter hook (and appended a `Checkpoint` at the last
+            // completed iteration); here we flip the run to the terminal
+            // failure state so `GET /v1/runs/:id` stops reporting
+            // `state=running`. Classification is `ExecutionError` —
+            // breaker trips are operator-facing policy enforcement, not
+            // timeout classes (the wall-clock breaker is distinct from
+            // the legacy `timeout_ms` path which still maps to
+            // `FailureClass::TimedOut`).
+            finalize_run_failure(
+                state.as_ref(),
+                &run.session_id,
+                &run.run_id,
+                cairn_domain::FailureClass::ExecutionError,
+            )
+            .await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "termination": "breaker_tripped",
+                    "which": trip.which,
+                    "measured": trip.measured,
+                    "limit": trip.limit,
+                    "at_iteration": trip.at_iteration,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             // T6a-H9: log the full error details (for ops) but send a
             // sanitized stable message to the client. The full Display

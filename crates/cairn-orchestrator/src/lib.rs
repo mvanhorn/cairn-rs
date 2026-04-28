@@ -18,6 +18,7 @@
 //! time so each phase can be tested and replaced independently.
 
 pub mod approval_policy;
+pub(crate) mod breakers;
 pub mod completion_verification;
 pub mod context;
 pub mod decide;
@@ -34,8 +35,8 @@ pub mod task_sink;
 pub use approval_policy::derive_match_policy;
 pub use completion_verification::extract_verification;
 pub use context::{
-    ActionResult, ActionStatus, CompactionConfig, DecideOutput, ExecuteOutcome, GatherOutput,
-    LoopConfig, LoopSignal, LoopTermination, OrchestrationContext, StepSummary,
+    ActionResult, ActionStatus, BreakerConfig, CompactionConfig, DecideOutput, ExecuteOutcome,
+    GatherOutput, LoopConfig, LoopSignal, LoopTermination, OrchestrationContext, StepSummary,
 };
 pub use decide::DecidePhase;
 pub use decide_impl::{estimate_tokens, LlmDecidePhase, TokenBudget};

@@ -104,28 +104,34 @@ Each orchestrator drive spawns **one new root-Run within the Session**. The exis
 
 Four per-root-Run breakers, enforced by `loop_runner`:
 
-| Breaker | Measures | Default | Config |
-|---|---|---|---|
-| RoundCap | DECIDE/GATHER/EXECUTE iterations | 30 | `orchestrator.breakers.round_cap` + per-dispatch override |
-| TokenCap | cumulative in+out tokens across DECIDE calls | 200_000 | `orchestrator.breakers.token_cap` + override |
-| NoToolUseStreak | consecutive DECIDE responses with zero tool_calls | 3 | `orchestrator.breakers.no_tool_use_streak` + override |
-| WallClock | per-root-Run elapsed wall-clock ms | 900_000 (15min) | `orchestrator.breakers.wall_clock_ms` + override |
+| Breaker (doc name) | Code enum variant | Measures | Default | Config |
+|---|---|---|---|---|
+| RoundCap | `BreakerKind::Round` | DECIDE/GATHER/EXECUTE iterations | 30 | `orchestrator_round_cap` + per-dispatch override |
+| TokenCap | `BreakerKind::Tokens` | cumulative in+out tokens across DECIDE calls | 200_000 | `orchestrator_token_cap` + override |
+| NoToolUseStreak | `BreakerKind::NoToolUseConsecutive` | consecutive DECIDE responses with zero tool_calls | 3 | `orchestrator_no_tool_use_streak` + override |
+| WallClock | `BreakerKind::WallClock` | per-root-Run elapsed wall-clock ms | 900_000 (15min) | `orchestrator_wall_clock_ms` + override |
+
+*Naming divergence note (F65 PR-3):* the code uses shorter variant names (`Round`, `Tokens`, `NoToolUseConsecutive`, `WallClock`) on `BreakerKind` in `cairn-domain::session_orchestration`; this doc retains the longer marketing names in prose. Both resolve to the same `snake_case` wire-format strings on the event log, so operator dashboards pin on `"round"`, `"tokens"`, `"no_tool_use_consecutive"`, `"wall_clock"` regardless.
 
 `WallClock` here is the **per-root-Run** breaker (independent of the per-Session `SessionRecord.issue_budget.wall_clock_ms_cap` in §4.2). The Session-level cap bounds the orchestrator loop; the per-root-Run WallClock bounds a single bounded sub-agent invocation. Both are needed — a single pathological root-Run shouldn't consume the whole Session's wall-clock budget without a break point.
 
 Precedence: whichever trips first wins. Every trip produces a `CircuitBreakerTrip { kind, limit, measured, at_iteration }` and terminates with `TerminationReason::BreakerTripped(trip)`.
 
-**80%-of-limit warning (Q10).** For each breaker, when `measured / limit >= 0.80` and the warning has not yet fired for this root-Run, emit a `BudgetThresholdCrossed { which_breaker, measured, limit, ratio }` event exactly once. This lets the orchestrator tighten its last-chance prompt or decide to abort early. It does not terminate the session.
+**80%-of-limit warning (Q10).** For each breaker **except `NoToolUseStreak`**, when `measured / limit >= 0.80` and the warning has not yet fired for this root-Run, emit a `BudgetThresholdCrossed { which_breaker, measured, limit, ratio_bps }` event exactly once. This lets the orchestrator tighten its last-chance prompt or decide to abort early. It does not terminate the session. `NoToolUseStreak` carves out of the warning because the small default (3) means 80 % rounds to 2 — one turn before the trip, which is not actionable for re-prompting. `ratio_bps` is the fraction in basis points (0-10_000) so events stay `Eq`-able.
 
 **Where:** `loop_runner` enforces; `decide_impl` reports token counts; a small `BreakerState` struct is threaded through the loop alongside `LoopContext`. The 80% threshold check sits in the same tick where the limit check runs.
 
 **Observability:**
 - counter `cairn_orchestrator_breaker_trips_total{kind}`
-- counter `cairn_orchestrator_breaker_threshold_warns_total{kind}`
-- histogram `cairn_orchestrator_breaker_measured_at_trip{kind}`
-- SSE events `BreakerTripped { kind, limit, measured }` before session teardown, and `BudgetThresholdCrossed { which_breaker, measured, limit, ratio }` on first crossing of 80%
+- counter `cairn_orchestrator_breaker_threshold_warns_total{kind}` (Round / Tokens / WallClock only)
+- three per-kind histograms with absolute-value buckets tuned for each breaker's natural range:
+  - `cairn_orchestrator_breaker_round_measured_at_trip` (buckets `[1, 5, 10, 20, 30, 50]`)
+  - `cairn_orchestrator_breaker_tokens_measured_at_trip` (buckets `[10_000, 50_000, 100_000, 200_000, 300_000, 500_000]`)
+  - `cairn_orchestrator_breaker_wall_clock_measured_at_trip_ms` (buckets `[30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000]`)
+  - `NoToolUseConsecutive` deliberately skips the histogram — it always trips at exactly the cap, so the distribution is a single spike.
+- SSE events `breaker_tripped { which, measured, limit, at_iteration }` before session teardown, and `budget_threshold_crossed { which, measured, limit, ratio_bps }` on first crossing of 80%. Both also land on the durable event log via `RuntimeEvent::CircuitBreakerTripped` / `RuntimeEvent::BudgetThresholdCrossed`.
 
-**Config surface:** new `OrchestratorConfig` section in FabricConfig (defaults). `POST /runs/{id}/orchestrate` body gains `breaker_overrides: { round_cap?, token_cap?, no_tool_use_streak? }` — the outer orchestrator, when spawning a sub-session, can tighten but not loosen defaults.
+**Config surface:** breaker defaults are resolved at request time via the existing `RuntimeConfig` 3-layer fallback (store → env → default) at `crates/cairn-runtime/src/runtime_config.rs`. The four keys `orchestrator_round_cap`, `orchestrator_token_cap`, `orchestrator_no_tool_use_streak`, `orchestrator_wall_clock_ms` are hot-reloadable via the existing `PUT /v1/settings/defaults/system/system/<key>` admin endpoint. Environment fallbacks: `CAIRN_ORCHESTRATOR_*` (uppercase of each key). Hardcoded defaults: 30 / 200_000 / 3 / 900_000. `POST /v1/runs/{id}/orchestrate` body gains `breaker_overrides: { round_cap?, token_cap?, no_tool_use_streak?, wall_clock_ms? }` — tighten-only. Any override that exceeds the configured default returns HTTP 400 `invalid_breaker_override`. (The earlier "FabricConfig.orchestrator.breakers" proposal was rejected because `FabricConfig` is Valkey/lease-layer configuration, not orchestrator policy.)
 
 ### 4.2 Per-Session attempt cap on root-Runs
 

@@ -77,6 +77,40 @@ pub const OPENAPI_JSON: &str = r##"{
         "description": "F65: kinds of circuit breakers enforced by the orchestrator in PR-3.",
         "enum": ["round", "tokens", "no_tool_use_consecutive", "wall_clock"]
       },
+      "BreakerOverrides": {
+        "type": "object",
+        "description": "F65 PR-3: per-run overrides for any subset of the four circuit-breaker caps. Tighten-only — each override must be less than or equal to the corresponding operator-configured default resolved via the RuntimeConfig 3-layer fallback (store → env → default). Loosening requests return HTTP 400 `invalid_breaker_override`.",
+        "properties": {
+          "round_cap":          { "type": "integer", "nullable": true, "description": "Cap on orchestrator iterations (tighter than default only)." },
+          "token_cap":          { "type": "integer", "nullable": true, "description": "Cap on cumulative LLM tokens (input + output). Tighter than default only." },
+          "no_tool_use_streak": { "type": "integer", "nullable": true, "description": "Cap on consecutive DECIDE rounds with zero tool-use proposals. Tighter than default only." },
+          "wall_clock_ms":      { "type": "integer", "nullable": true, "description": "Cap on wall-clock milliseconds from orchestrator loop start. Tighter than default only." }
+        }
+      },
+      "OrchestrateRequest": {
+        "type": "object",
+        "description": "F65 PR-3: request body for POST /v1/runs/{id}/orchestrate. All fields optional. `breaker_overrides` tightens the operator-configured defaults on a per-run basis.",
+        "properties": {
+          "goal":                { "type": "string", "nullable": true },
+          "max_iterations":      { "type": "integer", "nullable": true, "description": "Legacy iteration cap. Still enforced independently of `breaker_overrides.round_cap` — whichever cap is tighter wins. If both are provided the run terminates under `MaxIterationsReached` or `BreakerTripped(Round)` respectively depending on which one fires first." },
+          "timeout_ms":          { "type": "integer", "nullable": true, "description": "Legacy wall-clock timeout. Still enforced independently of `breaker_overrides.wall_clock_ms` — whichever cap is tighter wins. If both are provided the run terminates under `TimedOut` or `BreakerTripped(WallClock)` respectively depending on which one fires first." },
+          "mode":                { "type": "string", "enum": ["direct", "plan", "execute"], "nullable": true },
+          "approval_timeout_ms": { "type": "integer", "nullable": true },
+          "breaker_overrides":   { "$ref": "#/components/schemas/BreakerOverrides", "nullable": true }
+        }
+      },
+      "OrchestrateTerminationBreakerTripped": {
+        "type": "object",
+        "description": "F65 PR-3: response body shape for `termination = \"breaker_tripped\"`. HTTP 200 — the run was cleanly terminated by a circuit-breaker trip; the run's `state` is flipped to the terminal `Failed` state with `FailureClass::ExecutionError` before the response returns.",
+        "properties": {
+          "termination":  { "type": "string", "enum": ["breaker_tripped"] },
+          "which":        { "$ref": "#/components/schemas/BreakerKind" },
+          "measured":     { "type": "integer" },
+          "limit":        { "type": "integer" },
+          "at_iteration": { "type": "integer" }
+        },
+        "required": ["termination", "which", "measured", "limit", "at_iteration"]
+      },
       "CircuitBreakerTrip": {
         "type": "object",
         "description": "F65: one circuit-breaker trip event.",

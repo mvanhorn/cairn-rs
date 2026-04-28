@@ -599,6 +599,61 @@ where
         Ok(out)
     }
 
+    /// F65 PR-3 helper: dispatch a `BreakerCheck` result. `Continue`
+    /// is a no-op; `Warning` logs + invokes `on_budget_threshold_crossed`
+    /// and returns `None` so the caller keeps running; `Tripped` logs +
+    /// invokes `on_breaker_tripped` and returns
+    /// `Some(LoopTermination::BreakerTripped)` which the caller
+    /// propagates as the final termination.
+    ///
+    /// Extracted to close the pre-gather / post-decide duplication
+    /// Gemini flagged on PR #348 review.
+    async fn handle_breaker_check(
+        &self,
+        ctx: &OrchestrationContext,
+        check: crate::breakers::BreakerCheck,
+        where_label: &'static str,
+    ) -> Option<LoopTermination> {
+        use crate::breakers::BreakerCheck;
+        match check {
+            BreakerCheck::Continue => None,
+            BreakerCheck::Warning {
+                which,
+                measured,
+                limit,
+                ratio_bps,
+            } => {
+                tracing::warn!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    which     = ?which,
+                    measured,
+                    limit,
+                    ratio_bps,
+                    where_label,
+                    "orchestrator budget threshold crossed"
+                );
+                self.emitter
+                    .on_budget_threshold_crossed(ctx, which, measured, limit, ratio_bps)
+                    .await;
+                None
+            }
+            BreakerCheck::Tripped(trip) => {
+                tracing::warn!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    which     = ?trip.which,
+                    measured  = trip.measured,
+                    limit     = trip.limit,
+                    where_label,
+                    "orchestrator circuit breaker tripped"
+                );
+                self.emitter.on_breaker_tripped(ctx, &trip).await;
+                Some(LoopTermination::BreakerTripped { trip })
+            }
+        }
+    }
+
     async fn run_inner(
         &self,
         ctx: &mut OrchestrationContext,
@@ -632,12 +687,31 @@ where
         // is audited against the three dispatch paths.
         let mut verification_acc = crate::completion_verification::VerificationAccumulator::new();
 
+        // F65 PR-3: circuit-breaker state, anchored to Instant::now() for
+        // monotonic wall-clock measurement independent of system-clock jumps.
+        // `check_pre_gather` fires at the top of each iteration (Round +
+        // WallClock); `after_decide` fires after DECIDE (Tokens +
+        // NoToolUseConsecutive). The config's caps are resolved by the
+        // HTTP handler via the 3-layer RuntimeConfig fallback plus per-run
+        // overrides.
+        let mut breaker_state = crate::breakers::BreakerState::new(self.config.breakers.clone());
+        // Warn-once latch: fired when a DECIDE response lacks both input
+        // and output token counts so token-cap accounting silently
+        // under-counts. Set on first occurrence and never cleared; rare
+        // in practice (providers routinely report usage) but we refuse
+        // to silently accept a stuck under-count.
+        let mut decide_usage_absent_warned = false;
+
         tracing::info!(
             run_id    = %ctx.run_id,
             goal      = %ctx.goal,
             agent     = %ctx.agent_type,
             max_iter  = self.config.max_iterations,
             timeout_s = self.config.timeout_ms / 1_000,
+            round_cap = self.config.breakers.round_cap,
+            token_cap = self.config.breakers.token_cap,
+            no_tool_use_streak = self.config.breakers.no_tool_use_streak,
+            wall_clock_ms = self.config.breakers.wall_clock_ms,
             "orchestrator loop starting"
         );
         for _iter in 0..self.config.max_iterations {
@@ -809,6 +883,24 @@ where
                 return Ok(LoopTermination::TimedOut);
             }
 
+            // ── (1a) F65 PR-3: pre-GATHER breaker check ─────────────────────
+            // Round + WallClock caps are consulted here so a trip fires
+            // BEFORE we commit irreversible side effects (LLM call, tool
+            // dispatch, checkpoint write) for this iteration. The
+            // emitter hook appends `RuntimeEvent::CircuitBreakerTripped`
+            // via the cairn-app `TracingEmitter`; a `Warning` variant
+            // records `BudgetThresholdCrossed` without terminating.
+            if let Some(term) = self
+                .handle_breaker_check(
+                    ctx,
+                    breaker_state.check_pre_gather(ctx.iteration),
+                    "pre_gather",
+                )
+                .await
+            {
+                return Ok(term);
+            }
+
             // ── (1b) Lease health gate ───────────────────────────────────────
             // FF's ClaimedTask tracks consecutive renewal failures; after 3
             // misses `is_lease_healthy()` returns false and every downstream
@@ -934,6 +1026,69 @@ where
                 "decide complete"
             );
             self.emitter.on_decide_completed(ctx, &decide_output).await;
+
+            // ── (3a) F65 PR-3: post-DECIDE breaker check ────────────────────
+            // DecideOutput carries provider-reported token counts; we
+            // build a "tool or terminal" proposal count (see below) for
+            // the NoToolUseConsecutive streak. If both input AND output
+            // are None for a given DECIDE round, the provider did not
+            // report usage — we warn once per run and treat this round as
+            // zero tokens. Providers that PERMANENTLY omit usage will
+            // cause the token-cap breaker to under-count for the whole
+            // run; operators should confirm their provider reports usage
+            // before relying on the token-cap breaker. This is the
+            // intentional trade-off — we prefer under-counting to
+            // refusing to run entirely.
+            if decide_output.input_tokens.is_none()
+                && decide_output.output_tokens.is_none()
+                && !decide_usage_absent_warned
+            {
+                decide_usage_absent_warned = true;
+                tracing::warn!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    model     = %decide_output.model_id,
+                    "DECIDE response carried no token usage — token-cap breaker may \
+                     under-count for this run (warn-once)"
+                );
+            }
+            // NoToolUseConsecutive streak counts as "non-zero" for any
+            // proposal that either carries a concrete tool_name OR is
+            // a terminal / operator-gated action type (complete_run /
+            // escalate_to_operator / spawn_subagent). Without this
+            // carve-out, a legitimate `complete_run` after two prior
+            // narration rounds would trip the streak breaker BEFORE
+            // execute dispatches the terminal action — converting the
+            // user's intentional completion into a BreakerTripped
+            // failure. Cursor Bugbot flagged this HIGH-severity on
+            // PR #348. `create_memory` (pure narration-for-memory) is
+            // intentionally NOT in the terminal list — memorising a
+            // thought is not forward progress the user asked for.
+            let tool_or_terminal_count = decide_output
+                .proposals
+                .iter()
+                .filter(|p| {
+                    p.tool_name.is_some()
+                        || matches!(
+                            p.action_type,
+                            cairn_domain::ActionType::CompleteRun
+                                | cairn_domain::ActionType::EscalateToOperator
+                                | cairn_domain::ActionType::SpawnSubagent
+                        )
+                })
+                .count();
+            let post_decide_check = breaker_state.after_decide(
+                ctx.iteration,
+                decide_output.input_tokens.unwrap_or(0),
+                decide_output.output_tokens.unwrap_or(0),
+                tool_or_terminal_count,
+            );
+            if let Some(term) = self
+                .handle_breaker_check(ctx, post_decide_check, "post_decide")
+                .await
+            {
+                return Ok(term);
+            }
 
             // ── (3a') Emitter fatal-error check ──────────────────────────────
             // `on_decide_completed` is the only callback that dual-writes
@@ -2105,6 +2260,21 @@ mod tests {
         }
     }
 
+    /// F65 PR-3: breaker config large enough that no legacy unit test trips
+    /// a circuit breaker. Used by tests that exercise `LoopTermination`
+    /// variants other than `BreakerTripped` but whose stubbed DECIDE
+    /// output happens to emit consecutive no-tool-use proposals
+    /// (`complete_run`), which would otherwise trip the default
+    /// NoToolUseConsecutive cap of 3.
+    fn permissive_breakers() -> crate::context::BreakerConfig {
+        crate::context::BreakerConfig {
+            round_cap: 10_000,
+            token_cap: u64::MAX,
+            no_tool_use_streak: 10_000,
+            wall_clock_ms: u64::MAX,
+        }
+    }
+
     fn decide_tool(tool: &str) -> DecideOutput {
         DecideOutput {
             raw_response: format!(r#"[{{"action_type":"invoke_tool","tool_name":"{tool}"}}]"#),
@@ -2378,6 +2548,7 @@ mod tests {
         // First two calls return Continue; third returns Done.
         let config = LoopConfig {
             max_iterations: 10,
+            breakers: permissive_breakers(),
             ..Default::default()
         };
 
@@ -2619,7 +2790,10 @@ mod tests {
             FixedGather,
             ScriptedDecide::always(decide_done()),
             TwoThenDone(std::sync::Mutex::new(0)),
-            LoopConfig::default(),
+            LoopConfig {
+                breakers: permissive_breakers(),
+                ..Default::default()
+            },
         )
         .with_checkpoint_hook(hook);
 

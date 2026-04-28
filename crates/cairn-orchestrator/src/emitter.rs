@@ -21,7 +21,10 @@
 //! ```
 
 use async_trait::async_trait;
-use cairn_domain::{CompletionVerification, RunId};
+use cairn_domain::{
+    session_orchestration::{BreakerKind, CircuitBreakerTrip},
+    CompletionVerification, RunId,
+};
 
 use crate::context::{
     DecideOutput, ExecuteOutcome, GatherOutput, LoopTermination, OrchestrationContext,
@@ -107,6 +110,26 @@ pub enum OrchestratorEvent {
         iteration: u32,
         /// The extracted plan markdown.
         plan_markdown: String,
+    },
+    /// F65 PR-3: a circuit breaker tripped — the loop is about to
+    /// return `LoopTermination::BreakerTripped`.
+    BreakerTripped {
+        run_id: RunId,
+        iteration: u32,
+        which: BreakerKind,
+        measured: u64,
+        limit: u64,
+    },
+    /// F65 PR-3: a budget threshold (80% of a breaker cap) was crossed —
+    /// non-terminal, the loop continues.
+    BudgetThresholdCrossed {
+        run_id: RunId,
+        iteration: u32,
+        which: BreakerKind,
+        measured: u64,
+        limit: u64,
+        /// Measured-to-limit ratio in basis points (0-10_000).
+        ratio_bps: u32,
     },
     /// The loop has finished (terminal or suspended).
     Finished {
@@ -198,6 +221,34 @@ pub trait OrchestratorEventEmitter: Send + Sync {
 
     /// Called when a Plan-mode run detects a `<proposed_plan>` block (RFC 018).
     async fn on_plan_proposed(&self, _ctx: &OrchestrationContext, _plan_markdown: &str) {}
+
+    /// F65 PR-3: called once when a circuit breaker reaches its cap and
+    /// the loop is about to return `LoopTermination::BreakerTripped`.
+    ///
+    /// The production emitter in `cairn-app` appends
+    /// `RuntimeEvent::CircuitBreakerTripped` to the durable event log so
+    /// the projections + operator UI can surface the trip. SSE-only
+    /// emitters render a dashboard frame. The default no-op impl keeps
+    /// tests and local mode decoupled from the event log.
+    async fn on_breaker_tripped(&self, _ctx: &OrchestrationContext, _trip: &CircuitBreakerTrip) {}
+
+    /// F65 PR-3: called once per breaker per run when the measured value
+    /// first crosses the 80 % warning threshold. Non-terminal; the loop
+    /// continues. `ratio_bps` is the measured-to-limit ratio in basis
+    /// points (integer, 0-10_000) — matches the wire format of
+    /// `RuntimeEvent::BudgetThresholdCrossed`.
+    ///
+    /// `NoToolUseConsecutive` deliberately never triggers this hook —
+    /// see `BreakerConfig` rustdoc for the rationale.
+    async fn on_budget_threshold_crossed(
+        &self,
+        _ctx: &OrchestrationContext,
+        _which: BreakerKind,
+        _measured: u64,
+        _limit: u64,
+        _ratio_bps: u32,
+    ) {
+    }
 
     /// Called once after the loop terminates (terminal or suspended).
     async fn on_finished(&self, _ctx: &OrchestrationContext, _termination: &LoopTermination) {}
@@ -405,6 +456,34 @@ impl OrchestratorEventEmitter for ChannelEmitter {
         });
     }
 
+    async fn on_breaker_tripped(&self, ctx: &OrchestrationContext, trip: &CircuitBreakerTrip) {
+        self.send(OrchestratorEvent::BreakerTripped {
+            run_id: ctx.run_id.clone(),
+            iteration: trip.at_iteration,
+            which: trip.which,
+            measured: trip.measured,
+            limit: trip.limit,
+        });
+    }
+
+    async fn on_budget_threshold_crossed(
+        &self,
+        ctx: &OrchestrationContext,
+        which: BreakerKind,
+        measured: u64,
+        limit: u64,
+        ratio_bps: u32,
+    ) {
+        self.send(OrchestratorEvent::BudgetThresholdCrossed {
+            run_id: ctx.run_id.clone(),
+            iteration: ctx.iteration,
+            which,
+            measured,
+            limit,
+            ratio_bps,
+        });
+    }
+
     async fn on_finished(&self, ctx: &OrchestrationContext, termination: &LoopTermination) {
         // F47 PR1: carry the verification sidecar only on the Completed
         // branch. Other terminations (failed / timed_out / suspended)
@@ -431,6 +510,20 @@ impl OrchestratorEventEmitter for ChannelEmitter {
             LoopTermination::PlanProposed { plan_markdown } => (
                 "plan_proposed".to_owned(),
                 Some(format!("plan ({} chars)", plan_markdown.len())),
+            ),
+            // F65 PR-3: surface breaker-trip terminations on the SSE
+            // `finished` frame so operator dashboards can render a
+            // distinct badge. The detail string carries the kind +
+            // measured/limit so the UI can format it inline without
+            // parsing the full `CircuitBreakerTrip` — the event-log side
+            // still carries the structured payload via
+            // `RuntimeEvent::CircuitBreakerTripped`.
+            LoopTermination::BreakerTripped { trip } => (
+                "breaker_tripped".to_owned(),
+                Some(format!(
+                    "{:?} breaker tripped at iteration {}: measured={} limit={}",
+                    trip.which, trip.at_iteration, trip.measured, trip.limit
+                )),
             ),
         };
         self.send(OrchestratorEvent::Finished {

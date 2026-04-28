@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use cairn_domain::{
-    decisions::RunMode, ActionProposal, ApprovalId, CompletionVerification, DefaultSetting,
-    ProjectKey, RunId, SessionId, TaskId, ToolInvocationId,
+    decisions::RunMode, session_orchestration::CircuitBreakerTrip, ActionProposal, ApprovalId,
+    CompletionVerification, DefaultSetting, ProjectKey, RunId, SessionId, TaskId, ToolInvocationId,
 };
 use cairn_graph::GraphNode;
 use cairn_memory::retrieval::RetrievalResult;
@@ -276,6 +276,13 @@ pub enum LoopTermination {
     /// Plan-mode run completed with a plan artifact (RFC 018).
     /// The run is Completed with outcome `plan_proposed`.
     PlanProposed { plan_markdown: String },
+    /// F65 PR-3: a circuit breaker tripped and terminated the loop.
+    ///
+    /// The `trip` payload (`BreakerKind`, measured, limit, at_iteration) is
+    /// carried through to the HTTP response body, the SSE `orchestrate_finished`
+    /// frame, and the `RuntimeEvent::CircuitBreakerTripped` event that the
+    /// loop appends via the emitter before returning this termination.
+    BreakerTripped { trip: CircuitBreakerTrip },
 }
 
 // ── LoopConfig ───────────────────────────────────────────────────────────────
@@ -291,6 +298,8 @@ pub struct LoopConfig {
     pub checkpoint_every_n_tool_calls: u32,
     /// Context compaction settings (RFC 018).
     pub compaction: CompactionConfig,
+    /// F65 PR-3: circuit-breaker caps enforced by `OrchestratorLoop`.
+    pub breakers: BreakerConfig,
 }
 
 impl Default for LoopConfig {
@@ -300,6 +309,71 @@ impl Default for LoopConfig {
             timeout_ms: 5 * 60 * 1_000, // 5 minutes
             checkpoint_every_n_tool_calls: 1,
             compaction: CompactionConfig::default(),
+            breakers: BreakerConfig::default(),
+        }
+    }
+}
+
+// ── BreakerConfig ────────────────────────────────────────────────────────────
+
+/// F65 PR-3: circuit-breaker caps enforced inside `OrchestratorLoop`.
+///
+/// Each field is a hard upper bound; when the measured value reaches or
+/// exceeds the cap the loop emits `RuntimeEvent::CircuitBreakerTripped` and
+/// terminates with `LoopTermination::BreakerTripped`.
+///
+/// Hardcoded defaults: `round_cap = 30`, `token_cap = 200_000`,
+/// `no_tool_use_streak = 3`, `wall_clock_ms = 900_000` (15 minutes).
+///
+/// Defaults are resolved via the `RuntimeConfig` 3-layer fallback
+/// (store → env → default) by the HTTP handler; request bodies may tighten
+/// (but never loosen) these caps per-run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BreakerConfig {
+    /// Maximum orchestrator iterations before the `Round` breaker trips.
+    ///
+    /// Enforced at the top of each loop iteration BEFORE gather. Trips
+    /// when `iteration >= round_cap` so a `round_cap` of 5 allows
+    /// iterations 0..=4 and trips entering iteration 5.
+    pub round_cap: u32,
+    /// Maximum cumulative LLM tokens (input + output) before the `Tokens`
+    /// breaker trips. Counted after each DECIDE phase using
+    /// `DecideOutput.input_tokens` + `DecideOutput.output_tokens`.
+    pub token_cap: u64,
+    /// Maximum consecutive DECIDE rounds with no forward progress
+    /// before the `NoToolUseConsecutive` breaker trips.
+    ///
+    /// A "forward-progress" round is one whose proposals contain at
+    /// least one of:
+    ///   * a proposal with a concrete `tool_name: Some(_)` (invoke_tool),
+    ///   * an `ActionType::CompleteRun` proposal (intentional terminal),
+    ///   * an `ActionType::EscalateToOperator` proposal (intentional gate),
+    ///   * an `ActionType::SpawnSubagent` proposal (intentional delegation).
+    ///
+    /// Rounds that contain only narration-shaped proposals (e.g.
+    /// `create_memory`, `send_notification`) are treated as zero-
+    /// progress and increment the streak; any forward-progress round
+    /// resets the streak to zero. The carve-out for CompleteRun et al.
+    /// prevents the streak breaker from tripping immediately before
+    /// execute dispatches an intentional terminal action (regression
+    /// caught on PR #348 review).
+    ///
+    /// A streak equal to this value trips the breaker (e.g. `3` trips
+    /// after the third consecutive zero-progress round).
+    pub no_tool_use_streak: u32,
+    /// Wall-clock milliseconds from loop start before the `WallClock`
+    /// breaker trips. Measured with a monotonic `std::time::Instant`
+    /// captured at loop entry.
+    pub wall_clock_ms: u64,
+}
+
+impl Default for BreakerConfig {
+    fn default() -> Self {
+        Self {
+            round_cap: 30,
+            token_cap: 200_000,
+            no_tool_use_streak: 3,
+            wall_clock_ms: 15 * 60 * 1_000, // 15 minutes
         }
     }
 }

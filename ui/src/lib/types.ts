@@ -1930,6 +1930,8 @@ export interface CompletionVerification {
  * when `termination === "completed"`. Other terminations omit
  * `completion_verification`. Matches the serde-rename on
  * `OrchestratorEvent::Finished` in cairn-orchestrator.
+ *
+ * F65 PR-3: `breaker_tripped` added as a terminal-state discriminant.
  */
 export interface OrchestrateFinishedPayload {
   event: "orchestrate_finished";
@@ -1941,9 +1943,58 @@ export interface OrchestrateFinishedPayload {
     | "timed_out"
     | "waiting_approval"
     | "waiting_subagent"
-    | "plan_proposed";
+    | "plan_proposed"
+    | "breaker_tripped";
   detail: string | null;
   completion_verification?: CompletionVerification;
+}
+
+/**
+ * F65 PR-3: per-run circuit-breaker overrides sent in the request body
+ * of `POST /v1/runs/:id/orchestrate`. All fields optional; every
+ * present field MUST be less than or equal to the operator-configured
+ * default resolved via the server's RuntimeConfig 3-layer fallback.
+ * Loosening requests return HTTP 400 `invalid_breaker_override`.
+ */
+export interface BreakerOverrides {
+  round_cap?: number | null;
+  token_cap?: number | null;
+  no_tool_use_streak?: number | null;
+  wall_clock_ms?: number | null;
+}
+
+/**
+ * F65 PR-3: request body for `POST /v1/runs/:id/orchestrate`. Mirrors
+ * `cairn_app::handlers::runs::OrchestrateRequest`. All fields optional.
+ *
+ * Legacy `max_iterations` and `timeout_ms` are still enforced
+ * independently of `breaker_overrides.round_cap` and
+ * `breaker_overrides.wall_clock_ms`. When both are provided, whichever
+ * cap is tighter fires first, so the termination kind depends on which
+ * one wins (`MaxIterationsReached` / `TimedOut` vs `BreakerTripped`).
+ */
+export interface OrchestrateRequest {
+  goal?: string | null;
+  max_iterations?: number | null;
+  timeout_ms?: number | null;
+  mode?: "direct" | "plan" | "execute" | null;
+  approval_timeout_ms?: number | null;
+  breaker_overrides?: BreakerOverrides | null;
+}
+
+/**
+ * F65 PR-3: response body shape for `termination = "breaker_tripped"`
+ * on `POST /v1/runs/:id/orchestrate`. HTTP 200 — the run was cleanly
+ * terminated by a circuit-breaker trip; the run's `state` is flipped
+ * to terminal `Failed` (`FailureClass::ExecutionError`) before the
+ * response returns.
+ */
+export interface OrchestrateBreakerTrippedResponse {
+  termination: "breaker_tripped";
+  which: BreakerKind;
+  measured: number;
+  limit: number;
+  at_iteration: number;
 }
 
 /**

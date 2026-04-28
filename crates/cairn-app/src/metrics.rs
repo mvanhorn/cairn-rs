@@ -121,7 +121,61 @@ pub struct AppMetrics {
     provider_call_durations: Mutex<HashMap<ProviderCallDurationKey, HistogramSample>>,
     #[cfg(feature = "metrics-providers")]
     provider_tokens: Mutex<HashMap<ProviderTokenKey, u64>>,
+
+    // ── F65 PR-3 orchestrator breakers ──────────────────────────
+    /// Total trips per breaker kind (all four). Always-on: breakers
+    /// are core orchestrator policy, not an optional feature.
+    breaker_trips: Mutex<HashMap<String, u64>>,
+    /// Total warn-threshold crossings per breaker kind. Emitted for
+    /// Round / Tokens / WallClock only (NoToolUseConsecutive skips
+    /// the warning per arch §4.1 exception).
+    breaker_threshold_warns: Mutex<HashMap<String, u64>>,
+    /// Per-kind distribution of the measured value at trip time.
+    /// NoToolUseConsecutive is deliberately omitted (always trips at
+    /// exactly the cap — a single-bucket spike, not distribution-
+    /// worthy). Round / Tokens / WallClock each have their own
+    /// dedicated bucket array tuned to the quantity's natural range.
+    breaker_round_histogram: Mutex<BreakerHistogram<6>>,
+    breaker_tokens_histogram: Mutex<BreakerHistogram<6>>,
+    breaker_wall_clock_histogram: Mutex<BreakerHistogram<7>>,
 }
+
+/// F65 PR-3: per-kind breaker-trip distribution sample. Distinct from
+/// `HistogramSample` because breakers use widely different natural
+/// ranges (iterations vs tokens vs ms) — reusing the 10-bucket
+/// `HistogramSample` would force all three to share one bucket layout,
+/// which operator decision 3 explicitly rejected.
+#[derive(Clone, Debug)]
+pub(crate) struct BreakerHistogram<const N: usize> {
+    pub(crate) bucket_counts: [u64; N],
+    pub(crate) sum: u64,
+    pub(crate) count: u64,
+}
+
+impl<const N: usize> Default for BreakerHistogram<N> {
+    fn default() -> Self {
+        Self {
+            bucket_counts: [0; N],
+            sum: 0,
+            count: 0,
+        }
+    }
+}
+
+/// F65 PR-3: bucket edges for the Round-breaker measured-at-trip
+/// histogram. Values past the last edge roll into the `+Inf` bucket.
+/// Tuned for the 1..=50 iteration range; round cap default is 30.
+pub(crate) const BREAKER_ROUND_BUCKETS: [u64; 6] = [1, 5, 10, 20, 30, 50];
+/// F65 PR-3: bucket edges for the Tokens-breaker measured-at-trip
+/// histogram. Tuned to the 10k..=500k range; token cap default 200k.
+pub(crate) const BREAKER_TOKENS_BUCKETS: [u64; 6] =
+    [10_000, 50_000, 100_000, 200_000, 300_000, 500_000];
+/// F65 PR-3: bucket edges for the WallClock-breaker measured-at-trip
+/// histogram (milliseconds). Tuned for 30s..=30min; wall-clock default
+/// 15 minutes.
+pub(crate) const BREAKER_WALL_CLOCK_BUCKETS: [u64; 7] = [
+    30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000,
+];
 
 /// Per-tenant gauge bundle. Held behind a single mutex so updates
 /// are atomic per tenant and reader-side iteration doesn't need to
@@ -183,6 +237,119 @@ pub(crate) struct ProviderTokenKey {
     pub(crate) model: String,
     /// `input` or `output`.
     pub(crate) kind: String,
+}
+
+/// F65 PR-3: map a `BreakerKind` to its snake_case label used both as
+/// the Prometheus `kind` label and the map-key. Stable across versions —
+/// dashboards pin on these strings.
+fn breaker_kind_label(which: cairn_domain::session_orchestration::BreakerKind) -> &'static str {
+    use cairn_domain::session_orchestration::BreakerKind;
+    match which {
+        BreakerKind::Round => "round",
+        BreakerKind::Tokens => "tokens",
+        BreakerKind::NoToolUseConsecutive => "no_tool_use_consecutive",
+        BreakerKind::WallClock => "wall_clock",
+    }
+}
+
+/// F65 PR-3: record a single circuit-breaker trip. Increments the
+/// per-kind counter and, for Round / Tokens / WallClock, adds a
+/// measured-at-trip histogram observation. NoToolUseConsecutive is
+/// excluded from the histogram (it always trips at exactly the cap).
+pub(crate) fn record_breaker_trip(
+    metrics: &AppMetrics,
+    which: cairn_domain::session_orchestration::BreakerKind,
+    measured: u64,
+) {
+    use cairn_domain::session_orchestration::BreakerKind;
+    let label = breaker_kind_label(which);
+    {
+        let mut m = metrics
+            .breaker_trips
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *m.entry(label.to_owned()).or_insert(0) += 1;
+    }
+    match which {
+        BreakerKind::Round => {
+            let mut h = metrics
+                .breaker_round_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            observe_histogram(&mut h, &BREAKER_ROUND_BUCKETS, measured);
+        }
+        BreakerKind::Tokens => {
+            let mut h = metrics
+                .breaker_tokens_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            observe_histogram(&mut h, &BREAKER_TOKENS_BUCKETS, measured);
+        }
+        BreakerKind::WallClock => {
+            let mut h = metrics
+                .breaker_wall_clock_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            observe_histogram(&mut h, &BREAKER_WALL_CLOCK_BUCKETS, measured);
+        }
+        BreakerKind::NoToolUseConsecutive => {
+            // Counter above already recorded; no histogram by design.
+        }
+    }
+}
+
+/// F65 PR-3: record a 80% warning threshold crossing.
+pub(crate) fn record_breaker_threshold_warn(
+    metrics: &AppMetrics,
+    which: cairn_domain::session_orchestration::BreakerKind,
+) {
+    let label = breaker_kind_label(which);
+    let mut m = metrics
+        .breaker_threshold_warns
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *m.entry(label.to_owned()).or_insert(0) += 1;
+}
+
+fn observe_histogram<const N: usize>(
+    h: &mut BreakerHistogram<N>,
+    buckets: &[u64; N],
+    measured: u64,
+) {
+    h.count = h.count.saturating_add(1);
+    h.sum = h.sum.saturating_add(measured);
+    for (idx, edge) in buckets.iter().enumerate() {
+        if measured <= *edge {
+            h.bucket_counts[idx] = h.bucket_counts[idx].saturating_add(1);
+            return;
+        }
+    }
+    // `+Inf` bucket is implicit via `count - sum_of_buckets`; nothing
+    // to do here when the observation overflows the last edge.
+}
+
+/// F65 PR-3: render a per-kind breaker histogram in the Prometheus
+/// cumulative-bucket format (`le=` labels, monotonic counts, trailing
+/// `+Inf` / `_sum` / `_count`).
+fn render_breaker_histogram<const N: usize>(
+    lines: &mut Vec<String>,
+    metric_name: &str,
+    help: &str,
+    h: &BreakerHistogram<N>,
+    buckets: &[u64; N],
+) {
+    lines.push(format!("# HELP {metric_name} {help}"));
+    lines.push(format!("# TYPE {metric_name} histogram"));
+    let mut cumulative: u64 = 0;
+    for (idx, edge) in buckets.iter().enumerate() {
+        cumulative = cumulative.saturating_add(h.bucket_counts[idx]);
+        lines.push(format!(
+            "{metric_name}_bucket{{le=\"{edge}\"}} {cumulative}"
+        ));
+    }
+    lines.push(format!("{metric_name}_bucket{{le=\"+Inf\"}} {}", h.count));
+    lines.push(format!("{metric_name}_sum {}", h.sum));
+    lines.push(format!("{metric_name}_count {}", h.count));
 }
 
 impl AppMetrics {
@@ -658,7 +825,96 @@ impl AppMetrics {
         #[cfg(feature = "metrics-providers")]
         self.render_providers_into(&mut lines);
 
+        // F65 PR-3: orchestrator circuit-breaker metrics. Always-on —
+        // breakers are core orchestrator policy, not an optional
+        // feature.
+        self.render_breakers_into(&mut lines);
+
         lines.join("\n")
+    }
+
+    /// F65 PR-3: render the breaker counters + per-kind histograms.
+    fn render_breakers_into(&self, lines: &mut Vec<String>) {
+        // ── cairn_orchestrator_breaker_trips_total{kind}  (counter) ──
+        lines.push(
+            "# HELP cairn_orchestrator_breaker_trips_total Total circuit-breaker trips per kind."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_breaker_trips_total counter".to_owned());
+        {
+            let snapshot = self
+                .breaker_trips
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let mut rows: Vec<_> = snapshot.into_iter().collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            for (kind, count) in rows {
+                lines.push(format!(
+                    "cairn_orchestrator_breaker_trips_total{{kind=\"{kind}\"}} {count}"
+                ));
+            }
+        }
+
+        // ── cairn_orchestrator_breaker_threshold_warns_total{kind}  (counter) ──
+        lines.push(
+            "# HELP cairn_orchestrator_breaker_threshold_warns_total Total 80% breaker-threshold warnings per kind (Round/Tokens/WallClock only)."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_breaker_threshold_warns_total counter".to_owned());
+        {
+            let snapshot = self
+                .breaker_threshold_warns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let mut rows: Vec<_> = snapshot.into_iter().collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            for (kind, count) in rows {
+                lines.push(format!(
+                    "cairn_orchestrator_breaker_threshold_warns_total{{kind=\"{kind}\"}} {count}"
+                ));
+            }
+        }
+
+        // ── round histogram ──
+        render_breaker_histogram(
+            lines,
+            "cairn_orchestrator_breaker_round_measured_at_trip",
+            "Distribution of iterations observed at Round-breaker trip time.",
+            &self
+                .breaker_round_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            &BREAKER_ROUND_BUCKETS,
+        );
+
+        // ── tokens histogram ──
+        render_breaker_histogram(
+            lines,
+            "cairn_orchestrator_breaker_tokens_measured_at_trip",
+            "Distribution of cumulative tokens observed at Tokens-breaker trip time.",
+            &self
+                .breaker_tokens_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            &BREAKER_TOKENS_BUCKETS,
+        );
+
+        // ── wall-clock histogram ──
+        render_breaker_histogram(
+            lines,
+            "cairn_orchestrator_breaker_wall_clock_measured_at_trip_ms",
+            "Distribution of elapsed milliseconds observed at WallClock-breaker trip time.",
+            &self
+                .breaker_wall_clock_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            &BREAKER_WALL_CLOCK_BUCKETS,
+        );
     }
 
     #[cfg(feature = "metrics-core")]

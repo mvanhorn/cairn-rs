@@ -49,6 +49,25 @@ pub const KEY_BRAIN_URL: &str = "brain_url";
 /// DefaultsService key for the worker inference endpoint URL.
 pub const KEY_WORKER_URL: &str = "worker_url";
 
+// ── F65 PR-3: orchestrator circuit-breaker defaults ─────────────────────────
+/// DefaultsService key for the default orchestrator Round-cap breaker.
+pub const KEY_ORCHESTRATOR_ROUND_CAP: &str = "orchestrator_round_cap";
+/// DefaultsService key for the default orchestrator Tokens-cap breaker.
+pub const KEY_ORCHESTRATOR_TOKEN_CAP: &str = "orchestrator_token_cap";
+/// DefaultsService key for the default orchestrator NoToolUseStreak-cap breaker.
+pub const KEY_ORCHESTRATOR_NO_TOOL_USE_STREAK: &str = "orchestrator_no_tool_use_streak";
+/// DefaultsService key for the default orchestrator WallClock-cap breaker (ms).
+pub const KEY_ORCHESTRATOR_WALL_CLOCK_MS: &str = "orchestrator_wall_clock_ms";
+
+/// Hardcoded default orchestrator Round cap — matches `BreakerConfig::default()`.
+pub const DEFAULT_ORCHESTRATOR_ROUND_CAP: u32 = 30;
+/// Hardcoded default orchestrator Tokens cap — matches `BreakerConfig::default()`.
+pub const DEFAULT_ORCHESTRATOR_TOKEN_CAP: u64 = 200_000;
+/// Hardcoded default orchestrator NoToolUseStreak cap — matches `BreakerConfig::default()`.
+pub const DEFAULT_ORCHESTRATOR_NO_TOOL_USE_STREAK: u32 = 3;
+/// Hardcoded default orchestrator WallClock cap (ms) — matches `BreakerConfig::default()`.
+pub const DEFAULT_ORCHESTRATOR_WALL_CLOCK_MS: u64 = 15 * 60 * 1_000;
+
 // ── RuntimeConfig ─────────────────────────────────────────────────────────────
 
 /// Hot-reloadable runtime configuration.
@@ -85,6 +104,105 @@ impl RuntimeConfig {
         }
         // 3. Hardcoded default
         fallback.to_owned()
+    }
+
+    /// F65 PR-3: read a `u32` setting using the three-layer fallback.
+    ///
+    /// Store values may be encoded as JSON numbers or numeric strings —
+    /// both are accepted. Any other JSON shape (float, bool, array,
+    /// object, null) emits an operator-facing warn log and falls
+    /// through to the env var; parse failures on numeric strings fall
+    /// through similarly; malformed env vars fall through to the
+    /// hardcoded default. Every fall-through path logs so mis-typed
+    /// settings are visible rather than silently ignored.
+    async fn get_u32(&self, key: &str, env_var: &str, fallback: u32) -> u32 {
+        if let Ok(Some(setting)) = self.store.get(Scope::System, "system", key).await {
+            if let Some(n) = setting.value.as_u64() {
+                if let Ok(v) = u32::try_from(n) {
+                    return v;
+                }
+                tracing::warn!(
+                    key,
+                    value = n,
+                    "RuntimeConfig: store value exceeds u32; falling back to env/default"
+                );
+            } else if let Some(s) = setting.value.as_str() {
+                match s.parse::<u32>() {
+                    Ok(v) => return v,
+                    Err(e) => tracing::warn!(
+                        key,
+                        value = s,
+                        error = %e,
+                        "RuntimeConfig: store value is not a valid u32; falling back to env/default"
+                    ),
+                }
+            } else {
+                // Copilot review on #348: emit a warn when the store
+                // carries an unexpected JSON shape (float / bool /
+                // array / object / null) so a mis-typed setting can't
+                // silently fall through to env/default.
+                tracing::warn!(
+                    key,
+                    value = %setting.value,
+                    "RuntimeConfig: store value is not a JSON number or numeric string; falling back to env/default"
+                );
+            }
+        }
+        if let Ok(s) = std::env::var(env_var) {
+            if !s.is_empty() {
+                match s.parse::<u32>() {
+                    Ok(v) => return v,
+                    Err(e) => tracing::warn!(
+                        env_var,
+                        value = s,
+                        error = %e,
+                        "RuntimeConfig: env var is not a valid u32; falling back to hardcoded default"
+                    ),
+                }
+            }
+        }
+        fallback
+    }
+
+    /// F65 PR-3: read a `u64` setting using the three-layer fallback.
+    /// Same semantics as [`Self::get_u32`] but widened to `u64`.
+    async fn get_u64(&self, key: &str, env_var: &str, fallback: u64) -> u64 {
+        if let Ok(Some(setting)) = self.store.get(Scope::System, "system", key).await {
+            if let Some(n) = setting.value.as_u64() {
+                return n;
+            }
+            if let Some(s) = setting.value.as_str() {
+                match s.parse::<u64>() {
+                    Ok(v) => return v,
+                    Err(e) => tracing::warn!(
+                        key,
+                        value = s,
+                        error = %e,
+                        "RuntimeConfig: store value is not a valid u64; falling back to env/default"
+                    ),
+                }
+            } else {
+                tracing::warn!(
+                    key,
+                    value = %setting.value,
+                    "RuntimeConfig: store value is not a JSON number or numeric string; falling back to env/default"
+                );
+            }
+        }
+        if let Ok(s) = std::env::var(env_var) {
+            if !s.is_empty() {
+                match s.parse::<u64>() {
+                    Ok(v) => return v,
+                    Err(e) => tracing::warn!(
+                        env_var,
+                        value = s,
+                        error = %e,
+                        "RuntimeConfig: env var is not a valid u64; falling back to hardcoded default"
+                    ),
+                }
+            }
+        }
+        fallback
     }
 
     // ── Typed accessors ───────────────────────────────────────────────────────
@@ -197,6 +315,60 @@ impl RuntimeConfig {
             .await
             .iter()
             .any(|prefix| model_id.contains(prefix.as_str()))
+    }
+
+    // ── F65 PR-3: orchestrator circuit-breaker defaults ─────────────────────
+
+    /// Default orchestrator Round-cap breaker.
+    ///
+    /// Key: `orchestrator_round_cap` · Env: `CAIRN_ORCHESTRATOR_ROUND_CAP`
+    /// · Default: `30`.
+    pub async fn orchestrator_round_cap(&self) -> u32 {
+        self.get_u32(
+            KEY_ORCHESTRATOR_ROUND_CAP,
+            "CAIRN_ORCHESTRATOR_ROUND_CAP",
+            DEFAULT_ORCHESTRATOR_ROUND_CAP,
+        )
+        .await
+    }
+
+    /// Default orchestrator Tokens-cap breaker (cumulative input + output).
+    ///
+    /// Key: `orchestrator_token_cap` · Env: `CAIRN_ORCHESTRATOR_TOKEN_CAP`
+    /// · Default: `200_000`.
+    pub async fn orchestrator_token_cap(&self) -> u64 {
+        self.get_u64(
+            KEY_ORCHESTRATOR_TOKEN_CAP,
+            "CAIRN_ORCHESTRATOR_TOKEN_CAP",
+            DEFAULT_ORCHESTRATOR_TOKEN_CAP,
+        )
+        .await
+    }
+
+    /// Default orchestrator NoToolUseStreak-cap breaker.
+    ///
+    /// Key: `orchestrator_no_tool_use_streak` · Env:
+    /// `CAIRN_ORCHESTRATOR_NO_TOOL_USE_STREAK` · Default: `3`.
+    pub async fn orchestrator_no_tool_use_streak(&self) -> u32 {
+        self.get_u32(
+            KEY_ORCHESTRATOR_NO_TOOL_USE_STREAK,
+            "CAIRN_ORCHESTRATOR_NO_TOOL_USE_STREAK",
+            DEFAULT_ORCHESTRATOR_NO_TOOL_USE_STREAK,
+        )
+        .await
+    }
+
+    /// Default orchestrator WallClock-cap breaker (milliseconds).
+    ///
+    /// Key: `orchestrator_wall_clock_ms` · Env: `CAIRN_ORCHESTRATOR_WALL_CLOCK_MS`
+    /// · Default: `900_000` (15 minutes).
+    pub async fn orchestrator_wall_clock_ms(&self) -> u64 {
+        self.get_u64(
+            KEY_ORCHESTRATOR_WALL_CLOCK_MS,
+            "CAIRN_ORCHESTRATOR_WALL_CLOCK_MS",
+            DEFAULT_ORCHESTRATOR_WALL_CLOCK_MS,
+        )
+        .await
     }
 }
 
