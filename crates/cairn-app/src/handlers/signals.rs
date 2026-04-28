@@ -265,20 +265,19 @@ pub(crate) async fn list_signals_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<OptionalProjectScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .signals
-        .list_by_project(&query.project(), query.limit(), query.offset())
+        .list_by_project(&query.project(), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -308,20 +307,19 @@ pub(crate) async fn list_signal_subscriptions_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<OptionalProjectScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .signal_router
-        .list_by_project(&query.project(), query.limit(), query.offset())
+        .list_by_project(&query.project(), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }

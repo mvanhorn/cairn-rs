@@ -137,20 +137,19 @@ pub(crate) async fn list_workers_handler(
     tenant_scope: TenantScope,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .external_workers
-        .list(tenant_scope.tenant_id(), query.limit(), query.offset())
+        .list(tenant_scope.tenant_id(), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }

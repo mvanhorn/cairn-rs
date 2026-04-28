@@ -124,11 +124,21 @@ pub(crate) struct RunReplayQuery {
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct StalledRunsQuery {
     pub(crate) minutes: Option<u64>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) offset: Option<usize>,
 }
 
 impl StalledRunsQuery {
     pub(crate) fn stale_after_ms(&self) -> u64 {
         self.minutes.unwrap_or(30).saturating_mul(60_000)
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.unwrap_or(100)
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
     }
 }
 
@@ -720,7 +730,7 @@ pub(crate) async fn list_stalled_runs_handler(
         }
     }
 
-    let mut items = Vec::new();
+    let mut all = Vec::new();
     for run in candidate_runs {
         // Admin service account sees all tenants; operator tenants are
         // restricted to their own runs.
@@ -729,20 +739,23 @@ pub(crate) async fn list_stalled_runs_handler(
         }
 
         match build_diagnosis_report(state.as_ref(), &run, stale_after_ms).await {
-            Ok((report, true)) => items.push(report),
+            Ok((report, true)) => all.push(report),
             Ok((_report, false)) => {}
             Err(err) => return store_error_response(err),
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(ListResponse {
-            items,
-            has_more: false,
-        }),
-    )
-        .into_response()
+    // #422: honest pagination. Stalled-run diagnosis is assembled in
+    // memory from two state scans (Running + Pending) filtered by
+    // staleness. Apply limit/offset against the filtered total so the
+    // UI load-more works for large backlogs.
+    let total = all.len();
+    let offset = query.offset();
+    let limit = query.limit();
+    let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(items.len()) < total;
+
+    (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
 }
 
 /// `GET /v1/runs/:id/telemetry` — live-aggregated per-run telemetry.
@@ -998,21 +1011,32 @@ fn redact_provider_error(raw: Option<&str>) -> Option<String> {
 pub(crate) async fn list_escalated_runs_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: escalations per tenant are small (typically <50), but the
+    // read model returns them all in one call. Apply limit/offset
+    // in-memory and emit an honest `has_more`.
     match RecoveryEscalationReadModel::list_by_tenant(
         state.runtime.store.as_ref(),
         tenant_scope.tenant_id(),
     )
     .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse::<cairn_domain::recovery::RecoveryEscalation> {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (
+                StatusCode::OK,
+                Json(ListResponse::<cairn_domain::recovery::RecoveryEscalation> {
+                    items,
+                    has_more,
+                }),
+            )
+                .into_response()
+        }
         Err(err) => store_error_response(err),
     }
 }
@@ -1297,22 +1321,21 @@ pub(crate) async fn list_run_interventions_handler(
         Err(response) => return response,
     }
 
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match OperatorInterventionReadModel::list_by_run(
         state.runtime.store.as_ref(),
         &run_id,
-        query.limit(),
+        limit + 1,
         query.offset(),
     )
     .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => store_error_response(err),
     }
 }
@@ -1783,21 +1806,24 @@ pub(crate) async fn set_run_cost_alert_handler(
 pub(crate) async fn list_run_cost_alerts_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: the service returns every triggered alert for the tenant.
+    // Paginate in-memory and emit an honest `has_more`.
     match state
         .runtime
         .run_cost_alerts
         .list_triggered_by_tenant(tenant_scope.tenant_id())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1868,21 +1894,28 @@ pub(crate) async fn get_run_sla_handler(
 pub(crate) async fn list_sla_breached_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: service returns every breach for the tenant. Paginate in
+    // memory and emit an honest `has_more`.
     match state
         .runtime
         .run_sla
         .list_breached_by_tenant(tenant_scope.tenant_id())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse::<cairn_domain::sla::SlaBreach> {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (
+                StatusCode::OK,
+                Json(ListResponse::<cairn_domain::sla::SlaBreach> { items, has_more }),
+            )
+                .into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1890,28 +1923,28 @@ pub(crate) async fn list_sla_breached_handler(
 pub(crate) async fn list_due_run_resumes_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     match PauseScheduleReadModel::list_due(state.runtime.store.as_ref(), now_ms()).await {
         Ok(due) => {
-            let mut items = Vec::new();
+            let mut all = Vec::new();
             for record in due {
                 if record.project.tenant_id != *tenant_scope.tenant_id() {
                     continue;
                 }
                 match state.runtime.runs.get(&record.run_id).await {
-                    Ok(Some(run)) if run.state == RunState::Paused => items.push(run),
+                    Ok(Some(run)) if run.state == RunState::Paused => all.push(run),
                     Ok(_) => {}
                     Err(err) => return runtime_error_response(err),
                 }
             }
-            (
-                StatusCode::OK,
-                Json(ListResponse {
-                    items,
-                    has_more: false,
-                }),
-            )
-                .into_response()
+            // #422: honest pagination against the filtered total.
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
         Err(err) => store_error_response(err),
     }
@@ -2077,20 +2110,22 @@ pub(crate) async fn list_child_runs_handler(
             Err(response) => return response,
         };
 
+    // #422: the service accepts a limit but not an offset — fetch
+    // `limit + 1` rows and flip `has_more` on overflow. Offset-based
+    // deep paging through children is not supported yet; operators
+    // usually want the first N anyway.
+    let limit = query.limit();
     match state
         .runtime
         .runs
-        .list_child_runs(&parent_run.run_id, query.limit())
+        .list_child_runs(&parent_run.run_id, limit + 1)
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -3835,21 +3870,27 @@ pub(crate) async fn list_tenant_costs_handler(
     tenant_scope: TenantScope,
     Query(query): Query<TenantCostQuery>,
 ) -> impl IntoResponse {
+    // #423: honest pagination. The previous shape returned every
+    // session-cost row for the tenant in one payload; a tenant with
+    // six months of activity could produce 100k+ rows, an OOM and
+    // latency hazard the store's own read path did not bound. Fetch
+    // `limit + 1` at the store layer and flip `has_more` on overflow.
+    let limit = query.limit();
+    let offset = query.offset();
     match SessionCostReadModel::list_by_tenant(
         state.runtime.store.as_ref(),
         tenant_scope.tenant_id(),
         query.since_ms.unwrap_or(0),
+        limit + 1,
+        offset,
     )
     .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => store_error_response(err),
     }
 }

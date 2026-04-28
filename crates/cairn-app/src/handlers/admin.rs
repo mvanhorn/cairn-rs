@@ -191,6 +191,16 @@ pub(crate) struct TenantScopedQuery {
     pub offset: Option<usize>,
 }
 
+impl TenantScopedQuery {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(100)
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
+}
+
 // ── Admin DTOs ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -304,20 +314,17 @@ pub(crate) async fn list_tenants_handler(
     // T6a-H3 + T6a-C4: listing every tenant is an admin-only operation.
     // Non-admins enumerating the tenant topology is a cross-tenant
     // metadata leak.
-    match state
-        .runtime
-        .tenants
-        .list(query.limit(), query.offset())
-        .await
-    {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+    //
+    // #422: honest pagination — fetch `limit + 1`, compute `has_more`,
+    // truncate. The previous unconditional `has_more: false` silently
+    // hid extra rows past the first page.
+    let limit = query.limit();
+    match state.runtime.tenants.list(limit + 1, query.offset()).await {
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -638,7 +645,15 @@ pub(crate) async fn list_audit_log_for_resource_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
     Path((resource_type, resource_id)): Path<(String, String)>,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination. `list_by_resource` does not push
+    // limit/offset into the store today (the backing data is naturally
+    // bounded per resource-id — audit entries per run are single-digit
+    // on average, three-digit for pathological flows). Apply the page
+    // in-memory after the tenant filter, and compute `has_more` against
+    // the filtered total so callers see honest flags even when the
+    // page ends exactly at the list tail.
     match AuditLogReadModel::list_by_resource(
         state.runtime.store.as_ref(),
         &resource_type,
@@ -651,14 +666,12 @@ pub(crate) async fn list_audit_log_for_resource_handler(
                 .into_iter()
                 .filter(|entry| entry.tenant_id == *tenant_scope.tenant_id())
                 .collect();
-            (
-                StatusCode::OK,
-                Json(ListResponse {
-                    has_more: false,
-                    items: filtered,
-                }),
-            )
-                .into_response()
+            let total = filtered.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<AuditLogEntry> = filtered.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { has_more, items })).into_response()
         }
         Err(err) => runtime_error_response(err.into()),
     }
@@ -787,13 +800,22 @@ pub(crate) async fn create_snapshot_handler(
 pub(crate) async fn list_snapshots_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     use cairn_store::projections::SnapshotReadModel;
     let tenant_id = TenantId::new(id);
     match SnapshotReadModel::list_by_tenant(state.runtime.store.as_ref(), &tenant_id).await {
         Ok(snapshots) => {
+            // #422: honest pagination. Snapshots per tenant are bounded
+            // (typically <30), but callers still get a truthful
+            // `has_more` so the UI "load more" control works.
+            let total = snapshots.len();
+            let offset = query.offset();
+            let limit = query.limit();
             let items: Vec<_> = snapshots
                 .iter()
+                .skip(offset)
+                .take(limit)
                 .map(|s| {
                     serde_json::json!({
                         "snapshot_id": s.snapshot_id,
@@ -804,14 +826,8 @@ pub(crate) async fn list_snapshots_handler(
                     })
                 })
                 .collect();
-            (
-                StatusCode::OK,
-                Json(ListResponse {
-                    items,
-                    has_more: false,
-                }),
-            )
-                .into_response()
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
         Err(err) => store_error_response(err),
     }
@@ -906,25 +922,24 @@ pub(crate) async fn list_workspaces_handler(
     Path(tenant_id): Path<String>,
     Query(query): Query<ListWorkspacesQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .workspaces
         .list_by_tenant(
             &TenantId::new(tenant_id),
-            query.limit(),
+            limit + 1,
             query.offset(),
             query.include_archived,
         )
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1021,25 +1036,24 @@ pub(crate) async fn list_projects_handler(
         Err(err) => return runtime_error_response(err),
     };
 
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .projects
         .list_by_workspace(
             &workspace.tenant_id,
             &workspace.workspace_id,
-            query.limit(),
+            limit + 1,
             query.offset(),
         )
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1071,26 +1085,30 @@ pub(crate) async fn add_workspace_member_handler(
 pub(crate) async fn list_workspace_members_handler(
     State(state): State<Arc<AppState>>,
     Path(workspace_id): Path<String>,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     let workspace_key = match workspace_key_for_id(&state, &WorkspaceId::new(workspace_id)).await {
         Ok(workspace_key) => workspace_key,
         Err(err) => return runtime_error_response(err),
     };
 
+    // #422: the service returns every member in one shot. Membership
+    // per workspace is bounded (typically <100), so pagination happens
+    // in-memory after the service call.
     match state
         .runtime
         .workspace_memberships
         .list_members(&workspace_key)
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1149,6 +1167,11 @@ pub(crate) async fn list_workspace_shares_handler(
     Query(query): Query<TenantScopedQuery>,
 ) -> impl IntoResponse {
     use cairn_runtime::ResourceSharingService;
+    // #422: shares per workspace are bounded (admin-curated), but the
+    // service returns the full list. Apply limit/offset in-memory and
+    // compute `has_more` against the filtered total.
+    let offset = query.offset();
+    let limit = query.limit();
     match state
         .runtime
         .resource_sharing
@@ -1158,14 +1181,12 @@ pub(crate) async fn list_workspace_shares_handler(
         )
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1243,25 +1264,22 @@ pub(crate) async fn list_credentials_handler(
         return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "credential not found")
             .into_response();
     }
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .credentials
-        .list(&target, query.limit(), query.offset())
+        .list(&target, limit + 1, query.offset())
         .await
     {
-        Ok(items) => {
-            let items = items
+        Ok(records) => {
+            let has_more = records.len() > limit;
+            let items = records
                 .into_iter()
+                .take(limit)
                 .map(credential_summary)
                 .collect::<Vec<_>>();
-            (
-                StatusCode::OK,
-                Json(ListResponse {
-                    items,
-                    has_more: false,
-                }),
-            )
-                .into_response()
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
         Err(err) => runtime_error_response(err),
     }
@@ -1339,20 +1357,19 @@ pub(crate) async fn list_operator_profiles_handler(
     Path(tenant_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .operator_profiles
-        .list(&TenantId::new(tenant_id), query.limit(), query.offset())
+        .list(&TenantId::new(tenant_id), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1422,21 +1439,25 @@ pub(crate) async fn get_operator_notifications_handler(
 pub(crate) async fn list_failed_notifications_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: service returns every failed record for the tenant. Apply
+    // limit/offset in-memory; this list is naturally small (most
+    // tenants have 0-10 failed notifications at a time).
     match state
         .runtime
         .notifications
         .list_failed(tenant_scope.tenant_id())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }

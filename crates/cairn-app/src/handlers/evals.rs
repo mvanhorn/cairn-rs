@@ -108,6 +108,20 @@ pub(crate) struct CreateEvalRubricRequest {
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct ListEvalDatasetsQuery {
     tenant_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+impl ListEvalDatasetsQuery {
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(100)
+    }
+
+    fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
 }
 
 /// Query parameters for `GET /v1/evals/runs`. Combines the standard
@@ -500,19 +514,21 @@ pub(crate) async fn list_eval_datasets_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListEvalDatasetsQuery>,
 ) -> impl IntoResponse {
+    // #422: in-memory read model returns the tenant's full list.
+    // Paginate in-memory with honest `has_more`.
+    let offset = query.offset();
+    let limit = query.limit();
     let tenant_id = TenantId::new(
         query
             .tenant_id
+            .clone()
             .unwrap_or_else(|| DEFAULT_TENANT_ID.to_owned()),
     );
-    (
-        StatusCode::OK,
-        Json(ListResponse {
-            items: state.eval_datasets.list(&tenant_id),
-            has_more: false,
-        }),
-    )
-        .into_response()
+    let all = state.eval_datasets.list(&tenant_id);
+    let total = all.len();
+    let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(items.len()) < total;
+    (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
 }
 
 pub(crate) async fn create_eval_dataset_handler(
@@ -561,38 +577,40 @@ pub(crate) async fn list_eval_baselines_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListEvalDatasetsQuery>,
 ) -> impl IntoResponse {
+    // #422: in-memory read model returns the tenant's full list.
+    let offset = query.offset();
+    let limit = query.limit();
     let tenant_id = TenantId::new(
         query
             .tenant_id
+            .clone()
             .unwrap_or_else(|| DEFAULT_TENANT_ID.to_owned()),
     );
-    (
-        StatusCode::OK,
-        Json(ListResponse {
-            items: state.eval_baselines.list(&tenant_id),
-            has_more: false,
-        }),
-    )
-        .into_response()
+    let all = state.eval_baselines.list(&tenant_id);
+    let total = all.len();
+    let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(items.len()) < total;
+    (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
 }
 
 pub(crate) async fn list_eval_rubrics_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListEvalDatasetsQuery>,
 ) -> impl IntoResponse {
+    // #422: in-memory read model returns the tenant's full list.
+    let offset = query.offset();
+    let limit = query.limit();
     let tenant_id = TenantId::new(
         query
             .tenant_id
+            .clone()
             .unwrap_or_else(|| DEFAULT_TENANT_ID.to_owned()),
     );
-    (
-        StatusCode::OK,
-        Json(ListResponse {
-            items: state.eval_rubrics.list(&tenant_id),
-            has_more: false,
-        }),
-    )
-        .into_response()
+    let all = state.eval_rubrics.list(&tenant_id);
+    let total = all.len();
+    let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(items.len()) < total;
+    (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
 }
 
 pub(crate) async fn create_eval_baseline_handler(
@@ -1394,14 +1412,13 @@ pub(crate) async fn list_scorecards_handler(
         bx.partial_cmp(&ax).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    (
-        StatusCode::OK,
-        Json(ListResponse {
-            has_more: false,
-            items: summaries,
-        }),
-    )
-        .into_response()
+    // #422: honest pagination against the aggregated, sorted set.
+    let total = summaries.len();
+    let offset = query.offset();
+    let limit = query.limit();
+    let items: Vec<_> = summaries.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(items.len()) < total;
+    (StatusCode::OK, Json(ListResponse { has_more, items })).into_response()
 }
 
 pub(crate) async fn get_eval_asset_trend_handler(

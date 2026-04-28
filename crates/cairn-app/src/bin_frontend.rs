@@ -5,6 +5,7 @@ use crate::*;
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use cairn_app::openapi_spec;
 use rust_embed::RustEmbed;
 
 // ── OpenAPI spec + Swagger UI ─────────────────────────────────────────────────

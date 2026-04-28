@@ -1223,10 +1223,17 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Events"],
         "summary": "Real-time SSE event stream",
-        "description": "Emits live events. On connect a `connected` event carries the current head position. Reconnect with `Last-Event-ID` to replay up to 1 000 missed events. No auth required.",
-        "security": [],
+        "description": "Emits live events. On connect a `connected` event carries the current head position. Reconnect with `Last-Event-ID` to replay up to 1 000 missed events. Requires bearer token via `Authorization: Bearer <token>` header OR `?token=<token>` query parameter (browsers cannot set custom headers on EventSource).",
+        "security": [{ "bearerAuth": [] }],
         "operationId": "streamEvents",
-        "responses": { "200": { "description": "SSE stream", "content": { "text/event-stream": {} } } }
+        "parameters": [
+          { "name": "token", "in": "query", "required": false, "description": "Bearer token fallback for EventSource clients that cannot set the `Authorization` header (browsers). Accepts the same values as the `Authorization` header.", "schema": { "type": "string" } },
+          { "name": "Last-Event-ID", "in": "header", "required": false, "description": "Replay events since this position. Up to 1 000 missed events are replayed.", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "SSE stream", "content": { "text/event-stream": {} } },
+          "401": { "description": "Missing or invalid bearer token (header absent AND `?token=` absent/invalid)" }
+        }
       }
     },
     "/v1/evals/runs": {
@@ -1312,6 +1319,13 @@ pub const OPENAPI_JSON: &str = r##"{
         "operationId": "listEvalRubrics",
         "parameters": [{ "name": "tenant_id", "in": "query", "schema": { "type": "string" } }],
         "responses": { "200": { "description": "Eval rubric list" } }
+      },
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Create a rubric for a tenant",
+        "operationId": "createEvalRubric",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Rubric created" } }
       }
     },
     "/v1/evals/baselines": {
@@ -1321,6 +1335,13 @@ pub const OPENAPI_JSON: &str = r##"{
         "operationId": "listEvalBaselines",
         "parameters": [{ "name": "tenant_id", "in": "query", "schema": { "type": "string" } }],
         "responses": { "200": { "description": "Eval baseline list" } }
+      },
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Create a baseline for a tenant",
+        "operationId": "createEvalBaseline",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Baseline created" } }
       }
     },
     "/v1/traces": {
@@ -1330,14 +1351,6 @@ pub const OPENAPI_JSON: &str = r##"{
         "operationId": "listTraces",
         "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "default": 500 } }],
         "responses": { "200": { "description": "LLM call traces" } }
-      }
-    },
-    "/v1/costs": {
-      "get": {
-        "tags": ["Evals"],
-        "summary": "Aggregate cost summary",
-        "operationId": "getCosts",
-        "responses": { "200": { "description": "Cost totals (calls, tokens, USD micros)" } }
       }
     },
     "/v1/admin/audit-log": {
@@ -1353,6 +1366,16 @@ pub const OPENAPI_JSON: &str = r##"{
       }
     },
     "/v1/admin/tenants": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List tenants (admin only)",
+        "operationId": "listTenants",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Tenant list" } }
+      },
       "post": {
         "tags": ["Admin"],
         "summary": "Create a new tenant",
@@ -1777,6 +1800,13 @@ pub const OPENAPI_JSON: &str = r##"{
           { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
         ],
         "responses": { "200": { "description": "Prompt asset list" } }
+      },
+      "post": {
+        "tags": ["Prompts"],
+        "summary": "Create a prompt asset",
+        "operationId": "createPromptAsset",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Prompt asset created" } }
       }
     },
     "/v1/prompts/releases": {
@@ -1789,6 +1819,13 @@ pub const OPENAPI_JSON: &str = r##"{
           { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
         ],
         "responses": { "200": { "description": "Prompt release list" } }
+      },
+      "post": {
+        "tags": ["Prompts"],
+        "summary": "Create a prompt release",
+        "operationId": "createPromptRelease",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Prompt release created" } }
       }
     },
     "/v1/notifications": {
@@ -2041,6 +2078,1459 @@ pub const OPENAPI_JSON: &str = r##"{
           "400": { "description": "Invalid request (bad PEM, empty key, etc.)" },
           "502": { "description": "GitHub API error — credentials or installation ID rejected" }
         }
+      }
+    },
+    "/v1/runs/{id}/orchestrate": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Kick off orchestration for a run (F65)",
+        "description": "Starts the orchestration loop. The request body is an `OrchestrateRequest` (see schema). Returns 202 when the loop has been enqueued.",
+        "operationId": "orchestrateRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrchestrateRequest" } } } },
+        "responses": {
+          "202": { "description": "Orchestration enqueued" },
+          "400": { "description": "Invalid request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
+          "404": { "description": "Run not found" }
+        }
+      }
+    },
+    "/v1/runs/{id}/cancel": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Cancel a run",
+        "operationId": "cancelRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Run cancelled" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/recover": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Force run recovery — no-op legacy (scheduled background scanners handle recovery now)",
+        "operationId": "recoverRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "202": { "description": "Recovery request accepted (no-op)" } }
+      }
+    },
+    "/v1/runs/{id}/spawn": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Spawn a subagent child run",
+        "operationId": "spawnSubagentRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "201": {
+            "description": "Child run created",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "parent_run_id": { "type": "string" }, "child_run_id": { "type": "string" } } } } }
+          },
+          "404": { "description": "Parent run not found" }
+        }
+      }
+    },
+    "/v1/runs/{id}/intervene": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Operator intervention on a run",
+        "operationId": "interveneRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Intervention recorded" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/diagnose": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "Build a diagnosis report for a (potentially stuck) run",
+        "operationId": "diagnoseRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Diagnosis report" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/sla": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "Fetch SLA status for a run",
+        "operationId": "getRunSla",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "SLA status" }, "404": { "description": "Run or SLA not found" } }
+      },
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Configure SLA for a run",
+        "operationId": "setRunSla",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "SLA configured" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/children": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List child (subagent) runs for a parent run",
+        "operationId": "listChildRuns",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Child run list" }, "404": { "description": "Parent run not found" } }
+      }
+    },
+    "/v1/runs/{id}/interventions": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List operator interventions recorded against a run",
+        "operationId": "listRunInterventions",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Intervention list" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/cost-alert": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Set a cost alert threshold for a run (RFC 010)",
+        "operationId": "setRunCostAlert",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Alert configured" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/audit": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "Audit trail for a run",
+        "operationId": "getRunAuditTrail",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Audit trail" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/export": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "Export a run as a portable bundle",
+        "operationId": "exportRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Run bundle" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/checkpoint": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Force-capture a checkpoint for a run",
+        "operationId": "createRunCheckpoint",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "201": { "description": "Checkpoint recorded" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/checkpoint-strategy": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Set checkpoint strategy for a run",
+        "operationId": "setCheckpointStrategy",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Strategy set" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/replay": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Replay a run from the event log",
+        "operationId": "replayRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Replay enqueued" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/replay-to-checkpoint": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Replay a run up to a specific checkpoint",
+        "operationId": "replayRunToCheckpoint",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Replay enqueued" }, "404": { "description": "Run or checkpoint not found" } }
+      }
+    },
+    "/v1/runs/stalled": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List stalled runs with diagnosis reports",
+        "operationId": "listStalledRuns",
+        "parameters": [
+          { "name": "minutes", "in": "query", "schema": { "type": "integer", "default": 30 } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Stalled-run list" } }
+      }
+    },
+    "/v1/runs/escalated": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List recovery-escalated runs for the tenant",
+        "operationId": "listEscalatedRuns",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Escalated-run list" } }
+      }
+    },
+    "/v1/runs/sla-breached": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List SLA-breached runs for the tenant",
+        "operationId": "listSlaBreachedRuns",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "SLA-breach list" } }
+      }
+    },
+    "/v1/runs/cost-alerts": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List triggered run cost alerts",
+        "operationId": "listRunCostAlerts",
+        "responses": { "200": { "description": "Triggered cost alert list" } }
+      }
+    },
+    "/v1/runs/resume-due": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List paused runs whose resume time has arrived",
+        "operationId": "listDueRunResumes",
+        "responses": { "200": { "description": "Due-resume run list" } }
+      }
+    },
+    "/v1/runs/process-scheduled-resumes": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Process all paused runs whose resume time has arrived",
+        "operationId": "processScheduledRunResumes",
+        "responses": { "200": { "description": "Resume batch processed" } }
+      }
+    },
+    "/v1/runs/batch": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Batch-create multiple runs in one request",
+        "operationId": "batchCreateRuns",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "array", "items": { "type": "object" } } } } },
+        "responses": { "201": { "description": "Runs created" } }
+      }
+    },
+    "/v1/workers": {
+      "get": {
+        "tags": ["Workers"],
+        "summary": "List registered external workers",
+        "operationId": "listWorkers",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Worker list" } }
+      }
+    },
+    "/v1/workers/register": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Register a new external worker",
+        "operationId": "registerWorker",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["worker_id"], "properties": { "worker_id": { "type": "string" }, "display_name": { "type": "string" } } } } } },
+        "responses": { "201": { "description": "Worker registered" } }
+      }
+    },
+    "/v1/workers/{id}": {
+      "get": {
+        "tags": ["Workers"],
+        "summary": "Get a worker by id",
+        "operationId": "getWorker",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Worker record" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/claim": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Worker claims a task for execution",
+        "operationId": "workerClaimTask",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Task claimed" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/heartbeat": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Worker sends a heartbeat",
+        "operationId": "workerHeartbeat",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Heartbeat accepted" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/report": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Worker reports task outcome",
+        "operationId": "workerReport",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Report accepted" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/suspend": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Suspend an external worker",
+        "operationId": "suspendWorker",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Worker suspended" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/reactivate": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Reactivate a suspended worker",
+        "operationId": "reactivateWorker",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Worker reactivated" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/feed": {
+      "get": {
+        "tags": ["Feed"],
+        "summary": "List feed items for the active project scope",
+        "operationId": "listFeedItems",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Feed items" } }
+      }
+    },
+    "/v1/feed/{id}/read": {
+      "post": {
+        "tags": ["Feed"],
+        "summary": "Mark a feed item as read",
+        "operationId": "markFeedItemRead",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Marked read" }, "404": { "description": "Feed item not found" } }
+      }
+    },
+    "/v1/feed/read-all": {
+      "post": {
+        "tags": ["Feed"],
+        "summary": "Mark every feed item in the project scope as read",
+        "operationId": "markAllFeedItemsRead",
+        "responses": { "200": { "description": "Changed count", "content": { "application/json": { "schema": { "type": "object", "properties": { "changed": { "type": "integer" } } } } } } }
+      }
+    },
+    "/v1/skills": {
+      "get": {
+        "tags": ["Skills"],
+        "summary": "List skills available in the active project scope",
+        "operationId": "listSkills",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Skill list" } }
+      },
+      "post": {
+        "tags": ["Skills"],
+        "summary": "Register a skill",
+        "operationId": "createSkill",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Skill created" } }
+      }
+    },
+    "/v1/skills/{id}": {
+      "get": {
+        "tags": ["Skills"],
+        "summary": "Get a skill by id",
+        "operationId": "getSkill",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Skill record" }, "404": { "description": "Skill not found" } }
+      },
+      "delete": {
+        "tags": ["Skills"],
+        "summary": "Delete a skill",
+        "operationId": "deleteSkill",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Skill not found" } }
+      }
+    },
+    "/v1/auth/tokens": {
+      "get": {
+        "tags": ["Auth"],
+        "summary": "List auth tokens for the caller's tenant",
+        "operationId": "listAuthTokens",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Auth token list" } }
+      },
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Mint a new auth token",
+        "operationId": "createAuthToken",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Auth token created" } }
+      }
+    },
+    "/v1/auth/tokens/{id}": {
+      "delete": {
+        "tags": ["Auth"],
+        "summary": "Revoke an auth token",
+        "operationId": "deleteAuthToken",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Revoked" }, "404": { "description": "Token not found" } }
+      }
+    },
+    "/v1/projects/{project}/triggers": {
+      "get": {
+        "tags": ["Triggers"],
+        "summary": "List triggers for a project",
+        "operationId": "listProjectTriggers",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Trigger list" } }
+      },
+      "post": {
+        "tags": ["Triggers"],
+        "summary": "Create a trigger in a project",
+        "operationId": "createProjectTrigger",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Trigger created" } }
+      }
+    },
+    "/v1/projects/{project}/triggers/{trigger_id}": {
+      "get": {
+        "tags": ["Triggers"],
+        "summary": "Get a trigger by id",
+        "operationId": "getProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Trigger record" }, "404": { "description": "Trigger not found" } }
+      },
+      "delete": {
+        "tags": ["Triggers"],
+        "summary": "Delete a trigger",
+        "operationId": "deleteProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Trigger not found" } }
+      }
+    },
+    "/v1/projects/{project}/triggers/{trigger_id}/enable": {
+      "post": {
+        "tags": ["Triggers"],
+        "summary": "Enable a trigger",
+        "operationId": "enableProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Trigger enabled" }, "404": { "description": "Trigger not found" } }
+      }
+    },
+    "/v1/projects/{project}/triggers/{trigger_id}/disable": {
+      "post": {
+        "tags": ["Triggers"],
+        "summary": "Disable a trigger",
+        "operationId": "disableProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Trigger disabled" }, "404": { "description": "Trigger not found" } }
+      }
+    },
+    "/v1/projects/{project}/triggers/{trigger_id}/resume": {
+      "post": {
+        "tags": ["Triggers"],
+        "summary": "Resume a paused trigger",
+        "operationId": "resumeProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Trigger resumed" }, "404": { "description": "Trigger not found" } }
+      }
+    },
+    "/v1/projects/{project}/run-templates": {
+      "get": {
+        "tags": ["Run templates"],
+        "summary": "List run templates for a project",
+        "operationId": "listProjectRunTemplates",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Run template list" } }
+      },
+      "post": {
+        "tags": ["Run templates"],
+        "summary": "Create a run template in a project",
+        "operationId": "createProjectRunTemplate",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Run template created" } }
+      }
+    },
+    "/v1/projects/{project}/run-templates/{template_id}": {
+      "get": {
+        "tags": ["Run templates"],
+        "summary": "Get a run template by id",
+        "operationId": "getProjectRunTemplate",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "template_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Run template" }, "404": { "description": "Template not found" } }
+      },
+      "delete": {
+        "tags": ["Run templates"],
+        "summary": "Delete a run template",
+        "operationId": "deleteProjectRunTemplate",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "template_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Template not found" } }
+      }
+    },
+    "/v1/costs": {
+      "get": {
+        "tags": ["Costs"],
+        "summary": "List per-session cost records for the caller's tenant",
+        "description": "Newest-first. The `limit` defaults to 200 and is clamped at 1 000 per page (issue #423); paginate via `offset` + `has_more`. `since_ms` bounds the `updated_at_ms` lower window.",
+        "operationId": "listTenantCosts",
+        "parameters": [
+          { "name": "since_ms", "in": "query", "schema": { "type": "integer", "format": "int64" } },
+          { "name": "limit",    "in": "query", "schema": { "type": "integer", "default": 200, "maximum": 1000 } },
+          { "name": "offset",   "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Per-session cost page" } }
+      }
+    },
+    "/v1/evals/runs/{id}/start": {
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Start an eval run",
+        "operationId": "startEvalRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Run started" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/evals/runs/{id}/complete": {
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Complete an eval run",
+        "operationId": "completeEvalRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Run completed" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/evals/runs/{id}/score": {
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Record a per-entry score for an eval run",
+        "operationId": "scoreEvalRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Score recorded" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/tool-invocations": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "List tool invocations for a run",
+        "operationId": "listToolInvocations",
+        "parameters": [
+          { "name": "run_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "state",  "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Tool invocation page" } }
+      },
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Record a tool invocation start",
+        "operationId": "createToolInvocation",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Invocation recorded" } }
+      }
+    },
+    "/v1/tool-invocations/{id}": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Get a tool invocation by id",
+        "operationId": "getToolInvocation",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Invocation view" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/tool-invocations/{id}/complete": {
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Mark a tool invocation as completed",
+        "operationId": "completeToolInvocation",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Invocation completed" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/tool-invocations/{id}/cancel": {
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Cancel (and record failure for) a tool invocation",
+        "operationId": "cancelToolInvocation",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Invocation cancelled" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/tool-invocations/{id}/progress": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Get latest progress snapshot for a tool invocation",
+        "operationId": "getToolInvocationProgress",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Progress snapshot" }, "404": { "description": "No progress recorded" } }
+      }
+    },
+    "/v1/checkpoints": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "List checkpoints for a run",
+        "operationId": "listCheckpoints",
+        "parameters": [
+          { "name": "run_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } }
+        ],
+        "responses": { "200": { "description": "Checkpoint list" }, "400": { "description": "run_id is required" } }
+      }
+    },
+    "/v1/checkpoints/{id}": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Get a checkpoint by id",
+        "operationId": "getCheckpoint",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Checkpoint" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/checkpoints/{id}/restore": {
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Restore run state from a checkpoint",
+        "operationId": "restoreCheckpoint",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Restored" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/memory/deep-search": {
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Deep search across memory documents (rerank + graph expansion)",
+        "operationId": "memoryDeepSearch",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Search results" } }
+      }
+    },
+    "/v1/memory/diagnostics": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "Memory pipeline diagnostics (index health, embedder queue depth, etc.)",
+        "operationId": "getMemoryDiagnostics",
+        "responses": { "200": { "description": "Diagnostics payload" } }
+      }
+    },
+    "/v1/integrations": {
+      "get": {
+        "tags": ["Integrations"],
+        "summary": "List integrations configured for the active project",
+        "operationId": "listIntegrations",
+        "responses": { "200": { "description": "Integration list" } }
+      },
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Register an integration",
+        "operationId": "createIntegration",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Integration created" } }
+      }
+    },
+    "/v1/integrations/{integration_id}": {
+      "get": {
+        "tags": ["Integrations"],
+        "summary": "Get an integration by id",
+        "operationId": "getIntegration",
+        "parameters": [{ "name": "integration_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Integration record" }, "404": { "description": "Not found" } }
+      },
+      "delete": {
+        "tags": ["Integrations"],
+        "summary": "Delete an integration",
+        "operationId": "deleteIntegration",
+        "parameters": [{ "name": "integration_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/providers/connections/{id}/resolve-key": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Resolve the API key for a provider connection (admin only)",
+        "operationId": "resolveProviderConnectionKey",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Resolved key" }, "404": { "description": "Connection not found" } }
+      }
+    },
+    "/v1/providers/connections/{id}/retry-policy": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Set retry policy for a provider connection",
+        "operationId": "setProviderRetryPolicy",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Policy set" }, "404": { "description": "Connection not found" } }
+      }
+    },
+    "/v1/providers/connections/{id}/test": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Test a provider connection by running a synthetic call",
+        "operationId": "testProviderConnection",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Test result" }, "404": { "description": "Connection not found" } }
+      }
+    },
+    "/v1/plugins/catalog": {
+      "get": {
+        "tags": ["Plugins"],
+        "summary": "Browse the plugin marketplace catalog (RFC 015)",
+        "operationId": "listPluginCatalog",
+        "responses": { "200": { "description": "Catalog list" } }
+      }
+    },
+    "/v1/plugins/{id}/install": {
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Install a plugin by id",
+        "operationId": "installPlugin",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Plugin installed" }, "404": { "description": "Plugin not found" } }
+      }
+    },
+    "/v1/plugins/{id}/uninstall": {
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Uninstall a plugin by id",
+        "operationId": "uninstallPlugin",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Plugin uninstalled" }, "404": { "description": "Plugin not found" } }
+      }
+    },
+    "/v1/plugins/{id}/verify": {
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Verify a plugin's manifest signature",
+        "operationId": "verifyPlugin",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Verification result" }, "404": { "description": "Plugin not found" } }
+      }
+    },
+    "/v1/plugins/{id}/credentials": {
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Set credentials for a plugin",
+        "operationId": "setPluginCredentials",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Credentials set" }, "404": { "description": "Plugin not found" } }
+      }
+    },
+    "/v1/webhooks/github/webhook": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "GitHub webhook delivery endpoint",
+        "operationId": "githubWebhook",
+        "responses": { "200": { "description": "Accepted" }, "401": { "description": "Signature mismatch" } }
+      }
+    },
+    "/v1/webhooks/github/queue/concurrency": {
+      "get": {
+        "tags": ["Integrations"],
+        "summary": "Get GitHub webhook queue concurrency configuration",
+        "operationId": "getGithubQueueConcurrency",
+        "responses": { "200": { "description": "Concurrency config" } }
+      },
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Set GitHub webhook queue concurrency",
+        "operationId": "setGithubQueueConcurrency",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Concurrency updated" } }
+      }
+    },
+    "/v1/webhooks/github/queue/pause": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Pause GitHub webhook queue processing",
+        "operationId": "pauseGithubQueue",
+        "responses": { "200": { "description": "Queue paused" } }
+      }
+    },
+    "/v1/webhooks/github/queue/resume": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Resume GitHub webhook queue processing",
+        "operationId": "resumeGithubQueue",
+        "responses": { "200": { "description": "Queue resumed" } }
+      }
+    },
+    "/v1/webhooks/github/queue/{issue}/retry": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Retry a failed webhook delivery for an issue",
+        "operationId": "retryGithubQueueIssue",
+        "parameters": [{ "name": "issue", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Retried" }, "404": { "description": "Issue not found" } }
+      }
+    },
+    "/v1/webhooks/github/queue/{issue}/skip": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Skip a failed webhook delivery for an issue",
+        "operationId": "skipGithubQueueIssue",
+        "parameters": [{ "name": "issue", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Skipped" }, "404": { "description": "Issue not found" } }
+      }
+    },
+    "/v1/admin/capabilities": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List admin-reachable capabilities for the current deployment",
+        "operationId": "getAdminCapabilities",
+        "responses": { "200": { "description": "Capability map" } }
+      }
+    },
+    "/v1/admin/entitlements": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Licensed entitlements and feature flags",
+        "operationId": "getAdminEntitlements",
+        "responses": { "200": { "description": "Entitlements" } }
+      }
+    },
+    "/v1/admin/license": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Current license state",
+        "operationId": "getLicense",
+        "responses": { "200": { "description": "License record" } }
+      }
+    },
+    "/v1/admin/license/activate": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Activate a license key",
+        "operationId": "activateLicense",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Activated" }, "400": { "description": "Invalid license" } }
+      }
+    },
+    "/v1/admin/license/override": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Override the license (admin emergency)",
+        "operationId": "overrideLicense",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Override applied" } }
+      }
+    },
+    "/v1/admin/logs": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Structured request log tail from the in-memory ring buffer",
+        "operationId": "listRequestLogs",
+        "parameters": [
+          { "name": "limit",    "in": "query", "schema": { "type": "integer", "default": 200 } },
+          { "name": "level",    "in": "query", "schema": { "type": "string", "description": "Comma-separated: info,warn,error" } },
+          { "name": "since_ms", "in": "query", "schema": { "type": "integer", "format": "int64" } }
+        ],
+        "responses": { "200": { "description": "Request log entries" } }
+      }
+    },
+    "/v1/admin/notifications/failed": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List failed notification deliveries for the caller's tenant",
+        "operationId": "listFailedNotifications",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Failed notification list" } }
+      }
+    },
+    "/v1/admin/workspaces": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List workspaces across all tenants (admin only)",
+        "operationId": "adminListWorkspaces",
+        "responses": { "200": { "description": "Workspace list" } }
+      }
+    },
+    "/v1/approval-policies": {
+      "get": {
+        "tags": ["Approvals"],
+        "summary": "List approval policies for the caller's tenant",
+        "operationId": "listApprovalPolicies",
+        "responses": { "200": { "description": "Approval policy list" } }
+      },
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Create an approval policy",
+        "operationId": "createApprovalPolicy",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Policy created" } }
+      }
+    },
+    "/v1/approvals/{id}/resolve": {
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Resolve an approval (approve or deny with decision payload)",
+        "operationId": "resolveApproval",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Resolved" }, "404": { "description": "Approval not found" } }
+      }
+    },
+    "/v1/assistant/message": {
+      "post": {
+        "tags": ["Assistant"],
+        "summary": "Send a message to the in-app assistant",
+        "operationId": "sendAssistantMessage",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Assistant reply" } }
+      }
+    },
+    "/v1/assistant/voice": {
+      "post": {
+        "tags": ["Assistant"],
+        "summary": "Submit a voice-formatted message to the assistant",
+        "operationId": "sendAssistantVoice",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Assistant reply" } }
+      }
+    },
+    "/v1/assistant/sessions": {
+      "get": {
+        "tags": ["Assistant"],
+        "summary": "List assistant sessions for the caller",
+        "operationId": "listAssistantSessions",
+        "responses": { "200": { "description": "Assistant session list" } }
+      }
+    },
+    "/v1/assistant/sessions/{sessionId}": {
+      "get": {
+        "tags": ["Assistant"],
+        "summary": "Get an assistant session by id",
+        "operationId": "getAssistantSession",
+        "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Assistant session" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/channels": {
+      "get": {
+        "tags": ["Channels"],
+        "summary": "List notification channels configured for the caller's tenant",
+        "operationId": "listChannels",
+        "responses": { "200": { "description": "Channel list" } }
+      },
+      "post": {
+        "tags": ["Channels"],
+        "summary": "Register a notification channel",
+        "operationId": "createChannel",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Channel created" } }
+      }
+    },
+    "/v1/config": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Dump server configuration (secrets redacted)",
+        "operationId": "getServerConfig",
+        "responses": { "200": { "description": "Config dump" } }
+      }
+    },
+    "/v1/config/{key}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get a single config value by key",
+        "operationId": "getConfigValue",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Value" }, "404": { "description": "Not found" } }
+      },
+      "put": {
+        "tags": ["Admin"],
+        "summary": "Set a config value",
+        "operationId": "setConfigValue",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Set" } }
+      },
+      "delete": {
+        "tags": ["Admin"],
+        "summary": "Delete a config value",
+        "operationId": "deleteConfigValue",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/evals/datasets": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "List eval datasets for the caller's tenant",
+        "operationId": "listEvalDatasets",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",     "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",    "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Dataset list" } }
+      },
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Create an eval dataset",
+        "operationId": "createEvalDataset",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Dataset created" } }
+      }
+    },
+    "/v1/evals/matrices/guardrail": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Guardrail matrix (per-release violation counts)",
+        "operationId": "getGuardrailMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/evals/matrices/memory-quality": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Memory-quality matrix",
+        "operationId": "getMemoryQualityMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/evals/matrices/permissions": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Permissions matrix",
+        "operationId": "getPermissionsMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/evals/matrices/prompt-comparison": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Prompt-comparison matrix",
+        "operationId": "getPromptComparisonMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/evals/matrices/skill-health": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Skill-health matrix",
+        "operationId": "getSkillHealthMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/export/{format}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Export a portable bundle in the given format",
+        "operationId": "exportBundleByFormat",
+        "parameters": [{ "name": "format", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Export archive" }, "400": { "description": "Unsupported format" } }
+      }
+    },
+    "/v1/fleet": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Fleet overview (hosts, roles, deployment mode)",
+        "operationId": "getFleet",
+        "responses": { "200": { "description": "Fleet overview" } }
+      }
+    },
+    "/v1/graph/trace": {
+      "get": {
+        "tags": ["Graph"],
+        "summary": "Graph trace query",
+        "operationId": "getGraphTrace",
+        "responses": { "200": { "description": "Trace data" } }
+      }
+    },
+    "/v1/import/reports": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List recent import reports",
+        "operationId": "listImportReports",
+        "responses": { "200": { "description": "Import reports" } }
+      }
+    },
+    "/v1/import/preview": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Preview what an import bundle would change",
+        "operationId": "previewImport",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Preview" } }
+      }
+    },
+    "/v1/import/validate": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Validate an import bundle",
+        "operationId": "validateImport",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Validation result" } }
+      }
+    },
+    "/v1/import/apply": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Apply an import bundle",
+        "operationId": "applyImport",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Applied" } }
+      }
+    },
+    "/v1/ingest/jobs": {
+      "get": {
+        "tags": ["Ingest"],
+        "summary": "List ingest jobs for the caller's project",
+        "operationId": "listIngestJobs",
+        "responses": { "200": { "description": "Ingest jobs" } }
+      },
+      "post": {
+        "tags": ["Ingest"],
+        "summary": "Create an ingest job",
+        "operationId": "createIngestJob",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Job created" } }
+      }
+    },
+    "/v1/memories": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "List memory documents",
+        "operationId": "listMemories",
+        "responses": { "200": { "description": "Memory list" } }
+      },
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Create a memory document",
+        "operationId": "createMemory",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Memory created" } }
+      }
+    },
+    "/v1/memories/search": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "Search memory documents",
+        "operationId": "searchMemories",
+        "parameters": [
+          { "name": "q",     "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } }
+        ],
+        "responses": { "200": { "description": "Search results" } }
+      }
+    },
+    "/v1/memories/{id}/accept": {
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Accept a memory document",
+        "operationId": "acceptMemory",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Accepted" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/memories/{id}/reject": {
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Reject a memory document",
+        "operationId": "rejectMemory",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Rejected" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/onboarding/status": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Onboarding status for the caller",
+        "operationId": "getOnboardingStatus",
+        "responses": { "200": { "description": "Onboarding status" } }
+      }
+    },
+    "/v1/onboarding/template": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Apply an onboarding template",
+        "operationId": "applyOnboardingTemplate",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Template applied" } }
+      }
+    },
+    "/v1/onboarding/templates": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List available onboarding templates",
+        "operationId": "listOnboardingTemplates",
+        "responses": { "200": { "description": "Onboarding template list" } }
+      }
+    },
+    "/v1/plugins": {
+      "get": {
+        "tags": ["Plugins"],
+        "summary": "List plugins registered with the host",
+        "operationId": "listPlugins",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Plugin list" } }
+      },
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Register a plugin manifest",
+        "operationId": "createPlugin",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Plugin registered" } }
+      }
+    },
+    "/v1/policies/decisions": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List recent guardrail-policy decisions",
+        "operationId": "listPolicyDecisions",
+        "responses": { "200": { "description": "Decision log" } }
+      }
+    },
+    "/v1/providers/bindings": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "List provider bindings for the caller's tenant",
+        "operationId": "listProviderBindings",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",     "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",    "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Binding list" } }
+      },
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Create a provider binding",
+        "operationId": "createProviderBinding",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Binding created" } }
+      }
+    },
+    "/v1/providers/bindings/cost-ranking": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "Per-binding cost ranking for the tenant",
+        "operationId": "listBindingCostRanking",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",     "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",    "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Cost ranking" } }
+      }
+    },
+    "/v1/providers/budget": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "List provider budgets",
+        "operationId": "listProviderBudgets",
+        "responses": { "200": { "description": "Budget list" } }
+      },
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Set a provider budget",
+        "operationId": "setProviderBudget",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Budget set" } }
+      }
+    },
+    "/v1/providers/policies": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "List route policies",
+        "operationId": "listRoutePolicies",
+        "responses": { "200": { "description": "Route policy list" } }
+      },
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Create a route policy",
+        "operationId": "createRoutePolicy",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Policy created" } }
+      }
+    },
+    "/v1/providers/pools": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "List provider connection pools",
+        "operationId": "listProviderPools",
+        "responses": { "200": { "description": "Pool list" } }
+      },
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Create a provider connection pool",
+        "operationId": "createProviderPool",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Pool created" } }
+      }
+    },
+    "/v1/providers/run-health-checks": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Run all due provider health checks now",
+        "operationId": "runProviderHealthChecks",
+        "responses": { "200": { "description": "Records produced by the batch" } }
+      }
+    },
+    "/v1/settings/tls": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "TLS certificate settings",
+        "operationId": "getTlsSettings",
+        "responses": { "200": { "description": "TLS settings" } }
+      }
+    },
+    "/v1/soul": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get the current soul document",
+        "operationId": "getSoul",
+        "responses": { "200": { "description": "Soul document" } }
+      },
+      "put": {
+        "tags": ["Admin"],
+        "summary": "Replace the soul document",
+        "operationId": "putSoul",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Soul updated" } }
+      }
+    },
+    "/v1/soul/history": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Soul document revision history",
+        "operationId": "getSoulHistory",
+        "responses": { "200": { "description": "History" } }
+      }
+    },
+    "/v1/soul/patches": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List soul patches pending review",
+        "operationId": "listSoulPatches",
+        "responses": { "200": { "description": "Patch list" } }
+      }
+    },
+    "/v1/sources": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "List knowledge sources for the caller's project",
+        "operationId": "listSources",
+        "responses": { "200": { "description": "Source list" } }
+      },
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Register a knowledge source",
+        "operationId": "createSource",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Source created" } }
+      }
+    },
+    "/v1/sources/process-refresh": {
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Process all due source refreshes now",
+        "operationId": "processSourceRefresh",
+        "responses": { "200": { "description": "Refresh batch processed" } }
+      }
+    },
+    "/v1/streams/runtime": {
+      "get": {
+        "tags": ["Events"],
+        "summary": "Alternate SSE event stream (legacy)",
+        "description": "Supplementary live event stream. Bearer auth required — same contract as `/v1/stream` (`Authorization` header OR `?token=` query parameter).",
+        "operationId": "streamRuntimeEvents",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "token", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "SSE stream" }, "401": { "description": "Unauthorized" } }
+      }
+    },
+    "/v1/tasks/expired": {
+      "get": {
+        "tags": ["Tasks"],
+        "summary": "List tasks whose lease has expired",
+        "operationId": "listExpiredTasks",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Expired task list" } }
+      }
+    },
+    "/v1/tasks/expire-leases": {
+      "post": {
+        "tags": ["Tasks"],
+        "summary": "Force-expire task leases past their deadline",
+        "operationId": "expireTaskLeases",
+        "responses": { "200": { "description": "Expired task ids" } }
+      }
+    },
+    "/v1/tasks/{id}/cancel": {
+      "post": {
+        "tags": ["Tasks"],
+        "summary": "Cancel a task",
+        "operationId": "cancelTask",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Task cancelled" }, "404": { "description": "Task not found" } }
+      }
+    },
+    "/v1/poll/run": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Internal: tick scheduled polling runs",
+        "operationId": "pollRun",
+        "responses": { "200": { "description": "Poll tick accepted" } }
       }
     }
   }

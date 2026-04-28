@@ -19,6 +19,7 @@ pub mod metrics_otel;
 #[cfg(any(feature = "metrics-core", feature = "metrics-providers"))]
 pub mod metrics_tap;
 pub mod middleware;
+pub mod openapi_spec;
 pub mod repo_routes;
 pub mod router;
 pub mod sandbox;

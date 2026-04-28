@@ -24,7 +24,12 @@ mod bin_websocket;
 mod bundles;
 #[allow(dead_code)]
 mod entitlements;
-mod openapi_spec;
+// `openapi_spec` is published via the library (`cairn_app::openapi_spec`)
+// so integration tests (e.g. `tests/openapi_coverage.rs`) can parse the
+// canonical spec. The binary-side `bin_frontend` module references the
+// constants through the full library path, so no re-import is needed
+// here (see Copilot PR review: an unused `use` would trip
+// `#![deny(warnings)]` CI).
 #[allow(dead_code)]
 mod sse_hooks;
 #[allow(dead_code)]

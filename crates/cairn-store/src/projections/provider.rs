@@ -88,10 +88,21 @@ pub trait SessionCostReadModel: Send + Sync {
         session_id: &SessionId,
     ) -> Result<Option<SessionCostRecord>, StoreError>;
 
+    /// List per-session cost rows for a tenant, newest-first, starting
+    /// at `since_ms` (inclusive lower bound on `updated_at_ms`).
+    ///
+    /// `limit` caps the returned rows and `offset` skips that many
+    /// rows from the head — callers use `limit + 1` to detect whether
+    /// additional pages exist. Implementations MUST apply both bounds
+    /// at the query layer where possible (issue #423): a tenant with
+    /// months of activity can exceed 100k rows, and the historical
+    /// unbounded `list_by_tenant` led to OOM and latency incidents.
     async fn list_by_tenant(
         &self,
         tenant_id: &TenantId,
         since_ms: u64,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<SessionCostRecord>, StoreError>;
 }
 

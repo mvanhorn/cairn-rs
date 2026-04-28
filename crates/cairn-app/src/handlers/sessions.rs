@@ -318,6 +318,7 @@ pub(crate) async fn get_session_active_runs_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
     Path(id): Path<String>,
+    Query(query): Query<crate::handlers::admin::PaginationQuery>,
 ) -> impl IntoResponse {
     let session_id = SessionId::new(id.clone());
 
@@ -331,28 +332,67 @@ pub(crate) async fn get_session_active_runs_handler(
         Err(err) => return runtime_error_response(err),
     }
 
-    let runs = match RunReadModel::list_by_session(
-        state.runtime.store.as_ref(),
-        &session_id,
-        200,
-        0,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(err) => return store_error_response(err),
-    };
+    // #422: the store's `list_by_session` sorts by `created_at` ASC
+    // and does not push the state filter down, so a session with
+    // thousands of historical terminal runs would hide active runs
+    // past the scan window (cursor / gemini / copilot review). Fix:
+    // iterate in chunks, filter to active per chunk, stop when either
+    //   (a) we have enough rows to satisfy offset + limit + 1 active
+    //       rows (we then know `has_more` honestly), OR
+    //   (b) the store returns a short chunk (end of session reached).
+    // A total-runs ceiling bounds worst-case CPU: we do at most
+    // MAX_SCAN_CHUNKS × CHUNK_SIZE read ops, and the filter pass is
+    // O(rows) so the full walk is a known quantity. Sessions that
+    // legitimately have more than MAX_SCAN_CHUNKS × CHUNK_SIZE runs
+    // are pathological and the endpoint surfaces `has_more=true`
+    // with whatever active rows we did find.
+    const CHUNK_SIZE: usize = 500;
+    const MAX_SCAN_CHUNKS: usize = 40; // 40 × 500 = 20 000 runs scanned
 
-    let active: Vec<RunRecord> = runs
-        .into_iter()
-        .filter(|r| !r.state.is_terminal())
-        .collect();
+    let offset = query.offset();
+    let limit = query.limit();
+    let needed = offset.saturating_add(limit).saturating_add(1);
+
+    let mut active: Vec<RunRecord> = Vec::new();
+    let mut scanned_chunks = 0usize;
+    let mut scan_offset = 0usize;
+    let mut reached_end = false;
+    loop {
+        let chunk = match RunReadModel::list_by_session(
+            state.runtime.store.as_ref(),
+            &session_id,
+            CHUNK_SIZE,
+            scan_offset,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(err) => return store_error_response(err),
+        };
+        let chunk_len = chunk.len();
+        active.extend(chunk.into_iter().filter(|r| !r.state.is_terminal()));
+        scanned_chunks += 1;
+        if chunk_len < CHUNK_SIZE {
+            reached_end = true;
+            break;
+        }
+        if active.len() >= needed {
+            break;
+        }
+        if scanned_chunks >= MAX_SCAN_CHUNKS {
+            break;
+        }
+        scan_offset = scan_offset.saturating_add(CHUNK_SIZE);
+    }
+
+    let cap_exceeded = !reached_end && active.len() < needed;
+    let total = active.len();
+    let items: Vec<RunRecord> = active.into_iter().skip(offset).take(limit).collect();
+    let has_more = cap_exceeded || offset.saturating_add(items.len()) < total;
+
     (
         StatusCode::OK,
-        Json(ListResponse::<RunRecord> {
-            items: active,
-            has_more: false,
-        }),
+        Json(ListResponse::<RunRecord> { items, has_more }),
     )
         .into_response()
 }

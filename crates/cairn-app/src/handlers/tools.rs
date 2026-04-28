@@ -630,20 +630,23 @@ pub(crate) async fn list_checkpoints_handler(
         Err(resp) => return resp,
     }
 
+    // #422: the service accepts a limit but not an offset — fetch
+    // `limit + 1` rows so `has_more` reflects whether the run has
+    // unreturned checkpoints. Operators can re-request with a larger
+    // `limit` if they need more; offset-based paging through
+    // checkpoints is not required by the UI today.
+    let limit = query.limit();
     match state
         .runtime
         .checkpoints
-        .list_by_run(&run_id, query.limit())
+        .list_by_run(&run_id, limit + 1)
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }

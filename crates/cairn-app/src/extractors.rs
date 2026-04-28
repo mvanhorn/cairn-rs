@@ -113,6 +113,37 @@ impl PreservedMemorySearchParams {
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 pub(crate) struct TenantCostQuery {
     pub(crate) since_ms: Option<u64>,
+    /// Per-page row cap. Defaults to 200; capped at 1 000 to bound
+    /// worst-case response size (#423). Previously the handler returned
+    /// every session cost row for the tenant in one payload — tenants
+    /// with long run histories could produce 100k+-row responses, an
+    /// OOM and latency hazard the store's own READ path couldn't
+    /// protect against.
+    pub(crate) limit: Option<usize>,
+    /// Zero-based offset into the tenant's session-cost list, newest
+    /// first.
+    pub(crate) offset: Option<usize>,
+}
+
+impl TenantCostQuery {
+    /// Default page size. Matches the pattern used by other list
+    /// endpoints that truly need bulk reads (audit logs, traces).
+    pub(crate) const DEFAULT_LIMIT: usize = 200;
+
+    /// Maximum per-page cap (#423). Requests exceeding this are
+    /// clamped silently — the response's `has_more` flag is still
+    /// truthful so clients can keep paging.
+    pub(crate) const MAX_LIMIT: usize = 1_000;
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+            .unwrap_or(Self::DEFAULT_LIMIT)
+            .min(Self::MAX_LIMIT)
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
 }
 
 impl ProjectScopedQuery {

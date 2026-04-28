@@ -46,6 +46,16 @@ pub(crate) struct TenantScopedQuery {
     pub offset: Option<usize>,
 }
 
+impl TenantScopedQuery {
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.unwrap_or(100)
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 pub(crate) struct OptionalTenantScopedQuery {
     pub tenant_id: Option<String>,
@@ -56,6 +66,14 @@ pub(crate) struct OptionalTenantScopedQuery {
 impl OptionalTenantScopedQuery {
     pub(crate) fn tenant_id(&self) -> &str {
         self.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT_ID)
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.unwrap_or(100)
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
     }
 }
 
@@ -123,6 +141,18 @@ pub(crate) struct UpdateProviderConnectionRequest {
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct CostRankingQuery {
     pub tenant_id: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+impl CostRankingQuery {
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.unwrap_or(100)
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize, ToSchema)]
@@ -213,24 +243,24 @@ pub(crate) async fn list_provider_health_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TenantScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
+    let offset = query.offset();
     match state
         .runtime
         .provider_health
-        .list(
-            &TenantId::new(query.tenant_id),
-            query.limit.unwrap_or(100),
-            query.offset.unwrap_or(0),
-        )
+        .list(&TenantId::new(query.tenant_id), limit + 1, offset)
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse::<ProviderHealthRecord> {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (
+                StatusCode::OK,
+                Json(ListResponse::<ProviderHealthRecord> { items, has_more }),
+            )
+                .into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -239,20 +269,27 @@ pub(crate) async fn list_provider_budgets_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TenantScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: budgets per tenant are naturally bounded (one row per
+    // period), but the service returns them all in one shot. Paginate
+    // in-memory and compute `has_more` honestly.
+    let offset = query.offset();
+    let limit = query.limit();
     match state
         .runtime
         .budgets
         .list_budgets(&TenantId::new(query.tenant_id))
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse::<ProviderBudget> {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (
+                StatusCode::OK,
+                Json(ListResponse::<ProviderBudget> { items, has_more }),
+            )
+                .into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -385,6 +422,11 @@ pub(crate) async fn set_provider_retry_policy_handler(
 pub(crate) async fn run_provider_health_checks_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    // NOTE: this is a batch *action* whose response happens to be
+    // shaped like a list (every record that just ran). It is not a
+    // paginated read — there is no further page to fetch — so
+    // `has_more: false` here is literally true (no next page), not
+    // the pagination-lie from #422.
     match state.runtime.provider_health.run_due_health_checks().await {
         Ok(records) => (
             StatusCode::OK,
@@ -420,20 +462,22 @@ pub(crate) async fn list_provider_pools_handler(
     Query(query): Query<TenantScopedQuery>,
 ) -> impl IntoResponse {
     use cairn_runtime::ProviderConnectionPoolService;
+    // #422: pools per tenant are admin-curated and bounded, but we
+    // still honour limit/offset honestly.
+    let offset = query.offset();
+    let limit = query.limit();
     match state
         .runtime
         .provider_pools
         .list_pools(&TenantId::new(query.tenant_id))
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -475,24 +519,20 @@ pub(crate) async fn list_provider_connections_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TenantScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
+    let offset = query.offset();
     match state
         .runtime
         .provider_connections
-        .list(
-            &TenantId::new(query.tenant_id),
-            query.limit.unwrap_or(100),
-            query.offset.unwrap_or(0),
-        )
+        .list(&TenantId::new(query.tenant_id), limit + 1, offset)
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
             .into_response(),
     }
@@ -779,24 +819,19 @@ pub(crate) async fn list_provider_bindings_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<OptionalTenantScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .provider_bindings
-        .list(
-            &TenantId::new(query.tenant_id()),
-            query.limit.unwrap_or(100),
-            query.offset.unwrap_or(0),
-        )
+        .list(&TenantId::new(query.tenant_id()), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
             .into_response(),
     }
@@ -829,21 +864,24 @@ pub(crate) async fn list_binding_cost_ranking_handler(
     Query(query): Query<CostRankingQuery>,
 ) -> impl IntoResponse {
     use cairn_store::projections::ProviderBindingCostStatsReadModel;
+    // #422: the read model returns every binding's stats for the
+    // tenant. Apply limit/offset in-memory and compute `has_more` so
+    // operator UI can page through ranked bindings.
     let tenant_id = TenantId::new(query.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT_ID));
+    let offset = query.offset();
+    let limit = query.limit();
     match ProviderBindingCostStatsReadModel::list_by_tenant(
         state.runtime.store.as_ref(),
         &tenant_id,
     )
     .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => store_error_response(err),
     }
 }
@@ -874,22 +912,22 @@ pub(crate) async fn list_route_policies_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<TenantScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
+    let offset = query.offset();
     match RoutePolicyReadModel::list_by_tenant(
         state.runtime.store.as_ref(),
         &TenantId::new(query.tenant_id),
-        query.limit.unwrap_or(100),
-        query.offset.unwrap_or(0),
+        limit + 1,
+        offset,
     )
     .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => {
             tracing::error!("list_route_policies failed: {err}");
             AppApiError::new(

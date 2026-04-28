@@ -2671,17 +2671,24 @@ impl crate::projections::SessionCostReadModel for InMemoryStore {
     async fn list_by_tenant(
         &self,
         tenant_id: &cairn_domain::TenantId,
-        _since_ms: u64,
+        since_ms: u64,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<cairn_domain::providers::SessionCostRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Issue #423: the in-memory impl now honours `since_ms`,
+        // `limit`, and `offset`. Filter → sort newest-first →
+        // skip → take so callers that pass `limit + 1` can still
+        // detect the overflow page.
         let mut results: Vec<_> = state
             .session_costs
             .values()
-            .filter(|r| &r.tenant_id == tenant_id)
+            .filter(|r| &r.tenant_id == tenant_id && r.updated_at_ms >= since_ms)
             .cloned()
             .collect();
-        results.sort_by_key(|r| r.updated_at_ms);
-        Ok(results)
+        results.sort_by_key(|r| std::cmp::Reverse(r.updated_at_ms));
+        let page: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
+        Ok(page)
     }
 }
 
@@ -4123,21 +4130,29 @@ impl crate::projections::SignalSubscriptionReadModel for InMemoryStore {
     async fn list_by_project(
         &self,
         project: &cairn_domain::tenancy::ProjectKey,
-        _limit: usize,
-        _offset: usize,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<crate::projections::SignalSubscriptionRecord>, StoreError> {
+        // #422: the previous impl ignored both `limit` and `offset`,
+        // returning every subscription for the project. That broke the
+        // pagination contract the handler now enforces (fetch
+        // `limit + 1`, check overflow, truncate). Sort by
+        // subscription_id for stable ordering across pages, then
+        // skip/take.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let tid = project.tenant_id.as_str();
         let wid = project.workspace_id.as_str();
         let pid = project.project_id.as_str();
-        Ok(state
+        let mut all: Vec<_> = state
             .signal_subscriptions
             .values()
             .filter(|s| {
                 s.project_tenant == tid && s.project_workspace == wid && s.project_id == pid
             })
             .cloned()
-            .collect())
+            .collect();
+        all.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        Ok(all.into_iter().skip(offset).take(limit).collect())
     }
 
     async fn upsert_subscription(

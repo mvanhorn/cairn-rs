@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -488,20 +488,28 @@ pub(crate) async fn set_task_priority_handler(
 
 pub(crate) async fn list_expired_tasks_handler(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<crate::handlers::admin::PaginationQuery>,
 ) -> impl IntoResponse {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // #422: read model returns every expired lease in one shot.
+    // Paginate in-memory and emit an honest `has_more` — expired-lease
+    // storms can produce hundreds of rows at a time.
     match TaskLeaseExpiredReadModel::list_expired(state.runtime.store.as_ref(), now_ms).await {
-        Ok(tasks) => (
-            StatusCode::OK,
-            Json(ListResponse::<TaskRecord> {
-                items: tasks,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<TaskRecord> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (
+                StatusCode::OK,
+                Json(ListResponse::<TaskRecord> { items, has_more }),
+            )
+                .into_response()
+        }
         Err(err) => store_error_response(err),
     }
 }
