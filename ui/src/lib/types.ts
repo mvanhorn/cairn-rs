@@ -420,13 +420,30 @@ export type RunState =
   | "failed"
   | "canceled";
 
-/** Failure classification */
+/**
+ * Failure classification — MUST match `cairn_domain::lifecycle::FailureClass`
+ * (crates/cairn-domain/src/lifecycle.rs). The Rust enum uses
+ * `#[serde(rename_all = "snake_case")]`, so every variant below is the exact
+ * JSON string that hits the wire on `RunRecord.failure_class` /
+ * `TaskRecord.failure_class`.
+ *
+ * Adding a new variant? Update both sides:
+ *   1. `FailureClass` in `crates/cairn-domain/src/lifecycle.rs`
+ *   2. This union
+ *   3. `FAILURE_CLASS_VALUES` in `ui/src/lib/__tests__/failureClass.test.ts`
+ *      (the compile-time coverage check lives there)
+ *
+ * Source of truth is Rust. If the wire format ever diverges, the TS side
+ * is wrong by construction.
+ */
 export type FailureClass =
-  | "provider_failure"
-  | "policy_denied"
-  | "timeout"
-  | "internal_error"
+  | "timed_out"
+  | "dependency_failed"
   | "approval_rejected"
+  | "policy_denied"
+  | "execution_error"
+  | "lease_expired"
+  | "canceled_by_operator"
   /**
    * F62: terminal FCALL deadlocked against the fabric — the orchestrator
    * produced artifacts but the fabric rejects both the terminal write and
@@ -625,7 +642,7 @@ export interface TaskRecord {
   parent_run_id: string | null;
   parent_task_id: string | null;
   state: TaskState;
-  failure_class: string | null;
+  failure_class: FailureClass | null;
   lease_owner: string | null;
   lease_expires_at: number | null;
   version: number;
