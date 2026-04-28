@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use cairn_domain::ProjectKey;
 
 use crate::error::FabricError;
@@ -28,11 +30,13 @@ pub fn check_fcall_success(raw: &ferriskey::Value, function_name: &str) -> Resul
     if status == 1 {
         return Ok(());
     }
-    let code = match arr.get(1) {
-        Some(Ok(ferriskey::Value::BulkString(b))) => String::from_utf8_lossy(b).into_owned(),
-        Some(Ok(ferriskey::Value::SimpleString(s))) => s.clone(),
-        _ => "unknown".to_owned(),
-    };
+    // Only allocate on the rejected path. `fcall_error_code_ref` returns a
+    // borrowed `&str` for `SimpleString` (no alloc) and a `Cow::Owned` only
+    // for `BulkString` (one unavoidable UTF-8-validation copy). The
+    // `format!` below materialises the final message either way, but we
+    // no longer pay a separate owned-String allocation when a caller
+    // pre-dispatches on the typed code (see `fcall_error_code_ref`).
+    let code = fcall_error_code_ref(raw).unwrap_or(Cow::Borrowed("unknown"));
     Err(FabricError::Internal(format!(
         "{function_name} rejected: {code}"
     )))
@@ -42,17 +46,33 @@ pub fn check_fcall_success(raw: &ferriskey::Value, function_name: &str) -> Resul
 /// (`{Int(status_code), BulkString(error_code), ...}`). Returns `None` when
 /// the envelope is OK or malformed.
 ///
+/// **Prefer [`fcall_error_code_ref`]** — it returns a borrowed `Cow<'_, str>`
+/// (zero alloc for `SimpleString`) and lets typed-code dispatch avoid the
+/// owned-String round-trip entirely. This owned-String variant is retained
+/// only for backwards-compat with callers that cannot thread a lifetime
+/// through; new code should use the `_ref` form.
+///
 /// Callers use this to dispatch on FF's typed error codes (e.g.
 /// `use_claim_resumed_execution`) without going through the string-formatted
 /// [`FabricError::Internal`] message. Keep the caller pattern:
 ///
 /// ```ignore
-/// if let Some(code) = fcall_error_code(&raw) {
+/// if let Some(code) = fcall_error_code_ref(&raw) {
 ///     if code == "use_claim_resumed_execution" { /* dispatch */ }
 /// }
 /// check_fcall_success(&raw, FF_…)?;
 /// ```
 pub fn fcall_error_code(raw: &ferriskey::Value) -> Option<String> {
+    fcall_error_code_ref(raw).map(Cow::into_owned)
+}
+
+/// Zero-alloc variant of [`fcall_error_code`]: returns `Cow::Borrowed` for
+/// the `SimpleString` envelope shape (FF's most common on typed-error paths
+/// — `lease_expired`, `stale_lease`, `waitpoint_closed`, etc.) and
+/// `Cow::Owned` only for `BulkString` (which requires a UTF-8 validation
+/// copy). The success path stays alloc-free because the function
+/// short-circuits on `status == 1` before touching the error slot.
+pub fn fcall_error_code_ref(raw: &ferriskey::Value) -> Option<Cow<'_, str>> {
     let arr = match raw {
         ferriskey::Value::Array(arr) => arr,
         _ => return None,
@@ -65,8 +85,11 @@ pub fn fcall_error_code(raw: &ferriskey::Value) -> Option<String> {
         return None;
     }
     match arr.get(1) {
-        Some(Ok(ferriskey::Value::BulkString(b))) => Some(String::from_utf8_lossy(b).into_owned()),
-        Some(Ok(ferriskey::Value::SimpleString(s))) => Some(s.clone()),
+        // `String::from_utf8_lossy` returns `Cow<'_, str>` — Borrowed when
+        // the bytes are valid UTF-8 (FF always writes ASCII codes here),
+        // Owned only on the cold error-recovery path.
+        Some(Ok(ferriskey::Value::BulkString(b))) => Some(String::from_utf8_lossy(b)),
+        Some(Ok(ferriskey::Value::SimpleString(s))) => Some(Cow::Borrowed(s.as_str())),
         _ => None,
     }
 }
@@ -482,5 +505,74 @@ mod tests {
     fn is_already_satisfied_false_for_non_array() {
         let raw = ferriskey::Value::SimpleString("OK".to_owned());
         assert!(!is_already_satisfied(&raw));
+    }
+
+    // ── #500 regression: fcall_error_code_ref returns borrowed on SimpleString ──
+    //
+    // The zero-alloc variant must return `Cow::Borrowed` when the error
+    // slot is a `SimpleString` (FF's normal encoding for short typed
+    // codes: `lease_expired`, `stale_lease`, `waitpoint_closed`, …) so
+    // that callers which only dispatch on typed codes pay zero
+    // allocation on the rejected path.
+
+    #[test]
+    fn fcall_error_code_ref_returns_borrowed_for_simple_string() {
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::Int(0)),
+            Ok(ferriskey::Value::SimpleString("lease_expired".to_owned())),
+        ]);
+        let code = fcall_error_code_ref(&raw).expect("typed code present");
+        assert_eq!(code, "lease_expired");
+        assert!(
+            matches!(code, Cow::Borrowed(_)),
+            "SimpleString must stay borrowed (no alloc) on the rejected path"
+        );
+    }
+
+    #[test]
+    fn fcall_error_code_ref_returns_cow_for_bulk_string() {
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::Int(0)),
+            Ok(ferriskey::Value::BulkString(b"stale_lease".to_vec().into())),
+        ]);
+        let code = fcall_error_code_ref(&raw).expect("typed code present");
+        assert_eq!(code, "stale_lease");
+        // For valid-UTF-8 BulkString, `from_utf8_lossy` returns Borrowed.
+        // This is FF's invariant (all typed codes are ASCII), so assert
+        // it — a refactor that loses this zero-copy would silently
+        // regress.
+        assert!(matches!(code, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn fcall_error_code_ref_returns_none_on_success() {
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::Int(1)),
+            Ok(ferriskey::Value::SimpleString("OK".to_owned())),
+        ]);
+        assert!(fcall_error_code_ref(&raw).is_none());
+    }
+
+    #[test]
+    fn fcall_error_code_ref_returns_none_on_non_array() {
+        let raw = ferriskey::Value::SimpleString("OK".to_owned());
+        assert!(fcall_error_code_ref(&raw).is_none());
+    }
+
+    #[test]
+    fn fcall_error_code_owned_shim_still_works() {
+        // Back-compat: the owned-String wrapper delegates to
+        // fcall_error_code_ref and materialises. Callers that still
+        // expect String keep working.
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::Int(0)),
+            Ok(ferriskey::Value::SimpleString(
+                "use_claim_resumed_execution".to_owned(),
+            )),
+        ]);
+        assert_eq!(
+            fcall_error_code(&raw).as_deref(),
+            Some("use_claim_resumed_execution"),
+        );
     }
 }

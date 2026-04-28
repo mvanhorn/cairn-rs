@@ -150,6 +150,40 @@ pub struct DecideOutput {
     pub output_tokens: Option<u32>,
 }
 
+impl DecideOutput {
+    /// Number of proposals that count as "forward progress" for the
+    /// NoToolUseConsecutive circuit breaker. A proposal counts if it
+    /// either carries a concrete tool name OR targets a terminal /
+    /// operator-gated action (complete_run / escalate_to_operator /
+    /// spawn_subagent). The carve-out prevents a legitimate
+    /// `complete_run` from tripping the streak breaker BEFORE the
+    /// execute phase dispatches it (Cursor Bugbot HIGH on PR #348).
+    ///
+    /// `create_memory` is intentionally NOT in the terminal set —
+    /// memorising a thought is not forward progress the user asked for.
+    ///
+    /// **Perf note (#510)**: today `proposals` is small (≤5 per DECIDE
+    /// in production traces) so the O(n) walk costs tens of ns. This
+    /// helper exists so that when DECIDE later emits batched tool
+    /// bursts (50+ proposals), the count can be memoised on
+    /// `DecideOutput` construction or routed through a provider-side
+    /// segmented count without touching call sites.
+    pub fn tool_or_terminal_count(&self) -> usize {
+        self.proposals
+            .iter()
+            .filter(|p| {
+                p.tool_name.is_some()
+                    || matches!(
+                        p.action_type,
+                        cairn_domain::ActionType::CompleteRun
+                            | cairn_domain::ActionType::EscalateToOperator
+                            | cairn_domain::ActionType::SpawnSubagent
+                    )
+            })
+            .count()
+    }
+}
+
 // ── ExecuteOutcome ────────────────────────────────────────────────────────────
 
 /// What actually happened after running the proposals from `DecideOutput`.
@@ -416,5 +450,93 @@ impl Default for CompactionConfig {
             summary_token_budget: 2000,
             cooldown_iterations: 5,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_domain::{ActionProposal, ActionType};
+
+    fn empty_decide(proposals: Vec<ActionProposal>) -> DecideOutput {
+        DecideOutput {
+            raw_response: String::new(),
+            proposals,
+            calibrated_confidence: 1.0,
+            requires_approval: false,
+            model_id: "test".into(),
+            latency_ms: 0,
+            input_tokens: None,
+            output_tokens: None,
+        }
+    }
+
+    fn proposal(action_type: ActionType, tool_name: Option<&str>) -> ActionProposal {
+        ActionProposal {
+            action_type,
+            description: String::new(),
+            confidence: 1.0,
+            tool_name: tool_name.map(str::to_owned),
+            tool_args: None,
+            requires_approval: false,
+        }
+    }
+
+    #[test]
+    fn tool_or_terminal_count_empty() {
+        let d = empty_decide(vec![]);
+        assert_eq!(d.tool_or_terminal_count(), 0);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_counts_tool_name() {
+        // `InvokeTool` with a concrete tool_name counts.
+        let d = empty_decide(vec![
+            proposal(ActionType::InvokeTool, Some("shell")),
+            proposal(ActionType::InvokeTool, Some("read")),
+        ]);
+        assert_eq!(d.tool_or_terminal_count(), 2);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_counts_complete_run_without_tool_name() {
+        // Terminal action with no tool_name still counts — the
+        // carve-out Cursor Bugbot added to keep `complete_run` from
+        // tripping the NoToolUseConsecutive breaker.
+        let d = empty_decide(vec![proposal(ActionType::CompleteRun, None)]);
+        assert_eq!(d.tool_or_terminal_count(), 1);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_counts_escalate_and_subagent() {
+        let d = empty_decide(vec![
+            proposal(ActionType::EscalateToOperator, None),
+            proposal(ActionType::SpawnSubagent, None),
+        ]);
+        assert_eq!(d.tool_or_terminal_count(), 2);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_excludes_pure_narration_and_memory() {
+        // create_memory / send_notification without a tool_name is
+        // deliberately NOT counted — memorising a thought or pinging
+        // Slack is not forward progress the user asked for.
+        let d = empty_decide(vec![
+            proposal(ActionType::CreateMemory, None),
+            proposal(ActionType::SendNotification, None),
+        ]);
+        assert_eq!(d.tool_or_terminal_count(), 0);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_mixed_proposal_set() {
+        let d = empty_decide(vec![
+            proposal(ActionType::SendNotification, None),
+            proposal(ActionType::InvokeTool, Some("grep")),
+            proposal(ActionType::CreateMemory, None),
+            proposal(ActionType::CompleteRun, None),
+        ]);
+        // grep + complete_run count; notification + create_memory do not.
+        assert_eq!(d.tool_or_terminal_count(), 2);
     }
 }

@@ -1061,22 +1061,13 @@ where
             // execute dispatches the terminal action — converting the
             // user's intentional completion into a BreakerTripped
             // failure. Cursor Bugbot flagged this HIGH-severity on
-            // PR #348. `create_memory` (pure narration-for-memory) is
-            // intentionally NOT in the terminal list — memorising a
-            // thought is not forward progress the user asked for.
-            let tool_or_terminal_count = decide_output
-                .proposals
-                .iter()
-                .filter(|p| {
-                    p.tool_name.is_some()
-                        || matches!(
-                            p.action_type,
-                            cairn_domain::ActionType::CompleteRun
-                                | cairn_domain::ActionType::EscalateToOperator
-                                | cairn_domain::ActionType::SpawnSubagent
-                        )
-                })
-                .count();
+            // PR #348.
+            //
+            // Classification logic lives on `DecideOutput` so future
+            // DECIDE refactors (batched tool bursts, provider-side
+            // segmented counts, `.terminal_action_count()` etc.) can
+            // memoise it without touching this call site — see #510.
+            let tool_or_terminal_count = decide_output.tool_or_terminal_count();
             let post_decide_check = breaker_state.after_decide(
                 ctx.iteration,
                 decide_output.input_tokens.unwrap_or(0),

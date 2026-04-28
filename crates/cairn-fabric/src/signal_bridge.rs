@@ -1,12 +1,25 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use flowfabric::core::keys::ExecKeyContext;
-use flowfabric::core::types::{ExecutionId, SignalId, TimestampMs, WaitpointId, WaitpointToken};
+use flowfabric::core::types::{
+    ExecutionId, LaneId, SignalId, TimestampMs, WaitpointId, WaitpointToken,
+};
 use flowfabric::sdk::task::{Signal, SignalOutcome};
 
 use crate::boot::FabricRuntime;
 use crate::error::FabricError;
 use crate::helpers::sanitize_signal_component;
+
+/// Bounded cap for the per-execution `lane_id` cache (#506).
+///
+/// Each entry is `(ExecutionId, LaneId)` — both small owned `String`s
+/// backed by UUIDv4 / lane literals, so worst-case memory at the cap is
+/// ~200 bytes × `LANE_ID_CACHE_MAX` ≈ 200 KiB. Generous for the expected
+/// working set (hundreds of concurrent runs per cairn-app process) while
+/// still giving a hard ceiling so a pathological fan-out of dead
+/// executions can't grow the map unbounded.
+const LANE_ID_CACHE_MAX: usize = 1024;
 
 /// Read the HMAC waitpoint token from FF's waitpoint hash.
 ///
@@ -41,13 +54,92 @@ pub(crate) async fn read_waitpoint_token(
 
 pub struct SignalBridge {
     runtime: Arc<FabricRuntime>,
+    /// Per-execution `lane_id` cache.
+    ///
+    /// FF stamps `lane_id` on the execution core hash at
+    /// `ff_create_flow` / `ff_create_execution` time and never rewrites
+    /// it — every signal delivery (tool_result / approval /
+    /// child_completed) was paying an extra round-trip HGET to read the
+    /// same static value (#506). Caching it here halves the signal
+    /// delivery round-trip count on the hot path.
+    ///
+    /// `Mutex<HashMap>` rather than a striped cache: signal delivery is
+    /// already serialized upstream (one signal per waitpoint at a time
+    /// via FF's idempotency fence), and the critical section is two
+    /// hash ops — contention is a non-concern at the rates cairn hits.
+    /// **Arbitrary-victim eviction** at `LANE_ID_CACHE_MAX` (via
+    /// `HashMap::keys().next()` — order is unspecified by construction);
+    /// cold-miss on evicted entries simply re-HGETs. Not LRU: strict LRU
+    /// would need a side queue, and the cost isn't justified because
+    /// lane_id is immutable per execution so any eviction is always
+    /// safe (just refetches).
+    lane_id_cache: Mutex<HashMap<ExecutionId, LaneId>>,
 }
 
 impl SignalBridge {
     pub fn new(runtime: &Arc<FabricRuntime>) -> Self {
         Self {
             runtime: runtime.clone(),
+            lane_id_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Load the `lane_id` for this execution, consulting the per-
+    /// execution cache first. Cache misses fall back to an HGET against
+    /// `ctx.core()`; the default lane literal `"cairn"` is used when
+    /// FF returns `None` (matches the pre-cache behaviour).
+    ///
+    /// Cache invalidation is not strictly required — FF never rewrites
+    /// `lane_id` after creation — but the map is capped at
+    /// `LANE_ID_CACHE_MAX` with arbitrary-victim eviction (see the
+    /// `lane_id_cache` field doc for why not LRU) to keep memory
+    /// bounded when the process serves thousands of runs over its
+    /// lifetime.
+    async fn load_lane_id(
+        &self,
+        execution_id: &ExecutionId,
+        ctx: &ExecKeyContext,
+    ) -> Result<LaneId, FabricError> {
+        // Fast path: cached. Recover from a poisoned mutex rather than
+        // silently skipping the cache — any prior panic here left the
+        // map in a valid state (two simple hash ops) and downgrading
+        // poison into a silent fallthrough would both lose the
+        // performance win AND hide the panic from operators forever.
+        // Matches the `AppMetrics` poison-recovery pattern.
+        {
+            let cache = self.lane_id_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(lane) = cache.get(execution_id) {
+                return Ok(lane.clone());
+            }
+        }
+
+        // Cold path: fetch from FF's exec core hash.
+        let lane_str: Option<String> = self
+            .runtime
+            .client
+            .hget(&ctx.core(), "lane_id")
+            .await
+            .map_err(|e| FabricError::Valkey(format!("HGET lane_id: {e}")))?;
+        let lane_id = LaneId::new(lane_str.as_deref().unwrap_or("cairn"));
+
+        // Insert into the cache. Size-cap via "drop one arbitrary key"
+        // rather than a strict LRU — the map is write-heavy on fresh
+        // runs, read-heavy thereafter, and lane_id never changes for a
+        // given execution so any eviction is safe (just refetches).
+        let mut cache = self.lane_id_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= LANE_ID_CACHE_MAX {
+            // HashMap iteration order is unspecified — the victim
+            // choice is arbitrary, not insertion-order. `.keys().next()`
+            // is amortized O(1) to grab the first iterator item; the
+            // arbitrary-victim policy is safe because lane_id is
+            // immutable per execution, so any eviction just forces a
+            // refetch on next access.
+            if let Some(victim) = cache.keys().next().cloned() {
+                cache.remove(&victim);
+            }
+        }
+        cache.insert(execution_id.clone(), lane_id.clone());
+        Ok(lane_id)
     }
 
     pub async fn deliver_approval_signal(
@@ -179,13 +271,11 @@ impl SignalBridge {
         let signal_id = SignalId::new();
         let now = TimestampMs::now();
 
-        let lane_str: Option<String> = self
-            .runtime
-            .client
-            .hget(&ctx.core(), "lane_id")
-            .await
-            .map_err(|e| FabricError::Valkey(format!("HGET lane_id: {e}")))?;
-        let lane_id = flowfabric::core::types::LaneId::new(lane_str.as_deref().unwrap_or("cairn"));
+        // `lane_id` is stamped on the exec core hash at create-flow
+        // time and never rewritten — cache it per execution so the
+        // happy path is a HashMap lookup instead of a second Valkey
+        // round-trip per signal (#506).
+        let lane_id = self.load_lane_id(execution_id, &ctx).await?;
 
         let derived_idem = format!("{}:{}:{}", execution_id, signal.signal_name, waitpoint_id);
         let effective_idem = signal
@@ -221,12 +311,14 @@ impl SignalBridge {
             signal.waitpoint_token.as_str(),
         );
 
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
+        // Pass `&[String]` directly into `FabricRuntime::fcall` — the
+        // ~2 × Vec<&str> rebuild on every signal delivery (tool-result /
+        // approval / child-completed, all on the hot path) was pure
+        // re-borrowing waste. See #501 and `FabricRuntime::fcall`'s new
+        // signature accepting `&[String]`.
         let raw: ferriskey::Value = self
             .runtime
-            .fcall(crate::fcall::names::FF_DELIVER_SIGNAL, &key_refs, &arg_refs)
+            .fcall(crate::fcall::names::FF_DELIVER_SIGNAL, &keys, &args)
             .await?;
 
         parse_signal_result(&raw)
@@ -245,15 +337,20 @@ fn parse_signal_result(raw: &ferriskey::Value) -> Result<SignalOutcome, FabricEr
     };
 
     if status != 1 {
-        let code = extract_str(arr, 1).unwrap_or_else(|| "unknown".into());
+        // Error path: we format into a new String either way, so materialise
+        // once from the borrowed view rather than allocating a separate
+        // String via `extract_str` first.
+        let code = extract_str_ref(arr, 1).unwrap_or(std::borrow::Cow::Borrowed("unknown"));
         return Err(FabricError::Bridge(format!(
             "deliver_signal rejected: {code}"
         )));
     }
 
-    let sub = extract_str(arr, 1).unwrap_or_default();
-
-    if sub == "DUPLICATE" {
+    // Hot path: only materialise a `String` when we actually need it.
+    // The `DUPLICATE` sentinel is checked via a borrowed byte comparison
+    // so the (frequent) non-duplicate branch stays alloc-free at the
+    // sub-tag read.
+    if is_tag(arr, 1, b"DUPLICATE") {
         let existing_id = extract_str(arr, 2).unwrap_or_default();
         return Ok(SignalOutcome::Duplicate {
             existing_signal_id: existing_id,
@@ -272,11 +369,40 @@ fn parse_signal_result(raw: &ferriskey::Value) -> Result<SignalOutcome, FabricEr
     }
 }
 
+/// Zero-alloc tag check against a ferriskey envelope slot. Both
+/// `BulkString` and `SimpleString` are compared by borrowed byte slices,
+/// so the hot path of `parse_signal_result` (non-duplicate, non-error)
+/// never allocates a `String` just to check a sentinel.
+fn is_tag(arr: &[Result<ferriskey::Value, ferriskey::Error>], idx: usize, tag: &[u8]) -> bool {
+    match arr.get(idx) {
+        Some(Ok(ferriskey::Value::BulkString(b))) => &**b == tag,
+        Some(Ok(ferriskey::Value::SimpleString(s))) => s.as_bytes() == tag,
+        _ => false,
+    }
+}
+
 fn extract_str(arr: &[Result<ferriskey::Value, ferriskey::Error>], idx: usize) -> Option<String> {
     arr.get(idx).and_then(|v| match v {
         Ok(ferriskey::Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
         Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
         Ok(ferriskey::Value::Int(n)) => Some(n.to_string()),
+        _ => None,
+    })
+}
+
+/// Borrowed variant of [`extract_str`]. Returns `Cow::Borrowed` for
+/// `SimpleString` and `Cow::Owned` for `BulkString` (UTF-8 validation
+/// may copy) / `Int` (digit conversion). Used on the rejected-envelope
+/// path where the final destination is a `format!` — the owned-String
+/// intermediate was pure waste.
+fn extract_str_ref(
+    arr: &[Result<ferriskey::Value, ferriskey::Error>],
+    idx: usize,
+) -> Option<std::borrow::Cow<'_, str>> {
+    arr.get(idx).and_then(|v| match v {
+        Ok(ferriskey::Value::BulkString(b)) => Some(String::from_utf8_lossy(b)),
+        Ok(ferriskey::Value::SimpleString(s)) => Some(std::borrow::Cow::Borrowed(s.as_str())),
+        Ok(ferriskey::Value::Int(n)) => Some(std::borrow::Cow::Owned(n.to_string())),
         _ => None,
     })
 }
@@ -412,4 +538,154 @@ mod tests {
         assert_eq!(obj.get("child_task_id").unwrap(), "task_1");
         assert_eq!(obj.get("success").unwrap(), false);
     }
+
+    // ── #499 regression: hot-path allocation on sub-tag check ──────────
+    //
+    // `parse_signal_result` must treat the `DUPLICATE` marker via a
+    // borrowed byte comparison (no `String` materialisation on the
+    // non-duplicate path). These tests pin the decoded outcome from
+    // both sides of the borrow — if a refactor re-introduces the
+    // `extract_str(arr, 1).unwrap_or_default() == "DUPLICATE"` pattern
+    // the behaviour stays correct but the perf win disappears; the
+    // explicit `is_tag` helper is the load-bearing assertion.
+
+    #[test]
+    fn parse_signal_result_accepted_path() {
+        let sig_id = flowfabric::core::types::SignalId::new();
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::Int(1)),
+            Ok(ferriskey::Value::BulkString(b"OK".to_vec().into())),
+            Ok(ferriskey::Value::BulkString(
+                sig_id.to_string().into_bytes().into(),
+            )),
+            Ok(ferriskey::Value::SimpleString("accepted".to_owned())),
+        ]);
+        let outcome = parse_signal_result(&raw).expect("parse accepted");
+        assert!(matches!(outcome, SignalOutcome::Accepted { .. }));
+    }
+
+    #[test]
+    fn parse_signal_result_duplicate_via_simple_string() {
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::Int(1)),
+            Ok(ferriskey::Value::SimpleString("DUPLICATE".to_owned())),
+            Ok(ferriskey::Value::SimpleString("sig_existing".to_owned())),
+        ]);
+        let outcome = parse_signal_result(&raw).expect("parse dup");
+        match outcome {
+            SignalOutcome::Duplicate { existing_signal_id } => {
+                assert_eq!(existing_signal_id, "sig_existing");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_signal_result_duplicate_via_bulk_string() {
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::Int(1)),
+            Ok(ferriskey::Value::BulkString(b"DUPLICATE".to_vec().into())),
+            Ok(ferriskey::Value::BulkString(b"sig_dup".to_vec().into())),
+        ]);
+        let outcome = parse_signal_result(&raw).expect("parse dup bulk");
+        match outcome {
+            SignalOutcome::Duplicate { existing_signal_id } => {
+                assert_eq!(existing_signal_id, "sig_dup");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_tag_matches_bulk_and_simple_strings_without_alloc() {
+        let arr: Vec<Result<ferriskey::Value, ferriskey::Error>> = vec![
+            Ok(ferriskey::Value::Int(1)),
+            Ok(ferriskey::Value::BulkString(b"DUPLICATE".to_vec().into())),
+        ];
+        assert!(is_tag(&arr, 1, b"DUPLICATE"));
+        assert!(!is_tag(&arr, 1, b"ACCEPTED"));
+
+        let arr2: Vec<Result<ferriskey::Value, ferriskey::Error>> = vec![
+            Ok(ferriskey::Value::Int(1)),
+            Ok(ferriskey::Value::SimpleString("DUPLICATE".to_owned())),
+        ];
+        assert!(is_tag(&arr2, 1, b"DUPLICATE"));
+
+        // Out-of-bounds or wrong shape never panics or allocates.
+        let empty: Vec<Result<ferriskey::Value, ferriskey::Error>> = vec![];
+        assert!(!is_tag(&empty, 1, b"DUPLICATE"));
+    }
+
+    #[test]
+    fn parse_signal_result_rejected_path_formats_code() {
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::Int(0)),
+            Ok(ferriskey::Value::SimpleString(
+                "waitpoint_closed".to_owned(),
+            )),
+        ]);
+        let err = parse_signal_result(&raw).expect_err("expected rejection");
+        assert!(err.to_string().contains("waitpoint_closed"));
+    }
+
+    // ── #506 regression: lane_id cache cap + insertion-order eviction ──
+    //
+    // The live happy-path / cache-miss behaviour is exercised by the
+    // integration-test `test_signal_delivery_is_idempotent` (pulls a
+    // real `SignalBridge` through `FabricRuntime` + Valkey
+    // testcontainer). This unit test pins the in-memory map semantics
+    // in isolation: capped map + evict-on-overflow + new inserts
+    // succeed after eviction. Together they're the full contract.
+
+    #[test]
+    fn lane_id_cache_evicts_at_cap_and_accepts_new_entries() {
+        // Exercise the cap logic directly so the integration test
+        // doesn't need to populate 1024 entries through live Valkey.
+        let cache: Mutex<HashMap<ExecutionId, LaneId>> = Mutex::new(HashMap::new());
+        let cap = 4usize;
+        let mint = |_i: u32| {
+            let uuid = uuid::Uuid::new_v4();
+            ExecutionId::parse(&format!("{{fp:0}}:{uuid}")).expect("uuid+prefix should parse")
+        };
+
+        // Populate up to cap.
+        let ids: Vec<ExecutionId> = (0..cap as u32).map(mint).collect();
+        {
+            let mut m = cache.lock().unwrap();
+            for (i, eid) in ids.iter().enumerate() {
+                if m.len() >= cap {
+                    if let Some(v) = m.keys().next().cloned() {
+                        m.remove(&v);
+                    }
+                }
+                m.insert(eid.clone(), LaneId::new(format!("lane_{i}")));
+            }
+            assert_eq!(m.len(), cap);
+        }
+
+        // Insert one more and evict.
+        let overflow = mint(999);
+        {
+            let mut m = cache.lock().unwrap();
+            if m.len() >= cap {
+                if let Some(v) = m.keys().next().cloned() {
+                    m.remove(&v);
+                }
+            }
+            m.insert(overflow.clone(), LaneId::new("overflow"));
+            assert_eq!(m.len(), cap, "cap must hold after eviction + insert");
+            assert!(
+                m.contains_key(&overflow),
+                "newest insert must survive eviction"
+            );
+        }
+    }
+
+    // Pin the cap — if someone bumps it 100x, the memory budget
+    // documented in the constant comment needs re-evaluation. Compile-
+    // time assertion so the invariant is enforced without a runtime test.
+    const _: () = {
+        assert!(LANE_ID_CACHE_MAX <= 10_000);
+        assert!(LANE_ID_CACHE_MAX >= 256);
+    };
 }

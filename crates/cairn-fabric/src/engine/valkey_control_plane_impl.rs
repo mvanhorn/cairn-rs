@@ -32,8 +32,8 @@ use flowfabric::sdk::task::parse_report_usage_result;
 use crate::error::FabricError;
 use crate::fcall;
 use crate::helpers::{
-    check_fcall_success, fcall_error_code, is_duplicate_result, parse_eligibility_result,
-    parse_fail_outcome, parse_stage_result_revision, FailOutcome,
+    check_fcall_success, fcall_error_code, fcall_error_code_ref, is_duplicate_result,
+    parse_eligibility_result, parse_fail_outcome, parse_stage_result_revision, FailOutcome,
 };
 
 use super::control_plane::ControlPlaneBackend;
@@ -100,12 +100,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             hard_limits,
             soft_limits,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_BUDGET, &key_refs, &argv_refs)
+            .fcall(fcall::names::FF_CREATE_BUDGET, &keys, &argv)
             .await?;
         check_fcall_success(&raw, fcall::names::FF_CREATE_BUDGET)?;
 
@@ -137,16 +135,10 @@ impl ControlPlaneBackend for ValkeyEngine {
 
         let (keys, argv) =
             fcall::budget::build_report_usage(&ctx, dimension_deltas, now, &dedup_key);
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_REPORT_USAGE_AND_CHECK,
-                &key_refs,
-                &argv_refs,
-            )
+            .fcall(fcall::names::FF_REPORT_USAGE_AND_CHECK, &keys, &argv)
             .await?;
 
         let ff_outcome: ReportUsageResult =
@@ -163,12 +155,9 @@ impl ControlPlaneBackend for ValkeyEngine {
         let keys: Vec<String> = vec![ctx.definition(), ctx.usage(), resets_zset];
         let argv: Vec<String> = vec![budget_id.to_string(), now.to_string()];
 
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_RESET_BUDGET, &key_refs, &argv_refs)
+            .fcall(fcall::names::FF_RESET_BUDGET, &keys, &argv)
             .await?;
         check_fcall_success(&raw, fcall::names::FF_RESET_BUDGET)?;
 
@@ -284,12 +273,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             now,
             dimension,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_QUOTA_POLICY, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CREATE_QUOTA_POLICY, &keys, &args)
             .await?;
         check_fcall_success(&raw, fcall::names::FF_CREATE_QUOTA_POLICY)?;
 
@@ -332,16 +319,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             concurrency_cap,
             dimension,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_CHECK_ADMISSION_AND_RECORD,
-                &key_refs,
-                &arg_refs,
-            )
+            .fcall(fcall::names::FF_CHECK_ADMISSION_AND_RECORD, &keys, &args)
             .await?;
 
         parse_admission_result(&raw)
@@ -372,16 +353,10 @@ impl ControlPlaneBackend for ValkeyEngine {
                 new_secret_hex,
                 grace_ms,
             );
-            let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
             match self
                 .runtime()
-                .fcall(
-                    fcall::names::FF_ROTATE_WAITPOINT_HMAC_SECRET,
-                    &key_refs,
-                    &arg_refs,
-                )
+                .fcall(fcall::names::FF_ROTATE_WAITPOINT_HMAC_SECRET, &keys, &args)
                 .await
             {
                 Ok(raw) => {
@@ -477,12 +452,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &tags_json,
             partition.index,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CREATE_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_create_execution: {e}")))?;
 
@@ -518,12 +491,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.lease.attempt_id,
             &input.lease.source,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_COMPLETE_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_COMPLETE_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_complete_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_COMPLETE_EXECUTION)?;
@@ -567,12 +538,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &retry_policy_json,
             &input.lease.source,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_FAIL_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_FAIL_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_fail_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_FAIL_EXECUTION)?;
@@ -602,12 +571,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.lease.lease_id,
             &input.lease.lease_epoch,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CANCEL_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CANCEL_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_cancel_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_CANCEL_EXECUTION)?;
@@ -635,12 +602,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.resume_source,
             "0",
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_RESUME_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_RESUME_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_resume_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_RESUME_EXECUTION)?;
@@ -693,12 +658,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &max_signals,
             waitpoint_token.as_str(),
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_DELIVER_SIGNAL, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_DELIVER_SIGNAL, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_deliver_signal: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_DELIVER_SIGNAL)?;
@@ -720,12 +683,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.namespace,
             now,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_FLOW, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CREATE_FLOW, &keys, &args)
             .await?;
         check_fcall_success(&raw, fcall::names::FF_CREATE_FLOW)?;
         Ok(())
@@ -743,12 +704,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.cancel_mode,
             now,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CANCEL_FLOW, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CANCEL_FLOW, &keys, &args)
             .await?;
 
         // `flow_already_terminal` is acceptable — the flow may already
@@ -800,16 +759,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             String::new(),
             String::new(),
         ];
-        let grant_key_refs: Vec<&str> = grant_keys.iter().map(|s| s.as_str()).collect();
-        let grant_arg_refs: Vec<&str> = grant_args.iter().map(|s| s.as_str()).collect();
 
         let raw_grant: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_ISSUE_CLAIM_GRANT,
-                &grant_key_refs,
-                &grant_arg_refs,
-            )
+            .fcall(fcall::names::FF_ISSUE_CLAIM_GRANT, &grant_keys, &grant_args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_issue_claim_grant: {e}")))?;
         check_fcall_success(&raw_grant, fcall::names::FF_ISSUE_CLAIM_GRANT)?;
@@ -861,16 +814,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             String::new(),
             String::new(),
         ];
-        let claim_key_refs: Vec<&str> = claim_keys.iter().map(|s| s.as_str()).collect();
-        let claim_arg_refs: Vec<&str> = claim_args.iter().map(|s| s.as_str()).collect();
 
         let raw_claim: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_CLAIM_EXECUTION,
-                &claim_key_refs,
-                &claim_arg_refs,
-            )
+            .fcall(fcall::names::FF_CLAIM_EXECUTION, &claim_keys, &claim_args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_claim_execution: {e}")))?;
 
@@ -880,7 +827,10 @@ impl ControlPlaneBackend for ValkeyEngine {
         // resumes the SAME attempt instead of allocating a new one. The
         // grant is still live: FF's dispatch guard runs BEFORE grant
         // consumption, so we do NOT re-issue it.
-        if fcall_error_code(&raw_claim).as_deref() == Some(USE_CLAIM_RESUMED_EXECUTION) {
+        // Use the zero-alloc variant: the typed-code dispatch only needs a
+        // borrowed `&str` comparison against the static sentinel. The owned
+        // `String` round-trip via `fcall_error_code` was pure waste here.
+        if fcall_error_code_ref(&raw_claim).as_deref() == Some(USE_CLAIM_RESUMED_EXECUTION) {
             return self
                 .claim_resumed_execution(
                     &ctx,
@@ -944,12 +894,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &tags_json,
             partition.index,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CREATE_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_create_execution: {e}")))?;
 
@@ -985,15 +933,9 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.namespace,
             now,
         );
-        let create_key_refs: Vec<&str> = create_keys.iter().map(|s| s.as_str()).collect();
-        let create_arg_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
         let create_raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_CREATE_FLOW,
-                &create_key_refs,
-                &create_arg_refs,
-            )
+            .fcall(fcall::names::FF_CREATE_FLOW, &create_keys, &create_args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_create_flow: {e}")))?;
         check_fcall_success(&create_raw, fcall::names::FF_CREATE_FLOW)?;
@@ -1008,12 +950,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.execution_id,
             now_ms,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_ADD_EXECUTION_TO_FLOW, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_ADD_EXECUTION_TO_FLOW, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_add_execution_to_flow: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_ADD_EXECUTION_TO_FLOW)?;
@@ -1039,12 +979,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             input.expected_graph_revision,
             now_ms,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_STAGE_DEPENDENCY_EDGE, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_STAGE_DEPENDENCY_EDGE, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_stage_dependency_edge: {e}")))?;
 
@@ -1099,16 +1037,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.data_passing_ref,
             now_ms,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_APPLY_DEPENDENCY_TO_CHILD,
-                &key_refs,
-                &arg_refs,
-            )
+            .fcall(fcall::names::FF_APPLY_DEPENDENCY_TO_CHILD, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_apply_dependency_to_child: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_APPLY_DEPENDENCY_TO_CHILD)?;
@@ -1123,16 +1055,10 @@ impl ControlPlaneBackend for ValkeyEngine {
         let ctx = ExecKeyContext::new(&partition, execution_id);
 
         let (keys, args) = fcall::flow_edges::build_evaluate_flow_eligibility(&ctx);
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_EVALUATE_FLOW_ELIGIBILITY,
-                &key_refs,
-                &arg_refs,
-            )
+            .fcall(fcall::names::FF_EVALUATE_FLOW_ELIGIBILITY, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_evaluate_flow_eligibility: {e}")))?;
 
@@ -1174,12 +1100,9 @@ impl ControlPlaneBackend for ValkeyEngine {
             crate::constants::DEFAULT_LEASE_HISTORY_GRACE_MS.to_owned(),
         ];
 
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_RENEW_LEASE, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_RENEW_LEASE, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_renew_lease: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_RENEW_LEASE)?;
@@ -1244,16 +1167,10 @@ impl ValkeyEngine {
             lease_duration_ms.to_string(),
             String::new(),
         ];
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_CLAIM_RESUMED_EXECUTION,
-                &key_refs,
-                &arg_refs,
-            )
+            .fcall(fcall::names::FF_CLAIM_RESUMED_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_claim_resumed_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_CLAIM_RESUMED_EXECUTION)?;

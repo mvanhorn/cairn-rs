@@ -278,16 +278,24 @@ impl FabricRuntime {
         &self.backend
     }
 
+    /// Dispatch an FCALL against FF's registered Lua library.
+    ///
+    /// Takes `&[String]` rather than `&[&str]` so the ~20 internal call
+    /// sites no longer rebuild two transient `Vec<&str>` per dispatch —
+    /// each FCALL previously paid two allocations just to re-borrow the
+    /// owned `String`s the builders already produced (#501). Both
+    /// `ferriskey::Client::fcall` (`&[impl ToArgs]`) and
+    /// `crate::fcall::verify_builder_counts` (`&[String]`) accept the
+    /// owned slice directly, so the transformation is a pure de-allocation
+    /// without changing the wire format.
     pub async fn fcall(
         &self,
         function: &str,
-        keys: &[&str],
-        args: &[&str],
+        keys: &[String],
+        args: &[String],
     ) -> Result<ferriskey::Value, FabricError> {
         if cfg!(debug_assertions) {
-            let k: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
-            let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-            crate::fcall::verify_builder_counts(function, &k, &a)?;
+            crate::fcall::verify_builder_counts(function, keys, args)?;
         }
         let timeout = std::time::Duration::from_millis(self.config.fcall_timeout_ms);
         match tokio::time::timeout(timeout, self.client.fcall(function, keys, args)).await {

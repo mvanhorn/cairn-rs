@@ -11,6 +11,53 @@ use std::{
 pub(crate) const HTTP_DURATION_BUCKETS_MS: [u64; 10] =
     [5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000];
 
+/// Cardinality budget for tenant-labelled gauges (#502).
+///
+/// Prometheus starts choking (scrape latency, TSDB ingestion cost) in the
+/// 10k-100k series range per instance. Cairn at the commercial layer will
+/// run many small tenants (one per customer), so uncapped
+/// `cairn_active_{runs,tasks}_by_tenant{tenant=…}` can hit that ceiling.
+///
+/// Policy: emit at most `TENANT_METRIC_TOP_N` tenants (ranked by total
+/// activity, i.e. `active_runs + active_tasks + pending_approvals`);
+/// overflow aggregates into a single `tenant="__other__"` row whose value
+/// is the SUM across the evicted tenants. Operators get accurate top-N
+/// dashboards AND a visible signal that there's additional activity
+/// beyond the cap — "__other__" > 0 is the prompt to bump N or to
+/// redirect high-cardinality breakdowns to OpenTelemetry traces.
+///
+/// 100 is a deliberate compromise: the top decile of tenants dominate
+/// activity in every real cairn deployment we've seen, and 100 × 3
+/// gauges = 300 series — comfortably under the "several thousand"
+/// soft ceiling for a single Prometheus scrape.
+pub(crate) const TENANT_METRIC_TOP_N: usize = 100;
+
+/// Overflow-bucket label used when the tenant count exceeds
+/// `TENANT_METRIC_TOP_N` or the distinct `(provider_connection, model)`
+/// combination exceeds `PROVIDER_METRIC_TOP_N`. Pinned as a constant so
+/// alerting rules / dashboards can match on a stable string.
+pub(crate) const CARDINALITY_OVERFLOW_LABEL: &str = "__other__";
+
+/// Cardinality budget for provider-call series (#503).
+///
+/// `model` (and `provider_connection`) are operator-supplied — rotating
+/// model IDs (`gpt-4o-mini`, `gpt-4o-mini-2024-07-18`,
+/// `gpt-4o-mini-20241218`) accumulate one series each. `ProviderCallKey`
+/// crosses four labels, so the raw hashmap can reach
+/// `|connections| × |models| × |ops| × 3` — unbounded in practice.
+///
+/// Policy: at render time, keep the top-N `(provider_connection, model)`
+/// combinations ranked by total call count; overflow rows collapse into
+/// `{provider_connection="__other__", model="__other__"}`. `operation_kind`
+/// + `status` are bounded enums so they're never aggregated.
+///
+/// The counter map itself is still unbounded (record paths insert on
+/// every call) — an operator-visible overflow is better than a silent
+/// cap that drops updates. Render-time aggregation gives the backpressure
+/// where it matters: Prometheus scrapes.
+#[cfg(feature = "metrics-providers")]
+pub(crate) const PROVIDER_METRIC_TOP_N: usize = 100;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RequestCountKey {
     pub(crate) method: String,
@@ -1074,12 +1121,13 @@ impl AppMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut tenant_entries: Vec<(String, TenantQueueDepth)> =
-            tenant_queue_depth.into_iter().collect();
-        tenant_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let tenant_entries = cap_tenant_entries(tenant_queue_depth.into_iter().collect());
 
         lines.push(
-            "# HELP cairn_active_runs_by_tenant Active non-terminal runs per tenant.".to_owned(),
+            "# HELP cairn_active_runs_by_tenant Active non-terminal runs per tenant. \
+             Capped at the top TENANT_METRIC_TOP_N tenants by activity; overflow \
+             aggregates into tenant=\"__other__\" (#502)."
+                .to_owned(),
         );
         lines.push("# TYPE cairn_active_runs_by_tenant gauge".to_owned());
         for (tenant, depth) in &tenant_entries {
@@ -1091,7 +1139,10 @@ impl AppMetrics {
         }
 
         lines.push(
-            "# HELP cairn_active_tasks_by_tenant Active non-terminal tasks per tenant.".to_owned(),
+            "# HELP cairn_active_tasks_by_tenant Active non-terminal tasks per tenant. \
+             Capped at the top TENANT_METRIC_TOP_N tenants; overflow aggregates \
+             into tenant=\"__other__\"."
+                .to_owned(),
         );
         lines.push("# TYPE cairn_active_tasks_by_tenant gauge".to_owned());
         for (tenant, depth) in &tenant_entries {
@@ -1103,7 +1154,9 @@ impl AppMetrics {
         }
 
         lines.push(
-            "# HELP cairn_pending_approvals_by_tenant Pending approvals awaiting decision per tenant."
+            "# HELP cairn_pending_approvals_by_tenant Pending approvals awaiting decision per \
+             tenant. Capped at the top TENANT_METRIC_TOP_N tenants; overflow aggregates into \
+             tenant=\"__other__\"."
                 .to_owned(),
         );
         lines.push("# TYPE cairn_pending_approvals_by_tenant gauge".to_owned());
@@ -1118,15 +1171,31 @@ impl AppMetrics {
 
     #[cfg(feature = "metrics-providers")]
     fn render_providers_into(&self, lines: &mut Vec<String>) {
-        // Provider calls counter.
-        let calls = self
+        // ── #503 cardinality cap ─────────────────────────────────────
+        // `provider_connection` + `model` are operator-supplied and
+        // unbounded; rotating model IDs or frequent connection swaps
+        // accumulate one series each. Compute the top-N
+        // (connection, model) pairs by total call count; any row
+        // outside the top-N collapses into
+        // `{provider_connection="__other__", model="__other__"}` at
+        // render time. The in-memory counter maps stay unbounded so
+        // `record_provider_call` never has to decide what to drop —
+        // backpressure lives where it matters (Prometheus scrapes).
+        let calls_raw = self
             .provider_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let keep_pairs: std::collections::HashSet<(String, String)> =
+            provider_top_n_pairs(&calls_raw);
+
+        // Provider calls counter — aggregated with the cap applied.
+        let calls = capped_calls(&calls_raw, &keep_pairs);
         lines.push(
             "# HELP cairn_provider_calls_total \
-                LLM provider calls, labelled by provider family + model + operation + status."
+                LLM provider calls, labelled by provider family + model + operation + status. \
+                (provider_connection, model) capped at PROVIDER_METRIC_TOP_N; overflow \
+                aggregates into provider_connection=\"__other__\",model=\"__other__\" (#503)."
                 .to_owned(),
         );
         lines.push("# TYPE cairn_provider_calls_total counter".to_owned());
@@ -1156,15 +1225,18 @@ impl AppMetrics {
             ));
         }
 
-        // Provider call duration histogram.
-        let durations = self
+        // Provider call duration histogram — same cap, but summing
+        // histogram samples rather than counts.
+        let durations_raw = self
             .provider_call_durations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let durations = capped_durations(&durations_raw, &keep_pairs);
         lines.push(
             "# HELP cairn_provider_call_duration_ms \
-                LLM provider call wall-clock latency, labelled by provider family + model + operation."
+                LLM provider call wall-clock latency, labelled by provider family + model + operation. \
+                (provider_connection, model) capped at PROVIDER_METRIC_TOP_N."
                 .to_owned(),
         );
         lines.push("# TYPE cairn_provider_call_duration_ms histogram".to_owned());
@@ -1203,15 +1275,17 @@ impl AppMetrics {
             ));
         }
 
-        // Token counters.
-        let tokens = self
+        // Token counters — same cap.
+        let tokens_raw = self
             .provider_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let tokens = capped_tokens(&tokens_raw, &keep_pairs);
         lines.push(
             "# HELP cairn_provider_tokens_total \
-                Tokens billed by LLM providers, by family + model + kind (input/output)."
+                Tokens billed by LLM providers, by family + model + kind (input/output). \
+                (provider_connection, model) capped at PROVIDER_METRIC_TOP_N."
                 .to_owned(),
         );
         lines.push("# TYPE cairn_provider_tokens_total counter".to_owned());
@@ -1237,4 +1311,400 @@ impl AppMetrics {
 
 fn prometheus_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Cap the number of emitted tenants at `TENANT_METRIC_TOP_N` (#502).
+///
+/// Ranks the input entries by total activity (runs + tasks + approvals)
+/// descending, takes the top N, aggregates the remainder into a single
+/// `__other__` row whose value is the sum across the evicted tenants.
+/// The result is sorted by tenant name so the Prometheus exposition is
+/// stable between scrapes.
+///
+/// When the input is already within the cap, returns the input sorted
+/// by tenant (same shape as the old behaviour, no `__other__` row).
+///
+/// Declared outside `AppMetrics::render_*_into` so it's testable in
+/// isolation — the render functions are too large to unit-test cleanly.
+#[cfg(feature = "metrics-core")]
+fn cap_tenant_entries(input: Vec<(String, TenantQueueDepth)>) -> Vec<(String, TenantQueueDepth)> {
+    if input.len() <= TENANT_METRIC_TOP_N {
+        let mut sorted = input;
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        return sorted;
+    }
+
+    // Rank by total activity (descending). Ties broken by name ascending
+    // so the cap decision is deterministic across scrapes.
+    let mut ranked = input;
+    ranked.sort_by(|a, b| {
+        let a_total = a.1.active_runs + a.1.active_tasks + a.1.pending_approvals;
+        let b_total = b.1.active_runs + b.1.active_tasks + b.1.pending_approvals;
+        b_total.cmp(&a_total).then_with(|| a.0.cmp(&b.0))
+    });
+
+    let (top, overflow) = ranked.split_at(TENANT_METRIC_TOP_N);
+    let mut other = TenantQueueDepth::default();
+    for (_, depth) in overflow {
+        other.active_runs = other.active_runs.saturating_add(depth.active_runs);
+        other.active_tasks = other.active_tasks.saturating_add(depth.active_tasks);
+        other.pending_approvals = other
+            .pending_approvals
+            .saturating_add(depth.pending_approvals);
+    }
+
+    let mut out: Vec<(String, TenantQueueDepth)> = top.to_vec();
+    out.push((CARDINALITY_OVERFLOW_LABEL.to_owned(), other));
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Compute the set of `(provider_connection, model)` pairs to retain at
+/// render time for the provider metrics (#503).
+///
+/// Ranks by total call count across all `(operation_kind, status)`
+/// combinations for each pair; ties broken by lexicographic order so
+/// the cap decision is deterministic.
+///
+/// Returns the FULL set of distinct pairs when the input is already
+/// within `PROVIDER_METRIC_TOP_N` (the "everything is kept" semantic
+/// — callers treat membership in the returned set as "keep this pair
+/// as-is"). When the input exceeds the cap, only the top-N pairs
+/// appear in the set; everything outside folds into the `__other__`
+/// overflow bucket at render time.
+#[cfg(feature = "metrics-providers")]
+fn provider_top_n_pairs(
+    calls: &std::collections::HashMap<ProviderCallKey, u64>,
+) -> std::collections::HashSet<(String, String)> {
+    // Fold per-(connection, model) totals.
+    let mut totals: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::new();
+    for (key, count) in calls {
+        let pair = (key.provider_connection.clone(), key.model.clone());
+        *totals.entry(pair).or_insert(0) += *count;
+    }
+
+    if totals.len() <= PROVIDER_METRIC_TOP_N {
+        // No cap needed — return the full set.
+        return totals.into_keys().collect();
+    }
+
+    // Rank and keep top-N.
+    let mut ranked: Vec<((String, String), u64)> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(PROVIDER_METRIC_TOP_N)
+        .map(|(pair, _)| pair)
+        .collect()
+}
+
+/// Apply the top-N `(provider_connection, model)` cap to the provider-
+/// calls counter map. Rows whose `(provider_connection, model)` pair is
+/// in `keep_pairs` pass through unchanged; rows outside fold into an
+/// `__other__` overflow bucket (preserving `operation_kind` + `status`
+/// — those are bounded enums and stay as distinct rows under the fold).
+///
+/// Callers typically obtain `keep_pairs` from
+/// [`provider_top_n_pairs`], which returns the FULL set when below the
+/// cap — so "nothing to fold" is expressed by a keep-set that covers
+/// every pair, not by an empty keep-set. An empty `keep_pairs` is
+/// therefore an instruction to fold EVERYTHING into `__other__` (used
+/// only by tests that want to exercise the fold in isolation).
+#[cfg(feature = "metrics-providers")]
+fn capped_calls(
+    calls: &std::collections::HashMap<ProviderCallKey, u64>,
+    keep_pairs: &std::collections::HashSet<(String, String)>,
+) -> std::collections::HashMap<ProviderCallKey, u64> {
+    // Single linear pass: each input row is either kept as-is (its
+    // pair is in `keep_pairs`) or folded into the overflow bucket.
+    // When `keep_pairs` covers every pair (the below-cap case), all
+    // rows are kept as-is and the `HashMap` has the same shape as
+    // the input.
+    let mut out: std::collections::HashMap<ProviderCallKey, u64> =
+        std::collections::HashMap::with_capacity(calls.len());
+    for (key, count) in calls {
+        let pair = (key.provider_connection.clone(), key.model.clone());
+        if keep_pairs.contains(&pair) {
+            out.insert(key.clone(), *count);
+        } else {
+            let overflow_key = ProviderCallKey {
+                provider_connection: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                model: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                operation_kind: key.operation_kind.clone(),
+                status: key.status.clone(),
+            };
+            *out.entry(overflow_key).or_insert(0) += *count;
+        }
+    }
+    out
+}
+
+/// Apply the same cap to the duration-histogram map. Histogram samples
+/// fold by element-wise bucket addition; `sum_ms` and `count` sum
+/// normally.
+#[cfg(feature = "metrics-providers")]
+fn capped_durations(
+    durations: &std::collections::HashMap<ProviderCallDurationKey, HistogramSample>,
+    keep_pairs: &std::collections::HashSet<(String, String)>,
+) -> std::collections::HashMap<ProviderCallDurationKey, HistogramSample> {
+    let mut out: std::collections::HashMap<ProviderCallDurationKey, HistogramSample> =
+        std::collections::HashMap::with_capacity(durations.len());
+    for (key, sample) in durations {
+        let pair = (key.provider_connection.clone(), key.model.clone());
+        let target_key = if keep_pairs.contains(&pair) {
+            key.clone()
+        } else {
+            ProviderCallDurationKey {
+                provider_connection: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                model: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                operation_kind: key.operation_kind.clone(),
+            }
+        };
+        let agg = out.entry(target_key).or_default();
+        for (idx, b) in sample.bucket_counts.iter().enumerate() {
+            agg.bucket_counts[idx] = agg.bucket_counts[idx].saturating_add(*b);
+        }
+        agg.sum_ms = agg.sum_ms.saturating_add(sample.sum_ms);
+        agg.count = agg.count.saturating_add(sample.count);
+    }
+    out
+}
+
+/// Apply the cap to the token-counter map.
+#[cfg(feature = "metrics-providers")]
+fn capped_tokens(
+    tokens: &std::collections::HashMap<ProviderTokenKey, u64>,
+    keep_pairs: &std::collections::HashSet<(String, String)>,
+) -> std::collections::HashMap<ProviderTokenKey, u64> {
+    let mut out: std::collections::HashMap<ProviderTokenKey, u64> =
+        std::collections::HashMap::with_capacity(tokens.len());
+    for (key, value) in tokens {
+        let pair = (key.provider_connection.clone(), key.model.clone());
+        let target_key = if keep_pairs.contains(&pair) {
+            key.clone()
+        } else {
+            ProviderTokenKey {
+                provider_connection: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                model: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                kind: key.kind.clone(),
+            }
+        };
+        *out.entry(target_key).or_insert(0) += *value;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── #502 regression: tenant cardinality cap ───────────────────────
+
+    #[cfg(feature = "metrics-core")]
+    fn tenant_depth(runs: u64, tasks: u64, approvals: u64) -> TenantQueueDepth {
+        TenantQueueDepth {
+            active_runs: runs,
+            active_tasks: tasks,
+            pending_approvals: approvals,
+        }
+    }
+
+    #[cfg(feature = "metrics-core")]
+    #[test]
+    fn cap_tenant_entries_passthrough_below_cap() {
+        let input = vec![
+            ("alpha".to_owned(), tenant_depth(1, 2, 3)),
+            ("bravo".to_owned(), tenant_depth(4, 5, 6)),
+        ];
+        let out = cap_tenant_entries(input.clone());
+        assert_eq!(out.len(), input.len());
+        // Must be sorted by tenant name so Prometheus output is stable.
+        assert_eq!(out[0].0, "alpha");
+        assert_eq!(out[1].0, "bravo");
+        // No __other__ row when below the cap.
+        assert!(!out.iter().any(|(t, _)| t == CARDINALITY_OVERFLOW_LABEL));
+    }
+
+    #[cfg(feature = "metrics-core")]
+    #[test]
+    fn cap_tenant_entries_aggregates_overflow_into_other_bucket() {
+        // Build TOP_N + 3 tenants. Top TOP_N should survive; 3 fold.
+        let mut input: Vec<(String, TenantQueueDepth)> = Vec::new();
+        // High-activity top tenants (score: 1000 each).
+        for i in 0..TENANT_METRIC_TOP_N {
+            input.push((format!("hi_{i:04}"), tenant_depth(500, 400, 100)));
+        }
+        // Low-activity overflow tenants.
+        input.push(("lo_a".to_owned(), tenant_depth(1, 2, 3)));
+        input.push(("lo_b".to_owned(), tenant_depth(4, 5, 6)));
+        input.push(("lo_c".to_owned(), tenant_depth(7, 8, 9)));
+
+        let out = cap_tenant_entries(input);
+        // Top-N + one __other__ bucket.
+        assert_eq!(out.len(), TENANT_METRIC_TOP_N + 1);
+        let other = out
+            .iter()
+            .find(|(t, _)| t == CARDINALITY_OVERFLOW_LABEL)
+            .expect("__other__ bucket must exist when overflow occurs");
+        // __other__ = sum of lo_a/b/c.
+        assert_eq!(other.1.active_runs, 1 + 4 + 7);
+        assert_eq!(other.1.active_tasks, 2 + 5 + 8);
+        assert_eq!(other.1.pending_approvals, 3 + 6 + 9);
+
+        // Low-activity tenants must not appear (they were evicted into
+        // __other__).
+        assert!(!out.iter().any(|(t, _)| t.starts_with("lo_")));
+    }
+
+    #[cfg(feature = "metrics-core")]
+    #[test]
+    fn cap_tenant_entries_ranks_by_total_activity() {
+        // Build TOP_N-1 zero-activity tenants + 2 high-activity tenants
+        // + 2 medium-activity tenants. When we push past the cap, the
+        // low-activity ones should fold.
+        let mut input: Vec<(String, TenantQueueDepth)> = Vec::new();
+        for i in 0..TENANT_METRIC_TOP_N - 1 {
+            input.push((format!("zero_{i:04}"), tenant_depth(0, 0, 0)));
+        }
+        input.push(("alice".to_owned(), tenant_depth(1000, 0, 0)));
+        input.push(("bob".to_owned(), tenant_depth(500, 500, 0)));
+        input.push(("charlie".to_owned(), tenant_depth(10, 10, 10)));
+        input.push(("dave".to_owned(), tenant_depth(5, 5, 5)));
+        let out = cap_tenant_entries(input);
+        assert_eq!(out.len(), TENANT_METRIC_TOP_N + 1);
+        // Alice and Bob (high) must survive.
+        assert!(out.iter().any(|(t, _)| t == "alice"));
+        assert!(out.iter().any(|(t, _)| t == "bob"));
+        // At least one zero_ should have been evicted — there's
+        // TOP_N - 1 of them and only TOP_N survivor-slots after the
+        // 4 named ones, so some must fold.
+        let zero_survivors = out.iter().filter(|(t, _)| t.starts_with("zero_")).count();
+        assert!(zero_survivors < TENANT_METRIC_TOP_N - 1);
+    }
+
+    // ── #503 regression: provider cardinality cap ────────────────────
+
+    #[cfg(feature = "metrics-providers")]
+    fn pc_key(conn: &str, model: &str, op: &str, status: &str) -> ProviderCallKey {
+        ProviderCallKey {
+            provider_connection: conn.to_owned(),
+            model: model.to_owned(),
+            operation_kind: op.to_owned(),
+            status: status.to_owned(),
+        }
+    }
+
+    #[cfg(feature = "metrics-providers")]
+    #[test]
+    fn provider_top_n_passthrough_below_cap() {
+        let mut calls: std::collections::HashMap<ProviderCallKey, u64> =
+            std::collections::HashMap::new();
+        calls.insert(pc_key("openai", "gpt-4o", "chat", "succeeded"), 100);
+        calls.insert(pc_key("anthropic", "sonnet", "chat", "succeeded"), 50);
+        let keep = provider_top_n_pairs(&calls);
+        // Every pair in a below-cap set is kept.
+        assert_eq!(keep.len(), 2);
+        assert!(keep.contains(&("openai".to_owned(), "gpt-4o".to_owned())));
+        assert!(keep.contains(&("anthropic".to_owned(), "sonnet".to_owned())));
+    }
+
+    #[cfg(feature = "metrics-providers")]
+    #[test]
+    fn provider_top_n_ranks_and_caps_at_budget() {
+        let mut calls: std::collections::HashMap<ProviderCallKey, u64> =
+            std::collections::HashMap::new();
+        // TOP_N + 3 distinct (connection, model) pairs.
+        for i in 0..PROVIDER_METRIC_TOP_N {
+            calls.insert(
+                pc_key("openai", &format!("gpt-model-{i:04}"), "chat", "succeeded"),
+                1000,
+            );
+        }
+        // Low-activity overflow pairs (rotating model IDs exactly the
+        // case the audit flagged).
+        calls.insert(
+            pc_key("openai", "gpt-4o-mini-2024-07-18", "chat", "succeeded"),
+            1,
+        );
+        calls.insert(
+            pc_key("openai", "gpt-4o-mini-2024-11-20", "chat", "succeeded"),
+            2,
+        );
+        calls.insert(
+            pc_key("openai", "gpt-4o-mini-2024-12-18", "chat", "succeeded"),
+            3,
+        );
+
+        let keep = provider_top_n_pairs(&calls);
+        assert_eq!(keep.len(), PROVIDER_METRIC_TOP_N);
+        // Low-activity rotating-model-ID pairs must be evicted.
+        assert!(
+            !keep.contains(&("openai".to_owned(), "gpt-4o-mini-2024-07-18".to_owned())),
+            "low-activity rotating model ID must not be in the top-N"
+        );
+    }
+
+    #[cfg(feature = "metrics-providers")]
+    #[test]
+    fn capped_calls_folds_overflow_into_other_label_pair() {
+        let mut calls: std::collections::HashMap<ProviderCallKey, u64> =
+            std::collections::HashMap::new();
+        calls.insert(pc_key("openai", "gpt-4o", "chat", "succeeded"), 100);
+        calls.insert(pc_key("openai", "gpt-old-1", "chat", "succeeded"), 3);
+        calls.insert(pc_key("openai", "gpt-old-2", "chat", "succeeded"), 2);
+        calls.insert(pc_key("openai", "gpt-old-3", "chat", "succeeded"), 1);
+
+        // Keep only the top pair; force overflow.
+        let keep: std::collections::HashSet<(String, String)> =
+            std::iter::once(("openai".to_owned(), "gpt-4o".to_owned())).collect();
+        let out = capped_calls(&calls, &keep);
+
+        // gpt-4o kept as-is.
+        assert_eq!(
+            out.get(&pc_key("openai", "gpt-4o", "chat", "succeeded")),
+            Some(&100)
+        );
+        // Three gpt-old-* collapsed into __other__/__other__ with summed count.
+        let other_key = pc_key(
+            CARDINALITY_OVERFLOW_LABEL,
+            CARDINALITY_OVERFLOW_LABEL,
+            "chat",
+            "succeeded",
+        );
+        assert_eq!(out.get(&other_key), Some(&(3 + 2 + 1)));
+        // Exactly 2 distinct rows after folding.
+        assert_eq!(out.len(), 2);
+    }
+
+    #[cfg(feature = "metrics-providers")]
+    #[test]
+    fn capped_calls_preserves_status_dimension() {
+        // operation_kind + status are bounded enums — the cap must not
+        // collapse them. Distinct `status` values for the same evicted
+        // pair should remain distinct rows under __other__.
+        let mut calls: std::collections::HashMap<ProviderCallKey, u64> =
+            std::collections::HashMap::new();
+        calls.insert(pc_key("openai", "gpt-a", "chat", "succeeded"), 100);
+        calls.insert(pc_key("openai", "gpt-a", "chat", "failed"), 10);
+        let keep: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let out = capped_calls(&calls, &keep);
+        // Both collapsed rows should appear — same __other__/__other__
+        // on the (conn, model) axis but distinct on status.
+        let succeeded = pc_key(
+            CARDINALITY_OVERFLOW_LABEL,
+            CARDINALITY_OVERFLOW_LABEL,
+            "chat",
+            "succeeded",
+        );
+        let failed = pc_key(
+            CARDINALITY_OVERFLOW_LABEL,
+            CARDINALITY_OVERFLOW_LABEL,
+            "chat",
+            "failed",
+        );
+        assert_eq!(out.get(&succeeded), Some(&100));
+        assert_eq!(out.get(&failed), Some(&10));
+        assert_eq!(out.len(), 2);
+    }
 }
