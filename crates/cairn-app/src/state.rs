@@ -1032,6 +1032,34 @@ impl AppState {
         runtime: Arc<InMemoryServices>,
         fabric: Option<Arc<cairn_fabric::FabricServices>>,
     ) -> Result<Self, String> {
+        // Surface any `Stubbed` RuntimeEvent variants at boot so pg/sqlite
+        // operators see the silent-no-op inventory instead of discovering
+        // it via empty API reads. In-memory skips the stubbed check (it
+        // materialises projections through a separate code path that
+        // cannot leak empty reads), but still runs
+        // `assert_no_stubs_for_in_memory` so the uniform call path is
+        // exercised. See
+        // `docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md`
+        // for the registry contract.
+        let projection_check: Result<(), cairn_store::RegistryError> = match &config.storage {
+            cairn_api::bootstrap::StorageBackend::InMemory => {
+                cairn_store::assert_no_stubs_for_in_memory()
+            }
+            cairn_api::bootstrap::StorageBackend::Sqlite { .. } => {
+                cairn_store::assert_no_stubs_for_persistent_backend(cairn_store::Backend::Sqlite)
+            }
+            cairn_api::bootstrap::StorageBackend::Postgres { .. } => {
+                cairn_store::assert_no_stubs_for_persistent_backend(cairn_store::Backend::Postgres)
+            }
+        };
+        if let Err(err) = projection_check {
+            tracing::warn!(
+                %err,
+                backend = crate::errors::storage_backend_label(&config.storage),
+                "projection registry carries Stubbed variants"
+            );
+        }
+
         let graph = Arc::new(InMemoryGraphStore::new());
         let plugin_registry = Arc::new(InMemoryPluginRegistry::new());
         let document_store = Arc::new(InMemoryDocumentStore::new());

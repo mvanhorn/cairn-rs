@@ -3,6 +3,56 @@ set -euo pipefail
 
 echo "═══ pre-commit ═══"
 
+# ── RFC-025 Phase 0: reject new log_stub() sites ───────────────────────
+#
+# log_stub is a silent no-op in the pg/sqlite projection appliers — the
+# event commits to the event log but no read-model table is written. Every
+# new site is a new silent-read hazard. Replace with a real projection, or
+# declare the variant ProjectionStatus::Ephemeral in
+# crates/cairn-store/src/projection_registry.rs AND route it through pg's
+# dedicated no-op arm (no log_stub needed).
+#
+# CI fallback lives in .github/workflows/ci.yml so devs who skip local
+# hook install cannot sneak stubs onto main.
+echo "  RFC-025 log_stub guard..."
+projection_paths=(
+  "crates/cairn-store/src/pg/projections.rs"
+  "crates/cairn-store/src/sqlite/projections.rs"
+)
+added_stubs=0
+diff_out=$(git diff --cached -U0 -- "${projection_paths[@]}" 2>/dev/null || true)
+if [ -n "$diff_out" ]; then
+  added_stubs=$(printf '%s\n' "$diff_out" \
+    | grep -E '^\+' \
+    | grep -v -E '^\+\+\+' \
+    | grep -c 'log_stub(' \
+    || true)
+fi
+if [ "${added_stubs:-0}" -gt 0 ]; then
+  cat >&2 <<ERR
+  ❌ RFC-025: $added_stubs new log_stub() site(s) in pg/sqlite projections.
+
+     log_stub is a silent no-op — the event commits to the event log
+     but no projection table is updated. Stubbed is not a supported
+     steady state per RFC-025 Phase 0; every variant on a persistent
+     backend must be either Projected or Ephemeral.
+
+     Fix: either
+       • add a real INSERT/UPDATE arm in pg AND sqlite appliers, then
+         set the variant to ProjectionStatus::Projected in
+         crates/cairn-store/src/projection_registry.rs
+       • OR declare ProjectionStatus::Ephemeral and handle the variant
+         as an explicit no-op in **both** pg and sqlite match arms
+         (e.g. via pg's dedicated '| RuntimeEvent::X(_) => {}' arm and
+         a matching no-op in sqlite — NOT log_stub in either file,
+         since this guard rejects log_stub on both backends).
+
+     See docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md
+ERR
+  exit 1
+fi
+echo "  ✓ RFC-025 log_stub guard"
+
 echo "  fmt..."
 if ! cargo fmt --all --check >/dev/null 2>&1; then
   echo "  ❌ cargo fmt failed. Run 'cargo fmt --all'"

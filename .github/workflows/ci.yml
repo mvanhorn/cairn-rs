@@ -27,6 +27,71 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # ── 1b. Projection stub guard (RFC-025 Phase 0) ───────────────────────────
+  # CI mirror of .githooks/pre-commit: reject PRs that add new log_stub()
+  # sites to pg/sqlite projection appliers. log_stub is a silent no-op —
+  # the event commits to the event log but no read-model table is
+  # written, producing silently-empty reads on persistent backends.
+  #
+  # Contributors who skip `./scripts/install-hooks.sh` locally still hit
+  # this gate before merge, so the Phase 0 invariant cannot be bypassed.
+  projection-stub-guard:
+    name: projection-stub-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the merge-base commit to diff against on pull_request
+          # events. `fetch-depth: 0` grabs full history; the step below
+          # narrows to the diff window.
+          fetch-depth: 0
+      - name: no new log_stub() sites
+        env:
+          # GitHub Actions does NOT expose `github.event.before` as an
+          # automatic env var; we have to pipe it through explicitly.
+          # On pull_request events it's empty (the base ref comparison
+          # below handles that case).
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # Pick the diff range.
+          # - On pull_request events: diff against the PR base ref.
+          # - On push events: diff against `github.event.before` — the
+          #   previous tip of the branch *before* this push landed, so
+          #   multi-commit pushes still surface stubs in every commit
+          #   of the push window, not just the final one.
+          # Fall back to HEAD~1 only if `github.event.before` is empty
+          # AND the base ref is also empty (e.g. a first push to a new
+          # branch that the repo has never seen). That fallback is
+          # rare and intentionally narrow.
+          if [ -n "${GITHUB_BASE_REF:-}" ]; then
+            base="origin/${GITHUB_BASE_REF}"
+            git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}"
+          elif [ -n "${EVENT_BEFORE:-}" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            base="${EVENT_BEFORE}"
+          else
+            base="HEAD~1"
+          fi
+          echo "diff range: ${base}...HEAD"
+          added_stubs=$(
+            git diff "${base}...HEAD" --unified=0 -- \
+              'crates/cairn-store/src/pg/projections.rs' \
+              'crates/cairn-store/src/sqlite/projections.rs' \
+              2>/dev/null \
+              | grep -E '^\+' \
+              | grep -v -E '^\+\+\+' \
+              | grep -c 'log_stub(' \
+              || true
+          )
+          if [ "${added_stubs:-0}" -gt 0 ]; then
+            echo "::error::RFC-025: ${added_stubs} new log_stub() site(s) added to pg/sqlite projections."
+            echo "log_stub is a silent no-op. Add a real projection OR declare the variant" >&2
+            echo "ProjectionStatus::Ephemeral in crates/cairn-store/src/projection_registry.rs." >&2
+            echo "See docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md" >&2
+            exit 1
+          fi
+          echo "✓ no new log_stub() sites"
+
   # ── 2. Check ─────────────────────────────────────────────────────────────────
   check:
     name: check
