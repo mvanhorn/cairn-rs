@@ -144,11 +144,43 @@ pub(crate) struct SetTenantQuotaRequest {
     pub max_tasks_per_run: u32,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, ToSchema)]
+/// Closes #492: the plaintext value must never survive in logs, `Debug`,
+/// or the OpenAPI example.
+///
+/// The struct itself is crate-private (`pub(crate)`) and `plaintext_value`
+/// is exposed through a narrow accessor (`into_plaintext_value`) so the
+/// handler can move it into the credential service call without exposing
+/// the field to unrelated code. The manual `Debug` impl prints
+/// `[redacted]` so future `tracing::debug!("{body:?}")` additions cannot
+/// leak the secret.
+///
+/// Per Copilot review on PR #535: the field was previously `pub` with a
+/// comment claiming it was private; tightening now so the comment and
+/// the access pattern match.
+#[derive(Clone, serde::Deserialize, ToSchema)]
 pub(crate) struct StoreCredentialRequest {
     pub provider_id: String,
-    pub plaintext_value: String,
+    plaintext_value: String,
     pub key_id: Option<String>,
+}
+
+impl StoreCredentialRequest {
+    /// Move the plaintext value out for the encrypt call. The caller is
+    /// expected to hand this straight to the credential service, which
+    /// wraps it in `Zeroizing<String>` for the remainder of its lifetime.
+    pub(crate) fn into_plaintext_value(self) -> String {
+        self.plaintext_value
+    }
+}
+
+impl std::fmt::Debug for StoreCredentialRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreCredentialRequest")
+            .field("provider_id", &self.provider_id)
+            .field("plaintext_value", &"[redacted]")
+            .field("key_id", &self.key_id)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -1153,15 +1185,15 @@ pub(crate) async fn store_credential_handler(
     }
     let tenant = TenantId::new(tenant_id);
     let provider_id = body.provider_id.clone();
+    let key_id = body.key_id.clone();
+    // `into_plaintext_value` moves the secret out so it does NOT stay
+    // accessible on the `body` stack frame after this call. The service
+    // wraps it in `Zeroizing<String>` for the rest of its lifetime.
+    let plaintext_value = body.into_plaintext_value();
     match state
         .runtime
         .credentials
-        .store(
-            tenant.clone(),
-            body.provider_id,
-            body.plaintext_value,
-            body.key_id,
-        )
+        .store(tenant.clone(), provider_id.clone(), plaintext_value, key_id)
         .await
     {
         Ok(record) => (StatusCode::CREATED, Json(credential_summary(record))).into_response(),
@@ -1188,13 +1220,23 @@ pub(crate) async fn store_credential_handler(
 
 pub(crate) async fn list_credentials_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(tenant_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // Closes #447: enforce the same tenant/admin scoping that every other
+    // tenant-scoped list endpoint uses. A non-admin caller asking for a
+    // tenant that is not their own gets a 404 so the endpoint does not
+    // leak tenant-id existence.
+    let target = TenantId::new(tenant_id);
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "credential not found")
+            .into_response();
+    }
     match state
         .runtime
         .credentials
-        .list(&TenantId::new(tenant_id), query.limit(), query.offset())
+        .list(&target, query.limit(), query.offset())
         .await
     {
         Ok(items) => {
@@ -1649,5 +1691,41 @@ fn unanimous_input_error_code(
         Some(first.to_owned())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StoreCredentialRequest;
+
+    /// Closes #492: `{body:?}` must not leak the plaintext. The handler
+    /// does not print the body today, but `StoreCredentialRequest` is
+    /// derived-Clone and public within the crate, so any future
+    /// `tracing::debug!("body = {body:?}")` MUST redact. This pins the
+    /// Debug shape so the invariant can't silently regress.
+    #[test]
+    fn store_credential_request_debug_redacts_plaintext() {
+        let body = StoreCredentialRequest {
+            provider_id: "openai".to_owned(),
+            plaintext_value: "sk-SHOULD-BE-REDACTED-9f8e7d".to_owned(),
+            key_id: Some("primary".to_owned()),
+        };
+        let formatted = format!("{body:?}");
+        assert!(
+            !formatted.contains("sk-SHOULD-BE-REDACTED"),
+            "Debug leaked plaintext: {formatted}"
+        );
+        assert!(
+            formatted.contains("[redacted]"),
+            "Debug must mark plaintext_value as [redacted]; got: {formatted}"
+        );
+        assert!(
+            formatted.contains("openai"),
+            "non-secret fields should still be visible: {formatted}"
+        );
+        assert!(
+            formatted.contains("primary"),
+            "key_id should still be visible: {formatted}"
+        );
     }
 }

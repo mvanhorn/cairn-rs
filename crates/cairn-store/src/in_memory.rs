@@ -4721,6 +4721,33 @@ impl crate::projections::CredentialReadModel for InMemoryStore {
             .cloned()
             .collect())
     }
+
+    /// Single-pass scan across all tenants. Used by
+    /// `cairn_runtime::services::scan_legacy_ciphertexts` at boot. The
+    /// InMemoryStore projection is the authoritative read model for
+    /// every backend (pg and sqlite dual-write through service events),
+    /// so one pass over `state.credentials` covers the whole deployment
+    /// without the per-tenant N+1 that the default impl falls back to.
+    ///
+    /// Returns `Some(rows)` — including `Some(Vec::new())` on a deployment
+    /// with zero credentials — so the caller can unambiguously skip the
+    /// per-tenant fallback. The default `Ok(None)` is reserved for
+    /// backends that have not wired a single-pass path.
+    async fn list_all_active(
+        &self,
+        limit: usize,
+    ) -> Result<Option<Vec<cairn_domain::credentials::CredentialRecord>>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Some(
+            state
+                .credentials
+                .values()
+                .filter(|r| r.active)
+                .take(limit)
+                .cloned()
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait]

@@ -52,6 +52,11 @@ async fn default_to_localhost_6379_when_cairn_fabric_url_unset() {
             "00000000000000000000000000000000000000000000000000000000000000aa",
         )
         .env("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "cairn-test-default")
+        // META #461: team mode refuses to start without a master key.
+        .env(
+            "CAIRN_CREDENTIAL_KEY",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
         .env("RUST_LOG", "info")
         .env_remove("CAIRN_LOG_DIR")
         // `tracing_subscriber::fmt()` writes to stdout (not stderr) —

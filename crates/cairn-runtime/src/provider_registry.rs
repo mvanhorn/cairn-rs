@@ -137,14 +137,16 @@ pub struct ProviderRegistry<S> {
     store: Arc<S>,
     cache: Mutex<HashMap<String, Arc<CachedProvider>>>,
     fallbacks: RwLock<StartupFallbackProviders>,
+    master_key: Arc<crate::services::MasterKey>,
 }
 
 impl<S> ProviderRegistry<S> {
-    pub fn new(store: Arc<S>) -> Self {
+    pub fn new(store: Arc<S>, master_key: Arc<crate::services::MasterKey>) -> Self {
         Self {
             store,
             cache: Mutex::new(HashMap::new()),
             fallbacks: RwLock::new(StartupFallbackProviders::default()),
+            master_key,
         }
     }
 
@@ -547,7 +549,10 @@ where
             });
         }
 
-        Ok(Some(decrypt_credential_record(&credential)?))
+        Ok(Some(decrypt_credential_record(
+            self.master_key.as_ref(),
+            &credential,
+        )?))
     }
 
     fn select_fallback_generation(
@@ -1213,6 +1218,11 @@ mod tests {
     use super::{
         ProviderRegistry, ProviderResolutionPurpose, StartupFallbackProviders, StartupProviderEntry,
     };
+    use crate::services::MasterKey;
+
+    fn test_master_key() -> Arc<MasterKey> {
+        Arc::new(MasterKey::from_bytes([0x42; 32]))
+    }
 
     struct FakeGenerationProvider {
         label: &'static str,
@@ -1264,7 +1274,7 @@ mod tests {
     async fn caches_connection_backed_generation_providers_by_connection_id() {
         let store = seeded_store().await;
         seed_connection(&store, "conn_cache").await;
-        let registry = ProviderRegistry::new(store);
+        let registry = ProviderRegistry::new(store, test_master_key());
 
         let first = registry
             .resolve_generation_for_model(
@@ -1292,7 +1302,7 @@ mod tests {
     async fn invalidate_rebuilds_connection_backed_provider() {
         let store = seeded_store().await;
         seed_connection(&store, "conn_invalidate").await;
-        let registry = ProviderRegistry::new(store);
+        let registry = ProviderRegistry::new(store, test_master_key());
         let connection_id = ProviderConnectionId::new("conn_invalidate");
 
         let first = registry
@@ -1321,7 +1331,7 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_startup_generation_when_no_connections_exist() {
         let store = seeded_store().await;
-        let registry = ProviderRegistry::new(store);
+        let registry = ProviderRegistry::new(store, test_master_key());
         let fallback: Arc<dyn GenerationProvider> =
             Arc::new(FakeGenerationProvider { label: "fallback" });
         registry.set_startup_fallbacks(StartupFallbackProviders {
@@ -1345,7 +1355,7 @@ mod tests {
     #[tokio::test]
     async fn falls_back_to_startup_embedding_when_no_connections_exist() {
         let store = seeded_store().await;
-        let registry = ProviderRegistry::new(store);
+        let registry = ProviderRegistry::new(store, test_master_key());
         let fallback: Arc<dyn DomainEmbeddingProvider> =
             Arc::new(FakeEmbeddingProvider { token_count: 7 });
         registry.set_startup_fallbacks(StartupFallbackProviders {
@@ -1369,7 +1379,7 @@ mod tests {
     async fn snapshot_reports_cached_connections_and_configured_fallbacks() {
         let store = seeded_store().await;
         seed_connection(&store, "conn_snapshot").await;
-        let registry = ProviderRegistry::new(store);
+        let registry = ProviderRegistry::new(store, test_master_key());
         registry.set_startup_fallbacks(StartupFallbackProviders {
             brain: Some(
                 StartupProviderEntry::generation(Arc::new(FakeGenerationProvider {
@@ -1433,7 +1443,7 @@ mod tests {
 
     async fn seed_connection(store: &Arc<InMemoryStore>, connection_id: &str) {
         let connections = ProviderConnectionServiceImpl::new(store.clone());
-        let credentials = CredentialServiceImpl::new(store.clone());
+        let credentials = CredentialServiceImpl::new(store.clone(), test_master_key());
         let defaults = DefaultsServiceImpl::new(store.clone());
 
         connections

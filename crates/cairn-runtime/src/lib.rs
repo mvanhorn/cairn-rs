@@ -114,14 +114,15 @@ pub use runtime_config::{
     KEY_ORCHESTRATOR_WALL_CLOCK_MS, KEY_STREAM_MODEL, KEY_THINKING_MODEL_PREFIXES, KEY_WORKER_URL,
 };
 pub use services::{
-    AllowlistRevokedRun, ApprovalPolicyServiceImpl, ApprovalServiceImpl, BaseRevisionDriftRun,
-    CheckpointServiceImpl, EvalRunServiceImpl, ExternalWorkerService, ExternalWorkerServiceImpl,
-    IngestJobServiceImpl, LlmObservabilityServiceImpl, MailboxServiceImpl, ProjectServiceImpl,
-    PromptAssetServiceImpl, PromptReleaseServiceImpl, PromptVersionServiceImpl, RecoveryService,
-    RecoveryServiceImpl, SandboxLostRun, SandboxReattachedRun, SignalServiceImpl,
-    SimpleRouteResolver, TenantServiceImpl, ToolCallApprovalReaderAdapter,
-    ToolCallApprovalServiceImpl, ToolInvocationService, ToolInvocationServiceImpl,
-    WorkspaceServiceImpl,
+    decrypt_credential_record, scan_legacy_ciphertexts, AllowlistRevokedRun,
+    ApprovalPolicyServiceImpl, ApprovalServiceImpl, BaseRevisionDriftRun, CheckpointServiceImpl,
+    CredentialServiceImpl, EvalRunServiceImpl, ExternalWorkerService, ExternalWorkerServiceImpl,
+    IngestJobServiceImpl, LegacyCredential, LlmObservabilityServiceImpl, MailboxServiceImpl,
+    MasterKey, MasterKeyError, ProjectServiceImpl, PromptAssetServiceImpl,
+    PromptReleaseServiceImpl, PromptVersionServiceImpl, RecoveryService, RecoveryServiceImpl,
+    SandboxLostRun, SandboxReattachedRun, SignalServiceImpl, SimpleRouteResolver,
+    TenantServiceImpl, ToolCallApprovalReaderAdapter, ToolCallApprovalServiceImpl,
+    ToolInvocationService, ToolInvocationServiceImpl, WorkspaceServiceImpl,
 };
 pub use sessions::SessionService;
 pub use signals::SignalService;

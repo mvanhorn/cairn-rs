@@ -9,6 +9,55 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security (breaking pre-release)
+
+- **Credential encryption cluster (META #461; closes #447, #448, #449, #450,
+  #492). Breaking ciphertext format — operators must rotate existing
+  credentials.** Five regressions shipped together:
+  - **Fixed master key eradicated (#448).** The credential store previously
+    encrypted every secret with a key derived from the string
+    `"cairn-local-test-key"` committed in the source tree. Operators now
+    supply a 32-byte master key via `CAIRN_CREDENTIAL_KEY` (hex or base64)
+    or `CAIRN_CREDENTIAL_KEY_FILE` (Docker secrets / K8s). In
+    `--mode team`, the binary refuses to start if neither is set. In local
+    mode, a loud warning names the env var and boot falls back to a
+    dev-only deterministic key — local dev keeps working but the literal
+    repo string is gone.
+  - **Random AES-GCM nonces (#449).** Every encrypt now draws a fresh
+    12-byte nonce from `OsRng`. The on-disk ciphertext layout is
+    `nonce(12) || ct_with_tag`, and post-fix rows carry
+    `key_version = Some("v2")`. The previous deterministic nonce
+    (`SHA-256(tenant:provider:timestamp_ms)`) collapsed to a static value
+    on same-millisecond writes and is a keystream-recovery primitive on
+    any collision. This is a **hard wire-format break**: rows written by
+    the pre-fix code cannot be decrypted by the new code. On every boot,
+    `AppState::new` invokes `scan_legacy_ciphertexts`, which flags every
+    active credential whose `key_version` is not `Some("v2")` (the
+    pre-fix code either omitted the tag or wrote `"v1"`) and logs up to
+    twenty rows by `(tenant_id, credential_id, provider_id, key_version)`
+    plus a `...and N more` line when the list is longer. Length-based
+    detection was dropped because realistic API keys (50-char `sk-...`
+    tokens) produce 66-byte pre-fix blobs that easily pass any sane
+    nonce+tag length threshold.
+  - **`list_credentials_handler` now enforces tenant scope (#447).** Added
+    `TenantScope` extractor; non-admin cross-tenant lists return 404.
+  - **`rotate_key` scrubs plaintext via `Zeroizing<String>` (#450).** The
+    re-encrypt loop previously held decrypted secrets in a plain
+    `Vec<String>` across await points.
+  - **`StoreCredentialRequest` redacts plaintext in `Debug` (#492).** Belt-
+    and-braces against a future `tracing::debug!("{body:?}")` leaking the
+    API key into the request-log ring buffer.
+
+  **Operator action required:** before upgrading, export every stored
+  credential via the pre-fix binary, then revoke-and-re-create them
+  under the new binary with `CAIRN_CREDENTIAL_KEY` set. The new binary
+  CANNOT decrypt pre-fix ciphertexts — it reads the first 12 bytes as
+  a random nonce — so `POST .../credentials/rotate-key` is NOT a valid
+  remediation; its decrypt side errors on every pre-fix row. The boot
+  scan (`scan_legacy_ciphertexts`) labels every legacy row so the
+  revoke+recreate queue is visible, with up to 20 rows printed and a
+  count-of-remaining line when the list exceeds that.
+
 ### Changed
 
 - **F63: default `CAIRN_FABRIC_LEASE_TTL_MS` raised `30_000` → `180_000`

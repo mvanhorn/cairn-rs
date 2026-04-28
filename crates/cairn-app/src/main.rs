@@ -189,6 +189,33 @@ fn parse_args_from(args: &[String]) -> (BootstrapConfig, bool) {
     let storage_explicit =
         db_before_env || std::env::var("CAIRN_DB").is_ok_and(|v| !v.trim().is_empty());
 
+    // If the operator set CAIRN_CREDENTIAL_KEY* in their environment, treat
+    // that as the source of truth for the entitlement gate (`credentials_available`)
+    // regardless of deployment mode. `AppState::new` then loads the actual
+    // key material via `MasterKey::from_env` and errors loudly on malformed
+    // values. We only adjust the config slot here; we do NOT read the key
+    // bytes themselves in the CLI parser.
+    //
+    // Read each env var ONCE into a local and branch on the captured value.
+    // The previous shape read `CAIRN_CREDENTIAL_KEY_FILE` twice (once in the
+    // `is_ok_and` guard, once inside the `if` body to build the path) — if
+    // the env changed between the two reads, the inner body saw a different
+    // value than the guard validated. Cursor review on PR #535 (main.rs:209).
+    let key_file = std::env::var("CAIRN_CREDENTIAL_KEY_FILE")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let key_value_present = std::env::var("CAIRN_CREDENTIAL_KEY")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    if let Some(path) = key_file {
+        config.encryption_key = EncryptionKeySource::File { path };
+    } else if key_value_present {
+        config.encryption_key = EncryptionKeySource::EnvVar {
+            var_name: "CAIRN_CREDENTIAL_KEY".to_owned(),
+        };
+    }
+
     if config.mode == DeploymentMode::SelfHostedTeam {
         if config.listen_addr == "127.0.0.1" {
             config.listen_addr = "0.0.0.0".to_owned();
@@ -655,11 +682,16 @@ async fn real_main() {
     }
 
     // ── Lib.rs AppState (catalog-driven router, shared runtime) ─────────────
-    let mut lib_state = Arc::new(
-        cairn_app::AppState::new(config.clone())
-            .await
-            .expect("failed to initialise lib AppState"),
-    );
+    let mut lib_state = Arc::new(match cairn_app::AppState::new(config.clone()).await {
+        Ok(state) => state,
+        Err(e) => {
+            // AppState::new returns the credential-key fatal error verbatim;
+            // print it on its own line so operators see exactly one message
+            // and exit non-zero.
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    });
     // Register the admin token in the SHARED token registry so both routers
     // authenticate identically.
     lib_state.service_tokens.register(
@@ -1478,6 +1510,58 @@ async fn real_main() {
     lib_state.replay_graph().await;
     lib_state.replay_evals().await;
     lib_state.replay_triggers().await;
+
+    // ── META #461: legacy credential-format scan ─────────────────────────────
+    // Report rows written under the pre-fix deterministic-nonce format so
+    // operators get an actionable rotation list. The scan is bounded at
+    // 100k rows total (see `LEGACY_SCAN_LIMIT`) and uses the single-pass
+    // projection read. Failures here are advisory — we don't want to block
+    // boot if the projection is transiently unavailable, but the cluster
+    // that motivated this PR is severe enough that the warning MUST land in
+    // ops logs. See CHANGELOG security section and PR #535 reviews.
+    match cairn_runtime::scan_legacy_ciphertexts(lib_state.runtime.store.as_ref()).await {
+        Ok(legacy) if legacy.is_empty() => {
+            tracing::info!("credentials: no pre-fix legacy rows detected");
+        }
+        Ok(legacy) => {
+            let count = legacy.len();
+            tracing::warn!(
+                count,
+                "credentials: {} pre-fix row(s) detected — revoke and re-enter before use; \
+                 `rotate-key` is NOT a valid remediation (see META #461)",
+                count
+            );
+            eprintln!(
+                "⚠ credentials: {count} pre-fix row(s) detected. \
+                 Revoke and re-enter each credential — `rotate-key` is NOT a \
+                 valid remediation because the new binary cannot decrypt these \
+                 rows (it reads the first 12 bytes as a random nonce). See \
+                 CHANGELOG META #461 for the migration runbook."
+            );
+            for entry in legacy.iter().take(20) {
+                tracing::warn!(
+                    tenant = %entry.tenant_id,
+                    credential_id = %entry.credential_id,
+                    provider_id = %entry.provider_id,
+                    key_version = ?entry.key_version,
+                    "legacy credential requires rotation"
+                );
+            }
+            if count > 20 {
+                tracing::warn!(
+                    "...and {} more pre-fix credential(s) (truncated log output)",
+                    count - 20
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "credentials: legacy-format scan failed (boot continues); \
+                 re-run /health/ready once projections warm up"
+            );
+        }
+    }
 
     // RFC 020 Track 3: populate the tool-call result cache from
     // `ToolInvocationCompleted` events that landed before this boot.

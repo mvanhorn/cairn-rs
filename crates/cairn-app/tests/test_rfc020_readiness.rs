@@ -79,6 +79,11 @@ impl DelayedHarness {
                 "00000000000000000000000000000000000000000000000000000000000000aa",
             )
             .env("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "cairn-test-k1")
+            // META #461: team mode refuses to start without a master key.
+            .env(
+                "CAIRN_CREDENTIAL_KEY",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             // The dev-only hook: defer the final readiness flip so the
             // test can observe the 503-with-progress contract.
             .env("CAIRN_TEST_STARTUP_DELAY_MS", STARTUP_DELAY_MS.to_string())

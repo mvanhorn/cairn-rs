@@ -405,6 +405,15 @@ fn spawn_subprocess_internal(
             "00000000000000000000000000000000000000000000000000000000000000aa",
         )
         .env("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "cairn-test-k1")
+        // META #461: cairn-app refuses to boot in team mode without
+        // `CAIRN_CREDENTIAL_KEY`. Use a deterministic test key so every
+        // LiveHarness subprocess in this test run shares the same key —
+        // the test asserts against ciphertexts the subprocess itself
+        // writes, so the key doesn't need to match any external fixture.
+        .env(
+            "CAIRN_CREDENTIAL_KEY",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
         // Silence noisy tracing so stderr is dominated by structured
         // startup lines; integration tests don't need debug spam.
         // Tests can override via `CAIRN_TEST_RUST_LOG` when they need

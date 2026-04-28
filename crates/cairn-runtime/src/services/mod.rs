@@ -78,7 +78,10 @@ pub use workspace_impl::WorkspaceServiceImpl;
 pub use audit_impl::AuditServiceImpl;
 pub use budget_impl::BudgetServiceImpl;
 pub use channel_impl::ChannelServiceImpl;
-pub use credential_impl::CredentialServiceImpl;
+pub use credential_impl::{
+    decrypt_credential_record, scan_legacy_ciphertexts, CredentialServiceImpl, LegacyCredential,
+    MasterKey, MasterKeyError,
+};
 pub use defaults_impl::DefaultsServiceImpl;
 pub use guardrail_impl::GuardrailServiceImpl;
 pub use license_impl::LicenseServiceImpl;

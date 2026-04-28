@@ -164,6 +164,29 @@ impl InMemoryServices {
         tasks: Arc<dyn TaskService>,
         sessions: Arc<dyn SessionService>,
     ) -> Self {
+        // Tests that construct the aggregate directly use an ephemeral
+        // deterministic master key. Production callers use
+        // [`with_store_core_and_key`] so the operator-configured
+        // `CAIRN_CREDENTIAL_KEY` is honored end-to-end.
+        let master_key = Arc::new(crate::services::MasterKey::from_bytes([0u8; 32]));
+        Self::with_store_core_and_key(store, runs, tasks, sessions, master_key)
+    }
+
+    /// Build a runtime aggregate with an operator-supplied master key.
+    ///
+    /// This is the production path — cairn-app's `AppState::new` loads the
+    /// key from `CAIRN_CREDENTIAL_KEY`/`CAIRN_CREDENTIAL_KEY_FILE` and passes
+    /// it here. The single [`MasterKey`](crate::services::MasterKey)
+    /// is shared between the `CredentialServiceImpl` (encrypt/decrypt path)
+    /// and the `ProviderRegistry` (decrypt-on-read path) so there is exactly
+    /// one key material instance per deployment.
+    pub fn with_store_core_and_key(
+        store: Arc<InMemoryStore>,
+        runs: Arc<dyn RunService>,
+        tasks: Arc<dyn TaskService>,
+        sessions: Arc<dyn SessionService>,
+        master_key: Arc<crate::services::MasterKey>,
+    ) -> Self {
         // RFC 020 §"Decision Cache Survival": wire the shared event log
         // into the decision service so cached decisions are persisted
         // and can be replayed at startup. The log clone uses the store
@@ -203,8 +226,11 @@ impl InMemoryServices {
             provider_connections: ProviderConnectionServiceImpl::new(store.clone()),
             provider_health: ProviderHealthServiceImpl::new(store.clone()),
             provider_pools: ProviderConnectionPoolServiceImpl::new(store.clone()),
-            provider_registry: std::sync::Arc::new(ProviderRegistry::new(store.clone())),
-            credentials: CredentialServiceImpl::new(store.clone()),
+            provider_registry: std::sync::Arc::new(ProviderRegistry::new(
+                store.clone(),
+                master_key.clone(),
+            )),
+            credentials: CredentialServiceImpl::new(store.clone(), master_key.clone()),
             defaults: DefaultsServiceImpl::new(store.clone()),
             licenses: LicenseServiceImpl::new(store.clone()),
             guardrails: GuardrailServiceImpl::new(store.clone()),

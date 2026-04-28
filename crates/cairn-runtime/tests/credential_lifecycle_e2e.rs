@@ -18,12 +18,16 @@ use std::time::Duration;
 use cairn_domain::{CredentialId, TenantId};
 use cairn_runtime::credentials::CredentialService;
 use cairn_runtime::error::RuntimeError;
-use cairn_runtime::services::{CredentialServiceImpl, TenantServiceImpl};
+use cairn_runtime::services::{CredentialServiceImpl, MasterKey, TenantServiceImpl};
 use cairn_runtime::tenants::TenantService;
 use cairn_store::InMemoryStore;
 
 fn tenant_id() -> TenantId {
     TenantId::new("tenant_rfc011")
+}
+
+fn test_master_key() -> Arc<MasterKey> {
+    Arc::new(MasterKey::from_bytes([9u8; 32]))
 }
 
 async fn setup() -> (Arc<InMemoryStore>, CredentialServiceImpl<InMemoryStore>) {
@@ -33,7 +37,7 @@ async fn setup() -> (Arc<InMemoryStore>, CredentialServiceImpl<InMemoryStore>) {
         .create(tenant_id(), "RFC 011 Tenant".to_owned())
         .await
         .unwrap();
-    let cred_svc = CredentialServiceImpl::new(store.clone());
+    let cred_svc = CredentialServiceImpl::new(store.clone(), test_master_key());
     (store, cred_svc)
 }
 
@@ -83,10 +87,13 @@ async fn store_credential_encrypts_value_and_tags_key_version() {
         Some("kek-primary-v1"),
         "key_id must be preserved on the record"
     );
+    // Post-#461: stored rows carry "v2" to mark the random-nonce format.
+    // Pre-fix rows carried "v1" and are flagged by `scan_legacy_ciphertexts`
+    // for operator-driven rotation.
     assert_eq!(
         stored.key_version.as_deref(),
-        Some("v1"),
-        "RFC 011: key_version must be set to 'v1' on store"
+        Some("v2"),
+        "META #461: newly-stored credentials must carry key_version=v2"
     );
     assert!(
         stored.encrypted_at_ms.is_some(),
@@ -237,7 +244,7 @@ async fn revoke_is_idempotent() {
 #[tokio::test]
 async fn store_for_nonexistent_tenant_returns_not_found() {
     let store = Arc::new(InMemoryStore::new());
-    let cred_svc = CredentialServiceImpl::new(store);
+    let cred_svc = CredentialServiceImpl::new(store, test_master_key());
 
     let err = cred_svc
         .store(

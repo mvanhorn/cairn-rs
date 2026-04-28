@@ -265,6 +265,11 @@ jobs:
         run: |
           set -euo pipefail
           export CAIRN_ADMIN_TOKEN="dev-admin-token"
+          # META #461: team mode requires CAIRN_CREDENTIAL_KEY at boot. Smoke
+          # needs a real 32-byte key since the bootstrap path rejects unset in
+          # team mode. Use a per-run random hex key so ciphertexts in this
+          # smoke cycle can only be read by this cycle.
+          export CAIRN_CREDENTIAL_KEY="$(openssl rand -hex 32)"
           export CAIRN_FABRIC_WAITPOINT_HMAC_SECRET="$(openssl rand -hex 32)"
           export CAIRN_FABRIC_WAITPOINT_HMAC_KID="ci-smoke"
           export CAIRN_FABRIC_URL="valkey://127.0.0.1:6379"

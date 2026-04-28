@@ -1003,11 +1003,18 @@ impl AppState {
     }
 
     pub async fn new(config: BootstrapConfig) -> Result<Self, String> {
+        // Load the credential master key BEFORE any runtime construction so
+        // a misconfigured team-mode deployment fails fast with a
+        // single, unambiguous error line in boot logs rather than partway
+        // through a lengthy Fabric connect. See `load_master_key` for the
+        // source-priority and fail-loud semantics.
+        let master_key = load_master_key(&config)?;
+
         // Construct FabricServices + install the FabricAdapter trio for
         // runs/tasks/sessions. Any boot failure on the Fabric path
         // (unreachable Valkey, HMAC validation, …) surfaces here before
         // cairn-app starts serving traffic — no silent fall-back.
-        let (runtime, fabric) = build_runtime_with_optional_fabric().await?;
+        let (runtime, fabric) = build_runtime_with_optional_fabric(master_key).await?;
         Self::new_with_runtime(config, runtime, fabric).await
     }
 
@@ -1459,7 +1466,9 @@ pub(crate) fn default_snapshot_dir() -> PathBuf {
 /// `crates/cairn-app/tests/support/fake_fabric.rs`) and call
 /// [`AppBootstrap::router_with_injected_runtime`] directly, bypassing
 /// this constructor.
-async fn build_runtime_with_optional_fabric() -> Result<
+async fn build_runtime_with_optional_fabric(
+    master_key: Arc<cairn_runtime::MasterKey>,
+) -> Result<
     (
         Arc<InMemoryServices>,
         Option<Arc<cairn_fabric::FabricServices>>,
@@ -1547,7 +1556,8 @@ async fn build_runtime_with_optional_fabric() -> Result<
         crate::fabric_adapter::FabricSessionServiceAdapter::new(fabric.clone(), store.clone()),
     );
 
-    let mut services = InMemoryServices::with_store_and_core(store, runs, tasks, sessions);
+    let mut services =
+        InMemoryServices::with_store_core_and_key(store, runs, tasks, sessions, master_key);
     // Also expose the raw fabric via the type-erased slot on
     // InMemoryServices so non-trait surfaces (budgets, quotas, signals)
     // remain reachable from runtime-scoped code. Cast the Arc to Any here
@@ -1557,4 +1567,74 @@ async fn build_runtime_with_optional_fabric() -> Result<
     tracing::info!("fabric runtime installed; adapters active on runs/tasks/sessions");
 
     Ok((Arc::new(services), Some(fabric)))
+}
+
+/// Resolve the credential master key at boot.
+///
+/// Priority (same shape as `CAIRN_ADMIN_TOKEN` resolution in `main.rs`):
+///   1. `CAIRN_CREDENTIAL_KEY_FILE` — path to a file containing the key.
+///   2. `CAIRN_CREDENTIAL_KEY` — the key directly (hex or base64).
+///
+/// Semantics by deployment mode:
+///   - **SelfHostedTeam**: unset OR malformed → hard error with `Err(_)`. The
+///     caller fails startup rather than booting with a silently-default key.
+///   - **Local**: unset → log a loud warning and fall back to a
+///     hard-coded dev-only key. This is intentionally insecure and exists
+///     only to keep local development booting without extra setup. A real
+///     deployment must set the env var.
+///
+/// The fallback path exists because local-mode operators use `--db memory`,
+/// which discards credentials on restart anyway — there is no persistence
+/// contract to break. The fallback key is repository-visible and must not
+/// be treated as secret; operators who need confidentiality must set
+/// `CAIRN_CREDENTIAL_KEY` or `CAIRN_CREDENTIAL_KEY_FILE`. The previous
+/// pre-fix default (`"cairn-local-test-key"`) is deliberately NOT reused
+/// so old ciphertexts encrypted under it cannot be decrypted by the new
+/// binary (that would silently re-validate the regression the cluster
+/// closed).
+fn load_master_key(config: &BootstrapConfig) -> Result<Arc<cairn_runtime::MasterKey>, String> {
+    use cairn_api::bootstrap::DeploymentMode;
+
+    match cairn_runtime::MasterKey::from_env() {
+        Ok(Some(key)) => {
+            tracing::info!(
+                fingerprint = %key.fingerprint(),
+                "credential master key loaded from environment"
+            );
+            eprintln!(
+                "credentials: master key loaded (fingerprint={})",
+                key.fingerprint()
+            );
+            Ok(Arc::new(key))
+        }
+        Ok(None) => {
+            if config.mode == DeploymentMode::SelfHostedTeam {
+                Err(
+                    "FATAL: CAIRN_CREDENTIAL_KEY (or CAIRN_CREDENTIAL_KEY_FILE) is \
+                     required in self-hosted team mode. Generate a 32-byte key with \
+                     `openssl rand -hex 32` and set it in the process environment \
+                     before starting cairn-app. Credentials encrypted with the \
+                     pre-fix default key must be rotated."
+                        .to_owned(),
+                )
+            } else {
+                eprintln!(
+                    "warning: credentials: CAIRN_CREDENTIAL_KEY is not set — \
+                     using a dev-only deterministic key. This is ACCEPTED only \
+                     for local --db memory runs and the credentials encrypted \
+                     here CANNOT be carried over to a production deployment. \
+                     Set CAIRN_CREDENTIAL_KEY to a 32-byte hex or base64 value \
+                     to encrypt credentials with an operator-chosen key."
+                );
+                // Derive a deterministic 32-byte dev key from a short literal
+                // so the key is reproducible for local dev and we don't
+                // accidentally ship "cairn-local-test-key" as the real key
+                // again. The key is still hardcoded — a local operator who
+                // cares about secrecy sets CAIRN_CREDENTIAL_KEY.
+                let dev_bytes = *b"cairn-dev-local-INSECURE-32byte!";
+                Ok(Arc::new(cairn_runtime::MasterKey::from_bytes(dev_bytes)))
+            }
+        }
+        Err(e) => Err(format!("FATAL: credential master key invalid: {e}")),
+    }
 }
