@@ -9,6 +9,11 @@ rust-version.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "f65_kernel_probe"
+path = "src/bin/f65_kernel_probe.rs"
+required-features = ["kernel-probe"]
+
 [dependencies]
 cairn-domain = { path = "../cairn-domain" }
 async-trait = "0.1"
@@ -16,6 +21,31 @@ reflink-copy = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["time"] }
+
+# Optional dependencies gated behind the `kernel-probe` feature so the
+# `lib` and RFC-016 integration tests do not pull Linux-only crates on
+# hosts that do not need them. Enabled together by the feature below.
+anyhow = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+landlock = { version = "0.4", optional = true }
+nix = { version = "0.31", features = ["fs", "mount", "ptrace", "sched", "signal", "user"], optional = true }
+seccompiler = { version = "0.5", optional = true }
+tempfile = { version = "3", optional = true }
+
+[features]
+default = []
+# Compiles the `f65_kernel_probe` binary. Gated so the host-specific
+# Linux deps stay out of the default cargo build + lib consumers. The
+# reflink probe reuses the crate-level `reflink-copy` dep; this feature
+# only adds crates specific to the probe binary.
+kernel-probe = [
+    "dep:anyhow",
+    "dep:chrono",
+    "dep:landlock",
+    "dep:nix",
+    "dep:seccompiler",
+    "dep:tempfile",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }
