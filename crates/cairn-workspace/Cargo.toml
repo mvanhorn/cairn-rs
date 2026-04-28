@@ -14,6 +14,17 @@ name = "f65_kernel_probe"
 path = "src/bin/f65_kernel_probe.rs"
 required-features = ["kernel-probe"]
 
+# Test-only helper: the `test_sandbox_env_isolation` integration test spawns
+# this binary via `spawn_sandboxed_agent` and asserts the child's observed
+# environment matches the allowlist — i.e. no parent secrets leak across the
+# sandbox boundary. Cargo always compiles `[[bin]]` entries regardless of
+# profile, but the binary is tiny (dumps /proc/self/environ to fd 3) and
+# contributes < 1 KiB to the debug build. Exposing it as a real bin also
+# lets us resolve its path via `env!("CARGO_BIN_EXE_...")` from the test.
+[[bin]]
+name = "sandbox_env_dumper"
+path = "src/bin/sandbox_env_dumper.rs"
+
 # Test-only helper for the F65 PR-4 sandbox integration suite. Always
 # built so integration tests get `CARGO_BIN_EXE_sandbox_primitive_harness`
 # without needing a feature flag. Small and dep-free by design — see the
