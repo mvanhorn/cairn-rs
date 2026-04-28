@@ -322,6 +322,34 @@ pub(crate) async fn load_run_visible_to_tenant(
     }
 }
 
+/// Return the `EvalRunRecord` when it exists AND is visible to the
+/// caller. Mirrors [`load_run_visible_to_tenant`] for evals, closing
+/// the cross-tenant-mutation gap called out in #405 (the `#337` bug
+/// shape applied to eval runs).
+///
+/// The projection is the canonical source of the run's `ProjectKey`
+/// (the in-memory `EvalService` only carries `project_id`, without
+/// tenant/workspace). Handlers that use this must have a
+/// `TenantScope` in scope and should return 404 `not_found` when the
+/// result is `Ok(None)` — never leak "exists but forbidden" across
+/// the tenant boundary.
+pub(crate) async fn load_eval_run_visible_to_tenant(
+    state: &AppState,
+    tenant_scope: &TenantScope,
+    eval_run_id: &cairn_domain::EvalRunId,
+) -> Result<Option<cairn_store::projections::EvalRunRecord>, axum::response::Response> {
+    use cairn_store::projections::EvalRunReadModel;
+    match EvalRunReadModel::get(state.runtime.store.as_ref(), eval_run_id).await {
+        Ok(Some(rec))
+            if tenant_scope.is_admin || rec.project.tenant_id == *tenant_scope.tenant_id() =>
+        {
+            Ok(Some(rec))
+        }
+        Ok(_) => Ok(None),
+        Err(err) => Err(store_error_response(err)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Event helpers
 // ---------------------------------------------------------------------------

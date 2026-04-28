@@ -232,7 +232,10 @@ async fn eval_and_graph_routes_round_trip() {
         "test-token".to_string(),
         AuthPrincipal::Operator {
             operator_id: OperatorId::new("test_op"),
-            tenant: TenantKey::new("tenant_http"),
+            // Match the tenant used by resources created below so the
+            // per-handler TenantScope check (#405) doesn't 404 the
+            // operator on its own eval runs.
+            tenant: TenantKey::new("tenant_acme"),
         },
     );
 
@@ -342,7 +345,10 @@ async fn eval_trend_and_winner_routes_return_best_run() {
         "eval-trend-token".to_string(),
         AuthPrincipal::Operator {
             operator_id: OperatorId::new("test_op"),
-            tenant: TenantKey::new("tenant_http"),
+            // Match `tenant_acme` so the per-handler TenantScope
+            // check (#405) doesn't 404 the operator on its own eval
+            // runs.
+            tenant: TenantKey::new("tenant_acme"),
         },
     );
 
@@ -558,7 +564,10 @@ async fn eval_report_and_export_routes_cover_improving_runs() {
         "eval-report-token".to_string(),
         AuthPrincipal::Operator {
             operator_id: OperatorId::new("test_op"),
-            tenant: TenantKey::new("tenant_http"),
+            // Match `tenant_acme` so the per-handler TenantScope
+            // check (#405) doesn't 404 the operator on its own eval
+            // runs.
+            tenant: TenantKey::new("tenant_acme"),
         },
     );
 

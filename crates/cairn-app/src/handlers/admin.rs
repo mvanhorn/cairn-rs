@@ -1205,6 +1205,13 @@ pub(crate) async fn revoke_workspace_share_handler(
 
 // ── Credentials ──────────────────────────────────────────────────────────────
 
+/// Upper bound for `plaintext_value`. API keys/secrets across
+/// supported providers (OpenAI, Anthropic, Bedrock signed tokens,
+/// Vertex service accounts JSON) sit well under 4 KiB. A caller that
+/// submits more has almost certainly mis-pasted the value — reject
+/// early rather than encrypt a 4 KiB garbage string and burn storage.
+const MAX_PLAINTEXT_VALUE_LEN: usize = 4096;
+
 pub(crate) async fn store_credential_handler(
     State(state): State<Arc<AppState>>,
     _role: AdminRoleGuard,
@@ -1213,6 +1220,22 @@ pub(crate) async fn store_credential_handler(
 ) -> impl IntoResponse {
     if let Some(denied) = require_feature(&state.config, CREDENTIAL_MANAGEMENT) {
         return denied;
+    }
+    // Closes #403: validation before any credential work. Empty
+    // provider_id / plaintext_value and oversized plaintext_value
+    // were previously 201-accepted, leading to a tenant accumulating
+    // unusable or suspicious credential rows.
+    if body.provider_id.trim().is_empty() {
+        return validation_error_response("provider_id must not be empty");
+    }
+    if body.plaintext_value.is_empty() {
+        return validation_error_response("plaintext_value must not be empty");
+    }
+    if body.plaintext_value.len() > MAX_PLAINTEXT_VALUE_LEN {
+        return validation_error_response(format!(
+            "plaintext_value exceeds {MAX_PLAINTEXT_VALUE_LEN} bytes (got {})",
+            body.plaintext_value.len()
+        ));
     }
     let tenant = TenantId::new(tenant_id);
     let provider_id = body.provider_id.clone();
@@ -1354,6 +1377,11 @@ pub(crate) async fn create_operator_profile_handler(
 
 pub(crate) async fn list_operator_profiles_handler(
     State(state): State<Arc<AppState>>,
+    // Closes #404 negative-path: the /v1/admin/* prefix signals
+    // admin-only. Operator profiles are roster-sensitive (operator
+    // ids, display names, permissions) — non-admins, including
+    // same-tenant operators, must not list.
+    _role: AdminRoleGuard,
     Path(tenant_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {

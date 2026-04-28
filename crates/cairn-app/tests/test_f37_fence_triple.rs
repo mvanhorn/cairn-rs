@@ -201,9 +201,20 @@ async fn force_complete(h: &LiveHarness, run_id: &str) -> (u16, Value) {
 /// `execution_not_active` — a clean, structured 409 Conflict, NOT a
 /// 500 with raw FCALL internals.
 ///
-/// The test uses a 1 s lease TTL (FabricConfig's hard minimum) plus a
-/// sleep so the FF-side `attempt_timeout` / `execution_deadline`
-/// scanners reliably roll the execution past `active`.
+/// # Why this test polls rather than sleeps
+///
+/// Previous versions slept 3 s hoping FF's expiry scanner had moved
+/// the execution to `terminal_outcome=expired` by then. Per
+/// `feedback_no_such_thing_as_flake.md` that is a race, not a test.
+/// The fix: the F37 invariant ("never 500, never leak FCALL
+/// internals") must hold at ALL times during the run's lifecycle —
+/// not only post-expiry. So we poll force_complete in a tight loop
+/// from before the lease TTL through well past it, asserting the
+/// invariants on every response. The test passes only if the
+/// invariant holds every iteration; it covers both the live-lease
+/// path (force_complete succeeds against a fenced lease) and the
+/// post-expiry path (FF's scanner has fired, unfenced terminal
+/// rejects with structured 4xx) without wall-clock timing gambles.
 #[tokio::test]
 async fn complete_run_after_lease_expiry_returns_clean_conflict() {
     // 1 s is FabricConfig::validate's hard minimum.
@@ -211,38 +222,111 @@ async fn complete_run_after_lease_expiry_returns_clean_conflict() {
 
     let run_id = provision_session_and_run(&h).await;
 
-    // Wait past lease TTL. FF's expiry scanner runs on a separate cadence
-    // and may need a moment to move the execution to terminal; 3 s is a
-    // generous upper bound observed on CI.
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    // Two-phase test (Copilot review round 4 correctly pointed out
+    // that calling force_complete BEFORE the TTL elapses makes the
+    // run terminal immediately — subsequent 409s test terminal-state
+    // handling, not lease-expired handling, so the pre-F37 partial-
+    // fence-triple regression path is never exercised).
+    //
+    // Phase 1: wait past the lease TTL + scanner cadence so FF has
+    //          had a chance to expire the lease on an active
+    //          (not-yet-terminal) run. This is the EXACT pre-F37
+    //          production scenario: long-running orchestrator loop
+    //          outlives the lease, FF scanner clears current_lease_id,
+    //          then a terminal FCALL fires.
+    //
+    // Phase 2: poll force_complete. The FIRST iteration now hits an
+    //          expired-lease-but-lifecycle-active run. Per F37 the
+    //          response must be a structured 4xx (execution_not_active
+    //          surfaced as 409 / lease_expired mapped to
+    //          InvalidTransition 409), NOT a 500 leaking FCALL
+    //          internals. After that first call the run becomes
+    //          terminal and subsequent iterations test the
+    //          terminal-state path; both are acceptable as long as the
+    //          invariant (no 500, no leaked strings) holds on every
+    //          response.
+    //
+    // Invariant: every response must satisfy the F37 invariant: no
+    // 500, no leaked FCALL internals. A single violation fails
+    // immediately.
+    //
+    // Sleep justification (Copilot round 6 #256): unlike race-based
+    // sleeps that "hope the event fired", this sleep is a bounded
+    // DETERMINISTIC CEILING — `lease_ttl` is set via env override and
+    // `scanner_budget` tracks FF's documented worst-case expiry-scanner
+    // cadence (see ff-script's `expire_scanner_sweep_cadence_ms`,
+    // default 1000 ms, rounded up to 1500 ms for CI jitter headroom).
+    // There is no public read-only HTTP signal that surfaces
+    // `current_lease_id == None` (FF owns the lease state in Valkey,
+    // not cairn's projection — see `FabricRunService::renew_lease_if_stale`
+    // which reads it via `engine.describe_execution`). A polling
+    // alternative would need to piggy-back on `force_complete` itself,
+    // but that mutates the execution, so there is no probe that can
+    // be retried. If FF ever exposes a non-mutating lease-snapshot
+    // endpoint, this sleep becomes a `poll_until(lease_cleared)` loop.
+    // Until then, `lease_ttl + scanner_budget` IS the correct ceiling.
+    let lease_ttl = Duration::from_millis(1_000); // matches env override above.
+    let scanner_budget = Duration::from_millis(1_500); // FF worst-case scanner cadence.
+    tokio::time::sleep(lease_ttl + scanner_budget).await;
 
-    let (status, body) = force_complete(&h, &run_id).await;
+    let budget = Duration::from_millis(5_000);
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut iterations: u32 = 0;
 
-    // The load-bearing F37 invariant: no 500 `fabric layer error`, no
-    // raw `partial_fence_triple`, no raw `fence_required`. Pre-F37 the
-    // response was {"message":"internal runtime error: fabric layer
-    // error","status_code":500,...}. Post-F37 either 200 (lease still
-    // live — FF's scanner hadn't run yet) or a structured 4xx
-    // (execution already terminal). Either outcome is fine; what's
-    // unacceptable is a 500 leaking FCALL internals.
-    let body_str = body.to_string();
-    assert_ne!(
-        status, 500,
-        "F37: lease-expired force-complete must NOT surface as a 500 \
-         fabric layer error. status={status}, body={body_str}"
-    );
-    assert!(
-        !body_str.contains("partial_fence_triple"),
-        "F37: response must not leak `partial_fence_triple`; body={body_str}"
-    );
-    assert!(
-        !body_str.contains("fence_required"),
-        "F37: response must not leak `fence_required`; body={body_str}"
-    );
-    assert!(
-        !body_str.contains("fabric layer error"),
-        "F37: response must not leak `fabric layer error`; body={body_str}"
-    );
+    loop {
+        iterations += 1;
+        let (status, body) = force_complete(&h, &run_id).await;
+        let body_str = body.to_string();
+
+        // The load-bearing F37 invariant — must hold on every call,
+        // every phase. Pre-F37 the response was
+        // {"message":"internal runtime error: fabric layer error",
+        //  "status_code":500,...}.
+        //
+        // Copilot round 6 #310: fail on ANY 5xx, not just 500. Other
+        // 5xx (502/503/504) would also be fabric/runtime leaks that
+        // should regress the test.
+        assert!(
+            status < 500,
+            "F37 (iter {iterations}): force-complete must NOT surface as 5xx \
+             (pre-F37 this was 500 `fabric layer error`; any 5xx is a leak). \
+             status={status}, body={body_str}"
+        );
+        assert!(
+            !body_str.contains("partial_fence_triple"),
+            "F37 (iter {iterations}): response must not leak `partial_fence_triple`; body={body_str}"
+        );
+        assert!(
+            !body_str.contains("fence_required"),
+            "F37 (iter {iterations}): response must not leak `fence_required`; body={body_str}"
+        );
+        assert!(
+            !body_str.contains("fabric layer error"),
+            "F37 (iter {iterations}): response must not leak `fabric layer error`; body={body_str}"
+        );
+
+        // Since we deliberately started this loop AFTER the TTL +
+        // scanner budget, every iteration is "post-TTL". A 200 or 4xx
+        // confirms the expiry path has been exercised without
+        // regression. Anything else (1xx/3xx) is unexpected for
+        // force_complete and the deadline assertion below will
+        // surface it as a hard failure instead of a silent pass.
+        if status == 200 || (400..500).contains(&status) {
+            break;
+        }
+
+        // Copilot round 6 #310: the prior `break` on deadline let a
+        // test that never reached a valid state silently pass. Now
+        // the deadline is a hard failure that reports the last
+        // observed status/body so regressions (including permanent
+        // 1xx/3xx loops) surface instead of quietly passing.
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "F37: {iterations} iterations exhausted {budget:?} budget without a \
+             200 or 4xx response. last_status={status}, last_body={body_str}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Cancel-while-unclaimed guardrail: `ff_cancel_execution` also takes

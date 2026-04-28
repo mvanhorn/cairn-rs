@@ -28,8 +28,21 @@
 //!
 //! These cover counter + histogram + gauge; enough to catch silent
 //! drift if FF renames or removes these metrics in a future version.
+//!
+//! # Deterministic timing (fixes #401)
+//!
+//! Previous version slept 2 s hoping FF's scanner had ticked at least
+//! once by then. Per `feedback_no_such_thing_as_flake.md` bare sleeps
+//! before a projection-level read are races. We poll instead: scrape
+//! /metrics repeatedly with 100 ms step and 10 s ceiling, break on
+//! first response that contains all three expected FF metric names.
+//! On a healthy run the first scan after scanner boot (~750 ms) has
+//! them; pathological CI nodes get up to 10 s before the test fails
+//! loudly.
 
 mod support;
+
+use std::time::Duration;
 
 use support::live_fabric::LiveHarness;
 
@@ -37,52 +50,77 @@ use support::live_fabric::LiveHarness;
 async fn metrics_endpoint_exposes_ff_metrics() {
     let h = LiveHarness::setup().await;
 
-    // FF's fastest scanner (delayed_promoter) ticks at 750 ms; scanner
-    // cycles record into `ff_scanner_cycle_total` unconditionally.
-    // Wait past one tick so the registry holds at least one sample —
-    // otherwise an over-eager scrape races the first cycle and misses
-    // the sample lines (HELP/TYPE alone aren't enough for a useful
-    // regression guard against silent metric-name drift).
-    tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
-
-    let res = h
-        .client()
-        .get(format!("{}/metrics", h.base_url))
-        .send()
-        .await
-        .expect("/metrics endpoint reachable");
-    assert_eq!(res.status().as_u16(), 200, "/metrics returns 200");
-    let ct = res
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    assert!(
-        ct.starts_with("text/plain"),
-        "prometheus exposition is text/plain, got {ct:?}"
-    );
-    let body = res.text().await.expect("body");
-
-    // Cairn's own metrics must still be present — the bridge augments,
-    // never replaces.
-    assert!(
-        body.contains("http_requests_total"),
-        "cairn's http_requests_total still present: {body}"
-    );
-
-    // FF metrics that must land on /metrics. Names per
-    // ff-observability 0.3.2 `real.rs` `mod name`, with OTEL's
-    // Prometheus-exporter suffix rules applied (`_total` for counters,
-    // `_seconds` for `unit="s"`).
-    for expected in [
+    // FF metrics we must see on /metrics. Names per ff-observability
+    // 0.3.2 `real.rs` `mod name`, with OTEL's Prometheus-exporter
+    // suffix rules applied (`_total` for counters, `_seconds` for
+    // `unit="s"`).
+    let required: [&str; 3] = [
         "ff_scanner_cycle_total",
         "ff_scanner_cycle_duration_seconds",
         "ff_cancel_backlog_depth",
-    ] {
+    ];
+
+    // Poll /metrics with 100 ms step + 10 s ceiling. FF's fastest
+    // scanner (delayed_promoter) ticks at 750 ms, so in a healthy run
+    // the first scrape after ~800 ms carries all three names. We
+    // break early on success.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(10_000);
+    let mut iterations: u32 = 0;
+
+    loop {
+        iterations += 1;
+        let res = h
+            .client()
+            .get(format!("{}/metrics", h.base_url))
+            .send()
+            .await
+            .expect("/metrics endpoint reachable");
+        let last_status = res.status().as_u16();
+        let last_ct = res
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let last_body = res.text().await.expect("body");
+
+        // Content-type / cairn-native metric must always be present.
+        // An /metrics outage is a handler bug, not a scanner race —
+        // fail fast rather than letting the loop time out.
+        assert_eq!(last_status, 200, "/metrics returns 200");
         assert!(
-            body.contains(expected),
-            "FF metric `{expected}` expected in /metrics body; got:\n{body}"
+            last_ct.starts_with("text/plain"),
+            "prometheus exposition is text/plain, got {last_ct:?}"
         );
+        assert!(
+            last_body.contains("http_requests_total"),
+            "cairn's http_requests_total still present: {last_body}"
+        );
+
+        if required.iter().all(|name| last_body.contains(name)) {
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let missing: Vec<&str> = required
+                .iter()
+                .copied()
+                .filter(|name| !last_body.contains(name))
+                .collect();
+            panic!(
+                "FF metric(s) {missing:?} absent from /metrics after {iterations} polls \
+                 over 10 s (last status={last_status}, ct={last_ct:?}). Body tail:\n{}",
+                // Tail so the panic message stays bounded on very long exposition.
+                last_body
+                    .chars()
+                    .rev()
+                    .take(4_000)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

@@ -308,26 +308,44 @@ async fn orchestrate(h: &LiveHarness, run_id: &str, goal: &str) -> (u16, Value) 
 /// provider returns `complete_run`, terminal FCALL fires, run reaches
 /// `Completed`. No pre-fix difference here.
 ///
-/// Sleep 3 s: FF's lease-expiry scanner clears `current_lease_id` on
-/// the execution. The run projection is already `Completed` from the
-/// first call, but the secondary `orchestrate` must still be idempotent
-/// across an expired lease — re-calling the endpoint on a completed
-/// run is a no-op that returns `termination == "completed"`, and this
-/// path must NOT hit `lease_expired` on entry. That is what F51 fixes:
-/// pre-fix, the handler's entry-time `ensure_active` would short-circuit
-/// (the lease was non-None when it was claimed) and any downstream
-/// FCALL would reject.
+/// # Why this test polls rather than sleeps 3 s
 ///
-/// Post-fix assertion: second orchestrate call is either a clean 200
-/// with terminal state (because the run already completed — the
-/// handler observes terminal run state before entering the loop) or a
-/// 409 InvalidTransition on a terminal run. Both are operator-friendly.
-/// What must NOT happen is a `termination == "failed"` with a raw
-/// `lease_expired` reason.
+/// Previous versions slept 3 s hoping FF's lease-expiry scanner had
+/// cleared `current_lease_id` by then. Per
+/// `feedback_no_such_thing_as_flake.md` bare sleeps before an
+/// assertion are races. The F51 invariant ("second orchestrate after
+/// a TTL gap must return 200/409 and must not leak `lease_expired`")
+/// is monotonic once the run has completed: the run is terminal, the
+/// handler's entry projection read sees that, and all subsequent
+/// orchestrate calls short-circuit through the same terminal-state
+/// reply. That means the invariant must hold on the SECOND call AND
+/// every call after, whether or not the scanner has fired. So we
+/// poll — drive repeated orchestrate calls from immediately after
+/// the first completion through well past the TTL, asserting on
+/// every response. The loop exits when time has elapsed past the
+/// scanner's worst-case cadence; a single invariant violation fails
+/// the test immediately.
+///
+/// Post-fix acceptable outcomes (every iteration — both preserve
+/// the operator-friendly cairn-mapped error shape, neither leaks FF
+/// internals):
+///
+///   * 200 with `termination == "completed"` — the handler's entry
+///     re-read projection sees the run already terminal, and
+///     short-circuits back through the completed path.
+///   * 409 `InvalidTransition` — the run is terminal and this
+///     orchestrate is rejected cleanly before the loop runs.
+///
+/// Unacceptable at any point: 5xx, `termination == "failed"` with
+/// any reason mentioning `lease_expired`, or any body that leaks
+/// the raw classifier text. Pre-F51 this test would hit
+/// `{"termination":"failed", "reason":"... lease_expired ..."}`
+/// on the poll past the TTL.
 #[tokio::test]
 async fn orchestrate_after_ttl_gap_recovers_via_reclaim() {
-    // 2 s: above FabricConfig's 1000 ms minimum, and short enough that
-    // a 3 s sleep reliably trips the TTL on CI.
+    // 2 s: above FabricConfig's 1000 ms minimum. Short enough that
+    // the poll loop below covers well past the TTL within a 5 s
+    // budget.
     let h = LiveHarness::setup_with_env(&[("CAIRN_FABRIC_LEASE_TTL_MS", "2000")]).await;
     let (mock_url, hits) = spawn_mock().await;
 
@@ -348,59 +366,93 @@ async fn orchestrate_after_ttl_gap_recovers_via_reclaim() {
     );
     assert_eq!(hits.load(Ordering::SeqCst), 1, "one provider hit on turn 1");
 
-    // Sleep well past the 2s TTL so FF's scanner clears the lease
-    // between calls. 3s is the same upper bound F37's `lease_expiry`
-    // regression test uses; CI-reliable.
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
-
-    // Second orchestrate on the same (now terminal, lease-expired) run.
-    // Pre-F51 the handler's entry-time FCALL plumbing could surface
-    // `lease_expired` when `ensure_active` or a downstream projection
-    // read touched the FF execution. The F51 fix's renewal helper is
-    // the backstop; on a terminal run the handler's Pending → Running
-    // guard short-circuits first, and the response is a structured
-    // terminal-state reply rather than a `lease_expired` failure.
-    let (status, body) = orchestrate(&h, &run_id, "Answer again.").await;
-
-    // Post-fix acceptable outcomes (both preserve the operator-friendly
-    // cairn-mapped error shape, neither leaks FF internals):
+    // Poll the second orchestrate across the lease-TTL window. We
+    // want to cover BOTH the pre-expiry phase (scanner hasn't cleared
+    // the lease yet) AND the post-expiry phase (lease cleared) on
+    // the same terminal run. The F51 invariant must hold every call.
     //
-    //   * 200 with `termination == "completed"` — the handler's entry
-    //     re-read projection sees the run already terminal, and
-    //     short-circuits back through the completed path.
-    //   * 409 `InvalidTransition` — the run is terminal and the second
-    //     orchestrate is rejected cleanly before the loop runs.
-    //
-    // Unacceptable: 5xx, `termination == "failed"` with any reason
-    // mentioning `lease_expired`, or any body that leaks the raw
-    // classifier text. Pre-F51 this test would hit
-    // `{"termination":"failed", "reason":"... lease_expired ..."}`.
-    let body_str = body.to_string();
-    assert!(
-        status == 200 || status == 409,
-        "F51: orchestrate after TTL gap must return 200 or 409 (terminal-run \
-         short-circuit), got status={status}; body={body_str}"
-    );
-    if status == 200 {
-        let term = body
-            .get("termination")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<missing>");
-        assert_eq!(
-            term, "completed",
-            "F51: 200-response second orchestrate must carry \
-             termination=completed (run is already terminal); body={body_str}"
+    // Budget is an upper bound, not a floor: the loop breaks the
+    // instant it has observed at least one valid response AFTER
+    // `lease_ttl + scanner_headroom` has elapsed (i.e. the expiry
+    // path has definitely been exercised). On healthy runs that's
+    // ~4 iterations. The 5 s deadline only fires if FF's scanner is
+    // misbehaving, and in that case we fail hard rather than silently
+    // succeed. The provider mock was set to 1 hit on turn 1 —
+    // subsequent orchestrate calls on the terminal run must NOT spawn
+    // additional provider hits, which we assert at the end to catch
+    // a regression where the handler re-enters the loop after an
+    // expired lease.
+    let lease_ttl = Duration::from_millis(2_000); // matches env override above.
+    let scanner_headroom = Duration::from_millis(1_500); // FF worst-case scanner cadence.
+    let post_expiry_threshold = lease_ttl + scanner_headroom;
+    let budget = Duration::from_millis(5_000);
+    let start = tokio::time::Instant::now();
+    let deadline = start + budget;
+    let mut iterations: u32 = 0;
+    let mut post_expiry_observation = false;
+
+    loop {
+        iterations += 1;
+        let (status, body) = orchestrate(&h, &run_id, "Answer again.").await;
+        let body_str = body.to_string();
+
+        assert!(
+            status == 200 || status == 409,
+            "F51 (iter {iterations}): orchestrate must return 200 or 409 \
+             (terminal-run short-circuit), got status={status}; body={body_str}"
         );
+        if status == 200 {
+            let term = body
+                .get("termination")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>");
+            assert_eq!(
+                term, "completed",
+                "F51 (iter {iterations}): 200-response orchestrate must carry \
+                 termination=completed (run is already terminal); body={body_str}"
+            );
+        }
+        assert!(
+            !body_str.contains("lease_expired"),
+            "F51 (iter {iterations}): response must not leak `lease_expired` \
+             across an inter-call TTL gap; body={body_str}"
+        );
+        assert!(
+            !body_str.contains("lease expired before cairn could write"),
+            "F51 (iter {iterations}): response must not leak the raw \
+             lease_expired classifier message; body={body_str}"
+        );
+
+        // Break the instant we've observed a valid response after
+        // the lease-TTL + scanner-headroom window. Any iteration
+        // past that point proves the post-expiry path fired
+        // without regression; paying the full 5 s budget on every
+        // green run is wasted CI time.
+        if start.elapsed() >= post_expiry_threshold {
+            post_expiry_observation = true;
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
     assert!(
-        !body_str.contains("lease_expired"),
-        "F51: response must not leak `lease_expired` across an \
-         inter-call TTL gap; body={body_str}"
+        post_expiry_observation,
+        "F51: orchestrate poll loop hit {budget:?} deadline ({iterations} iterations) \
+         without ever reaching post-expiry window ({post_expiry_threshold:?}) — \
+         harness or endpoint unresponsive"
     );
-    assert!(
-        !body_str.contains("lease expired before cairn could write"),
-        "F51: response must not leak the raw lease_expired classifier \
-         message across an inter-call TTL gap; body={body_str}"
+    // No extra provider hits across the whole poll window: the
+    // handler's short-circuit sees the run is terminal and never
+    // re-enters the loop. A regression where `ensure_active`
+    // re-takes the lease and runs the provider again would trip this.
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "F51: poll loop ran {iterations} orchestrate calls on a terminal run; \
+         provider must have been hit exactly once (on turn 1)"
     );
 }
 

@@ -26,6 +26,8 @@ use std::sync::Arc;
 
 use cairn_api::http::ListResponse;
 
+use crate::extractors::TenantScope;
+use crate::helpers::load_eval_run_visible_to_tenant;
 use crate::{
     bad_request_response, parse_eval_subject_kind, require_feature, runtime_error_response,
     store_error_response, AppApiError, AppState, OptionalProjectScopedQuery, ProjectScopedQuery,
@@ -416,12 +418,35 @@ pub(crate) async fn get_eval_run_handler(
 /// cross-project runs return 404.
 pub(crate) async fn delete_eval_run_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Query(query): Query<OptionalProjectScopedQuery>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let eval_run_id = EvalRunId::new(id);
-    let project_key = query.project();
-    let project_id_domain = ProjectId::new(project_key.project_id.as_str());
+
+    // Closes #405: tenant-scope check FIRST — before any per-project
+    // comparison. The projection carries the canonical `ProjectKey`;
+    // the query params are caller-supplied and untrusted.
+    let record =
+        match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                    .into_response();
+            }
+            Err(response) => return response,
+        };
+
+    // `record.project` is the canonical ProjectKey (from the
+    // projection); the query params are untrusted and only used to
+    // validate the caller knew the correct scope. Copilot review
+    // round 3 correctly flagged that using the query-derived
+    // `project_key` to build the EvalRunArchived event let an admin
+    // accidentally emit the wrong `project` ownership via a
+    // mismatched query. Canonical scope is the projection's; query
+    // is an extra belt-and-suspenders check.
+    let canonical_project = record.project.clone();
+    let query_project = query.project();
 
     let existing = match state.evals.get(&eval_run_id) {
         Some(run) => run,
@@ -431,10 +456,18 @@ pub(crate) async fn delete_eval_run_handler(
         }
     };
 
-    // Enforce project ownership: an id collision across projects is a
-    // tenant-isolation bug (see `create_eval_run_handler`); a DELETE from
-    // the wrong scope must not silently archive another project's run.
-    if existing.project_id != project_id_domain {
+    // Enforce project ownership on THREE surfaces so a mismatch
+    // between the in-memory service, the projection, and the
+    // caller-supplied query all 404 the request:
+    //   (1) in-memory service `state.evals` project_id vs canonical
+    //   (2) caller-supplied query ProjectKey must match canonical in
+    //       FULL (tenant + workspace + project), not just project_id
+    //   (3) load helper already rejected tenant mismatches above
+    if existing.project_id != canonical_project.project_id
+        || query_project.tenant_id != canonical_project.tenant_id
+        || query_project.workspace_id != canonical_project.workspace_id
+        || query_project.project_id != canonical_project.project_id
+    {
         return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
             .into_response();
     }
@@ -472,7 +505,13 @@ pub(crate) async fn delete_eval_run_handler(
         )),
         EventSource::Runtime,
         cairn_domain::RuntimeEvent::EvalRunArchived(cairn_domain::events::EvalRunArchived {
-            project: project_key,
+            // Use the projection-canonical ProjectKey, not the
+            // caller-supplied one — admins can bypass the tenant
+            // check but MUST NOT be able to emit an ownership event
+            // under the wrong scope (would pollute the audit trail
+            // + downstream per-tenant projections). Copilot review
+            // round 3 flagged this path.
+            project: canonical_project.clone(),
             eval_run_id: eval_run_id.clone(),
             archived_at: now,
         }),
@@ -881,9 +920,24 @@ pub(crate) async fn create_eval_run_handler(
 
 pub(crate) async fn start_eval_run_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.evals.start_run(&EvalRunId::new(id)) {
+    let eval_run_id = EvalRunId::new(id);
+    // Closes #405: cross-tenant mutation leak. Prior to this PR the
+    // handler loaded the run straight out of `state.evals` by id
+    // alone, so any authenticated operator could start / complete /
+    // score / delete an eval run owned by any tenant. Projection-
+    // backed visibility check mirrors `cancel_run_handler`.
+    match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                .into_response();
+        }
+        Err(response) => return response,
+    }
+    match state.evals.start_run(&eval_run_id) {
         Ok(run) => (StatusCode::OK, Json(run)).into_response(),
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
             .into_response(),
@@ -892,12 +946,22 @@ pub(crate) async fn start_eval_run_handler(
 
 pub(crate) async fn complete_eval_run_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
     Json(body): Json<CompleteEvalRunRequest>,
 ) -> impl IntoResponse {
+    let eval_run_id = EvalRunId::new(id);
+    match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                .into_response();
+        }
+        Err(response) => return response,
+    }
     match state
         .evals
-        .complete_run(&EvalRunId::new(id), body.metrics, body.cost)
+        .complete_run(&eval_run_id, body.metrics, body.cost)
     {
         Ok(run) => (StatusCode::OK, Json(run)).into_response(),
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
@@ -907,10 +971,20 @@ pub(crate) async fn complete_eval_run_handler(
 
 pub(crate) async fn score_eval_run_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
     Json(body): Json<ScoreEvalRunRequest>,
 ) -> impl IntoResponse {
-    match state.evals.record_score(&EvalRunId::new(id), body.metrics) {
+    let eval_run_id = EvalRunId::new(id);
+    match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                .into_response();
+        }
+        Err(response) => return response,
+    }
+    match state.evals.record_score(&eval_run_id, body.metrics) {
         Ok(run) => (StatusCode::OK, Json(run)).into_response(),
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
             .into_response(),

@@ -95,6 +95,72 @@ jf() { printf '%s' "$_BODY" | python3 -c \
 jlen() { printf '%s' "$_BODY" | python3 -c \
   "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0; }
 
+# wait_until LABEL PATH NEEDLE [TIMEOUT_MS]
+#
+# Deterministically poll GET <PATH> until the response body contains
+# NEEDLE (a plain substring match, same shape as `grep -q`). Uses
+# exponential-ish backoff (10/25/50/100/200/500 ms) capped at 500 ms,
+# up to TIMEOUT_MS (default 3000) total. Exits 0 on match, 1 on
+# timeout (with a log_fail). Replaces bare `sleep N` before a read —
+# per the "no flake" principle: we wait for the event we care about,
+# not a wall-clock guess.
+#
+# Copilot round 6 #136: budget is enforced against REAL wall-clock
+# elapsed (via `date +%s%3N`), not cumulative `waited_ms += step_ms`,
+# because `api` shells out to curl which burns its own time (up to
+# `--max-time` per call). Summing sleep-only steps under-counts actual
+# elapsed by the curl round-trip on every iteration and lets
+# `wait_until` blow past its TIMEOUT_MS budget when the server is
+# slow — exactly the scenario the timeout was meant to bound. Per-poll
+# curl is additionally capped at 1 s so a single hung request can't
+# run out the whole budget.
+#
+# Leaves $_HTTP / $_BODY set to the final poll's response so the
+# following `chk` can log status cleanly without re-fetching.
+wait_until() {
+  local label="$1" path="$2" needle="$3" timeout_ms="${4:-3000}"
+  local step_ms=10
+  # Real wall-clock start in ms. `date +%s%3N` works on GNU coreutils;
+  # the python3 fallback matches the same encoding for BSD/macOS.
+  local start_ms
+  start_ms=$(date +%s%3N 2>/dev/null || python3 -c "import time;print(int(time.time()*1000))")
+  # Per-poll curl cap: 1 s is far below the 3 s default budget and
+  # prevents one hung request from eating the whole window. `local`
+  # relies on bash's dynamic scoping so `api`'s `--max-time "$TIMEOUT"`
+  # reads this override while we're inside `wait_until`, then the
+  # caller's value is restored automatically on return.
+  local TIMEOUT=1
+  while true; do
+    api GET "$path"
+    # `-F` → fixed string (never interpret as regex). `--` → `$needle`
+    # can't be mis-parsed as a flag if it ever starts with `-`.
+    # `printf '%s'` instead of `echo` so bodies that start with `-n` /
+    # `-e` or contain backslash escapes don't get re-interpreted.
+    if [ "$_HTTP" = "200" ] && printf '%s' "$_BODY" | grep -F -q -- "$needle"; then
+      return 0
+    fi
+    local now_ms waited_ms
+    now_ms=$(date +%s%3N 2>/dev/null || python3 -c "import time;print(int(time.time()*1000))")
+    waited_ms=$(( now_ms - start_ms ))
+    if [ "$waited_ms" -ge "$timeout_ms" ]; then
+      log_fail "$label (projection did not surface '$needle' within ${timeout_ms}ms; waited=${waited_ms}ms; last HTTP=$_HTTP)"
+      [ -n "$_BODY" ] && echo -e "     ${RED}${_BODY:0:160}${RST}" >&2
+      return 1
+    fi
+    # Fractional-second sleep. `sleep` on GNU coreutils and BSD
+    # accepts fractions ("0.025"); POSIX /bin/sh does not. We shell
+    # out to python3 (already a hard dep of `jf`/`jlen` above) so
+    # the value parses consistently across locales and any shell
+    # that exposes `sleep`.
+    sleep "$(python3 -c "print($step_ms/1000)" 2>/dev/null || echo 0.05)"
+    # Exponential-ish growth capped at 500ms: 10→25→50→100→200→500→500…
+    if [ "$step_ms" -lt 500 ]; then
+      step_ms=$(( step_ms * 5 / 2 ))
+      [ "$step_ms" -gt 500 ] && step_ms=500
+    fi
+  done
+}
+
 # =============================================================================
 SUITE_START=$(date +%s%3N 2>/dev/null || python3 -c "import time;print(int(time.time()*1000))")
 echo -e "${BLD}cairn smoke test${RST}" >&2
@@ -218,9 +284,15 @@ SOURCE="{\"source_type\":\"runtime\"}"
 chk "POST /v1/events/append (TaskCreated)" 201 POST /v1/events/append \
   "[{\"event_id\":\"evt_t_${RUN_ID}\",\"source\":${SOURCE},\"ownership\":${OWNERSHIP},\"causation_id\":null,\"correlation_id\":null,\"payload\":{\"event\":\"task_created\",\"project\":${PROJECT},\"task_id\":\"${TASK_ID}\",\"parent_run_id\":\"${RUN_ID}\",\"parent_task_id\":null,\"prompt_release_id\":null}}]"
 
-sleep 0.4
-
-chk "GET /v1/tasks" 200 GET "/v1/tasks?tenant_id=default&workspace_id=default&project_id=default"
+# Poll until the TaskCreated event surfaces through the /v1/tasks
+# projection. events/append returns after the in-process sync but the
+# cross-bridge consumer is eventually-consistent; a bare sleep is a
+# race (see #399).
+wait_until "GET /v1/tasks (task projected)" \
+  "/v1/tasks?tenant_id=default&workspace_id=default&project_id=default" \
+  "$TASK_ID" 3000 \
+  && log_ok "GET /v1/tasks (HTTP $_HTTP, task $TASK_ID visible)" \
+  || true  # wait_until already logged the failure
 
 # =============================================================================
 section "5. Approval workflow"
@@ -228,9 +300,13 @@ section "5. Approval workflow"
 chk "POST /v1/events/append (ApprovalRequested)" 201 POST /v1/events/append \
   "[{\"event_id\":\"evt_a_${RUN_ID}\",\"source\":${SOURCE},\"ownership\":${OWNERSHIP},\"causation_id\":null,\"correlation_id\":null,\"payload\":{\"event\":\"approval_requested\",\"project\":${PROJECT},\"approval_id\":\"${APPR_ID}\",\"run_id\":\"${RUN_ID}\",\"task_id\":null,\"requirement\":\"required\"}}]"
 
-sleep 0.4
-
-chk "GET /v1/approvals/pending" 200 GET /v1/approvals/pending
+# Poll until the ApprovalRequested event surfaces through the
+# /v1/approvals/pending projection (replaces bare sleep 0.4 — #399).
+wait_until "GET /v1/approvals/pending (approval projected)" \
+  "/v1/approvals/pending" \
+  "$APPR_ID" 3000 \
+  && log_ok "GET /v1/approvals/pending (HTTP $_HTTP, approval $APPR_ID visible)" \
+  || true
 
 chk "POST /v1/approvals/:id/resolve" 200 POST \
   "/v1/approvals/${APPR_ID}/resolve" '{"decision":"approved","reason":"smoke"}'
@@ -380,10 +456,13 @@ chk "POST gate run" 201 POST /v1/runs \
 chk "POST event ApprovalRequested (gate)" 201 POST /v1/events/append \
   "[{\"event_id\":\"evt_gate_${RUN_ID}\",\"source\":${SOURCE},\"ownership\":${OWNERSHIP},\"causation_id\":null,\"correlation_id\":null,\"payload\":{\"event\":\"approval_requested\",\"project\":${PROJECT},\"approval_id\":\"${GATE_APPR_ID}\",\"run_id\":\"${GATE_RUN_ID}\",\"task_id\":null,\"requirement\":\"required\"}}]"
 
-sleep 0.4
-
-chk "GET /v1/approvals/pending (gate)" 200 GET \
-  "/v1/approvals/pending?tenant_id=default&workspace_id=default&project_id=default"
+# Poll until the gate approval surfaces in /v1/approvals/pending
+# (replaces bare sleep 0.4 — #399).
+wait_until "GET /v1/approvals/pending (gate projected)" \
+  "/v1/approvals/pending?tenant_id=default&workspace_id=default&project_id=default" \
+  "$GATE_APPR_ID" 3000 \
+  && log_ok "GET /v1/approvals/pending (gate) (HTTP $_HTTP, approval $GATE_APPR_ID visible)" \
+  || true
 
 # Resolve the gate via /v1/approvals/:id/resolve
 chk "POST resolve gate" 200 POST \
@@ -555,6 +634,185 @@ chk "GET /v1/system/info" 200 GET /v1/system/info
 chk2xx "GET /v1/notifications" GET /v1/notifications
 chk "GET /v1/settings" 200 GET /v1/settings
 chk "GET /v1/overview" 200 GET "/v1/overview?tenant_id=default&workspace_id=default&project_id=default"
+
+# =============================================================================
+# Section 25: credential + provider-connection + breaker + webhook sections
+# close audit #398. These are the exact flows ("credential →
+# connection → orchestrate → breaker trip", webhook URL validation)
+# that had been manually dogfood-verified but never smoke-gated, so
+# a regression in any one would previously ship without this script
+# failing. Each section is small, deterministic, and uses HTTP-only
+# assertions so it stays portable across the local/dev/team builds.
+# =============================================================================
+section "25. Credential lifecycle"
+
+# Use a unique provider_id per run to avoid 409-on-rerun when the
+# server is long-lived (e.g. local dev mode). Suffix matches RUN_ID
+# naming so post-mortem logs correlate cleanly.
+CRED_PROVIDER_ID="smoke-cred-${RUN_ID}"
+CRED_TENANT="default_tenant"
+CRED_BODY="{\"provider_id\":\"${CRED_PROVIDER_ID}\",\"plaintext_value\":\"sk-smoke-${RUN_ID}\"}"
+
+# (a) first store → 201 (seeds the tenant cred list)
+chk "POST /v1/admin/tenants/:t/credentials" 201 POST \
+  "/v1/admin/tenants/${CRED_TENANT}/credentials" "$CRED_BODY"
+CRED_ID=$(jf id)
+[ -n "$CRED_ID" ] && log_ok "  credential id=${CRED_ID}" \
+  || log_fail "  credential create body missing id"
+
+# (b) second store same provider_id → 409 credential_exists (#217 regression)
+api POST "/v1/admin/tenants/${CRED_TENANT}/credentials" "$CRED_BODY"
+if [ "$_HTTP" = "409" ]; then
+  CODE=$(jf code)
+  if [ "$CODE" = "credential_exists" ]; then
+    log_ok "POST duplicate /credentials 409 code=credential_exists (#217 closed)"
+  else
+    log_fail "POST duplicate /credentials 409 but code='${CODE}' (expected credential_exists)"
+  fi
+else
+  log_fail "POST duplicate /credentials expected 409, got HTTP $_HTTP"
+fi
+
+# (c) list contains exactly one record for this provider
+chk "GET /v1/admin/tenants/:t/credentials" 200 GET \
+  "/v1/admin/tenants/${CRED_TENANT}/credentials"
+# Pass the provider id through the environment rather than embedded
+# in the Python source so a quote/backslash in the id (real risk
+# once dogfood feeds arbitrary provider names through here) can't
+# inject into the script. The env var is set on the python3 command
+# (not printf) so it actually lands in python's process environ.
+CRED_MATCH=$(printf '%s' "$_BODY" | CRED_PROVIDER_ID="$CRED_PROVIDER_ID" python3 -c \
+  "import sys,json,os; provider_id=os.environ['CRED_PROVIDER_ID']; d=json.load(sys.stdin); items=d.get('items',[]); print(sum(1 for c in items if c.get('provider_id')==provider_id))" 2>/dev/null || echo 0)
+[ "${CRED_MATCH:-0}" = "1" ] \
+  && log_ok "  exactly 1 active credential for provider (no silent accumulation)" \
+  || log_fail "  ${CRED_MATCH:-0} credential rows for provider (expected 1)"
+
+# (d) empty plaintext_value → 422 validation_error (#403 regression)
+api POST "/v1/admin/tenants/${CRED_TENANT}/credentials" \
+  "{\"provider_id\":\"smoke-cred-empty-${RUN_ID}\",\"plaintext_value\":\"\"}"
+if [ "$_HTTP" = "422" ]; then
+  log_ok "POST /credentials empty plaintext 422 (#403 closed)"
+else
+  log_fail "POST /credentials empty plaintext expected 422, got HTTP $_HTTP"
+fi
+
+# =============================================================================
+section "26. Provider connection"
+
+# Create a provider connection that binds to the credential above.
+# Keeps the happy path for the 'credential → connection' flow that
+# audit #398 flagged as un-smoke-gated.
+CONN_ID="smoke-conn-${RUN_ID}"
+CONN_BODY="{\"tenant_id\":\"${CRED_TENANT}\",\"provider_connection_id\":\"${CONN_ID}\",\"provider_family\":\"openai\",\"adapter_type\":\"openai\",\"supported_models\":[\"gpt-4\"],\"credential_id\":\"${CRED_ID}\"}"
+api POST /v1/providers/connections "$CONN_BODY"
+# Accept 201 or 503 (feature-gated-off) — both are sane release states
+if [ "$_HTTP" = "201" ]; then
+  log_ok "POST /v1/providers/connections (HTTP 201 — connection created)"
+  # Confirm the connection appears in the list. GET requires the
+  # tenant_id query param (the TenantScopedQuery extractor 400s
+  # without it).
+  chk "GET /v1/providers/connections" 200 GET \
+    "/v1/providers/connections?tenant_id=${CRED_TENANT}"
+  if printf '%s' "$_BODY" | grep -F -q -- "$CONN_ID"; then
+    log_ok "  connection ${CONN_ID} visible in list"
+  else
+    log_fail "  connection ${CONN_ID} missing from list body"
+  fi
+elif [ "$_HTTP" = "503" ]; then
+  log_skip "POST /v1/providers/connections skipped — MULTI_PROVIDER feature gated off"
+else
+  log_fail "POST /v1/providers/connections (unexpected HTTP $_HTTP)"
+fi
+
+# =============================================================================
+section "27. Webhook validation (SSRF + malformed URL)"
+
+# Closes #398 sub-point + #235 regression: set_operator_notifications
+# must reject malformed webhook targets AND block IMDS / RFC 1918 /
+# loopback unless explicitly allowed. The smoke gate only asserts the
+# validation path fires — we don't assert a delivery.
+
+# (a) malformed webhook URL (not-a-url) → 422 validation_error
+api POST "/v1/admin/operators/smoke_operator_${RUN_ID}/notifications" \
+  "{\"tenant_id\":\"${CRED_TENANT}\",\"event_types\":[\"run_completed\"],\"channels\":[{\"kind\":\"webhook\",\"target\":\"not-a-url\"}]}"
+if [ "$_HTTP" = "422" ]; then
+  log_ok "POST /admin/operators/:id/notifications malformed URL 422 (#235 closed)"
+else
+  log_fail "POST /admin/operators/:id/notifications malformed URL expected 422, got HTTP $_HTTP"
+fi
+
+# (b) SSRF target (IMDS) — strict fail-closed. Per Copilot review
+# round 5: any 2xx is a regression (the gate is meant to block IMDS
+# unconditionally, independent of server env). Success is a 4xx from
+# the validation_error family (400/403/422); anything 2xx means the
+# SSRF check didn't fire. We probe BOTH http and https variants —
+# #451's core risk is scheme-independent, and https://169.254.169.254
+# is the canonical IMDS-theft URL (see webhook_validation.rs tests
+# at lines 708-736 which pin BOTH schemes). A regression that only
+# re-allows the https path would previously have slipped through a
+# http-only smoke probe.
+imds_ssrf_probe() {
+  local scheme="$1" label="$2"
+  api POST "/v1/admin/operators/smoke_operator_ssrf_${scheme}_${RUN_ID}/notifications" \
+    "{\"tenant_id\":\"${CRED_TENANT}\",\"event_types\":[\"run_completed\"],\"channels\":[{\"kind\":\"webhook\",\"target\":\"${scheme}://169.254.169.254/latest/meta-data/\"}]}"
+  # success set: 400/403/422 (validation_error family).
+  # failure set: anything 2xx — IMDS write-through is a #451 regression.
+  if [[ "$_HTTP" =~ ^(400|403|422)$ ]]; then
+    log_ok "POST /admin/operators/:id/notifications ${label} blocked (HTTP $_HTTP — #451 closed)"
+  elif [[ "$_HTTP" =~ ^2[0-9][0-9]$ ]]; then
+    log_fail "POST /admin/operators/:id/notifications ${label} accepted (HTTP $_HTTP) — SSRF gate bypassed, #451 regression. body=${_BODY:0:160}"
+  else
+    log_fail "POST /admin/operators/:id/notifications ${label} unexpected HTTP $_HTTP (expected 400/403/422). body=${_BODY:0:160}"
+  fi
+}
+
+imds_ssrf_probe "http"  "IMDS http:// target"
+imds_ssrf_probe "https" "IMDS https:// target"
+
+# =============================================================================
+section "28. Orchestrator breaker trip"
+
+# Closes #398 sub-point: "orchestrate with low breaker_overrides —
+# verify breaker-trip termination". Drives the breaker logic that
+# would previously ship unverified. We use round_cap=1 because the
+# orchestrator trips `iteration >= round_cap`, so a run bounded at
+# 1 iteration hits the cap immediately even without a live provider.
+#
+# We create a dedicated run so this doesn't collide with the
+# orchestrate-existing-run flow in section 21. Termination must be
+# `breaker_tripped` with `which=round`. If the orchestrator is
+# unavailable (503/502/429), skip — there's no provider configured.
+BRK_SESSION_ID="brk_sess_${RUN_ID}"
+BRK_RUN_ID="brk_run_${RUN_ID}"
+
+chk "POST /v1/sessions (breaker)" 201 POST /v1/sessions \
+  "{\"tenant_id\":\"default\",\"workspace_id\":\"default\",\"project_id\":\"default\",\"session_id\":\"${BRK_SESSION_ID}\"}"
+chk "POST /v1/runs (breaker)" 201 POST /v1/runs \
+  "{\"tenant_id\":\"default\",\"workspace_id\":\"default\",\"project_id\":\"default\",\"session_id\":\"${BRK_SESSION_ID}\",\"run_id\":\"${BRK_RUN_ID}\"}"
+
+# Orchestrate with breaker_overrides: round_cap=1 forces an immediate trip.
+api POST "/v1/runs/${BRK_RUN_ID}/orchestrate" \
+  "{\"goal\":\"breaker smoke\",\"max_iterations\":10,\"timeout_ms\":30000,\"breaker_overrides\":{\"round_cap\":1}}"
+
+if [[ "$_HTTP" =~ ^(200|202)$ ]]; then
+  TERM=$(jf termination)
+  WHICH=$(jf which)
+  # round_cap=1 must trip the Round breaker specifically. A
+  # different `which` value means the overrides weren't honoured
+  # or a different cap tripped first — pin both fields.
+  if [ "$TERM" = "breaker_tripped" ] && [ "$WHICH" = "round" ]; then
+    log_ok "POST orchestrate breaker trip (termination=breaker_tripped, which=round)"
+  else
+    log_fail "POST orchestrate breaker trip: termination='${TERM}', which='${WHICH:-<unset>}' (expected termination=breaker_tripped and which=round). body=${_BODY:0:160}"
+  fi
+elif [[ "$_HTTP" =~ ^(503|502|429)$ ]]; then
+  # 503 = no provider configured; 502/429 = upstream transient. A
+  # genuine 500 is an internal bug signal in the breaker/orchestrate
+  # path — do NOT skip on it (Copilot review #542 round 4).
+  log_skip "Orchestrator breaker trip skipped — no/transient provider (HTTP $_HTTP)"
+else
+  log_fail "POST orchestrate breaker trip (unexpected HTTP $_HTTP — internal error if 500)"
+fi
 
 # =============================================================================
 SUITE_END=$(date +%s%3N 2>/dev/null || python3 -c "import time;print(int(time.time()*1000))")
