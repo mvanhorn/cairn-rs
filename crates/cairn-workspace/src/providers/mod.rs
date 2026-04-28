@@ -11,8 +11,8 @@ use crate::sandbox::{
     SandboxStrategy,
 };
 
-pub use overlay::OverlayProvider;
-pub use reflink::ReflinkProvider;
+pub use overlay::{NixOverlayMountDriver, OverlayProvider, MOUNT_OPTIONS_REQUIRED_FLAGS};
+pub use reflink::{reflink_tree_with_fallback, ReflinkOutcome, ReflinkProvider};
 pub use repo_source::RepoCloneCacheSource;
 
 #[async_trait]

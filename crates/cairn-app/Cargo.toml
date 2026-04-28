@@ -116,7 +116,8 @@ sha2 = "0.10"
 # existing test-only use of source_id encoding.
 percent-encoding = "2"
 
-# metrics-otel: OTLP HTTP/protobuf transport. `opentelemetry-proto`
+# metrics-otel: OTLP HTTP/protobuf transport.
+# Placeholder comment preserved for next-block semantic continuity. `opentelemetry-proto`
 # gives us the generated prost structs (ExportTraceServiceRequest +
 # transitive span types); `prost` supplies the encode/decode traits.
 # Both optional — only compiled when `metrics-otel` is enabled.
@@ -128,9 +129,16 @@ prost = { version = "0.14", optional = true }
 # FabricServices.runtime.partition_config.
 flowfabric = { version = "0.11", optional = true }
 
+# F65 PR-4 sandboxed-agent mode: thin helpers for the confined child binary
+# path. Only pulled in on Linux — non-Linux builds of cairn-app cannot enter
+# sandboxed-agent mode (the confinement primitives don't exist).
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["socket"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util"] }
 http-body-util = "0.1"
+command-fds = "0.3"
 # Opt in to the F30 test-hook module so
 # `tests/test_f30_orchestrator_termination.rs` can reach the crate-
 # private prompt builders without those symbols leaking into the

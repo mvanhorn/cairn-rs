@@ -14,6 +14,8 @@ mod bin_handlers;
 mod bin_health;
 mod bin_providers;
 mod bin_router;
+#[cfg(target_os = "linux")]
+mod bin_sandboxed_agent;
 mod bin_seed;
 mod bin_state;
 mod bin_types;
@@ -355,8 +357,42 @@ async fn flush_state_to_disk(state: &AppState) {
 }
 
 // Demo data seeding → bin_seed.rs
+
+/// F65 PR-4 sandboxed-agent mode entrypoint. Runs BEFORE the tokio runtime
+/// because confinement (close_range + Landlock + seccomp) must happen in a
+/// quiescent process; tokio would spawn blocking-pool threads that each need
+/// to inherit the Landlock ruleset, which only works if we restrict_self
+/// before they start.
+///
+/// Returns `Some(exit_code)` when the mode fires (caller should exit with it);
+/// returns `None` when `--sandboxed-agent` is not in argv so the normal cairn-
+/// app boot path runs.
+#[cfg(target_os = "linux")]
+fn maybe_run_sandboxed_agent(args: &[String]) -> Option<std::process::ExitCode> {
+    match bin_sandboxed_agent::detect_and_parse(args) {
+        None => None,
+        Some(Ok(parsed)) => Some(bin_sandboxed_agent::run(parsed)),
+        Some(Err(err)) => {
+            eprintln!("[sandboxed-agent] bad CLI: {err}");
+            Some(std::process::ExitCode::from(1))
+        }
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    #[cfg(target_os = "linux")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(code) = maybe_run_sandboxed_agent(&args) {
+            return code;
+        }
+    }
+    real_main();
+    std::process::ExitCode::SUCCESS
+}
+
 #[tokio::main]
-async fn main() {
+async fn real_main() {
     // Load .env file if present (dev convenience — not required in production).
     // Silently ignored when the file doesn't exist.
     let _ = dotenvy::dotenv();

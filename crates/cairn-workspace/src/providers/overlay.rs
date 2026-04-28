@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -68,10 +67,52 @@ impl OverlayRepoSource for UnsupportedRepoSource {
     }
 }
 
+/// F65 PR-4 production overlay driver.
+///
+/// Calls `mount(2)` directly via `nix` rather than shelling out to
+/// `/bin/mount`, and hard-codes the three security-critical mount options:
+///
+/// - `metacopy=off` — REQUIRED. Without this flag an untrusted upperdir
+///   (which a sandboxed agent owns) can cause overlayfs to copy metadata
+///   from a lowerdir file while leaving the data pointer on the untrusted
+///   upper, enabling a published CVE class.
+/// - `xino=on` — stable inode numbers across copy-up, needed by tools that
+///   rely on inode identity (git pack detection, compilers, etc).
+/// - `redirect_dir=on` — consistent rename semantics between upper and
+///   merged when a directory is renamed in the sandbox.
+///
+/// The driver assumes the caller has already entered a private mount
+/// namespace via `confinement::namespace::unshare_mount_ns`. If not, the
+/// mount leaks into the host mount table. This precondition is enforced by
+/// the sandboxed-agent spawn path; the driver itself does not attempt to
+/// unshare on every call because `unshare(CLONE_NEWNS)` is idempotent-ish
+/// only in the sense that multiple unshares create stacked namespaces.
 #[derive(Debug, Default)]
-struct SystemOverlayMountDriver;
+pub struct NixOverlayMountDriver;
 
-impl OverlayMountDriver for SystemOverlayMountDriver {
+/// Render the canonical overlay options string. Centralized here so a
+/// regression in the security-critical flags is caught in one place.
+/// Integration test 4 greps `/proc/*/mountinfo` for the flag substrings
+/// after a real provision; the unit test here asserts the format without
+/// needing `CAP_SYS_ADMIN`.
+fn build_overlay_options(lower_dirs: &[PathBuf], upper: &Path, work: &Path) -> String {
+    let lowerdir = lower_dirs
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    format!(
+        "lowerdir={lowerdir},upperdir={},workdir={},xino=on,redirect_dir=on,metacopy=off",
+        upper.display(),
+        work.display()
+    )
+}
+
+/// The substrings every rendered overlay options string MUST contain.
+/// Integration tests grep `/proc/self/mountinfo` against this list.
+pub const MOUNT_OPTIONS_REQUIRED_FLAGS: &[&str] = &["metacopy=off", "xino=on", "redirect_dir=on"];
+
+impl OverlayMountDriver for NixOverlayMountDriver {
     fn mount(
         &self,
         lower_dirs: &[PathBuf],
@@ -81,30 +122,21 @@ impl OverlayMountDriver for SystemOverlayMountDriver {
     ) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
-            let lowerdir = lower_dirs
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(":");
-            let options = format!(
-                "lowerdir={lowerdir},upperdir={},workdir={}",
-                upper.display(),
-                work.display()
-            );
-            let output = Command::new("mount")
-                .arg("-t")
-                .arg("overlay")
-                .arg("overlay")
-                .arg("-o")
-                .arg(options)
-                .arg(merged)
-                .output()
-                .map_err(|error| error.to_string())?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-            }
+            use nix::mount::{mount, MsFlags};
+            let options = build_overlay_options(lower_dirs, upper, work);
+            mount(
+                Some("overlay"),
+                merged,
+                Some("overlay"),
+                MsFlags::empty(),
+                Some(options.as_str()),
+            )
+            .map_err(|err| {
+                format!(
+                    "nix::mount::mount(overlay, {}): {err} (opts: {options})",
+                    merged.display()
+                )
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -116,15 +148,17 @@ impl OverlayMountDriver for SystemOverlayMountDriver {
     fn unmount(&self, merged: &Path) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
-            let output = Command::new("umount")
-                .arg(merged)
-                .output()
-                .map_err(|error| error.to_string())?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-            }
+            // MNT_DETACH is the atomicity fence per arch §4.3.3: the mount
+            // disappears from /proc/self/mounts synchronously; in-flight
+            // opens stay valid until closed, so a late tool call cannot
+            // tear a snapshot mid-reflink.
+            use nix::mount::{umount2, MntFlags};
+            umount2(merged, MntFlags::MNT_DETACH).map_err(|err| {
+                format!(
+                    "nix::mount::umount2(MNT_DETACH, {}): {err}",
+                    merged.display()
+                )
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -173,7 +207,7 @@ impl OverlayProvider {
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self::with_dependencies(
             base_dir,
-            Arc::new(SystemOverlayMountDriver),
+            Arc::new(NixOverlayMountDriver),
             Arc::new(UnsupportedRepoSource),
         )
     }
@@ -182,7 +216,7 @@ impl OverlayProvider {
         base_dir: impl Into<PathBuf>,
         repo_source: Arc<dyn OverlayRepoSource>,
     ) -> Self {
-        Self::with_dependencies(base_dir, Arc::new(SystemOverlayMountDriver), repo_source)
+        Self::with_dependencies(base_dir, Arc::new(NixOverlayMountDriver), repo_source)
     }
 
     pub fn with_dependencies(
@@ -1170,5 +1204,29 @@ mod tests {
         let handles = provider.list().await.unwrap();
         assert_eq!(handles.len(), 1);
         assert_eq!(handles[0].metadata.run_id, run_id("run-list"));
+    }
+
+    #[test]
+    fn build_overlay_options_contains_all_required_security_flags() {
+        let lower = vec![PathBuf::from("/tmp/lower1"), PathBuf::from("/tmp/lower2")];
+        let opts = super::build_overlay_options(
+            &lower,
+            &PathBuf::from("/tmp/upper"),
+            &PathBuf::from("/tmp/work"),
+        );
+        for flag in super::MOUNT_OPTIONS_REQUIRED_FLAGS {
+            assert!(
+                opts.contains(flag),
+                "overlay options `{opts}` missing required flag `{flag}`"
+            );
+        }
+        // metacopy=off is security-critical — assert we don't accidentally
+        // render metacopy=on via any future refactor.
+        assert!(
+            !opts.contains("metacopy=on"),
+            "overlay options must NEVER contain metacopy=on: `{opts}`"
+        );
+        // Lower-dir colon concatenation preserved.
+        assert!(opts.contains("lowerdir=/tmp/lower1:/tmp/lower2"));
     }
 }

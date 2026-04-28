@@ -527,12 +527,14 @@ dependencies = [
  "cairn-tools",
  "cairn-workspace",
  "chrono",
+ "command-fds",
  "dotenvy",
  "flowfabric",
  "futures",
  "http-body-util",
  "libc",
  "mime_guess",
+ "nix 0.29.0",
  "opentelemetry-proto",
  "percent-encoding",
  "prost",
@@ -876,8 +878,10 @@ dependencies = [
  "async-trait",
  "cairn-domain",
  "chrono",
+ "command-fds",
  "landlock",
- "nix",
+ "libc",
+ "nix 0.29.0",
  "reflink-copy",
  "seccompiler",
  "serde",
@@ -955,6 +959,16 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "command-fds"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b60b5124979fccd9addd89d8b97a1d6eebb4950694520c75ddd722535ea443f"
+dependencies = [
+ "nix 0.31.2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3030,6 +3044,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mimalloc"
 version = "0.1.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3095,6 +3118,19 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nix"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
+]
 
 [[package]]
 name = "nix"
