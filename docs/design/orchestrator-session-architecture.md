@@ -65,14 +65,14 @@ attempts_used:   u32                   // counter incremented on each root-Run s
 Supporting types:
 
 ```
-IssueBudget           { wall_clock_ms_cap, wall_clock_ms_used, token_cap, tokens_used, cost_usd_cap, cost_usd_used }
-CircuitBreakerKind    { RoundCap, TokenCap, NoToolUseStreak, WallClock }
-CircuitBreakerTrip    { kind, limit, measured, at_iteration }
+IssueBudget           { max_tokens: Option<u64>, max_cost_micros: Option<u64>, max_wall_seconds: Option<u64> }   // shipped cap-only shape; None = unlimited at this layer. Used counters live on SessionRecord, not inside IssueBudget.
+BreakerKind           { Round, Tokens, NoToolUseConsecutive, WallClock }                              // see §4.1 divergence note; `CircuitBreakerKind` / `RoundCap` / `TokenCap` / `NoToolUseStreak` are stale alias names to reject on review.
+CircuitBreakerTrip    { which: BreakerKind, measured, limit, at_iteration }                          // field order + `which` name match crates/cairn-domain/src/session_orchestration.rs
 Checkpoint            { checkpoint_id, root_run_id, session_id, body, created_at, schema_version }
 WorkspaceSnapshot     { snapshot_id, session_id, parent_snapshot_id, snapshot_path, created_at }
 WorkspaceId           opaque ULID newtype; resolves to a live overlayfs mount path OR a reflinked snapshot path
-SessionOutcome        { session_id, root_run_id, checkpoint_id, workspace_snapshot_id, termination_reason, compacted_summary, next_step_hint, cost_usd }
-TerminationReason     { Completed | BreakerTripped(trip) | LeaseLost | Crashed | Cancelled | WaitingApproval | WaitingSubagent }
+SessionOutcome        { session_id, root_run_id, project, checkpoint_id, workspace_snapshot_id: Option<WorkspaceSnapshotId>, termination_reason, compacted_summary, next_step_hint, cost_micros, emitted_at }   // cost is USD micros (1 USD = 1_000_000); integer keeps outcomes Eq-able. workspace_snapshot_id is None on ephemeral backends.
+TerminationReason     { CompleteRun | CircuitBreakerTripped { trip } | LeaseLost | ProviderError { message } | OperatorCancel | Crashed { message } }   // shipped variants; earlier drafts used Completed/BreakerTripped/Cancelled/WaitingApproval/WaitingSubagent — none shipped.
 OrchestratorDecision  { Continue(checkpoint_id) | Retry(from_session_start) | Abort(reason) }
 ```
 
@@ -92,7 +92,7 @@ Each orchestrator drive spawns **one new root-Run within the Session**. The exis
 
 ### 3.4 Re-framing existing types
 
-- `LoopTermination` becomes a subset of `TerminationReason`. The existing variants (Completed, Failed, TimedOut, MaxIterationsReached, WaitingApproval, WaitingSubagent, PlanProposed) fold in. `MaxIterationsReached` becomes `BreakerTripped(RoundCap)`.
+- `LoopTermination` becomes a subset of `TerminationReason`. The existing variants (Completed, Failed, TimedOut, MaxIterationsReached, WaitingApproval, WaitingSubagent, PlanProposed) fold in. `MaxIterationsReached` becomes `TerminationReason::CircuitBreakerTripped { trip }` with `trip.which = BreakerKind::Round`.
 - `F47 CompletionVerification` stays. It's the successful-completion analyzer. `SessionOutcome` wraps it as one possible `compacted_summary` shape; other shapes (breaker-trip summary, crash-stub summary) exist alongside.
 - `IssueQueueEntry` is unchanged — it already points at a `SessionId`, so the extension lines up with no queue-layer surgery.
 
@@ -113,9 +113,9 @@ Four per-root-Run breakers, enforced by `loop_runner`:
 
 *Naming divergence note (F65 PR-3):* the code uses shorter variant names (`Round`, `Tokens`, `NoToolUseConsecutive`, `WallClock`) on `BreakerKind` in `cairn-domain::session_orchestration`; this doc retains the longer marketing names in prose. Both resolve to the same `snake_case` wire-format strings on the event log, so operator dashboards pin on `"round"`, `"tokens"`, `"no_tool_use_consecutive"`, `"wall_clock"` regardless.
 
-`WallClock` here is the **per-root-Run** breaker (independent of the per-Session `SessionRecord.issue_budget.wall_clock_ms_cap` in §4.2). The Session-level cap bounds the orchestrator loop; the per-root-Run WallClock bounds a single bounded sub-agent invocation. Both are needed — a single pathological root-Run shouldn't consume the whole Session's wall-clock budget without a break point.
+`WallClock` here is the **per-root-Run** breaker (independent of the per-Session `SessionRecord.issue_budget.max_wall_seconds` in §4.2). The Session-level cap bounds the orchestrator loop; the per-root-Run WallClock bounds a single bounded sub-agent invocation. Both are needed — a single pathological root-Run shouldn't consume the whole Session's wall-clock budget without a break point.
 
-Precedence: whichever trips first wins. Every trip produces a `CircuitBreakerTrip { kind, limit, measured, at_iteration }` and terminates with `TerminationReason::BreakerTripped(trip)`.
+Precedence: whichever trips first wins. Every trip produces a `CircuitBreakerTrip { which, measured, limit, at_iteration }` and terminates with `TerminationReason::CircuitBreakerTripped { trip }`.
 
 **80%-of-limit warning (Q10).** For each breaker **except `NoToolUseStreak`**, when `measured / limit >= 0.80` and the warning has not yet fired for this root-Run, emit a `BudgetThresholdCrossed { which_breaker, measured, limit, ratio_bps }` event exactly once. This lets the orchestrator tighten its last-chance prompt or decide to abort early. It does not terminate the session. `NoToolUseStreak` carves out of the warning because the small default (3) means 80 % rounds to 2 — one turn before the trip, which is not actionable for re-prompting. `ratio_bps` is the fraction in basis points (0-10_000) so events stay `Eq`-able.
 
@@ -138,7 +138,7 @@ Precedence: whichever trips first wins. Every trip produces a `CircuitBreakerTri
 Budget + attempt cap live on `SessionRecord` directly (see §3.2 extension and §7 schema). No separate `issue_budgets` table — the Session row already owns this state.
 
 Orchestrator (HTTP flow):
-1. Create Session (via normal Session creation path) → set `goal_title`, `max_attempts` (default 5), `issue_budget` (default `wall_clock_ms_cap = 3_600_000` (1h), `token_cap`, `cost_usd_cap`). Emit `SessionAttemptBudgetInitialized` on first use.
+1. Create Session (via normal Session creation path) → set `goal_title` and `max_attempts` (default 5). Under the currently shipped `POST /v1/sessions` surface, `issue_budget` is not populated by request-time defaults and remains `None` unless a later orchestrator/session-initialization step explicitly writes the caps (`max_wall_seconds` ≈ 3_600 (1h), `max_tokens`, `max_cost_micros`). `SessionAttemptBudgetInitialized` is the **planned** event for that future initialization; it is not yet a `RuntimeEvent` variant.
 2. Spawn root-Run → if `attempts_used < max_attempts`, increment + start; else return `SessionAttemptCapExhausted`.
 3. Root-Run ends → persist `SessionOutcome`, roll cost + tokens + wall-clock into the Session's `issue_budget.*_used` counters, evaluate orchestrator decision.
 4. On `OrchestratorDecision::Continue|Retry`, goto (2). The new root-Run is linked via `parent_run_id` to the previous root-Run's id.
@@ -262,18 +262,20 @@ The `WorkspaceResolver` (§4.6) knows which kind of path an id maps to.
 
 **Decision (Q2, resolved 2026-04-27):** LLM-written summary from the start. Not deterministic-first-with-LLM-later. Every session-end spawns a small/flash-tier summarizer sub-agent.
 
-`SessionOutcome` shape:
+`SessionOutcome` shape (matches `crates/cairn-domain/src/session_orchestration.rs`):
 
 ```
 SessionOutcome {
     session_id,
     root_run_id,
+    project: ProjectKey,
     checkpoint_id,
-    workspace_snapshot_id,
+    workspace_snapshot_id: Option<WorkspaceSnapshotId>,   // None on ephemeral backends
     termination_reason: TerminationReason,
     compacted_summary: String,         // LLM-written, structured per prompt below
-    next_step_hint: Option<String>,    // LLM-written, may be empty on Completed
-    cost_usd: f64,                     // aggregate: root-Run LLM cost + summarizer cost
+    next_step_hint: Option<String>,    // LLM-written, may be empty on CompleteRun
+    cost_micros: u64,                  // aggregate in USD micros (1 USD = 1_000_000): root-Run LLM cost + summarizer cost
+    emitted_at: u64,                   // unix-epoch ms
 }
 ```
 
@@ -293,7 +295,7 @@ Output MUST be valid JSON with these keys:
   final_state:    object         // { compiles?: bool, tests?: {passed, failed, skipped}, lints?: {errors, warns} }
   tool_calls:     array          // [{name, count, last_outcome: "ok"|"warn"|"err"}]
   blockers:       array          // strings; empty if none
-  next_step_hint: string|null    // one concrete suggestion for the next attempt; null if Completed cleanly
+  next_step_hint: string|null    // one concrete suggestion for the next attempt; null if termination_reason is CompleteRun
   termination_reason: string     // copy of the input termination_reason
 
 Do NOT include the raw transcript. Do NOT speculate beyond evidence in the inputs.
@@ -319,9 +321,9 @@ Produce the JSON summary.
 
 **Failure policy.** If the summarizer call fails (rate limit, model error, non-JSON response), emit a skeletal deterministic summary as fallback: termination_reason + tool-call count + last compile/test state from telemetry. Emit `SummarizerFallback { reason }` event. Never block termination on summarizer success.
 
-**Cost accounting.** Summarizer cost is rolled into `cost_usd` on the outcome. A root-Run that costs $0.11 in the agent loop and $0.002 in the summarizer records `cost_usd = 0.112`.
+**Cost accounting.** Summarizer cost is rolled into `cost_micros` on the outcome (USD micros, 1 USD = 1_000_000). A root-Run that costs $0.11 in the agent loop and $0.002 in the summarizer records `cost_micros = 112_000`.
 
-Relationship to F47: `CompletionVerification` runs on `TerminationReason::Completed` BEFORE the summarizer, and its output is included verbatim in `final_state` (summarizer must preserve it). On non-completed terminations, F47 is skipped; `final_state` is populated from best-effort telemetry captured by the loop.
+Relationship to F47: `CompletionVerification` runs on `TerminationReason::CompleteRun` BEFORE the summarizer, and its output is included verbatim in `final_state` (summarizer must preserve it). On non-`CompleteRun` terminations, F47 is skipped; `final_state` is populated from best-effort telemetry captured by the loop.
 
 ### 4.5 Orchestrator prompt hygiene
 
@@ -348,7 +350,7 @@ System-prompt contract for the orchestrator (shape, not final copy):
 >
 > You have `read`, `grep`, `glob`, and `memory_search` available, but treat them as **verification tools**, not default inputs. Prefer the compacted summary. Reach for `read`/`grep`/`glob` only when the summary is missing, contradicts what the tests or telemetry say, or when you need to confirm a specific claim before re-dispatching with a narrower goal. Avoid re-reading files the sub-agent already described unless its summary left you uncertain.
 >
-> You have `max_attempts` root-Run attempts per Session. Use them deliberately. Each attempt has its own circuit breakers (round cap, token cap, wall-clock cap, no-tool-use streak) and you will see an 80%-of-limit warning event before any breaker trips. When an attempt terminates with a non-`Completed` reason, you have its `Checkpoint` and `WorkspaceSnapshot` — continue from the checkpoint when the sub-agent was on the right track and just ran out of runway, retry from scratch when the approach itself was wrong, abort when the goal is unreachable under the Session's remaining budget.
+> You have `max_attempts` root-Run attempts per Session. Use them deliberately. Each attempt has its own circuit breakers (round cap, token cap, wall-clock cap, no-tool-use streak) and you will see an 80%-of-limit warning event before any breaker trips. When an attempt terminates with a non-`CompleteRun` reason, you have its `Checkpoint` and `WorkspaceSnapshot` — continue from the checkpoint when the sub-agent was on the right track and just ran out of runway, retry from scratch when the approach itself was wrong, abort when the goal is unreachable under the Session's remaining budget.
 
 The `spawn_attempt` tool accepts:
 ```
@@ -389,22 +391,25 @@ IDE integration: **out of scope for this redesign** (Q5, resolved 2026-04-27). F
 
 ## 5. Event shape
 
-New events (portable-JSON bodies, appended to existing event store):
+Events (portable-JSON bodies, appended to existing event store). Shipped shapes come from `crates/cairn-domain/src/events.rs`; planned events are marked.
 
 ```
-SessionAttemptBudgetInitialized { session_id, max_attempts, wall_clock_ms_cap, token_cap, cost_usd_cap }
-SessionAttemptStarted { root_run_id, session_id, workspace_id, base_checkpoint_id?, base_snapshot_id?, breaker_config }
-SessionAttemptEnded { root_run_id, session_id, termination_reason, duration_ms }
-BreakerTripped { root_run_id, kind, limit, measured, at_iteration }
-BudgetThresholdCrossed { root_run_id, which_breaker, measured, limit, ratio }   // fired at 80%, once per root-Run per breaker
-CheckpointPersisted { checkpoint_id, root_run_id, session_id, schema_version, body_size_bytes }
-WorkspaceSnapshotCreated { snapshot_id, session_id, parent_snapshot_id?, bytes, reflink_used: bool }   // snapshot_path NOT in event; stored in DB only, never exposed over SSE
-WorkspaceSnapshotReaped { snapshot_id, age_ms, reason }
-WorkspaceBackendDegraded { reason }                                            // e.g. "ext4-fallback-full-copy"
-SummarizerFallback { root_run_id, reason }                                     // LLM summarizer failed; skeletal summary emitted
-SessionOutcomePersisted { root_run_id, session_id, termination_reason, checkpoint_id, workspace_snapshot_id, cost_usd }
-OrchestratorDecisionMade { session_id, decision, target_checkpoint_id? }
-SessionClosed { session_id, final_status: Completed|BudgetExhausted|Aborted }
+// Shipped in PR-1 (payload mirrors crates/cairn-domain/src/events.rs)
+SessionAttemptStarted      { project, session_id, root_run_id, attempt_number, max_attempts, at_ms }
+SessionAttemptCompleted    { project, session_id, root_run_id, outcome_kind, at_ms }             // outcome_kind is the TerminationReason discriminator: "complete_run" | "circuit_breaker_tripped" | "lease_lost" | "provider_error" | "operator_cancel" | "crashed"
+CircuitBreakerTripped      { project, session_id, run_id, trip, at_ms }                          // trip: CircuitBreakerTrip { which, measured, limit, at_iteration }
+BudgetThresholdCrossed     { project, session_id, run_id, which_breaker, measured, limit, ratio_bps, at_ms }   // fired at 80%, once per root-Run per breaker; ratio_bps is basis points (0-10_000)
+CheckpointPersisted        { project, checkpoint_id, session_id, root_run_id, iteration, at_ms }
+WorkspaceSnapshotCreated   { project, snapshot_id, workspace_id, session_id, at_ms }             // snapshot_path intentionally absent; resolve via WorkspaceSnapshot projection
+WorkspaceSnapshotReaped    { project, snapshot_id, at_ms }
+WorkspaceBackendDegraded   { project, session_id, backend, reason, at_ms }                       // e.g. backend="ext4_copy", reason="overlayfs_unavailable" | "reflink_unsupported_fs"
+SummarizerFallback         { project, session_id, reason, at_ms }                                // LLM summarizer failed; skeletal summary emitted. reason codes: "provider_unavailable" | "budget_exceeded" | "configuration_missing"
+SessionOutcomeEmitted      { project, session_id, root_run_id, outcome: SessionOutcome, at_ms }  // one per session (not per attempt); outcome carries cost_micros/emitted_at/etc
+OrchestratorDecisionMade   { project, session_id, decision, at_ms }                              // decision is a short tag: "retry" | "stop" | "checkpoint_only" | "escalate"
+
+// Planned (shipped emission is future work; no `RuntimeEvent` variant yet):
+SessionAttemptBudgetInitialized { session_id, max_attempts, max_wall_seconds, max_tokens, max_cost_micros }   // emitted when an IssueBudget is first populated for the session
+SessionClosed                   { session_id, final_status: Completed|BudgetExhausted|Aborted }               // session-level status (distinct from per-attempt TerminationReason)
 ```
 
 All emitted through the existing `emitter.rs` SSE pipe. Durable via the event store. These are **product-layer events**; FF fabric events are unchanged.
@@ -415,13 +420,13 @@ All emitted through the existing `emitter.rs` SSE pipe. Durable via the event st
 
 ### 6.1 F47 CompletionVerification
 
-Extended, not replaced. Runs only on `TerminationReason::Completed`, before the summarizer. Its output is passed into the summarizer's input so that the resulting `compacted_summary` JSON includes a `final_state` key carrying the verifier output verbatim (the summarizer prompt in §4.4 requires preservation). `compacted_summary` itself is stored as a JSON string — downstream consumers parse it to access the `final_state` field. Non-completed terminations skip the verifier and use best-effort telemetry.
+Extended, not replaced. Runs only on `TerminationReason::CompleteRun`, before the summarizer. Its output is passed into the summarizer's input so that the resulting `compacted_summary` JSON includes a `final_state` key carrying the verifier output verbatim (the summarizer prompt in §4.4 requires preservation). `compacted_summary` itself is stored as a JSON string — downstream consumers parse it to access the `final_state` field. Non-`CompleteRun` terminations skip the verifier and use best-effort telemetry.
 
 ### 6.2 F51–F64 lease/phase mechanics
 
 Circuit breakers are **above** FF lease mechanics, not replacing them. Lease still bounds wall-clock failure; breakers bound logical work. A session can trip a breaker and still cleanly hand its lease back. A session whose lease is lost produces `TerminationReason::LeaseLost` with whatever checkpoint we managed to emit (best-effort; may be incomplete).
 
-F64 (terminal recovery loop) is directly addressed: every termination path emits `SessionOutcomePersisted`; there is no "nothing to recover to." The outer orchestrator always has something to consume.
+F64 (terminal recovery loop) is directly addressed: every termination path emits `SessionOutcomeEmitted`; there is no "nothing to recover to." The outer orchestrator always has something to consume.
 
 FF#371 (dual-door lease deadlock) cooperation: when FF ships the phase-probe primitive, cairn's complete-run path uses it to distinguish "lease lost due to terminal transition" from "lease lost due to expiry." Breaker logic is orthogonal.
 
@@ -526,17 +531,17 @@ Dependency chain:
          └── PR-7 WorkspaceId opaque type + path resolver + orchestrator prompt + spawn/continue/abort tools
 ```
 
-**PR-1 — Domain types + events.** Extend `SessionRecord` with `goal_title`, `max_attempts`, `attempts_used`, `issue_budget` fields. Reuse the existing `WorkspaceId` newtype from `crates/cairn-domain/src/ids.rs` (do NOT introduce a second one). Add `CircuitBreakerKind/Trip`, `Checkpoint`, `WorkspaceSnapshot`, `SessionOutcome`, `TerminationReason`, `OrchestratorDecision`, and event variants (`SessionAttemptBudgetInitialized`, `SessionAttemptStarted/Ended`, `BreakerTripped`, `BudgetThresholdCrossed`, `CheckpointPersisted`, `WorkspaceSnapshotCreated/Reaped`, `WorkspaceBackendDegraded`, `SummarizerFallback`, `SessionOutcomePersisted`, `OrchestratorDecisionMade`, `SessionClosed`). No behavior change. ~400 LOC.
+**PR-1 — Domain types + events.** Extend `SessionRecord` with `goal_title`, `max_attempts`, `attempts_used`, `issue_budget` fields. Reuse the existing `WorkspaceId` newtype from `crates/cairn-domain/src/ids.rs` (do NOT introduce a second one). Add `BreakerKind` + `CircuitBreakerTrip`, `Checkpoint`, `WorkspaceSnapshot`, `SessionOutcome`, `TerminationReason`, `OrchestratorDecision`, and event variants (`SessionAttemptStarted/Completed`, `CircuitBreakerTripped`, `BudgetThresholdCrossed`, `CheckpointPersisted`, `WorkspaceSnapshotCreated/Reaped`, `WorkspaceBackendDegraded`, `SummarizerFallback`, `SessionOutcomeEmitted`, `OrchestratorDecisionMade` — all shipped; `SessionAttemptBudgetInitialized`, `SessionClosed` remain planned, not yet `RuntimeEvent` variants). No behavior change. ~400 LOC.
 
 **PR-2 — Store projections.** Migrations for pg + sqlite: ALTER TABLE sessions, CREATE workspace_registry/checkpoints/workspace_snapshots/session_outcomes. Symmetric schemas. In-memory store parity. Service-layer CRUD + read queries. Portable SQL only (no JSONB/arrays/advisory locks). ~800 LOC. Depends on PR-1.
 
-**PR-3 — Circuit breaker enforcement in loop_runner.** `BreakerState` threaded through `LoopContext`; `decide_impl` reports token counts; `NoToolUseStreak` counter; wall-clock tick. Trip emits `BreakerTripped` + `LoopTermination::BreakerTripped(trip)`. **80% warning** fires `BudgetThresholdCrossed` once per breaker per root-Run. Config in `FabricConfig.orchestrator.breakers`. Request-body override in `POST /runs/{id}/orchestrate`. ~600 LOC. Depends on PR-2.
+**PR-3 — Circuit breaker enforcement in loop_runner.** (Shipped in #348, ba8adc6e.) `BreakerState` threaded through `LoopContext`; `decide_impl` reports token counts; `NoToolUseConsecutive` counter; wall-clock tick. Trip emits `RuntimeEvent::CircuitBreakerTripped` + `TerminationReason::CircuitBreakerTripped { trip }`. **80% warning** fires `BudgetThresholdCrossed` once per breaker per root-Run (NoToolUseConsecutive excepted — see §4.1). Config via `LoopConfig.breakers` + `RuntimeConfig` 3-layer fallback. Request-body override in `POST /runs/{id}/orchestrate`. Depends on PR-2.
 
 **PR-4 — Sandbox runtime.** Mount namespace via `nix::sched::unshare(CLONE_NEWNS)`. Overlayfs mount (lower = reflinked base, upper + work per root-Run, `xino=on`). Landlock ruleset + `FullyEnforced` assertion (bail otherwise). Seccomp-BPF deny list (mount/umount2/pivot_root/ptrace/bpf/perf_event_open). Startup detection of kernel version, overlayfs unprivileged support, reflink-capable FS with warn-on-ext4. Base workspace provisioning (repo clone → reflinked lower). ~900 LOC. Depends on PR-2.
 
 **PR-5 — Snapshot + resume + GC.** On every termination path: umount merged → `reflink_tree(upper, ~/.cairn/snapshots/<uuid>/)` → persist `workspace_snapshots` row → emit `WorkspaceSnapshotCreated`. Resume path: `reflink_tree(snapshot, new-lower)` → fresh overlayfs → allocate fresh `WorkspaceId`. Hourly GC sweep with 7-day TTL and `WorkspaceSnapshotReaped` event. `DELETE /sessions/{id}/snapshots` admin endpoint. ~700 LOC. Depends on PR-4.
 
-**PR-6 — LLM summarizer + SessionOutcome.** Summarizer sub-agent spawned on every termination path using small/flash-tier model. Canonical prompt from §4.4 inlined. Input = decide_transcript_tail (last 40 turns) + tool_result_tail (last 20, 2KB each) + termination_reason + goal. Output parsed as structured JSON; `SessionOutcome` row inserted; `SessionOutcomePersisted` event emitted. Fallback skeletal summary on summarizer failure with `SummarizerFallback` event. Cost rolled into `cost_usd`. F47 output preserved in `final_state`. ~600 LOC. Depends on PR-5.
+**PR-6 — LLM summarizer + SessionOutcome.** Summarizer sub-agent spawned on every termination path using small/flash-tier model. Canonical prompt from §4.4 inlined. Input = decide_transcript_tail (last 40 turns) + tool_result_tail (last 20, 2KB each) + termination_reason + goal. Output parsed as structured JSON; `SessionOutcome` row inserted; `SessionOutcomeEmitted` event emitted. Fallback skeletal summary on summarizer failure with `SummarizerFallback` event. Cost rolled into `cost_micros` (USD micros). F47 output preserved in `final_state`. ~600 LOC. Depends on PR-5.
 
 **PR-7 — WorkspaceId + orchestrator prompt + tools.** `WorkspaceResolver` (maps WorkspaceId → overlayfs merged/ OR reflinked snapshot path). Path confinement check in tool dispatch. LLM context strings switched to opaque IDs. Orchestrator system-prompt contract. Tool whitelist enforcement (`OrchestratorToolForbidden` on violation). Orchestrator tools: `spawn_attempt`, `continue_from_checkpoint`, `abort_session`, `terminate_attempt`, plus `memory_search` (read-only, gated on RetrievalService availability). Budget + attempts_used wiring. ~800 LOC. Depends on PR-6.
 
@@ -548,8 +553,8 @@ Total estimate: ~4800 LOC product + ~1500 LOC integration tests across the 7 PRs
 
 Only LiveHarness tests count (per feedback_integration_tests_only). All spawn real cairn-app subprocess.
 
-1. `test_breaker_round_cap_trips_and_emits_outcome` — max_iterations=3, dispatch LLM that never completes; assert `SessionOutcome` persisted with `BreakerTripped(RoundCap)` and measured=3.
-2. `test_breaker_token_cap_trips_mid_session` — small token_cap; assert trip fires and checkpoint is emitted before tool-call completes its echo.
+1. `test_breaker_round_cap_trips_and_emits_outcome` — max_iterations=3, dispatch LLM that never completes; assert `SessionOutcome.termination_reason = TerminationReason::CircuitBreakerTripped { trip }` with `trip.which = BreakerKind::Round` and `trip.measured = 3`.
+2. `test_breaker_token_cap_trips_mid_session` — small token_cap; assert `TerminationReason::CircuitBreakerTripped { trip }` with `trip.which = BreakerKind::Tokens`, and checkpoint is emitted before tool-call completes its echo.
 3. `test_breaker_no_tool_use_streak_trips_on_narration` — stub LLM with 3 consecutive no-tool-call responses; assert trip.
 4. `test_breaker_overrides_tighten_from_request_body` — default 30, override 5; assert override wins.
 5. `test_budget_threshold_crossed_fires_at_80_percent` — drive a root-Run to 0.80 * token_cap; assert single `BudgetThresholdCrossed` event with ratio in [0.80, 1.0); confirm it does not terminate.
@@ -574,7 +579,7 @@ Only LiveHarness tests count (per feedback_integration_tests_only). All spawn re
 
 | Risk | Mitigation |
 |---|---|
-| F47 duplication | Keep F47 as the verifier for `Completed`; summarizer preserves its output in `final_state`. |
+| F47 duplication | Keep F47 as the verifier for `TerminationReason::CompleteRun`; summarizer preserves its output in `final_state`. |
 | Checkpoint size blowup (long transcripts) | Size budget in `CheckpointV1`; overflow policy = truncate oldest tool_results with elision marker + pointer to event-log cursor. |
 | **Linux 5.13+ kernel requirement** | Landlock LSM requires 5.13+. Detect at cairn-app startup (`/proc/version` + Landlock ABI probe). Fail loud with operator-visible error naming the required feature. No silent degradation. |
 | **overlayfs unprivileged mount on kernel < 5.11** | Older kernels need CAP_SYS_ADMIN to mount overlayfs. Detect at startup; bail with a named error if neither condition holds. |

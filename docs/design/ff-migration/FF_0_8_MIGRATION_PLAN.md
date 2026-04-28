@@ -1,7 +1,9 @@
 # FlowFabric 0.3.4 → 0.10.0 Migration Plan
 
-Status: **Active — FF 0.10.0 published 2026-04-26. CG-a + CG-b + CG-c shipped; CH/CI/CJ remain on the follow-up track.**
-Last updated: 2026-04-26
+> **STATUS 2026-04-27 — HISTORICAL.** FF is now at **0.11.0** in the workspace (see `Cargo.lock`; cf. `f3026a3d chore(ff): bump FlowFabric 0.10.0 -> 0.11.0 (Wave 9 PG parity)`). CG-a / CG-b / CG-c mechanical bumps completed. CH / CI partial. CJ (Postgres backend opt-in cargo feature) is tracked in cairn-rs [#346](https://github.com/avifenesh/cairn-rs/issues/346); the backend-agnosticism meta is [#347](https://github.com/avifenesh/cairn-rs/issues/347). **This plan doc is historical record — retained for the 0.3.4 → 0.10.0 migration trail.** Do not treat its "Active" markers as current; see the issues above for in-flight state.
+
+Status: **Historical — FF 0.10.0 published 2026-04-26. CG-a + CG-b + CG-c shipped; CH/CI/CJ were on the follow-up track at archival time (superseded by FF 0.11.0; see banner above).**
+Last updated: 2026-04-27 (historical-status annotation; migration body is a 2026-04-26 snapshot)
 Author: planning aggregated from 4 research agents (breaking changes, PG backend, boot path, encapsulation)
 Related: FF#277–#283 (cairn-first asks for 0.9) + FF#322/#323/#324 (cairn-first asks for 0.10) — all CLOSED in the respective FF releases.
 
