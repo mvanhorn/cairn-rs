@@ -1,9 +1,25 @@
 //! F65 PR-3 LiveHarness integration tests for circuit-breaker
 //! enforcement in `OrchestratorLoop`.
 //!
-//! Eight scenarios, every one running the real `POST /v1/runs/{id}/orchestrate`
+//! Every scenario runs the real `POST /v1/runs/{id}/orchestrate`
 //! HTTP path against a `cairn-app` subprocess (via `LiveHarness`) with a
-//! scripted OpenAI-compatible mock provider:
+//! scripted OpenAI-compatible mock provider.
+//!
+//! ## 4 × 3 breaker coverage matrix
+//!
+//! Four breaker kinds (Round / Tokens / NoToolUseConsecutive / WallClock)
+//! × three lifecycle cells (trip / 80%-warn / override-tighten). The
+//! matrix is filled explicitly so a regression in any single cell is
+//! caught by its own test rather than relying on cross-breaker overlap.
+//!
+//! | kind                 | trip                                     | 80%-warn                                       | override-tighten                                 |
+//! |----------------------|------------------------------------------|------------------------------------------------|--------------------------------------------------|
+//! | Round                | `_round_cap_trips_and_emits_outcome` (#1) | `_round_cap_warn_at_80_percent` (#9)           | `_overrides_tighten_from_request_body` (#4)      |
+//! | Tokens               | `_token_cap_trips_mid_session` (#2)      | `_budget_threshold_crossed_fires_at_80_percent` (#6) | `_token_cap_override_tighten_reduces_trip_point` (#11) |
+//! | NoToolUseConsecutive | `_no_tool_use_streak_trips_on_narration` (#3) | `_no_tool_use_streak_does_not_warn_at_80_percent` (#10, negative — locks design) | `_no_tool_use_streak_override_tighten_reduces_trip_point` (#12) |
+//! | WallClock            | `_wall_clock_breaker_trips_under_stopwatch` (#8) | `_wall_clock_warn_at_80_percent` (#13)         | `_wall_clock_override_tighten_reduces_trip_point` (#14) |
+//!
+//! Scenarios:
 //!
 //! 1. `test_breaker_round_cap_trips_and_emits_outcome` — round breaker
 //!    terminates at iteration equal to cap, with an event on the log.
@@ -303,6 +319,94 @@ fn event_type(ev: &Value) -> &str {
         .or_else(|| ev.get("event"))
         .and_then(Value::as_str)
         .unwrap_or("")
+}
+
+/// Assert the Prometheus threshold-warn counter for `kind` equals
+/// `expected_count`, and that none of `other_kinds_must_be_absent`
+/// appear in the scrape. Extracted to eliminate the four-way duplicate
+/// assertion block across tests #6/#9/#10/#13 (Gemini review on #541).
+///
+/// The endpoint is `/v1/metrics` with no query parameters — the current
+/// handler in `handlers::health::metrics_handler` takes only `State`,
+/// no `Query<…>`, so adding `?scope_id=all` would be silently ignored
+/// by today's server and could bake in an assumption about a future
+/// scoping contract that does not yet exist. When tenant-scoped
+/// metrics are introduced, this helper will need to grow a scope
+/// parameter — but speculating on that shape now would be premature.
+async fn assert_prometheus_warn_counter(
+    h: &LiveHarness,
+    kind: &str,
+    expected_count: u64,
+    other_kinds_must_be_absent: &[&str],
+) {
+    let r = h
+        .client()
+        .get(format!("{}/v1/metrics", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("metrics reach server");
+    // Assert the scrape succeeded BEFORE parsing. Without this guard,
+    // a 401/500 response produces an error body (or empty string) that
+    // would later fail with a misleading "missing counter line" panic,
+    // hiding the real auth/server problem from the test operator.
+    // (Closes Copilot review follow-up on #541.)
+    let status = r.status();
+    let body = r.text().await.unwrap_or_default();
+    assert!(
+        status.is_success(),
+        "GET /v1/metrics failed with status {status}; body:\n{body}"
+    );
+    let metric_name = "cairn_orchestrator_breaker_threshold_warns_total";
+    let label = format!("kind=\"{kind}\"");
+
+    let line = body
+        .lines()
+        .find(|l| l.contains(metric_name) && l.contains(&label));
+
+    if expected_count > 0 {
+        let line = line.unwrap_or_else(|| {
+            panic!("metrics scrape missing {kind}-warn counter line; full body:\n{body}")
+        });
+        // `rsplit_once(' ')` is an allocation-free parse: Prometheus
+        // exposition format terminates each sample with `<name> <value>`
+        // where the value is the final space-separated token. A parse
+        // failure here would mean the exposition format itself has
+        // drifted — we panic with the raw line so the operator can
+        // diagnose the surface change, rather than silently falling
+        // back to 0 and reporting a confusing count mismatch further
+        // down. (Closes Copilot review follow-up on #541.)
+        let (_, raw_value) = line
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("metric line has no space-separated value; line={line:?}"));
+        let count: u64 = raw_value.parse().unwrap_or_else(|e| {
+            panic!(
+                "failed to parse {kind}-warn counter value {raw_value:?} as u64: {e}; \
+                 line={line:?}"
+            )
+        });
+        assert_eq!(
+            count, expected_count,
+            "expected {kind} threshold-warn counter == {expected_count}; \
+             got {count} (line: {line})"
+        );
+    } else {
+        assert!(
+            line.is_none(),
+            "kind={kind} threshold-warn counter must NOT exist; body:\n{body}"
+        );
+    }
+
+    for other in other_kinds_must_be_absent {
+        let present = body
+            .lines()
+            .any(|l| l.contains(metric_name) && l.contains(&format!("kind=\"{other}\"")));
+        assert!(
+            !present,
+            "kind={other} threshold-warn counter must not exist in a {kind}-scoped scenario; \
+             body:\n{body}"
+        );
+    }
 }
 
 /// Shortcut: scripted round emitting a single narration proposal. The
@@ -692,39 +796,7 @@ async fn test_budget_threshold_crossed_fires_at_80_percent() {
     // the NoToolUseConsecutive warn counter must be absent (never
     // incremented), encoding Decision 2's "skip warning for streak"
     // guarantee in the observable metric surface.
-    let r = h
-        .client()
-        .get(format!("{}/v1/metrics", h.base_url))
-        .bearer_auth(&h.admin_token)
-        .send()
-        .await
-        .expect("metrics reach server");
-    let body = r.text().await.unwrap_or_default();
-    let tokens_line = body
-        .lines()
-        .find(|l| {
-            l.contains("cairn_orchestrator_breaker_threshold_warns_total")
-                && l.contains("kind=\"tokens\"")
-        })
-        .unwrap_or_else(|| {
-            panic!("metrics scrape missing tokens-warn counter line; full body:\n{body}")
-        });
-    let tokens_count: u64 = tokens_line
-        .split_whitespace()
-        .last()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    assert_eq!(
-        tokens_count, 1,
-        "expected tokens threshold-warn counter == 1; got {tokens_count} (line: {tokens_line})"
-    );
-    let streak_present = body
-        .lines()
-        .any(|l| l.contains("kind=\"no_tool_use_consecutive\"") && l.contains("threshold_warns"));
-    assert!(
-        !streak_present,
-        "Decision 2 guard: NoToolUseConsecutive must never appear in the threshold-warn counter"
-    );
+    assert_prometheus_warn_counter(&h, "tokens", 1, &["no_tool_use_consecutive"]).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -850,17 +922,495 @@ async fn test_wall_clock_breaker_trips_under_stopwatch() {
         measured >= 500,
         "reported measured must be >= cap on trip; got {measured}"
     );
-    // Caller-visible wall-clock should not be below the configured
-    // breaker cap (500ms). We intentionally DO NOT enforce an upper
-    // bound here: slow or heavily loaded CI runners may legitimately
-    // exceed any fixed ceiling, and per cairn's "no such thing as a
-    // flake" memory we must not gate a correctness assertion on
-    // scheduling jitter. The lower-bound check catches the genuine
-    // regression class (breaker firing implausibly early), which is
-    // the one the breaker should prevent.
+    // Caller-visible wall-clock must not be below the configured breaker
+    // cap (500ms) — the lower bound catches "breaker fired too early."
+    // It also must not drift wildly above the cap — the upper bound
+    // catches the "breaker fired LATE" regression class that a
+    // lower-bound-only check would silently miss (closes #402).
+    //
+    // 10_000ms is a deliberately generous ceiling on a 500ms cap: the
+    // expected elapsed under healthy conditions is ~600-800ms (two
+    // DECIDE rounds sleeping 300ms each plus HTTP overhead). A 20×
+    // blow-out catches a regression where the breaker fails to fire
+    // until round 50+ while tolerating legitimate CI scheduler jitter.
+    // If this ceiling is ever exceeded the right response is to
+    // investigate — not to widen it — per "no such thing as a flake."
     assert!(
         elapsed_ms >= 500,
-        "stopwatch plausibility check: elapsed_ms={elapsed_ms} below 500ms cap — \
+        "stopwatch plausibility (lower): elapsed_ms={elapsed_ms} below 500ms cap — \
          breaker fired before the wall-clock limit was reached"
+    );
+    assert!(
+        elapsed_ms <= 10_000,
+        "stopwatch plausibility (upper): elapsed_ms={elapsed_ms} above 10_000ms ceiling on a 500ms cap — \
+         breaker fired LATE (regression class #402). Healthy value is ~600-800ms."
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9 — Round breaker fires BudgetThresholdCrossed exactly once at 80%
+//     (closes #397 — Round×80%-warn cell).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// round_cap=5; 80 % of 5 is 4 (in basis points: 4*10_000/5 = 8_000).
+// Loop progression with the 80 %-warn check in `check_pre_gather`:
+//   iter=0..=3 pre_gather → Continue → DECIDE
+//   iter=4 pre_gather     → Warning(Round) (once, latched) → DECIDE
+//   iter=5 pre_gather     → Trip(Round)
+//
+// Script length is 5 forward-progress rounds so the streak breaker
+// stays quiet (streak resets every round that dispatches a tool).
+
+#[tokio::test]
+async fn test_breaker_round_cap_warn_at_80_percent() {
+    let h = LiveHarness::setup().await;
+    let script: Vec<_> = (0..5).map(|_| read_round(50, 50)).collect();
+    let (mock_url, hits) = spawn_scripted_mock(script).await;
+    let (_sess, run_id) = provision(&h, &mock_url, "f65_p3_round_warn").await;
+
+    let (status, body) = orchestrate(
+        &h,
+        &run_id,
+        json!({
+            "goal": "round 80 percent warn",
+            "max_iterations": 100,
+            "breaker_overrides": { "round_cap": 5 },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(
+        body.get("termination").and_then(Value::as_str),
+        Some("breaker_tripped"),
+    );
+    assert_eq!(body.get("which").and_then(Value::as_str), Some("round"));
+    assert_eq!(body.get("limit").and_then(Value::as_u64), Some(5));
+    let n = hits.load(Ordering::SeqCst);
+    assert_eq!(
+        n, 5,
+        "expected 5 DECIDEs (iter 0..=4; trip on entry to iter 5), got {n}"
+    );
+
+    // Exactly ONE BudgetThresholdCrossed event on the durable log —
+    // warn-once latch. `/v1/events` returns a summary shape
+    // (position, event_type, message, run_id, stored_at) so we count
+    // by event_type and discriminate the kind via the Prometheus
+    // scrape below (which is labelled by kind). That mirrors #6's
+    // approach and works for all three non-streak breakers.
+    let events = fetch_events(&h).await;
+    let warnings: Vec<&Value> = events
+        .iter()
+        .filter(|e| event_type(e) == "budget_threshold_crossed")
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected exactly one BudgetThresholdCrossed warning for Round; got {}: types={:?}",
+        warnings.len(),
+        events.iter().map(event_type).collect::<Vec<_>>()
+    );
+
+    // Prometheus scrape: the round warn counter must be exactly 1, and
+    // no other kind's warn counter may have fired (only round is
+    // engaged in this test — tokens/wall_clock/streak stay quiet).
+    assert_prometheus_warn_counter(
+        &h,
+        "round",
+        1,
+        &["tokens", "wall_clock", "no_tool_use_consecutive"],
+    )
+    .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10 — NoToolUseConsecutive does NOT warn at 80 %
+//      (closes #397 — Streak×80%-warn cell; locks Decision 2).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The streak breaker intentionally skips the 80 % warning per Decision 2
+// (breakers.rs rustdoc §"80% warning for Tokens (once). NoToolUseConsecutive
+// deliberately skips…"). A dedicated negative test is needed even though
+// #6 already asserts the streak kind is absent from the metrics counter,
+// because #6 drives Tokens — not streak — through the warn codepath.
+// Here we drive the streak counter through its 80 % ratio directly and
+// confirm the guard holds end-to-end (no event, no metric).
+//
+// Default operator streak is 3; we bump it to 5 via the settings
+// endpoint so 80 % is 4 — a reachable value. Then we drive 5
+// consecutive narration rounds: rounds 1..=4 climb the streak through
+// the 80 % ratio (1→2→3→4) without emitting a warning, and round 5
+// trips the breaker. The assertions cover both the warn-suppression
+// invariant (Decision 2) AND that the trip still lands correctly at
+// the configured cap — a defensive lock that prevents a regression
+// where "no warn" accidentally became "no trip either." Trip-at-the-
+// default-cap-of-3 is covered separately by #3.
+
+#[tokio::test]
+async fn test_breaker_no_tool_use_streak_does_not_warn_at_80_percent() {
+    let h = LiveHarness::setup().await;
+
+    // Raise the operator-wide default so 80 % is integer-addressable.
+    let r = h
+        .client()
+        .put(format!(
+            "{}/v1/settings/defaults/system/system/orchestrator_no_tool_use_streak",
+            h.base_url
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({ "value": 5 }))
+        .send()
+        .await
+        .expect("settings reach server");
+    assert_eq!(r.status().as_u16(), 200);
+
+    // 5 narration rounds so the trip lands on round 5; the first four
+    // rounds climb streak 1→2→3→4 without emitting a warning.
+    let script: Vec<_> = (0..5).map(|_| narration_round(10, 10)).collect();
+    let (mock_url, hits) = spawn_scripted_mock(script).await;
+    let (_sess, run_id) = provision(&h, &mock_url, "f65_p3_streak_nowarn").await;
+
+    let (status, body) = orchestrate(
+        &h,
+        &run_id,
+        json!({
+            "goal": "streak crosses 80 percent without warning",
+            "max_iterations": 50,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(
+        body.get("termination").and_then(Value::as_str),
+        Some("breaker_tripped"),
+    );
+    assert_eq!(
+        body.get("which").and_then(Value::as_str),
+        Some("no_tool_use_consecutive"),
+    );
+    assert_eq!(body.get("limit").and_then(Value::as_u64), Some(5));
+    let n = hits.load(Ordering::SeqCst);
+    assert_eq!(
+        n, 5,
+        "expected 5 DECIDEs (streak climbs 1..=5, trip at 5), got {n}"
+    );
+
+    // Decision 2 guard: no BudgetThresholdCrossed may appear for this
+    // run, because the only breaker engaged here is the streak — and
+    // streak is excluded from the 80 % warn emission.
+    let events = fetch_events(&h).await;
+    let warnings: Vec<&Value> = events
+        .iter()
+        .filter(|e| event_type(e) == "budget_threshold_crossed")
+        .collect();
+    assert!(
+        warnings.is_empty(),
+        "Decision 2: NoToolUseConsecutive must NEVER emit BudgetThresholdCrossed; \
+         got {} warning event(s): {:?}",
+        warnings.len(),
+        warnings,
+    );
+
+    // Prometheus scrape: the streak warn counter must be absent (never
+    // incremented). We also confirm no OTHER kind's warn counter fired
+    // spuriously — the test setup only engages the streak breaker.
+    // (`expected_count=0` on the target kind asserts its absence;
+    // `other_kinds_must_be_absent` enforces the same guarantee for
+    // tokens/round/wall_clock. Closes Copilot review feedback on #541.)
+    assert_prometheus_warn_counter(
+        &h,
+        "no_tool_use_consecutive",
+        0,
+        &["tokens", "round", "wall_clock"],
+    )
+    .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11 — Tokens override-tighten reduces trip point
+//      (closes #397 — Tokens×override-tighten cell).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Default operator token_cap is 200_000. Without an override the run
+// would take ~1_429 rounds at 140 tokens/round to trip. With
+// `breaker_overrides.token_cap = 250`, round 2 pushes cumulative to
+// 280 > 250 → trip. The test proves the override actually reduced
+// the trip point (i.e. the override wire-path feeds BreakerConfig,
+// not just the validation path).
+
+#[tokio::test]
+async fn test_breaker_token_cap_override_tighten_reduces_trip_point() {
+    let h = LiveHarness::setup().await;
+    let script: Vec<_> = (0..6).map(|_| read_round(100, 40)).collect();
+    let (mock_url, hits) = spawn_scripted_mock(script).await;
+    let (_sess, run_id) = provision(&h, &mock_url, "f65_p3_token_tighten").await;
+
+    let (status, body) = orchestrate(
+        &h,
+        &run_id,
+        json!({
+            "goal": "tighten token_cap",
+            "max_iterations": 100,
+            "breaker_overrides": { "token_cap": 250 },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(
+        body.get("termination").and_then(Value::as_str),
+        Some("breaker_tripped"),
+    );
+    assert_eq!(body.get("which").and_then(Value::as_str), Some("tokens"));
+    // limit MUST be the overridden 250, not the 200_000 default. This
+    // is the core proof that the override flows into BreakerConfig.
+    assert_eq!(body.get("limit").and_then(Value::as_u64), Some(250));
+    let measured = body.get("measured").and_then(Value::as_u64).unwrap();
+    assert!(
+        (250..200_000).contains(&measured),
+        "measured must be >= overridden limit (250) and << default (200_000); got {measured}"
+    );
+    let n = hits.load(Ordering::SeqCst);
+    assert_eq!(
+        n, 2,
+        "expected trip after 2 DECIDE calls (140+140=280 > 250), got {n}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12 — NoToolUseStreak override-tighten reduces trip point
+//      (closes #397 — Streak×override-tighten cell).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Default operator no_tool_use_streak is 3. With `breaker_overrides
+// .no_tool_use_streak = 2` the cap is tightened so the breaker trips
+// after exactly 2 narration rounds instead of 3. The at-trip
+// `measured` and `limit` in the response body must both be 2 to prove
+// the override actually reduced the trip point.
+
+#[tokio::test]
+async fn test_breaker_no_tool_use_streak_override_tighten_reduces_trip_point() {
+    let h = LiveHarness::setup().await;
+    let script: Vec<_> = (0..3).map(|_| narration_round(10, 10)).collect();
+    let (mock_url, hits) = spawn_scripted_mock(script).await;
+    let (_sess, run_id) = provision(&h, &mock_url, "f65_p3_streak_tighten").await;
+
+    let (status, body) = orchestrate(
+        &h,
+        &run_id,
+        json!({
+            "goal": "tighten no_tool_use_streak",
+            "max_iterations": 50,
+            "breaker_overrides": { "no_tool_use_streak": 2 },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(
+        body.get("termination").and_then(Value::as_str),
+        Some("breaker_tripped"),
+    );
+    assert_eq!(
+        body.get("which").and_then(Value::as_str),
+        Some("no_tool_use_consecutive"),
+    );
+    // Both limit and measured must be 2 — the override value — not the
+    // default 3. This locks the override-flows-into-config path.
+    assert_eq!(body.get("limit").and_then(Value::as_u64), Some(2));
+    assert_eq!(body.get("measured").and_then(Value::as_u64), Some(2));
+    let n = hits.load(Ordering::SeqCst);
+    assert_eq!(
+        n, 2,
+        "expected trip after exactly 2 narration DECIDEs (override=2), got {n}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13 — WallClock fires BudgetThresholdCrossed at 80 %
+//      (closes #397 — WallClock×80%-warn cell).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// wall_clock_ms=2500; 80 % of 2500 is 2000. Each DECIDE sleeps 2100 ms
+// in the mock. Progression:
+//   iter=0 pre_gather (elapsed=0)     → Continue → DECIDE (sleeps 2100ms)
+//   iter=1 pre_gather (elapsed≈2100)  → Warning(WallClock) → DECIDE (sleeps 2100ms)
+//   iter=2 pre_gather (elapsed≈4200)  → Trip(WallClock)
+//
+// The 400 ms headroom between sleep (2100) and cap (2500) de-risks the
+// race where HTTP roundtrip + EXECUTE overhead could push iter=1 past
+// the cap BEFORE the 80% warn check in pre_gather fires — that would
+// yield a Trip event without a preceding Warning. A loopback HTTP +
+// `read /etc/hostname` tool dispatch is typically <50 ms, so 400 ms is
+// a ~10× margin.
+//
+// No `tokio::time::pause()`: the breaker uses `Instant::now()` which is
+// a monotonic system clock unaffected by tokio's mock clock, and the
+// subprocess HTTP boundary precludes injecting a test clock. A real
+// sleep in the mock is the only driver available; the 400 ms headroom
+// absorbs scheduler jitter deterministically.
+
+#[tokio::test]
+async fn test_breaker_wall_clock_warn_at_80_percent() {
+    let h = LiveHarness::setup().await;
+    let script: Vec<_> = (0..3)
+        .map(|_| ScriptEntry {
+            proposals: json!([{
+                "action_type": "invoke_tool",
+                "description": "read a file",
+                "tool_name": "read",
+                "tool_args": { "path": "/etc/hostname" },
+                "confidence": 0.9,
+                "requires_approval": false,
+            }]),
+            prompt_tokens: 50,
+            completion_tokens: 50,
+            sleep_ms: 2_100,
+        })
+        .collect();
+    let (mock_url, _hits) = spawn_scripted_mock(script).await;
+    let (_sess, run_id) = provision(&h, &mock_url, "f65_p3_wall_warn").await;
+
+    let started = Instant::now();
+    let (status, body) = orchestrate(
+        &h,
+        &run_id,
+        json!({
+            "goal": "wall-clock 80 percent warn",
+            "max_iterations": 50,
+            "timeout_ms": 60_000,
+            "breaker_overrides": { "wall_clock_ms": 2_500 },
+        }),
+    )
+    .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(
+        body.get("termination").and_then(Value::as_str),
+        Some("breaker_tripped"),
+    );
+    assert_eq!(
+        body.get("which").and_then(Value::as_str),
+        Some("wall_clock"),
+    );
+    assert_eq!(body.get("limit").and_then(Value::as_u64), Some(2_500));
+    // Plausibility window on the caller-visible elapsed: the trip has
+    // to land >= cap and shouldn't run wildly past it. Upper bound
+    // applies the same anti-LATE regression guard that #8 now enforces.
+    assert!(
+        elapsed_ms >= 2_500,
+        "elapsed_ms={elapsed_ms} below cap=2500ms — breaker fired early"
+    );
+    assert!(
+        elapsed_ms <= 25_000,
+        "elapsed_ms={elapsed_ms} above 25_000ms ceiling on a 2_500ms cap — breaker fired LATE"
+    );
+
+    // Exactly ONE BudgetThresholdCrossed event on the durable log.
+    // `/v1/events` returns a summary (event_type only, no body) so we
+    // discriminate the kind via the per-kind-labelled Prometheus scrape
+    // below — same pattern as #6 and #9.
+    let events = fetch_events(&h).await;
+    let warnings: Vec<&Value> = events
+        .iter()
+        .filter(|e| event_type(e) == "budget_threshold_crossed")
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected exactly one BudgetThresholdCrossed for WallClock; got {}: types={:?}",
+        warnings.len(),
+        events.iter().map(event_type).collect::<Vec<_>>()
+    );
+
+    // Prometheus: wall_clock warn counter == 1, and no other kind fired
+    // (pure wall-clock scenario; tokens/round/streak stay quiet).
+    assert_prometheus_warn_counter(
+        &h,
+        "wall_clock",
+        1,
+        &["tokens", "round", "no_tool_use_consecutive"],
+    )
+    .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 14 — WallClock override-tighten reduces trip point
+//      (closes #397 — WallClock×override-tighten cell).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Default operator wall_clock_ms is 15 * 60 * 1000 = 900_000. With
+// `breaker_overrides.wall_clock_ms = 400` the cap collapses to 400 ms.
+// Each DECIDE sleeps 250 ms. Progression:
+//   iter=0 pre_gather (elapsed=0)    → Continue → DECIDE (sleeps 250ms)
+//   iter=1 pre_gather (elapsed≈250)  → Continue → DECIDE (sleeps 250ms)
+//   iter=2 pre_gather (elapsed≈500)  → Trip (>= 400ms override)
+//
+// This differs from #8 — which proves the WallClock TRIP shape under a
+// stopwatch — by focusing the assertion on the override wire-path:
+// `body.limit == 400` (the overridden value), not the default 900_000.
+// Without the override the run would run for the full 15 minutes before
+// tripping. The response body's `limit` field is the proof the override
+// propagated into BreakerConfig.
+
+#[tokio::test]
+async fn test_breaker_wall_clock_override_tighten_reduces_trip_point() {
+    let h = LiveHarness::setup().await;
+    let script: Vec<_> = (0..4)
+        .map(|_| ScriptEntry {
+            proposals: json!([{
+                "action_type": "invoke_tool",
+                "description": "read a file",
+                "tool_name": "read",
+                "tool_args": { "path": "/etc/hostname" },
+                "confidence": 0.9,
+                "requires_approval": false,
+            }]),
+            prompt_tokens: 50,
+            completion_tokens: 50,
+            sleep_ms: 250,
+        })
+        .collect();
+    let (mock_url, _hits) = spawn_scripted_mock(script).await;
+    let (_sess, run_id) = provision(&h, &mock_url, "f65_p3_wall_tighten").await;
+
+    let started = Instant::now();
+    let (status, body) = orchestrate(
+        &h,
+        &run_id,
+        json!({
+            "goal": "tighten wall_clock_ms",
+            "max_iterations": 50,
+            "timeout_ms": 60_000,
+            "breaker_overrides": { "wall_clock_ms": 400 },
+        }),
+    )
+    .await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(
+        body.get("termination").and_then(Value::as_str),
+        Some("breaker_tripped"),
+    );
+    assert_eq!(
+        body.get("which").and_then(Value::as_str),
+        Some("wall_clock"),
+    );
+    // limit MUST be the overridden 400, not the 900_000 default.
+    assert_eq!(body.get("limit").and_then(Value::as_u64), Some(400));
+    let measured = body.get("measured").and_then(Value::as_u64).unwrap();
+    assert!(
+        (400..900_000).contains(&measured),
+        "measured must be >= overridden limit (400) and << default (900_000); got {measured}"
+    );
+    // Plausibility window on caller-visible elapsed — matching #8's
+    // upper-bound guard against the "breaker fires LATE" regression
+    // class. 10_000 ms is a 25× ceiling on a 400 ms cap.
+    assert!(
+        elapsed_ms >= 400,
+        "elapsed_ms={elapsed_ms} below cap=400ms — breaker fired early"
+    );
+    assert!(
+        elapsed_ms <= 10_000,
+        "elapsed_ms={elapsed_ms} above 10_000ms ceiling on a 400ms cap — breaker fired LATE"
     );
 }
