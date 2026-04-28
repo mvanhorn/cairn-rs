@@ -208,6 +208,19 @@ impl ModelRegistry {
     /// entries.  Returns the number of models imported.
     pub fn import_litellm(&self, json: &str) -> usize {
         let entries = cairn_domain::model_catalog::import_litellm_json(json);
+        self.insert_entries(entries)
+    }
+
+    /// Import models from an already-parsed LiteLLM map. Prefer this over
+    /// [`Self::import_litellm`] when the caller has the payload in memory
+    /// as a `serde_json::Value::Object` — avoids the second parse and the
+    /// `HashMap` intermediate allocation. Closes #493.
+    pub fn import_litellm_map(&self, map: &serde_json::Map<String, serde_json::Value>) -> usize {
+        let entries = cairn_domain::model_catalog::import_litellm_map(map);
+        self.insert_entries(entries)
+    }
+
+    fn insert_entries(&self, entries: Vec<cairn_domain::model_catalog::ModelEntry>) -> usize {
         let count = entries.len();
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         for entry in entries {

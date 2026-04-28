@@ -328,12 +328,22 @@ pub fn api_error_with_details(
 }
 
 pub(crate) fn json_rejection_response(err: JsonRejection) -> Response {
-    AppApiError::new(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "validation_error",
-        err.body_text(),
-    )
-    .into_response()
+    // Honour the rejection's native status — `JsonRejection::BytesRejection
+    // → FailedToBufferBody::LengthLimitError` returns 413 PAYLOAD_TOO_LARGE
+    // when a per-route `DefaultBodyLimit` rejects the body, and we must
+    // preserve that so the client gets the right signal instead of a 422.
+    // Other variants (JsonDataError / JsonSyntaxError / MissingJsonContentType)
+    // all map to 4xx codes that are fine to surface verbatim. The response
+    // body is still wrapped in the usual `AppApiError` shape so the error
+    // envelope matches the rest of the admin surface. Copilot review on
+    // PR #548, #493.
+    let status = err.status();
+    let code = if status == StatusCode::PAYLOAD_TOO_LARGE {
+        "payload_too_large"
+    } else {
+        "validation_error"
+    };
+    AppApiError::new(status, code, err.body_text()).into_response()
 }
 
 pub(crate) fn parse_run_state(value: &str) -> Result<RunState, String> {

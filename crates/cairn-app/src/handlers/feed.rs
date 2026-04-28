@@ -298,8 +298,26 @@ pub(crate) async fn append_mailbox_handler(
                         delivered: false,
                     },
                 );
-            let item = mailbox_message_view(&state, record).expect("mailbox overlay inserted");
-            (StatusCode::CREATED, Json(item)).into_response()
+            // #456: `mailbox_message_view` looks up the overlay we just
+            // inserted above, so the `Some` arm is the happy path. If a
+            // tombstone interleaves (concurrent `mark_mailbox_delivered_handler`
+            // evicting the entry) the lookup returns `None` — refuse to
+            // panic the request path; log + 500 instead.
+            match mailbox_message_view(&state, record) {
+                Some(item) => (StatusCode::CREATED, Json(item)).into_response(),
+                None => {
+                    tracing::error!(
+                        message_id = %message_id,
+                        "mailbox overlay vanished between insert and view",
+                    );
+                    AppApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "mailbox message disappeared after insert",
+                    )
+                    .into_response()
+                }
+            }
         }
         Err(err) => runtime_error_response(err),
     }

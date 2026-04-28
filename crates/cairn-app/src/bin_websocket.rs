@@ -3,12 +3,52 @@
 #[allow(unused_imports)]
 use crate::*;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{
+    close_code, CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade,
+};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use cairn_api::auth::{Authenticator, ServiceTokenAuthenticator};
 use serde::Deserialize;
+
+/// #459: maximum allowed incoming WebSocket text frame in bytes.
+///
+/// Cairn's client→server protocol is two message shapes:
+///   - `{"type":"subscribe","event_types":[...]}`
+///   - `{"type":"ping"}`
+///
+/// Both fit comfortably under 64 KiB even with a few hundred event types
+/// in the filter list. The Axum default (from tokio-tungstenite) allows
+/// frames up to 16 MiB, which combined with the per-connection
+/// `from_str::<Value>` path would let an authenticated caller hold open
+/// a WebSocket and stream 16 MiB frames until the server OOMs. This cap
+/// sits inside the handler AND is mirrored on the `WebSocketUpgrade`
+/// config so tungstenite can short-circuit even earlier on the frame
+/// boundary.
+pub(crate) const MAX_WS_INCOMING_FRAME_BYTES: usize = 64 * 1024;
+
+/// #459: decision function for an inbound WebSocket text frame.
+///
+/// Pure: no side effects, no awaits. Returns the action the caller should
+/// take. Hoisted out of the `tokio::select!` arm so it can be unit tested
+/// without constructing a real `WebSocket`.
+#[derive(Debug, PartialEq)]
+pub(crate) enum WsFrameDecision {
+    /// Frame is within limits — proceed to JSON parse + dispatch.
+    Accept,
+    /// Frame exceeds [`MAX_WS_INCOMING_FRAME_BYTES`]; the caller should
+    /// send a Close(1009 SIZE) and break the connection loop.
+    RejectOversized { bytes: usize },
+}
+
+pub(crate) fn classify_inbound_text_frame(text: &str) -> WsFrameDecision {
+    if text.len() > MAX_WS_INCOMING_FRAME_BYTES {
+        WsFrameDecision::RejectOversized { bytes: text.len() }
+    } else {
+        WsFrameDecision::Accept
+    }
+}
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 
@@ -56,7 +96,13 @@ pub(crate) async fn ws_handler(
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, principal))
+    // #459: cap both the full message size and the individual frame size
+    // at `MAX_WS_INCOMING_FRAME_BYTES`. The in-handler `if text.len() >`
+    // check below is belt-and-suspenders for the case where the cap
+    // changes; tungstenite will refuse oversize frames first.
+    ws.max_message_size(MAX_WS_INCOMING_FRAME_BYTES)
+        .max_frame_size(MAX_WS_INCOMING_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_ws_connection(socket, state, principal))
 }
 
 /// Drive a single WebSocket connection to completion.
@@ -107,6 +153,28 @@ pub(crate) async fn handle_ws_connection(
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(WsMessage::Text(text))) => {
+                        // #459: refuse to parse oversized frames. The
+                        // upgrade config already caps the frame size at
+                        // the tungstenite layer, but if that cap is ever
+                        // relaxed the handler still bounds the JSON
+                        // parse cost here. Close with 1009 SIZE so the
+                        // client sees the actual reason.
+                        if let WsFrameDecision::RejectOversized { bytes } =
+                            classify_inbound_text_frame(&text)
+                        {
+                            tracing::warn!(
+                                frame_bytes = bytes,
+                                max = MAX_WS_INCOMING_FRAME_BYTES,
+                                "rejecting oversized WebSocket text frame",
+                            );
+                            let _ = socket
+                                .send(WsMessage::Close(Some(CloseFrame {
+                                    code: close_code::SIZE,
+                                    reason: "frame exceeds 64 KiB limit".into(),
+                                })))
+                                .await;
+                            break;
+                        }
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
                             match val.get("type").and_then(|t| t.as_str()) {
                                 Some("subscribe") => {
@@ -209,3 +277,48 @@ pub(crate) async fn handle_ws_connection(
 // Export/Import handlers → bin_export.rs
 // Event replay + append handlers → bin_events.rs
 // DB status, admin snapshot/restore, projections → bin_admin.rs
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_inbound_text_frame, WsFrameDecision, MAX_WS_INCOMING_FRAME_BYTES};
+
+    #[test]
+    fn small_frame_accepted() {
+        assert_eq!(
+            classify_inbound_text_frame(r#"{"type":"ping"}"#),
+            WsFrameDecision::Accept,
+        );
+    }
+
+    #[test]
+    fn frame_at_limit_accepted() {
+        let at_cap = "x".repeat(MAX_WS_INCOMING_FRAME_BYTES);
+        assert_eq!(
+            classify_inbound_text_frame(&at_cap),
+            WsFrameDecision::Accept,
+            "frame exactly at the cap must still be accepted",
+        );
+    }
+
+    #[test]
+    fn oversized_frame_rejected() {
+        let oversize = "x".repeat(MAX_WS_INCOMING_FRAME_BYTES + 1);
+        assert_eq!(
+            classify_inbound_text_frame(&oversize),
+            WsFrameDecision::RejectOversized {
+                bytes: MAX_WS_INCOMING_FRAME_BYTES + 1
+            },
+        );
+    }
+
+    #[test]
+    fn two_mb_frame_rejected() {
+        // #459: the original audit repro — 2 MB attacker-crafted frame
+        // must NOT reach `serde_json::from_str`.
+        let big = "x".repeat(2 * 1024 * 1024);
+        assert!(matches!(
+            classify_inbound_text_frame(&big),
+            WsFrameDecision::RejectOversized { .. },
+        ));
+    }
+}

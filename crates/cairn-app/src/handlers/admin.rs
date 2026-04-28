@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{rejection::JsonRejection, Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -30,8 +30,8 @@ use cairn_runtime::{
 use cairn_store::projections::{AuditLogReadModel, QuotaReadModel, RetentionPolicyReadModel};
 
 use crate::errors::{
-    api_error_with_details, require_feature, runtime_error_response, store_error_response,
-    validation_error_response, AppApiError,
+    api_error_with_details, json_rejection_response, require_feature, runtime_error_response,
+    store_error_response, validation_error_response, AppApiError,
 };
 use crate::extractors::{AdminRoleGuard, TenantScope};
 use crate::state::AppState;
@@ -1528,23 +1528,45 @@ pub(crate) async fn delete_model_handler(
 
 /// `POST /v1/admin/models/import-litellm` — Import models from LiteLLM JSON body.
 ///
-/// Returns 400 if the body is not valid JSON (a HashMap of model objects).
+/// Error contract:
+/// - Extractor-level JSON failures return the extractor's native 4xx
+///   status (e.g. 400 for syntactically invalid JSON, 415 for a missing
+///   / invalid `Content-Type` header) with `{code:"validation_error"}`.
+///   Routed through the shared `json_rejection_response` helper so the
+///   response shape matches the rest of the admin surface.
+/// - 400 (with `{code:"invalid_json"}`) when the payload is syntactically
+///   valid JSON but not a top-level object.
+/// - 413 Payload Too Large (with `{code:"payload_too_large"}`) when the
+///   body exceeds the per-route 1,000,000-byte cap. Same
+///   `json_rejection_response` path — `BytesRejection::LengthLimitError`'s
+///   native status is `PAYLOAD_TOO_LARGE`.
+///
+/// #493: the route layers a `DefaultBodyLimit::max(1_000_000)` (1 MB
+/// decimal, ≈ 0.95 MiB) overriding the global 10 MB default. LiteLLM's
+/// real catalog is O(100 KB); anything near the cap is attacker-crafted.
+/// The handler parses the body exactly once via `Json<serde_json::Value>`
+/// and passes the inner
+/// `Map<String, Value>` straight to `import_litellm_map` — no re-parse
+/// and no `HashMap` intermediate.
 pub(crate) async fn import_litellm_handler(
     State(state): State<Arc<AppState>>,
     _role: AdminRoleGuard,
-    body: String,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
-    // Pre-validate: body must parse as a JSON object (HashMap).
-    if serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&body).is_err()
-    {
+    let Json(value) = match body {
+        Ok(v) => v,
+        Err(rej) => return json_rejection_response(rej),
+    };
+    // The LiteLLM format is a top-level JSON object keyed by model id.
+    let serde_json::Value::Object(obj) = value else {
         return AppApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_json",
             "request body is not valid LiteLLM JSON (expected a JSON object)",
         )
         .into_response();
-    }
-    let count = state.model_registry.import_litellm(&body);
+    };
+    let count = state.model_registry.import_litellm_map(&obj);
     (
         StatusCode::OK,
         Json(serde_json::json!({ "imported": count })),

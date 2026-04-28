@@ -1285,9 +1285,19 @@ impl AppBootstrap {
             )
             // ── Model pricing admin (CRUD) ────────────────────────────────────────────
             .route("/v1/admin/models", get(list_models_handler))
+            // #493: per-route body cap of 1_000_000 bytes (≈ 0.95 MiB,
+            // so call it 1 MB decimal — matches what a customer would
+            // type in a size-limit UI). Overrides the 10 MiB workspace
+            // default (the global `DefaultBodyLimit` layer still reads
+            // "10 MB" in that sense too — the two caps live at different
+            // binary/decimal edges, this route's is strictly tighter).
+            // LiteLLM's full catalog is ~120 KB; anything near the cap
+            // is attacker-crafted. Combined with the parse-once handler,
+            // an oversized POST is rejected by Axum with 413 before it
+            // reaches user code.
             .route(
                 "/v1/admin/models/import-litellm",
-                post(import_litellm_handler),
+                post(import_litellm_handler).layer(DefaultBodyLimit::max(1_000_000)),
             )
             .route(
                 "/v1/admin/models/:id",

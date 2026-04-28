@@ -448,22 +448,51 @@ pub(crate) fn bearer_token(request: &Request) -> Option<String> {
             }
         }
     }
-    // 2. Query-param fallback: `?token=<token>` for SSE EventSource
-    //    which can't set custom headers.
+    // 2. Query-param fallback: `?token=<token>` on GET requests only.
+    //    The original motivation is SSE EventSource and WebSocket
+    //    upgrade (both GET-only, both unable to set custom headers from
+    //    browser code). The gate is intentionally `method == GET` and
+    //    not a path allow-list — every mutation verb (POST/PUT/PATCH/
+    //    DELETE) is already rejected, and a single-predicate rule is
+    //    easier to audit than a growing path catalog. If ops telemetry
+    //    ever shows non-SSE/WS GETs accepting query tokens in practice,
+    //    a tighter path allow-list (e.g. only `/v1/stream`, `/v1/ws`,
+    //    `/v1/streams/runtime`) is the obvious next tightening.
     //
-    //    T6b-H2: percent-decode properly (so `%2B` becomes `+`), pick
-    //    only the FIRST `token` key (duplicates are rejected), and
-    //    reject whitespace-only values.
+    //    #491: pre-fix the fallback fired on ANY method — a
+    //    `POST /v1/admin/rotate-token?token=<bearer>` succeeded with
+    //    only the query param. That turned every channel that leaks a
+    //    URL (browser history, Referer header, upstream proxy /
+    //    load-balancer access log, CSRF via image-tag or form-submit)
+    //    into a full-privilege mutation vector. Bearer-in-query is a
+    //    fundamentally leakier channel than a header; GET-only closes
+    //    the mutation surface while keeping SSE + WS functional.
+    //
+    //    T6b-H2: percent-decode properly (so `%2B` becomes `+`),
+    //    actively reject duplicate `token` keys (query-param smuggling),
+    //    and reject whitespace-only values.
+    if request.method() != axum::http::Method::GET {
+        return None;
+    }
     if let Some(query) = request.uri().query() {
+        let mut found: Option<String> = None;
         for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
             if k.as_ref() == "token" {
+                if found.is_some() {
+                    // Duplicate `?token=a&token=b` — refuse the request
+                    // rather than first-wins or last-wins. Query-param
+                    // smuggling where a proxy reorders duplicates is a
+                    // real-world attack vector (Copilot review on PR #548).
+                    return None;
+                }
                 let v = v.trim();
                 if v.is_empty() {
                     return None;
                 }
-                return Some(v.to_owned());
+                found = Some(v.to_owned());
             }
         }
+        return found;
     }
     None
 }
@@ -822,6 +851,14 @@ mod tests {
         builder.body(Body::empty()).unwrap()
     }
 
+    fn make_request_method(method: &str, uri: &str, auth_header: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(header) = auth_header {
+            builder = builder.header("Authorization", header);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
     #[test]
     fn bearer_from_auth_header() {
         let req = make_request("/v1/runs", Some("Bearer my-secret-token"));
@@ -861,6 +898,72 @@ mod tests {
     #[test]
     fn bearer_none_for_empty_query_token() {
         let req = make_request("/v1/stream?token=", None);
+        assert_eq!(bearer_token(&req), None);
+    }
+
+    // #491: `?token=` query-string fallback must be GET-only.
+
+    #[test]
+    fn query_token_accepted_on_get() {
+        let req = make_request_method("GET", "/v1/stream?token=t1", None);
+        assert_eq!(bearer_token(&req), Some("t1".to_owned()));
+    }
+
+    #[test]
+    fn query_token_refused_on_post() {
+        let req = make_request_method("POST", "/v1/runs?token=t1", None);
+        assert_eq!(
+            bearer_token(&req),
+            None,
+            "query-param token fallback must not fire on POST",
+        );
+    }
+
+    #[test]
+    fn query_token_refused_on_put() {
+        let req = make_request_method("PUT", "/v1/settings?token=t1", None);
+        assert_eq!(bearer_token(&req), None);
+    }
+
+    #[test]
+    fn query_token_refused_on_patch() {
+        let req = make_request_method("PATCH", "/v1/settings?token=t1", None);
+        assert_eq!(bearer_token(&req), None);
+    }
+
+    #[test]
+    fn query_token_refused_on_delete() {
+        let req = make_request_method("DELETE", "/v1/runs/foo?token=t1", None);
+        assert_eq!(bearer_token(&req), None);
+    }
+
+    /// The method gate must NOT suppress a header-provided bearer on
+    /// non-GET methods — that would lock out every API consumer.
+    #[test]
+    fn header_bearer_still_accepted_on_post() {
+        let req = make_request_method("POST", "/v1/runs", Some("Bearer header-tok"));
+        assert_eq!(bearer_token(&req), Some("header-tok".to_owned()));
+    }
+
+    /// #491 + Copilot r3: `?token=a&token=b` must be rejected outright
+    /// (no first-wins or last-wins). A proxy that reorders duplicate
+    /// query params is a real-world smuggling vector, and the code
+    /// comment above the implementation commits to "duplicates are
+    /// rejected" — this test binds that contract.
+    #[test]
+    fn query_token_duplicates_rejected() {
+        let req = make_request_method("GET", "/v1/stream?token=a&token=b", None);
+        assert_eq!(
+            bearer_token(&req),
+            None,
+            "duplicate ?token= params must be rejected (query-param smuggling)",
+        );
+    }
+
+    /// Triple-duplicate sanity check — any count > 1 is a rejection.
+    #[test]
+    fn query_token_triple_duplicates_rejected() {
+        let req = make_request_method("GET", "/v1/stream?token=a&other=x&token=b&token=c", None);
         assert_eq!(bearer_token(&req), None);
     }
 

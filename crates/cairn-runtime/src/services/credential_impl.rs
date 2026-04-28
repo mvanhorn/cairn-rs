@@ -62,6 +62,17 @@ pub const MIN_CIPHERTEXT_LEN: usize = NONCE_LEN + TAG_LEN;
 /// instead.
 pub const CURRENT_KEY_VERSION: &str = "v2";
 
+/// Operator-facing error body for any AEAD encryption failure. Used by
+/// both `encrypt_value` and the regression test so the test actually
+/// exercises the shared message and a future refactor that drops or
+/// changes the constant is caught at compile time (Gemini + Copilot on
+/// PR #548, #460).
+pub const CREDENTIAL_ENCRYPTION_ERROR: &str = "credential encryption failed";
+
+/// Operator-facing error body for any AEAD decryption failure. Mirror
+/// constant to [`CREDENTIAL_ENCRYPTION_ERROR`].
+pub const CREDENTIAL_DECRYPTION_ERROR: &str = "credential decryption failed";
+
 /// The deployment-wide master key used to encrypt and decrypt stored
 /// credentials. 32 bytes, held in a `Zeroizing` buffer so it is scrubbed
 /// from memory on drop.
@@ -312,7 +323,7 @@ fn encrypt_value(master_key: &MasterKey, plaintext_value: &str) -> Result<Vec<u8
             // we still avoid forwarding it verbatim to keep the RuntimeError
             // body free of any provider-specific detail.
             tracing::error!(error = %e, "credential encryption failed");
-            RuntimeError::Internal("credential encryption failed".to_owned())
+            RuntimeError::Internal(CREDENTIAL_ENCRYPTION_ERROR.to_owned())
         })?;
     let mut out = Vec::with_capacity(NONCE_LEN + sealed.len());
     out.extend_from_slice(&nonce);
@@ -338,7 +349,7 @@ fn decrypt_value(master_key: &MasterKey, encrypted_value: &[u8]) -> Result<Strin
     let cipher = Aes256Gcm::new(master_key.as_aes_key());
     let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| {
         tracing::error!(error = %e, "credential decryption failed");
-        RuntimeError::Internal("credential decryption failed".to_owned())
+        RuntimeError::Internal(CREDENTIAL_DECRYPTION_ERROR.to_owned())
     })?;
     String::from_utf8(plaintext).map_err(|e| {
         // Don't include the invalid bytes in the error — they are still the
@@ -761,6 +772,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{decrypt_value, MasterKey};
+    use crate::error::RuntimeError;
     use cairn_domain::TenantId;
     use cairn_store::projections::CredentialRotationReadModel;
     use cairn_store::InMemoryStore;
@@ -900,6 +912,68 @@ mod tests {
         let k2 = Arc::new(MasterKey::from_bytes([2u8; 32]));
         let ct = super::encrypt_value(k1.as_ref(), "shhh").unwrap();
         assert!(decrypt_value(k2.as_ref(), &ct).is_err());
+    }
+
+    /// #460: decrypt-with-wrong-key errors must NOT embed the aes-gcm /
+    /// aead crate's error text. Even though `aead::Error`'s Display is
+    /// `"aead::Error"` today, stringifying it into the returned
+    /// `RuntimeError::Internal` would couple the HTTP error body to an
+    /// implementation-detail type name. The post-fix handler returns a
+    /// fixed operator-facing string from [`CREDENTIAL_DECRYPTION_ERROR`];
+    /// any future AEAD swap that starts printing richer errors won't
+    /// leak through.
+    ///
+    /// Exercises the REAL code path (`decrypt_value` with mismatched
+    /// keys) and asserts on the shared [`CREDENTIAL_DECRYPTION_ERROR`]
+    /// constant. A future refactor that reintroduces `{e}` interpolation
+    /// inside `decrypt_value`'s `map_err` closure — or that redefines
+    /// the constant to embed crypto detail — will fail this test.
+    #[test]
+    fn decrypt_error_does_not_leak_aead_internals() {
+        use super::CREDENTIAL_DECRYPTION_ERROR;
+
+        let k1 = Arc::new(MasterKey::from_bytes([1u8; 32]));
+        let k2 = Arc::new(MasterKey::from_bytes([2u8; 32]));
+        let ct = super::encrypt_value(k1.as_ref(), "shhh").unwrap();
+        let err = decrypt_value(k2.as_ref(), &ct).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(CREDENTIAL_DECRYPTION_ERROR),
+            "decrypt error body must contain the shared constant \
+             `{CREDENTIAL_DECRYPTION_ERROR}` — got: {msg}",
+        );
+        // Belt-and-suspenders: reject any aead/aes telemetry leak.
+        assert!(!msg.to_lowercase().contains("aead"));
+        assert!(!msg.to_lowercase().contains("aes"));
+        assert!(!msg.to_lowercase().contains("gcm"));
+        // Also assert the constant itself carries no crypto-crate
+        // detail, in case a future refactor tries to enrich it.
+        let k = CREDENTIAL_DECRYPTION_ERROR.to_lowercase();
+        assert!(!k.contains("aead"));
+        assert!(!k.contains("aes"));
+        assert!(!k.contains("gcm"));
+    }
+
+    /// #460 (encrypt side): the operator-facing encrypt-failure body
+    /// must stay free of aes-gcm / aead telemetry. Cairn holds aes-gcm
+    /// well below its documented input-size ceiling so `encrypt_value`
+    /// has no practical failure input, but we can still enforce the
+    /// contract at the constant level: `encrypt_value`'s `map_err`
+    /// produces `RuntimeError::Internal(CREDENTIAL_ENCRYPTION_ERROR)`
+    /// verbatim, and this test asserts the constant itself has no
+    /// crypto-crate leakage. Any refactor that re-introduces `{e}` or
+    /// redefines the constant fails here.
+    #[test]
+    fn encrypt_error_constant_has_no_crypto_detail() {
+        use super::CREDENTIAL_ENCRYPTION_ERROR;
+
+        let k = CREDENTIAL_ENCRYPTION_ERROR.to_lowercase();
+        assert!(!k.contains("aead"));
+        assert!(!k.contains("aes"));
+        assert!(!k.contains("gcm"));
+        // Sanity: the constant IS the text the handler emits.
+        let err = RuntimeError::Internal(CREDENTIAL_ENCRYPTION_ERROR.to_owned());
+        assert!(err.to_string().contains(CREDENTIAL_ENCRYPTION_ERROR));
     }
 
     #[test]

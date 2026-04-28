@@ -2326,18 +2326,28 @@ pub(crate) async fn orchestrate_run_handler(
     // read is a fast-path that lets the handler skip the workspace +
     // defaults plumbing entirely when the run is already terminal.
     if run.state.is_terminal() {
+        // `is_terminal()` covers exactly the three arms below today. A future
+        // variant that gets added to `RunState::is_terminal` but missed here
+        // must NOT panic the request path — `unreachable!` on an HTTP handler
+        // is a DoS surface (#455). Log + return 500 so the ops team sees a
+        // loud stack trace, not a dropped connection.
         let termination = match run.state {
             cairn_domain::RunState::Completed => "completed",
             cairn_domain::RunState::Failed => "failed",
             cairn_domain::RunState::Canceled => "canceled",
-            // `is_terminal()` covers exactly the three arms above today.
-            // Using `unreachable!` rather than a wildcard keeps
-            // exhaustiveness checks honest: any future terminal variant
-            // added to the domain enum will trip this at test time
-            // instead of silently reporting as "completed".
-            other => unreachable!(
-                "RunState::is_terminal returned true for non-terminal variant {other:?}"
-            ),
+            other => {
+                tracing::error!(
+                    run_id = %run.run_id,
+                    run_state = ?other,
+                    "RunState::is_terminal returned true for unhandled variant — update orchestrate_run_handler",
+                );
+                return AppApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "run is in an unexpected terminal state",
+                )
+                .into_response();
+            }
         };
         return (
             StatusCode::OK,
