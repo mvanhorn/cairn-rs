@@ -862,8 +862,53 @@ impl SqliteSyncProjection {
             RuntimeEvent::TaskDependencyResolved(_) => log_stub("TaskDependencyResolved"),
             RuntimeEvent::TaskLeaseExpired(_) => log_stub("TaskLeaseExpired"),
             RuntimeEvent::TaskPriorityChanged(_) => log_stub("TaskPriorityChanged"),
-            RuntimeEvent::ToolInvocationProgressUpdated(_) => {
-                log_stub("ToolInvocationProgressUpdated")
+            // #364: durable projection for progress updates. UPSERT keyed
+            // by `invocation_id`; we copy the project scope from the
+            // existing `tool_invocations` row so the handler can
+            // tenant-filter without a second lookup. Events for
+            // invocations that do not exist yet (should not happen in
+            // practice — started always precedes progress) are a no-op
+            // rather than silently fabricating a project scope.
+            RuntimeEvent::ToolInvocationProgressUpdated(e) => {
+                let scope: Option<(String, String, String)> = sqlx::query_as(
+                    "SELECT tenant_id, workspace_id, project_id
+                     FROM tool_invocations
+                     WHERE invocation_id = ?",
+                )
+                .bind(e.invocation_id.as_str())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+
+                if let Some((tenant_id, workspace_id, project_id)) = scope {
+                    let updated_at = i64::try_from(e.updated_at_ms).map_err(|_| {
+                        StoreError::Internal(format!(
+                            "ToolInvocationProgressUpdated.updated_at_ms {} exceeds i64::MAX",
+                            e.updated_at_ms
+                        ))
+                    })?;
+                    sqlx::query(
+                        "INSERT INTO tool_invocation_progress
+                             (invocation_id, tenant_id, workspace_id, project_id,
+                              progress_pct, message, updated_at_ms)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)
+                         ON CONFLICT(invocation_id) DO UPDATE SET
+                             progress_pct  = excluded.progress_pct,
+                             message       = excluded.message,
+                             updated_at_ms = excluded.updated_at_ms
+                         WHERE excluded.updated_at_ms >= tool_invocation_progress.updated_at_ms",
+                    )
+                    .bind(e.invocation_id.as_str())
+                    .bind(tenant_id)
+                    .bind(workspace_id)
+                    .bind(project_id)
+                    .bind(i64::from(e.progress_pct))
+                    .bind(e.message.as_deref())
+                    .bind(updated_at)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                }
             }
             // Projection contract: mirrors the pg handler so operator
             // REST queries over cache activity work identically across

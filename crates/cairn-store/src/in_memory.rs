@@ -153,6 +153,14 @@ struct State {
     /// `invocation_id` so replay + second-boot reads converge to the same
     /// set. Mirrors the pg/sqlite `tool_invocation_cache_hits` table.
     tool_invocation_cache_hits: HashMap<String, crate::projections::ToolInvocationCacheHitRecord>,
+    /// #364: latest `ToolInvocationProgressUpdated` per invocation, keyed
+    /// by `invocation_id`. Carries the `ProjectKey` so
+    /// `GET /v1/tool-invocations/:id/progress` can enforce tenant scope
+    /// without a second lookup against `tool_invocations`. Replaces the
+    /// previous `read_stream(None, 10_000)` + filter scan — that scan
+    /// was both a DoS (bounded by a fixed 10k window that masked data
+    /// past it) and cross-tenant readable.
+    tool_invocation_progress: HashMap<String, crate::projections::ToolInvocationProgressRecord>,
     /// F65 PR-2: orchestrator-session outcomes, keyed by `root_run_id`
     /// (the primary key of the pg/sqlite `session_outcomes` table).
     session_outcomes: HashMap<String, crate::projections::SessionOutcomeRecord>,
@@ -266,6 +274,7 @@ impl InMemoryStore {
                 resource_shares: HashMap::new(),
                 ff_lease_history_cursors: HashMap::new(),
                 tool_invocation_cache_hits: HashMap::new(),
+                tool_invocation_progress: HashMap::new(),
                 session_outcomes: HashMap::new(),
                 workspace_snapshots: HashMap::new(),
                 workspace_registry: HashMap::new(),
@@ -1337,8 +1346,43 @@ impl InMemoryStore {
             RuntimeEvent::TaskDependencyAdded(_)
             | RuntimeEvent::TaskDependencyResolved(_)
             | RuntimeEvent::TaskLeaseExpired(_)
-            | RuntimeEvent::TaskPriorityChanged(_)
-            | RuntimeEvent::ToolInvocationProgressUpdated(_) => {}
+            | RuntimeEvent::TaskPriorityChanged(_) => {}
+            // #364: project the LATEST progress update per invocation so
+            // the `get_tool_invocation_progress_handler` can answer
+            // tenant-scoped reads without walking the event log. We
+            // inherit the `ProjectKey` from the existing
+            // `tool_invocations` row rather than carrying it on the
+            // event, so the projection is only created when the
+            // invocation itself has been started. Progress events that
+            // arrive before the `ToolInvocationStarted` (should not
+            // happen in practice, but we refuse to silently fabricate a
+            // project) are a no-op.
+            //
+            // Out-of-order replay guard: an older event must not
+            // overwrite a newer one. Mirrors the
+            // `WHERE EXCLUDED.updated_at_ms >= …` clause on the pg/sqlite
+            // UPSERTs so every backend converges on the same row after
+            // replay. Flagged on PR #537 by Gemini / Copilot / Cursor.
+            RuntimeEvent::ToolInvocationProgressUpdated(e) => {
+                if let Some(inv) = state.tool_invocations.get(e.invocation_id.as_str()) {
+                    let should_write = state
+                        .tool_invocation_progress
+                        .get(e.invocation_id.as_str())
+                        .is_none_or(|existing| e.updated_at_ms >= existing.updated_at_ms);
+                    if should_write {
+                        state.tool_invocation_progress.insert(
+                            e.invocation_id.as_str().to_owned(),
+                            crate::projections::ToolInvocationProgressRecord {
+                                invocation_id: e.invocation_id.clone(),
+                                project: inv.project.clone(),
+                                progress_pct: e.progress_pct,
+                                message: e.message.clone(),
+                                updated_at_ms: e.updated_at_ms,
+                            },
+                        );
+                    }
+                }
+            }
             RuntimeEvent::SessionCostUpdated(e) => {
                 // The envelope carries a top-level `tenant_id` AND a
                 // `project.tenant_id` — two redundant fields that can
@@ -3129,6 +3173,22 @@ impl ToolInvocationReadModel for InMemoryStore {
             .collect();
         results.sort_by_key(|record| record.requested_at_ms);
         Ok(results.into_iter().skip(offset).take(limit).collect())
+    }
+}
+
+// -- ToolInvocationProgressReadModel --
+
+#[async_trait]
+impl crate::projections::ToolInvocationProgressReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        invocation_id: &ToolInvocationId,
+    ) -> Result<Option<crate::projections::ToolInvocationProgressRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .tool_invocation_progress
+            .get(invocation_id.as_str())
+            .cloned())
     }
 }
 
@@ -6470,6 +6530,140 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].invocation_id, invocation_id);
+    }
+
+    /// #364: the in-memory `tool_invocation_progress` projection
+    /// records the LATEST progress event per invocation, inherits the
+    /// `ProjectKey` from the existing `tool_invocations` row, and
+    /// refuses to overwrite with an older event (out-of-order replay
+    /// guard). Mirrors the pg/sqlite `WHERE excluded.updated_at_ms
+    /// >= …` UPSERT.
+    #[tokio::test]
+    async fn tool_invocation_progress_projection_idempotent_against_out_of_order_replay() {
+        use crate::projections::ToolInvocationProgressReadModel;
+
+        let store = InMemoryStore::new();
+        let project = test_project();
+        let invocation_id = ToolInvocationId::new("tool_progress_1");
+
+        // Seed the invocation so the progress projection has a
+        // project scope to inherit.
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationStarted(
+                ToolInvocationStarted {
+                    project: project.clone(),
+                    invocation_id: invocation_id.clone(),
+                    session_id: None,
+                    run_id: None,
+                    task_id: None,
+                    target: ToolInvocationTarget::Builtin {
+                        tool_name: "fs.read".to_owned(),
+                    },
+                    execution_class: ExecutionClass::SupervisedProcess,
+                    prompt_release_id: None,
+                    requested_at_ms: 100,
+                    started_at_ms: 101,
+                    args_json: None,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        // First progress event → stored.
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationProgressUpdated(
+                cairn_domain::ToolInvocationProgressUpdated {
+                    invocation_id: invocation_id.clone(),
+                    progress_pct: 20,
+                    message: Some("phase 1".to_owned()),
+                    updated_at_ms: 200,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        let rec = ToolInvocationProgressReadModel::get(&store, &invocation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.project, project);
+        assert_eq!(rec.progress_pct, 20);
+        assert_eq!(rec.updated_at_ms, 200);
+
+        // Newer progress event → replaces.
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationProgressUpdated(
+                cairn_domain::ToolInvocationProgressUpdated {
+                    invocation_id: invocation_id.clone(),
+                    progress_pct: 60,
+                    message: Some("phase 2".to_owned()),
+                    updated_at_ms: 300,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        let rec = ToolInvocationProgressReadModel::get(&store, &invocation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.progress_pct, 60, "newer event must overwrite");
+        assert_eq!(rec.updated_at_ms, 300);
+
+        // Older replay → must NOT regress.
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationProgressUpdated(
+                cairn_domain::ToolInvocationProgressUpdated {
+                    invocation_id: invocation_id.clone(),
+                    progress_pct: 10,
+                    message: Some("stale phase 0".to_owned()),
+                    updated_at_ms: 50,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        let rec = ToolInvocationProgressReadModel::get(&store, &invocation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.progress_pct, 60,
+            "older replay must NOT overwrite newer progress — would regress the operator UI",
+        );
+        assert_eq!(rec.updated_at_ms, 300);
+    }
+
+    /// #364: a progress event for an invocation that has not yet been
+    /// started is a no-op (we refuse to fabricate a project scope).
+    /// This is the edge case documented in the apply handler — in
+    /// practice `ToolInvocationStarted` always precedes progress.
+    #[tokio::test]
+    async fn tool_invocation_progress_projection_noop_without_invocation_row() {
+        use crate::projections::ToolInvocationProgressReadModel;
+
+        let store = InMemoryStore::new();
+        let invocation_id = ToolInvocationId::new("tool_progress_orphan");
+
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationProgressUpdated(
+                cairn_domain::ToolInvocationProgressUpdated {
+                    invocation_id: invocation_id.clone(),
+                    progress_pct: 5,
+                    message: None,
+                    updated_at_ms: 10,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        assert!(
+            ToolInvocationProgressReadModel::get(&store, &invocation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "progress without a prior Started event must NOT create a projection row",
+        );
     }
 
     #[tokio::test]

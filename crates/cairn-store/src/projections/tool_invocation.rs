@@ -7,6 +7,39 @@ pub use cairn_domain::tool_invocation::{ToolInvocationRecord, ToolInvocationStat
 
 use cairn_domain::{ProjectKey, TaskId};
 
+/// Latest-progress row for a tool invocation.
+///
+/// One row per `invocation_id`, upserted on every
+/// `RuntimeEvent::ToolInvocationProgressUpdated`. Carries the project key
+/// so `GET /v1/tool-invocations/:id/progress` can filter by
+/// `tenant_scope` without a second hop through `ToolInvocationReadModel`.
+///
+/// Replaces the previous `read_stream(None, 10_000)` scan in
+/// `get_tool_invocation_progress_handler` — that scan was both a DoS
+/// risk (bounded by a fixed 10k window that silently masked data past
+/// it) and a cross-tenant read (returned any tenant's progress).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolInvocationProgressRecord {
+    pub invocation_id: ToolInvocationId,
+    pub project: ProjectKey,
+    pub progress_pct: u8,
+    pub message: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+/// Read-model for the latest progress update of a tool invocation.
+/// Backed by `tool_invocation_progress` in pg/sqlite and an in-memory
+/// map in the `--db memory` backend.
+#[async_trait]
+pub trait ToolInvocationProgressReadModel: Send + Sync {
+    /// Return the most recent progress row for the given invocation, or
+    /// `None` when the invocation has not reported progress yet.
+    async fn get(
+        &self,
+        invocation_id: &ToolInvocationId,
+    ) -> Result<Option<ToolInvocationProgressRecord>, StoreError>;
+}
+
 /// F52: projected row of `ToolInvocationCacheHit`. One per cache-hit
 /// event. Operators can count/list via this read model without scanning
 /// the event log; backends must write one row per event.

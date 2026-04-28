@@ -4073,13 +4073,17 @@ pub(crate) async fn revise_plan_handler(
 ///
 /// Alias for `save_checkpoint_handler`; provides the `record_checkpoint_handler`
 /// name expected by the preserved route catalog and audit tests.
+///
+/// #370: tenant-scoped — forwards the `TenantScope` extractor into the
+/// underlying handler so the alias path is not a bypass.
 #[allow(dead_code)]
 pub(crate) async fn record_checkpoint_handler(
     state: State<Arc<AppState>>,
+    tenant_scope: crate::extractors::TenantScope,
     path: Path<String>,
     body: Json<crate::SaveCheckpointRequest>,
 ) -> impl IntoResponse {
-    crate::save_checkpoint_handler(state, path, body).await
+    crate::save_checkpoint_handler(state, tenant_scope, path, body).await
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

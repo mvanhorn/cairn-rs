@@ -1,4 +1,20 @@
 //! Tool invocation and checkpoint HTTP handlers.
+//!
+//! Tenant isolation contract
+//! -------------------------
+//!
+//! Every handler in this module enforces tenant isolation, either via
+//! a direct `TenantScope` extractor on the handler signature or via a
+//! body extractor such as `ProjectJson<T>` that validates the body
+//! tenant against the caller's scope at extraction time. Before
+//! reading or mutating any record, handlers enforce
+//! `tenant_scope.is_admin || record.project.tenant_id ==
+//! *tenant_scope.tenant_id()`. Cross-tenant access returns 404 (not
+//! 403) to avoid an id-enumeration oracle.
+//!
+//! See META #372 for the audit trail — these handlers previously took
+//! only `State<Arc<AppState>>` + a path/query/body extractor and leaked
+//! cross-tenant reads, writes, and cancellations.
 
 use std::sync::Arc;
 
@@ -12,12 +28,13 @@ use axum::{
 use cairn_api::http::ListResponse;
 use cairn_domain::tool_invocation::ToolInvocationTarget;
 use cairn_domain::{
-    CheckpointId, CheckpointStrategy, CheckpointStrategySet, ExecutionClass, ProjectKey, RunId,
-    RuntimeEvent, SessionId, TaskId, ToolInvocationId,
+    CheckpointId, CheckpointStrategy, CheckpointStrategySet, ExecutionClass, RunId, RuntimeEvent,
+    SessionId, TaskId, ToolInvocationId,
 };
 use cairn_runtime::{CheckpointService, ToolInvocationService};
 use cairn_store::projections::{
-    CheckpointReadModel, CheckpointStrategyReadModel, RunReadModel, ToolInvocationReadModel,
+    CheckpointReadModel, CheckpointStrategyReadModel, ToolInvocationProgressReadModel,
+    ToolInvocationReadModel,
 };
 use cairn_store::EventLog;
 
@@ -32,6 +49,46 @@ use crate::{
     cancel_plugin_invocation, current_event_head, parse_tool_invocation_state,
     publish_runtime_frames_since,
 };
+
+// ── Shared helpers ──────────────────────────────────────────────────────────
+
+/// Response shared by every "this id is either not yours or doesn't exist"
+/// exit path in this module. A single string keeps the behavior uniform so
+/// a cross-tenant probe cannot distinguish a real miss from a scope miss by
+/// the error body.
+fn tool_invocation_not_found_response() -> axum::response::Response {
+    AppApiError::new(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "tool invocation not found",
+    )
+    .into_response()
+}
+
+fn checkpoint_not_found_response() -> axum::response::Response {
+    AppApiError::new(StatusCode::NOT_FOUND, "not_found", "checkpoint not found").into_response()
+}
+
+fn run_not_found_response() -> axum::response::Response {
+    AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found").into_response()
+}
+
+fn tool_invocation_progress_not_found_response() -> axum::response::Response {
+    AppApiError::new(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "tool invocation progress not found",
+    )
+    .into_response()
+}
+
+/// True when the caller is allowed to see a record rooted at the given
+/// `ProjectKey`. Admin tokens see every tenant (matches the existing
+/// `load_run_visible_to_tenant` / `load_task_visible_to_tenant`
+/// contract); non-admin tokens must match tenant exactly.
+fn tenant_visible(scope: &TenantScope, project: &cairn_domain::ProjectKey) -> bool {
+    scope.is_admin || project.tenant_id == *scope.tenant_id()
+}
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
 
@@ -53,6 +110,16 @@ impl ToolInvocationListQuery {
     }
 }
 
+/// Body shape for `POST /v1/tool-invocations`.
+///
+/// #365: a body-supplied `tenant_id` is now validated against the
+/// `TenantScope` via `ProjectJson<CreateToolInvocationRequest>`.
+/// Non-admin callers whose body `tenant_id` disagrees with the
+/// bearer-token tenant are refused with 403 before the handler even
+/// runs; admin tokens pass through (matches the `CreateRunRequest` /
+/// `CreateTaskRequest` shape). The old handler accepted the body
+/// tenant verbatim, which let any authenticated caller plant records
+/// into an arbitrary tenant.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct CreateToolInvocationRequest {
     pub(crate) tenant_id: String,
@@ -71,12 +138,18 @@ pub(crate) struct CreateToolInvocationRequest {
 }
 
 impl CreateToolInvocationRequest {
-    pub(crate) fn project(&self) -> ProjectKey {
-        ProjectKey::new(
+    pub(crate) fn project(&self) -> cairn_domain::ProjectKey {
+        cairn_domain::ProjectKey::new(
             self.tenant_id.as_str(),
             self.workspace_id.as_str(),
             self.project_id.as_str(),
         )
+    }
+}
+
+impl crate::extractors::HasProjectScope for CreateToolInvocationRequest {
+    fn project(&self) -> cairn_domain::ProjectKey {
+        Self::project(self)
     }
 }
 
@@ -177,8 +250,17 @@ impl ToolInvocationView {
     }
 }
 
+/// `GET /v1/tool-invocations?run_id=…`
+///
+/// #362: tenant-scoped. The run is resolved first and its project scope
+/// is compared against the caller. A non-admin reading a run from
+/// another tenant sees an empty list (same shape as "no invocations")
+/// — we do not 404 because this endpoint is list-shaped, and returning
+/// empty matches the behavior of a run whose invocation table happens
+/// to be empty. Admins see all tenants.
 pub(crate) async fn list_tool_invocations_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Query(query): Query<ToolInvocationListQuery>,
 ) -> impl IntoResponse {
     let Some(run_id) = query.run_id.as_deref() else {
@@ -191,6 +273,27 @@ pub(crate) async fn list_tool_invocations_handler(
         )
             .into_response();
     };
+
+    // Resolve the run through the shared `load_run_visible_to_tenant`
+    // helper so the tenant gate stays in lockstep with every other run
+    // read in cairn-app. A missing run returns the same empty shape as
+    // "run with no invocations" — cross-tenant probing cannot
+    // distinguish the two cases. (Cursor bugbot #537.)
+    let run_id = RunId::new(run_id);
+    match crate::helpers::load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::OK,
+                Json(ListResponse::<ToolInvocationView> {
+                    items: Vec::new(),
+                    has_more: false,
+                }),
+            )
+                .into_response();
+        }
+        Err(resp) => return resp,
+    }
 
     // F55 review: filter BEFORE pagination. The state filter is applied
     // in-memory (the read model doesn't push it down), so fetching only
@@ -212,7 +315,7 @@ pub(crate) async fn list_tool_invocations_handler(
 
     let all = match ToolInvocationReadModel::list_by_run(
         state.runtime.store.as_ref(),
-        &RunId::new(run_id),
+        &run_id,
         MAX_TOOL_INVOCATIONS_PER_RUN + 1,
         0,
     )
@@ -249,71 +352,80 @@ pub(crate) async fn list_tool_invocations_handler(
     (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
 }
 
+/// `GET /v1/tool-invocations/:id`
+///
+/// #363: tenant-scoped. Cross-tenant reads return 404 (same response
+/// as unknown id) so the endpoint does not leak id existence across
+/// tenants.
 pub(crate) async fn get_tool_invocation_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match ToolInvocationReadModel::get(state.runtime.store.as_ref(), &ToolInvocationId::new(id))
         .await
     {
-        // F55: return the flattened operator view so single-item GETs
-        // match the shape of the list endpoint.
-        Ok(Some(record)) => (
+        Ok(Some(record)) if tenant_visible(&tenant_scope, &record.project) => (
             StatusCode::OK,
+            // F55: return the flattened operator view so single-item
+            // GETs match the shape of the list endpoint.
             Json(ToolInvocationView::from_record(record)),
         )
             .into_response(),
-        Ok(None) => AppApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "tool invocation not found",
-        )
-        .into_response(),
+        Ok(Some(_)) | Ok(None) => tool_invocation_not_found_response(),
         Err(err) => store_error_response(err),
     }
 }
 
+/// `GET /v1/tool-invocations/:id/progress`
+///
+/// #364: tenant-scoped AND O(1). The previous implementation scanned
+/// up to 10k events from the log and reverse-searched for a matching
+/// `ToolInvocationProgressUpdated`, which was both a DoS (the scan
+/// runs on every request, and 10k is neither enough for busy runs
+/// nor bounded by tenant) and a cross-tenant read oracle. The fix
+/// queries the new `tool_invocation_progress` projection — one row
+/// per invocation with the project scope already materialized — and
+/// returns 404 when the caller is not allowed to see it.
 pub(crate) async fn get_tool_invocation_progress_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let invocation_id = ToolInvocationId::new(id);
-    // Scan events for the latest ToolInvocationProgressUpdated for this invocation.
-    let events = match state.runtime.store.read_stream(None, 10_000).await {
-        Ok(e) => e,
-        Err(err) => return store_error_response(err),
-    };
-    let latest = events.into_iter().rev().find_map(|stored| {
-        if let RuntimeEvent::ToolInvocationProgressUpdated(p) = stored.envelope.payload {
-            if p.invocation_id == invocation_id {
-                return Some(p);
-            }
-        }
-        None
-    });
-    match latest {
-        Some(p) => (
+    match ToolInvocationProgressReadModel::get(state.runtime.store.as_ref(), &invocation_id).await {
+        Ok(Some(record)) if tenant_visible(&tenant_scope, &record.project) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "percent": p.progress_pct as f64 + 0.5,
-                "message": p.message,
-                "updated_at_ms": p.updated_at_ms,
+                // Preserve the off-by-half ceiling used by the earlier
+                // handler — operator dashboards render a float and
+                // the +0.5 prevents a 99/100 jitter at completion.
+                "percent": record.progress_pct as f64 + 0.5,
+                "message": record.message,
+                "updated_at_ms": record.updated_at_ms,
             })),
         )
             .into_response(),
-        None => AppApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "tool invocation progress not found",
-        )
-        .into_response(),
+        Ok(Some(_)) | Ok(None) => tool_invocation_progress_not_found_response(),
+        Err(err) => store_error_response(err),
     }
 }
 
+/// `POST /v1/tool-invocations`
+///
+/// #365: the body-supplied tenant is validated against the caller's
+/// `TenantScope` via `ProjectJson<T>`. Non-admin callers whose body
+/// `tenant_id` disagrees with the bearer-token tenant are refused
+/// before this handler runs (403 from the extractor); admin tokens
+/// pass through. Matches `CreateRunRequest` /
+/// `CreateTaskRequest` — the pre-fix handler bypassed the check and
+/// accepted any tenant from the body, so a caller could plant a
+/// record into any tenant simply by spelling it in JSON.
 pub(crate) async fn create_tool_invocation_handler(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateToolInvocationRequest>,
+    project_scope: crate::extractors::ProjectJson<CreateToolInvocationRequest>,
 ) -> impl IntoResponse {
+    let body = project_scope.into_inner();
     let before = current_event_head(&state).await;
     let project = body.project();
     let invocation_id = ToolInvocationId::new(body.invocation_id);
@@ -360,23 +472,23 @@ pub(crate) async fn create_tool_invocation_handler(
     }
 }
 
+/// `POST /v1/tool-invocations/:id/complete`
+///
+/// #366: tenant-scoped. Cross-tenant callers (and unknown ids) get
+/// 404 — the 404 comes first so we don't leak the target's existence
+/// by running the state machine on a record we're not allowed to
+/// touch.
 pub(crate) async fn complete_tool_invocation_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let before = current_event_head(&state).await;
     let invocation_id = ToolInvocationId::new(id);
     let record =
         match ToolInvocationReadModel::get(state.runtime.store.as_ref(), &invocation_id).await {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                return AppApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "not_found",
-                    "tool invocation not found",
-                )
-                .into_response();
-            }
+            Ok(Some(record)) if tenant_visible(&tenant_scope, &record.project) => record,
+            Ok(Some(_)) | Ok(None) => return tool_invocation_not_found_response(),
             Err(err) => return store_error_response(err),
         };
 
@@ -419,23 +531,23 @@ pub(crate) async fn complete_tool_invocation_handler(
     }
 }
 
+/// `POST /v1/tool-invocations/:id/cancel`
+///
+/// #367: tenant-scoped. The plugin-cancel RPC only fires once we
+/// have confirmed the caller owns the invocation — otherwise any
+/// tenant could DoS another tenant's plugin host by flooding cancel
+/// calls against ids they learned from a timing side channel.
 pub(crate) async fn cancel_tool_invocation_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let invocation_id = ToolInvocationId::new(id);
 
     let record =
         match ToolInvocationReadModel::get(state.runtime.store.as_ref(), &invocation_id).await {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                return AppApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "not_found",
-                    "tool invocation not found",
-                )
-                .into_response();
-            }
+            Ok(Some(record)) if tenant_visible(&tenant_scope, &record.project) => record,
+            Ok(Some(_)) | Ok(None) => return tool_invocation_not_found_response(),
             Err(err) => return store_error_response(err),
         };
 
@@ -444,7 +556,10 @@ pub(crate) async fn cancel_tool_invocation_handler(
         ToolInvocationTarget::Plugin { tool_name, .. } => tool_name.clone(),
     };
 
-    // Best-effort: send cancel RPC to the plugin if one is handling this invocation
+    // Best-effort: send cancel RPC to the plugin if one is handling this
+    // invocation. Only runs AFTER the tenant check above so a cross-tenant
+    // caller cannot use this endpoint to reach another tenant's plugin
+    // host.
     if let ToolInvocationTarget::Plugin { plugin_id, .. } = &record.target {
         if let Ok(mut host) = state.plugin_host.lock() {
             cancel_plugin_invocation(&mut host, plugin_id, invocation_id.as_str());
@@ -480,18 +595,45 @@ pub(crate) async fn cancel_tool_invocation_handler(
 
 // ── Handlers: Checkpoints ───────────────────────────────────────────────────
 
+/// `GET /v1/checkpoints?run_id=…`
+///
+/// #368: tenant-scoped. The run is resolved first and its project is
+/// compared against the caller; a non-admin reading another tenant's
+/// run sees an empty list (same shape as a run with no checkpoints),
+/// matching `list_tool_invocations_handler`.
 pub(crate) async fn list_checkpoints_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Query(query): Query<CheckpointListQuery>,
 ) -> impl IntoResponse {
     let Some(run_id) = query.run_id.as_deref() else {
         return validation_error_response("run_id is required");
     };
 
+    // Shared `load_run_visible_to_tenant` helper keeps the gate in
+    // sync with every other run read in cairn-app. Cross-tenant or
+    // missing → same empty shape as "run with no checkpoints".
+    // (Cursor bugbot #537.)
+    let run_id = RunId::new(run_id);
+    match crate::helpers::load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::OK,
+                Json(ListResponse::<cairn_domain::Checkpoint> {
+                    items: Vec::new(),
+                    has_more: false,
+                }),
+            )
+                .into_response();
+        }
+        Err(resp) => return resp,
+    }
+
     match state
         .runtime
         .checkpoints
-        .list_by_run(&RunId::new(run_id), query.limit())
+        .list_by_run(&run_id, query.limit())
         .await
     {
         Ok(items) => (
@@ -506,40 +648,50 @@ pub(crate) async fn list_checkpoints_handler(
     }
 }
 
+/// `GET /v1/checkpoints/:id`
+///
+/// Tenant-scoped read — cross-tenant callers get 404.
 pub(crate) async fn get_checkpoint_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match CheckpointReadModel::get(state.runtime.store.as_ref(), &CheckpointId::new(id)).await {
-        Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
-        Ok(None) => AppApiError::new(StatusCode::NOT_FOUND, "not_found", "checkpoint not found")
-            .into_response(),
+        Ok(Some(record)) if tenant_visible(&tenant_scope, &record.project) => {
+            (StatusCode::OK, Json(record)).into_response()
+        }
+        Ok(Some(_)) | Ok(None) => checkpoint_not_found_response(),
         Err(err) => store_error_response(err),
     }
 }
 
-/// `POST /v1/checkpoints/:id/restore` -- restore a run to a specific checkpoint.
+/// `POST /v1/checkpoints/:id/restore` — restore a run to a specific
+/// checkpoint.
+///
+/// #369: tenant-scoped. This is the most dangerous endpoint in the
+/// module — restoring a checkpoint rewinds the run and re-fires side
+/// effects, so a cross-tenant restore could destroy inflight work in
+/// another tenant. The check is applied BEFORE any event-log read so
+/// a probe cannot learn which checkpoint ids exist via timing.
 ///
 /// Alias for `POST /v1/runs/:run_id/replay-to-checkpoint?checkpoint_id=<id>`.
-/// Looks up the checkpoint by ID to resolve the owning run, then replays the
-/// run's event log up to the position where the checkpoint was recorded.
+/// Looks up the checkpoint by ID to resolve the owning run, then
+/// replays the run's event log up to the position where the
+/// checkpoint was recorded.
 pub(crate) async fn restore_checkpoint_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(checkpoint_id_str): Path<String>,
 ) -> impl IntoResponse {
     let checkpoint_id = CheckpointId::new(&checkpoint_id_str);
 
-    // Resolve the checkpoint -> run_id.
-    let checkpoint = match CheckpointReadModel::get(state.runtime.store.as_ref(), &checkpoint_id)
-        .await
-    {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "checkpoint not found")
-                .into_response();
-        }
-        Err(err) => return store_error_response(err),
-    };
+    // Resolve the checkpoint -> run_id + tenant-scope gate.
+    let checkpoint =
+        match CheckpointReadModel::get(state.runtime.store.as_ref(), &checkpoint_id).await {
+            Ok(Some(c)) if tenant_visible(&tenant_scope, &c.project) => c,
+            Ok(Some(_)) | Ok(None) => return checkpoint_not_found_response(),
+            Err(err) => return store_error_response(err),
+        };
 
     // Find the event-log position at which the checkpoint was recorded.
     let position = match checkpoint_recorded_position(
@@ -568,28 +720,28 @@ pub(crate) async fn restore_checkpoint_handler(
     }
 }
 
+/// `POST /v1/runs/:id/checkpoint` — save a checkpoint for a run.
+///
+/// #370: tenant-scoped. Non-admin callers cannot plant a checkpoint
+/// on another tenant's run; the run lookup returns 404 when the caller
+/// is out of scope.
 pub(crate) async fn save_checkpoint_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(run_id): Path<String>,
     Json(body): Json<SaveCheckpointRequest>,
 ) -> impl IntoResponse {
     let run_id = RunId::new(run_id);
-    let run = match RunReadModel::get(state.runtime.store.as_ref(), &run_id).await {
-        Ok(Some(run)) => run,
-        Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response()
-        }
-        Err(err) => {
-            tracing::error!("checkpoint save: failed to read run: {err}");
-            return AppApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                err.to_string(),
-            )
-            .into_response();
-        }
-    };
+    // Shared helper — stays in lockstep with every other run mutation
+    // in cairn-app. Missing / cross-tenant → 404. (Cursor bugbot #537.)
+    let run =
+        match crate::helpers::load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id)
+            .await
+        {
+            Ok(Some(run)) => run,
+            Ok(None) => return run_not_found_response(),
+            Err(resp) => return resp,
+        };
 
     let before = current_event_head(&state).await;
     match state
@@ -606,6 +758,12 @@ pub(crate) async fn save_checkpoint_handler(
     }
 }
 
+/// `GET /v1/runs/:id/checkpoint-strategy`
+///
+/// #371: tenant-scoped with admin bypass — the pre-fix shape missed
+/// `is_admin`, so the admin token would 404 on any tenant other than
+/// its own. Same class of bug as PR #337; aligned here to close the
+/// gap.
 pub(crate) async fn get_checkpoint_strategy_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
@@ -613,11 +771,8 @@ pub(crate) async fn get_checkpoint_strategy_handler(
 ) -> impl IntoResponse {
     let run_id = RunId::new(run_id);
     let run = match state.runtime.runs.get(&run_id).await {
-        Ok(Some(run)) if run.project.tenant_id == *tenant_scope.tenant_id() => run,
-        Ok(Some(_)) | Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
-        }
+        Ok(Some(run)) if tenant_visible(&tenant_scope, &run.project) => run,
+        Ok(Some(_)) | Ok(None) => return run_not_found_response(),
         Err(err) => return runtime_error_response(err),
     };
 
@@ -633,6 +788,10 @@ pub(crate) async fn get_checkpoint_strategy_handler(
     }
 }
 
+/// `POST /v1/runs/:id/checkpoint-strategy`
+///
+/// #371: tenant-scoped with admin bypass. Same shape change as the
+/// companion GET above.
 pub(crate) async fn set_checkpoint_strategy_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
@@ -641,11 +800,8 @@ pub(crate) async fn set_checkpoint_strategy_handler(
 ) -> impl IntoResponse {
     let run_id = RunId::new(run_id);
     let run = match state.runtime.runs.get(&run_id).await {
-        Ok(Some(run)) if run.project.tenant_id == *tenant_scope.tenant_id() => run,
-        Ok(Some(_)) | Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
-        }
+        Ok(Some(run)) if tenant_visible(&tenant_scope, &run.project) => run,
+        Ok(Some(_)) | Ok(None) => return run_not_found_response(),
         Err(err) => return runtime_error_response(err),
     };
 

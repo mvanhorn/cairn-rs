@@ -664,6 +664,59 @@ impl ToolInvocationReadModel for PgAdapter {
 }
 
 #[async_trait]
+impl crate::projections::ToolInvocationProgressReadModel for PgAdapter {
+    async fn get(
+        &self,
+        invocation_id: &ToolInvocationId,
+    ) -> Result<Option<crate::projections::ToolInvocationProgressRecord>, StoreError> {
+        let row: Option<(String, String, String, i16, Option<String>, i64)> = sqlx::query_as(
+            "SELECT tenant_id, workspace_id, project_id,
+                    progress_pct, message, updated_at_ms
+             FROM tool_invocation_progress
+             WHERE invocation_id = $1",
+        )
+        .bind(invocation_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        // Checked conversions from the signed DB columns. Writes always
+        // originate from `u8` / `u64`, but corruption / manual edits /
+        // unexpected schema drift could yield negative or oversized
+        // values — silently wrapping via `as u8` / `as u64` would hand
+        // the handler a garbage row. Flagged on PR #537 by Copilot.
+        row.map(
+            |(tenant, ws, project, pct, msg, updated)| -> Result<_, StoreError> {
+                let progress_pct = u8::try_from(pct).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "tool_invocation_progress.progress_pct out of u8 range for {}: {pct}",
+                        invocation_id.as_str(),
+                    ))
+                })?;
+                let updated_at_ms = u64::try_from(updated).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "tool_invocation_progress.updated_at_ms out of u64 range for {}: {updated}",
+                        invocation_id.as_str(),
+                    ))
+                })?;
+                Ok(crate::projections::ToolInvocationProgressRecord {
+                    invocation_id: invocation_id.clone(),
+                    project: cairn_domain::ProjectKey::new(
+                        tenant.as_str(),
+                        ws.as_str(),
+                        project.as_str(),
+                    ),
+                    progress_pct,
+                    message: msg,
+                    updated_at_ms,
+                })
+            },
+        )
+        .transpose()
+    }
+}
+
+#[async_trait]
 impl crate::projections::FfLeaseHistoryCursorStore for PgAdapter {
     async fn get(
         &self,

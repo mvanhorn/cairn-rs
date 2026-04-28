@@ -693,4 +693,22 @@ CREATE INDEX IF NOT EXISTS idx_tool_invocation_cache_hits_tool_call
     ON tool_invocation_cache_hits (tool_call_id);
 CREATE INDEX IF NOT EXISTS idx_tool_invocation_cache_hits_served_at
     ON tool_invocation_cache_hits (served_at_ms);
+
+-- #364: durable projection for `ToolInvocationProgressUpdated` events.
+-- One row per `invocation_id`, UPSERTed on every progress update so the
+-- HTTP handler can answer tenant-scoped reads in O(1) without scanning
+-- the event log. Mirrors the Postgres schema at
+-- `crates/cairn-store/src/pg/migrations/V033__create_tool_invocation_progress.sql`.
+CREATE TABLE IF NOT EXISTS tool_invocation_progress (
+    invocation_id  TEXT    PRIMARY KEY,
+    tenant_id      TEXT    NOT NULL,
+    workspace_id   TEXT    NOT NULL,
+    project_id     TEXT    NOT NULL,
+    progress_pct   INTEGER NOT NULL,
+    message        TEXT,
+    updated_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_invocation_progress_tenant
+    ON tool_invocation_progress (tenant_id, workspace_id, project_id);
 "#;

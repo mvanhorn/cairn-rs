@@ -497,6 +497,47 @@ api GET "/v1/runs/${RUN_ID}/checkpoint-strategy"
   || log_fail "GET /v1/runs/:id/checkpoint-strategy (unexpected HTTP $_HTTP)"
 
 # =============================================================================
+section "22b. Cross-tenant isolation for tools.rs handlers (META #372)"
+
+# Mint an operator token scoped to a different tenant. If minting fails
+# (e.g. /v1/auth/tokens not wired in this build) we skip — the
+# in-process integration tests in crates/cairn-app/tests/ cover the
+# same surface with fuller fixtures.
+CROSS_TENANT="smoke-cross-${RANDOM}"
+api POST "/v1/auth/tokens" \
+  "{\"operator_id\":\"smoke_cross_op\",\"tenant_id\":\"${CROSS_TENANT}\",\"name\":\"smoke-cross-tenant\"}"
+if [[ "$_HTTP" == "201" ]]; then
+  CROSS_TOKEN=$(printf '%s' "$_BODY" | python3 -c \
+    "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+
+  if [ -n "$CROSS_TOKEN" ]; then
+    # Cross-tenant checkpoint restore must 404 (no id-enumeration oracle).
+    # Uses the $CHECKPOINT_ID planted above under the admin-default tenant.
+    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" \
+      -X POST -H "Authorization: Bearer ${CROSS_TOKEN}" \
+      -H "Content-Type: application/json" \
+      "${BASE}/v1/checkpoints/${CHECKPOINT_ID}/restore" 2>/dev/null)
+    [ "$status" = "404" ] \
+      && log_ok "POST /v1/checkpoints/:id/restore cross-tenant (HTTP $status) — #369 closed" \
+      || log_fail "POST /v1/checkpoints/:id/restore cross-tenant (expected 404, got $status) — #369 REGRESSION"
+
+    # Cross-tenant save checkpoint on foreign run must 404.
+    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" \
+      -X POST -H "Authorization: Bearer ${CROSS_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "{\"checkpoint_id\":\"ckpt_smoke_spoof_${RANDOM}\"}" \
+      "${BASE}/v1/runs/${RUN_ID}/checkpoint" 2>/dev/null)
+    [ "$status" = "404" ] \
+      && log_ok "POST /v1/runs/:id/checkpoint cross-tenant (HTTP $status) — #370 closed" \
+      || log_fail "POST /v1/runs/:id/checkpoint cross-tenant (expected 404, got $status) — #370 REGRESSION"
+  else
+    log_skip "cross-tenant checks skipped — token mint returned empty token"
+  fi
+else
+  log_skip "cross-tenant checks skipped — /v1/auth/tokens returned HTTP $_HTTP"
+fi
+
+# =============================================================================
 section "23. Graph endpoints"
 
 chk2xx "GET /v1/graph/nodes"  GET "/v1/graph/nodes?tenant_id=default&workspace_id=default&project_id=default&limit=10"

@@ -175,6 +175,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "f65_orchestrator_projections",
         include_str!("migrations/V032__f65_orchestrator_projections.sql"),
     ),
+    (
+        33,
+        "create_tool_invocation_progress",
+        include_str!("migrations/V033__create_tool_invocation_progress.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

@@ -513,6 +513,59 @@ impl PgSyncProjection {
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
             RuntimeEvent::ToolRecoveryPaused(_) => log_stub("ToolRecoveryPaused"),
+
+            // #364: durable projection of `ToolInvocationProgressUpdated`
+            // so `GET /v1/tool-invocations/:id/progress` can answer
+            // tenant-scoped reads in O(1) without scanning the event log.
+            // UPSERT keyed by `invocation_id`; we copy the project scope
+            // from the existing `tool_invocations` row so the handler can
+            // tenant-filter without a second lookup. Events for an
+            // invocation that does not exist yet (should not happen —
+            // Started precedes progress) are a no-op rather than
+            // fabricating a project scope. The `WHERE excluded.updated_at_ms
+            // >= ...` clause keeps out-of-order replay idempotent: a
+            // stale event never overwrites a newer one.
+            RuntimeEvent::ToolInvocationProgressUpdated(e) => {
+                let scope: Option<(String, String, String)> = sqlx::query_as(
+                    "SELECT tenant_id, workspace_id, project_id
+                     FROM tool_invocations
+                     WHERE invocation_id = $1",
+                )
+                .bind(e.invocation_id.as_str())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+
+                if let Some((tenant_id, workspace_id, project_id)) = scope {
+                    let updated_at = i64::try_from(e.updated_at_ms).map_err(|_| {
+                        StoreError::Internal(format!(
+                            "ToolInvocationProgressUpdated.updated_at_ms {} exceeds i64::MAX",
+                            e.updated_at_ms
+                        ))
+                    })?;
+                    sqlx::query(
+                        "INSERT INTO tool_invocation_progress
+                             (invocation_id, tenant_id, workspace_id, project_id,
+                              progress_pct, message, updated_at_ms)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)
+                         ON CONFLICT (invocation_id) DO UPDATE SET
+                             progress_pct  = EXCLUDED.progress_pct,
+                             message       = EXCLUDED.message,
+                             updated_at_ms = EXCLUDED.updated_at_ms
+                         WHERE EXCLUDED.updated_at_ms >= tool_invocation_progress.updated_at_ms",
+                    )
+                    .bind(e.invocation_id.as_str())
+                    .bind(tenant_id)
+                    .bind(workspace_id)
+                    .bind(project_id)
+                    .bind(i16::from(e.progress_pct))
+                    .bind(e.message.as_deref())
+                    .bind(updated_at)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                }
+            }
             // F39: RFC 020 Track 4 boot-level recovery audit projected to
             // `recovery_summaries` (one row per boot_id). The emitter
             // contract guarantees one summary per boot; ON CONFLICT DO
@@ -1064,7 +1117,6 @@ impl PgSyncProjection {
             | RuntimeEvent::TaskDependencyResolved(_)
             | RuntimeEvent::TaskLeaseExpired(_)
             | RuntimeEvent::TaskPriorityChanged(_)
-            | RuntimeEvent::ToolInvocationProgressUpdated(_)
             // RFC 005 approval policies — no durable table yet
             | RuntimeEvent::ApprovalPolicyCreated(_)
             // RFC 001 gradual rollout — state tracked via prompt_releases table
