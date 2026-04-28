@@ -64,6 +64,109 @@ The database is created and migrated automatically on first start.
 
 ---
 
+## Minimum kernel version
+
+The upcoming sandbox confinement work (F65 PR-4) requires **Linux kernel
+5.13 or newer** on the host. Kernel 5.13 is the first release with
+Landlock LSM, the unprivileged filesystem sandbox we use to confine
+sub-agent workspace writes. Once that work lands, older kernels will
+fall back to a degraded mode on boot and refuse to run confined agents.
+
+Today cairn-rs does not yet enforce this requirement at startup — but
+the kernel target is locked so that self-hosted operators can provision
+their hosts now and avoid an upgrade churn when confinement ships.
+Verification: `uname -r` on the host.
+
+| Distro | Default kernel | Works? |
+|---|---|---|
+| Ubuntu 22.04 LTS | 5.15+ | Yes |
+| Ubuntu 24.04 LTS | 6.8+ | Yes |
+| Amazon Linux 2023 | 6.1+ | Yes |
+| Debian 12 | 6.1+ | Yes |
+| RHEL 9 | 5.14+ | Yes (5.14 includes Landlock backport) |
+| Debian 11 | 5.10 | No (upgrade or use backports kernel) |
+| Ubuntu 20.04 LTS | 5.4 | No (upgrade to 22.04 LTS) |
+| Amazon Linux 2 | 5.10 | No (migrate to AL2023) |
+
+Distro kernel versions last verified 2026-04-27.
+
+---
+
+## Filesystem choice for the sandbox workspace root
+
+cairn-rs stores per-session sandbox state under
+`$TMPDIR/cairn-workspace-sandboxes` by default, overridable via the
+`CAIRN_SANDBOX_BASE_DIR` env var. When an attempt ends, cairn takes a
+snapshot of the agent's write delta. The snapshot cost depends on the
+filesystem hosting that directory:
+
+| Filesystem | Snapshot cost | Recommended |
+|---|---|---|
+| **btrfs** | O(inodes) — ~20ms regardless of size | Yes (fast path) |
+| **XFS with reflink=1** | O(inodes) — ~20ms regardless of size | Yes (fast path, default on RHEL 8+) |
+| **bcachefs** | O(inodes) | Yes (kernel 6.7+, new on most distros) |
+| **ext4** | O(bytes) — ~100ms per 100MB of delta | Works, but slower |
+| **tmpfs** | O(bytes), memory-backed | Not recommended (state lost on restart) |
+
+### How to provision a reflink-capable EBS volume on AWS
+
+The default Amazon Linux 2023 AMI uses ext4 for the root volume. For
+production deployments you should attach a separate EBS volume formatted
+as btrfs or XFS-with-reflink and mount it at `/var/lib/cairn-workspaces`,
+then set `CAIRN_SANDBOX_BASE_DIR=/var/lib/cairn-workspaces`.
+
+Attach a 100GB gp3 EBS volume to the instance. Most modern EC2 instance
+types (e.g. `m8g`, `m7i`, `c7`, `r7`) expose EBS as NVMe devices under
+`/dev/nvme*n1`, while older Xen-based generations use `/dev/xvd*`.
+Identify the new volume with:
+
+```bash
+lsblk
+# or, for NVMe instances:
+sudo nvme list
+```
+
+Replace `$DEV` below with the block device you identified
+(e.g. `/dev/nvme1n1` or `/dev/xvdf`), then:
+
+```bash
+sudo mkfs.btrfs "$DEV"
+sudo mkdir -p /var/lib/cairn-workspaces
+sudo mount "$DEV" /var/lib/cairn-workspaces
+echo "$DEV /var/lib/cairn-workspaces btrfs defaults 0 0" | sudo tee -a /etc/fstab
+```
+
+Or for XFS with reflink:
+
+```bash
+sudo mkfs.xfs -m reflink=1 "$DEV"
+sudo mkdir -p /var/lib/cairn-workspaces
+sudo mount "$DEV" /var/lib/cairn-workspaces
+echo "$DEV /var/lib/cairn-workspaces xfs defaults 0 0" | sudo tee -a /etc/fstab
+```
+
+On Amazon Linux 2023, install the tooling with `sudo dnf install btrfs-progs xfsprogs` if it is not already present.
+
+> **Use UUIDs in `/etc/fstab` for production.** Block-device names can
+> change across reboots, especially on NVMe. Prefer
+> `UUID=<uuid> /var/lib/cairn-workspaces btrfs defaults 0 0`; get the
+> UUID from `sudo blkid "$DEV"`.
+
+### What if I stay on ext4?
+
+When reflink is unavailable, cairn is expected to detect this at runtime
+and fall back to a byte-copy snapshot. Correctness is preserved; the
+snapshot is just slower. For typical agent workloads (<100MB upper-layer
+churn per attempt) the difference is imperceptible. For heavy-build
+workloads (multi-GB diffs) the fallback can add seconds per
+attempt-termination.
+
+The `WorkspaceBackendDegraded` event type is defined in `cairn-domain`
+for this signal. Wiring the emission into the workspace provisioner is
+part of the same F65 PR-4 sandbox work and not yet live in `main`.
+
+---
+
 ## Environment variables
 
 | Variable | Default | Description |

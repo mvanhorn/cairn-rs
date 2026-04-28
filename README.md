@@ -147,6 +147,9 @@ or `OLLAMA_HOST` in a `.env` file, or register at runtime via
 | `http://localhost:3000/v1/openapi.json` | OpenAPI 3.0 spec |
 | `http://localhost:3000/health` | Liveness probe |
 
+> **Production deployments:** see [`docs/deployment.md`](./docs/deployment.md)
+> for kernel and filesystem requirements.
+
 ---
 
 ## Architecture
