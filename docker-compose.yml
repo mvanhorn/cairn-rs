@@ -80,8 +80,10 @@ services:
       DATABASE_URL: "postgres://cairn:${POSTGRES_PASSWORD:-cairn-dev-password}@postgres:5432/cairn"
 
       # ── FlowFabric (Valkey) ────────────────────────────────────────────────
-      CAIRN_FABRIC_HOST: "${CAIRN_FABRIC_HOST:-valkey}"
-      CAIRN_FABRIC_PORT: "${CAIRN_FABRIC_PORT:-6379}"
+      # `CAIRN_FABRIC_URL` is the single knob for backend connection.
+      # Valkey variants: `valkey://host:port`, `rediss://host:port`
+      # (TLS), `valkey://host:port?tls=1&cluster=1` (explicit flags).
+      CAIRN_FABRIC_URL: "${CAIRN_FABRIC_URL:-valkey://valkey:6379}"
       # Dev-only HMAC secret (64 hex chars = 32 bytes). Production operators
       # MUST override via .env with `openssl rand -hex 32`; rotate at runtime
       # via `POST /v1/admin/rotate-waitpoint-hmac`. Leaving the default in

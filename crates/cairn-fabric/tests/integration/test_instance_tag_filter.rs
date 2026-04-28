@@ -55,10 +55,7 @@ async fn spawn_instance(instance_suffix: &str) -> TestInstance {
     let _ = instance_suffix;
 
     let config = FabricConfig {
-        valkey_host: host,
-        valkey_port: port,
-        tls: false,
-        cluster: false,
+        backend: flowfabric::core::backend::BackendConfig::valkey(host, port),
         lane_id,
         worker_id: flowfabric::core::types::WorkerId::new(format!("w-{instance_suffix}-{suffix}")),
         worker_instance_id: flowfabric::core::types::WorkerInstanceId::new(format!(

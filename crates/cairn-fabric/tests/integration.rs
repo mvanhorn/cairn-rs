@@ -87,10 +87,7 @@ impl TestHarness {
         let lane_id = cairn_fabric::id_map::project_to_lane(&project);
 
         let config = FabricConfig {
-            valkey_host: host,
-            valkey_port: port,
-            tls: false,
-            cluster: false,
+            backend: flowfabric::core::backend::BackendConfig::valkey(host, port),
             lane_id,
             worker_id: flowfabric::core::types::WorkerId::new("test-worker"),
             worker_instance_id: flowfabric::core::types::WorkerInstanceId::new(

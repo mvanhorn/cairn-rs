@@ -45,23 +45,12 @@ impl CairnWorker {
         // Collecting preserves that order on the wire.
         let capabilities: Vec<String> = config.worker_capabilities.iter().cloned().collect();
 
-        // FF 0.4 reshape: flat `host / port / tls / cluster` collapsed
-        // into nested `backend: BackendConfig`. Build via
-        // `BackendConfig::valkey` then override tls/cluster on the
-        // embedded `ValkeyConnection` (the only parameters cairn
-        // exposes at the config layer).
-        let mut backend = flowfabric::core::backend::BackendConfig::valkey(
-            config.valkey_host.clone(),
-            config.valkey_port,
-        );
-        if let flowfabric::core::backend::BackendConnection::Valkey(ref mut vk) = backend.connection
-        {
-            vk.tls = config.tls;
-            vk.cluster = config.cluster;
-        }
-
+        // `FabricConfig::backend` is the single source of truth for
+        // backend connection shape (host/port/tls/cluster for Valkey,
+        // URL+pool for Postgres). Hand it to `WorkerConfig` as-is —
+        // cairn no longer maintains a parallel derivation here.
         let worker_config = WorkerConfig {
-            backend,
+            backend: config.backend.clone(),
             worker_id: config.worker_id.clone(),
             worker_instance_id: config.worker_instance_id.clone(),
             namespace: config.namespace.clone(),

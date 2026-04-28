@@ -11,7 +11,7 @@ default = []
 # Off by default — production binaries never link testcontainers. Consumers
 # that run live-Valkey integration tests (cairn-fabric's own test binary,
 # cairn-app's HTTP integration tests) turn this on via dev-dependencies.
-test-harness = ["dep:testcontainers", "dep:url"]
+test-harness = ["dep:testcontainers"]
 
 [dependencies]
 # FlowFabric umbrella crate — CG-c (2026-04-26) bumped to 0.10 to
@@ -74,7 +74,11 @@ thiserror = "2"
 async-trait = "0.1"
 # Gated behind `test-support` — pulled in only when the harness is needed.
 testcontainers = { version = "0.23", optional = true }
-url = { version = "2", optional = true }
+# `url` is unconditional: `FabricConfig::from_env` parses `CAIRN_FABRIC_URL`
+# on every boot, so the parser is library-code. Default features only —
+# cairn does NOT opt into `url`'s `serde` feature (verified via
+# `cargo tree -p cairn-fabric -e features | grep url`).
+url = "2"
 
 [dev-dependencies]
 # Own integration suite consumes the same harness via the feature.

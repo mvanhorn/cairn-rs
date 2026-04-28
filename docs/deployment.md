@@ -37,10 +37,12 @@ Services started:
 | `valkey` | 6379 | Valkey 8 (FlowFabric state — lease, lifecycle, eligibility) |
 
 > **Valkey / FlowFabric.** `docker compose up` now provisions Valkey 8
-> alongside Postgres and wires cairn-app at `CAIRN_FABRIC_HOST=valkey`. To
-> point at an external Valkey instead, override `CAIRN_FABRIC_HOST` /
-> `CAIRN_FABRIC_PORT` in `.env`. In-memory mode (`--db memory`) is dev-only
-> and skips Fabric entirely.
+> alongside Postgres and wires cairn-app at
+> `CAIRN_FABRIC_URL=valkey://valkey:6379`. To point at an external Valkey
+> instead, override `CAIRN_FABRIC_URL` in `.env`. `--db memory` skips
+> Postgres-backed persistence (useful for dev), but the standard
+> cairn-app runtime still requires Fabric/Valkey at boot — only the
+> FakeFabric-injected test path can run without it.
 
 ---
 
@@ -175,8 +177,7 @@ part of the same F65 PR-4 sandbox work and not yet live in `main`.
 | `CAIRN_PORT` | `3000` | HTTP listen port (also settable with `--port`; CLI flag wins). |
 | `CAIRN_DB` | in-memory | Storage backend DSN — `memory`, `postgres://…`, `postgresql://…`, or a SQLite path. Also settable with `--db`; CLI flag wins. |
 | `CAIRN_MODE` | `local` | Deployment mode: `local` or `team` (alias: `self-hosted`). Also settable with `--mode`; CLI flag wins. |
-| `CAIRN_FABRIC_HOST` | `localhost` (bare binary) / `valkey` (compose) | Valkey hostname FlowFabric connects to for lease / lifecycle / eligibility state. |
-| `CAIRN_FABRIC_PORT` | `6379` | Valkey port. |
+| `CAIRN_FABRIC_URL` | `valkey://localhost:6379` (bare binary) / `valkey://valkey:6379` (compose) | Backend connection for FlowFabric state. Accepted schemes: `valkey://` and `rediss://` (TLS). Query params `?tls=1&cluster=1` toggle Valkey flags. Default when unset: `valkey://localhost:6379`. |
 | `CAIRN_FABRIC_WAITPOINT_HMAC_SECRET` | **required** when Fabric is enabled | 32-byte hex secret seeded into every FlowFabric execution partition. Boot fails loud when unset. Rotate at runtime via `POST /v1/admin/rotate-waitpoint-hmac`. See [SECURITY.md](../SECURITY.md). |
 | `CAIRN_FABRIC_INSTANCE_ID` | auto-UUID persisted to `/tmp` | Distinguishes this cairn-app process from others sharing the same Valkey. See [operations/cross-instance-isolation.md](./operations/cross-instance-isolation.md). |
 | `CAIRN_BACKFILL_INSTANCE_TAG` | unset | When `1`, runs a one-shot boot-time backfill that stamps `cairn.instance_id` onto pre-existing exec-tag hashes that lack it. Only needed for in-place binary swaps with in-flight runs that predate the isolation filter. |

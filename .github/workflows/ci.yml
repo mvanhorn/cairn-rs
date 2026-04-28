@@ -259,8 +259,7 @@ jobs:
           export CAIRN_ADMIN_TOKEN="dev-admin-token"
           export CAIRN_FABRIC_WAITPOINT_HMAC_SECRET="$(openssl rand -hex 32)"
           export CAIRN_FABRIC_WAITPOINT_HMAC_KID="ci-smoke"
-          export CAIRN_FABRIC_HOST="127.0.0.1"
-          export CAIRN_FABRIC_PORT="6379"
+          export CAIRN_FABRIC_URL="valkey://127.0.0.1:6379"
           export RUST_LOG="warn"
           nohup ./target/release/cairn-app \
             --addr 127.0.0.1 --port 3000 \

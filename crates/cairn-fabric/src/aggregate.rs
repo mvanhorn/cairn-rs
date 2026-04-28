@@ -214,16 +214,21 @@ mod tests {
 
     #[test]
     fn fabric_config_from_env_defaults() {
+        use flowfabric::core::backend::BackendConnection;
         use std::sync::Mutex;
         static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CAIRN_FABRIC_HOST");
-        std::env::remove_var("CAIRN_FABRIC_PORT");
+        std::env::remove_var("CAIRN_FABRIC_URL");
         std::env::remove_var("CAIRN_FABRIC_LEASE_TTL_MS");
         std::env::remove_var("CAIRN_FABRIC_MAX_TASKS");
         std::env::remove_var("CAIRN_FABRIC_GRANT_TTL_MS");
         let config = FabricConfig::from_env().unwrap();
-        assert_eq!(config.valkey_host, "localhost");
-        assert_eq!(config.valkey_port, 6379);
+        match &config.backend.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "localhost");
+                assert_eq!(vk.port, 6379);
+            }
+            other => panic!("expected Valkey backend, got {other:?}"),
+        }
     }
 }

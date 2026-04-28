@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ferriskey::Client;
-use flowfabric::core::backend::{ScannerFilter, ValkeyConnection};
+use flowfabric::core::backend::ScannerFilter;
 use flowfabric::core::capability::Capabilities;
 use flowfabric::core::completion_backend::CompletionBackend;
 use flowfabric::core::contracts::SeedWaitpointHmacSecretArgs;
@@ -49,11 +49,14 @@ impl FabricRuntime {
     // ferriskey's internal connection pool — it re-establishes transparently
     // on the next command. This retry loop only covers initial startup.
     pub async fn start(config: FabricConfig) -> Result<Self, FabricError> {
+        // Pull the ValkeyConnection once; non-Valkey backends fail loud
+        // here rather than deeper into ferriskey.
+        let vk = config.valkey_connection()?.clone();
         tracing::info!(
-            host = %config.valkey_host,
-            port = config.valkey_port,
-            tls = config.tls,
-            cluster = config.cluster,
+            host = %vk.host,
+            port = vk.port,
+            tls = vk.tls,
+            cluster = vk.cluster,
             "connecting to valkey"
         );
 
@@ -61,7 +64,7 @@ impl FabricRuntime {
         let mut client = None;
         for attempt in 0..CONNECT_MAX_ATTEMPTS {
             // Rebuild each attempt: `ClientBuilder::build` consumes self.
-            let result = config.valkey_client_builder().build().await;
+            let result = config.client_builder()?.build().await;
             match result {
                 Ok(c) => {
                     client = Some(c);
@@ -153,13 +156,10 @@ impl FabricRuntime {
         // `CompletionListenerConfig` — PR #127 removed the implicit
         // listener field on EngineConfig in favour of an explicit
         // stream handed to `Engine::start_with_completions`.
-        let mut valkey_conn = ValkeyConnection::new(config.valkey_host.clone(), config.valkey_port);
-        valkey_conn.tls = config.tls;
-        valkey_conn.cluster = config.cluster;
         let backend = ValkeyBackend::from_client_partitions_and_connection(
             client.clone(),
             partition_config,
-            valkey_conn,
+            vk.clone(),
         );
 
         // FF 0.9 (FF#281): backend.prepare() replaces the hand-rolled

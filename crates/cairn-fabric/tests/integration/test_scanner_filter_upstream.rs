@@ -227,10 +227,7 @@ async fn engine_config_scanner_filter_is_wired() {
         flowfabric::core::types::WorkerInstanceId::new(format!("inst-upstream-{suffix}"));
 
     let config = FabricConfig {
-        valkey_host: host,
-        valkey_port: port,
-        tls: false,
-        cluster: false,
+        backend: flowfabric::core::backend::BackendConfig::valkey(host, port),
         lane_id,
         worker_id: flowfabric::core::types::WorkerId::new(format!("w-upstream-{suffix}")),
         worker_instance_id: worker_instance_id.clone(),

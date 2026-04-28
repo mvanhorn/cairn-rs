@@ -336,10 +336,7 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
 
 fn worker_config_from(h: &TestHarness) -> FabricConfig {
     FabricConfig {
-        valkey_host: h.fabric.runtime.config.valkey_host.clone(),
-        valkey_port: h.fabric.runtime.config.valkey_port,
-        tls: h.fabric.runtime.config.tls,
-        cluster: h.fabric.runtime.config.cluster,
+        backend: h.fabric.runtime.config.backend.clone(),
         lane_id: h.fabric.runtime.config.lane_id.clone(),
         worker_id: flowfabric::core::types::WorkerId::new("orchestrator-stream-worker"),
         worker_instance_id: flowfabric::core::types::WorkerInstanceId::new(

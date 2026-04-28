@@ -206,10 +206,7 @@ mod tests {
         caps.insert("linux-x86_64".to_owned());
 
         let config = FabricConfig {
-            valkey_host: "localhost".into(),
-            valkey_port: 6379,
-            tls: false,
-            cluster: false,
+            backend: flowfabric::core::backend::BackendConfig::valkey("localhost", 6379),
             lane_id: flowfabric::core::types::LaneId::new("test"),
             worker_id: flowfabric::core::types::WorkerId::new("w"),
             worker_instance_id: flowfabric::core::types::WorkerInstanceId::new("i"),

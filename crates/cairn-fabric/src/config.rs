@@ -1,14 +1,17 @@
 use std::collections::BTreeSet;
 
 use crate::error::FabricError;
+use flowfabric::core::backend::{BackendConfig, BackendConnection, ValkeyConnection};
 use flowfabric::core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
 
 #[derive(Clone, Debug)]
 pub struct FabricConfig {
-    pub valkey_host: String,
-    pub valkey_port: u16,
-    pub tls: bool,
-    pub cluster: bool,
+    /// Backend connection config. Single source of truth for the
+    /// Valkey host/port/TLS/cluster knobs (replaces the four flat
+    /// fields that pre-dated FF's `BackendConfig` reshape). Populated
+    /// from the `CAIRN_FABRIC_URL` env var via [`Self::from_env`] —
+    /// see [`parse_fabric_url`] for the scheme table.
+    pub backend: BackendConfig,
     pub lane_id: LaneId,
     pub worker_id: WorkerId,
     pub worker_instance_id: WorkerInstanceId,
@@ -93,19 +96,15 @@ pub struct FabricConfig {
 
 impl FabricConfig {
     pub fn from_env() -> Result<Self, FabricError> {
-        let valkey_host = std::env::var("CAIRN_FABRIC_HOST").unwrap_or_else(|_| "localhost".into());
-        let valkey_port = std::env::var("CAIRN_FABRIC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6379);
-        let tls = std::env::var("CAIRN_FABRIC_TLS")
-            .ok()
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
-        let cluster = std::env::var("CAIRN_FABRIC_CLUSTER")
-            .ok()
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        // Parse `CAIRN_FABRIC_URL`; if unset, fall back to the default
+        // Valkey endpoint (`valkey://localhost:6379`). There is no
+        // legacy env-var fallback — `CAIRN_FABRIC_HOST/PORT/TLS/CLUSTER`
+        // were removed when cairn-rs migrated to `BackendConfig`.
+        let backend = match std::env::var("CAIRN_FABRIC_URL") {
+            Ok(url) if !url.is_empty() => parse_fabric_url(&url)?,
+            _ => BackendConfig::valkey("localhost", 6379),
+        };
+
         let lane_id =
             LaneId::new(std::env::var("CAIRN_FABRIC_LANE").unwrap_or_else(|_| "cairn".into()));
         let worker_id = WorkerId::new(
@@ -164,10 +163,7 @@ impl FabricConfig {
             .filter(|s| !s.is_empty());
 
         let config = Self {
-            valkey_host,
-            valkey_port,
-            tls,
-            cluster,
+            backend,
             lane_id,
             worker_id,
             worker_instance_id,
@@ -185,6 +181,24 @@ impl FabricConfig {
         Ok(config)
     }
 
+    /// Borrow the `ValkeyConnection` out of `backend.connection`, or
+    /// return a typed error when the backend is non-Valkey. Used by
+    /// the host/port-shaped log lines in `FabricRuntime::start` and
+    /// the ferriskey client-builder construction below.
+    pub fn valkey_connection(&self) -> Result<&ValkeyConnection, FabricError> {
+        match &self.backend.connection {
+            BackendConnection::Valkey(vk) => Ok(vk),
+            // Format only the backend *kind* — a `{other:?}` dump
+            // would splice the full `BackendConnection::Postgres`
+            // value (including the Postgres connection URL) into the
+            // error string and thence into boot logs.
+            other => Err(FabricError::Config(format!(
+                "expected Valkey backend, got {}",
+                backend_kind(other)
+            ))),
+        }
+    }
+
     /// Resolve the HMAC kid to seed with, falling back to `"k1"` when the
     /// operator sets a secret without specifying a kid. Returns `None` if
     /// no secret is configured (no seeding will run).
@@ -199,8 +213,26 @@ impl FabricConfig {
     }
 
     pub fn validate(&self) -> Result<(), FabricError> {
-        if self.valkey_port == 0 {
-            return Err(FabricError::Config("port must be > 0".into()));
+        // `BackendConnection` is `#[non_exhaustive]` upstream — keep a
+        // catch-all arm so a future FF variant cairn doesn't know about
+        // fails loud at boot instead of silently defaulting.
+        match &self.backend.connection {
+            BackendConnection::Valkey(vk) => {
+                if vk.port == 0 {
+                    return Err(FabricError::Config("valkey port must be > 0".into()));
+                }
+            }
+            BackendConnection::Postgres(pg) => {
+                if pg.url.is_empty() {
+                    return Err(FabricError::Config("postgres url must not be empty".into()));
+                }
+            }
+            other => {
+                return Err(FabricError::Config(format!(
+                    "unsupported backend variant: {}",
+                    backend_kind(other)
+                )));
+            }
         }
         if self.lease_ttl_ms < 1000 {
             return Err(FabricError::Config("lease_ttl_ms must be >= 1000".into()));
@@ -269,21 +301,189 @@ impl FabricConfig {
     /// fabric's host/port/TLS/cluster settings. Callers call `.build().await`
     /// to get a connected `Client`.
     ///
+    /// Only valid for Valkey-backed configs — returns
+    /// [`FabricError::Config`] when the backend is not Valkey. A real
+    /// backend-agnostic builder lands with the runtime dispatch in PR-C.
+    ///
     /// This replaces the previous `valkey_url()` URL-string path. The
     /// `redis://` scheme was redundant (we never parse a URL — we build one
     /// only to hand it back to ferriskey, which re-parses it) and would
     /// break on non-Redis-cloud hosts that reject the `redis` scheme
     /// prefix. The builder accepts a bare host + port and applies TLS as
     /// an explicit flag, matching the ferriskey 0.2 public API.
-    pub fn valkey_client_builder(&self) -> ferriskey::ClientBuilder {
-        let mut builder = ferriskey::ClientBuilder::new().host(&self.valkey_host, self.valkey_port);
-        if self.tls {
+    pub fn client_builder(&self) -> Result<ferriskey::ClientBuilder, FabricError> {
+        let vk = self.valkey_connection()?;
+        let mut builder = ferriskey::ClientBuilder::new().host(&vk.host, vk.port);
+        if vk.tls {
             builder = builder.tls();
         }
-        if self.cluster {
+        if vk.cluster {
             builder = builder.cluster();
         }
-        builder
+        Ok(builder)
+    }
+}
+
+/// Parse a `CAIRN_FABRIC_URL` value into a [`BackendConfig`].
+///
+/// Accepted schemes:
+///
+/// | Scheme     | Mapping                                                         |
+/// |------------|-----------------------------------------------------------------|
+/// | `valkey://host:port`            | `BackendConfig::valkey(host, port)`  |
+/// | `rediss://host:port`            | Valkey + `ValkeyConnection.tls = true` |
+/// | `valkey://host:port?tls=1`      | As above + `tls = true`              |
+/// | `valkey://host:port?cluster=1`  | As above + `cluster = true`          |
+/// | `rediss://host:port?tls=0`      | **Error** — scheme contradicts param |
+/// | `valkey://[::1]:6379`           | IPv6, bracketed host preserved (`"[::1]"`) |
+/// | anything else                   | `FabricError::Config("unknown fabric URL scheme: ...; expected one of: valkey, rediss")` |
+///
+/// Defaults: `valkey://host` (no port) → port `6379`. `redis://` is
+/// **not** an alias; it was intentionally rejected during PR-A's
+/// design review (no legacy users to migrate). `postgres://` URL
+/// parsing lands with the Postgres runtime in PR-C.
+fn parse_fabric_url(raw: &str) -> Result<BackendConfig, FabricError> {
+    // Deliberately do NOT include the raw URL in the parse error —
+    // operators can paste Valkey/Postgres URLs that embed credentials
+    // (password, ACL user, query-string secrets) and the parse error
+    // lands in boot logs. Point at the env var name; operators know
+    // what they set.
+    let url = url::Url::parse(raw)
+        .map_err(|e| FabricError::Config(format!("CAIRN_FABRIC_URL is not a valid URL: {e}")))?;
+
+    // Scheme-match FIRST so an unsupported scheme surfaces the
+    // documented `unknown fabric URL scheme` error rather than a
+    // query-param complaint (e.g. `http://host?x=1` should fail on
+    // `http`, not `x`).
+    match url.scheme() {
+        "valkey" => {
+            let (tls_param, cluster_param) = parse_valkey_query(&url)?;
+            let (host, port) = extract_host_port(&url, 6379)?;
+            let mut cfg = BackendConfig::valkey(host, port);
+            if let BackendConnection::Valkey(ref mut vk) = cfg.connection {
+                if let Some(tls) = tls_param {
+                    vk.tls = tls;
+                }
+                if let Some(cluster) = cluster_param {
+                    vk.cluster = cluster;
+                }
+            }
+            Ok(cfg)
+        }
+        "rediss" => {
+            let (tls_param, cluster_param) = parse_valkey_query(&url)?;
+            // Scheme implies TLS; `?tls=0` contradicts and must fail
+            // loud rather than silently honour one or the other.
+            if let Some(false) = tls_param {
+                return Err(FabricError::Config(
+                    "rediss:// scheme contradicts tls=0 query param".into(),
+                ));
+            }
+            let (host, port) = extract_host_port(&url, 6379)?;
+            let mut cfg = BackendConfig::valkey(host, port);
+            if let BackendConnection::Valkey(ref mut vk) = cfg.connection {
+                vk.tls = true;
+                if let Some(cluster) = cluster_param {
+                    vk.cluster = cluster;
+                }
+            }
+            Ok(cfg)
+        }
+        other => Err(FabricError::Config(format!(
+            "unknown fabric URL scheme: {other}; expected one of: valkey, rediss"
+        ))),
+    }
+}
+
+/// Pull `host` and `port` out of a parsed URL. `url::Url::host_str()`
+/// preserves IPv6 brackets (e.g. `"[::1]"`), which matches what FF's
+/// `ValkeyConnection` stores and what ferriskey's TCP layer expects
+/// for IPv6 endpoints — no re-bracketing required on the cairn side.
+///
+/// Errors embed a redacted `scheme://host[:port]` shape via
+/// [`redact_url_for_error`], never the raw URL, so operators who
+/// paste credentials into their Valkey/Postgres URL do not see them
+/// echoed into boot logs.
+fn extract_host_port(url: &url::Url, default_port: u16) -> Result<(String, u16), FabricError> {
+    let host = url
+        .host_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            FabricError::Config(format!(
+                "fabric URL missing host: {}",
+                redact_url_for_error(url)
+            ))
+        })?
+        .to_owned();
+    let port = url.port().unwrap_or(default_port);
+    if port == 0 {
+        return Err(FabricError::Config(format!(
+            "fabric URL port must be > 0: {}",
+            redact_url_for_error(url)
+        )));
+    }
+    Ok((host, port))
+}
+
+/// Decode the `tls` / `cluster` query params, if present. Accepts
+/// `1`, `0`, `true`, `false` (case-insensitive). Rejects unknown
+/// query params so operator typos (`?tsl=1`) fail loud instead of
+/// silently defaulting.
+fn parse_valkey_query(url: &url::Url) -> Result<(Option<bool>, Option<bool>), FabricError> {
+    let mut tls = None;
+    let mut cluster = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "tls" => tls = Some(parse_bool_param("tls", &value)?),
+            "cluster" => cluster = Some(parse_bool_param("cluster", &value)?),
+            other => {
+                return Err(FabricError::Config(format!(
+                    "unknown fabric URL query param: {other:?}; expected one of: tls, cluster"
+                )));
+            }
+        }
+    }
+    Ok((tls, cluster))
+}
+
+fn parse_bool_param(name: &str, value: &str) -> Result<bool, FabricError> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        other => Err(FabricError::Config(format!(
+            "fabric URL query param {name}={other:?} must be one of: 0, 1, true, false"
+        ))),
+    }
+}
+
+/// Format only the backend *family* for error messages. Critical:
+/// never `Debug`-print a `BackendConnection` into a user-facing
+/// error, because `BackendConnection::Postgres` carries the
+/// connection URL which may embed credentials (user, password,
+/// sslpassword in the query string). This helper keeps the error
+/// message informative while keeping secrets out of boot logs.
+fn backend_kind(conn: &BackendConnection) -> &'static str {
+    match conn {
+        BackendConnection::Valkey(_) => "Valkey",
+        BackendConnection::Postgres(_) => "Postgres",
+        // `#[non_exhaustive]` upstream: future additive variants
+        // cairn hasn't taught this helper about fall back to a
+        // non-leaky placeholder rather than a Debug-print.
+        _ => "unknown",
+    }
+}
+
+/// Redact a parsed URL to `scheme://host[:port]` shape for error
+/// messages. Strips userinfo, path, query, and fragment because
+/// cairn's fabric URLs are Valkey endpoints whose `host` and `port`
+/// are the only fields needed to diagnose a parse/validate failure,
+/// and operators may (especially on Postgres URLs in PR-C) embed
+/// passwords in those omitted components.
+fn redact_url_for_error(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or("<missing-host>");
+    match url.port() {
+        Some(port) => format!("{scheme}://{host}:{port}", scheme = url.scheme()),
+        None => format!("{scheme}://{host}", scheme = url.scheme()),
     }
 }
 
@@ -308,45 +508,374 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn clear_fabric_env() {
+        // `CAIRN_FABRIC_HOST/PORT/TLS/CLUSTER` were removed when cairn-rs
+        // migrated to `CAIRN_FABRIC_URL`. Clear anyway so a stale value
+        // in the test runner's env can't leak into the no-URL default
+        // path (the implementation ignores them, but this keeps the
+        // tests hermetic against developer `.env` files).
+        for key in [
+            "CAIRN_FABRIC_URL",
+            "CAIRN_FABRIC_HOST",
+            "CAIRN_FABRIC_PORT",
+            "CAIRN_FABRIC_TLS",
+            "CAIRN_FABRIC_CLUSTER",
+            "CAIRN_FABRIC_LANE",
+            "CAIRN_FABRIC_LEASE_TTL_MS",
+            "CAIRN_FABRIC_MAX_TASKS",
+            "CAIRN_FABRIC_GRANT_TTL_MS",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn assert_valkey(cfg: &FabricConfig, host: &str, port: u16, tls: bool, cluster: bool) {
+        let vk = cfg.valkey_connection().expect("valkey backend");
+        assert_eq!(vk.host, host);
+        assert_eq!(vk.port, port);
+        assert_eq!(vk.tls, tls);
+        assert_eq!(vk.cluster, cluster);
+    }
+
     #[test]
-    fn default_config_from_env() {
+    fn default_config_from_env_when_url_unset() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CAIRN_FABRIC_HOST");
-        std::env::remove_var("CAIRN_FABRIC_PORT");
-        std::env::remove_var("CAIRN_FABRIC_TLS");
-        std::env::remove_var("CAIRN_FABRIC_CLUSTER");
-        std::env::remove_var("CAIRN_FABRIC_LANE");
-        std::env::remove_var("CAIRN_FABRIC_LEASE_TTL_MS");
-        std::env::remove_var("CAIRN_FABRIC_MAX_TASKS");
-        std::env::remove_var("CAIRN_FABRIC_GRANT_TTL_MS");
+        clear_fabric_env();
 
         let config = FabricConfig::from_env().unwrap();
-        assert_eq!(config.valkey_host, "localhost");
-        assert_eq!(config.valkey_port, 6379);
-        assert!(!config.tls);
-        assert!(!config.cluster);
+        assert_valkey(&config, "localhost", 6379, false, false);
         assert_eq!(config.lane_id.as_str(), "cairn");
         assert_eq!(config.lease_ttl_ms, 180_000);
         assert_eq!(config.max_concurrent_tasks, 4);
     }
 
     #[test]
-    fn valkey_client_builder_without_tls() {
-        // ferriskey's `ClientBuilder` does not expose public accessors on
-        // its internal `ConnectionRequest`, so we can only assert that the
-        // builder constructs without panicking and that `build_lazy()`
-        // (the synchronous validation path) accepts the address list.
-        // Full wire assertion requires an integration test against a real
-        // Valkey instance; those live under `tests/` and in the downstream
-        // `cairn-app` integration suite.
-        let config = FabricConfig {
-            valkey_host: "myhost".into(),
-            valkey_port: 6380,
-            tls: false,
-            cluster: false,
+    fn cairn_fabric_url_valkey_scheme_populates_backend() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://some-host:7001");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_valkey(&config, "some-host", 7001, false, false);
+
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    #[test]
+    fn cairn_fabric_url_empty_string_falls_back_to_default() {
+        // Matches cairn's existing `.filter(|s| !s.is_empty())`
+        // convention elsewhere in bootstrap: an operator who
+        // `export CAIRN_FABRIC_URL=` shouldn't hit a parse error
+        // downstream of a blank-string URL.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_valkey(&config, "localhost", 6379, false, false);
+
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    // ── URL parser unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn parse_valkey_url_basic() {
+        let cfg = parse_fabric_url("valkey://example.com:7000").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "example.com");
+                assert_eq!(vk.port, 7000);
+                assert!(!vk.tls);
+                assert!(!vk.cluster);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_valkey_url_default_port() {
+        let cfg = parse_fabric_url("valkey://some-host").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "some-host");
+                assert_eq!(vk.port, 6379, "missing-port defaults to 6379");
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rediss_url_implies_tls() {
+        let cfg = parse_fabric_url("rediss://secure.host:6380").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert!(vk.tls, "rediss:// scheme must set tls=true");
+                assert_eq!(vk.host, "secure.host");
+                assert_eq!(vk.port, 6380);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_with_tls_query_param() {
+        let cfg = parse_fabric_url("valkey://h:6379?tls=1").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => assert!(vk.tls),
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_with_cluster_query_param() {
+        let cfg = parse_fabric_url("valkey://h:6379?cluster=true").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert!(vk.cluster);
+                assert!(!vk.tls);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_with_tls_and_cluster_query_params() {
+        let cfg = parse_fabric_url("valkey://h:6379?tls=1&cluster=1").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert!(vk.tls);
+                assert!(vk.cluster);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rediss_with_tls_0_errors() {
+        let err = parse_fabric_url("rediss://h:6379?tls=0")
+            .expect_err("rediss + tls=0 must fail")
+            .to_string();
+        assert!(
+            err.contains("rediss:// scheme contradicts tls=0"),
+            "expected contradiction error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rediss_with_explicit_tls_1_is_fine() {
+        // Redundant but not contradictory — operators are allowed to be
+        // explicit even when the scheme already implies TLS.
+        let cfg = parse_fabric_url("rediss://h:6379?tls=1").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => assert!(vk.tls),
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    // Guard for the decision locked on 2026-04-27: `redis://` is NOT
+    // an alias. Operators must use `valkey://` or `rediss://`.
+    #[test]
+    fn redis_scheme_rejected_with_named_error() {
+        let err = parse_fabric_url("redis://h:6379")
+            .expect_err("redis:// must not be accepted")
+            .to_string();
+        assert!(
+            err.contains("unknown fabric URL scheme: redis") && err.contains("valkey, rediss"),
+            "expected named unknown-scheme error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgres_scheme_rejected_on_pr_a() {
+        // PR-C wires the postgres runtime; PR-A rejects at parse time.
+        let err = parse_fabric_url("postgres://u:p@h:5432/db")
+            .expect_err("postgres:// not accepted on PR-A")
+            .to_string();
+        assert!(
+            err.contains("unknown fabric URL scheme: postgres"),
+            "expected unknown-scheme error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn other_schemes_rejected_with_named_error() {
+        for bad in &[
+            "http://example.com",
+            "mysql://u:p@h/db",
+            "ftp://archive.local",
+        ] {
+            let err = parse_fabric_url(bad)
+                .expect_err("scheme must not be accepted")
+                .to_string();
+            assert!(
+                err.contains("unknown fabric URL scheme"),
+                "expected named error for {bad}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_scheme_with_query_params_errors_on_scheme_not_query() {
+        // Regression guard: parse_fabric_url must match on scheme
+        // BEFORE consulting query params, otherwise an unsupported
+        // scheme with garbage query params surfaces the wrong error
+        // (query-param complaint instead of scheme rejection).
+        let err = parse_fabric_url("http://example.com?tsl=1")
+            .expect_err("http:// must fail on scheme")
+            .to_string();
+        assert!(
+            err.contains("unknown fabric URL scheme"),
+            "expected scheme error before query-param error, got: {err}"
+        );
+        assert!(
+            !err.contains("unknown fabric URL query param"),
+            "scheme error must pre-empt query error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_error_does_not_echo_raw_url() {
+        // Security guard: operators may paste a Valkey URL embedding
+        // an ACL password (e.g. `valkey://user:pw@host:6379`). The
+        // parse error must NOT splice the raw input into its message,
+        // because the error lands in boot logs. The URL crate accepts
+        // userinfo on valkey://, so we exercise the malformed branch.
+        let secret = "super-secret-password-12345";
+        let url = format!("::malformed//user:{secret}@host:6379");
+        let err = parse_fabric_url(&url)
+            .expect_err("malformed URL must not be accepted")
+            .to_string();
+        assert!(
+            !err.contains(secret),
+            "parse error must not echo secret into logs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_host_port_error_does_not_echo_userinfo() {
+        // A valkey:// URL with userinfo and a missing host should
+        // surface the redacted endpoint, not the raw URL (which
+        // carries the password).
+        let secret = "leak-me-into-logs-43211234";
+        // No host between the `@` and the next slash — triggers the
+        // missing-host arm in extract_host_port.
+        let url = format!("valkey://user:{secret}@/path");
+        let err = parse_fabric_url(&url)
+            .expect_err("missing-host URL must fail")
+            .to_string();
+        assert!(
+            !err.contains(secret),
+            "extract_host_port error must not embed credentials, got: {err}"
+        );
+    }
+
+    #[test]
+    fn valkey_connection_error_does_not_echo_postgres_url() {
+        // Postgres URLs embed credentials in userinfo. If an operator
+        // configures a Postgres backend and calls `valkey_connection()`,
+        // the "expected Valkey backend" error must NOT include the
+        // full Postgres URL.
+        let mut cfg = base_config();
+        let secret = "postgres-password-42";
+        let pg_url = format!("postgres://admin:{secret}@dbhost:5432/cairn");
+        cfg.backend = BackendConfig::postgres(pg_url.clone());
+        let err = cfg.valkey_connection().unwrap_err().to_string();
+        assert!(
+            !err.contains(secret),
+            "valkey_connection error must not leak Postgres creds, got: {err}"
+        );
+        assert!(
+            err.contains("Postgres"),
+            "error should name the backend family, got: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_url_rejected() {
+        let err = parse_fabric_url("::not a url::")
+            .expect_err("malformed URL must not be accepted")
+            .to_string();
+        assert!(
+            err.contains("not a valid URL"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ipv6_url_preserves_brackets() {
+        // `url::Url::host_str()` keeps the square brackets on IPv6
+        // hosts (e.g. `"[::1]"`). FF's `ValkeyConnection.host` stores
+        // this bracketed form verbatim; ferriskey's TCP layer expects
+        // the bracketed shape for IPv6 endpoints — document by test.
+        let cfg = parse_fabric_url("valkey://[::1]:6379").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "[::1]", "url::Url preserves IPv6 host shape");
+                assert_eq!(vk.port, 6379);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv6_url_with_tls_query_param() {
+        let cfg = parse_fabric_url("valkey://[2001:db8::1]:7001?tls=1").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "[2001:db8::1]");
+                assert_eq!(vk.port, 7001);
+                assert!(vk.tls);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rediss_ipv6_sets_tls() {
+        let cfg = parse_fabric_url("rediss://[::1]:6380").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert!(vk.tls);
+                assert_eq!(vk.host, "[::1]");
+                assert_eq!(vk.port, 6380);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_query_param_rejected() {
+        // Operators who typo `?tsl=1` should fail loud, not silently
+        // get default TLS.
+        let err = parse_fabric_url("valkey://h:6379?tsl=1")
+            .expect_err("unknown query param must fail")
+            .to_string();
+        assert!(
+            err.contains("unknown fabric URL query param"),
+            "expected unknown-query-param error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn query_param_invalid_bool_rejected() {
+        let err = parse_fabric_url("valkey://h:6379?tls=yes")
+            .expect_err("invalid bool must fail")
+            .to_string();
+        assert!(
+            err.contains("must be one of"),
+            "expected bool-format error, got: {err}"
+        );
+    }
+
+    // ── client_builder (renamed from valkey_client_builder) ─────────────
+
+    fn base_config() -> FabricConfig {
+        FabricConfig {
+            backend: BackendConfig::valkey("localhost", 6379),
             lane_id: LaneId::new("test"),
-            worker_id: WorkerId::new("w1"),
-            worker_instance_id: WorkerInstanceId::new("inst1"),
+            worker_id: WorkerId::new("w"),
+            worker_instance_id: WorkerInstanceId::new("i"),
             namespace: Namespace::new("ns"),
             lease_ttl_ms: 30_000,
             grant_ttl_ms: 5_000,
@@ -356,11 +885,38 @@ mod tests {
             worker_capabilities: BTreeSet::new(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
-        };
+        }
+    }
+
+    #[test]
+    fn client_builder_without_tls() {
+        // ferriskey's `ClientBuilder` does not expose public accessors on
+        // its internal `ConnectionRequest`, so we can only assert that the
+        // builder constructs without panicking and that `build_lazy()`
+        // (the synchronous validation path) accepts the address list.
+        // Full wire assertion requires an integration test against a real
+        // Valkey instance; those live under `tests/` and in the downstream
+        // `cairn-app` integration suite.
+        let mut config = base_config();
+        config.backend = BackendConfig::valkey("myhost", 6380);
         // build_lazy validates the address list synchronously without
         // establishing a TCP connection — any misconfiguration (empty
         // addresses, bad protocol/push_sender combo) surfaces here.
-        assert!(config.valkey_client_builder().build_lazy().is_ok());
+        assert!(config.client_builder().unwrap().build_lazy().is_ok());
+    }
+
+    #[test]
+    fn client_builder_with_tls() {
+        // Same limitation as `client_builder_without_tls`: no public
+        // accessors on `ClientBuilder`/`ConnectionRequest`. We assert
+        // synchronous validation passes with TLS toggled on.
+        let mut config = base_config();
+        let mut cfg = BackendConfig::valkey("secure.host", 6379);
+        if let BackendConnection::Valkey(ref mut vk) = cfg.connection {
+            vk.tls = true;
+        }
+        config.backend = cfg;
+        assert!(config.client_builder().unwrap().build_lazy().is_ok());
     }
 
     #[test]
@@ -368,8 +924,8 @@ mod tests {
         // Confirms the synchronous validation path we rely on actually
         // catches misconfiguration — otherwise the positive tests above
         // would pass even if `build_lazy()` silently accepted garbage.
-        // `valkey_client_builder()` always pushes a host, so we build a
-        // bare `ClientBuilder` directly to exercise the empty-address
+        // `client_builder()` always pushes a host, so we build a bare
+        // `ClientBuilder` directly to exercise the empty-address
         // rejection branch (see ferriskey ClientBuilder::build_lazy).
         // `LazyClient` does not implement `Debug`, so we can't use
         // `.expect_err(..)`. Match on the result directly.
@@ -384,16 +940,15 @@ mod tests {
         }
     }
 
+    // ── validate() — backend-shape guard ────────────────────────────────
+
     fn test_config(
         port: u16,
         lease_ttl_ms: u64,
         max_tasks: usize,
     ) -> Result<FabricConfig, FabricError> {
         let config = FabricConfig {
-            valkey_host: "localhost".into(),
-            valkey_port: port,
-            tls: false,
-            cluster: false,
+            backend: BackendConfig::valkey("localhost", port),
             lane_id: LaneId::new("test"),
             worker_id: WorkerId::new("w"),
             worker_instance_id: WorkerInstanceId::new("i"),
@@ -435,28 +990,41 @@ mod tests {
             .contains("max_concurrent_tasks"));
     }
 
-    // ── HMAC secret validation ────────────────────────────────────────────
+    #[test]
+    fn rejects_empty_postgres_url_in_validate() {
+        // Smoke-test the Postgres validation arm — the URL parser
+        // rejects `postgres://` today, but validate() still needs to
+        // guard the non-Valkey branch for the PR-C roll-forward path.
+        let mut cfg = base_config();
+        cfg.backend = BackendConfig::postgres("");
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("postgres url must not be empty"),
+            "expected empty-url error, got: {err}"
+        );
+    }
 
-    fn base_config() -> FabricConfig {
-        FabricConfig {
-            valkey_host: "localhost".into(),
-            valkey_port: 6379,
-            tls: false,
-            cluster: false,
-            lane_id: LaneId::new("test"),
-            worker_id: WorkerId::new("w"),
-            worker_instance_id: WorkerInstanceId::new("i"),
-            namespace: Namespace::new("ns"),
-            lease_ttl_ms: 30_000,
-            grant_ttl_ms: 5_000,
-            max_concurrent_tasks: 1,
-            signal_dedup_ttl_ms: 86_400_000,
-            fcall_timeout_ms: 5_000,
-            worker_capabilities: BTreeSet::new(),
-            waitpoint_hmac_secret: None,
-            waitpoint_hmac_kid: None,
+    #[test]
+    fn client_builder_rejects_non_valkey_backend() {
+        // When the backend is not Valkey, `client_builder()` fails
+        // loud instead of lying about a ferriskey connection.
+        // `ClientBuilder` does not impl Debug, so the `Ok` arm is
+        // unreachable by a direct `unwrap_err()` — match explicitly.
+        let mut cfg = base_config();
+        cfg.backend = BackendConfig::postgres("postgres://u:p@h:5432/db");
+        match cfg.client_builder() {
+            Ok(_) => panic!("non-Valkey backend must not return a client builder"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("expected Valkey backend"),
+                    "expected non-valkey error, got: {msg}"
+                );
+            }
         }
     }
+
+    // ── HMAC secret validation ────────────────────────────────────────────
 
     #[test]
     fn hmac_secret_none_validates() {
@@ -559,31 +1127,5 @@ mod tests {
             err.contains("waitpoint_hmac_kid set but waitpoint_hmac_secret is None"),
             "expected missing-secret error, got {err}"
         );
-    }
-
-    #[test]
-    fn valkey_client_builder_with_tls() {
-        // Same limitation as `valkey_client_builder_without_tls`: no
-        // public accessors on `ClientBuilder`/`ConnectionRequest`. We
-        // assert synchronous validation passes with TLS toggled on.
-        let config = FabricConfig {
-            valkey_host: "secure.host".into(),
-            valkey_port: 6379,
-            tls: true,
-            cluster: false,
-            lane_id: LaneId::new("test"),
-            worker_id: WorkerId::new("w1"),
-            worker_instance_id: WorkerInstanceId::new("inst1"),
-            namespace: Namespace::new("ns"),
-            lease_ttl_ms: 30_000,
-            grant_ttl_ms: 5_000,
-            max_concurrent_tasks: 1,
-            signal_dedup_ttl_ms: 86_400_000,
-            fcall_timeout_ms: 5_000,
-            worker_capabilities: BTreeSet::new(),
-            waitpoint_hmac_secret: None,
-            waitpoint_hmac_kid: None,
-        };
-        assert!(config.valkey_client_builder().build_lazy().is_ok());
     }
 }

@@ -63,8 +63,10 @@ impl DelayedHarness {
             .arg("127.0.0.1")
             .arg("--db")
             .arg("memory")
-            .env("CAIRN_FABRIC_HOST", &valkey_host)
-            .env("CAIRN_FABRIC_PORT", valkey_port.to_string())
+            .env(
+                "CAIRN_FABRIC_URL",
+                format!("valkey://{valkey_host}:{valkey_port}"),
+            )
             .env("CAIRN_FABRIC_LANE", format!("test-{suffix}"))
             .env("CAIRN_FABRIC_WORKER_ID", format!("worker-{suffix}"))
             .env("CAIRN_FABRIC_INSTANCE_ID", format!("instance-{suffix}"))

@@ -378,8 +378,10 @@ fn spawn_subprocess_internal(
         .arg("127.0.0.1")
         .arg("--db")
         .arg(storage.db_arg())
-        .env("CAIRN_FABRIC_HOST", valkey_host)
-        .env("CAIRN_FABRIC_PORT", valkey_port.to_string())
+        .env(
+            "CAIRN_FABRIC_URL",
+            format!("valkey://{valkey_host}:{valkey_port}"),
+        )
         // Unique FF lane so this test's worker queues don't pick up
         // tasks from sibling tests.
         .env("CAIRN_FABRIC_LANE", format!("test-{suffix}"))
