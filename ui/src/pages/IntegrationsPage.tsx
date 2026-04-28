@@ -9,6 +9,7 @@ import { clsx } from "clsx";
 import { useToast } from "../components/Toast";
 import { defaultApi } from "../lib/api";
 import type { GitHubQueueEntry } from "../lib/api";
+import { errorMessage } from "../lib/errors";
 import { surface, border, text } from "../lib/design-system";
 import { PageHeader } from "../components/PageHeader";
 import { StatCard } from "../components/StatCard";
@@ -71,6 +72,7 @@ function ScanDialog({ onClose, onScan }: {
               Repository
             </label>
             <input
+              data-testid="github-scan-repo-input"
               type="text"
               value={repo}
               onChange={(e) => setRepo(e.target.value)}
@@ -132,6 +134,7 @@ function ScanDialog({ onClose, onScan }: {
             Cancel
           </button>
           <button
+            data-testid="github-scan-submit-btn"
             onClick={() => {
               if (!repo.includes("/")) return;
               onScan(repo, labels || undefined, limit);
@@ -441,7 +444,10 @@ export function IntegrationsPage() {
       toast.success(`Queued ${data.queued} issues from ${data.repo}`);
       void qc.invalidateQueries({ queryKey: ["github-queue"] });
     },
-    onError: () => toast.error("Scan failed"),
+    // #379: GitHub scans fail with operationally important detail —
+    // `rate limited: retry in 60s`, `repo not in allowlist`, `installation
+    // revoked`. Matches the pauseMut/resumeMut shape already in this file.
+    onError: (e) => toast.error(errorMessage(e, "Scan failed.")),
   });
 
   const pauseMut = useMutation({
@@ -613,6 +619,7 @@ export function IntegrationsPage() {
                 )}
 
                 <button
+                  data-testid="github-scan-open-btn"
                   onClick={() => setShowScan(true)}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600 hover:bg-indigo-700 text-white transition-colors"
                 >

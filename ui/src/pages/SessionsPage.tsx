@@ -8,6 +8,7 @@ import { EmptyScopeHint } from '../components/EmptyScopeHint';
 import { useToast } from '../components/Toast';
 import { clsx } from 'clsx';
 import { defaultApi } from '../lib/api';
+import { errorMessage } from '../lib/errors';
 import { sectionLabel } from '../lib/design-system';
 import type { SessionRecord, SessionState } from '../lib/types';
 import { EntityExplainer } from '../components/EntityExplainer';
@@ -91,7 +92,10 @@ export function SessionsPage() {
       toast.success(`Session ${s.session_id} created`);
       qc.invalidateQueries({ queryKey: ['sessions'] });
     },
-    onError: () => toast.error('Failed to create session'),
+    // #378: surface backend message — scope, tenant-auth, or uniqueness
+    // reasons all have distinct operator-actionable text that was being
+    // discarded by the previous zero-arg handler.
+    onError: (e) => toast.error(errorMessage(e, 'Failed to create session.')),
   });
 
   const list = sessions ?? [];
@@ -117,7 +121,7 @@ export function SessionsPage() {
         toast.success('Session imported successfully.');
         void qc.invalidateQueries({ queryKey: ['sessions'] });
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : 'Import failed — invalid JSON or incompatible format.');
+        toast.error(errorMessage(err, 'Import failed — invalid JSON or incompatible format.'));
       }
       // Reset input so the same file can be re-imported if needed.
       if (importRef.current) importRef.current.value = '';

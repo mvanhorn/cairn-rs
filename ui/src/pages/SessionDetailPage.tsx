@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation } from "@tanstack/react-query";
 import {
   ArrowLeft, Loader2, AlertTriangle, CheckCircle2, Inbox, Download,
 } from "lucide-react";
@@ -8,6 +8,7 @@ import { StateBadge } from "../components/StateBadge";
 import { CopyButton } from "../components/CopyButton";
 import { useToast } from "../components/Toast";
 import { ApiError, defaultApi } from "../lib/api";
+import { errorMessage } from "../lib/errors";
 import { table as tablePreset } from "../lib/design-system";
 import type { RunRecord, SessionCostResponse, SessionState } from "../lib/types";
 import { formatUsd, formatTokens } from "../lib/formatters";
@@ -191,6 +192,25 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
     retry: false,
   });
 
+  // #381: Export session as JSON. Previously a bare promise with no
+  // loading state — operator could double-click and fire parallel
+  // downloads while a long session serialised. Now `useMutation.isPending`
+  // gates the button. Mirrors the `exportRunMut` shape in
+  // `RunDetailPage.tsx` (#380 in this same PR).
+  const exportSessionMut = useMutation({
+    mutationFn: () => defaultApi.exportSession(sessionId),
+    onSuccess: (data) => {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `session-${sessionId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    onError: (e) => toast.error(errorMessage(e, "Export failed.")),
+  });
+
   return (
     <div className="h-full overflow-y-auto bg-gray-50 dark:bg-zinc-900">
       <div className="max-w-4xl mx-auto px-5 py-5 space-y-6">
@@ -227,25 +247,19 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
             <div className="flex items-center gap-3 shrink-0">
               {session && <SessionPill state={session.state} />}
               <button
-                onClick={() => {
-                  void defaultApi.exportSession(sessionId)
-                    .then(data => {
-                      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-                      const url  = URL.createObjectURL(blob);
-                      const a    = document.createElement('a');
-                      a.href     = url;
-                      a.download = `session-${sessionId}.json`;
-                      a.click();
-                      URL.revokeObjectURL(url);
-                    })
-                    .catch(e => toast.error(`Export failed: ${e instanceof Error ? e.message : String(e)}`));
-                }}
+                data-testid="session-export-btn"
+                data-pending={exportSessionMut.isPending ? "true" : "false"}
+                onClick={() => exportSessionMut.mutate()}
+                disabled={exportSessionMut.isPending}
                 title="Export session as JSON"
                 className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
                            border border-gray-200 dark:border-zinc-700 text-gray-500 dark:text-zinc-400 hover:text-gray-800 dark:hover:text-zinc-200 hover:border-zinc-600
-                           bg-gray-50 dark:bg-zinc-900 transition-colors"
+                           bg-gray-50 dark:bg-zinc-900 transition-colors disabled:opacity-50"
               >
-                <Download size={12} /> Export
+                {exportSessionMut.isPending
+                  ? <Loader2 size={12} className="animate-spin" />
+                  : <Download size={12} />}
+                Export
               </button>
             </div>
           </div>

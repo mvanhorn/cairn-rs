@@ -366,13 +366,18 @@ export type TerminationReason =
  * F65: rich terminal envelope emitted once per session when it closes.
  * PR-1 defines the shape; PR-6 wires the LLM summarizer that populates
  * `compacted_summary` and `next_step_hint`.
+ *
+ * `checkpoint_id` and `workspace_snapshot_id` reference `Checkpoint` /
+ * `WorkspaceSnapshot` records on the backend — see interfaces below.
+ * The union of `SessionOutcome.checkpoint_id` and `Checkpoint.checkpoint_id`
+ * is enforced at compile time by `ui/src/lib/__tests__/sessionOutcomeRefs.test.ts`.
  */
 export interface SessionOutcome {
   session_id: string;
   root_run_id: string;
   project: ProjectKey;
-  checkpoint_id: string;
-  workspace_snapshot_id?: string | null;
+  checkpoint_id: Checkpoint["checkpoint_id"];
+  workspace_snapshot_id?: WorkspaceSnapshot["snapshot_id"] | null;
   termination_reason: TerminationReason;
   /** JSON-encoded summary produced by the LLM summarizer in PR-6. */
   compacted_summary: string;
@@ -381,6 +386,63 @@ export interface SessionOutcome {
   cost_micros: number;
   /** Unix-epoch ms. */
   emitted_at: number;
+}
+
+// ── Checkpoint & WorkspaceSnapshot (F65) ──────────────────────────────────────
+
+/**
+ * Mirrors `cairn_store::projections::CheckpointRecord` — the current-state
+ * record returned by the checkpoint handlers in `crates/cairn-app/src/handlers/tools.rs`.
+ *
+ *   - `GET /v1/checkpoints/:id`     → `CheckpointRecord`
+ *   - `POST /v1/runs/:id/checkpoint` → `CheckpointRecord`
+ *   - `GET /v1/checkpoints?run_id`  → `{ items: CheckpointRecord[], has_more: boolean }`
+ *
+ * (The handler's generic annotation says `Checkpoint` but the items are
+ * populated via `CheckpointReadModel::list_by_run` which returns
+ * `Vec<CheckpointRecord>` — see `crates/cairn-runtime/src/services/checkpoint_impl.rs`.
+ * Both shapes coincide in the fields the UI observes today, but we name
+ * the TS type for the one actually on the wire.)
+ *
+ * Audit finding #383: SessionOutcome was referring to this type by its
+ * string id before the interface existed anywhere in the UI. Added here
+ * so cross-type references (see `SessionOutcome.checkpoint_id`) have a
+ * real compile-time anchor.
+ */
+export interface Checkpoint {
+  checkpoint_id: string;
+  project: ProjectKey;
+  run_id: string;
+  /** Intentionally narrow in v1 — mirrors `CheckpointDisposition`. */
+  disposition: "latest" | "superseded";
+  /** Opaque JSON state blob. Format is orchestrator-defined and versioned. */
+  data?: unknown | null;
+  version: number;
+  /** Unix-epoch ms when the checkpoint was recorded. */
+  created_at: number;
+}
+
+/**
+ * Mirrors `cairn_domain::session_orchestration::WorkspaceSnapshot` — the
+ * record the workspace backend produces at session-outcome time or on
+ * explicit operator checkpoint. Referenced by `SessionOutcome` via
+ * `workspace_snapshot_id`.
+ *
+ * `snapshot_path` SHOULD be relative to the configured workspace-snapshot
+ * root (per the Rust doc comment on `WorkspaceSnapshot::snapshot_path`).
+ * This is a portability constraint for the backend; the UI should treat
+ * the path as host-local and display-only.
+ */
+export interface WorkspaceSnapshot {
+  snapshot_id: string;
+  workspace_id: string;
+  snapshot_path: string;
+  /** Unix-epoch ms when the snapshot was created. */
+  created_at: number;
+  /** Unix-epoch ms when the snapshot may be reaped. `null` means GC-managed. */
+  expires_at?: number | null;
+  /** If this snapshot was built on top of another, the parent id is recorded. */
+  parent_snapshot_id?: string | null;
 }
 
 /**

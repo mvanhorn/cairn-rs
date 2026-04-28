@@ -20,6 +20,7 @@ import { useToast } from "../components/Toast";
 import { MiniChart } from "../components/MiniChart";
 import { BarChart } from "../components/BarChart";
 import { defaultApi } from "../lib/api";
+import { errorMessage } from "../lib/errors";
 import { useScope } from "../hooks/useScope";
 import type { EvalRunRecord, EvalRunStatus } from "../lib/types";
 import { EntityExplainer } from "../components/EntityExplainer";
@@ -402,8 +403,10 @@ export function EvalsPage() {
       setSelectedPromptAssetId("");
       toast.success("Eval run created");
     },
-    onError: (e: unknown) =>
-      toast.error(`Failed to create eval run: ${e instanceof Error ? e.message : String(e)}`),
+    // #382: the prior form used `String(e)` as fallback which produces
+    // "[object Object]" on non-Error throws. The shared `errorMessage`
+    // helper degrades to the fallback string instead.
+    onError: (e) => toast.error(errorMessage(e, "Failed to create eval run.")),
   });
 
   const runs = data?.items ?? [];
@@ -478,6 +481,7 @@ export function EvalsPage() {
 
         <div className="ml-auto relative">
           <button
+            data-testid="eval-new-open-btn"
             onClick={() => setShowNewForm(v => !v)}
             className="flex items-center gap-1.5 rounded bg-indigo-600 hover:bg-indigo-500
                        text-white text-[12px] font-medium px-3 py-1.5 transition-colors"
@@ -632,6 +636,8 @@ export function EvalsPage() {
                 </label>
 
                 <button
+                  data-testid="eval-create-submit-btn"
+                  data-pending={createEval.isPending ? "true" : "false"}
                   onClick={() => createEval.mutate()}
                   disabled={createEval.isPending}
                   className="w-full flex items-center justify-center gap-1.5 rounded bg-indigo-600 hover:bg-indigo-500

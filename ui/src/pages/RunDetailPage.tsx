@@ -16,6 +16,7 @@ import { CopyButton } from "../components/CopyButton";
 import { Drawer } from "../components/Drawer";
 import { useToast } from "../components/Toast";
 import { defaultApi } from "../lib/api";
+import { errorMessage } from "../lib/errors";
 import {
   mapRunActionError,
   stateGateTooltip,
@@ -1416,8 +1417,28 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
       toast.success(`Run ${runId} canceled.`);
     },
     onError: (error: unknown) => {
-      toast.error(error instanceof Error ? error.message : "Failed to cancel run.");
+      toast.error(errorMessage(error, "Failed to cancel run."));
     },
+  });
+
+  // #380: Export run as JSON. Previously a bare `defaultApi.exportRun(...)`
+  // promise with no loading state — the operator could double-click and
+  // fire parallel downloads while a run with many events serialised. Now
+  // `useMutation.isPending` disables the button and swaps the icon for a
+  // spinner. `onSuccess` runs the blob download; `onError` surfaces the
+  // backend message via the shared `errorMessage` helper.
+  const exportRunMut = useMutation({
+    mutationFn: () => defaultApi.exportRun(runId),
+    onSuccess: (data) => {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `run-${runId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    onError: (e) => toast.error(errorMessage(e, "Export failed.")),
   });
 
   const isTerminal = run && TERMINAL_STATES.has(run.state);
@@ -1478,25 +1499,19 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
                 </button>
               )}
               <button
-                onClick={() => {
-                  void defaultApi.exportRun(runId)
-                    .then(data => {
-                      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-                      const url  = URL.createObjectURL(blob);
-                      const a    = document.createElement('a');
-                      a.href     = url;
-                      a.download = `run-${runId}.json`;
-                      a.click();
-                      URL.revokeObjectURL(url);
-                    })
-                    .catch(e => toast.error(`Export failed: ${e instanceof Error ? e.message : String(e)}`));
-                }}
+                data-testid="run-export-btn"
+                data-pending={exportRunMut.isPending ? "true" : "false"}
+                onClick={() => exportRunMut.mutate()}
+                disabled={exportRunMut.isPending}
                 title="Export run as JSON"
                 className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
                            border border-gray-200 dark:border-zinc-700 text-gray-500 dark:text-zinc-400 hover:text-gray-800 dark:hover:text-zinc-200 hover:border-zinc-600
-                           bg-gray-50 dark:bg-zinc-900 transition-colors"
+                           bg-gray-50 dark:bg-zinc-900 transition-colors disabled:opacity-50"
               >
-                <Download size={12} /> Export
+                {exportRunMut.isPending
+                  ? <Loader2 size={12} className="animate-spin" />
+                  : <Download size={12} />}
+                Export
               </button>
             </div>
           </div>

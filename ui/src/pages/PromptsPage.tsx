@@ -8,6 +8,7 @@ import {
 import { clsx } from "clsx";
 import { Card } from "../components/Card";
 import { defaultApi } from "../lib/api";
+import { errorMessage } from "../lib/errors";
 import { sectionLabel } from "../lib/design-system";
 import { useToast } from "../components/Toast";
 import { useScope } from "../hooks/useScope";
@@ -309,46 +310,50 @@ function ReleaseControls({ release }: { release: PromptReleaseRecord }) {
     });
   };
 
+  // Error handlers surface the backend message (e.g. `insufficient role:
+  // requires prompt_admin`, `already in state approved`) — see audit
+  // finding #377. Prior shape `onError: () => toast.error("Failed to X.")`
+  // swallowed the one piece of context the operator actually needs.
   const activate = useMutation({
     mutationFn: () => defaultApi.activatePromptRelease(release.prompt_release_id),
     onSuccess: () => { toast.success("Release activated."); invalidate(); },
-    onError:   () => toast.error("Failed to activate release."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to activate release.")),
   });
 
   const applyRollout = useMutation({
     mutationFn: () => defaultApi.rolloutPromptRelease(release.prompt_release_id, rollout),
     onSuccess: () => { toast.success(`Rollout set to ${rollout}%.`); invalidate(); },
-    onError:   () => toast.error("Failed to update rollout."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to update rollout.")),
   });
 
   const reqApproval = useMutation({
     mutationFn: () => defaultApi.requestPromptReleaseApproval(release.prompt_release_id),
     onSuccess: () => { toast.success("Approval requested."); invalidate(); },
-    onError:   () => toast.error("Failed to request approval."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to request approval.")),
   });
 
   const approve = useMutation({
     mutationFn: () => defaultApi.transitionPromptRelease(release.prompt_release_id, "approved"),
     onSuccess: () => { toast.success("Release approved."); invalidate(); },
-    onError:   () => toast.error("Failed to approve release."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to approve release.")),
   });
 
   const reject = useMutation({
     mutationFn: () => defaultApi.transitionPromptRelease(release.prompt_release_id, "rejected"),
     onSuccess: () => { toast.success("Release rejected."); invalidate(); },
-    onError:   () => toast.error("Failed to reject release."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to reject release.")),
   });
 
   const demote = useMutation({
     mutationFn: () => defaultApi.transitionPromptRelease(release.prompt_release_id, "approved"),
     onSuccess: () => { toast.success("Release demoted to approved."); invalidate(); },
-    onError:   () => toast.error("Failed to demote release."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to demote release.")),
   });
 
   const archive = useMutation({
     mutationFn: () => defaultApi.transitionPromptRelease(release.prompt_release_id, "archived"),
     onSuccess: () => { toast.success("Release archived."); invalidate(); },
-    onError:   () => toast.error("Failed to archive release."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to archive release.")),
   });
 
   // Any pending mutation on this release locks out competing buttons
@@ -391,6 +396,8 @@ function ReleaseControls({ release }: { release: PromptReleaseRecord }) {
       {release.state === "draft" && (
         <>
           <button
+            data-testid={`prompt-release-request-approval-btn-${release.prompt_release_id}`}
+            data-pending={reqApproval.isPending ? "true" : "false"}
             onClick={() => reqApproval.mutate()}
             disabled={anyPending}
             className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
@@ -553,7 +560,8 @@ function AssetItem({
       toast.success("Release created.");
       void qc.invalidateQueries({ queryKey: ["prompt-releases", sk] });
     },
-    onError: () => toast.error("Failed to create release."),
+    // Same #377 fix shape as the seven mutations in `ReleaseActions`.
+    onError: (e) => toast.error(errorMessage(e, "Failed to create release.")),
   });
 
   return (
@@ -563,6 +571,7 @@ function AssetItem({
     )}>
       {/* Collapsed header */}
       <button
+        data-testid={`prompt-asset-expand-btn-${asset.prompt_asset_id}`}
         onClick={() => setExpanded((v) => !v)}
         className="w-full flex items-center gap-3 px-4 py-3 text-left"
       >
