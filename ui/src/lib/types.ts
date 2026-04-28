@@ -2102,3 +2102,43 @@ export interface RunCompletion {
   /** Wall-clock ms at which the orchestrator emitted the annotation. */
   completed_at: number;
 }
+
+// ── Decisions (policy allow/deny audit) ──────────────────────────────────────
+
+/** Outcome sidecar on a decision row. The backend emits a nested struct
+ *  `{outcome, deny_reason?}` rather than a bare string, so UIs render the
+ *  inner `outcome` string directly and surface `deny_reason` as a tooltip. */
+export interface DecisionOutcome {
+  outcome?: string;
+  deny_reason?: string;
+}
+
+/** `ProjectScope` emitted by the decision-cache endpoint. Keyed by tenant /
+ *  workspace / project rather than `cache_key` so the operator can see which
+ *  scope a cached rule applies to. */
+export interface DecisionCacheScope {
+  level: string;
+  tenant_id: string;
+  workspace_id: string;
+  project_id: string;
+}
+
+/** A single decision row from GET /v1/decisions. */
+export interface Decision {
+  decision_id: string;
+  /** Some rows (e.g. cache-hit rows) omit `kind` entirely; render code must
+   *  handle missing/string/object variants gracefully. */
+  kind?: Record<string, unknown> | string;
+  outcome?: DecisionOutcome;
+  created_at: number;
+}
+
+/** A single cache entry from GET /v1/decisions/cache. */
+export interface DecisionCacheEntry {
+  decision_id: string;
+  outcome?: DecisionOutcome;
+  kind_tag?: string;
+  scope: DecisionCacheScope;
+  expires_at: number;
+  hit_count: number;
+}

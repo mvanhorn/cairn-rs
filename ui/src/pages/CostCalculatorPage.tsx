@@ -12,7 +12,7 @@
  * slider, tools / reasoning capability chips.
  */
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useId } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Calculator,
@@ -128,11 +128,19 @@ function TokenInput({ label, value, onChange, testId }: {
   onChange: (n: number) => void;
   testId?: string;
 }) {
+  // Issue #386: associate the <label> with the <input> via htmlFor/id so
+  // screen readers announce the label when the input receives focus, and
+  // so clicking the label focuses the input. Without this association, AT
+  // users navigating by label hit a dead element. useId() yields a stable
+  // ID per mount which is safe even when multiple TokenInput instances
+  // coexist on the same page.
+  const inputId = useId();
   return (
     <div>
-      <label className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wider block mb-2">{label}</label>
+      <label htmlFor={inputId} className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wider block mb-2">{label}</label>
       <div className="space-y-2">
         <input
+          id={inputId}
           type="number"
           min={0}
           value={value}
@@ -211,6 +219,8 @@ export function CostCalculatorPage() {
   const [toolsOnly,      setToolsOnly]      = useState(false);
   const [reasoningOnly,  setReasoningOnly]  = useState(false);
   const [configuredOnly, setConfiguredOnly] = useState(false);
+  // Issue #386: stable id so the Model <label> can `htmlFor` the <select>.
+  const modelSelectId = useId();
   // `copied` flips true only on a SUCCESSFUL copy and auto-resets after
   // 1.5 s — we mirror that in the button label below so a failed copy
   // (denied permission, HTTP context without clipboard API, etc.) doesn't
@@ -362,8 +372,8 @@ export function CostCalculatorPage() {
 
             {/* Model selector */}
             <div>
-              <label className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wider block mb-2">Model</label>
-              <select value={effectiveId} onChange={e => setSelectedId(e.target.value)}
+              <label htmlFor={modelSelectId} className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wider block mb-2">Model</label>
+              <select id={modelSelectId} value={effectiveId} onChange={e => setSelectedId(e.target.value)}
                 data-testid="costcalc-model-select"
                 className="w-full rounded border border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-900 text-[13px] text-gray-800 dark:text-zinc-200
                            px-3 py-2 focus:outline-none focus:border-indigo-500 transition-colors">

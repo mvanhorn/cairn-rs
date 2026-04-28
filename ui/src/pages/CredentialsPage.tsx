@@ -179,7 +179,12 @@ function AddCredentialModal({
   const { mutate, isPending, error: mutErr } = useMutation({
     mutationFn: ({ tenantId, body }: { tenantId: string; body: StoreCredentialRequest }) =>
       defaultApi.storeCredential(tenantId, body),
-    onSuccess: () => {
+    onSuccess: (_data, { body }) => {
+      // Issue #384: storing a credential is a security-positive action —
+      // surface an explicit success toast so the operator knows their
+      // credential landed. Matches the revoke success toast above
+      // (ChannelsPage / SourcesPage / SessionsPage share the same pattern).
+      toast.success(`Credential ${body.provider_id} stored.`);
       onCreated();
       onClose();
     },

@@ -14,6 +14,7 @@ import { GanttView } from "../components/TimelineView";
 import { RunTelemetryPanel } from "../components/RunTelemetryPanel";
 import { CopyButton } from "../components/CopyButton";
 import { Drawer } from "../components/Drawer";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { useToast } from "../components/Toast";
 import { defaultApi } from "../lib/api";
 import { errorMessage } from "../lib/errors";
@@ -310,6 +311,15 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
   const [showRevise, setShowRevise] = useState(false);
 
   // Check if this run has a plan artifact via events
+  //
+  // Issue #391: RunDetail mounts many queries per run — the default
+  // TanStack retry of 3× with exponential backoff multiplies load under an
+  // outage. The plan-events query commonly returns an empty array for
+  // non-plan runs (not 404, so no signal there), so the lack of retries is
+  // safe: on a transient failure the next render/focus will refetch. A 404
+  // specifically means "no plan artifact here" and must never retry; for
+  // other statuses we allow a single retry to absorb one blip without
+  // cascading.
   const { data: planEvents } = useQuery({
     queryKey: ["run-plan", runId],
     queryFn: async () => {
@@ -321,6 +331,11 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
       );
     },
     staleTime: 10_000,
+    retry: (failureCount, err) => {
+      const status = (err as { status?: number })?.status;
+      if (status === 404) return false;
+      return failureCount < 1;
+    },
   });
 
   const hasPlan = planEvents && planEvents.length > 0;
@@ -554,12 +569,14 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
 const RUNNING_STATES = PAUSABLE_RUN_STATES;
 const TERMINAL_STATES = TERMINAL_RUN_STATES;
 
-function confirmAction(label: string, runId: string): boolean {
-  // Match the existing "confirm" pattern used by cancelRun above — keep it
-  // consistent with TriggersPage/ApprovalsPage which also use window.confirm
-  // rather than a modal for destructive actions.
-  return window.confirm(`${label} run ${runId}?`);
-}
+// Issue #393: destructive actions (Cancel Run / Recover / Claim) now route
+// through the ConfirmDialog component, matching the Drawer-based Intervene
+// and Spawn-subagent flows on this same page. The previous `window.confirm`
+// blocked the main thread, ignored the dark theme, and was inconsistent
+// with the rest of the design system. State for each prompt lives in
+// OperatorActions / RunDetailPage so the parent can pass `isPending` from
+// the underlying mutation and keep the dialog open until the mutation
+// settles.
 
 interface ActionBtnProps {
   onClick: () => void;
@@ -579,11 +596,18 @@ function ActionBtn({ onClick, disabled, pending, icon, label, variant = "default
     primary: "border border-indigo-300 dark:border-indigo-700 text-indigo-700 dark:text-indigo-300 hover:text-indigo-900 dark:hover:text-indigo-100 bg-indigo-50 dark:bg-indigo-950/30",
     danger:  "border border-red-200 dark:border-red-800/60 text-red-600 dark:text-red-300 hover:text-red-700 dark:hover:text-red-200 bg-red-50 dark:bg-red-950/30",
   };
+  // Issue #385: while these buttons render icon+text, the extended `title`
+  // often contains state-gate context (e.g. "Cannot pause: run is terminal")
+  // that screen readers should announce verbatim. Set `aria-label` from the
+  // same string the sighted user sees via `title` so keyboard/AT users
+  // get the same hover-tooltip information without relying on `title` alone.
+  const accessibleName = title ?? label;
   return (
     <button
       onClick={onClick}
       disabled={disabled || pending}
-      title={title ?? label}
+      title={accessibleName}
+      aria-label={accessibleName}
       className={clsx(base, variants[variant])}
       data-testid={testId}
       data-pending={pending ? "true" : undefined}
@@ -802,6 +826,10 @@ function OperatorActions({ runId, run }: { runId: string; run?: RunRecord }) {
   const [interveneOpen, setInterveneOpen] = useState(false);
   const [diagnoseDrawer, setDiagnoseDrawer] = useState<{ open: boolean; data?: unknown }>({ open: false });
   const [interventionsOpen, setInterventionsOpen] = useState(false);
+  // Issue #393: single discriminator drives both Recover and Claim confirm
+  // dialogs — they are mutually exclusive (the operator can only be
+  // confirming one at a time). `null` = no dialog open.
+  const [destructiveConfirm, setDestructiveConfirm] = useState<"recover" | "claim" | null>(null);
 
   const invalidateRun = () => {
     void queryClient.invalidateQueries({ queryKey: ["run-detail", runId] });
@@ -921,25 +949,65 @@ function OperatorActions({ runId, run }: { runId: string; run?: RunRecord }) {
           icon={<LifeBuoy size={12} />}
           label="Recover"
           variant="danger"
-          onClick={() => {
-            if (!confirmAction("Recover (re-trigger scanners on)", runId)) return;
-            recoverMut.mutate();
-          }}
+          onClick={() => setDestructiveConfirm("recover")}
           pending={recoverMut.isPending}
           title="Re-trigger the recovery scanners (legacy no-op in v1)"
+          testId="run-recover-btn"
         />
         <ActionBtn
           icon={<Lock size={12} />}
           label="Claim"
           variant="danger"
-          onClick={() => {
-            if (!confirmAction("Take operator claim on", runId)) return;
-            claimMut.mutate();
-          }}
+          onClick={() => setDestructiveConfirm("claim")}
           pending={claimMut.isPending}
           title="Take an admin claim on this run for inspection"
+          testId="run-claim-btn"
         />
       </div>
+
+      {/* Issue #393: styled confirm dialogs for destructive actions — replaces
+          the previous window.confirm. Kept mounted (via `open`) so focus-trap
+          mounts/unmounts cleanly. */}
+      <ConfirmDialog
+        open={destructiveConfirm === "recover"}
+        title="Re-run recovery scanners?"
+        message={
+          <>
+            This will re-trigger the recovery scanners on run{" "}
+            <span className="font-mono text-gray-700 dark:text-zinc-300">{runId}</span>.
+            It is safe but may be a no-op in v1 (handled by background scanners).
+          </>
+        }
+        confirmLabel="Recover"
+        variant="danger"
+        isPending={recoverMut.isPending}
+        onConfirm={() => {
+          setDestructiveConfirm(null);
+          recoverMut.mutate();
+        }}
+        onCancel={() => setDestructiveConfirm(null)}
+        testId="run-recover-confirm"
+      />
+      <ConfirmDialog
+        open={destructiveConfirm === "claim"}
+        title="Take operator claim?"
+        message={
+          <>
+            This takes an admin claim on run{" "}
+            <span className="font-mono text-gray-700 dark:text-zinc-300">{runId}</span>{" "}
+            so you can inspect it. The run will not progress further until released.
+          </>
+        }
+        confirmLabel="Take claim"
+        variant="danger"
+        isPending={claimMut.isPending}
+        onConfirm={() => {
+          setDestructiveConfirm(null);
+          claimMut.mutate();
+        }}
+        onCancel={() => setDestructiveConfirm(null)}
+        testId="run-claim-confirm"
+      />
 
       {run && (
         <SpawnSubagentModal
@@ -999,11 +1067,29 @@ function OperatorActions({ runId, run }: { runId: string; run?: RunRecord }) {
 }
 
 function ChildRunsSection({ runId }: { runId: string }) {
+  // Issue #389 polling hygiene:
+  //   * `refetchInterval` stops firing once the query is in an error state —
+  //     a transient 5xx used to keep hammering the server every 15s under an
+  //     outage. TanStack Query calls `refetchInterval` with the `Query`
+  //     object, so we can switch it to `false` on the first error.
+  //   * `refetchIntervalInBackground: false` pauses polling while the tab is
+  //     hidden, avoiding multiplied load from operators who leave RunDetail
+  //     open across multiple tabs.
+  //   * `retry: (_, err) => err.status < 500` retries client-classified
+  //     4xx once (in case of stale scope) but never retries 5xx — retry is
+  //     the interval's job, and only after the next focus event.
   const { data: children, isLoading } = useQuery({
     queryKey: ["run-children", runId],
     queryFn: () => defaultApi.listChildRuns(runId),
-    refetchInterval: 15_000,
-    retry: false,
+    refetchInterval: (query) => (query.state.error ? false : 15_000),
+    refetchIntervalInBackground: false,
+    retry: (failureCount, err) => {
+      // `ApiError` carries `status`; anything else (network failure,
+      // runtime bug) is treated as 5xx-equivalent — don't retry.
+      const status = (err as { status?: number })?.status;
+      if (typeof status !== "number") return false;
+      return status < 500 && failureCount < 1;
+    },
   });
 
   if (isLoading) {
@@ -1347,6 +1433,10 @@ interface RunDetailPageProps {
 export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
   const queryClient = useQueryClient();
   const toast = useToast();
+  // Issue #393: Drawer-style confirm for Cancel Run — replaces the former
+  // window.confirm. Kept in RunDetailPage state because the button lives in
+  // the header, not inside OperatorActions.
+  const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
 
   const { data: runDetail } = useQuery({
     queryKey: ["run-detail", runId],
@@ -1484,11 +1574,14 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
               {run && <StateBadge state={run.state} />}
               {run && !isTerminal && (
                 <button
-                  onClick={() => {
-                    if (!window.confirm(`Cancel run ${runId}?`)) return;
-                    cancelRunMut.mutate();
-                  }}
+                  data-testid="run-cancel-btn"
+                  onClick={() => setCancelConfirmOpen(true)}
                   disabled={cancelRunMut.isPending}
+                  // Issue #385: screen readers inconsistently read `title`.
+                  // Keep `title` for the sighted hover tooltip, add
+                  // `aria-label` so assistive tech always announces the
+                  // action even on icon-only rendering.
+                  aria-label="Cancel run"
                   title="Cancel this run"
                   className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
                              border border-red-200 dark:border-red-800/60 text-red-600 dark:text-red-300 hover:text-red-700 dark:hover:text-red-200
@@ -1503,6 +1596,8 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
                 data-pending={exportRunMut.isPending ? "true" : "false"}
                 onClick={() => exportRunMut.mutate()}
                 disabled={exportRunMut.isPending}
+                // Issue #385: explicit aria-label for AT users.
+                aria-label="Export run as JSON"
                 title="Export run as JSON"
                 className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
                            border border-gray-200 dark:border-zinc-700 text-gray-500 dark:text-zinc-400 hover:text-gray-800 dark:hover:text-zinc-200 hover:border-zinc-600
@@ -1746,6 +1841,32 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
         </Section>
 
       </div>
+
+      {/* Issue #393: Drawer-style confirm for Cancel Run — replaces
+          window.confirm. `isPending` flips the primary button into a
+          spinner so double-click cannot fire the mutation twice while
+          the request is in flight. */}
+      <ConfirmDialog
+        open={cancelConfirmOpen}
+        title="Cancel run?"
+        message={
+          <>
+            This immediately terminates run{" "}
+            <span className="font-mono text-gray-700 dark:text-zinc-300">{runId}</span>.
+            Any in-flight tool calls will be aborted. This cannot be undone.
+          </>
+        }
+        confirmLabel="Cancel run"
+        cancelLabel="Keep running"
+        variant="danger"
+        isPending={cancelRunMut.isPending}
+        onConfirm={() => {
+          setCancelConfirmOpen(false);
+          cancelRunMut.mutate();
+        }}
+        onCancel={() => setCancelConfirmOpen(false)}
+        testId="run-cancel-confirm"
+      />
     </div>
   );
 }

@@ -16,7 +16,7 @@ import {
 import { clsx } from "clsx";
 import { card as cardPreset } from "../lib/design-system";
 import { defaultApi } from "../lib/api";
-import { PAUSABLE_RUN_STATES, TERMINAL_RUN_STATES } from "../lib/runStateErrors";
+import { PAUSABLE_RUN_STATES, TERMINAL_RUN_STATES, mapRunActionError } from "../lib/runStateErrors";
 import { useScope, type ProjectScope } from "../hooks/useScope";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -207,7 +207,21 @@ function buildScenarios(scope: ProjectScope): ScenarioDef[] {
         label: "Pause run",
         description: "POST /v1/runs/:id/pause",
         run: async (ctx) => {
-          const r = await defaultApi.pauseRun(String(ctx["run_id"]), { detail: "harness test pause" });
+          // Issue #392: a 409 invalid_state_transition from the backend
+          // carries internal state-machine vocabulary (e.g.
+          // `partial_fence_triple -> suspended`) that is not operator-
+          // actionable. Wrap ONLY the network call so the mapper fires on
+          // backend 4xx/5xx; our local post-condition assertions (state
+          // mismatch, version didn't increment) already produce
+          // operator-readable messages and must not be reclassified. The
+          // e2e spec at `ui/e2e/test-harness.spec.ts` asserts this is
+          // what the operator sees when pause hits a 409.
+          let r;
+          try {
+            r = await defaultApi.pauseRun(String(ctx["run_id"]), { detail: "harness test pause" });
+          } catch (e: unknown) {
+            throw new Error(mapRunActionError(e, "Pause failed.", "pause"));
+          }
           if (r.state !== "paused") throw new Error(`expected paused, got ${r.state}`);
           ctx["run_version_paused"] = r.version;
           return r;
@@ -218,7 +232,14 @@ function buildScenarios(scope: ProjectScope): ScenarioDef[] {
         label: "Resume run",
         description: "POST /v1/runs/:id/resume",
         run: async (ctx) => {
-          const r = await defaultApi.resumeRun(String(ctx["run_id"]));
+          // Symmetry with pause_run: network 4xx/5xx gets mapped; post-
+          // condition failures keep their test-specific error text.
+          let r;
+          try {
+            r = await defaultApi.resumeRun(String(ctx["run_id"]));
+          } catch (e: unknown) {
+            throw new Error(mapRunActionError(e, "Resume failed.", "resume"));
+          }
           if (r.state !== "running") throw new Error(`expected running, got ${r.state}`);
           if (Number(r.version) <= Number(ctx["run_version_paused"])) {
             throw new Error("version should increment after resume");

@@ -333,7 +333,16 @@ export function MetricsPage() {
   } = useQuery<MetricsSnapshot>({
     queryKey: ["api-metrics"],
     queryFn:  () => defaultApi.getMetrics(),
+    // Issue #390: pause polling when the tab isn't visible. Operators often
+    // leave MetricsPage open in a background tab; a 10s poll there compounds
+    // load across every open UI session against a single cairn-app. Pausing
+    // in background preserves foreground responsiveness while cutting idle
+    // traffic. `staleTime: 8_000` avoids a double-poll on mount+focus (the
+    // focused tab becomes stale after 8s, so the next refetch window is the
+    // 10s interval, not an immediate focus-triggered extra fetch).
     refetchInterval: 10_000,
+    refetchIntervalInBackground: false,
+    staleTime: 8_000,
     retry: 1,
   });
 

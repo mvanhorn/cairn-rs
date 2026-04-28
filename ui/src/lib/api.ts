@@ -1082,6 +1082,34 @@ export function createApiClient(config: ApiClientConfig) {
      *  `summariseCostItems` to get a `CostSummary` for stat-card rendering. */
     getCosts: (): Promise<import("./types").CostListResponse> => get("/v1/costs"),
 
+    // ── Decisions (policy allow/deny audit) ─────────────────────────────────
+    //
+    // Centralised in defaultApi so that DecisionsPage no longer reads the auth
+    // token directly from localStorage (issue #387) and so every call goes
+    // through `apiFetch`, which dispatches the `cairn:auth-expired` event on
+    // 401 and applies the global retry/error conventions.
+
+    /** GET /v1/decisions — recent policy decisions (allow/deny outcomes). */
+    listDecisions: (): Promise<import("./types").Decision[]> =>
+      getList("/v1/decisions"),
+
+    /** GET /v1/decisions/cache — cached decision rules. */
+    listDecisionsCache: (): Promise<import("./types").DecisionCacheEntry[]> =>
+      getList("/v1/decisions/cache"),
+
+    /** POST /v1/decisions/:id/invalidate — invalidate a single cache entry. */
+    invalidateDecision: (
+      decisionId: string,
+      reason = "operator-invalidated",
+    ): Promise<unknown> =>
+      post(`/v1/decisions/${encodeURIComponent(decisionId)}/invalidate`, { reason }),
+
+    /** POST /v1/decisions/invalidate — bulk-invalidate the decision cache. */
+    bulkInvalidateDecisions: (
+      reason = "operator-bulk-clear",
+    ): Promise<unknown> =>
+      post("/v1/decisions/invalidate", { reason }),
+
     // ── API metrics ──────────────────────────────────────────────────────────
 
     /** GET /v1/metrics/prometheus — rolling request metrics in Prometheus

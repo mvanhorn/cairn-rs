@@ -123,15 +123,29 @@ function BatchCreateModal({ onClose, onDone }: BatchCreateModalProps) {
       return defaultApi.batchCreateRuns(runs);
     },
     onSuccess: result => {
+      // Issue #388: surface partial success explicitly. The batch endpoint
+      // returns per-item `{ok, error}` results (#174), so the inner loop
+      // cannot leak partial state the way the old N-sequential-POST version
+      // did — but we still have to describe the mixed outcome to the
+      // operator. When some succeeded and some failed, use `toast.warning`
+      // (amber) rather than two back-to-back toasts; a mixed batch is
+      // neither a pure success nor a hard failure. On an all-success /
+      // all-fail batch we keep the single-variant toast.
       const ok  = result.results.filter(r => r.ok).length;
       const bad = result.results.filter(r => !r.ok);
-      if (ok > 0) toast.success(`Created ${ok} run${ok !== 1 ? "s" : ""}.`);
-      if (bad.length > 0) {
+      if (bad.length === 0 && ok > 0) {
+        toast.success(`Created ${ok} run${ok !== 1 ? "s" : ""}.`);
+      } else if (ok === 0 && bad.length > 0) {
         const sample = bad[0]?.error ?? "run creation failed";
         toast.error(
           bad.length === 1
             ? `1 run failed: ${sample}`
             : `${bad.length} runs failed (first: ${sample})`,
+        );
+      } else if (ok > 0 && bad.length > 0) {
+        const sample = bad[0]?.error ?? "run creation failed";
+        toast.warning(
+          `Partial: ${ok} of ${ok + bad.length} runs created; ${bad.length} failed (first: ${sample}).`,
         );
       }
       onDone();

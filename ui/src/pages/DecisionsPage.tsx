@@ -9,50 +9,20 @@ import { ErrorFallback } from "../components/ErrorFallback";
 import { useToast } from "../components/Toast";
 import { clsx } from "clsx";
 import { sectionLabel } from "../lib/design-system";
-import { ApiError } from "../lib/api";
+import { defaultApi } from "../lib/api";
+import type { Decision, DecisionCacheEntry, DecisionCacheScope } from "../lib/types";
 import { EmptyScopeHint } from "../components/EmptyScopeHint";
 import { EntityExplainer } from "../components/EntityExplainer";
 import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-const authHeaders = () => ({ Authorization: `Bearer ${localStorage.getItem("cairn_token") || ""}` });
-
-/** Fetch wrapper that throws on non-2xx. The raw-`fetch` call sites below
- *  previously ignored HTTP errors entirely — 4xx/5xx returned undefined and
- *  the success toast fired as if the server had honored the request.
- *
- *  Throws `ApiError` (not a generic `Error`) so the global 401 interceptor
- *  in `main.tsx` recognizes auth-expired failures and routes the operator
- *  back to the LoginPage. Mirrors the behavior of `apiFetch` in `api.ts`
- *  so 401 handling stays consistent across the UI. */
-async function assertOk(path: string, init: RequestInit): Promise<Response> {
-  const res = await fetch(path, init);
-  if (!res.ok) {
-    let code = 'unknown_error';
-    let message = `HTTP ${res.status}`;
-    try {
-      const body = await res.json();
-      code = body?.code ?? code;
-      message = body?.message ?? message;
-    } catch {
-      // Non-JSON body — fall back to the default message above.
-    }
-    throw new ApiError(res.status, code, message);
-  }
-  return res;
-}
-
-/** Normalize list responses to `T[]`. Mirrors the `getList` helper used by
- *  `createApiClient` in `api.ts` so DecisionsPage handles both the bare
- *  array and `{items, hasMore}` envelope shapes consistently. */
-function unwrapList<T>(data: unknown): T[] {
-  if (Array.isArray(data)) return data as T[];
-  if (data && typeof data === 'object' && 'items' in data && Array.isArray((data as { items: unknown }).items)) {
-    return (data as { items: T[] }).items;
-  }
-  return [];
-}
+//
+// Issue #387: DecisionsPage used to build its own `authHeaders()` from a
+// raw `localStorage.getItem('cairn_token')` and call bare `fetch` — that
+// bypassed the `getStoredToken` helper, the global 401 interceptor in
+// `api.ts` (which dispatches `cairn:auth-expired`), and the shared
+// env-var fallback (`VITE_API_TOKEN`). All four network calls below now
+// go through `defaultApi`, which centralizes those concerns.
 
 function fmtRelative(ms: number): string {
   const d = Date.now() - ms;
@@ -66,44 +36,10 @@ function mono(s: string, max = 18): string {
   return s.length > max ? `${s.slice(0, max - 3)}…` : s;
 }
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// Types moved to `../lib/types` (Decision, DecisionCacheEntry, DecisionCacheScope)
+// so the same shape is referenced by `defaultApi.listDecisions` / `listDecisionsCache`.
 
-interface Decision {
-  decision_id: string;
-  // Optional — not every decision row carries a `kind` field (cache-hit
-  // rows emit `decision_key` instead). Treat as optional so the render
-  // path doesn't turn `undefined` into the literal string "undefined".
-  kind?: Record<string, unknown> | string;
-  outcome?: { outcome?: string; deny_reason?: string };
-  created_at: number;
-}
-
-interface CacheScope {
-  level: string;
-  tenant_id: string;
-  workspace_id: string;
-  project_id: string;
-}
-
-interface CacheEntry {
-  decision_id: string;
-  // Backend emits a nested `{outcome, deny_reason?}` struct (same shape as
-  // `Decision.outcome`), not a bare string — rendering the object directly
-  // crashed OutcomePill with "Objects are not valid as a React child".
-  // Fields marked optional because backend occasionally emits empty/missing
-  // values; render paths must handle absent gracefully (em-dash fallback)
-  // instead of leaking "undefined" / blank cells onto the operator UI.
-  outcome?: { outcome?: string; deny_reason?: string };
-  kind_tag?: string;
-  // Backend emits a `ProjectScope` object, not a string — rendering the
-  // object directly would crash React with "Objects are not valid as a
-  // React child".
-  scope: CacheScope;
-  expires_at: number;
-  hit_count: number;
-}
-
-function scopeLabel(s: CacheScope): string {
+function scopeLabel(s: DecisionCacheScope): string {
   return `${s.tenant_id}/${s.workspace_id}/${s.project_id}`;
 }
 
@@ -147,40 +83,26 @@ export function DecisionsPage() {
 
   const decisionsQ = useQuery<Decision[]>({
     queryKey: ["decisions"],
-    queryFn: async () => {
-      const res = await assertOk("/v1/decisions", { headers: authHeaders() });
-      return unwrapList<Decision>(await res.json());
-    },
+    queryFn: () => defaultApi.listDecisions(),
     refetchInterval: 30_000,
   });
 
-  const cacheQ = useQuery<CacheEntry[]>({
+  const cacheQ = useQuery<DecisionCacheEntry[]>({
     queryKey: ["decisions-cache"],
-    queryFn: async () => {
-      const res = await assertOk("/v1/decisions/cache", { headers: authHeaders() });
-      return unwrapList<CacheEntry>(await res.json());
-    },
+    queryFn: () => defaultApi.listDecisionsCache(),
     refetchInterval: 30_000,
   });
 
   const invalidateMut = useMutation({
-    mutationFn: (id: string) => assertOk(`/v1/decisions/${id}/invalidate`, {
-      method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ reason: "operator-invalidated" }),
-    }),
+    mutationFn: (id: string) => defaultApi.invalidateDecision(id, "operator-invalidated"),
     onSuccess: () => { toast.success("Cache entry invalidated."); void qc.invalidateQueries({ queryKey: ["decisions-cache"] }); },
     onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Failed to invalidate cache entry."),
   });
 
   // Bulk-invalidate the decision cache. The real endpoint is the bulk form
   // of `/v1/decisions/invalidate` (see crates/cairn-app/src/router.rs:1271).
-  // The previous URL (`/v1/decisions/cache/invalidate-all`) does not exist;
-  // the raw `fetch` also ignored the 404 and fired the success toast.
   const bulkMut = useMutation({
-    mutationFn: () => assertOk("/v1/decisions/invalidate", {
-      method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ reason: "operator-bulk-clear" }),
-    }),
+    mutationFn: () => defaultApi.bulkInvalidateDecisions("operator-bulk-clear"),
     onSuccess: () => { toast.success("All cache entries invalidated."); void qc.invalidateQueries({ queryKey: ["decisions-cache"] }); },
     onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Failed to bulk-invalidate cache."),
   });
@@ -264,7 +186,7 @@ export function DecisionsPage() {
           emptyText="No decisions yet. Decisions appear here when a tool call, trigger, or plugin action is policy-checked."
         />
       ) : (
-        <DataTable<CacheEntry>
+        <DataTable<DecisionCacheEntry>
           data={cacheEntries}
           getRowId={e => e.decision_id}
           rowClassName="group"
