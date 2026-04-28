@@ -18,6 +18,17 @@
 //!
 //! The actual LLM-driven agent loop is PR-5 territory — PR-4 ships the
 //! confinement-plus-bridge skeleton that PR-5 extends.
+//!
+//! # Linux-only
+//!
+//! Landlock, seccomp-BPF, and `unshare(CLONE_NEWNS)` are Linux kernel
+//! features. The module is compiled only when `target_os = "linux"` (see
+//! `main.rs`), which is why every `nix`/`mount`/`ptrace`/`fstat` call in
+//! this file is unconditional — dead-branch `#[cfg(not(target_os = "linux"))]`
+//! arms were removed per review feedback because they are unreachable when
+//! the whole module is gated.
+
+#![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -143,7 +154,7 @@ pub fn run(args: SandboxedAgentArgs) -> ExitCode {
     // straight through `nix::sys::socket::{recv, send}` which take `RawFd`
     // directly; the `unsafe` ffi boundary stays inside nix, keeping this
     // crate inside the workspace-level `unsafe_code = "forbid"` lint.
-    match run_bridge_loop(args.socket_fd) {
+    match run_bridge_loop(args.socket_fd, &args.merged_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("[sandboxed-agent] bridge loop error: {err}");
@@ -165,7 +176,7 @@ fn exit_code_for(err: &ConfinementError) -> ExitCode {
     }
 }
 
-fn run_bridge_loop(socket_fd: i32) -> std::io::Result<()> {
+fn run_bridge_loop(socket_fd: i32, merged_path: &std::path::Path) -> std::io::Result<()> {
     // We use nix::sys::socket::{recv, send} directly on the raw fd. Both take
     // RawFd which keeps the loop inside the crate's `unsafe_code = "forbid"`
     // lint (the unsafe boundary lives inside nix). The fd is non-CLOEXEC
@@ -179,7 +190,7 @@ fn run_bridge_loop(socket_fd: i32) -> std::io::Result<()> {
         while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
             let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
             let line = String::from_utf8_lossy(&line_bytes[..line_bytes.len().saturating_sub(1)]);
-            let reply = handle_frame(line.trim());
+            let reply = handle_frame(line.trim(), merged_path);
             let payload = format!("{reply}\n");
             send_all(socket_fd, payload.as_bytes())?;
         }
@@ -225,7 +236,7 @@ fn send_all(fd: i32, mut data: &[u8]) -> std::io::Result<()> {
 ///
 /// Parsing is hand-rolled (no serde) to keep the sandboxed binary tiny and
 /// avoid pulling a JSON parser onto the confined code path.
-fn handle_frame(line: &str) -> String {
+fn handle_frame(line: &str, merged_path: &std::path::Path) -> String {
     let Some(op) = extract_op_value(line) else {
         return format!(
             "{{\"ok\":false,\"error\":\"malformed frame\",\"raw\":{}}}",
@@ -239,48 +250,169 @@ fn handle_frame(line: &str) -> String {
             std::process::id()
         ),
         "probe_write_outside" => {
-            // Try to open /tmp/<scratch> for write. Under Landlock this MUST
-            // fail. Either way `ok` is true (we handled the request); the
-            // security signal is `denied`.
-            match std::fs::File::create("/tmp/cairn-sandbox-escape-probe") {
+            // Try to open /tmp/<scratch-per-pid> for write. Under Landlock
+            // this MUST fail with EACCES. `ok` = "request handled"; the
+            // security signal is `denied`. The per-pid suffix keeps
+            // concurrent sandbox tests from racing on a shared path.
+            let scratch = format!("/tmp/cairn-sandbox-escape-probe-{}", std::process::id());
+            match std::fs::File::create(&scratch) {
                 Ok(_) => {
-                    "{\"ok\":true,\"op\":\"probe_write_outside\",\"denied\":false}".to_string()
+                    // Cleanup on the allow-path so we don't leak into /tmp.
+                    let _ = std::fs::remove_file(&scratch);
+                    format!(
+                        "{{\"ok\":true,\"op\":\"probe_write_outside\",\"denied\":false,\"path\":{}}}",
+                        escape_for_json(&scratch)
+                    )
                 }
                 Err(err) => format!(
-                    "{{\"ok\":true,\"op\":\"probe_write_outside\",\"denied\":true,\"errno\":\"{}\"}}",
+                    "{{\"ok\":true,\"op\":\"probe_write_outside\",\"denied\":true,\"errno\":\"{}\",\"path\":{}}}",
+                    err.kind(),
+                    escape_for_json(&scratch)
+                ),
+            }
+        }
+        "probe_write_inside" => {
+            // Write inside the workspace (the R+W path Landlock grants).
+            // Under full confinement this MUST succeed — proves the deny on
+            // `probe_write_outside` is path-specific, not a blanket block.
+            let target = merged_path.join(".cairn-sandbox-probe-inside");
+            match std::fs::File::create(&target) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&target);
+                    format!(
+                        "{{\"ok\":true,\"op\":\"probe_write_inside\",\"allowed\":true,\"path\":{}}}",
+                        escape_for_json(&target.display().to_string())
+                    )
+                }
+                Err(err) => format!(
+                    "{{\"ok\":true,\"op\":\"probe_write_inside\",\"allowed\":false,\"errno\":\"{}\",\"path\":{}}}",
+                    err.kind(),
+                    escape_for_json(&target.display().to_string())
+                ),
+            }
+        }
+        "probe_getpid" => {
+            // `getpid` is NOT in the seccomp deny list. The call MUST
+            // succeed under the full fence; if it doesn't, something's
+            // wrong with the allow-by-default policy.
+            //
+            // Use `std::process::id()` (the libstd wrapper around getpid(2))
+            // instead of `nix::unistd::getpid()` so the reply construction
+            // matches the `self_test` arm above and stays consistent.
+            // Either way the syscall we exercise is getpid(2).
+            let pid = std::process::id();
+            format!("{{\"ok\":true,\"op\":\"probe_getpid\",\"pid\":{pid},\"allowed\":true}}")
+        }
+        "probe_mount_ns_inode" => {
+            // Read the mount-ns inode from /proc/self/ns/mnt. Tests
+            // compare this to the parent's inode to confirm `unshare`
+            // actually split the namespace. On a host where `unshare`
+            // was skipped (Ubuntu 24.04+ with AppArmor, or the
+            // CAIRN_SANDBOX_DISABLE_UNSHARE=1 dev affordance) the inode
+            // matches the parent's.
+            match std::fs::read_link("/proc/self/ns/mnt") {
+                Ok(link) => format!(
+                    "{{\"ok\":true,\"op\":\"probe_mount_ns_inode\",\"ns\":{}}}",
+                    escape_for_json(&link.display().to_string())
+                ),
+                Err(err) => format!(
+                    "{{\"ok\":true,\"op\":\"probe_mount_ns_inode\",\"ns\":null,\"errno\":\"{}\"}}",
                     err.kind()
                 ),
             }
         }
+        "probe_inherited_fd" => {
+            // Each frame carries `"fd":N`. Report whether fd N is open,
+            // via fstat (nix::sys::stat::fstat). EBADF on closed.
+            let fd = match extract_int_field(line, "fd") {
+                Some(n) => n,
+                None => {
+                    return "{\"ok\":false,\"error\":\"probe_inherited_fd requires \\\"fd\\\":N\"}"
+                        .to_string();
+                }
+            };
+            match nix::sys::stat::fstat(fd) {
+                Ok(_) => format!(
+                    "{{\"ok\":true,\"op\":\"probe_inherited_fd\",\"fd\":{fd},\"open\":true}}"
+                ),
+                Err(err) => format!(
+                    "{{\"ok\":true,\"op\":\"probe_inherited_fd\",\"fd\":{fd},\"open\":false,\"errno\":\"{err}\"}}"
+                ),
+            }
+        }
+        "probe_ptrace_me" => {
+            // PTRACE_TRACEME marks the CURRENT process as traceable by its
+            // parent. Under the allow-by-default seccomp policy it succeeds
+            // (doesn't require any capability). Under our deny list it
+            // returns EPERM. That makes it a reliable seccomp-specific
+            // canary — unlike `mount`, which also fails EPERM without
+            // CAP_SYS_ADMIN and so cannot distinguish seccomp from
+            // normal-user permission denial.
+            let res = nix::sys::ptrace::traceme();
+            let denied = res.is_err();
+            let errno = match &res {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("{e}"),
+            };
+            format!(
+                "{{\"ok\":true,\"op\":\"probe_ptrace_me\",\"denied\":{denied},\"errno\":{}}}",
+                escape_for_json(&errno)
+            )
+        }
         "probe_mount" => {
             // Try to mount tmpfs — under seccomp this MUST fail EPERM.
-            #[cfg(target_os = "linux")]
-            {
-                use nix::mount::{mount, MsFlags};
-                let r = mount(
-                    Some("none"),
-                    "/tmp",
-                    Some("tmpfs"),
-                    MsFlags::empty(),
-                    None::<&str>,
-                );
-                format!(
-                    "{{\"ok\":true,\"op\":\"probe_mount\",\"denied\":{},\"errno\":\"{:?}\"}}",
-                    r.is_err(),
-                    r.err()
-                )
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                "{\"ok\":true,\"op\":\"probe_mount\",\"denied\":false,\"errno\":\"non-linux\"}"
-                    .to_string()
-            }
+            use nix::mount::{mount, MsFlags};
+            let r = mount(
+                Some("none"),
+                "/tmp",
+                Some("tmpfs"),
+                MsFlags::empty(),
+                None::<&str>,
+            );
+            let denied = r.is_err();
+            let errno = match &r {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("{e}"),
+            };
+            format!(
+                "{{\"ok\":true,\"op\":\"probe_mount\",\"denied\":{denied},\"errno\":{}}}",
+                escape_for_json(&errno)
+            )
         }
         _ => format!(
             "{{\"ok\":false,\"error\":\"unknown op\",\"raw\":{}}}",
             escape_for_json(line)
         ),
     }
+}
+
+/// Extract an integer field from a JSON frame. Hand-rolled to avoid
+/// dragging serde onto the confined code path. Scans for `"name":N` where
+/// N is a signed decimal integer. Returns `None` when the field is
+/// missing or malformed.
+fn extract_int_field(line: &str, name: &str) -> Option<i32> {
+    let key = format!("\"{name}\"");
+    let pos = line.find(&key)?;
+    let after = &line[pos + key.len()..];
+    let after = after.trim_start().strip_prefix(':')?.trim_start();
+    // Walk the optional sign + digits.
+    let mut chars = after.chars();
+    let mut buf = String::new();
+    if let Some(c) = chars.next() {
+        if c == '-' || c.is_ascii_digit() {
+            buf.push(c);
+        } else {
+            return None;
+        }
+    }
+    for c in chars {
+        if c.is_ascii_digit() {
+            buf.push(c);
+        } else {
+            break;
+        }
+    }
+    buf.parse::<i32>().ok()
 }
 
 /// Extract the `op` string value from a JSON frame. Hand-rolled exact-match
@@ -371,8 +503,18 @@ mod tests {
 
     #[test]
     fn handle_self_test_frame() {
-        let reply = handle_frame(r#"{"op":"self_test"}"#);
+        let scratch = std::path::Path::new("/tmp");
+        let reply = handle_frame(r#"{"op":"self_test"}"#, scratch);
         assert!(reply.contains("\"ok\":true"));
         assert!(reply.contains("self_test"));
+    }
+
+    #[test]
+    fn extract_int_field_parses_positive_and_negative() {
+        assert_eq!(extract_int_field(r#"{"fd":5}"#, "fd"), Some(5));
+        assert_eq!(extract_int_field(r#"{"fd": 7 }"#, "fd"), Some(7));
+        assert_eq!(extract_int_field(r#"{"fd":-3}"#, "fd"), Some(-3));
+        assert_eq!(extract_int_field(r#"{"fd":"nope"}"#, "fd"), None);
+        assert_eq!(extract_int_field(r#"{"other":1}"#, "fd"), None);
     }
 }

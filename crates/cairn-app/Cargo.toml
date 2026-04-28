@@ -133,7 +133,18 @@ flowfabric = { version = "0.11", optional = true }
 # path. Only pulled in on Linux — non-Linux builds of cairn-app cannot enter
 # sandboxed-agent mode (the confinement primitives don't exist).
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", features = ["socket"] }
+# nix features required by `bin_sandboxed_agent`:
+#   socket — recv/send on the tool-bridge fd
+#   mount  — probe_mount (compound EPERM check)
+#   fs     — fstat (probe_inherited_fd close_range assertion)
+#   process — getpid (probe_getpid seccomp allow assertion)
+#   ptrace — probe_ptrace_me (the seccomp-specific canary; PTRACE_TRACEME
+#            normally succeeds for any UID so a returned EPERM comes
+#            uniquely from the seccomp deny list)
+# cairn-workspace already asks for all of these through cargo feature
+# unification, but declaring them here too keeps the build honest if
+# someone drops that dependency.
+nix = { version = "0.29", features = ["socket", "mount", "fs", "process", "ptrace"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util"] }

@@ -1,19 +1,36 @@
 //! F65 PR-4 integration tests — sandbox runtime.
 //!
-//! Maps to the 9 tests called out in `/tmp/plan-f65-pr4.md` §5. Tests that
-//! require `unshare(CLONE_NEWNS)` or an overlayfs mount (tests 1-3, 4, 6, 9)
-//! are gated on `kernel_supports_full_sandbox()` — on the Ubuntu 24.04 +
-//! AppArmor host where `kernel.apparmor_restrict_unprivileged_userns=1`
-//! they are `ignore`d with a named reason, matching the per-host behavior
-//! documented in `docs/design/f65-kernel-probe-findings.md`.
+//! # Test quality contract (closes audit findings #395, #396, #406)
 //!
-//! Tests 5, 7, 8 are kernel-independent (they exercise the CLI/confinement
-//! decision logic in ways that don't need CAP_SYS_ADMIN) and run on every
-//! Linux host.
+//! Every security-relevant test in this file either:
+//!
+//! 1. Exercises a real primitive end-to-end via a child process (spawning
+//!    `sandbox_primitive_harness` with the primitive under test), asserting
+//!    on the concrete deny/allow behavior — EACCES on outside-workspace
+//!    write, EPERM on a seccomp-denied syscall, EBADF on a closed fd, etc.
+//! 2. Validates pure-logic invariants (error-variant construction, probe
+//!    markdown parsing, reflink fallback flag) that do not depend on any
+//!    Linux primitive.
+//!
+//! Tests that REQUIRE a kernel primitive the host lacks (mount-ns unshare
+//! on Ubuntu 24.04+ with AppArmor) MUST:
+//!
+//! - Probe for support via `kernel_supports_*()` helpers.
+//! - When unavailable, `eprintln!("SKIP <test> — <reason>")` and early
+//!   return. The skip is ALWAYS visible in CI logs — never silent.
+//!
+//! Deleted in the fraud fix (see commit history): three no-op
+//! `eprintln!`-only stubs that always passed and counted toward the "9
+//! tests landed" claim without verifying anything. The Landlock /
+//! seccomp / path-confinement coverage they nominally provided is now
+//! delivered by `sandboxed_agent_*` tests in `cairn-app` integration
+//! tests PLUS the new `confined_child_*` tests below that exercise the
+//! primitives through `sandbox_primitive_harness` child processes.
 
 #![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 
 use cairn_workspace::providers::{reflink_tree_with_fallback, MOUNT_OPTIONS_REQUIRED_FLAGS};
@@ -22,16 +39,45 @@ use cairn_workspace::sandbox::{
     BufferedF65EventSink, F65SandboxEvent, F65SandboxEventSink, ProbeFindings, SandboxConfinement,
     Status,
 };
+use command_fds::{CommandFdExt, FdMapping};
 
-/// Detect whether the host kernel can support the full F65 sandbox at runtime.
+/// Landlock works on every kernel with `CONFIG_SECURITY_LANDLOCK=y`; no
+/// unshare needed.
+fn kernel_supports_landlock() -> bool {
+    matches!(
+        cairn_workspace::sandbox::confinement::probe::run_live_probe().landlock_v1_fully_enforced,
+        Status::Pass
+    )
+}
+
+/// seccomp-BPF is a kernel-wide capability gated on `CONFIG_SECCOMP_FILTER=y`.
+fn kernel_supports_seccomp() -> bool {
+    matches!(
+        cairn_workspace::sandbox::confinement::probe::run_live_probe().seccomp_bpf,
+        Status::Pass
+    )
+}
+
+/// Heuristic: does the live probe report that `unshare(CLONE_NEWNS)` is
+/// likely to succeed?
 ///
-/// Returns `false` on the Ubuntu 24.04 probe-FAIL path where AppArmor blocks
-/// unprivileged user namespaces and therefore overlayfs-as-non-root fails.
-/// Tests that need CAP_SYS_ADMIN path should skip in that case.
-fn kernel_supports_full_sandbox() -> bool {
-    let findings = cairn_workspace::sandbox::confinement::probe::run_live_probe();
-    matches!(findings.mount_namespace_unshare, Status::Pass)
-        && matches!(findings.overlayfs_unprivileged, Status::Pass)
+/// IMPORTANT: this is a fast pre-check, not proof. `run_live_probe()` only
+/// reads `/proc/self/ns/mnt` presence and the AppArmor
+/// `apparmor_restrict_unprivileged_userns` sysctl — it does NOT call
+/// `unshare(2)` (that would pollute the caller's mount table). Tests that
+/// depend on mount-ns support MUST additionally handle the real unshare
+/// call failing at the subprocess level and skip accordingly. The two
+/// `confined_child_*` tests below use `unshare(1)` exit-status checks to
+/// catch hosts where the heuristic was optimistic.
+fn kernel_probably_supports_mount_ns_unshare() -> bool {
+    matches!(
+        cairn_workspace::sandbox::confinement::probe::run_live_probe().mount_namespace_unshare,
+        Status::Pass
+    )
+}
+
+fn harness_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_sandbox_primitive_harness"))
 }
 
 // ─── Test 4: metacopy=off is present in every rendered mount-options string.
@@ -161,43 +207,61 @@ fn test_kernel_probe_findings_block_boot_when_required() {
 }
 
 // ─── Test 8: close_nonstandard_fds closes inherited fds (pre-Landlock fence).
+//
+// #396 fix: the old test gated its real body on `CAIRN_F65_FD_CLOSE_TEST`
+// which was set nowhere in CI. Now runs unconditionally via the
+// `close-range-scratch` helper mode — the harness binary is a FRESH child
+// process with exactly the fds we hand it, so we never touch cargo's own
+// open-fd set.
 
 #[test]
-fn test_close_nonstandard_fds_keeps_keep_fd() {
-    use cairn_workspace::sandbox::confinement::namespace::close_nonstandard_fds;
+fn test_close_nonstandard_fds_closes_inherited_fd_keeps_kept_fd() {
+    // Open two scratch files in the parent and give the owned fds to
+    // command-fds; it dup2s them into the child's fd table at fd 3 and
+    // fd 4. The child calls `close_nonstandard_fds(Some(3))` and asserts
+    // fd 3 stays open while fd 4 is now EBADF. That contract is the
+    // pre-Landlock fence we ship.
+    use std::os::fd::OwnedFd;
 
-    // Open a scratch fd, then attempt to close all non-0/1/2/keep_fd fds.
-    // Since we're running inside the test harness we can't actually close
-    // all of them (cargo keeps several open); instead, open a specific file,
-    // record its fd, and assert close_nonstandard_fds doesn't return an
-    // error when we ask it to keep it.
-    let tmp = tempfile::NamedTempFile::new().expect("tmpfile");
-    let path = tmp.path().to_path_buf();
-    // Re-open the file to get a fd we can inspect.
-    let file = std::fs::File::open(&path).expect("reopen");
-    let kept_fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+    let keep_file = tempfile::NamedTempFile::new().expect("keep_file");
+    let drop_file = tempfile::NamedTempFile::new().expect("drop_file");
 
-    // Just run the function with keep_fd = kept_fd. The call must not fail,
-    // and it must not close the kept fd (checked via the subsequent read).
-    // Note: this will close any other fds cargo has open, so the test
-    // needs to not rely on them.  In practice cargo's harness tolerates it.
-    // We guard against running it under --nocapture where it's more
-    // invasive by gating on an env var.
-    if std::env::var_os("CAIRN_F65_FD_CLOSE_TEST").is_none() {
-        eprintln!(
-            "skipping close_nonstandard_fds live test (set CAIRN_F65_FD_CLOSE_TEST=1 to run)"
-        );
-        return;
-    }
-    // Clone the file before calling — we want a second fd pointing at the
-    // same inode to use after the close-loop runs.
-    let file2 = file.try_clone().expect("dup");
-    let kept_fd2 = std::os::unix::io::AsRawFd::as_raw_fd(&file2);
-    close_nonstandard_fds(Some(kept_fd2)).expect("close_range");
-    // The kept fd must still be valid.
-    let metadata = file2.metadata().expect("metadata on kept fd");
-    assert!(metadata.is_file());
-    let _ = kept_fd; // silence
+    let keep_handle: OwnedFd = std::fs::File::open(keep_file.path())
+        .expect("open keep")
+        .into();
+    let drop_handle: OwnedFd = std::fs::File::open(drop_file.path())
+        .expect("open drop")
+        .into();
+
+    const KEEP_FD: i32 = 3;
+    const DROP_FD: i32 = 4;
+
+    let mut cmd = Command::new(harness_bin());
+    cmd.arg("close-range-scratch")
+        .arg(KEEP_FD.to_string())
+        .arg(DROP_FD.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.fd_mappings(vec![
+        FdMapping {
+            parent_fd: keep_handle,
+            child_fd: KEEP_FD,
+        },
+        FdMapping {
+            parent_fd: drop_handle,
+            child_fd: DROP_FD,
+        },
+    ])
+    .expect("fd_mappings");
+
+    let out = cmd.output().expect("run harness");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "close-range-scratch exited {:?}, stderr = `{stderr}`",
+        out.status
+    );
 }
 
 // ─── Test 9: snapshot atomicity — MNT_DETACH returns synchronously.
@@ -250,51 +314,271 @@ fn test_f65_event_sink_captures_degraded_event() {
     ));
 }
 
-// ─── Tests gated on kernel/OS capability.
+// ─── Confinement-assertion tests (closes #395 and fills the #406 gap).
+//
+// Each test spawns `sandbox_primitive_harness` with a one-shot mode
+// (landlock / seccomp / close-range / mount-ns), exercises the primitive
+// in the child, and asserts on the child's exit code + stderr. The old
+// three eprintln-only stubs (overlayfs / seccomp / path-confinement) are
+// replaced by these. Primitives that REQUIRE unshare (overlayfs, full
+// mount-ns) skip with an explicit message when the host kernel blocks
+// unprivileged userns.
 
 #[test]
-fn test_overlayfs_sandbox_blocks_write_outside_workspace() {
-    if !kernel_supports_full_sandbox() {
+fn confined_child_landlock_denies_outside_allows_inside() {
+    if !kernel_supports_landlock() {
         eprintln!(
-            "SKIP test_overlayfs_sandbox_blocks_write_outside_workspace — kernel cannot unshare"
+            "SKIP confined_child_landlock_denies_outside_allows_inside — \
+             Landlock not available on this kernel"
         );
         return;
     }
-    // Full spawn + confine + probe_write_outside flow. When the host kernel
-    // supports the fence this runs end-to-end; otherwise it skips with a
-    // visible message so the regression is never silent.
-    // Implementation deferred to PR-5 where the agent loop reaches maturity;
-    // for PR-4 we assert the skeleton spawns via cairn-app integration tests.
-    eprintln!(
-        "test_overlayfs_sandbox_blocks_write_outside_workspace: kernel supports unshare, \
-         but full spawn+probe is exercised by cairn-app integration tests (see \
-         tests/test_f65_pr4_sandbox_child.rs)"
+    // Build a scratch sandbox root + pick an outside target under /tmp
+    // that the probe MUST NOT be able to write once Landlock confines it.
+    let sandbox = tempfile::tempdir().expect("sandbox tmpdir");
+    let outside_dir = tempfile::tempdir().expect("outside tmpdir");
+    let outside_target = outside_dir.path().join("escape-target-must-not-exist.txt");
+
+    let out = Command::new(harness_bin())
+        .arg("landlock-confine-and-verify")
+        .arg(sandbox.path())
+        .arg(&outside_target)
+        .output()
+        .expect("run harness");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "landlock-confine-and-verify exited {:?}, stderr = `{stderr}`",
+        out.status
+    );
+    // The primitive's own assertion: the escape target MUST NOT exist on
+    // the host after the run. If Landlock didn't enforce, the child's
+    // `fs::write(&outside)` would have succeeded and the harness would have
+    // exited non-zero, but belt-and-suspenders: also check the file isn't
+    // there. (The harness removes it on failure to avoid host pollution.)
+    assert!(
+        !outside_target.exists(),
+        "escape target {} must not exist — Landlock confinement bypassed",
+        outside_target.display()
+    );
+    // And the inside-sandbox write must have produced the scratch file.
+    assert!(
+        sandbox.path().join("inside.txt").is_file(),
+        "inside-sandbox write should have succeeded under Landlock R+W grant"
     );
 }
 
 #[test]
-fn test_seccomp_denies_mount_and_ptrace() {
-    if !kernel_supports_full_sandbox() {
-        eprintln!("SKIP test_seccomp_denies_mount_and_ptrace — kernel cannot unshare");
+fn confined_child_seccomp_denies_ptrace_traceme() {
+    if !kernel_supports_seccomp() {
+        eprintln!("SKIP confined_child_seccomp_denies_ptrace_traceme — seccomp-BPF not available");
         return;
     }
-    // Same story as the test above: full seccomp-in-child flow is exercised
-    // via cairn-app integration tests where the probe flow actually fires.
-    eprintln!(
-        "test_seccomp_denies_mount_and_ptrace: kernel supports seccomp; full flow exercised via \
-         cairn-app integration tests"
+    // Exit code 0 iff PTRACE_TRACEME returned EPERM (the seccomp-specific
+    // signal). PTRACE_TRACEME is chosen deliberately over mount(): mount
+    // returns EPERM for unprivileged users regardless of seccomp, so a
+    // test built on it would pass even with the deny list disabled.
+    // PTRACE_TRACEME normally succeeds for any UID, so an EPERM here is
+    // uniquely a seccomp signal.
+    let out = Command::new(harness_bin())
+        .arg("seccomp-ptrace-me")
+        .output()
+        .expect("run harness");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "seccomp-ptrace-me exited {:?}, stderr = `{stderr}`",
+        out.status
     );
 }
 
 #[test]
-fn test_workspace_path_confinement_rejects_escape() {
-    if !kernel_supports_full_sandbox() {
-        eprintln!("SKIP test_workspace_path_confinement_rejects_escape — kernel cannot unshare");
+fn confined_child_mount_ns_inode_differs_from_parent_under_unshare() {
+    if !kernel_probably_supports_mount_ns_unshare() {
+        eprintln!(
+            "SKIP confined_child_mount_ns_inode_differs_from_parent_under_unshare — \
+             kernel heuristic reports unshare(CLONE_NEWNS) likely to fail \
+             (e.g. Ubuntu 24.04+ with kernel.apparmor_restrict_unprivileged_userns=1)"
+        );
         return;
     }
-    eprintln!(
-        "test_workspace_path_confinement_rejects_escape: full flow exercised via cairn-app \
-         integration tests"
+    // Under `unshare -mUr` the child's /proc/self/ns/mnt inode MUST differ
+    // from the parent's. This proves the unshare actually split the
+    // namespace — a no-op unshare or a silent fallback would produce a
+    // matching inode.
+    let parent_inode = std::fs::read_link(format!("/proc/{}/ns/mnt", std::process::id()))
+        .expect("read_link parent ns");
+    let parent_inode_s = parent_inode.display().to_string();
+
+    // Use `unshare -mUr` from util-linux:
+    //   -m : new mount namespace
+    //   -U : new user namespace (required on non-root CI because a plain
+    //        `unshare -m` needs CAP_SYS_ADMIN; a new user namespace gives
+    //        the caller CAP_SYS_ADMIN *inside* that namespace)
+    //   -r : map the invoking UID to root inside the new userns (otherwise
+    //        many distros refuse the mount ns via `userns.mount = 0` or
+    //        similar)
+    // We cannot call `nix::sched::unshare` directly in a fork — nix's
+    // `fork` is `unsafe` (forbidden workspace-wide). `unshare(1)` handles
+    // the fork for us. util-linux is installed on every Linux CI runner.
+    let out = Command::new("unshare")
+        .arg("-mUr")
+        .arg(harness_bin())
+        .arg("mount-ns-inode")
+        .output();
+    let Ok(out) = out else {
+        eprintln!(
+            "SKIP confined_child_mount_ns_inode_differs_from_parent_under_unshare — \
+             unshare(1) not installed or could not exec ({:?})",
+            out
+        );
+        return;
+    };
+    if !out.status.success() {
+        // `unshare` itself can bail (EPERM) on hosts where the heuristic
+        // probe was optimistic but the actual syscall still fails (other
+        // userns restrictions, unprivileged-userns-clone=0, container
+        // seccomp deny list, etc.). Surface as a skip rather than a test
+        // failure — the skip message carries the errno + stderr so
+        // operators reading CI logs see the concrete root cause.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "SKIP confined_child_mount_ns_inode_differs_from_parent_under_unshare — \
+             unshare(1) -mUr exited {:?}: {stderr}",
+            out.status
+        );
+        return;
+    }
+    let child_inode = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        !child_inode.is_empty(),
+        "harness must print the child ns/mnt inode"
+    );
+    assert_ne!(
+        child_inode, parent_inode_s,
+        "child ns/mnt inode must differ from parent's after unshare(CLONE_NEWNS) — \
+         parent={parent_inode_s}, child={child_inode}"
+    );
+}
+
+#[test]
+fn confined_child_overlayfs_unprivileged_mount() {
+    if !kernel_probably_supports_mount_ns_unshare() {
+        eprintln!(
+            "SKIP confined_child_overlayfs_unprivileged_mount — kernel heuristic \
+             reports unshare(CLONE_NEWNS) likely to fail (e.g. Ubuntu 24.04+ \
+             with AppArmor); overlayfs-as-non-root requires that primitive"
+        );
+        return;
+    }
+    // When unshare is supported, run `unshare -mUr` inside a shell that
+    // mounts overlayfs AND dumps its own `/proc/self/mountinfo`. Both
+    // steps MUST happen in the same unshared namespace — the mount is
+    // process-scoped, so a separate unshare cannot observe it.
+    //
+    // We pass the mount options straight through shell quoting so the
+    // shell's `$$` stays literal and the mount command runs with the
+    // exact options the production driver would use.
+    let lower = tempfile::tempdir().expect("lower tmpdir");
+    let upper = tempfile::tempdir().expect("upper tmpdir");
+    let work = tempfile::tempdir().expect("work tmpdir");
+    let merged = tempfile::tempdir().expect("merged tmpdir");
+    // Seed the lower dir with a file so we can observe copy-up behavior.
+    std::fs::write(lower.path().join("baseline.txt"), b"lower").unwrap();
+
+    let script = format!(
+        r#"set -e; mount -t overlay overlay -o "lowerdir={lower},upperdir={upper},workdir={work},xino=on,metacopy=off,redirect_dir=on" {merged}; cat /proc/self/mountinfo"#,
+        lower = lower.path().display(),
+        upper = upper.path().display(),
+        work = work.path().display(),
+        merged = merged.path().display(),
+    );
+    let out = match Command::new("unshare")
+        .args(["-mUr", "bash", "-c"])
+        .arg(&script)
+        .output()
+    {
+        Ok(o) => o,
+        Err(err) => {
+            eprintln!(
+                "SKIP confined_child_overlayfs_unprivileged_mount — could not exec \
+                 unshare(1)/bash(1): {err}"
+            );
+            return;
+        }
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Distinguish "host doesn't support this primitive" (legit SKIP)
+        // from "the test script regressed" (real failure). The known
+        // kernel/LSM denial modes produce specific errno strings:
+        //   EPERM           — unprivileged userns blocked (apparmor)
+        //   EINVAL          — overlayfs options rejected
+        //   ENODEV          — overlay fs module not loaded
+        //   "not permitted" — util-linux wording for userns deny
+        // Anything else — `bash: mount: not found`, syntax errors, etc. —
+        // is a regression in OUR test script and should fail loudly.
+        let host_lacks_primitive = stderr.contains("Operation not permitted")
+            || stderr.contains("not permitted")
+            || stderr.contains("Invalid argument")
+            || stderr.contains("No such device")
+            || stderr.contains("EPERM")
+            || stderr.contains("EINVAL")
+            || stderr.contains("ENODEV");
+        if host_lacks_primitive {
+            eprintln!(
+                "SKIP confined_child_overlayfs_unprivileged_mount — host lacks \
+                 the primitive (unshare -mUr or overlayfs-in-userns): exit \
+                 {status:?}, stderr: {stderr}",
+                status = out.status,
+            );
+            return;
+        }
+        panic!(
+            "confined_child_overlayfs_unprivileged_mount — unshare -mUr bash -c \
+             exited {status:?} with an unexpected error shape (NOT a known \
+             primitive-unavailable pattern). This is likely a regression in \
+             the test script, not a host-kernel skip. stderr: {stderr}",
+            status = out.status,
+        );
+    }
+    let mountinfo = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Assert on the line that corresponds to OUR overlay mount. CI runners
+    // and containerized test hosts frequently have unrelated overlay
+    // mounts in /proc/self/mountinfo (docker layers, snap mounts) — a
+    // naive `contains("overlay")` would pass even if our mount never
+    // happened. Anchor the assertion on the merged-path temp dir we
+    // created a moment ago.
+    let merged_str = merged.path().display().to_string();
+    let our_line = mountinfo.lines().find(|line| line.contains(&merged_str));
+    let our_line = match our_line {
+        Some(l) => l,
+        None => panic!(
+            "mountinfo did not contain a mount line for {merged_str}; \
+             got `{mountinfo}`, stderr `{stderr}`"
+        ),
+    };
+    // The security-relevant assertion: metacopy=off must be in the
+    // options OF OUR OWN MOUNT LINE. That's what prevents a lower-layer
+    // file-with-xattrs attack per `orchestrator-session-architecture.md`
+    // §4.3.2.
+    assert!(
+        our_line.contains("metacopy=off"),
+        "our overlay mount line must have metacopy=off; got line = `{our_line}`"
+    );
+    // And xino=on / redirect_dir=on are the other two production flags
+    // the driver sets. If any of them is missing the mount options drift
+    // from what `crates/cairn-workspace/src/providers/overlay.rs`
+    // renders.
+    assert!(
+        our_line.contains("xino=on"),
+        "overlay mount line missing xino=on; got `{our_line}`"
+    );
+    assert!(
+        our_line.contains("redirect_dir=on"),
+        "overlay mount line missing redirect_dir=on; got `{our_line}`"
     );
 }
 

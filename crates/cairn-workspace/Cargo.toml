@@ -14,6 +14,14 @@ name = "f65_kernel_probe"
 path = "src/bin/f65_kernel_probe.rs"
 required-features = ["kernel-probe"]
 
+# Test-only helper for the F65 PR-4 sandbox integration suite. Always
+# built so integration tests get `CARGO_BIN_EXE_sandbox_primitive_harness`
+# without needing a feature flag. Small and dep-free by design — see the
+# module comment at `src/bin/sandbox_primitive_harness.rs`.
+[[bin]]
+name = "sandbox_primitive_harness"
+path = "src/bin/sandbox_primitive_harness.rs"
+
 [dependencies]
 cairn-domain = { path = "../cairn-domain" }
 async-trait = "0.1"
@@ -59,6 +67,11 @@ kernel-probe = ["dep:anyhow", "dep:chrono"]
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 tempfile = "3"
+# Note: integration tests use `command-fds` to dup2 pre-opened fds into the
+# child of `sandbox_primitive_harness`. That crate is already declared
+# above under `[target.'cfg(target_os = "linux")'.dependencies]` (used by
+# the production spawn path in `src/sandbox/spawn.rs`); tests inherit that
+# dependency automatically, so we do NOT redeclare it here.
 
 [lints]
 workspace = true

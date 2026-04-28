@@ -436,6 +436,9 @@ fn live_probe_landlock() -> Status {
 #[cfg(target_os = "linux")]
 fn live_probe_seccomp() -> Status {
     // Construct a filter but don't apply it — application is process-wide.
+    // seccompiler rejects filters where `match_action == mismatch_action`
+    // (the filter would be a no-op), so we pass distinct actions here just
+    // to exercise the construction path. We never load this filter.
     use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
     let arch = match std::env::consts::ARCH {
         "aarch64" => TargetArch::aarch64,
@@ -444,7 +447,12 @@ fn live_probe_seccomp() -> Status {
     };
     let rules: std::collections::BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         std::collections::BTreeMap::new();
-    match SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Allow, arch) {
+    match SeccompFilter::new(
+        rules,
+        SeccompAction::Errno(libc::EPERM as u32),
+        SeccompAction::Allow,
+        arch,
+    ) {
         Ok(_) => Status::Pass,
         Err(err) => Status::Fail(format!("seccomp filter construction: {err}")),
     }
