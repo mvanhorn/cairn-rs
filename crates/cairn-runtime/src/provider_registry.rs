@@ -180,6 +180,39 @@ impl<S> ProviderRegistry<S> {
             fallbacks,
         }
     }
+
+    /// Return the `Backend` of the startup fallback that
+    /// `resolve_generation_for_model(purpose=Brain)` would pick when
+    /// the tenant has no active provider connections, OR `None` if no
+    /// startup fallback is configured / the stored metadata doesn't
+    /// parse to a known backend.
+    ///
+    /// Mirrors the priority order used by `select_fallback_generation`
+    /// for `ProviderResolutionPurpose::Brain`:
+    /// brain → worker → openrouter → bedrock → ollama. The orchestrate
+    /// handler's #351 defensive check consults this when no
+    /// tenant-registered connection matches `model_id` so an env-only
+    /// (`CAIRN_BRAIN_URL` / `CAIRN_WORKER_URL`) deployment that picks
+    /// the `openai-compatible` fallback still gets the refusal on a
+    /// tight `token_cap`. Copilot review on #354.
+    pub fn brain_fallback_backend(&self) -> Option<Backend> {
+        let fallbacks = read_lock(&self.fallbacks);
+        let candidates = [
+            fallbacks.brain.as_ref(),
+            fallbacks.worker.as_ref(),
+            fallbacks.openrouter.as_ref(),
+            fallbacks.bedrock.as_ref(),
+            fallbacks.ollama.as_ref(),
+        ];
+        for entry in candidates.into_iter().flatten() {
+            if let Some(backend) =
+                backend_for_family_or_adapter(entry.backend.as_str(), entry.backend.as_str())
+            {
+                return Some(backend);
+            }
+        }
+        None
+    }
 }
 
 impl<S> ProviderRegistry<S>
@@ -257,6 +290,47 @@ where
                 )
             })
             .collect())
+    }
+
+    /// Lookup the `Backend` enum for a specific tenant + connection_id
+    /// pair, or `None` if the connection isn't active (or the stored
+    /// `adapter_type` / `provider_family` don't parse to a known
+    /// backend).
+    ///
+    /// Used by the orchestrate handler's defensive usage-reporting
+    /// check after `resolve_generation_for_connection` has already
+    /// selected the routing target — we just need the backend metadata
+    /// to decide whether to refuse the run, without re-building the
+    /// provider or re-walking the full routing order.
+    ///
+    /// Uses `ProviderConnectionReadModel::get(id)` for an O(1) projection
+    /// lookup rather than scanning `list_by_tenant` — the orchestrate
+    /// handler calls this on every request and a tenant-wide scan would
+    /// allocate the full active-connection vec just to inspect one row.
+    /// Copilot review on #354.
+    pub async fn backend_for_connection_id(
+        &self,
+        tenant_id: &TenantId,
+        connection_id: &ProviderConnectionId,
+    ) -> Result<Option<Backend>, RuntimeError> {
+        let Some(conn) =
+            ProviderConnectionReadModel::get(self.store.as_ref(), connection_id).await?
+        else {
+            return Ok(None);
+        };
+        // Enforce tenant isolation + active-status filter at the helper
+        // so callers cannot accidentally leak a cross-tenant backend
+        // classification (cairn-domain scope rule) or act on a disabled
+        // connection's stored metadata.
+        if conn.tenant_id != *tenant_id
+            || conn.status != cairn_domain::providers::ProviderConnectionStatus::Active
+        {
+            return Ok(None);
+        }
+        Ok(backend_for_family_or_adapter(
+            &conn.adapter_type,
+            &conn.provider_family,
+        ))
     }
 
     pub async fn resolve_embedding_for_model(
@@ -931,6 +1005,31 @@ fn backend_for_connection(connection: &ProviderConnectionRecord) -> Result<Backe
             connection.provider_connection_id
         ),
     })
+}
+
+/// Public helper mirroring `backend_for_connection` for callers that
+/// already have the `provider_family` / `adapter_type` strings in hand
+/// (e.g. the orchestrate handler, which inspects active connection
+/// summaries before invoking the registry to build providers).
+///
+/// Used by the orchestrate handler's "provider reports usage" defensive
+/// check: when the selected connection's backend returns
+/// `Backend::reports_usage() == false` AND the operator's configured
+/// `token_cap` is below the sentinel, the handler refuses to start the
+/// run with a 422 so the operator gets an actionable error instead of
+/// the token-cap breaker silently under-counting.
+///
+/// Returns `None` when neither string matches a known backend; callers
+/// can treat that as "unknown family" and fail closed (conservative) or
+/// open (pass-through) depending on the context.
+pub fn backend_for_family_or_adapter(adapter_type: &str, provider_family: &str) -> Option<Backend> {
+    for raw in [adapter_type, provider_family] {
+        let normalized = normalize_backend(raw);
+        if let Ok(backend) = normalized.parse::<Backend>() {
+            return Some(backend);
+        }
+    }
+    None
 }
 
 fn normalize_backend(raw: &str) -> String {

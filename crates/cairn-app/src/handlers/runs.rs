@@ -2887,6 +2887,12 @@ pub(crate) async fn orchestrate_run_handler(
     //
     // Dogfood run 2 motivated this: MiniMax empty → Qwen 503 → Llama 429.
     // A single-model hard-fail is a budget DoS on the operator's day.
+    // Track which tenant-registered connection (if any) serves the
+    // preferred `model_id`. Surfaced back out of the routing block so
+    // the post-loop `token_cap` defensive check (issue #351) can
+    // look up the selected backend's `reports_usage` flag without
+    // re-walking the active-connection list.
+    let mut preferred_connection_id: Option<String> = None;
     let routed = {
         let scoped_cooldowns = state.provider_fallback_cooldown.clone();
         let tenant_key = run.project.tenant_id.as_str().to_owned();
@@ -2996,6 +3002,14 @@ pub(crate) async fn orchestrate_run_handler(
             // model X does not suppress the same model X for another
             // tenant or for a sibling connection that has its own quota.
             let cooldown = scoped_cooldowns.get_or_create(&tenant_key, conn_id);
+            // Track the first successfully-constructed binding that
+            // serves `model_id` so the #351 defensive check classifies
+            // the backend that will actually run DECIDE, not merely a
+            // connection that advertised the model but failed to build
+            // (Copilot review on #354).
+            if Some(idx) == preferred_idx && preferred_connection_id.is_none() {
+                preferred_connection_id = Some(conn_id.clone());
+            }
             bindings.push(cairn_runtime::RoutedBinding {
                 binding_id: conn_id.clone(),
                 provider: adapter,
@@ -3062,6 +3076,87 @@ pub(crate) async fn orchestrate_run_handler(
                     .into_response();
             }
         };
+
+    // Issue #351 — defensive check: a provider that does not populate
+    // `Usage` on every chat response silently disables the token-cap
+    // circuit breaker (see `BreakerState::after_decide` — absent tokens
+    // add 0, so the cap can never trip). Operators who set a tight cap
+    // on such a provider are relying on a budget that does not exist;
+    // only the Round or WallClock breakers will ever terminate the run.
+    //
+    // We refuse to start the run when BOTH conditions hold:
+    //   * The selected backend's `reports_usage()` is `false`, AND
+    //   * The resolved `token_cap` is below `PROVIDER_USAGE_SENTINEL`.
+    //
+    // Sentinel rationale: a minimum-useful agent turn is ~5–10k tokens
+    // (system prompt + tool schemas + step history). 50_000 gives an
+    // operator roughly 5× a minimum turn of headroom — enough that a
+    // non-reporting provider misconfigured at (say) token_cap=1000
+    // trips this check loudly instead of burning hours of budget on
+    // runs that never terminate via the token path.
+    //
+    // Flagged by Copilot on PR #348 (F65 PR-3). Coverage: only the
+    // `Backend::OpenAiCompatible` slot (operator-supplied generic
+    // endpoint) returns `false` today — every other typed backend
+    // (OpenAI, Anthropic, Bedrock*, Ollama, OpenRouter, Groq, DeepSeek,
+    // Google, xAI, Azure, MiniMax, Zai*) populates `usage`.
+    //
+    // Two resolution paths:
+    //   1. Tenant-registered connection matches `model_id`
+    //      (`preferred_connection_id` is `Some`): classify via
+    //      `backend_for_connection_id`.
+    //   2. Env-only startup fallback (`preferred_connection_id` is
+    //      `None`, i.e. no tenant connections served the model): the
+    //      orchestrate flow falls through to `state.brain_provider`
+    //      which itself may be built from `CAIRN_BRAIN_URL` /
+    //      `CAIRN_WORKER_URL` — the exact case that produces an
+    //      `openai-compatible` (non-reporting) backend. Classify via
+    //      `brain_fallback_backend`, which mirrors the priority order
+    //      `select_fallback_generation(Brain)` uses. Copilot on #354
+    //      flagged that skipping this path left the token-cap bypass
+    //      in place for env-only OpenAI-compat deployments.
+    const PROVIDER_USAGE_SENTINEL: u64 = 50_000;
+    let selected_backend: Option<cairn_providers::Backend> =
+        if let Some(connection_id) = preferred_connection_id.as_deref() {
+            let conn_id_typed = cairn_domain::ProviderConnectionId::new(connection_id);
+            state
+                .runtime
+                .provider_registry
+                .backend_for_connection_id(&run.project.tenant_id, &conn_id_typed)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            state.runtime.provider_registry.brain_fallback_backend()
+        };
+
+    if let Some(backend) = selected_backend {
+        if !backend.reports_usage() && breakers.token_cap < PROVIDER_USAGE_SENTINEL {
+            return AppApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "provider_does_not_report_usage",
+                format!(
+                    "Provider {backend} does not report token usage; token_cap={} is below the \
+                     {PROVIDER_USAGE_SENTINEL} sentinel. The token-cap circuit breaker cannot \
+                     enforce a budget this tight on a provider that omits `usage` from chat \
+                     responses — raise token_cap (explicit opt-in to unbounded token spend \
+                     on this provider) via PUT /v1/settings/defaults/system/system/orchestrator_token_cap \
+                     or via `breaker_overrides.token_cap` in the orchestrate request body, \
+                     OR switch to a provider connection whose backend populates usage \
+                     (OpenAI, Anthropic, Bedrock, Ollama, OpenRouter, Groq, DeepSeek, \
+                     Google, xAI, Azure, MiniMax, Z.ai). See issue #351.",
+                    breakers.token_cap,
+                ),
+            )
+            .into_response();
+        }
+    }
+    // `None` means the registry couldn't classify the active backend
+    // (registry lookup error, or stored metadata doesn't parse to a
+    // known variant, or startup fallback entry is missing the
+    // `with_metadata` label). Proceed without refusal — the status
+    // quo pre-#351 is preserved (log-once WARN inside the loop).
+
     cfg.breakers = breakers;
 
     // Build RuntimeExecutePhase from the shared runtime store.
