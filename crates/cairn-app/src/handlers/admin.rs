@@ -30,8 +30,8 @@ use cairn_runtime::{
 use cairn_store::projections::{AuditLogReadModel, QuotaReadModel, RetentionPolicyReadModel};
 
 use crate::errors::{
-    require_feature, runtime_error_response, store_error_response, validation_error_response,
-    AppApiError,
+    api_error_with_details, require_feature, runtime_error_response, store_error_response,
+    validation_error_response, AppApiError,
 };
 use crate::extractors::{AdminRoleGuard, TenantScope};
 use crate::state::AppState;
@@ -751,14 +751,24 @@ pub(crate) async fn create_snapshot_handler(
     let snapshot = match state.runtime.store.create_snapshot(&tenant_id) {
         Ok(s) => s,
         Err(e) => {
-            return (
+            // Closes #418 + SEC-007: the snapshot backend surfaces raw
+            // driver strings (connection paths, SQL fragments, tenant
+            // row data in some arms). Log the full chain server-side
+            // and return a stable opaque message — operators correlate
+            // via `x-request-id`. The envelope is the canonical
+            // `AppApiError` shape so UI parsers keyed on `code`/
+            // `message` no longer see `undefined`.
+            tracing::error!(
+                tenant_id = %tenant_id.as_str(),
+                error = %e,
+                "snapshot_failed: create_snapshot backend error"
+            );
+            return AppApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "snapshot_failed",
-                    "message": e.to_string(),
-                })),
+                "snapshot_failed",
+                "failed to create tenant snapshot",
             )
-                .into_response();
+            .into_response();
         }
     };
     (
@@ -1616,13 +1626,23 @@ pub(crate) async fn rotate_waitpoint_hmac_handler(
         .rotate_waitpoint_hmac(&body.new_kid, &body.new_secret_hex, grace_ms)
         .await;
 
+    // SEC-007 defense-in-depth (Gemini review on PR #540): the fabric
+    // `RotationFailure::detail` contract today is an opaque
+    // classification hint (`"lua_rejected"`, `"transport_error"`,
+    // `"unparseable_envelope"`) and `RotationFailure::code` is a typed
+    // FF sentinel. But if the engine-level implementation later drifts
+    // and stuffs a raw driver string into `detail`, that would leak
+    // through this handler. Allowlist `detail` values to the known
+    // classifiers here so the HTTP body cannot surface anything
+    // unexpected even if the engine regresses. Raw failure strings
+    // are already logged at `debug` level in the engine.
     let failed: Vec<RotateWaitpointHmacFailure> = outcome
         .failed
         .iter()
         .map(|f| RotateWaitpointHmacFailure {
             partition_index: f.partition_index,
             code: f.code.clone(),
-            detail: f.detail.clone(),
+            detail: sanitize_rotation_detail(&f.detail),
         })
         .collect();
 
@@ -1633,32 +1653,41 @@ pub(crate) async fn rotate_waitpoint_hmac_handler(
         new_kid: outcome.new_kid.clone(),
     };
 
+    // Closes #418: canonical envelope (`status_code`, `code`,
+    // `message`, `request_id`) on both failure paths. The per-
+    // partition breakdown (rotated/noop/failed counts + per-failure
+    // codes) lives under `details` so operators keep the diagnostic
+    // richness without the envelope drifting from the shape every SDK
+    // parser keys on.
+    //
     // All partitions failed with the same Lua-level input-validation
     // code → 400. This is the "operator typo" path (empty kid, bad
     // hex, etc.) and the rotation never did anything useful anywhere.
     if outcome.rotated == 0 && outcome.noop == 0 {
+        // Fallback to an empty object (not `null`) when serialization
+        // fails — keeps the OpenAPI contract clean for clients that
+        // treat `details: null` ambiguously. Serialization of a
+        // `RotateWaitpointHmacResponse` cannot actually fail given
+        // the derived `Serialize` impl, but the fallback is cheap
+        // defence against future refactors.
+        let details = serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(code) = unanimous_input_error_code(&outcome.failed) {
-            return (
+            return api_error_with_details(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "rotation rejected by every partition",
-                    "code": code,
-                    "outcome": resp,
-                })),
-            )
-                .into_response();
+                code,
+                "rotation rejected by every partition",
+                details,
+            );
         }
         // Every partition failed but not with a unanimous input code →
         // transport or mixed failure. 500 so the operator sees this
         // as a service fault rather than a validation issue.
-        return (
+        return api_error_with_details(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "rotation failed on every partition",
-                "outcome": resp,
-            })),
-        )
-            .into_response();
+            "rotation_failed",
+            "rotation failed on every partition",
+            details,
+        );
     }
 
     // Any success (rotated or noop) → 200 with the full outcome
@@ -1667,6 +1696,31 @@ pub(crate) async fn rotate_waitpoint_hmac_handler(
     // operators retry with the same (new_kid, new_secret_hex) to
     // converge.
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// SEC-007 defense-in-depth: map a fabric `RotationFailure::detail`
+/// string to the allowlisted classification sentinel the HTTP body
+/// may carry. Unknown values collapse to `"unspecified"` so any
+/// future engine regression that stuffs a raw driver string into
+/// `detail` cannot leak through the response body.
+///
+/// The allowlist mirrors the `ROTATION_DETAIL_*` constants the
+/// `valkey_control_plane_impl` engine emits today. Any new classifier
+/// added upstream must be added here explicitly — a deliberate
+/// breakage surface so review catches the envelope-drift.
+fn sanitize_rotation_detail(raw: &str) -> String {
+    const ALLOWED: &[&str] = &["lua_rejected", "transport_error", "unparseable_envelope"];
+    if ALLOWED.contains(&raw) {
+        raw.to_owned()
+    } else {
+        // Log the drift so operators see the upstream contract has
+        // changed; return a safe sentinel to the caller.
+        tracing::warn!(
+            raw_detail = %raw,
+            "unexpected rotation failure detail — falling back to `unspecified` for SEC-007"
+        );
+        "unspecified".to_owned()
+    }
 }
 
 /// If every partition failed with the same FF input-validation code,
@@ -1696,7 +1750,41 @@ fn unanimous_input_error_code(
 
 #[cfg(test)]
 mod tests {
-    use super::StoreCredentialRequest;
+    use super::{sanitize_rotation_detail, StoreCredentialRequest};
+
+    /// SEC-007 defense-in-depth (Gemini review on PR #540):
+    /// `sanitize_rotation_detail` must pass through only the allowlist
+    /// of classification sentinels and collapse anything else to the
+    /// opaque `unspecified` sentinel — including what would be a raw
+    /// driver string if the upstream engine ever regressed.
+    #[test]
+    fn rotation_detail_sanitizer_passes_known_classifiers_and_redacts_unknown() {
+        // Known allowlist — must pass through verbatim.
+        for ok in ["lua_rejected", "transport_error", "unparseable_envelope"] {
+            assert_eq!(
+                sanitize_rotation_detail(ok),
+                ok,
+                "allowlisted classifier must pass through: {ok}"
+            );
+        }
+
+        // Simulated engine-regression values — must collapse to
+        // `unspecified` so the caller's body never surfaces raw driver
+        // content.
+        for leaky in [
+            "connection refused: host=internal-db.prod.example.com port=5432",
+            "NOSCRIPT No matching script. SHA1=abcdef...",
+            "FCALL args=['cairn.lease_fence=0xDEADBEEF']",
+            "", // empty detail still collapses — contract says allowlist-only.
+            "timeout waiting for cluster-reply from cairn-valkey-prod:7001",
+        ] {
+            assert_eq!(
+                sanitize_rotation_detail(leaky),
+                "unspecified",
+                "non-allowlist input must collapse to `unspecified`: {leaky}"
+            );
+        }
+    }
 
     /// Closes #492: `{body:?}` must not leak the plaintext. The handler
     /// does not print the body today, but `StoreCredentialRequest` is

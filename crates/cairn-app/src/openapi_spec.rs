@@ -33,11 +33,15 @@ pub const OPENAPI_JSON: &str = r##"{
     "schemas": {
       "Error": {
         "type": "object",
+        "description": "Canonical error envelope. Every HTTP error response uses this shape: `status_code` mirrors the HTTP status, `code` is a stable machine-readable sentinel, `message` is a human-readable operator message, and `request_id` is the correlation id (also echoed in the `x-request-id` response header). Some errors carry additional structured context under `details` — this field is optional and its schema is endpoint-specific (e.g. rotate-waitpoint-hmac returns partition breakdown; all_providers_exhausted returns per-attempt diagnostics).",
         "properties": {
-          "code":    { "type": "string" },
-          "message": { "type": "string" }
+          "status_code": { "type": "integer", "format": "int32", "description": "HTTP status code echoed in the body for parsers that inspect JSON only." },
+          "code":        { "type": "string", "description": "Stable machine-readable error sentinel (e.g. `not_found`, `invalid_state_transition`, `lease_expired`, `all_providers_exhausted`)." },
+          "message":     { "type": "string", "description": "Human-readable operator message. Must not carry internal details such as SQL fragments, driver error text, or credential-adjacent fragments (SEC-007)." },
+          "request_id":  { "type": "string", "nullable": true, "description": "Per-request correlation id; also emitted as the `x-request-id` response header. The key is always present; the value is `null` when the handler has not been instrumented to thread the id into the body (the header still carries it)." },
+          "details":     { "type": "object", "nullable": true, "description": "Optional endpoint-specific structured context. Schema varies by endpoint. Absent for most errors; some endpoints emit `null` explicitly.", "additionalProperties": true }
         },
-        "required": ["code", "message"]
+        "required": ["status_code", "code", "message", "request_id"]
       },
       "ProjectKey": {
         "type": "object",

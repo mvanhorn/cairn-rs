@@ -267,8 +267,10 @@ async fn orchestrate_falls_back_to_second_model_after_preferred_is_rate_limited(
     // is an acceptable outcome — what we must NOT see is a provider
     // exhaustion error.
     let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    // Closes #416 follow-up: the envelope is now canonical — assert
+    // against `code` rather than the removed `error_code` peer.
     assert_ne!(
-        parsed.get("error_code").and_then(|v| v.as_str()),
+        parsed.get("code").and_then(|v| v.as_str()),
         Some("all_providers_exhausted"),
         "fallback must not exhaust when only the preferred model rate-limits: {body}"
     );

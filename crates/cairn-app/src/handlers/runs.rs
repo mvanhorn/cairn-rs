@@ -29,8 +29,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::errors::{
-    bad_request_response, now_ms, operator_event_envelope, parse_run_state, runtime_error_response,
-    store_error_response, validation_error_response, AppApiError,
+    api_error_with_details, bad_request_response, now_ms, operator_event_envelope, parse_run_state,
+    runtime_error_response, store_error_response, validation_error_response, AppApiError,
 };
 use crate::extractors::{HasProjectScope, ProjectJson, ProjectScope, TenantCostQuery, TenantScope};
 use crate::helpers::{
@@ -3066,13 +3066,12 @@ pub(crate) async fn orchestrate_run_handler(
         match resolve_breaker_overrides(&default_breakers, body.breaker_overrides.as_ref()) {
             Ok(b) => b,
             Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error_code": "invalid_breaker_override",
-                        "message": e,
-                    })),
-                )
+                // Closes #415: use the canonical `AppApiError` envelope
+                // (`status_code`, `code`, `message`, `request_id`) — every
+                // other validation error in runs.rs uses it, and clients
+                // that parse `code`/`message` previously saw `undefined`
+                // because this hand-rolled `json!` omitted them.
+                return AppApiError::new(StatusCode::BAD_REQUEST, "invalid_breaker_override", e)
                     .into_response();
             }
         };
@@ -3638,19 +3637,26 @@ pub(crate) async fn orchestrate_run_handler(
                         full_summary = %summary,
                         "all providers exhausted during orchestration"
                     );
-                    return (
+                    // Closes #416: canonical envelope (`status_code`,
+                    // `code`, `message`, `request_id`) with per-attempt
+                    // diagnostics and termination sentinel folded under
+                    // `details`. SDK parsers keyed on `code`/`message`
+                    // previously saw `null` because the outer object used
+                    // `error_code`/`remediation` as peer fields.
+                    let remediation = "One or more of: rotate credentials, top up provider credits, add a provider connection via POST /v1/providers/connections, update system defaults via PUT /v1/settings/defaults/system/brain_model (or generate_model), or edit a connection's `supported_models`. Full per-model failure summary is available in the tool-call-approvals UI.";
+                    let details = serde_json::json!({
+                        "termination": "providers_exhausted",
+                        "attempts": attempts.iter().map(|a| serde_json::json!({
+                            "model_id": a.model_id,
+                            "reason_code": a.reason_code,
+                        })).collect::<Vec<_>>(),
+                    });
+                    return api_error_with_details(
                         StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "termination": "providers_exhausted",
-                            "error_code": "all_providers_exhausted",
-                            "attempts": attempts.iter().map(|a| serde_json::json!({
-                                "model_id": a.model_id,
-                                "reason_code": a.reason_code,
-                            })).collect::<Vec<_>>(),
-                            "remediation": "One or more of: rotate credentials, top up provider credits, add a provider connection via POST /v1/providers/connections, update system defaults via PUT /v1/settings/defaults/system/brain_model (or generate_model), or edit a connection's `supported_models`. Full per-model failure summary is available in the tool-call-approvals UI.",
-                        })),
-                    )
-                        .into_response();
+                        "all_providers_exhausted",
+                        remediation,
+                        details,
+                    );
                 }
                 cairn_orchestrator::OrchestratorError::ProviderAuthFailed {
                     binding_id,

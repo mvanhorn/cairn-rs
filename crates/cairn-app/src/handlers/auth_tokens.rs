@@ -14,7 +14,7 @@ use axum::{
 
 use cairn_api::auth::AuthPrincipal;
 
-use crate::errors::bad_request_response;
+use crate::errors::{bad_request_response, AppApiError};
 use crate::extractors::is_admin_principal;
 use crate::state::AppState;
 use crate::tokens::OperatorTokenRecord;
@@ -47,15 +47,17 @@ pub(crate) async fn create_auth_token_handler(
     Extension(principal): Extension<AuthPrincipal>,
     Json(body): Json<CreateAuthTokenRequest>,
 ) -> impl IntoResponse {
+    // Closes #417: canonical `AppApiError` envelope (`status_code`,
+    // `code`, `message`, `request_id`) — the hand-rolled
+    // `{error, detail}` shape hid the `code`/`message` fields that
+    // clients and UI share with every other Forbidden response.
     if !is_admin_principal(&principal) {
-        return (
+        return AppApiError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "forbidden",
-                "detail": "only the admin token may create operator tokens"
-            })),
+            "forbidden",
+            "only the admin token may create operator tokens",
         )
-            .into_response();
+        .into_response();
     }
     if body.operator_id.trim().is_empty() {
         return bad_request_response("operator_id must not be empty");
@@ -121,12 +123,14 @@ pub(crate) async fn list_auth_tokens_handler(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<AuthPrincipal>,
 ) -> impl IntoResponse {
+    // Closes #417: canonical envelope.
     if !is_admin_principal(&principal) {
-        return (
+        return AppApiError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "forbidden" })),
+            "forbidden",
+            "only the admin token may list operator tokens",
         )
-            .into_response();
+        .into_response();
     }
     let tokens: Vec<serde_json::Value> = state
         .operator_tokens
@@ -154,23 +158,27 @@ pub(crate) async fn delete_auth_token_handler(
     Extension(principal): Extension<AuthPrincipal>,
     Path(token_id): Path<String>,
 ) -> impl IntoResponse {
+    // Closes #417: canonical envelope on both auth-failure and
+    // not-found paths. The previous `{error, token_id}` body hid the
+    // canonical `code`/`message` fields; `token_id` was redundant with
+    // the URL path and now lives in the operator audit log.
     if !is_admin_principal(&principal) {
-        return (
+        return AppApiError::new(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "forbidden" })),
+            "forbidden",
+            "only the admin token may revoke operator tokens",
         )
-            .into_response();
+        .into_response();
     }
     let raw = match state.operator_tokens.raw_token(&token_id) {
         Some(t) => t,
         None => {
-            return (
+            return AppApiError::new(
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "not_found", "token_id": token_id
-                })),
+                "not_found",
+                format!("operator token not found: {token_id}"),
             )
-                .into_response();
+            .into_response();
         }
     };
     state.service_tokens.revoke(&raw);

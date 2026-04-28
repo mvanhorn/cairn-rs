@@ -724,10 +724,21 @@ async fn test_breaker_overrides_loosen_returns_400() {
     )
     .await;
     assert_eq!(status, 400, "body={body}");
+    // Closes #415: the envelope is now canonical — `code` at the top
+    // level, no legacy `error_code` peer. `status_code` mirrors HTTP.
     assert_eq!(
-        body.get("error_code").and_then(Value::as_str),
+        body.get("code").and_then(Value::as_str),
         Some("invalid_breaker_override"),
         "body={body}"
+    );
+    assert_eq!(
+        body.get("status_code").and_then(Value::as_u64),
+        Some(400),
+        "body={body}"
+    );
+    assert!(
+        body.get("error_code").is_none(),
+        "legacy `error_code` peer must not reappear alongside the canonical envelope: {body}"
     );
     let msg = body.get("message").and_then(Value::as_str).unwrap_or("");
     assert!(
