@@ -302,6 +302,7 @@ function OrchestrationTimeline({ runId }: { runId: string }) {
 
 function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib/types").RunRecord }) {
   const queryClient = useQueryClient();
+  const toast = useToast();
   const [rejectReason, setRejectReason] = useState("");
   const [reviseComments, setReviseComments] = useState("");
   const [showReject, setShowReject] = useState(false);
@@ -348,36 +349,56 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
   // rerenders with the plan-state event) and `approvals` (so any pending
   // approval row on the Approvals tab disappears immediately instead of
   // waiting for the next poll).
+  //
+  // RFC 018 plan-gate safety (issue #373): these three mutations must NEVER
+  // fail silently. A 403 (missing reviewer role), 409 (plan already decided,
+  // or wrong plan-mode state), or 500 (engine error) must surface a toast
+  // so the operator does NOT assume the plan was approved. On error we keep
+  // the reject/revise form OPEN so the operator can read their comment and
+  // retry without retyping — same shape as the #253 orchestrate fix.
+  //
+  // Invalidations live in `onSettled` (runs on both success AND failure) to
+  // close the partial-success-with-network-error window: the backend may
+  // have applied the plan decision before the client lost the connection,
+  // so we must always refetch to reconcile. Mirrors the WorkspacesPage
+  // `deleteWorkspace` pattern.
+  const invalidatePlanQueries = () => {
+    queryClient.invalidateQueries({ queryKey: ["run-plan", runId] });
+    queryClient.invalidateQueries({ queryKey: ["runs"] });
+    queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
+    queryClient.invalidateQueries({ queryKey: ["approvals"] });
+  };
+
   const approveMut = useMutation({
     mutationFn: () => defaultApi.approvePlan(runId, { approved_by: "operator" }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["run-plan", runId] });
-      queryClient.invalidateQueries({ queryKey: ["runs"] });
-      queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
-      queryClient.invalidateQueries({ queryKey: ["approvals"] });
+      toast.success("Plan approved.");
     },
+    onError: (err: unknown) =>
+      toast.error(`Failed to approve plan — ${err instanceof Error ? err.message : "try again."}`),
+    onSettled: invalidatePlanQueries,
   });
 
   const rejectMut = useMutation({
     mutationFn: () => defaultApi.rejectPlan(runId, { rejected_by: "operator", reason: rejectReason }),
     onSuccess: () => {
+      toast.success("Plan rejected.");
       setShowReject(false);
-      queryClient.invalidateQueries({ queryKey: ["run-plan", runId] });
-      queryClient.invalidateQueries({ queryKey: ["runs"] });
-      queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
-      queryClient.invalidateQueries({ queryKey: ["approvals"] });
     },
+    onError: (err: unknown) =>
+      toast.error(`Failed to reject plan — ${err instanceof Error ? err.message : "try again."}`),
+    onSettled: invalidatePlanQueries,
   });
 
   const reviseMut = useMutation({
     mutationFn: () => defaultApi.revisePlan(runId, { reviewer_comments: reviseComments }),
     onSuccess: () => {
+      toast.success("Revision requested.");
       setShowRevise(false);
-      queryClient.invalidateQueries({ queryKey: ["run-plan", runId] });
-      queryClient.invalidateQueries({ queryKey: ["runs"] });
-      queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
-      queryClient.invalidateQueries({ queryKey: ["approvals"] });
     },
+    onError: (err: unknown) =>
+      toast.error(`Failed to request revision — ${err instanceof Error ? err.message : "try again."}`),
+    onSettled: invalidatePlanQueries,
   });
 
   if (!isPlanMode) return null;
@@ -433,6 +454,8 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
           {!showReject && !showRevise && (
             <div className="flex items-center gap-2">
               <button
+                data-testid="plan-approve-btn"
+                data-pending={approveMut.isPending ? "true" : "false"}
                 onClick={() => approveMut.mutate()}
                 disabled={approveMut.isPending}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-600 text-white text-[12px] font-medium hover:bg-emerald-500 disabled:opacity-50 transition-colors"
@@ -441,12 +464,14 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
                 Approve
               </button>
               <button
+                data-testid="plan-reject-open-btn"
                 onClick={() => setShowReject(true)}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-red-600/80 text-white text-[12px] font-medium hover:bg-red-500 transition-colors"
               >
                 <ThumbsDown size={11} /> Reject
               </button>
               <button
+                data-testid="plan-revise-open-btn"
                 onClick={() => setShowRevise(true)}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-gray-200 dark:bg-zinc-700 text-gray-700 dark:text-zinc-200 text-[12px] font-medium hover:bg-zinc-600 transition-colors"
               >
@@ -457,8 +482,9 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
 
           {/* Reject form */}
           {showReject && (
-            <div className="space-y-2">
+            <div data-testid="plan-reject-form" className="space-y-2">
               <textarea
+                data-testid="plan-reject-reason"
                 value={rejectReason}
                 onChange={e => setRejectReason(e.target.value)}
                 placeholder="Reason for rejection…"
@@ -466,6 +492,8 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
               />
               <div className="flex items-center gap-2">
                 <button
+                  data-testid="plan-reject-confirm-btn"
+                  data-pending={rejectMut.isPending ? "true" : "false"}
                   onClick={() => rejectMut.mutate()}
                   disabled={rejectMut.isPending || !rejectReason.trim()}
                   className="px-3 py-1.5 rounded bg-red-600 text-white text-[12px] hover:bg-red-500 disabled:opacity-50 transition-colors"
@@ -484,8 +512,9 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
 
           {/* Revise form */}
           {showRevise && (
-            <div className="space-y-2">
+            <div data-testid="plan-revise-form" className="space-y-2">
               <textarea
+                data-testid="plan-revise-comments"
                 value={reviseComments}
                 onChange={e => setReviseComments(e.target.value)}
                 placeholder="What should be changed in the plan?"
@@ -493,6 +522,8 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
               />
               <div className="flex items-center gap-2">
                 <button
+                  data-testid="plan-revise-confirm-btn"
+                  data-pending={reviseMut.isPending ? "true" : "false"}
                   onClick={() => reviseMut.mutate()}
                   disabled={reviseMut.isPending || !reviseComments.trim()}
                   className="px-3 py-1.5 rounded bg-indigo-600 text-white text-[12px] hover:bg-indigo-500 disabled:opacity-50 transition-colors"

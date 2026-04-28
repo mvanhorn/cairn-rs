@@ -99,6 +99,7 @@ function DeleteDialog({
   return (
     <div className={ds.modal.backdrop} onClick={onCancel}>
       <div
+        data-testid="credential-revoke-dialog"
         className={clsx(ds.modal.container, "w-full max-w-md mx-4 shadow-2xl")}
         ref={trapRef}
         role="dialog"
@@ -128,6 +129,8 @@ function DeleteDialog({
             Cancel
           </button>
           <button
+            data-testid="credential-revoke-confirm-btn"
+            data-pending={isPending ? "true" : "false"}
             onClick={onConfirm}
             disabled={isPending}
             className="px-3 py-1.5 rounded bg-red-600 text-white text-[12px] hover:bg-red-500 disabled:opacity-50 transition-colors flex items-center gap-1.5"
@@ -440,6 +443,7 @@ function CredentialRow({
       <div className="w-20 shrink-0 px-2 flex justify-end">
         {cred.active && (
           <button
+            data-testid={`credential-revoke-btn-${cred.id}`}
             onClick={() => onRevoke(cred)}
             title="Revoke credential"
             className="flex items-center gap-1 px-2 py-1 rounded text-[11px] text-red-500/70 hover:bg-red-500/10 hover:text-red-400 transition-colors"
@@ -460,6 +464,7 @@ export function CredentialsPage() {
   const [showAdd,     setShowAdd]     = useState(false);
   const [revokeTarget, setRevokeTarget] = useState<CredentialSummary | null>(null);
   const queryClient = useQueryClient();
+  const toast = useToast();
 
   useEffect(() => {
     setTenantId(scope.tenant_id || DEFAULT_SCOPE.tenant_id);
@@ -471,12 +476,39 @@ export function CredentialsPage() {
     refetchInterval: 60_000,
   });
 
+  // Issue #375: revoke was silent on HTTP error. A 403/404/500 used to
+  // close the confirmation dialog on success-only and invalidate the
+  // query — the operator then saw the credential still listed and would
+  // assume a UI bug while the credential stayed ACTIVE. That is a
+  // security regression for a revocation path. Surface a toast on both
+  // outcomes and leave `revokeTarget` set on error so the DeleteDialog
+  // stays open and the operator can retry without reopening the dialog.
+  //
+  // Invalidation lives in `onSettled` (mirrors WorkspacesPage.deleteWorkspace):
+  // it runs on both success AND failure. This closes the partial-success
+  // window where the backend applied the revoke but the client received a
+  // network error — we still refetch, so either the credential is gone
+  // (server won) or still active (operator can retry), and the cache never
+  // drifts from reality. For a security-critical revoke path this is the
+  // correct invariant.
+  //
+  // Invalidate using the mutation's `variables.tenant_id` — NOT the
+  // component-state `tenantId` — because the operator can switch
+  // tenants via the selector while the revoke is in flight. Keying the
+  // invalidation to the tenant that was ACTUALLY revoked ensures the
+  // right cache entry refetches even if the UI scope has moved on.
+  // (Copilot review #532.)
   const { mutate: revoke, isPending: isRevoking } = useMutation({
     mutationFn: (cred: CredentialSummary) =>
       defaultApi.revokeCredential(cred.tenant_id, cred.id),
     onSuccess: () => {
+      toast.success('Credential revoked.');
       setRevokeTarget(null);
-      queryClient.invalidateQueries({ queryKey: ['credentials', tenantId] });
+    },
+    onError: (e: unknown) =>
+      toast.error(`Failed to revoke credential: ${e instanceof Error ? e.message : 'try again.'}`),
+    onSettled: (_data, _err, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials', variables.tenant_id] });
     },
   });
 
