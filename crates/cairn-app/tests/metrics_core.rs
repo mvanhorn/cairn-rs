@@ -10,8 +10,9 @@
 
 #![cfg(feature = "metrics-core")]
 
+mod support;
+
 use std::sync::Arc;
-use std::time::Duration;
 
 use cairn_app::metrics::AppMetrics;
 use cairn_app::metrics_tap::MetricsTap;
@@ -23,6 +24,7 @@ use cairn_domain::{
 };
 use cairn_store::event_log::EventLog;
 use cairn_store::InMemoryStore;
+use support::metrics_wait::{assert_metrics_absent, wait_for_metrics};
 
 /// Spawn a store + metrics + tap triple. Returns the store so tests
 /// can append events, the metrics handle so tests can call
@@ -33,13 +35,6 @@ async fn setup() -> (Arc<InMemoryStore>, Arc<AppMetrics>, MetricsTap) {
     let metrics = Arc::new(AppMetrics::default());
     let tap = MetricsTap::spawn(store.clone(), metrics.clone());
     (store, metrics, tap)
-}
-
-/// The tap is async — give it a moment to drain appended events into
-/// the counter mutex. 50ms is generous: in-process broadcast
-/// typically resolves in microseconds, but CI noise can stretch it.
-async fn drain_tap() {
-    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 fn project(tenant: &str, workspace: &str, project: &str) -> ProjectKey {
@@ -74,13 +69,11 @@ async fn run_created_bumps_counter() {
         .await
         .unwrap();
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(
-        output.contains(r#"cairn_runs_created_total{tenant="t1",workspace="w1"} 1"#),
-        "render_prometheus output missing counter bump:\n{output}"
-    );
+    wait_for_metrics(
+        &metrics,
+        &[r#"cairn_runs_created_total{tenant="t1",workspace="w1"} 1"#],
+    )
+    .await;
 
     tap.shutdown().await;
 }
@@ -121,27 +114,15 @@ async fn run_terminal_transitions_split_by_outcome_and_failure_class() {
             .unwrap();
     }
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(
-        output.contains(
-            r#"cairn_runs_terminal_total{tenant="t1",workspace="w1",outcome="completed",failure_class=""} 1"#
-        ),
-        "missing completed series:\n{output}"
-    );
-    assert!(
-        output.contains(
-            r#"cairn_runs_terminal_total{tenant="t1",workspace="w1",outcome="failed",failure_class="execution_error"} 1"#
-        ),
-        "missing failed series with failure_class:\n{output}"
-    );
-    assert!(
-        output.contains(
-            r#"cairn_runs_terminal_total{tenant="t1",workspace="w1",outcome="canceled",failure_class=""} 1"#
-        ),
-        "missing canceled series:\n{output}"
-    );
+    wait_for_metrics(
+        &metrics,
+        &[
+            r#"cairn_runs_terminal_total{tenant="t1",workspace="w1",outcome="completed",failure_class=""} 1"#,
+            r#"cairn_runs_terminal_total{tenant="t1",workspace="w1",outcome="failed",failure_class="execution_error"} 1"#,
+            r#"cairn_runs_terminal_total{tenant="t1",workspace="w1",outcome="canceled",failure_class=""} 1"#,
+        ],
+    )
+    .await;
 
     tap.shutdown().await;
 }
@@ -175,19 +156,14 @@ async fn task_retryable_failed_with_lease_expired_bumps_lease_expiry_counter() {
         .await
         .unwrap();
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(
-        output.contains(
-            r#"cairn_tasks_terminal_total{tenant="t1",workspace="w1",outcome="retryable_failed",failure_class="lease_expired"} 1"#
-        ),
-        "missing task terminal row:\n{output}"
-    );
-    assert!(
-        output.contains(r#"cairn_lease_expiries_total{entity="task"} 1"#),
-        "missing lease_expiry counter:\n{output}"
-    );
+    wait_for_metrics(
+        &metrics,
+        &[
+            r#"cairn_tasks_terminal_total{tenant="t1",workspace="w1",outcome="retryable_failed",failure_class="lease_expired"} 1"#,
+            r#"cairn_lease_expiries_total{entity="task"} 1"#,
+        ],
+    )
+    .await;
 
     tap.shutdown().await;
 }
@@ -227,23 +203,15 @@ async fn tool_invocations_counted_by_name_and_outcome() {
             .unwrap();
     }
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(
-        output.contains(r#"cairn_tool_invocations_total{tool="fs.read",outcome="success"} 1"#),
-        "missing fs.read/success row:\n{output}"
-    );
-    assert!(
-        output.contains(r#"cairn_tool_invocations_total{tool="fs.read",outcome="timeout"} 1"#),
-        "missing fs.read/timeout row:\n{output}"
-    );
-    assert!(
-        output.contains(
-            r#"cairn_tool_invocations_total{tool="shell.exec",outcome="permanent_failure"} 1"#
-        ),
-        "missing shell.exec/permanent_failure row:\n{output}"
-    );
+    wait_for_metrics(
+        &metrics,
+        &[
+            r#"cairn_tool_invocations_total{tool="fs.read",outcome="success"} 1"#,
+            r#"cairn_tool_invocations_total{tool="fs.read",outcome="timeout"} 1"#,
+            r#"cairn_tool_invocations_total{tool="shell.exec",outcome="permanent_failure"} 1"#,
+        ],
+    )
+    .await;
 
     tap.shutdown().await;
 }
@@ -273,14 +241,16 @@ async fn unrelated_events_do_not_bump_counters() {
         .await
         .unwrap();
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(output.contains(r#"cairn_tasks_created_total{tenant="t1",workspace="w1"} 1"#));
-    assert!(
-        !output.contains("cairn_tasks_terminal_total{tenant=\"t1\""),
-        "tasks_terminal must not have any rows after a pure-create:\n{output}"
-    );
+    // Positive-edge wait: once the created counter materialises the
+    // tap has processed our append, so the subsequent
+    // `assert_metrics_absent` check is synchronous — no race with an
+    // arriving-later terminal frame because we never emitted one.
+    wait_for_metrics(
+        &metrics,
+        &[r#"cairn_tasks_created_total{tenant="t1",workspace="w1"} 1"#],
+    )
+    .await;
+    assert_metrics_absent(&metrics, &["cairn_tasks_terminal_total{tenant=\"t1\""]);
 
     tap.shutdown().await;
 }
@@ -315,13 +285,7 @@ async fn run_failed_with_lease_expired_bumps_run_entity_counter() {
         .await
         .unwrap();
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(
-        output.contains(r#"cairn_lease_expiries_total{entity="run"} 1"#),
-        "missing run lease_expiry counter:\n{output}"
-    );
+    wait_for_metrics(&metrics, &[r#"cairn_lease_expiries_total{entity="run"} 1"#]).await;
 
     tap.shutdown().await;
 }

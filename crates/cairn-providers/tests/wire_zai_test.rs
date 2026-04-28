@@ -316,8 +316,13 @@ async fn zai_streaming_preserves_reasoning_alongside_tool_calls() {
 /// Ignored by default — run with
 /// `ZAI_API_KEY=... cargo test -p cairn-providers --test wire_zai_test \
 ///     zai_live_smoke -- --ignored --nocapture`.
+///
+/// Un-ignore trigger tracked in issue #552 (scheduled-integration
+/// policy for live z.ai smokes).
 #[tokio::test]
-#[ignore]
+#[ignore = "hits real z.ai coding endpoint; requires ZAI_API_KEY. \
+            Un-ignore policy tracked in \
+            https://github.com/avifenesh/cairn-rs/issues/552"]
 async fn zai_live_smoke() {
     let key = match std::env::var("ZAI_API_KEY") {
         Ok(k) => k,

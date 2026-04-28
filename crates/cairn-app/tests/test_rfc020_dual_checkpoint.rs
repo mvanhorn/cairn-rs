@@ -232,8 +232,13 @@ async fn recovery_summary_event_emitted_on_restart() {
 /// assertions will be: (a) checkpoint body is smaller than the full
 /// message history, (b) replay reconstructs history from the base +
 /// diffs, (c) `message_history_size` reports the compacted size.
+///
+/// Tracked in issue #550 (Track 4b: delta-based checkpoints). When
+/// that issue closes, drop the `#[ignore]` and flip the body to the
+/// concrete assertions above.
 #[ignore = "Gap 3 resolution: v1 ships full snapshots, not diffs. \
-            Un-ignore when a diff-based Track 4b is adopted."]
+            Un-ignore when Track 4b lands — see issue \
+            https://github.com/avifenesh/cairn-rs/issues/550"]
 #[tokio::test]
 async fn checkpoint_compression_v1_skipped_by_design() {
     unreachable!(

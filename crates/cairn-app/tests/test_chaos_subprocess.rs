@@ -84,7 +84,21 @@ async fn sigstop_sigcont_resumes_cleanly() {
     //    bytes, depending on timing. What we assert is that the
     //    subprocess does NOT wake on its own: we'll verify that
     //    below by measuring readiness BEFORE SIGCONT.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    //
+    //    Pre-probe sleep budget: SIGSTOP delivery on Linux is
+    //    synchronous once `libc::kill` returns zero — the kernel
+    //    flips the process into TASK_STOPPED before any further
+    //    user-space runs in this test. 100ms is a generous margin
+    //    against any residual in-flight tokio work on the
+    //    subprocess side completing a response that was already
+    //    mid-flight when the signal arrived. There is no OS-level
+    //    phenomenon that needs seconds to stabilise here; the old
+    //    3s value (#413) was arbitrary and served only to keep the
+    //    test wall-clock inflated. The probe's own 500ms request
+    //    timeout below is what establishes "subprocess can't
+    //    respond 200"; the sleep just steps past the stop-signal
+    //    handoff.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let probe = h
         .client()
@@ -142,10 +156,13 @@ async fn sigstop_sigcont_resumes_cleanly() {
         res.text().await.unwrap_or_default(),
     );
 
-    // 5. Hard elapsed-budget cap. SIGSTOP held 3s + ≤10s readiness
+    // 5. Hard elapsed-budget cap. SIGSTOP held 100ms + ≤10s readiness
     //    recovery + one HTTP round-trip — any more than 30s total
     //    means something is hung and we want the test to fail loudly
-    //    rather than masquerade as a flaky slow test.
+    //    rather than masquerade as a flaky slow test. The 30s budget
+    //    stays conservative despite the shortened SIGSTOP window so
+    //    CI runners with cold-boot overhead in `LiveHarness::setup`
+    //    still finish under the cap.
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(30),

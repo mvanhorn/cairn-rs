@@ -15,57 +15,22 @@
 //! `localhost:6379` exists on the host (CI usually doesn't have one;
 //! some dev machines do — see the Copilot review on PR #356).
 
-use std::process::Stdio;
-use std::time::Duration;
+mod support;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
-use tokio::time::timeout;
+use std::process::Stdio;
+
+use support::fabric_url_subprocess::{
+    cairn_app_command, restore_fabric_env, scan_stdout, scan_with_timeout, scrub_fabric_env,
+};
 
 #[tokio::test]
 async fn default_to_localhost_6379_when_cairn_fabric_url_unset() {
-    let bin = env!("CARGO_BIN_EXE_cairn-app");
+    // Scrub inherited CAIRN_FABRIC_* so the default-path arm fires
+    // regardless of dev-shell state.
+    let prev_env = scrub_fabric_env();
 
-    let mut cmd = Command::new(bin);
-    cmd.arg("--mode")
-        .arg("team")
-        .arg("--port")
-        .arg("0")
-        .arg("--addr")
-        .arg("127.0.0.1")
-        .arg("--db")
-        .arg("memory")
-        // F65 PR-5: CI runners block unprivileged userns; skip the
-        // probe gate so this test can exercise FabricConfig defaults
-        // without the boot probe refusing to start.
-        .arg("--allow-missing-sandbox-primitives")
-        // Explicitly remove any inherited CAIRN_FABRIC_URL so the
-        // default-path arm in `FabricConfig::from_env` fires.
-        .env_remove("CAIRN_FABRIC_URL")
-        .env_remove("CAIRN_FABRIC_HOST")
-        .env_remove("CAIRN_FABRIC_PORT")
-        .env_remove("CAIRN_FABRIC_TLS")
-        .env_remove("CAIRN_FABRIC_CLUSTER")
-        .env("CAIRN_ADMIN_TOKEN", "default-test-admin-token")
-        .env(
-            "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET",
-            "00000000000000000000000000000000000000000000000000000000000000aa",
-        )
-        .env("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "cairn-test-default")
-        // META #461: team mode refuses to start without a master key.
-        .env(
-            "CAIRN_CREDENTIAL_KEY",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .env("RUST_LOG", "info")
-        .env_remove("CAIRN_LOG_DIR")
-        // `tracing_subscriber::fmt()` writes to stdout (not stderr) —
-        // the `connecting to valkey` info event lands there. Pipe it
-        // so we can scan for the default-endpoint fields. Panic text
-        // goes to stderr; drop it.
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+    let mut cmd = cairn_app_command("default-test", "default");
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
 
     let mut child = cmd
         .spawn()
@@ -80,26 +45,21 @@ async fn default_to_localhost_6379_when_cairn_fabric_url_unset() {
     // localhost:6379 lets cairn-app boot all the way to steady state
     // (in which case stdout would never reach EOF and a drain-until-
     // EOF would hang until the test timeout).
-    let (matched, transcript) = match timeout(
-        Duration::from_secs(30),
-        scan_stdout_for_default_endpoint(stdout),
+    let (matched, transcript) = scan_with_timeout(
+        &mut child,
+        scan_stdout(stdout, |stripped| {
+            stripped.contains("connecting to valkey")
+                && stripped.contains("host=localhost")
+                && stripped.contains("port=6379")
+        }),
+        "default-URL stdout scan",
     )
-    .await
-    {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            panic!("stdout read errored: {e}");
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            panic!("timed out waiting for `connecting to valkey` line");
-        }
-    };
+    .await;
+
     let _ = child.kill().await;
     let _ = child.wait().await;
+
+    restore_fabric_env(prev_env);
 
     assert!(
         matched,
@@ -107,52 +67,4 @@ async fn default_to_localhost_6379_when_cairn_fabric_url_unset() {
          `connecting to valkey` line — default fallback regressed.\n\
          ---- subprocess stdout ----\n{transcript}\n---- end ----"
     );
-}
-
-/// Scan subprocess stdout line-by-line for the boot-time
-/// `connecting to valkey host=localhost port=6379` event. Returns
-/// `(true, transcript)` on first match, `(false, transcript)` on EOF
-/// without a match. The transcript is surfaced in failure messages so
-/// regressions show the actual subprocess output, not a blind false.
-async fn scan_stdout_for_default_endpoint(
-    stdout: tokio::process::ChildStdout,
-) -> std::io::Result<(bool, String)> {
-    let mut lines = BufReader::new(stdout).lines();
-    let mut transcript = String::new();
-    while let Some(line) = lines.next_line().await? {
-        transcript.push_str(&line);
-        transcript.push('\n');
-        let stripped = strip_ansi(&line);
-        if stripped.contains("connecting to valkey")
-            && stripped.contains("host=localhost")
-            && stripped.contains("port=6379")
-        {
-            return Ok((true, transcript));
-        }
-    }
-    Ok((false, transcript))
-}
-
-/// Small CSI-escape stripper. Only covers the `ESC [ ... m` SGR
-/// sequences that tracing's fmt layer emits; full `ansi_term` or
-/// `strip-ansi-escapes` would work but adds a test-only dep the
-/// integration test suite can skip.
-fn strip_ansi(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next(); // consume '['
-                          // Consume until the SGR terminator 'm' (or any ASCII
-                          // letter for robustness); drop everything inside.
-            for next in chars.by_ref() {
-                if next.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }

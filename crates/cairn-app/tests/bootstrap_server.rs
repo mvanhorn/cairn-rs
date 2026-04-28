@@ -1998,6 +1998,64 @@ async fn admin_routes_round_trip() {
     assert_eq!(tenant_response.status(), StatusCode::CREATED);
 }
 
+/// Operator tokens (non-`admin` service accounts, non-`System` principals)
+/// must be rejected with 403 on admin-gated routes.
+///
+/// The `admin_routes_round_trip` test above proves the positive path
+/// for the `admin` service account. The enforcement half was only
+/// covered by an inline comment (`Non-admin operator tokens correctly
+/// get 403.`) with no corresponding assertion, per audit finding
+/// #411. A regression to `is_admin_principal` that accidentally
+/// whitelisted `AuthPrincipal::Operator` would have shipped silently.
+///
+/// Test shape: mint an operator token, hit the same `POST
+/// /v1/admin/tenants` route `admin_routes_round_trip` uses for its
+/// positive case, assert 403. The route match is identical; only the
+/// auth principal differs — so this is the minimal delta that proves
+/// the ACL and nothing else.
+#[tokio::test]
+async fn operator_token_gets_403_on_admin_tenants_route() {
+    let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    state.service_tokens.register(
+        "operator-token".to_string(),
+        AuthPrincipal::Operator {
+            operator_id: OperatorId::new("op_not_admin"),
+            tenant: TenantKey::new("default_tenant"),
+        },
+    );
+
+    let tenant_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/tenants")
+                .header("authorization", "Bearer operator-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "tenant_id": "tenant_admin_http_denied",
+                        "name": "Admin Tenant (operator attempt)"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The exact enforcement claim from the inline comment at the top
+    // of `admin_routes_round_trip`: operators MUST get 403, not 201,
+    // not 401, not a silent 200. Route-not-found would surface as
+    // 404, which a partial-ACL regression could produce; pin on 403.
+    assert_eq!(
+        tenant_response.status(),
+        StatusCode::FORBIDDEN,
+        "operator token on admin route: expected 403 FORBIDDEN, got {}",
+        tenant_response.status(),
+    );
+}
+
 #[tokio::test]
 async fn tool_invocation_progress_route_returns_latest_progress() {
     let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
