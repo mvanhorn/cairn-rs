@@ -2092,6 +2092,22 @@ pub struct ApprovalDelegated {
     pub approval_id: ApprovalId,
     pub delegated_to: String,
     pub delegated_at_ms: u64,
+    /// Monotonic per-delegation identifier minted by the runtime service
+    /// (`approval_impl::next_delegation_id`) at emit time. Included in
+    /// the projection PK so two delegations that share `(approval_id,
+    /// delegated_to, delegated_at_ms)` — the same delegator asked twice
+    /// in the same millisecond — both survive as distinct audit rows.
+    ///
+    /// `#[serde(default)]` is retained for backward-compatible
+    /// deserialization because pre-Phase-2a.2 fixtures/event-log entries
+    /// do not carry this field. Legacy events therefore deserialize with
+    /// an empty `delegation_id`; the pg/sqlite + in-memory projections
+    /// insert that empty string as-is under the PK `(approval_id,
+    /// delegation_id)`. Pre-v0.1.0 there are no persisted ApprovalDelegated
+    /// events so no legacy collapse can happen in production; the
+    /// `#[serde(default)]` exists for fixture / replay safety only.
+    #[serde(default)]
+    pub delegation_id: String,
 }
 
 /// Audit log entry event — carries only Eq-able fields; metadata is in the projection.

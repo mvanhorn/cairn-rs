@@ -425,6 +425,17 @@ mod in_memory_vs_sqlite {
             "PlanApproved",
             "PlanRejected",
             "PlanRevisionRequested",
+            // RFC-025 Phase 2a.2 milestone 1: approval-delegation fixture
+            // below.
+            "ApprovalDelegated",
+            // RFC-025 Phase 2a.2 milestone 2: guardrail fixtures below.
+            "GuardrailPolicyCreated",
+            "GuardrailPolicyEvaluated",
+            // RFC-025 Phase 2a.2 milestone 3: retention fixture below.
+            "RetentionPolicySet",
+            // RFC-025 Phase 2a.2 milestone 4: entitlement override fixture
+            // below.
+            "EntitlementOverrideSet",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -1144,6 +1155,318 @@ mod in_memory_vs_sqlite {
         // Default threshold is 80 when the event omits it.
         assert_eq!(mem_b.alert_threshold_percent, 80);
         assert_eq!(sqlite_b.alert_threshold_percent, 80);
+    }
+
+    // ── RFC-025 Phase 2a.2 milestone 1: approval-delegation parity.
+    use cairn_domain::ApprovalDelegated;
+    use cairn_store::projections::ApprovalDelegationReadModel;
+
+    #[tokio::test]
+    async fn approval_delegation_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let approval_id = ApprovalId::new("ap_parity_delegate");
+        let events = vec![
+            env(RuntimeEvent::ApprovalDelegated(ApprovalDelegated {
+                approval_id: approval_id.clone(),
+                delegated_to: "op_first".into(),
+                delegated_at_ms: 1_000,
+                delegation_id: "deleg_ap_parity_delegate_1000_first".into(),
+            })),
+            env(RuntimeEvent::ApprovalDelegated(ApprovalDelegated {
+                approval_id: approval_id.clone(),
+                delegated_to: "op_second".into(),
+                delegated_at_ms: 2_000,
+                delegation_id: "deleg_ap_parity_delegate_2000_second".into(),
+            })),
+            // Idempotency probe: replaying the same delegation with the
+            // same (approval_id, delegation_id) must be a no-op on both
+            // backends (composite PK collapse).
+            env(RuntimeEvent::ApprovalDelegated(ApprovalDelegated {
+                approval_id: approval_id.clone(),
+                delegated_to: "op_first".into(),
+                delegated_at_ms: 1_000,
+                delegation_id: "deleg_ap_parity_delegate_1000_first".into(),
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rows = ApprovalDelegationReadModel::list_for_approval(&mem, &approval_id)
+            .await
+            .unwrap();
+        let sqlite_rows = ApprovalDelegationReadModel::list_for_approval(&adapter, &approval_id)
+            .await
+            .unwrap();
+        assert_eq!(mem_rows.len(), 2);
+        assert_eq!(sqlite_rows.len(), 2);
+        assert_eq!(mem_rows, sqlite_rows);
+        assert_eq!(mem_rows[0].delegated_to, "op_first");
+        assert_eq!(mem_rows[1].delegated_to, "op_second");
+    }
+
+    // ── RFC-025 Phase 2a.2 milestone 2: guardrail parity ─────────────
+    use cairn_domain::policy::{
+        GuardrailDecisionKind, GuardrailRule, GuardrailRuleEffect, GuardrailSubjectType,
+    };
+    use cairn_domain::{GuardrailPolicyCreated, GuardrailPolicyEvaluated};
+    use cairn_store::projections::{GuardrailEvaluationReadModel, GuardrailReadModel};
+
+    #[tokio::test]
+    async fn guardrail_policy_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_gr_policy");
+        let rules = vec![GuardrailRule {
+            subject_type: GuardrailSubjectType::Tool,
+            subject_id: Some("fs.delete".into()),
+            action: "invoke".into(),
+            effect: GuardrailRuleEffect::Deny,
+            conditions: vec!["cwd=/".into()],
+        }];
+        let events = vec![env(RuntimeEvent::GuardrailPolicyCreated(
+            GuardrailPolicyCreated {
+                tenant_id: tenant_id.clone(),
+                policy_id: "gr_parity_1".into(),
+                name: "delete-fence".into(),
+                rules: rules.clone(),
+            },
+        ))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_pol = GuardrailReadModel::get_policy(&mem, "gr_parity_1")
+            .await
+            .unwrap()
+            .expect("mem policy");
+        let sq_pol = GuardrailReadModel::get_policy(&adapter, "gr_parity_1")
+            .await
+            .unwrap()
+            .expect("sqlite policy");
+        assert_eq!(mem_pol.policy_id, sq_pol.policy_id);
+        assert_eq!(mem_pol.name, sq_pol.name);
+        assert_eq!(mem_pol.rules, sq_pol.rules);
+        assert_eq!(mem_pol.enabled, sq_pol.enabled);
+
+        let mem_list = GuardrailReadModel::list_policies(&mem, &tenant_id, 100, 0)
+            .await
+            .unwrap();
+        let sq_list = GuardrailReadModel::list_policies(&adapter, &tenant_id, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 1);
+        assert_eq!(sq_list.len(), 1);
+        // Tenant isolation: an unknown tenant must see zero policies on
+        // both backends.
+        let other = TenantId::new("t_parity_gr_other");
+        let mem_other = GuardrailReadModel::list_policies(&mem, &other, 100, 0)
+            .await
+            .unwrap();
+        let sq_other = GuardrailReadModel::list_policies(&adapter, &other, 100, 0)
+            .await
+            .unwrap();
+        assert!(mem_other.is_empty());
+        assert!(sq_other.is_empty());
+    }
+
+    #[tokio::test]
+    async fn guardrail_evaluation_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_gr_eval");
+        let events = vec![
+            env(RuntimeEvent::GuardrailPolicyEvaluated(
+                GuardrailPolicyEvaluated {
+                    tenant_id: tenant_id.clone(),
+                    policy_id: "gr_eval_1".into(),
+                    subject_type: GuardrailSubjectType::Tool,
+                    subject_id: Some("fs.delete".into()),
+                    action: "invoke".into(),
+                    decision: GuardrailDecisionKind::Denied,
+                    reason: Some("matched deny rule".into()),
+                    evaluated_at_ms: 1_000,
+                },
+            )),
+            // Idempotency probe: composite PK collapse on replay.
+            env(RuntimeEvent::GuardrailPolicyEvaluated(
+                GuardrailPolicyEvaluated {
+                    tenant_id: tenant_id.clone(),
+                    policy_id: "gr_eval_1".into(),
+                    subject_type: GuardrailSubjectType::Tool,
+                    subject_id: Some("fs.delete".into()),
+                    action: "invoke".into(),
+                    decision: GuardrailDecisionKind::Denied,
+                    reason: Some("matched deny rule".into()),
+                    evaluated_at_ms: 1_000,
+                },
+            )),
+            env(RuntimeEvent::GuardrailPolicyEvaluated(
+                GuardrailPolicyEvaluated {
+                    tenant_id: tenant_id.clone(),
+                    policy_id: "gr_eval_1".into(),
+                    subject_type: GuardrailSubjectType::Tool,
+                    subject_id: None,
+                    action: "list".into(),
+                    decision: GuardrailDecisionKind::Allowed,
+                    reason: None,
+                    evaluated_at_ms: 2_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rows = GuardrailEvaluationReadModel::list_evaluations(&mem, &tenant_id, 100)
+            .await
+            .unwrap();
+        let sq_rows = GuardrailEvaluationReadModel::list_evaluations(&adapter, &tenant_id, 100)
+            .await
+            .unwrap();
+        assert_eq!(mem_rows.len(), 2, "idempotent replay");
+        assert_eq!(sq_rows.len(), 2);
+        // Most-recent first on both backends.
+        assert_eq!(mem_rows[0].evaluated_at_ms, 2_000);
+        assert_eq!(sq_rows[0].evaluated_at_ms, 2_000);
+        // Subject-id empty-string sentinel round-trips to None.
+        assert!(mem_rows[0].subject_id.is_none());
+        assert!(sq_rows[0].subject_id.is_none());
+        assert_eq!(mem_rows[1].subject_id.as_deref(), Some("fs.delete"));
+        assert_eq!(sq_rows[1].subject_id.as_deref(), Some("fs.delete"));
+        assert_eq!(mem_rows, sq_rows);
+    }
+
+    // ── RFC-025 Phase 2a.2 milestone 3: retention parity ─────────────
+    use cairn_domain::RetentionPolicySet;
+    use cairn_store::projections::RetentionPolicyReadModel;
+
+    #[tokio::test]
+    async fn retention_policy_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_ret");
+        let events = vec![
+            env(RuntimeEvent::RetentionPolicySet(RetentionPolicySet {
+                tenant_id: tenant_id.clone(),
+                policy_id: "ret_parity_1".into(),
+                full_history_days: 7,
+                current_state_days: 30,
+                max_events_per_entity: Some(1_000),
+            })),
+            // Upsert — second set must replace the first on both backends.
+            env(RuntimeEvent::RetentionPolicySet(RetentionPolicySet {
+                tenant_id: tenant_id.clone(),
+                policy_id: "ret_parity_2".into(),
+                full_history_days: 14,
+                current_state_days: 60,
+                max_events_per_entity: None,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_pol = RetentionPolicyReadModel::get_by_tenant(&mem, &tenant_id)
+            .await
+            .unwrap()
+            .expect("memory policy");
+        let sq_pol = RetentionPolicyReadModel::get_by_tenant(&adapter, &tenant_id)
+            .await
+            .unwrap()
+            .expect("sqlite policy");
+        assert_eq!(mem_pol.policy_id, "ret_parity_2");
+        assert_eq!(sq_pol.policy_id, "ret_parity_2");
+        assert_eq!(mem_pol.full_history_days, 14);
+        assert_eq!(sq_pol.full_history_days, 14);
+        assert_eq!(mem_pol.current_state_days, 60);
+        assert_eq!(sq_pol.current_state_days, 60);
+        // Option::None → 0 sentinel on both backends.
+        assert_eq!(mem_pol.max_events_per_entity, 0);
+        assert_eq!(sq_pol.max_events_per_entity, 0);
+    }
+
+    // ── RFC-025 Phase 2a.2 milestone 4: entitlement overrides parity ─
+
+    use cairn_domain::EntitlementOverrideSet;
+
+    #[tokio::test]
+    async fn entitlement_override_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_ov");
+        let events = vec![
+            env(RuntimeEvent::EntitlementOverrideSet(
+                EntitlementOverrideSet {
+                    tenant_id: tenant_id.clone(),
+                    feature: "eval_matrices".into(),
+                    allowed: true,
+                    reason: Some("pilot".into()),
+                    set_at_ms: 1_000,
+                },
+            )),
+            env(RuntimeEvent::EntitlementOverrideSet(
+                EntitlementOverrideSet {
+                    tenant_id: tenant_id.clone(),
+                    feature: "multi_provider".into(),
+                    allowed: true,
+                    reason: None,
+                    set_at_ms: 2_000,
+                },
+            )),
+            // Upsert on (tenant, feature) — second write to
+            // `eval_matrices` must replace the first.
+            env(RuntimeEvent::EntitlementOverrideSet(
+                EntitlementOverrideSet {
+                    tenant_id: tenant_id.clone(),
+                    feature: "eval_matrices".into(),
+                    allowed: false,
+                    reason: Some("revoked".into()),
+                    set_at_ms: 3_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rows = cairn_store::projections::LicenseReadModel::list_overrides(&mem, &tenant_id)
+            .await
+            .unwrap();
+        let sq_rows =
+            cairn_store::projections::LicenseReadModel::list_overrides(&adapter, &tenant_id)
+                .await
+                .unwrap();
+
+        assert_eq!(mem_rows.len(), 2);
+        assert_eq!(sq_rows.len(), 2);
+        // Both backends sort by `feature` ASC.
+        assert_eq!(mem_rows[0].feature, "eval_matrices");
+        assert_eq!(sq_rows[0].feature, "eval_matrices");
+        assert_eq!(mem_rows[1].feature, "multi_provider");
+        assert_eq!(sq_rows[1].feature, "multi_provider");
+        // Upsert effect: eval_matrices now allowed = false, reason = revoked,
+        // set_at_ms = 3_000 on both backends.
+        assert!(!mem_rows[0].allowed);
+        assert!(!sq_rows[0].allowed);
+        assert_eq!(mem_rows[0].reason.as_deref(), Some("revoked"));
+        assert_eq!(sq_rows[0].reason.as_deref(), Some("revoked"));
+        assert_eq!(mem_rows[0].set_at_ms, 3_000);
+        assert_eq!(sq_rows[0].set_at_ms, 3_000);
+        // Byte-equal field-by-field.
+        assert_eq!(mem_rows, sq_rows);
+
+        // Different tenant returns empty.
+        let other = TenantId::new("t_parity_ov_other");
+        let mem_empty = cairn_store::projections::LicenseReadModel::list_overrides(&mem, &other)
+            .await
+            .unwrap();
+        let sq_empty = cairn_store::projections::LicenseReadModel::list_overrides(&adapter, &other)
+            .await
+            .unwrap();
+        assert!(mem_empty.is_empty());
+        assert!(sq_empty.is_empty());
     }
 
     // ── RFC-025 Phase 2a.1 milestone 4: licenses projection parity.

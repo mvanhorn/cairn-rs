@@ -778,7 +778,39 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::EntitlementOverrideSet(_) => log_stub("EntitlementOverrideSet"),
+            // RFC-025 Phase 2a.2 milestone 4: entitlement_overrides projection.
+            // Keyed by (tenant_id, feature); `ON CONFLICT (tenant_id, feature)
+            // DO UPDATE` mirrors the in-memory HashMap::insert on the
+            // composite `{tenant}:{feature}` key. `set_at_ms` (u64 → i64)
+            // is checked via `try_from` per the Phase 2a.1 review pattern.
+            RuntimeEvent::EntitlementOverrideSet(e) => {
+                let set_at_ms = i64::try_from(e.set_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EntitlementOverrideSet.set_at_ms {} exceeds i64::MAX",
+                        e.set_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO entitlement_overrides (
+                        tenant_id, feature, allowed, reason, set_at_ms,
+                        created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $6)
+                     ON CONFLICT (tenant_id, feature) DO UPDATE SET
+                        allowed    = EXCLUDED.allowed,
+                        reason     = EXCLUDED.reason,
+                        set_at_ms  = EXCLUDED.set_at_ms,
+                        updated_at = EXCLUDED.updated_at",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.feature.as_str())
+                .bind(e.allowed)
+                .bind(e.reason.as_deref())
+                .bind(set_at_ms)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::NotificationPreferenceSet(_) => log_stub("NotificationPreferenceSet"),
             RuntimeEvent::NotificationSent(_) => log_stub("NotificationSent"),
             RuntimeEvent::ProviderPoolCreated(_) => log_stub("ProviderPoolCreated"),
@@ -847,10 +879,87 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::RetentionPolicySet(_) => log_stub("RetentionPolicySet"),
+            // RFC-025 Phase 2a.2 milestone 3: retention_policies projection.
+            // Keyed by tenant_id; `ON CONFLICT (tenant_id) DO UPDATE`
+            // mirrors the in-memory `HashMap::insert` latest-wins
+            // semantic. `max_events_per_entity` is stored nullable on
+            // pg so the event's `Option<u64>` round-trips without a
+            // sentinel. The `u32 / u64` → `i32 / i64` narrowing is
+            // checked via `try_from` (not `as`) per the Phase 2a.1
+            // review pattern.
+            RuntimeEvent::RetentionPolicySet(e) => {
+                let full_history_days = i32::try_from(e.full_history_days).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RetentionPolicySet.full_history_days {} exceeds i32::MAX",
+                        e.full_history_days
+                    ))
+                })?;
+                let current_state_days = i32::try_from(e.current_state_days).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RetentionPolicySet.current_state_days {} exceeds i32::MAX",
+                        e.current_state_days
+                    ))
+                })?;
+                let max_events = match e.max_events_per_entity {
+                    Some(v) => Some(i64::try_from(v).map_err(|_| {
+                        StoreError::Internal(format!(
+                            "RetentionPolicySet.max_events_per_entity {} exceeds i64::MAX",
+                            v
+                        ))
+                    })?),
+                    None => None,
+                };
+                sqlx::query(
+                    "INSERT INTO retention_policies (
+                        tenant_id, policy_id, full_history_days, current_state_days,
+                        max_events_per_entity, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $6)
+                     ON CONFLICT (tenant_id) DO UPDATE SET
+                        policy_id              = EXCLUDED.policy_id,
+                        full_history_days      = EXCLUDED.full_history_days,
+                        current_state_days     = EXCLUDED.current_state_days,
+                        max_events_per_entity  = EXCLUDED.max_events_per_entity,
+                        updated_at             = EXCLUDED.updated_at",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.policy_id.as_str())
+                .bind(full_history_days)
+                .bind(current_state_days)
+                .bind(max_events)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::RunCostAlertSet(_) => log_stub("RunCostAlertSet"),
             RuntimeEvent::RunCostAlertTriggered(_) => log_stub("RunCostAlertTriggered"),
-            RuntimeEvent::ApprovalDelegated(_) => log_stub("ApprovalDelegated"),
+            // RFC-025 Phase 2a.2 milestone 1: approval_delegations audit
+            // projection. One row per delegation event; replay is
+            // idempotent via the composite primary key (approval_id,
+            // delegation_id). `delegation_id` is minted monotonically by
+            // the runtime service at emit time (Copilot #571 round 4).
+            RuntimeEvent::ApprovalDelegated(e) => {
+                let delegated_at = i64::try_from(e.delegated_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ApprovalDelegated.delegated_at_ms {} exceeds i64::MAX",
+                        e.delegated_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO approval_delegations (
+                        approval_id, delegation_id, delegated_to, delegated_at_ms, created_at
+                     ) VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (approval_id, delegation_id) DO NOTHING",
+                )
+                .bind(e.approval_id.as_str())
+                .bind(e.delegation_id.as_str())
+                .bind(e.delegated_to.as_str())
+                .bind(delegated_at)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 2b.1: audit_log_entries projection.
             //
             // ON CONFLICT DO NOTHING keeps replay idempotent. The event
@@ -986,8 +1095,72 @@ impl PgSyncProjection {
             RuntimeEvent::EvalDatasetEntryAdded(_) => log_stub("EvalDatasetEntryAdded"),
             RuntimeEvent::EvalRubricCreated(_) => log_stub("EvalRubricCreated"),
             RuntimeEvent::EventLogCompacted(_) => log_stub("EventLogCompacted"),
-            RuntimeEvent::GuardrailPolicyCreated(_) => log_stub("GuardrailPolicyCreated"),
-            RuntimeEvent::GuardrailPolicyEvaluated(_) => log_stub("GuardrailPolicyEvaluated"),
+            // RFC-025 Phase 2a.2 milestone 2: guardrail_policies projection.
+            // `rules_json` stores `Vec<GuardrailRule>` serialised as a JSON
+            // array in a TEXT column — portable across pg/sqlite (no JSONB).
+            // `ON CONFLICT (policy_id) DO UPDATE` mirrors the in-memory
+            // `HashMap::insert` create-or-refresh semantic.
+            RuntimeEvent::GuardrailPolicyCreated(e) => {
+                let rules_json = serde_json::to_string(&e.rules).map_err(|err| {
+                    StoreError::Serialization(format!(
+                        "GuardrailPolicyCreated.rules serialize: {err}"
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO guardrail_policies (
+                        policy_id, tenant_id, name, rules_json, enabled, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, TRUE, $5, $5)
+                     ON CONFLICT (policy_id) DO UPDATE SET
+                        tenant_id   = EXCLUDED.tenant_id,
+                        name        = EXCLUDED.name,
+                        rules_json  = EXCLUDED.rules_json,
+                        enabled     = EXCLUDED.enabled,
+                        updated_at  = EXCLUDED.updated_at",
+                )
+                .bind(e.policy_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(e.name.as_str())
+                .bind(&rules_json)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // Audit trail — one row per evaluation event. Empty-string
+            // sentinel for absent `subject_id` keeps the composite PK
+            // pure-NOT-NULL (SQLite treats NULL as distinct under UNIQUE,
+            // which would break replay idempotency).
+            RuntimeEvent::GuardrailPolicyEvaluated(e) => {
+                let evaluated_at = i64::try_from(e.evaluated_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "GuardrailPolicyEvaluated.evaluated_at_ms {} exceeds i64::MAX",
+                        e.evaluated_at_ms
+                    ))
+                })?;
+                let subject_type = guardrail_subject_type_str(e.subject_type);
+                let decision = guardrail_decision_kind_str(e.decision);
+                let subject_id = e.subject_id.clone().unwrap_or_default();
+                sqlx::query(
+                    "INSERT INTO guardrail_evaluations (
+                        policy_id, tenant_id, subject_type, subject_id,
+                        action, decision, reason, evaluated_at_ms, created_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT (tenant_id, policy_id, subject_type, subject_id, action, evaluated_at_ms)
+                       DO NOTHING",
+                )
+                .bind(e.policy_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(subject_type)
+                .bind(&subject_id)
+                .bind(e.action.as_str())
+                .bind(decision)
+                .bind(e.reason.as_deref())
+                .bind(evaluated_at)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::OperatorIntervention(_) => log_stub("OperatorIntervention"),
             RuntimeEvent::OperatorProfileCreated(_) => log_stub("OperatorProfileCreated"),
             RuntimeEvent::OperatorProfileUpdated(_) => log_stub("OperatorProfileUpdated"),
@@ -2668,6 +2841,36 @@ fn log_stub(variant: &'static str) {
         "pg projection stub: event committed to event_log but no projection table updated \
          (see PgSyncProjection unprojected-stubs list for the coverage gap)"
     );
+}
+
+/// RFC-025 Phase 2a.2 milestone 2: snake_case string for
+/// `GuardrailSubjectType`. Stable wire-format matching the domain
+/// `#[serde(rename_all = "snake_case")]` contract so the read-model
+/// deserializer can round-trip.
+pub(super) fn guardrail_subject_type_str(
+    t: cairn_domain::policy::GuardrailSubjectType,
+) -> &'static str {
+    use cairn_domain::policy::GuardrailSubjectType as T;
+    match t {
+        T::Run => "run",
+        T::Task => "task",
+        T::Session => "session",
+        T::Tool => "tool",
+        T::Provider => "provider",
+    }
+}
+
+/// RFC-025 Phase 2a.2 milestone 2: snake_case string for
+/// `GuardrailDecisionKind`.
+pub(super) fn guardrail_decision_kind_str(
+    d: cairn_domain::policy::GuardrailDecisionKind,
+) -> &'static str {
+    use cairn_domain::policy::GuardrailDecisionKind as D;
+    match d {
+        D::Allowed => "allowed",
+        D::Denied => "denied",
+        D::Warned => "warned",
+    }
 }
 
 /// Serialize a serde-serializable enum variant to its snake_case string form.

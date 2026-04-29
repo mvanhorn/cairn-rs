@@ -671,8 +671,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     // new additions.
     ProjectionEntry {
         variant: "ApprovalDelegated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (approvals)",
+        status: ProjectionStatus::Projected {
+            table: Some("approval_delegations"),
         },
     },
     ProjectionEntry {
@@ -737,8 +737,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "EntitlementOverrideSet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (entitlements)",
+        status: ProjectionStatus::Projected {
+            table: Some("entitlement_overrides"),
         },
     },
     ProjectionEntry {
@@ -803,14 +803,14 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "GuardrailPolicyCreated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (guardrails)",
+        status: ProjectionStatus::Projected {
+            table: Some("guardrail_policies"),
         },
     },
     ProjectionEntry {
         variant: "GuardrailPolicyEvaluated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (guardrails)",
+        status: ProjectionStatus::Projected {
+            table: Some("guardrail_evaluations"),
         },
     },
     ProjectionEntry {
@@ -1047,8 +1047,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "RetentionPolicySet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (retention)",
+        status: ProjectionStatus::Projected {
+            table: Some("retention_policies"),
         },
     },
     ProjectionEntry {
@@ -1314,7 +1314,7 @@ mod tests {
         //     → 61 / 31 / 66.
         //   * Phase 2a.1 milestone 4 flips `LicenseActivated` to Projected
         //     → 62 / 31 / 65.
-        //   * Phase 1.5a (this PR #569) flips 8 state-carrying trigger /
+        //   * Phase 1.5a (PR #569) flips 8 state-carrying trigger /
         //     run_template variants (TriggerCreated, TriggerEnabled,
         //     TriggerDisabled, TriggerSuspended, TriggerResumed,
         //     TriggerDeleted, RunTemplateCreated, RunTemplateDeleted)
@@ -1328,7 +1328,7 @@ mod tests {
         //     is "backed by a read-model table updated synchronously",
         //     not "runtime replays from the table"). Net: +13 Projected,
         //     -13 Ephemeral → 75 / 18 / 65.
-        //   * Phase 3 (this PR) flips the four provider-state variants
+        //   * Phase 3 (PR #572) flips the four provider-state variants
         //     (ProviderBindingCreated / StateChanged, ProviderConnection
         //     Registered / Deleted) Stubbed → Projected with backing
         //     tables `provider_bindings` / `provider_connections`. Pools
@@ -1352,17 +1352,34 @@ mod tests {
         //     `PlanRevisionRequested`) Stubbed → Projected with backing
         //     table `plan_reviews` (pg V044 + sqlite schema.rs).
         //     Net: +4 Projected, -4 Stubbed → 86 / 18 / 54.
+        //   * Phase 2a.2 milestone 1 flips `ApprovalDelegated` Stubbed →
+        //     Projected with backing table `approval_delegations` (pg V045
+        //     + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 87 / 18 / 53.
+        //   * Phase 2a.2 milestone 2 flips `GuardrailPolicyCreated` +
+        //     `GuardrailPolicyEvaluated` Stubbed → Projected with backing
+        //     tables `guardrail_policies` + `guardrail_evaluations` (pg
+        //     V046 + sqlite schema.rs). Net: +2 Projected, -2 Stubbed
+        //     → 89 / 18 / 51.
+        //   * Phase 2a.2 milestone 3 flips `RetentionPolicySet` Stubbed →
+        //     Projected with backing table `retention_policies` (pg V047
+        //     + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 90 / 18 / 50.
+        //   * Phase 2a.2 milestone 4 flips `EntitlementOverrideSet`
+        //     Stubbed → Projected with backing table `entitlement_overrides`
+        //     (pg V048 + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 91 / 18 / 49.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 86,
+            projected, 91,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
             ephemeral, 18,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 54, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 49, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 

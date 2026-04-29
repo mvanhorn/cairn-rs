@@ -2613,11 +2613,52 @@ impl crate::projections::LicenseReadModel for SqliteAdapter {
 
     async fn list_overrides(
         &self,
-        _tenant_id: &cairn_domain::TenantId,
+        tenant_id: &cairn_domain::TenantId,
     ) -> Result<Vec<cairn_domain::EntitlementOverrideRecord>, StoreError> {
-        // See pg::adapter.rs — EntitlementOverrideSet migrates in
-        // Phase 2a.2 which wires the dedicated table + reader.
-        Ok(Vec::new())
+        let rows: Vec<EntitlementOverrideRow> = sqlx::query_as(
+            "SELECT tenant_id, feature, allowed, reason, set_at_ms
+             FROM entitlement_overrides
+             WHERE tenant_id = ?
+             ORDER BY feature ASC",
+        )
+        .bind(tenant_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(EntitlementOverrideRow::into_record)
+            .collect())
+    }
+}
+
+// ── RFC-025 Phase 2a.2 milestone 4: entitlement_overrides read row ───────────
+
+#[derive(sqlx::FromRow)]
+struct EntitlementOverrideRow {
+    tenant_id: String,
+    feature: String,
+    allowed: bool,
+    reason: Option<String>,
+    set_at_ms: i64,
+}
+
+impl EntitlementOverrideRow {
+    fn into_record(self) -> cairn_domain::EntitlementOverrideRecord {
+        // Parity with pg — same synthetic override_id + hardcoded
+        // `AdvancedAdmin` entitlement as the in-memory applier.
+        let set_at_ms = u64::try_from(self.set_at_ms.max(0)).unwrap_or(0);
+        cairn_domain::EntitlementOverrideRecord {
+            override_id: format!("override_{}_{}", self.tenant_id, self.feature),
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            entitlement: cairn_domain::commercial::Entitlement::AdvancedAdmin,
+            granted: self.allowed,
+            reason: self.reason,
+            applied_at: set_at_ms,
+            feature: self.feature,
+            allowed: self.allowed,
+            set_at_ms,
+        }
     }
 }
 
@@ -2641,6 +2682,247 @@ impl crate::projections::CredentialRotationReadModel for SqliteAdapter {
             .into_iter()
             .map(CredentialRotationRow::into_record)
             .collect())
+    }
+}
+
+// ── RFC-025 Phase 2a.2 milestone 1: ApprovalDelegationReadModel ─────────────
+
+#[derive(sqlx::FromRow)]
+struct ApprovalDelegationRow {
+    approval_id: String,
+    delegation_id: String,
+    delegated_to: String,
+    delegated_at_ms: i64,
+}
+
+impl ApprovalDelegationRow {
+    fn into_record(self) -> crate::projections::ApprovalDelegationRecord {
+        crate::projections::ApprovalDelegationRecord {
+            approval_id: ApprovalId::new(self.approval_id),
+            delegated_to: self.delegated_to,
+            delegated_at_ms: self.delegated_at_ms.max(0) as u64,
+            delegation_id: self.delegation_id,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::projections::ApprovalDelegationReadModel for SqliteAdapter {
+    async fn list_for_approval(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<Vec<crate::projections::ApprovalDelegationRecord>, StoreError> {
+        let rows: Vec<ApprovalDelegationRow> = sqlx::query_as(
+            "SELECT approval_id, delegation_id, delegated_to, delegated_at_ms
+             FROM approval_delegations
+             WHERE approval_id = ?
+             ORDER BY delegated_at_ms ASC, delegation_id ASC",
+        )
+        .bind(approval_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(ApprovalDelegationRow::into_record)
+            .collect())
+    }
+}
+
+// ── RFC-025 Phase 2a.2 milestone 2: GuardrailReadModel + GuardrailEvaluationReadModel ─
+
+#[derive(sqlx::FromRow)]
+struct GuardrailPolicyRow {
+    policy_id: String,
+    name: String,
+    rules_json: String,
+    // sqlx maps SQLite INTEGER 0/1 → bool via the FromRow helper.
+    enabled: bool,
+}
+
+impl GuardrailPolicyRow {
+    fn into_record(self) -> Result<cairn_domain::policy::GuardrailPolicy, StoreError> {
+        let rules: Vec<cairn_domain::policy::GuardrailRule> =
+            serde_json::from_str(&self.rules_json).map_err(|e| {
+                StoreError::Internal(format!("guardrail_policies.rules_json parse: {e}"))
+            })?;
+        Ok(cairn_domain::policy::GuardrailPolicy {
+            policy_id: self.policy_id,
+            name: self.name,
+            rules,
+            enabled: self.enabled,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::projections::GuardrailReadModel for SqliteAdapter {
+    async fn get_policy(
+        &self,
+        policy_id: &str,
+    ) -> Result<Option<cairn_domain::policy::GuardrailPolicy>, StoreError> {
+        let row: Option<GuardrailPolicyRow> = sqlx::query_as(
+            "SELECT policy_id, name, rules_json, enabled
+             FROM guardrail_policies
+             WHERE policy_id = ?",
+        )
+        .bind(policy_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(GuardrailPolicyRow::into_record).transpose()
+    }
+
+    async fn list_policies(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::policy::GuardrailPolicy>, StoreError> {
+        let rows: Vec<GuardrailPolicyRow> = sqlx::query_as(
+            "SELECT policy_id, name, rules_json, enabled
+             FROM guardrail_policies
+             WHERE tenant_id = ?
+             ORDER BY policy_id ASC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(tenant_id.as_str())
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(GuardrailPolicyRow::into_record)
+            .collect()
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct GuardrailEvaluationRow {
+    policy_id: String,
+    tenant_id: String,
+    subject_type: String,
+    subject_id: String,
+    action: String,
+    decision: String,
+    reason: Option<String>,
+    evaluated_at_ms: i64,
+}
+
+impl GuardrailEvaluationRow {
+    fn into_record(self) -> Result<crate::projections::GuardrailEvaluationRecord, StoreError> {
+        use cairn_domain::policy::{GuardrailDecisionKind as D, GuardrailSubjectType as T};
+        let subject_type = match self.subject_type.as_str() {
+            "run" => T::Run,
+            "task" => T::Task,
+            "session" => T::Session,
+            "tool" => T::Tool,
+            "provider" => T::Provider,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "guardrail_evaluations.subject_type unknown {other:?}"
+                )))
+            }
+        };
+        let decision = match self.decision.as_str() {
+            "allowed" => D::Allowed,
+            "denied" => D::Denied,
+            "warned" => D::Warned,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "guardrail_evaluations.decision unknown {other:?}"
+                )))
+            }
+        };
+        let subject_id = if self.subject_id.is_empty() {
+            None
+        } else {
+            Some(self.subject_id)
+        };
+        Ok(crate::projections::GuardrailEvaluationRecord {
+            policy_id: self.policy_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            subject_type,
+            subject_id,
+            action: self.action,
+            decision,
+            reason: self.reason,
+            evaluated_at_ms: self.evaluated_at_ms.max(0) as u64,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::projections::GuardrailEvaluationReadModel for SqliteAdapter {
+    async fn list_evaluations(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::GuardrailEvaluationRecord>, StoreError> {
+        let rows: Vec<GuardrailEvaluationRow> = sqlx::query_as(
+            "SELECT policy_id, tenant_id, subject_type, subject_id,
+                    action, decision, reason, evaluated_at_ms
+             FROM guardrail_evaluations
+             WHERE tenant_id = ?
+             ORDER BY evaluated_at_ms DESC, policy_id ASC
+             LIMIT ?",
+        )
+        .bind(tenant_id.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(GuardrailEvaluationRow::into_record)
+            .collect()
+    }
+}
+
+// ── RFC-025 Phase 2a.2 milestone 3: RetentionPolicyReadModel ────────────────
+
+#[derive(sqlx::FromRow)]
+struct RetentionPolicyRow {
+    tenant_id: String,
+    policy_id: String,
+    full_history_days: i32,
+    current_state_days: i32,
+    max_events_per_entity: Option<i64>,
+}
+
+impl RetentionPolicyRow {
+    fn into_record(self) -> cairn_domain::RetentionPolicy {
+        let max_events_per_entity = self
+            .max_events_per_entity
+            .map(|v| u32::try_from(v.max(0)).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        cairn_domain::RetentionPolicy {
+            policy_id: self.policy_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            full_history_days: u32::try_from(self.full_history_days.max(0)).unwrap_or(0),
+            current_state_days: u32::try_from(self.current_state_days.max(0)).unwrap_or(0),
+            max_events_per_entity,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::projections::RetentionPolicyReadModel for SqliteAdapter {
+    async fn get_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Option<cairn_domain::RetentionPolicy>, StoreError> {
+        let row: Option<RetentionPolicyRow> = sqlx::query_as(
+            "SELECT tenant_id, policy_id, full_history_days, current_state_days,
+                    max_events_per_entity
+             FROM retention_policies
+             WHERE tenant_id = ?",
+        )
+        .bind(tenant_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(RetentionPolicyRow::into_record))
     }
 }
 

@@ -1034,4 +1034,89 @@ CREATE INDEX IF NOT EXISTS idx_plan_reviews_project_state
 
 CREATE INDEX IF NOT EXISTS idx_plan_reviews_session
     ON plan_reviews (session_id, proposed_at, plan_run_id);
+
+-- RFC-025 Phase 2a.2 milestone 1 (approval delegations): sqlite parity
+-- with pg V045 (renumbered V039 → V041 → V045 across this PR's review
+-- cycle as main published new migrations). Audit trail — one row per
+-- `ApprovalDelegated` event. PK is `(approval_id, delegation_id)` so
+-- two distinct delegations of the same approval to the same operator
+-- within the same millisecond coexist without collapsing (Copilot #571
+-- round 4). `delegation_id` is monotonic per emit (see
+-- `approval_impl::next_delegation_id`). A supporting index on
+-- `(approval_id, delegated_at_ms, delegation_id)` serves the read
+-- model's `ORDER BY delegated_at_ms ASC, delegation_id ASC` without a
+-- secondary sort pass.
+CREATE TABLE IF NOT EXISTS approval_delegations (
+    approval_id     TEXT    NOT NULL,
+    delegation_id   TEXT    NOT NULL DEFAULT '',
+    delegated_to    TEXT    NOT NULL,
+    delegated_at_ms INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+    PRIMARY KEY (approval_id, delegation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_approval_delegations_read_model
+    ON approval_delegations (approval_id, delegated_at_ms, delegation_id);
+
+-- RFC-025 Phase 2a.2 milestone 2 (guardrails): sqlite parity with pg
+-- V046 (renumbered V040 → V042 → V046). `rules_json` is a JSON array
+-- stored as TEXT (no JSONB in SQLite). `enabled` maps BOOLEAN → INTEGER 0/1.
+CREATE TABLE IF NOT EXISTS guardrail_policies (
+    policy_id   TEXT    PRIMARY KEY,
+    tenant_id   TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    rules_json  TEXT    NOT NULL DEFAULT '[]',
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_guardrail_policies_tenant
+    ON guardrail_policies (tenant_id, policy_id);
+
+CREATE TABLE IF NOT EXISTS guardrail_evaluations (
+    policy_id       TEXT    NOT NULL,
+    tenant_id       TEXT    NOT NULL,
+    subject_type    TEXT    NOT NULL,
+    subject_id      TEXT    NOT NULL DEFAULT '',
+    action          TEXT    NOT NULL,
+    decision        TEXT    NOT NULL,
+    reason          TEXT,
+    evaluated_at_ms INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+    -- `tenant_id` leads the PK (parity with pg V046) — see that
+    -- migration for the cross-tenant-collision rationale.
+    PRIMARY KEY (tenant_id, policy_id, subject_type, subject_id, action, evaluated_at_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_guardrail_evaluations_tenant_time
+    ON guardrail_evaluations (tenant_id, evaluated_at_ms DESC);
+
+-- RFC-025 Phase 2a.2 milestone 3 (retention policies): sqlite parity
+-- with pg V047 (renumbered V041 → V043 → V047).
+CREATE TABLE IF NOT EXISTS retention_policies (
+    tenant_id              TEXT    PRIMARY KEY,
+    policy_id              TEXT    NOT NULL,
+    full_history_days      INTEGER NOT NULL,
+    current_state_days     INTEGER NOT NULL,
+    max_events_per_entity  INTEGER,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL
+);
+
+-- RFC-025 Phase 2a.2 milestone 4 (entitlement overrides): sqlite parity
+-- with pg V048 (renumbered V042 → V044 → V048). Keyed by (tenant_id, feature)
+-- so per-feature overrides upsert latest-wins, mirroring the in-memory
+-- HashMap::insert keyed on `{tenant}:{feature}`. `allowed` is INTEGER
+-- 0/1 (sqlite's BOOLEAN).
+CREATE TABLE IF NOT EXISTS entitlement_overrides (
+    tenant_id   TEXT    NOT NULL,
+    feature     TEXT    NOT NULL,
+    allowed     INTEGER NOT NULL,
+    reason      TEXT,
+    set_at_ms   INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, feature)
+);
 "#;

@@ -1318,6 +1318,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             approval_id: ApprovalId::new("a1"),
             delegated_to: "op2".to_owned(),
             delegated_at_ms: ts,
+            delegation_id: "deleg_a1_0_1".to_owned(),
         }),
         RuntimeEvent::AuditLogEntryRecorded(AuditLogEntryRecorded {
             entry_id: "ae1".to_owned(),

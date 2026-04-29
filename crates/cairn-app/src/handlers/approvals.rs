@@ -796,19 +796,89 @@ pub(crate) async fn amend_approval_handler(
     }
 }
 
-/// `POST /v1/approvals/:id/delegate` — stub retained from pre-F45.
+/// `POST /v1/approvals/:id/delegate` — delegate an unresolved approval
+/// to a named operator. Emits `ApprovalDelegated` which is projected to
+/// the `approval_delegations` audit table (RFC-025 Phase 2a.2 m1).
+///
+/// Scoping: routed through `resolve_approval_by_id` so the caller's
+/// `TenantScope` gates visibility — a caller from tenant A cannot
+/// delegate an approval owned by tenant B just by guessing the id
+/// (Copilot review #571). Plan approvals delegate through the runtime
+/// service; tool-call approvals are currently out of scope for
+/// delegation (422) because tool-call resolution carries its own
+/// per-session scope semantics.
 pub(crate) async fn delegate_approval_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
+    Extension(principal): Extension<AuthPrincipal>,
     Path(id): Path<String>,
     Json(body): Json<DelegateApprovalRequest>,
 ) -> impl IntoResponse {
-    let _ = (state, id, body);
-    AppApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented",
-        "approval delegation is not yet implemented",
-    )
-    .into_response()
+    let record = match resolve_approval_by_id(state.as_ref(), &tenant_scope, &id).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let plan = match record {
+        UnifiedApproval::Plan(record) => *record,
+        UnifiedApproval::ToolCall(_) => {
+            return AppApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                "delegation is only supported for plan approvals",
+            )
+            .into_response();
+        }
+    };
+    // The `ApprovalDelegated` event payload only carries `delegated_to`
+    // + timestamp; the delegator identity is captured on the central
+    // audit log via `AuditService::record` (same shape as
+    // `resolve_plan_approval` uses for `resolve_approval` /
+    // `reject_approval`). Audit rows are durable and queryable via
+    // `AuditReadModel` even though the projection row on
+    // `approval_delegations` doesn't carry the delegator.
+    let delegator = audit_actor_id(&principal);
+    let before = crate::handlers::sse::current_event_head(&state).await;
+    match state
+        .runtime
+        .approvals
+        .delegate(&plan.approval_id, body.delegated_to)
+        .await
+    {
+        Ok(record) => match state
+            .runtime
+            .audits
+            .record(
+                plan.project.tenant_id.clone(),
+                delegator.clone(),
+                "delegate_approval".to_owned(),
+                "approval".to_owned(),
+                record.approval_id.to_string(),
+                AuditOutcome::Success,
+                serde_json::json!({
+                    "delegated_to": record.delegated_to,
+                    "delegated_at_ms": record.delegated_at_ms,
+                }),
+            )
+            .await
+        {
+            Ok(_) => {
+                crate::handlers::sse::publish_runtime_frames_since(&state, before).await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "approval_id": record.approval_id.as_str(),
+                        "delegated_by": delegator,
+                        "delegated_to": record.delegated_to,
+                        "delegated_at_ms": record.delegated_at_ms,
+                        "delegation_id": record.delegation_id,
+                    })),
+                )
+                    .into_response()
+            }
+            Err(err) => runtime_error_response(err),
+        },
+        Err(err) => runtime_error_response(err),
+    }
 }
 
 // ── Internal: plan-approval resolution + audit ──────────────────────────────

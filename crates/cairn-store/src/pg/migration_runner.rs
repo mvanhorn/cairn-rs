@@ -230,10 +230,8 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     ),
     // RFC-025 Phase 2b.1: read-model table for `AuditLogEntryRecorded`
     // so audit records survive a pg/sqlite restart (previously `log_stub`
-    // on both SQL backends — silent loss on restart). V041 keeps the
-    // migration sequence gap-free (pg_migration_contract.rs invariant);
-    // the parallel Phase 2a.2 branch (#571, currently CONFLICTING) will
-    // rebase to V042+ when it lands.
+    // on both SQL backends — silent loss on restart). Landed on main in
+    // #573 while Phase 2a.2 (#571) was in review.
     (
         41,
         "create_audit_log_entries",
@@ -260,6 +258,37 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         44,
         "create_plan_reviews",
         include_str!("migrations/V044__create_plan_reviews.sql"),
+    ),
+    // RFC-025 Phase 2a.2 milestone 1 (approval delegations): one audit
+    // row per `ApprovalDelegated` event. Renumbered V039 → V041 → V045
+    // as main published new migrations during this PR's review cycle
+    // (trigger projections at V039; Phase 2b.1 audits/scheduled_tasks/
+    // outcomes/plan_reviews at V041-V044).
+    (
+        45,
+        "create_approval_delegations",
+        include_str!("migrations/V045__create_approval_delegations.sql"),
+    ),
+    // RFC-025 Phase 2a.2 milestone 2 (guardrails): guardrail_policies +
+    // guardrail_evaluations. Renumbered V040 → V042 → V046.
+    (
+        46,
+        "create_guardrails",
+        include_str!("migrations/V046__create_guardrails.sql"),
+    ),
+    // RFC-025 Phase 2a.2 milestone 3 (retention policies). Renumbered
+    // V041 → V043 → V047.
+    (
+        47,
+        "create_retention_policies",
+        include_str!("migrations/V047__create_retention_policies.sql"),
+    ),
+    // RFC-025 Phase 2a.2 milestone 4 (entitlement overrides). Renumbered
+    // V042 → V044 → V048.
+    (
+        48,
+        "create_entitlement_overrides",
+        include_str!("migrations/V048__create_entitlement_overrides.sql"),
     ),
 ];
 

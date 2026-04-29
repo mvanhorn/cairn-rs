@@ -384,3 +384,106 @@ async fn deprecated_list_drops_inbound_kind_and_forces_tool_call() {
         "other params preserved: {loc}"
     );
 }
+
+// ── 5. Plan delegation round trip + tenant scope enforcement (Copilot #571) ─
+
+#[tokio::test]
+async fn plan_delegation_round_trip_via_unified_surface() {
+    let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    register_principal(&state);
+
+    // Seed a plan approval.
+    let project = ProjectKey::new("default_tenant", "default_workspace", "default_project");
+    let approval_id = ApprovalId::new("plan_del_1");
+    state
+        .runtime
+        .approvals
+        .request(
+            &project,
+            approval_id.clone(),
+            None,
+            None,
+            ApprovalRequirement::Required,
+        )
+        .await
+        .expect("request approval");
+
+    // Delegate. Body must be valid JSON; the handler reads `delegated_to`.
+    let (status, body, _) = call(
+        app.clone(),
+        "POST",
+        "/v1/approvals/plan_del_1/delegate",
+        Some(json!({ "delegated_to": "op_delegate" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "delegate: {body}");
+    assert_eq!(body["approval_id"], "plan_del_1");
+    assert_eq!(body["delegated_to"], "op_delegate");
+    // `delegated_by` echoes the authenticated principal so the caller
+    // can audit the identity server-side even when the body does not
+    // carry it.
+    assert_eq!(body["delegated_by"], ACTOR);
+    // `delegation_id` is minted per emit (Copilot #571 round 4) and is
+    // part of the projection PK — the response surfaces it so the
+    // operator UI can correlate the row back to the audit table.
+    let delegation_id = body["delegation_id"]
+        .as_str()
+        .expect("delegation_id missing from response");
+    assert!(
+        delegation_id.starts_with("deleg_plan_del_1_"),
+        "delegation_id should encode approval_id + timestamp + seq, got {delegation_id:?}"
+    );
+}
+
+#[tokio::test]
+async fn delegate_rejects_tool_call_approvals_with_422() {
+    let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    register_principal(&state);
+
+    // Seed a tool-call approval instead of a plan approval.
+    let proposal = ToolCallProposal {
+        call_id: ToolCallId::new("tc_no_delegate"),
+        session_id: SessionId::new("sess_ndel"),
+        run_id: RunId::new("run_ndel"),
+        project: ProjectKey::new("default_tenant", "default_workspace", "default_project"),
+        tool_name: "read".to_owned(),
+        tool_args: json!({ "path": "/tmp/x" }),
+        display_summary: Some("read /tmp/x".to_owned()),
+        match_policy: ApprovalMatchPolicy::Exact,
+    };
+    state
+        .runtime
+        .tool_call_approvals
+        .submit_proposal(proposal)
+        .await
+        .expect("submit");
+
+    let (status, body, _) = call(
+        app,
+        "POST",
+        "/v1/approvals/tc_no_delegate/delegate",
+        Some(json!({ "delegated_to": "op_delegate" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "validation_error");
+}
+
+#[tokio::test]
+async fn delegate_unknown_approval_returns_404() {
+    let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    register_principal(&state);
+
+    let (status, body, _) = call(
+        app,
+        "POST",
+        "/v1/approvals/plan_does_not_exist/delegate",
+        Some(json!({ "delegated_to": "op_delegate" })),
+    )
+    .await;
+    // `resolve_approval_by_id` returns 404 when neither tool-call nor
+    // plan approvals know about the id — this also proves that the
+    // handler goes through the TenantScope-aware helper rather than
+    // trusting a caller-supplied id blindly.
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}

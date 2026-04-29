@@ -77,6 +77,12 @@ struct State {
     runs: HashMap<String, RunRecord>,
     tasks: HashMap<String, TaskRecord>,
     approvals: HashMap<String, ApprovalRecord>,
+    /// RFC-025 Phase 2a.2 milestone 1: audit trail for `ApprovalDelegated`
+    /// events. One entry per delegation event, pushed on event apply.
+    /// Mirrors the `approval_delegations` projection on pg/sqlite so
+    /// `ApprovalDelegationReadModel::list_for_approval` returns byte-equal
+    /// results across backends.
+    approval_delegations: Vec<crate::projections::ApprovalDelegationRecord>,
     /// PR BP-2: projection of `ToolCall*` approval events keyed by call_id.
     tool_call_approvals: HashMap<String, ToolCallApprovalRecord>,
     checkpoints: HashMap<String, CheckpointRecord>,
@@ -135,6 +141,27 @@ struct State {
     notification_prefs: HashMap<String, cairn_domain::notification_prefs::NotificationPreference>,
     notification_records: Vec<cairn_domain::notification_prefs::NotificationRecord>,
     guardrail_policies: HashMap<String, cairn_domain::policy::GuardrailPolicy>,
+    /// RFC-025 Phase 2a.2 milestone 2: tenant association for guardrail
+    /// policies so `list_policies(tenant_id, ..)` scopes correctly. The
+    /// domain `GuardrailPolicy` struct omits tenant_id; pg/sqlite store
+    /// it on the projection row and filter in SQL. Mirror that here by
+    /// tracking it in a sibling map keyed on policy_id.
+    guardrail_policy_tenants: HashMap<String, cairn_domain::TenantId>,
+    /// RFC-025 Phase 2a.2 milestone 2: audit trail for
+    /// `GuardrailPolicyEvaluated` events. One row per evaluation; a
+    /// replayed event with the same composite key (tenant_id, policy_id,
+    /// subject_type, subject_id_or_empty, action, evaluated_at_ms) is a
+    /// no-op, mirroring the pg/sqlite `PRIMARY KEY` contract.
+    guardrail_evaluations: Vec<crate::projections::GuardrailEvaluationRecord>,
+    /// Sidecar dedupe set for `guardrail_evaluations` — keeps the idempotency
+    /// guard O(1) per event apply instead of the prior O(n) linear scan.
+    /// The Vec above stays as the authoritative store so tenant-scoped
+    /// reads can preserve insertion order and re-sort at read time
+    /// (matching pg/sqlite `ORDER BY evaluated_at_ms DESC`). The two
+    /// structures are kept in lockstep by the applier and the clear paths
+    /// (`clear_state` / `reset_state`). Copilot #571 round 3 perf fix.
+    guardrail_evaluation_keys:
+        std::collections::HashSet<(String, String, String, String, String, u64)>,
     provider_budgets: HashMap<String, cairn_domain::providers::ProviderBudget>,
     provider_connections: HashMap<String, cairn_domain::providers::ProviderConnectionRecord>,
     quotas: HashMap<String, cairn_domain::TenantQuota>,
@@ -259,6 +286,7 @@ impl InMemoryStore {
                 runs: HashMap::new(),
                 tasks: HashMap::new(),
                 approvals: HashMap::new(),
+                approval_delegations: Vec::new(),
                 tool_call_approvals: HashMap::new(),
                 checkpoints: HashMap::new(),
                 mailbox_messages: HashMap::new(),
@@ -300,6 +328,9 @@ impl InMemoryStore {
                 notification_prefs: HashMap::new(),
                 notification_records: Vec::new(),
                 guardrail_policies: HashMap::new(),
+                guardrail_policy_tenants: HashMap::new(),
+                guardrail_evaluations: Vec::new(),
+                guardrail_evaluation_keys: std::collections::HashSet::new(),
                 provider_budgets: HashMap::new(),
                 provider_connections: HashMap::new(),
                 quotas: HashMap::new(),
@@ -1091,6 +1122,12 @@ impl InMemoryStore {
                         enabled: true,
                     },
                 );
+                // RFC-025 Phase 2a.2 m2: mirror the tenant association
+                // the pg/sqlite row carries so `list_policies` scopes
+                // correctly across backends.
+                state
+                    .guardrail_policy_tenants
+                    .insert(e.policy_id.clone(), e.tenant_id.clone());
             }
             RuntimeEvent::OperatorProfileCreated(e) => {
                 state.operator_profiles.insert(
@@ -1390,9 +1427,90 @@ impl InMemoryStore {
                         });
                 }
             }
-            RuntimeEvent::ApprovalDelegated(_)
-            | RuntimeEvent::EventLogCompacted(_)
-            | RuntimeEvent::GuardrailPolicyEvaluated(_)
+            // RFC-025 Phase 2a.2 milestone 1: append the audit row for
+            // each delegation. Composite key `(approval_id, delegation_id)`
+            // mirrors the pg/sqlite PRIMARY KEY — a replayed event is a
+            // no-op here too. `delegation_id` is minted monotonically per
+            // emit by the runtime service so two rapid delegations of
+            // the same approval to the same operator in the same
+            // millisecond both persist as distinct rows (Copilot #571
+            // round 4).
+            //
+            // Copilot #571 round 3: the O(n) `.iter().any(...)` dedupe
+            // was O(n²) across a replay. The Vec is kept in read-order
+            // (approval_id ASC, delegated_at_ms ASC, delegation_id ASC)
+            // matching the pg/sqlite `ORDER BY` — a binary-search probe
+            // on the same tuple gives O(log n) membership. Dedupe is
+            // on the PK `(approval_id, delegation_id)`; the sort key
+            // adds `delegated_at_ms` as the secondary discriminator so
+            // reads walk the vec in time-order without a re-sort.
+            RuntimeEvent::ApprovalDelegated(e) => {
+                let sort_probe = |record: &crate::projections::ApprovalDelegationRecord| {
+                    record
+                        .approval_id
+                        .cmp(&e.approval_id)
+                        .then_with(|| record.delegated_at_ms.cmp(&e.delegated_at_ms))
+                        .then_with(|| record.delegation_id.cmp(&e.delegation_id))
+                };
+                if let Err(idx) = state.approval_delegations.binary_search_by(sort_probe) {
+                    state.approval_delegations.insert(
+                        idx,
+                        crate::projections::ApprovalDelegationRecord {
+                            approval_id: e.approval_id.clone(),
+                            delegated_to: e.delegated_to.clone(),
+                            delegated_at_ms: e.delegated_at_ms,
+                            delegation_id: e.delegation_id.clone(),
+                        },
+                    );
+                }
+            }
+            // RFC-025 Phase 2a.2 milestone 2: audit trail for guardrail
+            // evaluations. Composite-key check mirrors pg/sqlite
+            // `PRIMARY KEY (tenant_id, policy_id, subject_type,
+            // subject_id, action, evaluated_at_ms)` + `ON CONFLICT DO
+            // NOTHING`. `tenant_id` leads so shared runtime-emitted
+            // `policy_id`s (e.g. "implicit_allow") cannot silently
+            // collapse evaluations across tenants.
+            //
+            // Copilot #571 round 3: O(1) dedupe via a sidecar HashSet on
+            // the composite PK. The Vec stays authoritative so the
+            // read-model re-sorts at query time to match pg/sqlite
+            // `ORDER BY evaluated_at_ms DESC`. `subject_id` collapses
+            // Option<String> → String via unwrap_or_default so the key
+            // matches the pg empty-string sentinel on the PK.
+            RuntimeEvent::GuardrailPolicyEvaluated(e) => {
+                use cairn_domain::policy::GuardrailSubjectType as T;
+                let subject_type_str = match e.subject_type {
+                    T::Run => "run",
+                    T::Task => "task",
+                    T::Session => "session",
+                    T::Tool => "tool",
+                    T::Provider => "provider",
+                };
+                let key = (
+                    e.tenant_id.as_str().to_owned(),
+                    e.policy_id.clone(),
+                    subject_type_str.to_owned(),
+                    e.subject_id.clone().unwrap_or_default(),
+                    e.action.clone(),
+                    e.evaluated_at_ms,
+                );
+                if state.guardrail_evaluation_keys.insert(key) {
+                    state
+                        .guardrail_evaluations
+                        .push(crate::projections::GuardrailEvaluationRecord {
+                            policy_id: e.policy_id.clone(),
+                            tenant_id: e.tenant_id.clone(),
+                            subject_type: e.subject_type,
+                            subject_id: e.subject_id.clone(),
+                            action: e.action.clone(),
+                            decision: e.decision,
+                            reason: e.reason.clone(),
+                            evaluated_at_ms: e.evaluated_at_ms,
+                        });
+                }
+            }
+            RuntimeEvent::EventLogCompacted(_)
             | RuntimeEvent::OperatorIntervention(_)
             | RuntimeEvent::PauseScheduled(_)
             | RuntimeEvent::PermissionDecisionRecorded(_)
@@ -3406,6 +3524,33 @@ impl ApprovalReadModel for InMemoryStore {
     }
 }
 
+// -- ApprovalDelegationReadModel --
+
+#[async_trait]
+impl crate::projections::ApprovalDelegationReadModel for InMemoryStore {
+    async fn list_for_approval(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<Vec<crate::projections::ApprovalDelegationRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<_> = state
+            .approval_delegations
+            .iter()
+            .filter(|r| r.approval_id == *approval_id)
+            .cloned()
+            .collect();
+        // Oldest first — matches pg/sqlite `ORDER BY delegated_at_ms ASC,
+        // delegation_id ASC`. `delegation_id` is a stable monotonic
+        // tiebreaker within the same ms.
+        rows.sort_by(|a, b| {
+            a.delegated_at_ms
+                .cmp(&b.delegated_at_ms)
+                .then_with(|| a.delegation_id.cmp(&b.delegation_id))
+        });
+        Ok(rows)
+    }
+}
+
 // -- ToolCallApprovalReadModel --
 
 #[async_trait]
@@ -4862,12 +5007,53 @@ impl crate::projections::GuardrailReadModel for InMemoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<cairn_domain::policy::GuardrailPolicy>, StoreError> {
-        let _ = tenant_id;
+        // RFC-025 Phase 2a.2 milestone 2: tenant-scoped read. pg/sqlite
+        // now filter `guardrail_policies.tenant_id = $1` in SQL; the
+        // in-memory side mirrors that via the sibling
+        // `guardrail_policy_tenants` map. Pre-fix the in-memory impl
+        // silently leaked policies across tenants.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut policies: Vec<_> = state.guardrail_policies.values().cloned().collect();
+        let mut policies: Vec<_> = state
+            .guardrail_policies
+            .values()
+            .filter(|p| {
+                state
+                    .guardrail_policy_tenants
+                    .get(&p.policy_id)
+                    .is_some_and(|t| t == tenant_id)
+            })
+            .cloned()
+            .collect();
         // Sort by policy_id (timestamp-based) for deterministic creation-order iteration.
         policies.sort_by_key(|r| r.policy_id.clone());
         Ok(policies.into_iter().skip(offset).take(limit).collect())
+    }
+}
+
+// -- GuardrailEvaluationReadModel --
+
+#[async_trait]
+impl crate::projections::GuardrailEvaluationReadModel for InMemoryStore {
+    async fn list_evaluations(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::GuardrailEvaluationRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<_> = state
+            .guardrail_evaluations
+            .iter()
+            .filter(|r| r.tenant_id == *tenant_id)
+            .cloned()
+            .collect();
+        // Most-recent first: mirrors pg/sqlite
+        // `ORDER BY evaluated_at_ms DESC, policy_id ASC`.
+        rows.sort_by(|a, b| {
+            b.evaluated_at_ms
+                .cmp(&a.evaluated_at_ms)
+                .then_with(|| a.policy_id.cmp(&b.policy_id))
+        });
+        Ok(rows.into_iter().take(limit).collect())
     }
 }
 
@@ -4890,12 +5076,18 @@ impl crate::projections::LicenseReadModel for InMemoryStore {
         tenant_id: &cairn_domain::TenantId,
     ) -> Result<Vec<cairn_domain::EntitlementOverrideRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2a.2 milestone 4: sort by `feature` ASC to match
+        // the pg/sqlite `ORDER BY feature ASC` contract. HashMap::values
+        // yields unordered output otherwise, which breaks byte-equal
+        // parity with the projection backends.
+        let mut rows: Vec<cairn_domain::EntitlementOverrideRecord> = state
             .entitlement_overrides
             .values()
             .filter(|r| &r.tenant_id == tenant_id)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| a.feature.cmp(&b.feature));
+        Ok(rows)
     }
 }
 
@@ -6203,6 +6395,7 @@ impl InMemoryStore {
         state.runs.clear();
         state.tasks.clear();
         state.approvals.clear();
+        state.approval_delegations.clear();
         state.checkpoints.clear();
         state.mailbox_messages.clear();
         state.tool_invocations.clear();
@@ -6242,6 +6435,9 @@ impl InMemoryStore {
         state.notification_prefs.clear();
         state.notification_records.clear();
         state.guardrail_policies.clear();
+        state.guardrail_policy_tenants.clear();
+        state.guardrail_evaluations.clear();
+        state.guardrail_evaluation_keys.clear();
         state.provider_budgets.clear();
         state.provider_connections.clear();
         state.quotas.clear();
@@ -6364,6 +6560,7 @@ impl InMemoryStore {
             state.runs.clear();
             state.tasks.clear();
             state.approvals.clear();
+            state.approval_delegations.clear();
             state.checkpoints.clear();
             state.mailbox_messages.clear();
             state.tool_invocations.clear();
@@ -6403,6 +6600,9 @@ impl InMemoryStore {
             state.notification_prefs.clear();
             state.notification_records.clear();
             state.guardrail_policies.clear();
+            state.guardrail_policy_tenants.clear();
+            state.guardrail_evaluations.clear();
+            state.guardrail_evaluation_keys.clear();
             state.provider_budgets.clear();
             state.provider_connections.clear();
             state.quotas.clear();
@@ -6687,6 +6887,7 @@ impl InMemoryStore {
         state.runs.clear();
         state.tasks.clear();
         state.approvals.clear();
+        state.approval_delegations.clear();
         state.checkpoints.clear();
         state.mailbox_messages.clear();
         state.tool_invocations.clear();
@@ -6723,6 +6924,9 @@ impl InMemoryStore {
         state.notification_prefs.clear();
         state.notification_records.clear();
         state.guardrail_policies.clear();
+        state.guardrail_policy_tenants.clear();
+        state.guardrail_evaluations.clear();
+        state.guardrail_evaluation_keys.clear();
         state.provider_budgets.clear();
         state.provider_connections.clear();
         state.quotas.clear();
