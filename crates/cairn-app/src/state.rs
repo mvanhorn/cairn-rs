@@ -20,16 +20,15 @@ use cairn_api::onboarding::StarterTemplateRegistry;
 use cairn_api::sse::SseFrame;
 
 use cairn_domain::{
-    KnowledgeDocumentId, ProjectId, ProjectKey, PromptTemplateVar, RuntimeEvent, SourceId, TaskId,
-    TenantId, WorkspaceId,
+    KnowledgeDocumentId, ProjectKey, PromptTemplateVar, RuntimeEvent, SourceId, TaskId, TenantId,
+    WorkspaceId,
 };
 
 use cairn_evals::services::eval_service::{MemoryDiagnosticsSource, SourceQualitySnapshot};
 use cairn_evals::{
     EvalBaselineServiceImpl, EvalDatasetServiceImpl, EvalRubricServiceImpl,
-    EvalRunService as ProductEvalRunService, EvalRunStatus, EvalSubjectKind,
-    GraphIntegration as EvalGraphIntegration, ModelComparisonServiceImpl, PluginDimensionScore,
-    PluginRubricScorer,
+    EvalRunService as ProductEvalRunService, GraphIntegration as EvalGraphIntegration,
+    ModelComparisonServiceImpl, PluginDimensionScore, PluginRubricScorer,
 };
 
 use cairn_graph::event_projector::EventProjector as RuntimeGraphProjector;
@@ -723,134 +722,29 @@ impl AppState {
         }
     }
 
-    /// Replay `EvalRunStarted` / `EvalRunCompleted` events from the event log
-    /// into the in-memory eval service.
-    ///
-    /// `state.evals` is a standalone in-memory service -- it does NOT read from
-    /// the event log on its own.  API handlers that create eval runs now write
-    /// an `EvalRunStarted` event alongside their in-memory insert; this method
-    /// reconstructs that state on boot so eval runs survive restarts.
-    ///
-    /// Note: metrics recorded via `/v1/evals/runs/:id/score` are NOT yet in the
-    /// event log, so they will not be visible after a restart.
-    pub async fn replay_evals(&self) {
-        use cairn_store::event_log::EventLog;
-        let events = match self.runtime.store.read_stream(None, usize::MAX).await {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("eval replay: failed to read events: {e}");
-                return;
-            }
-        };
-
-        let mut created: u32 = 0;
-        let mut completed: u32 = 0;
-        let mut archived: u32 = 0;
-
-        for stored in &events {
-            match &stored.envelope.payload {
-                cairn_domain::RuntimeEvent::EvalRunStarted(e) => {
-                    // Skip if already present (could have been created before replay).
-                    if self.evals.get(&e.eval_run_id).is_some() {
-                        continue;
-                    }
-                    // Reconstruct the EvalRun with what the event carries.
-                    // Metrics are not in the event -- they default to empty.
-                    let subject_kind: EvalSubjectKind =
-                        serde_json::from_str(&format!("\"{}\"", e.subject_kind))
-                            .unwrap_or(EvalSubjectKind::PromptRelease);
-
-                    self.evals.create_run(
-                        e.eval_run_id.clone(),
-                        ProjectId::new(e.project.project_id.as_str()),
-                        subject_kind,
-                        e.evaluator_type.clone(),
-                        e.prompt_asset_id.clone(),
-                        e.prompt_version_id.clone(),
-                        e.prompt_release_id.clone(),
-                        e.created_by.clone(),
-                    );
-                    // Issue #220 (dataset) + #223 (rubric + baseline): restore
-                    // bindings that were previously only held in memory.
-                    // Defaults to None for pre-#220/#223 events
-                    // (serde default on `EvalRunStarted`).
-                    if let Some(dataset_id) = e.dataset_id.as_ref() {
-                        if let Err(err) = self
-                            .evals
-                            .set_dataset_id(&e.eval_run_id, dataset_id.clone())
-                        {
-                            tracing::warn!(
-                                eval_run_id = %e.eval_run_id,
-                                dataset_id = %dataset_id,
-                                "eval replay: set_dataset_id failed: {err}",
-                            );
-                        }
-                    }
-                    if let Some(rubric_id) = e.rubric_id.as_ref() {
-                        if let Err(err) =
-                            self.evals.set_rubric_id(&e.eval_run_id, rubric_id.clone())
-                        {
-                            tracing::warn!(
-                                eval_run_id = %e.eval_run_id,
-                                rubric_id = %rubric_id,
-                                "eval replay: set_rubric_id failed: {err}",
-                            );
-                        }
-                    }
-                    if let Some(baseline_id) = e.baseline_id.as_ref() {
-                        if let Err(err) = self
-                            .evals
-                            .set_baseline_id(&e.eval_run_id, baseline_id.clone())
-                        {
-                            tracing::warn!(
-                                eval_run_id = %e.eval_run_id,
-                                baseline_id = %baseline_id,
-                                "eval replay: set_baseline_id failed: {err}",
-                            );
-                        }
-                    }
-                    created += 1;
-                }
-                cairn_domain::RuntimeEvent::EvalRunCompleted(e) => {
-                    // Transition to completed state if the run exists.
-                    // Best-effort: ignore if run not found (could be from a different
-                    // code path that didn't write EvalRunStarted).
-                    if let Some(run) = self.evals.get(&e.eval_run_id) {
-                        if run.status == EvalRunStatus::Running {
-                            let _ = self.evals.complete_run(
-                                &e.eval_run_id,
-                                Default::default(), // metrics not in event
-                                None,
-                            );
-                            completed += 1;
-                        }
-                    }
-                }
-                // Issue #244: re-apply soft-delete state on restart so
-                // archived runs stay hidden from the default list and
-                // DELETE stays idempotent across process boots. Runs the
-                // event sees but doesn't yet have an in-memory record for
-                // are a no-op — `archive` returns NotFound.
-                cairn_domain::RuntimeEvent::EvalRunArchived(e) => {
-                    if let Err(err) = self.evals.archive(&e.eval_run_id, e.archived_at) {
-                        tracing::warn!(
-                            eval_run_id = %e.eval_run_id,
-                            "eval replay: EvalRunArchived apply failed: {err}",
-                        );
-                    } else {
-                        archived += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if created > 0 || completed > 0 || archived > 0 {
-            tracing::info!(
-                "eval replay: restored {created} runs ({completed} completed, {archived} archived)"
-            );
-        }
-    }
+    // RFC-025 Phase 1 (milestone 6): `replay_evals` removed.
+    //
+    // Before Phase 1, `state.evals` was a standalone in-memory service that
+    // did NOT read from the event log on its own, so boot had to walk the
+    // full log (O(N) per process restart per domain) to rebuild it. That
+    // walker was #437: a hand-rolled projection outside the SyncProjection
+    // framework, with two projection paths for the same domain and only
+    // one (the in-memory one) actually backed by the event log.
+    //
+    // Milestones 3/4 land real `eval_runs` projection tables on pg +
+    // sqlite (V034 migration), wired inside `PgSyncProjection::apply_async`
+    // / `SqliteSyncProjection::apply_async`. The in-memory projection
+    // applier in `cairn-store::in_memory` builds the same read model for
+    // `--db memory`. All three backends now expose `EvalRunReadModel` and
+    // are byte-equal per the projection_parity harness in
+    // `crates/cairn-store/tests/projection_parity.rs`.
+    //
+    // `state.evals` (the standalone in-memory service) continues to exist
+    // as a lazy hot-path cache for the handler response bodies that still
+    // return the richer `EvalRun` shape (includes plugin_metrics etc.)
+    // rather than the `EvalRunRecord` projection shape. It is populated on
+    // the write path inside each handler; a process restart drops the cache
+    // but every durable field reads back from the projection.
 
     /// Replay trigger/template lifecycle and fire outcomes into the in-memory trigger service.
     pub async fn replay_triggers(&self) {

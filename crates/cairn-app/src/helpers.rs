@@ -1005,6 +1005,8 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::EvalRunStarted(_) => "eval_run_started",
         RuntimeEvent::EvalRunCompleted(_) => "eval_run_completed",
         RuntimeEvent::EvalRunArchived(_) => "eval_run_archived",
+        RuntimeEvent::EvalRunScored(_) => "eval_run_scored",
+        RuntimeEvent::EvalRubricScored(_) => "eval_rubric_scored",
         RuntimeEvent::PromptAssetCreated(_) => "prompt_asset_created",
         RuntimeEvent::PromptVersionCreated(_) => "prompt_version_created",
         RuntimeEvent::PromptReleaseCreated(_) => "prompt_release_created",
@@ -1399,6 +1401,15 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         }
         RuntimeEvent::EvalRunArchived(eval_run) => {
             format!("Eval run {} archived", eval_run.eval_run_id)
+        }
+        RuntimeEvent::EvalRunScored(eval_run) => {
+            format!("Eval run {} scored", eval_run.eval_run_id)
+        }
+        RuntimeEvent::EvalRubricScored(eval_run) => {
+            format!(
+                "Eval run {} rubric-scored against {}",
+                eval_run.eval_run_id, eval_run.rubric_id
+            )
         }
         RuntimeEvent::PromptAssetCreated(asset) => {
             format!("Prompt asset {} created", asset.prompt_asset_id)

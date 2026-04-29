@@ -244,6 +244,12 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::EvalRunArchived(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
         }
+        RuntimeEvent::EvalRunScored(_) => {
+            assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
+        }
+        RuntimeEvent::EvalRubricScored(_) => {
+            assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
+        }
 
         // ── Entity-scoped: project() real, entity_ref = None or conditional ─
         RuntimeEvent::RecoveryAttempted(_) => {
@@ -986,6 +992,20 @@ fn all_variants() -> Vec<RuntimeEvent> {
             project: p(),
             eval_run_id: EvalRunId::new("er1"),
             archived_at: ts,
+        }),
+        RuntimeEvent::EvalRunScored(cairn_domain::EvalRunScored {
+            project: p(),
+            eval_run_id: EvalRunId::new("er1"),
+            metrics: cairn_domain::EvalMetrics::default(),
+            recorded_at_ms: ts,
+        }),
+        RuntimeEvent::EvalRubricScored(cairn_domain::EvalRubricScored {
+            project: p(),
+            eval_run_id: EvalRunId::new("er1"),
+            rubric_id: "ru1".to_owned(),
+            dimension_scores: vec![],
+            overall: 0.0,
+            recorded_at_ms: ts,
         }),
         RuntimeEvent::OutcomeRecorded(cairn_domain::OutcomeRecorded {
             project: p(),
@@ -1925,17 +1945,18 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 156 variants in the RuntimeEvent enum (143 baseline + F65 PR-1
+    // 158 variants in the RuntimeEvent enum (143 baseline + F65 PR-1
     // orchestrator session redesign foundation: SessionAttemptStarted,
     // SessionAttemptCompleted, CircuitBreakerTripped, BudgetThresholdCrossed,
     // CheckpointPersisted, WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
     // SessionOutcomeEmitted, OrchestratorDecisionMade, SummarizerFallback,
     // WorkspaceBackendDegraded — 11 new variants, plus #244's EvalRunArchived,
-    // plus F65 PR-5's SandboxCrashRecovered (#359 umount sweep)).
+    // plus F65 PR-5's SandboxCrashRecovered (#359 umount sweep), plus RFC-025
+    // Phase 1's EvalRunScored + EvalRubricScored).
     assert_eq!(
         variants.len(),
-        156,
-        "all_variants() must construct exactly 156 RuntimeEvent instances"
+        158,
+        "all_variants() must construct exactly 158 RuntimeEvent instances"
     );
 }
 

@@ -1512,8 +1512,17 @@ async fn real_main() {
     // Replay all store events into in-memory projections so pre-existing data
     // (seeded above or loaded from a snapshot) is immediately visible without
     // requiring an SSE connection first.
+    //
+    // RFC-025 Phase 1 (milestone 6) deleted `replay_evals` — the eval_runs
+    // projection is now the canonical read model (pg V034 + sqlite schema).
+    // `state.evals` is still populated lazily via handler writes on the hot
+    // path; a process restart drops the in-memory cache but all durable eval
+    // state (runs, scores, rubric verdicts, archived-at timestamps) reads
+    // back from the projection tables.
+    //
+    // replay_graph + replay_triggers continue to run here; they migrate to
+    // sync projections in Phases 1.5b + 1.5a respectively.
     lib_state.replay_graph().await;
-    lib_state.replay_evals().await;
     lib_state.replay_triggers().await;
 
     // ── META #461: legacy credential-format scan ─────────────────────────────

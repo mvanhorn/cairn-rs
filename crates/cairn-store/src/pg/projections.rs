@@ -395,9 +395,107 @@ impl PgSyncProjection {
             RuntimeEvent::UserMessageAppended(_) => log_stub("UserMessageAppended"),
             RuntimeEvent::IngestJobStarted(_) => log_stub("IngestJobStarted"),
             RuntimeEvent::IngestJobCompleted(_) => log_stub("IngestJobCompleted"),
-            RuntimeEvent::EvalRunStarted(_) => log_stub("EvalRunStarted"),
-            RuntimeEvent::EvalRunCompleted(_) => log_stub("EvalRunCompleted"),
-            RuntimeEvent::EvalRunArchived(_) => log_stub("EvalRunArchived"),
+            // RFC-025 Phase 1 (milestone 3): `eval_runs` projection.
+            // Upsert on Started so re-emitting the lifecycle edge
+            // doesn't clobber prior score/completion state (the
+            // in-memory applier uses the same or_insert_with pattern).
+            RuntimeEvent::EvalRunStarted(e) => {
+                sqlx::query(
+                    "INSERT INTO eval_runs
+                         (eval_run_id, tenant_id, workspace_id, project_id,
+                          subject_kind, evaluator_type,
+                          success, error_message, started_at, completed_at,
+                          archived_at, metrics_json, rubric_score_json,
+                          dataset_id, rubric_id, baseline_id,
+                          prompt_asset_id, prompt_version_id, prompt_release_id,
+                          created_by)
+                     VALUES ($1, $2, $3, $4, $5, $6,
+                             NULL, NULL, $7, NULL, NULL, NULL, NULL,
+                             $8, $9, $10, $11, $12, $13, $14)
+                     ON CONFLICT (eval_run_id) DO NOTHING",
+                )
+                .bind(e.eval_run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.subject_kind)
+                .bind(&e.evaluator_type)
+                .bind(e.started_at as i64)
+                .bind(e.dataset_id.as_deref())
+                .bind(e.rubric_id.as_deref())
+                .bind(e.baseline_id.as_deref())
+                .bind(e.prompt_asset_id.as_ref().map(|v| v.as_str()))
+                .bind(e.prompt_version_id.as_ref().map(|v| v.as_str()))
+                .bind(e.prompt_release_id.as_ref().map(|v| v.as_str()))
+                .bind(e.created_by.as_ref().map(|v| v.as_str()))
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRunCompleted(e) => {
+                sqlx::query(
+                    "UPDATE eval_runs
+                     SET success = $1,
+                         error_message = $2,
+                         completed_at = $3
+                     WHERE eval_run_id = $4",
+                )
+                .bind(e.success)
+                .bind(e.error_message.as_deref())
+                .bind(e.completed_at as i64)
+                .bind(e.eval_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRunArchived(e) => {
+                // Earliest-wins on archived_at (mirrors in-memory
+                // `EvalRunService::archive` idempotency: two concurrent
+                // DELETEs must not bump the timestamp to the later
+                // attempt — Copilot review on PR #336).
+                sqlx::query(
+                    "UPDATE eval_runs
+                     SET archived_at = $1
+                     WHERE eval_run_id = $2 AND archived_at IS NULL",
+                )
+                .bind(e.archived_at as i64)
+                .bind(e.eval_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRunScored(e) => {
+                // Serialize EvalMetrics as JSON; stored in a TEXT column
+                // for cross-backend parity with sqlite (no JSONB).
+                let metrics_json = serde_json::to_string(&e.metrics)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                sqlx::query(
+                    "UPDATE eval_runs SET metrics_json = $1 WHERE eval_run_id = $2",
+                )
+                .bind(metrics_json)
+                .bind(e.eval_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRubricScored(e) => {
+                let summary = crate::projections::EvalRubricScoreSummary {
+                    rubric_id: e.rubric_id.clone(),
+                    dimension_scores: e.dimension_scores.clone(),
+                    overall: e.overall,
+                    recorded_at_ms: e.recorded_at_ms,
+                };
+                let rubric_json = serde_json::to_string(&summary)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                sqlx::query(
+                    "UPDATE eval_runs SET rubric_score_json = $1 WHERE eval_run_id = $2",
+                )
+                .bind(rubric_json)
+                .bind(e.eval_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::OutcomeRecorded(_) => log_stub("OutcomeRecorded"),
             RuntimeEvent::ScheduledTaskCreated(_) => log_stub("ScheduledTaskCreated"),
             RuntimeEvent::PlanProposed(_) => log_stub("PlanProposed"),

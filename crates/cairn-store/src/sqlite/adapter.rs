@@ -2082,6 +2082,147 @@ impl crate::projections::F65CheckpointReadModel for SqliteAdapter {
     }
 }
 
+// ── RFC-025 Phase 1 (milestone 4): EvalRunReadModel ──────────────────────────
+//
+// sqlite parity with `PgAdapter`'s eval_runs impl. Same 20-column
+// SELECT (shape documented by the `EvalRunRow` struct below), same
+// serde_json::from_str for metrics_json / rubric_score_json. Parity
+// harness asserts byte-equality against the in-memory store + pg under
+// TEST_DATABASE_URL.
+
+/// Named row struct for the `eval_runs` projection on sqlite. Mirrors
+/// `pg::adapter::EvalRunRow` — 20 columns, which exceeds sqlx's tuple
+/// `FromRow` impls (capped at 16), so we use derive(FromRow).
+#[derive(sqlx::FromRow)]
+struct EvalRunRow {
+    eval_run_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    subject_kind: String,
+    evaluator_type: String,
+    success: Option<bool>,
+    error_message: Option<String>,
+    started_at: i64,
+    completed_at: Option<i64>,
+    archived_at: Option<i64>,
+    metrics_json: Option<String>,
+    rubric_score_json: Option<String>,
+    dataset_id: Option<String>,
+    rubric_id: Option<String>,
+    baseline_id: Option<String>,
+    prompt_asset_id: Option<String>,
+    prompt_version_id: Option<String>,
+    prompt_release_id: Option<String>,
+    created_by: Option<String>,
+}
+
+const EVAL_RUN_SELECT_COLS: &str = "eval_run_id, tenant_id, workspace_id, project_id, \
+     subject_kind, evaluator_type, \
+     success, error_message, started_at, completed_at, \
+     archived_at, metrics_json, rubric_score_json, \
+     dataset_id, rubric_id, baseline_id, \
+     prompt_asset_id, prompt_version_id, prompt_release_id, \
+     created_by";
+
+#[async_trait]
+impl crate::projections::EvalRunReadModel for SqliteAdapter {
+    async fn get(
+        &self,
+        eval_run_id: &cairn_domain::EvalRunId,
+    ) -> Result<Option<crate::projections::EvalRunRecord>, StoreError> {
+        let sql = format!("SELECT {EVAL_RUN_SELECT_COLS} FROM eval_runs WHERE eval_run_id = ?");
+        let row: Option<EvalRunRow> = sqlx::query_as(&sql)
+            .bind(eval_run_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        row.map(sqlite_row_to_eval_run_record).transpose()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::EvalRunRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {EVAL_RUN_SELECT_COLS} FROM eval_runs
+             WHERE tenant_id = ? AND workspace_id = ? AND project_id = ?
+             ORDER BY started_at ASC, eval_run_id ASC
+             LIMIT ? OFFSET ?"
+        );
+        let rows: Vec<EvalRunRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        rows.into_iter()
+            .map(sqlite_row_to_eval_run_record)
+            .collect()
+    }
+}
+
+/// sqlite equivalent of `pg::adapter::pg_row_to_eval_run_record`. Parity
+/// harness asserts the two produce byte-identical `EvalRunRecord`s for
+/// the same event sequence.
+fn sqlite_row_to_eval_run_record(
+    row: EvalRunRow,
+) -> Result<crate::projections::EvalRunRecord, StoreError> {
+    let metrics = match row.metrics_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str::<cairn_domain::EvalMetrics>(s).map_err(|e| {
+                StoreError::Internal(format!(
+                    "eval_runs.metrics_json parse error for {}: {e}",
+                    row.eval_run_id
+                ))
+            })?,
+        ),
+        None => None,
+    };
+    let rubric_score = match row.rubric_score_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str::<crate::projections::EvalRubricScoreSummary>(s).map_err(|e| {
+                StoreError::Internal(format!(
+                    "eval_runs.rubric_score_json parse error for {}: {e}",
+                    row.eval_run_id
+                ))
+            })?,
+        ),
+        None => None,
+    };
+    Ok(crate::projections::EvalRunRecord {
+        eval_run_id: cairn_domain::EvalRunId::new(row.eval_run_id),
+        project: cairn_domain::ProjectKey::new(row.tenant_id, row.workspace_id, row.project_id),
+        subject_kind: row.subject_kind,
+        evaluator_type: row.evaluator_type,
+        success: row.success,
+        error_message: row.error_message,
+        started_at: row.started_at.max(0) as u64,
+        completed_at: row.completed_at.map(|v| v.max(0) as u64),
+        archived_at: row.archived_at.map(|v| v.max(0) as u64),
+        metrics,
+        rubric_score,
+        dataset_id: row.dataset_id,
+        rubric_id: row.rubric_id,
+        baseline_id: row.baseline_id,
+        prompt_asset_id: row.prompt_asset_id.map(cairn_domain::PromptAssetId::new),
+        prompt_version_id: row
+            .prompt_version_id
+            .map(cairn_domain::PromptVersionId::new),
+        prompt_release_id: row
+            .prompt_release_id
+            .map(cairn_domain::PromptReleaseId::new),
+        created_by: row.created_by.map(cairn_domain::OperatorId::new),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -711,4 +711,36 @@ CREATE TABLE IF NOT EXISTS tool_invocation_progress (
 
 CREATE INDEX IF NOT EXISTS idx_tool_invocation_progress_tenant
     ON tool_invocation_progress (tenant_id, workspace_id, project_id);
+
+-- RFC-025 Phase 1 (milestone 4): eval_runs projection — parity with the
+-- pg V034 schema. Portable types only (no JSONB, no arrays): metrics +
+-- rubric verdict ride on TEXT columns as serde-JSON blobs. Mirror at
+-- `crates/cairn-store/src/pg/migrations/V034__create_eval_runs.sql`.
+CREATE TABLE IF NOT EXISTS eval_runs (
+    eval_run_id       TEXT    PRIMARY KEY,
+    tenant_id         TEXT    NOT NULL,
+    workspace_id      TEXT    NOT NULL,
+    project_id        TEXT    NOT NULL,
+    subject_kind      TEXT    NOT NULL,
+    evaluator_type    TEXT    NOT NULL,
+    -- sqlx maps Option<bool> onto SQLite INTEGER 0/1 (NULL for unset).
+    success           INTEGER,
+    error_message     TEXT,
+    started_at        INTEGER NOT NULL,
+    completed_at      INTEGER,
+    archived_at       INTEGER,
+    metrics_json      TEXT,
+    rubric_score_json TEXT,
+    -- RFC-025 milestone 6: run-bound metadata. See pg V034 for rationale.
+    dataset_id        TEXT,
+    rubric_id         TEXT,
+    baseline_id       TEXT,
+    prompt_asset_id   TEXT,
+    prompt_version_id TEXT,
+    prompt_release_id TEXT,
+    created_by        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_runs_project
+    ON eval_runs (tenant_id, workspace_id, project_id, started_at);
 "#;

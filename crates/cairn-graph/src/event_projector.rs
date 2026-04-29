@@ -504,7 +504,17 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::OrchestratorDecisionMade(_)
             | RuntimeEvent::SummarizerFallback(_)
             | RuntimeEvent::WorkspaceBackendDegraded(_)
-            | RuntimeEvent::SandboxCrashRecovered(_) => {}
+            | RuntimeEvent::SandboxCrashRecovered(_)
+            // RFC-025 Phase 1: eval scoring events are projection-only
+            // (they update the `eval_runs` read-model metrics columns in
+            // milestones 3/4/5). The graph projector does not need to
+            // create nodes or edges for score updates — the
+            // `EvalRunStarted` arm below already places the eval run
+            // node in the graph; score events are metric updates on that
+            // existing node, observable via the `eval_runs` table, not
+            // via new graph edges.
+            | RuntimeEvent::EvalRunScored(_)
+            | RuntimeEvent::EvalRubricScored(_) => {}
 
             RuntimeEvent::EvalRunStarted(e) => {
                 self.add_node(

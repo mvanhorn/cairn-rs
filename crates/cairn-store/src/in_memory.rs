@@ -1996,9 +1996,19 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::EvalRunStarted(e) => {
-                state.eval_runs.insert(
-                    e.eval_run_id.as_str().to_owned(),
-                    crate::projections::EvalRunRecord {
+                // Idempotency / lifecycle-edge pattern (RFC-025 Phase 1
+                // milestone 2): `EvalRunStarted` is emitted both by
+                // `create_eval_run_handler` (initial projection row) and
+                // by `start_eval_run_handler` (Pending → Running edge).
+                // The second emission MUST NOT clobber score/completion
+                // fields that were set between the two edges, so the
+                // projection upserts only fields that are unconditionally
+                // part of the "start" shape. Score / Completed / Archive
+                // events run their own arms.
+                state
+                    .eval_runs
+                    .entry(e.eval_run_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::EvalRunRecord {
                         eval_run_id: e.eval_run_id.clone(),
                         project: e.project.clone(),
                         subject_kind: e.subject_kind.clone(),
@@ -2008,8 +2018,16 @@ impl InMemoryStore {
                         started_at: e.started_at,
                         completed_at: None,
                         archived_at: None,
-                    },
-                );
+                        metrics: None,
+                        rubric_score: None,
+                        dataset_id: e.dataset_id.clone(),
+                        rubric_id: e.rubric_id.clone(),
+                        baseline_id: e.baseline_id.clone(),
+                        prompt_asset_id: e.prompt_asset_id.clone(),
+                        prompt_version_id: e.prompt_version_id.clone(),
+                        prompt_release_id: e.prompt_release_id.clone(),
+                        created_by: e.created_by.clone(),
+                    });
             }
             RuntimeEvent::EvalRunCompleted(e) => {
                 if let Some(rec) = state.eval_runs.get_mut(e.eval_run_id.as_str()) {
@@ -2031,6 +2049,29 @@ impl InMemoryStore {
                     if rec.archived_at.is_none() {
                         rec.archived_at = Some(e.archived_at);
                     }
+                }
+            }
+            // RFC-025 Phase 1 (milestone 5): project the most-recent
+            // metrics / rubric verdict onto the read model. Last-write
+            // wins — the full score history lives in the event log. If
+            // the run record doesn't exist yet (score landed before
+            // `EvalRunStarted` replayed) the score arm is a no-op rather
+            // than fabricating a ProjectKey / started_at; the sync
+            // projection runs inside the same `&mut tx` as the insert so
+            // this ordering only matters during replay.
+            RuntimeEvent::EvalRunScored(e) => {
+                if let Some(rec) = state.eval_runs.get_mut(e.eval_run_id.as_str()) {
+                    rec.metrics = Some(e.metrics.clone());
+                }
+            }
+            RuntimeEvent::EvalRubricScored(e) => {
+                if let Some(rec) = state.eval_runs.get_mut(e.eval_run_id.as_str()) {
+                    rec.rubric_score = Some(crate::projections::EvalRubricScoreSummary {
+                        rubric_id: e.rubric_id.clone(),
+                        dimension_scores: e.dimension_scores.clone(),
+                        overall: e.overall,
+                        recorded_at_ms: e.recorded_at_ms,
+                    });
                 }
             }
             RuntimeEvent::OutcomeRecorded(e) => {

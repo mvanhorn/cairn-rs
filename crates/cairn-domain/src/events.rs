@@ -141,6 +141,18 @@ pub enum RuntimeEvent {
     /// Issue #244: eval run soft-deleted. The run record is preserved for
     /// audit/history; list endpoints filter it out by default.
     EvalRunArchived(EvalRunArchived),
+    /// RFC-025 Phase 1 (#435): eval run metrics recorded via
+    /// `POST /v1/evals/runs/:id/score`. Prior to this event the handler
+    /// mutated `state.evals` in-process only, so scores were lost on
+    /// restart. The event carries the full `EvalMetrics` struct so
+    /// per-metric fields survive replay and are byte-equal across
+    /// pg/sqlite/in-memory projections.
+    EvalRunScored(EvalRunScored),
+    /// RFC-025 Phase 1 (#435): rubric scoring recorded via
+    /// `POST /v1/evals/runs/:id/rubric-score`. Carries the per-dimension
+    /// weighted scores + overall weighted score so the projection can
+    /// rebuild the rubric verdict after a process restart.
+    EvalRubricScored(EvalRubricScored),
     PromptAssetCreated(PromptAssetCreated),
     PromptVersionCreated(PromptVersionCreated),
     ApprovalPolicyCreated(ApprovalPolicyCreated),
@@ -358,6 +370,8 @@ impl RuntimeEvent {
             RuntimeEvent::EvalRunStarted(event) => &event.project,
             RuntimeEvent::EvalRunCompleted(event) => &event.project,
             RuntimeEvent::EvalRunArchived(event) => &event.project,
+            RuntimeEvent::EvalRunScored(event) => &event.project,
+            RuntimeEvent::EvalRubricScored(event) => &event.project,
             RuntimeEvent::PromptAssetCreated(event) => &event.project,
             RuntimeEvent::PromptVersionCreated(event) => &event.project,
             RuntimeEvent::ApprovalPolicyCreated(event) => &event.project,
@@ -609,6 +623,12 @@ impl RuntimeEvent {
                 eval_run_id: event.eval_run_id.clone(),
             }),
             RuntimeEvent::EvalRunArchived(event) => Some(RuntimeEntityRef::EvalRun {
+                eval_run_id: event.eval_run_id.clone(),
+            }),
+            RuntimeEvent::EvalRunScored(event) => Some(RuntimeEntityRef::EvalRun {
+                eval_run_id: event.eval_run_id.clone(),
+            }),
+            RuntimeEvent::EvalRubricScored(event) => Some(RuntimeEntityRef::EvalRun {
                 eval_run_id: event.eval_run_id.clone(),
             }),
             RuntimeEvent::OutcomeRecorded(event) => Some(RuntimeEntityRef::Run {
@@ -1435,6 +1455,112 @@ pub struct EvalRunCompleted {
     pub subject_node_id: Option<String>,
     pub completed_at: u64,
 }
+
+/// RFC-025 Phase 1 (#435): score recorded for an eval run.
+///
+/// Emitted by `score_eval_run_handler` when an operator posts metrics to
+/// `POST /v1/evals/runs/:id/score`. The full `EvalMetrics` payload is
+/// carried so the projection can surface each canonical metric field
+/// (task_success_rate, latency_p50_ms, etc.) after a restart. Without this
+/// event, metrics were only held in the in-process `EvalRunService` and
+/// silently vanished across a reboot (RFC-025 §#435).
+///
+/// `EvalMetrics` holds `Option<f64>` fields, so `Eq` cannot be derived.
+/// Follows the `OutcomeRecorded` pattern: hand-rolled `PartialEq`/`Eq`
+/// that hashes NaN deterministically via `to_bits()` so the enum-wide
+/// `#[derive(Eq)]` on `RuntimeEvent` stays valid.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalRunScored {
+    pub project: ProjectKey,
+    pub eval_run_id: EvalRunId,
+    /// Full metrics block captured at scoring time. Stored verbatim so
+    /// projection reads can reconstruct every canonical field.
+    pub metrics: crate::evals::EvalMetrics,
+    pub recorded_at_ms: u64,
+}
+
+impl PartialEq for EvalRunScored {
+    fn eq(&self, other: &Self) -> bool {
+        fn opt_bits(a: Option<f64>, b: Option<f64>) -> bool {
+            match (a, b) {
+                (Some(x), Some(y)) => x.to_bits() == y.to_bits(),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        self.project == other.project
+            && self.eval_run_id == other.eval_run_id
+            && self.recorded_at_ms == other.recorded_at_ms
+            && opt_bits(
+                self.metrics.task_success_rate,
+                other.metrics.task_success_rate,
+            )
+            && self.metrics.latency_p50_ms == other.metrics.latency_p50_ms
+            && self.metrics.latency_p99_ms == other.metrics.latency_p99_ms
+            && opt_bits(self.metrics.cost_per_run, other.metrics.cost_per_run)
+            && opt_bits(
+                self.metrics.policy_pass_rate,
+                other.metrics.policy_pass_rate,
+            )
+            && opt_bits(
+                self.metrics.retrieval_hit_at_k,
+                other.metrics.retrieval_hit_at_k,
+            )
+            && opt_bits(
+                self.metrics.citation_coverage,
+                other.metrics.citation_coverage,
+            )
+            && opt_bits(
+                self.metrics.source_diversity,
+                other.metrics.source_diversity,
+            )
+            && self.metrics.retrieval_latency_ms == other.metrics.retrieval_latency_ms
+            && opt_bits(self.metrics.retrieval_cost, other.metrics.retrieval_cost)
+    }
+}
+
+impl Eq for EvalRunScored {}
+
+/// RFC-025 Phase 1 (#435): rubric-scored verdict recorded for an eval run.
+///
+/// Emitted by `score_eval_rubric_handler` when an operator posts
+/// `{rubric_id, actual_outputs}` to `POST /v1/evals/runs/:id/rubric-score`.
+/// Carries the rubric id, the per-dimension weighted scores, and the
+/// overall weighted aggregate so the projection can rebuild the verdict
+/// after a restart without re-scoring against the dataset.
+///
+/// `f64` values use the `OutcomeRecorded` pattern for `PartialEq`/`Eq`
+/// so NaN round-trips deterministically.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EvalRubricScored {
+    pub project: ProjectKey,
+    pub eval_run_id: EvalRunId,
+    pub rubric_id: String,
+    /// Per-dimension `(dimension_name, weighted_score)` pairs, in the
+    /// order the rubric evaluated them.
+    pub dimension_scores: Vec<(String, f64)>,
+    /// Overall weighted score in `[0.0, 1.0]`.
+    pub overall: f64,
+    pub recorded_at_ms: u64,
+}
+
+impl PartialEq for EvalRubricScored {
+    fn eq(&self, other: &Self) -> bool {
+        self.project == other.project
+            && self.eval_run_id == other.eval_run_id
+            && self.rubric_id == other.rubric_id
+            && self.recorded_at_ms == other.recorded_at_ms
+            && self.overall.to_bits() == other.overall.to_bits()
+            && self.dimension_scores.len() == other.dimension_scores.len()
+            && self
+                .dimension_scores
+                .iter()
+                .zip(other.dimension_scores.iter())
+                .all(|((an, av), (bn, bv))| an == bn && av.to_bits() == bv.to_bits())
+    }
+}
+
+impl Eq for EvalRubricScored {}
 
 /// Actual outcome classification for an agent execution.
 ///

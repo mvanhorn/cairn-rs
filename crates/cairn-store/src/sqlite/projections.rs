@@ -433,9 +433,100 @@ impl SqliteSyncProjection {
             RuntimeEvent::UserMessageAppended(_) => log_stub("UserMessageAppended"),
             RuntimeEvent::IngestJobStarted(_) => log_stub("IngestJobStarted"),
             RuntimeEvent::IngestJobCompleted(_) => log_stub("IngestJobCompleted"),
-            RuntimeEvent::EvalRunStarted(_) => log_stub("EvalRunStarted"),
-            RuntimeEvent::EvalRunCompleted(_) => log_stub("EvalRunCompleted"),
-            RuntimeEvent::EvalRunArchived(_) => log_stub("EvalRunArchived"),
+            // RFC-025 Phase 1 (milestone 4): `eval_runs` projection —
+            // sqlite parity with the pg applier in
+            // `crates/cairn-store/src/pg/projections.rs`. Same
+            // last-write-wins + earliest-wins-on-archive semantics,
+            // same serde-JSON-in-TEXT shape for metrics / rubric
+            // verdict. If the two appliers ever drift, the
+            // projection_parity harness below catches it.
+            RuntimeEvent::EvalRunStarted(e) => {
+                sqlx::query(
+                    "INSERT INTO eval_runs
+                         (eval_run_id, tenant_id, workspace_id, project_id,
+                          subject_kind, evaluator_type,
+                          success, error_message, started_at, completed_at,
+                          archived_at, metrics_json, rubric_score_json,
+                          dataset_id, rubric_id, baseline_id,
+                          prompt_asset_id, prompt_version_id, prompt_release_id,
+                          created_by)
+                     VALUES (?, ?, ?, ?, ?, ?,
+                             NULL, NULL, ?, NULL, NULL, NULL, NULL,
+                             ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(eval_run_id) DO NOTHING",
+                )
+                .bind(e.eval_run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.subject_kind)
+                .bind(&e.evaluator_type)
+                .bind(e.started_at as i64)
+                .bind(e.dataset_id.as_deref())
+                .bind(e.rubric_id.as_deref())
+                .bind(e.baseline_id.as_deref())
+                .bind(e.prompt_asset_id.as_ref().map(|v| v.as_str()))
+                .bind(e.prompt_version_id.as_ref().map(|v| v.as_str()))
+                .bind(e.prompt_release_id.as_ref().map(|v| v.as_str()))
+                .bind(e.created_by.as_ref().map(|v| v.as_str()))
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRunCompleted(e) => {
+                sqlx::query(
+                    "UPDATE eval_runs
+                     SET success = ?,
+                         error_message = ?,
+                         completed_at = ?
+                     WHERE eval_run_id = ?",
+                )
+                .bind(e.success)
+                .bind(e.error_message.as_deref())
+                .bind(e.completed_at as i64)
+                .bind(e.eval_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRunArchived(e) => {
+                sqlx::query(
+                    "UPDATE eval_runs
+                     SET archived_at = ?
+                     WHERE eval_run_id = ? AND archived_at IS NULL",
+                )
+                .bind(e.archived_at as i64)
+                .bind(e.eval_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRunScored(e) => {
+                let metrics_json = serde_json::to_string(&e.metrics)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                sqlx::query("UPDATE eval_runs SET metrics_json = ? WHERE eval_run_id = ?")
+                    .bind(metrics_json)
+                    .bind(e.eval_run_id.as_str())
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRubricScored(e) => {
+                let summary = crate::projections::EvalRubricScoreSummary {
+                    rubric_id: e.rubric_id.clone(),
+                    dimension_scores: e.dimension_scores.clone(),
+                    overall: e.overall,
+                    recorded_at_ms: e.recorded_at_ms,
+                };
+                let rubric_json = serde_json::to_string(&summary)
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+                sqlx::query("UPDATE eval_runs SET rubric_score_json = ? WHERE eval_run_id = ?")
+                    .bind(rubric_json)
+                    .bind(e.eval_run_id.as_str())
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::PromptAssetCreated(e) => {
                 sqlx::query(
                     "INSERT INTO prompt_assets

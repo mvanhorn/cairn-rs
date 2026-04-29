@@ -385,15 +385,66 @@ pub(crate) async fn list_eval_runs_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListEvalRunsQuery>,
 ) -> impl IntoResponse {
-    let project_id = query.scope.project().project_id;
+    let project_key = query.scope.project();
+    let project_id = project_key.project_id.clone();
     let limit = query.scope.limit.unwrap_or(100);
     let offset = query.scope.offset.unwrap_or(0);
-    // Issue #244: archived runs are excluded by default so the EvalsPage
-    // doesn't show soft-deleted rows. `?include_archived=true` surfaces them
-    // for audit and admin recovery flows.
-    let mut items = state
+    // Projection-first read. In-memory-only lists are empty after a
+    // process restart; the `eval_runs` projection is the durable
+    // canonical source. Issue #244: archived runs excluded by default
+    // unless `?include_archived=true`.
+    //
+    // Pagination: when include_archived=true the page is `offset + limit
+    // + 1` for a tight has_more. When include_archived=false we
+    // over-fetch (10x the page) so that in-memory filtering doesn't
+    // under-fill — the projection trait doesn't yet carry an
+    // archived-filter knob. This is strictly better than the earlier
+    // hardcoded 10_000 cap (which silently truncated lists beyond 10k)
+    // and will collapse to a single native-SQL LIMIT once Phase 2a's
+    // read-model filter knob lands. Archived runs are typically a
+    // small fraction of the corpus, so 10x is the upper bound; if a
+    // workspace ever hits a pathological archive ratio a subsequent
+    // request with include_archived=true surfaces them for audit.
+    use cairn_store::projections::EvalRunReadModel;
+    let base_fetch = offset.saturating_add(limit).saturating_add(1);
+    let fetch_total = if query.include_archived {
+        base_fetch
+    } else {
+        base_fetch.saturating_mul(10)
+    };
+    let projection_records = match EvalRunReadModel::list_by_project(
+        state.runtime.store.as_ref(),
+        &project_key,
+        fetch_total,
+        0,
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(err) => return store_error_response(err),
+    };
+    // Filter archived in memory until the read model gains a native
+    // filter. Scope is (tenant, workspace, project) so the page is
+    // bounded.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut items: Vec<cairn_evals::EvalRun> = Vec::with_capacity(projection_records.len());
+    for rec in &projection_records {
+        seen.insert(rec.eval_run_id.as_str().to_owned());
+        if query.include_archived || rec.archived_at.is_none() {
+            items.push(eval_run_record_to_product_run(rec));
+        }
+    }
+    // Merge in-memory-only entries that the projection hasn't
+    // surfaced yet. Steady-state the projection is a superset; this
+    // merge is defense-in-depth for append-vs-read races.
+    for run in state
         .evals
-        .list_by_project_include_archived(&project_id, query.include_archived);
+        .list_by_project_include_archived(&project_id, query.include_archived)
+    {
+        if !seen.contains(run.eval_run_id.as_str()) {
+            items.push(run);
+        }
+    }
     let has_more = items.len() > offset.saturating_add(limit);
     items = items.into_iter().skip(offset).take(limit).collect();
     (StatusCode::OK, Json(ListResponse { has_more, items })).into_response()
@@ -403,10 +454,74 @@ pub(crate) async fn get_eval_run_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.evals.get(&EvalRunId::new(id)) {
-        Some(run) => (StatusCode::OK, Json(run)).into_response(),
-        None => AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+    let eval_run_id = EvalRunId::new(id);
+    // Read preference: in-memory cache first (richer shape:
+    // plugin_metrics, dataset_source, cost — fields that never flowed
+    // through the event log), then projection fallback. After a
+    // process restart the cache is cold and the projection is the
+    // only source; durable fields (dataset_id / rubric_id /
+    // baseline_id / prompt_* / metrics / rubric_score / archived_at —
+    // contracts locked by #220, #223, #244, #435, #436) come back,
+    // non-durable fields (plugin_metrics, dataset_source, cost)
+    // surface as empty defaults.
+    if let Some(run) = state.evals.get(&eval_run_id) {
+        return (StatusCode::OK, Json(run)).into_response();
+    }
+    use cairn_store::projections::EvalRunReadModel;
+    match EvalRunReadModel::get(state.runtime.store.as_ref(), &eval_run_id).await {
+        Ok(Some(rec)) => {
+            (StatusCode::OK, Json(eval_run_record_to_product_run(&rec))).into_response()
+        }
+        Ok(None) => AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
             .into_response(),
+        Err(err) => store_error_response(err),
+    }
+}
+
+/// Rehydrate a projection record back into the `cairn_evals::EvalRun`
+/// response shape used by `GET /v1/evals/runs/:id`. Fields that only
+/// ever lived on the in-memory `EvalRunService` (plugin_metrics,
+/// dataset_source, cost) come back empty / `None` post-restart —
+/// those were never durable and #220 / #223 / #244 locked only the
+/// durable subset.
+fn eval_run_record_to_product_run(
+    rec: &cairn_store::projections::EvalRunRecord,
+) -> cairn_evals::EvalRun {
+    let subject_kind: EvalSubjectKind = serde_json::from_str(&format!("\"{}\"", rec.subject_kind))
+        .unwrap_or(EvalSubjectKind::PromptRelease);
+    let status = if rec.archived_at.is_some() || rec.completed_at.is_some() {
+        match rec.success {
+            Some(false) => EvalRunStatus::Failed,
+            _ => EvalRunStatus::Completed,
+        }
+    } else {
+        // In-memory's start_run flips Pending → Running; the projection
+        // currently doesn't carry a discrete status column (started_at
+        // is unconditionally set on EvalRunStarted). Post-restart we
+        // surface Running as the "most useful default" — callers that
+        // need fine-grained status can read the event log directly.
+        EvalRunStatus::Running
+    };
+    cairn_evals::EvalRun {
+        eval_run_id: rec.eval_run_id.clone(),
+        project_id: ProjectId::new(rec.project.project_id.as_str()),
+        subject_kind,
+        status,
+        prompt_asset_id: rec.prompt_asset_id.clone(),
+        prompt_version_id: rec.prompt_version_id.clone(),
+        prompt_release_id: rec.prompt_release_id.clone(),
+        evaluator_type: rec.evaluator_type.clone(),
+        dataset_id: rec.dataset_id.clone(),
+        dataset_source: None,
+        rubric_id: rec.rubric_id.clone(),
+        baseline_id: rec.baseline_id.clone(),
+        metrics: rec.metrics.clone().unwrap_or_default(),
+        plugin_metrics: Vec::new(),
+        cost: None,
+        created_by: rec.created_by.clone(),
+        created_at: rec.started_at,
+        completed_at: rec.completed_at,
+        archived_at: rec.archived_at,
     }
 }
 
@@ -448,23 +563,21 @@ pub(crate) async fn delete_eval_run_handler(
     let canonical_project = record.project.clone();
     let query_project = query.project();
 
-    let existing = match state.evals.get(&eval_run_id) {
-        Some(run) => run,
-        None => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
-                .into_response();
-        }
-    };
-
-    // Enforce project ownership on THREE surfaces so a mismatch
-    // between the in-memory service, the projection, and the
-    // caller-supplied query all 404 the request:
-    //   (1) in-memory service `state.evals` project_id vs canonical
-    //   (2) caller-supplied query ProjectKey must match canonical in
-    //       FULL (tenant + workspace + project), not just project_id
-    //   (3) load helper already rejected tenant mismatches above
-    if existing.project_id != canonical_project.project_id
-        || query_project.tenant_id != canonical_project.tenant_id
+    // Enforce project ownership on both surfaces so a mismatch
+    // between the projection and the caller-supplied query 404s:
+    //   (1) caller-supplied query ProjectKey must match canonical in
+    //       FULL (tenant + workspace + project), not just project_id.
+    //   (2) load helper already rejected tenant mismatches above.
+    //
+    // Previously this handler also checked `state.evals.project_id`,
+    // but milestone 6 deletes `replay_evals` so the in-memory cache
+    // is empty post-restart. The projection already owns the
+    // canonical ProjectKey — the three-way check collapses to two
+    // without losing the tenant-leak guard (Copilot review round 3
+    // on PR #336 required the canonical-project-from-projection
+    // rule; the three-way was defence-in-depth when two paths
+    // existed).
+    if query_project.tenant_id != canonical_project.tenant_id
         || query_project.workspace_id != canonical_project.workspace_id
         || query_project.project_id != canonical_project.project_id
     {
@@ -474,8 +587,10 @@ pub(crate) async fn delete_eval_run_handler(
 
     // Already-archived → 204 idempotent, no new event (mirrors
     // `WorkspaceServiceImpl::archive`). Keeps the event log free of
-    // duplicate archive events on repeated DELETE calls.
-    if existing.archived_at.is_some() {
+    // duplicate archive events on repeated DELETE calls. Read the
+    // archived_at marker from the projection now that it's the
+    // canonical source; state.evals is empty post-restart.
+    if record.archived_at.is_some() {
         return StatusCode::NO_CONTENT.into_response();
     }
 
@@ -533,17 +648,18 @@ pub(crate) async fn delete_eval_run_handler(
         .into_response();
     }
 
+    // Best-effort update of the in-memory cache so subsequent same-
+    // process GETs see the archive immediately (without a projection
+    // round-trip). Post-milestone-6, the projection is the source of
+    // truth: a NotFound here is fine (the cache just hadn't seen this
+    // run yet — e.g. a cross-process DELETE right after a restart) and
+    // we do NOT surface it as 500. The projection already committed
+    // the `archived_at` via the EvalRunArchived event above.
     if let Err(err) = state.evals.archive(&eval_run_id, now) {
-        tracing::error!(
+        tracing::debug!(
             %eval_run_id,
-            "in-memory archive failed after event-log append: {err}"
+            "in-memory archive cache-miss (run not in state.evals); projection is canonical: {err}"
         );
-        return AppApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "failed to archive eval run",
-        )
-        .into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -918,30 +1034,204 @@ pub(crate) async fn create_eval_run_handler(
     (StatusCode::CREATED, Json(run)).into_response()
 }
 
+/// Hydrate `state.evals` from the projection record when the in-memory
+/// cache has no entry for this run. Returns the hydrated in-memory
+/// `EvalRun`.
+///
+/// Invariants on return:
+///
+/// * `state.evals.get(&record.eval_run_id).is_some()`.
+/// * The in-memory status matches the projection's terminal state.
+///   Completed if `completed_at.is_some()`. Running if the projection
+///   saw an `EvalRunStarted` lifecycle edge (not just the initial
+///   create — we detect "was Running" via `metrics.is_some()` OR
+///   `completed_at.is_some()`, since a score requires Running and
+///   completion requires Running). Otherwise Pending — this is the
+///   post-create, pre-start state, and the handler's own `start_run`
+///   call will transition it to Running legitimately.
+/// * Dataset / rubric / baseline bindings replayed (#220 + #223).
+/// * Archive marker replayed so `archived_at` survives and the default
+///   list continues to hide the run.
+///
+/// Crucially: hydrate does NOT call `start_run` by itself when the
+/// projection has only the create-time EvalRunStarted. Handlers call
+/// `start_run` themselves at the appropriate lifecycle edge — if
+/// hydrate eagerly flipped Pending → Running, a `/start` request on
+/// a never-started cold-cache run would hit InvalidTransition and
+/// 400 (Copilot round 2).
+fn hydrate_in_memory_from_projection(
+    state: &AppState,
+    record: &cairn_store::projections::EvalRunRecord,
+) -> cairn_evals::EvalRun {
+    let id = &record.eval_run_id;
+    if let Some(run) = state.evals.get(id) {
+        return run;
+    }
+    let subject_kind: EvalSubjectKind =
+        serde_json::from_str(&format!("\"{}\"", record.subject_kind))
+            .unwrap_or(EvalSubjectKind::PromptRelease);
+    state.evals.create_run(
+        id.clone(),
+        ProjectId::new(record.project.project_id.as_str()),
+        subject_kind,
+        record.evaluator_type.clone(),
+        record.prompt_asset_id.clone(),
+        record.prompt_version_id.clone(),
+        record.prompt_release_id.clone(),
+        record.created_by.clone(),
+    );
+    if let Some(dataset_id) = record.dataset_id.as_ref() {
+        let _ = state.evals.set_dataset_id(id, dataset_id.clone());
+    }
+    if let Some(rubric_id) = record.rubric_id.as_ref() {
+        let _ = state.evals.set_rubric_id(id, rubric_id.clone());
+    }
+    if let Some(baseline_id) = record.baseline_id.as_ref() {
+        let _ = state.evals.set_baseline_id(id, baseline_id.clone());
+    }
+    // Decide whether the projection has observed a Pending → Running
+    // transition. Signals:
+    //   - completed_at.is_some() → definitely was Running then moved
+    //     to Completed.
+    //   - metrics.is_some() → record_score was called, which only
+    //     succeeds on Running.
+    //   - rubric_score.is_some() → rubric was scored, only meaningful
+    //     post-Running.
+    // If none of those, treat the in-memory run as still Pending so
+    // a handler's explicit start_run transitions it legitimately.
+    let was_running_or_terminal =
+        record.completed_at.is_some() || record.metrics.is_some() || record.rubric_score.is_some();
+    if was_running_or_terminal {
+        let _ = state.evals.start_run(id);
+        if let Some(metrics) = record.metrics.clone() {
+            // Only applies when not already Completed; complete_run
+            // below would reject on non-Running. On a terminal run the
+            // metrics land via complete_run's metrics arg instead.
+            if record.completed_at.is_none() {
+                let _ = state.evals.record_score(id, metrics);
+            }
+        }
+        if record.completed_at.is_some() {
+            let metrics = record.metrics.clone().unwrap_or_default();
+            let _ = state.evals.complete_run(id, metrics, None);
+        }
+    }
+    if let Some(archived_at) = record.archived_at {
+        let _ = state.evals.archive(id, archived_at);
+    }
+    state
+        .evals
+        .get(id)
+        .expect("run was just hydrated into state.evals")
+}
+
 pub(crate) async fn start_eval_run_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let eval_run_id = EvalRunId::new(id);
-    // Closes #405: cross-tenant mutation leak. Prior to this PR the
-    // handler loaded the run straight out of `state.evals` by id
-    // alone, so any authenticated operator could start / complete /
-    // score / delete an eval run owned by any tenant. Projection-
-    // backed visibility check mirrors `cancel_run_handler`.
-    match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
-                .into_response();
+    // Cross-tenant mutation guard: projection is the canonical
+    // ProjectKey source; any authenticated operator with a mismatched
+    // tenant scope gets 404 (not 403 — tenant isolation must not leak
+    // existence). See `load_eval_run_visible_to_tenant` (#405).
+    let projection_record =
+        match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                    .into_response();
+            }
+            Err(response) => return response,
+        };
+
+    // Idempotency guards: already completed or archived → 400 with
+    // a specific message instead of emitting a stray lifecycle
+    // event. The projection's completed_at / archived_at are
+    // canonical (post-restart the in-memory cache is empty until
+    // hydrate runs, so validating here from projection sidesteps
+    // the round-1 split-brain concern).
+    if projection_record.completed_at.is_some() {
+        return AppApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "eval run already completed",
+        )
+        .into_response();
+    }
+    if projection_record.archived_at.is_some() {
+        return AppApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "cannot start an archived eval run",
+        )
+        .into_response();
+    }
+
+    // Append the lifecycle-edge event FIRST. Sync projection commits
+    // in the same tx, so a successful append = durable Running state.
+    // Append failure bails before any cache mutation; retrying goes
+    // through the idempotency guards above.
+    let now = now_millis();
+    let ev = EventEnvelope::for_runtime_event(
+        // Per-event timestamp so a re-start after a failed earlier
+        // attempt doesn't collide on UNIQUE(event_id). Two competing
+        // /start requests landing in the same ms would still need
+        // uuidv7-style entropy; for now the projection's ON CONFLICT
+        // DO NOTHING guard on EvalRunStarted makes the second arrival
+        // a no-op.
+        EventId::new(format!("eval_start_{}_{}", eval_run_id.as_str(), now)),
+        EventSource::Runtime,
+        RuntimeEvent::EvalRunStarted(cairn_domain::events::EvalRunStarted {
+            project: projection_record.project.clone(),
+            eval_run_id: eval_run_id.clone(),
+            subject_kind: projection_record.subject_kind.clone(),
+            evaluator_type: projection_record.evaluator_type.clone(),
+            started_at: now,
+            // Lifecycle-edge event only: prompt + dataset linkages
+            // are captured on the create event, and re-emitting
+            // would make the projection writer flip-flop the run
+            // record between two Started snapshots.
+            prompt_asset_id: None,
+            prompt_version_id: None,
+            prompt_release_id: None,
+            created_by: None,
+            dataset_id: None,
+            rubric_id: None,
+            baseline_id: None,
+        }),
+    );
+    if let Err(e) = state.runtime.store.append(&[ev]).await {
+        tracing::error!(
+            %eval_run_id,
+            "failed to persist EvalRunStarted lifecycle event: {e}"
+        );
+        return AppApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "failed to record eval run start",
+        )
+        .into_response();
+    }
+
+    // Durable Running state committed. Update the in-memory cache
+    // best-effort; a cache-miss-then-hydrate will rebuild later.
+    hydrate_in_memory_from_projection(state.as_ref(), &projection_record);
+    let response_run = match state.evals.start_run(&eval_run_id) {
+        Ok(run) => run,
+        Err(err) => {
+            tracing::debug!(
+                %eval_run_id,
+                "in-memory start_run transition failed post-event \
+                 (projection is canonical): {err}"
+            );
+            let mut projected = eval_run_record_to_product_run(&projection_record);
+            projected.status = cairn_evals::EvalRunStatus::Running;
+            projected
         }
-        Err(response) => return response,
-    }
-    match state.evals.start_run(&eval_run_id) {
-        Ok(run) => (StatusCode::OK, Json(run)).into_response(),
-        Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
-            .into_response(),
-    }
+    };
+
+    (StatusCode::OK, Json(response_run)).into_response()
 }
 
 pub(crate) async fn complete_eval_run_handler(
@@ -951,22 +1241,89 @@ pub(crate) async fn complete_eval_run_handler(
     Json(body): Json<CompleteEvalRunRequest>,
 ) -> impl IntoResponse {
     let eval_run_id = EvalRunId::new(id);
-    match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
-                .into_response();
-        }
-        Err(response) => return response,
+    let projection_record =
+        match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                    .into_response();
+            }
+            Err(response) => return response,
+        };
+
+    // Idempotency short-circuit: already-completed → 200 with the
+    // current state. Prevents the deterministic-event-id retry
+    // collision Cursor flagged and mirrors `delete_eval_run_handler`'s
+    // 204-idempotent contract.
+    if projection_record.completed_at.is_some() {
+        let run = hydrate_in_memory_from_projection(state.as_ref(), &projection_record);
+        return (StatusCode::OK, Json(run)).into_response();
     }
-    match state
+
+    // Append the event FIRST. The sync projection commits in the
+    // same transaction, so a successful append = durable Completed
+    // state. Failing here means we never mutate anything: the client
+    // sees 500 and a retry goes through the idempotency short-circuit
+    // above (or re-attempts cleanly). Timestamp-suffixed event_id so
+    // a crash-retry between append and response doesn't collide on
+    // UNIQUE(event_id).
+    let now = now_millis();
+    let ev = EventEnvelope::for_runtime_event(
+        EventId::new(format!("eval_complete_{}_{}", eval_run_id.as_str(), now)),
+        EventSource::Runtime,
+        RuntimeEvent::EvalRunCompleted(cairn_domain::events::EvalRunCompleted {
+            project: projection_record.project.clone(),
+            eval_run_id: eval_run_id.clone(),
+            // The API surface treats completion as success today; the
+            // "mark as failed" edge is tracked by #447.
+            success: true,
+            error_message: None,
+            subject_node_id: None,
+            completed_at: now,
+        }),
+    );
+    if let Err(e) = state.runtime.store.append(&[ev]).await {
+        tracing::error!(
+            %eval_run_id,
+            "failed to persist EvalRunCompleted event: {e}"
+        );
+        return AppApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "failed to record eval run completion",
+        )
+        .into_response();
+    }
+
+    // Durable state is now Completed. Update the in-memory cache
+    // best-effort; a failure here (cache miss after restart, or
+    // invalid transition) is a hot-path observability issue, not a
+    // correctness one — the projection is canonical. A subsequent
+    // GET will re-hydrate from the projection.
+    hydrate_in_memory_from_projection(state.as_ref(), &projection_record);
+    let response_run = match state
         .evals
-        .complete_run(&eval_run_id, body.metrics, body.cost)
+        .complete_run(&eval_run_id, body.metrics.clone(), body.cost)
     {
-        Ok(run) => (StatusCode::OK, Json(run)).into_response(),
-        Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
-            .into_response(),
-    }
+        Ok(run) => run,
+        Err(err) => {
+            tracing::debug!(
+                %eval_run_id,
+                "in-memory complete_run transition failed post-event \
+                 (projection is canonical, cache will rehydrate on next read): {err}"
+            );
+            // Rebuild the response from the projection + the just-
+            // posted edge so the client sees the durable state.
+            let mut projected = eval_run_record_to_product_run(&projection_record);
+            projected.status = cairn_evals::EvalRunStatus::Completed;
+            projected.metrics = body.metrics;
+            projected.cost = body.cost;
+            projected.completed_at = Some(now);
+            projected
+        }
+    };
+
+    (StatusCode::OK, Json(response_run)).into_response()
 }
 
 pub(crate) async fn score_eval_run_handler(
@@ -976,35 +1333,165 @@ pub(crate) async fn score_eval_run_handler(
     Json(body): Json<ScoreEvalRunRequest>,
 ) -> impl IntoResponse {
     let eval_run_id = EvalRunId::new(id);
-    match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
-                .into_response();
-        }
-        Err(response) => return response,
+    let projection_record =
+        match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                    .into_response();
+            }
+            Err(response) => return response,
+        };
+
+    // Archived runs cannot be re-scored — the projection is canonical
+    // so read the guard here rather than rely on the in-memory cache.
+    if projection_record.archived_at.is_some() {
+        return AppApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "cannot score an archived eval run",
+        )
+        .into_response();
     }
-    match state.evals.record_score(&eval_run_id, body.metrics) {
-        Ok(run) => (StatusCode::OK, Json(run)).into_response(),
+
+    // Append the event FIRST. Projection is last-write-wins on
+    // metrics, so a successful append = durable score. Append failure
+    // bails before any cache mutation, so retrying cleanly re-does
+    // the write.
+    let now = now_millis();
+    let ev = EventEnvelope::for_runtime_event(
+        // Per-event timestamp suffix so back-to-back scores don't
+        // collide on UNIQUE(event_id). Closes #435 (score durability).
+        EventId::new(format!("eval_scored_{}_{}", eval_run_id.as_str(), now)),
+        EventSource::Runtime,
+        RuntimeEvent::EvalRunScored(cairn_domain::EvalRunScored {
+            project: projection_record.project.clone(),
+            eval_run_id: eval_run_id.clone(),
+            metrics: body.metrics.clone(),
+            recorded_at_ms: now,
+        }),
+    );
+    if let Err(e) = state.runtime.store.append(&[ev]).await {
+        tracing::error!(
+            %eval_run_id,
+            "failed to persist EvalRunScored event: {e}"
+        );
+        return AppApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "failed to record eval run score",
+        )
+        .into_response();
+    }
+
+    // Durable metrics written. Update the in-memory cache
+    // best-effort for the response body; a cache-miss or invalid
+    // transition falls back to a projection-synthesised response so
+    // the client always sees the durable state.
+    hydrate_in_memory_from_projection(state.as_ref(), &projection_record);
+    let response_run = match state.evals.record_score(&eval_run_id, body.metrics.clone()) {
+        Ok(run) => run,
+        Err(err) => {
+            tracing::debug!(
+                %eval_run_id,
+                "in-memory record_score failed post-event \
+                 (projection is canonical): {err}"
+            );
+            let mut projected = eval_run_record_to_product_run(&projection_record);
+            projected.metrics = body.metrics;
+            projected
+        }
+    };
+
+    (StatusCode::OK, Json(response_run)).into_response()
+}
+
+pub(crate) async fn score_eval_rubric_handler(
+    State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
+    Path(id): Path<String>,
+    Json(body): Json<ScoreEvalRubricRequest>,
+) -> impl IntoResponse {
+    let eval_run_id = EvalRunId::new(id);
+    // Tenant-scope guard: without it any authenticated operator could
+    // compute + persist a rubric verdict against any tenant's run.
+    // Same shape as the other three eval mutation handlers.
+    let projection_record =
+        match load_eval_run_visible_to_tenant(state.as_ref(), &tenant_scope, &eval_run_id).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "eval run not found")
+                    .into_response();
+            }
+            Err(response) => return response,
+        };
+
+    // Hydrate in-memory from projection so `score_against_rubric` (which
+    // reads from the in-memory eval_runs service) can find the run
+    // after a process restart.
+    hydrate_in_memory_from_projection(state.as_ref(), &projection_record);
+
+    // Score first so we have the verdict to attach to the event. The
+    // rubric scorer only reads — no durable mutation yet.
+    match state
+        .eval_rubrics
+        .score_against_rubric(&eval_run_id, &body.rubric_id, &body.actual_outputs)
+        .await
+    {
+        Ok(result) => {
+            // Record the verdict in the event log so it survives a
+            // process restart. Projection ProjectKey is authoritative
+            // (not a caller-supplied field) — tenant leak guard.
+            let now = now_millis();
+            let ev = EventEnvelope::for_runtime_event(
+                EventId::new(format!(
+                    "eval_rubric_scored_{}_{}",
+                    eval_run_id.as_str(),
+                    now
+                )),
+                EventSource::Runtime,
+                RuntimeEvent::EvalRubricScored(cairn_domain::EvalRubricScored {
+                    project: projection_record.project.clone(),
+                    eval_run_id: eval_run_id.clone(),
+                    rubric_id: body.rubric_id.clone(),
+                    dimension_scores: result.dimension_scores.clone(),
+                    overall: result.overall,
+                    recorded_at_ms: now,
+                }),
+            );
+            if let Err(e) = state.runtime.store.append(&[ev]).await {
+                // The caller already has the verdict (scorer ran
+                // before append). Surface a 500 so the operator sees
+                // the durable-write failure and a retry can re-persist
+                // — silently losing the event-log entry was Bugbot's
+                // "silently skipping event emission" concern.
+                tracing::error!(
+                    %eval_run_id,
+                    rubric_id = %body.rubric_id,
+                    "failed to persist EvalRubricScored event: {e}"
+                );
+                return AppApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to record rubric score",
+                )
+                .into_response();
+            }
+            (StatusCode::OK, Json(result)).into_response()
+        }
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
             .into_response(),
     }
 }
 
-pub(crate) async fn score_eval_rubric_handler(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<ScoreEvalRubricRequest>,
-) -> impl IntoResponse {
-    match state
-        .eval_rubrics
-        .score_against_rubric(&EvalRunId::new(id), &body.rubric_id, &body.actual_outputs)
-        .await
-    {
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
-        Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
-            .into_response(),
-    }
+/// RFC-025 Phase 1 helper. Mirrors the pattern the archive/create
+/// handlers already use; kept local rather than re-exported so the
+/// clocks stay close to the emission sites.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub(crate) async fn compare_eval_baseline_handler(
@@ -1636,8 +2123,9 @@ pub(crate) async fn compare_eval_run_baseline_handler(
 /// `/v1/evals/runs/:id/score-rubric`.
 pub(crate) async fn score_eval_run_with_rubric_handler(
     state: State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     path: Path<String>,
     body: Json<ScoreEvalRubricRequest>,
 ) -> impl IntoResponse {
-    score_eval_rubric_handler(state, path, body).await
+    score_eval_rubric_handler(state, tenant_scope, path, body).await
 }

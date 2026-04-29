@@ -215,9 +215,13 @@ mod tests {
     #[test]
     fn fabric_config_from_env_defaults() {
         use flowfabric::core::backend::BackendConnection;
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Crate-shared lock so this test serialises against
+        // `config::tests` (which also flips `CAIRN_FABRIC_URL`). Two
+        // private Mutexes in sibling modules don't actually serialise —
+        // that's what flaked this test on parallel cargo test runs.
+        let _guard = crate::config::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CAIRN_FABRIC_URL");
         std::env::remove_var("CAIRN_FABRIC_LEASE_TTL_MS");
         std::env::remove_var("CAIRN_FABRIC_MAX_TASKS");

@@ -386,14 +386,228 @@ mod in_memory_vs_sqlite {
             "TenantCreated",
             "WorkspaceCreated",
             "ProjectCreated",
+            // RFC-025 Phase 1 milestone 8: eval fixtures below.
+            "EvalRunStarted",
+            "EvalRunCompleted",
+            "EvalRunArchived",
+            "EvalRunScored",
+            "EvalRubricScored",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
             assert!(
                 matches!(status, ProjectionStatus::Projected { .. }),
-                "{v} should be Projected per Phase 0 classification, got {status:?}"
+                "{v} should be Projected per Phase 0/1 classification, got {status:?}"
             );
         }
+    }
+
+    // ── RFC-025 Phase 1 milestone 8: eval_runs projection parity.
+    //    For each of the five eval lifecycle variants, emit the event
+    //    into both backends and assert the read-model record is field-
+    //    by-field equal. If pg/sqlite appliers drift (e.g. one reads
+    //    archived_at as the event timestamp and the other as the
+    //    stored_at time), this test catches it.
+    use cairn_domain::{
+        EvalMetrics, EvalRubricScored, EvalRunArchived, EvalRunCompleted, EvalRunId, EvalRunScored,
+        EvalRunStarted,
+    };
+    use cairn_store::projections::EvalRunReadModel;
+
+    #[tokio::test]
+    async fn eval_run_projection_matches_across_backends_started_only() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let eval_run_id = EvalRunId::new("er_parity_started");
+        let events = vec![env(RuntimeEvent::EvalRunStarted(EvalRunStarted {
+            project: project(),
+            eval_run_id: eval_run_id.clone(),
+            subject_kind: "prompt_release".into(),
+            evaluator_type: "accuracy".into(),
+            started_at: 1_000_000,
+            prompt_asset_id: Some(cairn_domain::PromptAssetId::new("pa_parity")),
+            prompt_version_id: Some(cairn_domain::PromptVersionId::new("pv_parity")),
+            prompt_release_id: Some(cairn_domain::PromptReleaseId::new("pr_parity")),
+            created_by: Some(cairn_domain::OperatorId::new("op_parity")),
+            dataset_id: Some("ds_parity".into()),
+            rubric_id: Some("ru_parity".into()),
+            baseline_id: Some("bl_parity".into()),
+        }))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = EvalRunReadModel::get(&mem, &eval_run_id)
+            .await
+            .unwrap()
+            .expect("started run in memory");
+        let sqlite_rec = EvalRunReadModel::get(&adapter, &eval_run_id)
+            .await
+            .unwrap()
+            .expect("started run in sqlite");
+
+        assert_eq!(mem_rec.eval_run_id, sqlite_rec.eval_run_id);
+        assert_eq!(mem_rec.project, sqlite_rec.project);
+        assert_eq!(mem_rec.subject_kind, sqlite_rec.subject_kind);
+        assert_eq!(mem_rec.evaluator_type, sqlite_rec.evaluator_type);
+        assert_eq!(mem_rec.started_at, sqlite_rec.started_at);
+        assert_eq!(mem_rec.dataset_id, sqlite_rec.dataset_id);
+        assert_eq!(mem_rec.rubric_id, sqlite_rec.rubric_id);
+        assert_eq!(mem_rec.baseline_id, sqlite_rec.baseline_id);
+        assert_eq!(mem_rec.prompt_asset_id, sqlite_rec.prompt_asset_id);
+        assert_eq!(mem_rec.prompt_version_id, sqlite_rec.prompt_version_id);
+        assert_eq!(mem_rec.prompt_release_id, sqlite_rec.prompt_release_id);
+        assert_eq!(mem_rec.created_by, sqlite_rec.created_by);
+        assert!(mem_rec.archived_at.is_none());
+        assert!(sqlite_rec.archived_at.is_none());
+        assert!(mem_rec.metrics.is_none());
+        assert!(sqlite_rec.metrics.is_none());
+    }
+
+    #[tokio::test]
+    async fn eval_run_projection_matches_across_backends_full_lifecycle() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let eval_run_id = EvalRunId::new("er_parity_full");
+        let metrics = EvalMetrics {
+            task_success_rate: Some(0.875),
+            latency_p50_ms: Some(42),
+            latency_p99_ms: Some(99),
+            cost_per_run: Some(0.0042),
+            policy_pass_rate: Some(0.91),
+            retrieval_hit_at_k: Some(0.77),
+            citation_coverage: None,
+            source_diversity: None,
+            retrieval_latency_ms: None,
+            retrieval_cost: None,
+        };
+        let events = vec![
+            env(RuntimeEvent::EvalRunStarted(EvalRunStarted {
+                project: project(),
+                eval_run_id: eval_run_id.clone(),
+                subject_kind: "prompt_release".into(),
+                evaluator_type: "accuracy".into(),
+                started_at: 2_000_000,
+                prompt_asset_id: None,
+                prompt_version_id: None,
+                prompt_release_id: None,
+                created_by: None,
+                dataset_id: None,
+                rubric_id: None,
+                baseline_id: None,
+            })),
+            env(RuntimeEvent::EvalRunScored(EvalRunScored {
+                project: project(),
+                eval_run_id: eval_run_id.clone(),
+                metrics: metrics.clone(),
+                recorded_at_ms: 2_000_100,
+            })),
+            env(RuntimeEvent::EvalRubricScored(EvalRubricScored {
+                project: project(),
+                eval_run_id: eval_run_id.clone(),
+                rubric_id: "ru_parity_full".into(),
+                dimension_scores: vec![("clarity".into(), 0.9), ("safety".into(), 0.8)],
+                overall: 0.86,
+                recorded_at_ms: 2_000_200,
+            })),
+            env(RuntimeEvent::EvalRunCompleted(EvalRunCompleted {
+                project: project(),
+                eval_run_id: eval_run_id.clone(),
+                success: true,
+                error_message: None,
+                subject_node_id: None,
+                completed_at: 2_000_300,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = EvalRunReadModel::get(&mem, &eval_run_id)
+            .await
+            .unwrap()
+            .expect("full-lifecycle run in memory");
+        let sqlite_rec = EvalRunReadModel::get(&adapter, &eval_run_id)
+            .await
+            .unwrap()
+            .expect("full-lifecycle run in sqlite");
+
+        // Identity + scope.
+        assert_eq!(mem_rec.eval_run_id, sqlite_rec.eval_run_id);
+        assert_eq!(mem_rec.project, sqlite_rec.project);
+        // Lifecycle transitions.
+        assert_eq!(mem_rec.success, sqlite_rec.success);
+        assert_eq!(mem_rec.success, Some(true));
+        assert_eq!(mem_rec.completed_at, sqlite_rec.completed_at);
+        assert_eq!(mem_rec.completed_at, Some(2_000_300));
+        // Metrics — field-by-field using to_bits to handle NaN parity.
+        let mem_m = mem_rec.metrics.as_ref().expect("memory metrics set");
+        let sq_m = sqlite_rec.metrics.as_ref().expect("sqlite metrics set");
+        assert_eq!(
+            mem_m.task_success_rate.map(f64::to_bits),
+            sq_m.task_success_rate.map(f64::to_bits),
+        );
+        assert_eq!(mem_m.latency_p50_ms, sq_m.latency_p50_ms);
+        assert_eq!(mem_m.latency_p99_ms, sq_m.latency_p99_ms);
+        assert_eq!(
+            mem_m.cost_per_run.map(f64::to_bits),
+            sq_m.cost_per_run.map(f64::to_bits),
+        );
+        // Rubric verdict.
+        let mem_r = mem_rec.rubric_score.as_ref().expect("memory rubric set");
+        let sq_r = sqlite_rec.rubric_score.as_ref().expect("sqlite rubric set");
+        assert_eq!(mem_r, sq_r);
+    }
+
+    #[tokio::test]
+    async fn eval_run_archived_at_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let eval_run_id = EvalRunId::new("er_parity_archived");
+        let events = vec![
+            env(RuntimeEvent::EvalRunStarted(EvalRunStarted {
+                project: project(),
+                eval_run_id: eval_run_id.clone(),
+                subject_kind: "prompt_release".into(),
+                evaluator_type: "accuracy".into(),
+                started_at: 3_000_000,
+                prompt_asset_id: None,
+                prompt_version_id: None,
+                prompt_release_id: None,
+                created_by: None,
+                dataset_id: None,
+                rubric_id: None,
+                baseline_id: None,
+            })),
+            env(RuntimeEvent::EvalRunArchived(EvalRunArchived {
+                project: project(),
+                eval_run_id: eval_run_id.clone(),
+                archived_at: 3_000_500,
+            })),
+            // Second archive — earliest-wins: both backends must keep
+            // 3_000_500 (#336 Copilot rule). Pre-Phase 1 pg/sqlite were
+            // log_stub no-ops and would silently diverge from memory.
+            env(RuntimeEvent::EvalRunArchived(EvalRunArchived {
+                project: project(),
+                eval_run_id: eval_run_id.clone(),
+                archived_at: 3_099_999,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = EvalRunReadModel::get(&mem, &eval_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_rec = EvalRunReadModel::get(&adapter, &eval_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_rec.archived_at, Some(3_000_500));
+        assert_eq!(sqlite_rec.archived_at, Some(3_000_500));
+        assert_eq!(mem_rec.archived_at, sqlite_rec.archived_at);
     }
 }
 

@@ -476,3 +476,242 @@ async fn eval_run_linkage_survives_restart() {
         "baseline_id must survive restart: {got}",
     );
 }
+
+/// RFC-025 Phase 1 (closes #435): eval run METRICS posted via
+/// `POST /v1/evals/runs/:id/score` must survive a process restart.
+///
+/// Before Phase 1 the handler mutated `state.evals` in-process only;
+/// operators who scored runs between reboots silently lost the score.
+/// The new `EvalRunScored` event + `eval_runs.metrics_json` projection
+/// persists every canonical metric field. The `GET /v1/evals/runs/:id`
+/// response post-restart rehydrates the projection record, which
+/// populates `metrics`.
+#[tokio::test]
+async fn eval_run_score_survives_restart() {
+    let mut h = LiveHarness::setup_with_sqlite().await;
+    let tenant = h.tenant.clone();
+    let workspace = h.workspace.clone();
+    let project = h.project.clone();
+
+    // Seed + create a run + start it so /score is valid (the handler
+    // requires Running status).
+    let base = h.base_url.clone();
+    let eval_run_id = "eval_score_phase1_persist";
+    let res = h
+        .client()
+        .post(format!("{base}/v1/evals/runs"))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id":      &tenant,
+            "workspace_id":   &workspace,
+            "project_id":     &project,
+            "eval_run_id":    eval_run_id,
+            "subject_kind":   "prompt_release",
+            "evaluator_type": "accuracy",
+        }))
+        .send()
+        .await
+        .expect("create run reaches server");
+    assert_eq!(res.status().as_u16(), 201, "create run");
+
+    let res = h
+        .client()
+        .post(format!("{base}/v1/evals/runs/{eval_run_id}/start"))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("start run reaches server");
+    assert_eq!(res.status().as_u16(), 200, "start run");
+
+    // Post a score — a mix of distinctive non-default values so the
+    // post-restart assertion catches any field-level data loss.
+    let res = h
+        .client()
+        .post(format!("{base}/v1/evals/runs/{eval_run_id}/score"))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "metrics": {
+                "task_success_rate":  0.875,
+                "latency_p50_ms":     123,
+                "latency_p99_ms":     456,
+                "cost_per_run":       0.0042,
+                "policy_pass_rate":   0.91,
+                "retrieval_hit_at_k": 0.77,
+            }
+        }))
+        .send()
+        .await
+        .expect("score run reaches server");
+    assert_eq!(
+        res.status().as_u16(),
+        200,
+        "score run: {}",
+        res.text().await.unwrap_or_default()
+    );
+
+    // Sigkill and bring up a fresh process against the same event log.
+    // `replay_evals` is deleted (milestone 6) so the only path back to
+    // the score is through the `eval_runs.metrics_json` projection.
+    h.sigkill_and_restart()
+        .await
+        .expect("sigkill+restart must succeed");
+
+    let got: Value = h
+        .client()
+        .get(format!("{}/v1/evals/runs/{eval_run_id}", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("post-restart get run")
+        .json()
+        .await
+        .expect("post-restart json");
+
+    let metrics = got
+        .get("metrics")
+        .expect("run carries metrics post-restart");
+    assert_eq!(
+        metrics.get("task_success_rate").and_then(|v| v.as_f64()),
+        Some(0.875),
+        "task_success_rate must survive restart: {got}",
+    );
+    assert_eq!(
+        metrics.get("latency_p50_ms").and_then(|v| v.as_u64()),
+        Some(123),
+        "latency_p50_ms must survive restart",
+    );
+    assert_eq!(
+        metrics.get("latency_p99_ms").and_then(|v| v.as_u64()),
+        Some(456),
+        "latency_p99_ms must survive restart",
+    );
+    assert_eq!(
+        metrics.get("cost_per_run").and_then(|v| v.as_f64()),
+        Some(0.0042),
+        "cost_per_run must survive restart",
+    );
+    assert_eq!(
+        metrics.get("policy_pass_rate").and_then(|v| v.as_f64()),
+        Some(0.91),
+        "policy_pass_rate must survive restart",
+    );
+    assert_eq!(
+        metrics.get("retrieval_hit_at_k").and_then(|v| v.as_f64()),
+        Some(0.77),
+        "retrieval_hit_at_k must survive restart",
+    );
+}
+
+/// RFC-025 Phase 1 (closes #436): `EvalRunArchived` must land in the
+/// pg/sqlite projections on par with the in-memory backend.
+///
+/// Before Phase 1, the pg + sqlite projection appliers handled
+/// `EvalRunArchived` with `log_stub` (no-op) while the in-memory
+/// applier updated `archived_at`. Any pg-backed `EvalRunReadModel`
+/// reading from the table would show archived runs as live.
+///
+/// This test: POST a run, archive it via DELETE, restart, assert the
+/// run is still findable via the `?include_archived=true` list and
+/// absent from the default list.
+#[tokio::test]
+async fn eval_run_archived_at_survives_restart() {
+    let mut h = LiveHarness::setup_with_sqlite().await;
+    let tenant = h.tenant.clone();
+    let workspace = h.workspace.clone();
+    let project = h.project.clone();
+
+    let base = h.base_url.clone();
+    let eval_run_id = "eval_archived_phase1_persist";
+    let res = h
+        .client()
+        .post(format!("{base}/v1/evals/runs"))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id":      &tenant,
+            "workspace_id":   &workspace,
+            "project_id":     &project,
+            "eval_run_id":    eval_run_id,
+            "subject_kind":   "prompt_release",
+            "evaluator_type": "accuracy",
+        }))
+        .send()
+        .await
+        .expect("create run reaches server");
+    assert_eq!(res.status().as_u16(), 201);
+
+    // DELETE → EvalRunArchived event + projection update.
+    let res = h
+        .client()
+        .delete(format!(
+            "{base}/v1/evals/runs/{eval_run_id}?tenant_id={}&workspace_id={}&project_id={}",
+            tenant, workspace, project,
+        ))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("delete run reaches server");
+    assert_eq!(
+        res.status().as_u16(),
+        204,
+        "archive: {}",
+        res.text().await.unwrap_or_default()
+    );
+
+    h.sigkill_and_restart()
+        .await
+        .expect("sigkill+restart must succeed");
+
+    // Default list must hide archived runs.
+    let default_list: Value = h
+        .client()
+        .get(format!(
+            "{}/v1/evals/runs?tenant_id={}&workspace_id={}&project_id={}",
+            h.base_url, tenant, workspace, project
+        ))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("default list")
+        .json()
+        .await
+        .expect("default list json");
+    let items = default_list
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !items
+            .iter()
+            .any(|it| it.get("eval_run_id").and_then(|v| v.as_str()) == Some(eval_run_id)),
+        "default list must hide archived run after restart: {default_list}"
+    );
+
+    // include_archived=true surfaces it with an archived_at populated.
+    let full_list: Value = h
+        .client()
+        .get(format!(
+            "{}/v1/evals/runs?tenant_id={}&workspace_id={}&project_id={}&include_archived=true",
+            h.base_url, tenant, workspace, project
+        ))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("full list")
+        .json()
+        .await
+        .expect("full list json");
+    let items = full_list
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let found = items
+        .iter()
+        .find(|it| it.get("eval_run_id").and_then(|v| v.as_str()) == Some(eval_run_id))
+        .expect("archived run must be in include_archived list after restart");
+    assert!(
+        found.get("archived_at").and_then(|v| v.as_u64()).is_some(),
+        "archived_at must be populated post-restart: {found}"
+    );
+}

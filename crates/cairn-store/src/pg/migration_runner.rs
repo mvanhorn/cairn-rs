@@ -180,6 +180,11 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_tool_invocation_progress",
         include_str!("migrations/V033__create_tool_invocation_progress.sql"),
     ),
+    (
+        34,
+        "create_eval_runs",
+        include_str!("migrations/V034__create_eval_runs.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

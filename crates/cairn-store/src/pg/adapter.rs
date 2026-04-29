@@ -1823,3 +1823,143 @@ impl crate::projections::F65CheckpointReadModel for PgAdapter {
             .collect())
     }
 }
+
+// ── RFC-025 Phase 1 (milestone 3): EvalRunReadModel ──────────────────────────
+//
+// Projects eval lifecycle events (Started / Completed / Archived / Scored /
+// RubricScored) into the `eval_runs` projection table created by migration
+// V034. Row shape maps 1:1 to `EvalRunRecord`; metrics + rubric verdict are
+// stored as JSON-in-TEXT for cross-backend parity with sqlite (no JSONB,
+// see `feedback_no_db_specific_features.md`).
+
+/// Row struct for the `eval_runs` projection. sqlx `FromRow` on tuples
+/// only goes up to 16 columns; the `eval_runs` schema has 20, so we use
+/// a named struct with derive(FromRow) just like `SessionRow` above.
+#[derive(sqlx::FromRow)]
+struct EvalRunRow {
+    eval_run_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    subject_kind: String,
+    evaluator_type: String,
+    success: Option<bool>,
+    error_message: Option<String>,
+    started_at: i64,
+    completed_at: Option<i64>,
+    archived_at: Option<i64>,
+    metrics_json: Option<String>,
+    rubric_score_json: Option<String>,
+    dataset_id: Option<String>,
+    rubric_id: Option<String>,
+    baseline_id: Option<String>,
+    prompt_asset_id: Option<String>,
+    prompt_version_id: Option<String>,
+    prompt_release_id: Option<String>,
+    created_by: Option<String>,
+}
+
+const EVAL_RUN_SELECT_COLS: &str = "eval_run_id, tenant_id, workspace_id, project_id, \
+     subject_kind, evaluator_type, \
+     success, error_message, started_at, completed_at, \
+     archived_at, metrics_json, rubric_score_json, \
+     dataset_id, rubric_id, baseline_id, \
+     prompt_asset_id, prompt_version_id, prompt_release_id, \
+     created_by";
+
+#[async_trait]
+impl crate::projections::EvalRunReadModel for PgAdapter {
+    async fn get(
+        &self,
+        eval_run_id: &cairn_domain::EvalRunId,
+    ) -> Result<Option<crate::projections::EvalRunRecord>, StoreError> {
+        let sql = format!("SELECT {EVAL_RUN_SELECT_COLS} FROM eval_runs WHERE eval_run_id = $1");
+        let row: Option<EvalRunRow> = sqlx::query_as(&sql)
+            .bind(eval_run_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        row.map(pg_row_to_eval_run_record).transpose()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::EvalRunRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {EVAL_RUN_SELECT_COLS} FROM eval_runs
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+             ORDER BY started_at ASC, eval_run_id ASC
+             LIMIT $4 OFFSET $5"
+        );
+        let rows: Vec<EvalRunRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        rows.into_iter().map(pg_row_to_eval_run_record).collect()
+    }
+}
+
+/// Convert a raw pg row tuple into `EvalRunRecord`, deserialising the two
+/// JSON-in-TEXT columns. Invalid JSON surfaces as `StoreError::Internal`
+/// rather than silently dropping the score: a corrupted projection row is
+/// strictly worse than a loud error the operator can triage.
+fn pg_row_to_eval_run_record(
+    row: EvalRunRow,
+) -> Result<crate::projections::EvalRunRecord, StoreError> {
+    let metrics = match row.metrics_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str::<cairn_domain::EvalMetrics>(s).map_err(|e| {
+                StoreError::Internal(format!(
+                    "eval_runs.metrics_json parse error for {}: {e}",
+                    row.eval_run_id
+                ))
+            })?,
+        ),
+        None => None,
+    };
+    let rubric_score = match row.rubric_score_json.as_deref() {
+        Some(s) => Some(
+            serde_json::from_str::<crate::projections::EvalRubricScoreSummary>(s).map_err(|e| {
+                StoreError::Internal(format!(
+                    "eval_runs.rubric_score_json parse error for {}: {e}",
+                    row.eval_run_id
+                ))
+            })?,
+        ),
+        None => None,
+    };
+    Ok(crate::projections::EvalRunRecord {
+        eval_run_id: cairn_domain::EvalRunId::new(row.eval_run_id),
+        project: ProjectKey::new(row.tenant_id, row.workspace_id, row.project_id),
+        subject_kind: row.subject_kind,
+        evaluator_type: row.evaluator_type,
+        success: row.success,
+        error_message: row.error_message,
+        started_at: row.started_at.max(0) as u64,
+        completed_at: row.completed_at.map(|v| v.max(0) as u64),
+        archived_at: row.archived_at.map(|v| v.max(0) as u64),
+        metrics,
+        rubric_score,
+        dataset_id: row.dataset_id,
+        rubric_id: row.rubric_id,
+        baseline_id: row.baseline_id,
+        prompt_asset_id: row.prompt_asset_id.map(cairn_domain::PromptAssetId::new),
+        prompt_version_id: row
+            .prompt_version_id
+            .map(cairn_domain::PromptVersionId::new),
+        prompt_release_id: row
+            .prompt_release_id
+            .map(cairn_domain::PromptReleaseId::new),
+        created_by: row.created_by.map(cairn_domain::OperatorId::new),
+    })
+}

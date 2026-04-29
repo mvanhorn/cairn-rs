@@ -501,12 +501,29 @@ fn load_or_generate_instance_id() -> String {
     id
 }
 
+/// Shared env-var serialisation lock for cairn-fabric tests.
+///
+/// Both `config::tests` and `aggregate::tests` mutate the same
+/// `CAIRN_FABRIC_*` environment variables. Rust's `#[test]` runner
+/// multithreads across `#[test]`s in a crate by default, and
+/// `std::env::{set_var, remove_var}` is process-global — so two
+/// modules holding different private Mutexes will race with each
+/// other and the non-guarded module may observe the other's
+/// in-flight edits.
+///
+/// Historic flake: `fabric_config_from_env_defaults` (in
+/// `aggregate::tests`) intermittently saw `CAIRN_FABRIC_URL` still
+/// set to a non-Valkey scheme because a concurrent `config::tests`
+/// case was in the middle of an `set_var` → `from_env` → `remove_var`
+/// sequence. Sharing this lock at the crate level forces serial
+/// access to the env across the whole cairn-fabric test binary.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use super::ENV_LOCK;
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn clear_fabric_env() {
         // `CAIRN_FABRIC_HOST/PORT/TLS/CLUSTER` were removed when cairn-rs

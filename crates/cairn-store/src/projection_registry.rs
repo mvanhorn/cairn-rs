@@ -177,6 +177,42 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             table: Some("decision_records"),
         },
     },
+    // RFC-025 Phase 1 (milestone 7): five eval lifecycle variants
+    // flipped from Stubbed / Ephemeral → Projected. pg V034 migration +
+    // sqlite schema.rs carry the `eval_runs` read-model table; in-memory
+    // store mirrors the projection. The two new variants (Scored /
+    // RubricScored) landed as Ephemeral staging in milestone 1 and
+    // become Projected here now that all three backends wire them.
+    ProjectionEntry {
+        variant: "EvalRubricScored",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRunArchived",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRunCompleted",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRunScored",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRunStarted",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
     ProjectionEntry {
         variant: "MailboxMessageAppended",
         status: ProjectionStatus::Projected {
@@ -719,24 +755,6 @@ pub const REGISTRY: &[ProjectionEntry] = &[
         },
     },
     ProjectionEntry {
-        variant: "EvalRunArchived",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 1 (evals)",
-        },
-    },
-    ProjectionEntry {
-        variant: "EvalRunCompleted",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 1 (evals)",
-        },
-    },
-    ProjectionEntry {
-        variant: "EvalRunStarted",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 1 (evals)",
-        },
-    },
-    ProjectionEntry {
         variant: "EventLogCompacted",
         status: ProjectionStatus::Stubbed {
             tracking: "RFC-025 Phase 2b (event-log compaction audit)",
@@ -1152,7 +1170,14 @@ mod tests {
     fn lookup_returns_registered_status() {
         let status = lookup("SessionCreated").expect("SessionCreated is Projected");
         assert!(status.is_projected());
-        let status = lookup("EvalRunStarted").expect("EvalRunStarted is Stubbed");
+        // RFC-025 Phase 1 milestone 7: EvalRunStarted flipped from
+        // Stubbed → Projected now that the pg/sqlite/in-memory
+        // `eval_runs` projection table is wired.
+        let status = lookup("EvalRunStarted").expect("EvalRunStarted is Projected (Phase 1)");
+        assert!(status.is_projected());
+        // CredentialStored is still Stubbed as of Phase 1 — Phase 2a
+        // migrates the credential surface.
+        let status = lookup("CredentialStored").expect("CredentialStored is Stubbed");
         assert!(status.is_stubbed());
         let status = lookup("CircuitBreakerTripped").expect("CircuitBreakerTripped is Ephemeral");
         assert!(status.is_ephemeral());
@@ -1166,27 +1191,38 @@ mod tests {
 
     #[test]
     fn assert_no_stubs_for_postgres_lists_every_stub() {
-        // Phase 0: this MUST fail (we haven't migrated anything yet), and
-        // the error payload MUST name every Stubbed registry entry so the
-        // operator sees a concrete action list in the boot log.
+        // Phase 0/1: this MUST fail until every Stubbed variant has a
+        // real projection; the error payload names each Stubbed entry
+        // so the operator sees a concrete action list in the boot log.
         let err = assert_no_stubs_for_persistent_backend(Backend::Postgres)
-            .expect_err("Phase 0: registry still carries Stubbed variants");
+            .expect_err("Phase 1: registry still carries Stubbed variants pending Phase 2a/2b");
         let RegistryError::StubbedVariantsPresent { backend, stubbed } = err;
         assert_eq!(backend, Backend::Postgres);
         assert!(
             !stubbed.is_empty(),
-            "Phase 0 should surface at least one stubbed variant"
+            "Phase 1 should surface at least one stubbed variant (Phase 2a/2b backlog)"
         );
-        // Spot-check a handful of variants that must be in the list
-        // until Phase 1/2a/2b land.
-        for required in [
-            "EvalRunStarted",
-            "CredentialStored",
-            "AuditLogEntryRecorded",
-        ] {
+        // Spot-check variants still in the Stubbed bucket post-Phase-1.
+        // EvalRunStarted moved to Projected in milestone 7 — pick
+        // credentials + audits instead, both owned by Phase 2a/2b.
+        for required in ["CredentialStored", "AuditLogEntryRecorded"] {
             assert!(
                 stubbed.contains(&required),
-                "{required} should be listed as stubbed in Phase 0"
+                "{required} should still be Stubbed after Phase 1 (Phase 2a/2b migrates)"
+            );
+        }
+        // And confirm the Phase-1 eval migrations left the Stubbed
+        // bucket (invariant test for milestone 7).
+        for migrated in [
+            "EvalRunStarted",
+            "EvalRunCompleted",
+            "EvalRunArchived",
+            "EvalRunScored",
+            "EvalRubricScored",
+        ] {
+            assert!(
+                !stubbed.contains(&migrated),
+                "{migrated} should be Projected after Phase 1 milestone 7"
             );
         }
     }
@@ -1207,23 +1243,34 @@ mod tests {
         // RFC-025 Phase 0 audit (2026-04-28). If these numbers change,
         // update the registry AND the RFC/memory note — the audit is the
         // baseline against which Phase 2a/2b progress is measured.
+        // RFC-025 Phase 1 baselines:
+        //   * Phase 0 shipped 48 Projected / 31 Ephemeral / 77 Stubbed.
+        //   * Milestone 1 added EvalRunScored + EvalRubricScored as
+        //     Ephemeral staging → 48 / 33 / 77.
+        //   * Milestone 7 flips five eval variants (Started / Completed
+        //     / Archived / Scored / RubricScored) to Projected, removing
+        //     two Ephemeral + three Stubbed → 53 / 31 / 74.
+        // If you're editing this test, confirm the registry edit
+        // matches the milestone you're landing.
         assert_eq!(
-            projected, 48,
+            projected, 53,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
             ephemeral, 31,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 77, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 156);
+        assert_eq!(stubbed, 74, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(projected + ephemeral + stubbed, 158);
     }
 
     #[test]
     fn error_display_includes_variant_list() {
         let err = assert_no_stubs_for_persistent_backend(Backend::Postgres).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("EvalRunStarted"));
+        // EvalRunStarted moved out of Stubbed in milestone 7; check a
+        // credential variant that stays Stubbed through Phase 2a.
+        assert!(msg.contains("CredentialStored"));
         assert!(msg.contains("Postgres") || msg.contains("postgres"));
     }
 }
