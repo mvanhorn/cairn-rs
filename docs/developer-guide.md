@@ -437,7 +437,7 @@ Fields of note:
 
 | Field | Type | Purpose |
 |---|---|---|
-| `runtime` | `Arc<InMemoryServices>` | sessions, runs, tasks, approvals |
+| `runtime` | `Arc<RuntimeServices>` | sessions, runs, tasks, approvals (RFC-025 Phase 4 rename) |
 | `ollama` | `Option<Arc<OllamaProvider>>` | local LLM, None if unconfigured |
 | `request_log` | `Arc<RwLock<RequestLogBuffer>>` | structured request ring buffer |
 | `notifications` | `Arc<RwLock<NotificationBuffer>>` | operator notification queue |

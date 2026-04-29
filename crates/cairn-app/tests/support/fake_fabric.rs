@@ -52,7 +52,7 @@ fn readonly(method: &'static str) -> RuntimeError {
 
 /// Build a trio of read-only trait objects backed by the same in-memory store.
 ///
-/// Wire into `InMemoryServices::with_store_and_core(store, runs, tasks, sessions)`
+/// Wire into `RuntimeServices::with_store_and_core(store, runs, tasks, sessions)`
 /// to stand up an AppState without a live Valkey.
 pub fn build_fake_fabric(
     store: Arc<InMemoryStore>,

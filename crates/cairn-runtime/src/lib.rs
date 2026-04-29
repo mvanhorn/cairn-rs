@@ -164,7 +164,7 @@ pub use signal_routing::SignalRouterService;
 pub use voice::{SpeechToTextService, TextToSpeechService};
 pub use workspace_memberships::WorkspaceMembershipService;
 
-pub use aggregate::InMemoryServices;
+pub use aggregate::RuntimeServices;
 pub use services::confidence_calibrator::{CalibrationAdjustment, ConfidenceCalibrator};
 pub use services::event_helpers::seed_event_counter;
 

@@ -81,7 +81,7 @@ pub const DEFAULT_ORCHESTRATOR_WARN_RATIO_BPS: u32 = 8_000;
 ///
 /// Wraps any type that implements [`DefaultsReadModel`] (e.g. `InMemoryStore`)
 /// to read system-scoped settings. The `Arc<dyn …>` is type-erased so
-/// `RuntimeConfig` can be stored in `AppState` and `InMemoryServices` without
+/// `RuntimeConfig` can be stored in `AppState` and `RuntimeServices` without
 /// generic parameters.
 pub struct RuntimeConfig {
     store: Arc<dyn DefaultsReadModel + Send + Sync>,
@@ -90,7 +90,7 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     /// Create a config backed by the given store.
     ///
-    /// Pass `runtime.store.clone()` from `InMemoryServices`.
+    /// Pass `runtime.store.clone()` from `RuntimeServices`.
     pub fn new(store: Arc<dyn DefaultsReadModel + Send + Sync>) -> Self {
         Self { store }
     }

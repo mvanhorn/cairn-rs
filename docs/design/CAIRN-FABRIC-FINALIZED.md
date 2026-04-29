@@ -110,7 +110,7 @@ cairn-app integration tests under `crates/cairn-app/tests/` boot
 read method (`get` / `list_by_session` / …) to the projection store and
 returns `RuntimeError::Internal` on every mutation. The fixture wires
 into `AppBootstrap::router_with_injected_runtime`, which accepts a
-caller-provided `InMemoryServices`.
+caller-provided `RuntimeServices` (renamed from `InMemoryServices` under RFC-025 Phase 4 — see `docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md`).
 
 Running the production binary (`cargo run -p cairn-app`) without a
 reachable Valkey will fail at boot with `FabricError::Config` — this is
@@ -121,12 +121,12 @@ intentional (no silent degrade).
 Post kill-in-memory-runtime, there is exactly one backing for
 Run/Task/Session services: `Fabric{Run,Task,Session}ServiceAdapter`
 against Valkey + FF. `AppState::new` wires it unconditionally;
-`InMemoryServices::with_store_and_core(store, runs, tasks, sessions)` is
-the only factory.
+`RuntimeServices::with_store_and_core(store, runs, tasks, sessions)` is
+the only factory (was `InMemoryServices` pre-RFC-025-Phase-4).
 
 The courtesy in-memory `RunServiceImpl` / `TaskServiceImpl` /
 `SessionServiceImpl` backings, together with their
-`InMemoryServices::{new, with_store, with_fabric}` constructors, existed
+historical `InMemoryServices::{new, with_store, with_fabric}` constructors (the struct is now `RuntimeServices` after RFC-025 Phase 4) existed
 during the Fabric migration as a compile-time escape hatch. Post
 migration they carried no correctness guarantees (state transitions
 drifted from Fabric's, no scanner lifecycle participation) and were

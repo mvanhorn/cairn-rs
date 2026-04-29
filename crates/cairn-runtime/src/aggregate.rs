@@ -1,4 +1,4 @@
-//! `InMemoryServices` — the bundled runtime service aggregate for cairn-app.
+//! `RuntimeServices` — the bundled runtime service aggregate for cairn-app.
 //!
 //! Provides a single injectable struct that wires all runtime services against
 //! a shared `InMemoryStore`. cairn-app constructs one instance at startup and
@@ -37,7 +37,7 @@ use crate::ProviderRegistry;
 /// — that is the only production path. All other fields remain concrete
 /// `*ServiceImpl<InMemoryStore>` and back non-execution surfaces
 /// (approvals, evals, provider bindings, etc.) that FF does not manage.
-pub struct InMemoryServices {
+pub struct RuntimeServices {
     /// The shared append-only event log + synchronous projections.
     pub store: Arc<InMemoryStore>,
 
@@ -150,7 +150,7 @@ pub struct InMemoryServices {
     pub runtime_config: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
 }
 
-impl InMemoryServices {
+impl RuntimeServices {
     /// Create a bundle wired to an existing store with caller-supplied core
     /// services.
     ///

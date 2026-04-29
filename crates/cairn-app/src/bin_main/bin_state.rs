@@ -9,7 +9,7 @@ use cairn_api::auth::ServiceTokenRegistry;
 use cairn_api::bootstrap::{DeploymentMode, ProcessRole};
 use cairn_memory::in_memory::{InMemoryDocumentStore, InMemoryRetrieval};
 use cairn_memory::pipeline::{IngestPipeline, ParagraphChunker};
-use cairn_runtime::{InMemoryServices, OllamaProvider};
+use cairn_runtime::{OllamaProvider, RuntimeServices};
 use cairn_store::pg::{PgAdapter, PgEventLog};
 use cairn_store::sqlite::{SqliteAdapter, SqliteEventLog};
 use serde::Serialize;
@@ -75,7 +75,7 @@ pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Fields like `document_store`, `retrieval`, and `ingest` are served
 /// exclusively by the catalog router and are NOT duplicated here.
 pub(crate) struct AppState {
-    pub(crate) runtime: Arc<InMemoryServices>,
+    pub(crate) runtime: Arc<RuntimeServices>,
     pub(crate) started_at: Arc<Instant>,
     pub(crate) tokens: Arc<ServiceTokenRegistry>,
     pub(crate) pg: Option<Arc<PgBackend>>,

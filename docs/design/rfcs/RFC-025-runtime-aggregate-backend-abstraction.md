@@ -2,10 +2,96 @@
 
 ## Status
 
-Phase 0 IMPLEMENTED — 2026-04-28. Phase 1 IMPLEMENTED — 2026-04-28.
-Phase 1.5b IMPLEMENTED — 2026-04-28 (graph read-model declared Ephemeral;
-`replay_graph` removed). Phases 1.5a, 2a, 2b, 3, 4 draft (seven phases
-total; Phase 0 is the infrastructure prerequisite).
+**Phase 4 IMPLEMENTED — 2026-04-29. RFC-025 Done.**
+
+Ten milestones are live on `main` (Phase 0 is infrastructure; the
+nine service-migration phases build on it):
+
+| Phase  | Landed          | PR    | Summary                                                                                         |
+| ------ | --------------- | ----- | ----------------------------------------------------------------------------------------------- |
+| 0      | 2026-04-28      | #549  | Projection registry + build.rs exhaustiveness + pre-commit/CI `log_stub` guard + parity harness |
+| 1      | 2026-04-28      | #559  | Eval event-sourcing (add `EvalRunScored` + `EvalRubricScored`) + pg/sqlite projections + delete `replay_evals` |
+| 1.5a   | 2026-04-29      | #569  | Triggers full-projection-backed (Option B); `replay_triggers` deleted                           |
+| 1.5b   | 2026-04-28      | #566  | Graph read-model declared Ephemeral; `replay_graph` deleted                                     |
+| 2a.1   | 2026-04-29      | #565  | Fill governance projections — credentials + quotas + budgets + licenses                          |
+| 2a.2   | 2026-04-29      | #571  | Remaining governance — delegations + guardrails + retention + entitlements + license overrides |
+| 2b.1   | 2026-04-29      | #573  | Add events + projections for audits + scheduled_tasks + outcomes + plan_reviews                  |
+| 2b.2a  | 2026-04-29      | #580  | external_workers projection + restart durability                                                 |
+| 3      | 2026-04-29      | #572  | Provider bindings + connections → Projected; pools + health stay Ephemeral                      |
+| 4      | 2026-04-29      | #585  | Rename `InMemoryServices` → `RuntimeServices` + doc cleanup (this PR)                           |
+
+**Final projection registry counts** (as of Phase 4 landing, tracked in `crates/cairn-store/src/projection_registry.rs`):
+
+- **95 Projected** — every lifecycle-carrying variant writes to a named
+  read-model table inside the event-append transaction (pg / sqlite /
+  in-memory byte-equal per the parity harness).
+- **18 Ephemeral** — observability-only, policy-scoped, or owned by a
+  downstream projection (graph, signal routing, FF lease history).
+  Documented in-registry with a `reason` string.
+- **45 Stubbed** — tracked for future phases outside RFC-025's scope.
+  The remaining set is Phase 2b.2b (channels + route policy Updated +
+  checkpoint strategy + subagent spawning + misc operator events), covered
+  by a separate follow-up issue (#574) and held off this RFC because the
+  parity story for each group requires dedicated design. The boot guard
+  surfaces the list at WARN on pg/sqlite so no operator is silently
+  reading empty projection tables.
+
+**Boot + read-path semantics after Phase 4 (honest accounting).** The
+three hand-rolled cairn-side walkers that motivated the RFC —
+`replay_evals`, `replay_graph`, `replay_triggers` — are deleted. Every
+`Projected` variant now lands in a read-model table in the configured
+backend inside the event-append transaction (pg/sqlite/in-memory
+byte-equal per the parity harness). Restart-durability integration
+tests cover evals, triggers, templates, governance, audits, scheduled
+tasks, outcomes, plan reviews, external workers, provider bindings +
+connections.
+
+**What Phase 4 does NOT yet deliver** (and what RFC-025 does NOT
+unilaterally claim):
+
+- **Boot is not O(1) in the production binary yet.** `main.rs` still
+  runs a `Startup replay from durable event log` block that reads pg
+  or sqlite in 10k-event batches and replays them through the
+  `InMemoryStore::append` path on every restart. This warms the
+  in-memory projections because the handler hot-paths today still
+  read from the `InMemoryStore`-backed `*ServiceImpl<InMemoryStore>`
+  fields, not directly from the pg/sqlite read-model tables. The
+  durable projection tables exist and pass the parity harness, but
+  cutting handler reads over to them — and deleting the startup
+  replay — is a follow-up refactor outside RFC-025's scope. The
+  per-domain `replay_*` walker deletion still matters: it removed
+  the domain-specific hand-rolled projection logic that duplicated
+  the `SyncProjection` contract and drifted from it.
+- **Writes still route through `InMemoryStore` first.** `main.rs` calls
+  `InMemoryStore::set_secondary_log(pg_or_sqlite_event_log)` so every
+  service-layer append lands in the InMemory projection first and
+  then dual-writes to the durable backend. Pg + sqlite therefore see
+  a strict superset of what the in-memory projection saw, which is
+  why the parity harness can compare in-memory ↔ sqlite byte-equal.
+  A future refactor that promotes pg/sqlite to the primary writer
+  would drop the secondary-log indirection.
+- **`RuntimeServices` fields are still concretely `*ServiceImpl<InMemoryStore>`.**
+  The rename is semantic (the aggregate is no longer named after one
+  specific storage engine) but the backend-generic `RuntimeServices<S: Store>`
+  that the original RFC §"Core shape" sketched is still future work.
+
+What Phase 4 DOES deliver:
+
+1. Naming honesty — `RuntimeServices` is correct for the direction of
+   travel, and distinguishes the aggregate from `cairn-store`'s
+   `InMemoryStore` and `cairn-memory`'s `InMemoryServices` type alias.
+2. A complete projection registry (Projected / Ephemeral / Stubbed)
+   with compile-time exhaustiveness + boot-time assertion + pre-commit
+   + CI `log_stub` guard.
+3. Durable pg/sqlite read-model tables for every `Projected` variant —
+   the substrate on which the "pg/sqlite reads are primary" follow-up
+   will land without further schema churn.
+4. Deletion of the three ad-hoc `replay_*` walkers that were not
+   backed by the `SyncProjection` framework.
+
+**Closes** #434 (critical), #435, #436, #437 (high) — the four
+original issues — and stands up the primitive that later phases can
+extend if additional ephemeral-today services become durable.
 
 Authored via iterated proposer/challenger debate (3 rounds). Final verdict:
 **ACCEPTED**. Open questions resolved 2026-04-28:
@@ -16,16 +102,18 @@ Authored via iterated proposer/challenger debate (3 rounds). Final verdict:
   shipped a static const-array registry + a `build.rs` script that
   parses `cairn-domain/src/events.rs` against the registry — simpler
   than a new proc-macro crate, same exhaustiveness guarantee.
-- **Sprint cadence:** full 7-phase plan.
+- **Sprint cadence:** full 7-phase plan (shipped as 10 PRs after
+  Phase 2a + Phase 2b were subdivided into 2a.1/2a.2 and 2b.1/2b.2a
+  per the risk-mitigation clause in each phase).
 - **Provider split (bindings vs connections):** research doc landed
-  alongside Phase 0 at `RFC-025-provider-boundary-research.md`; Phase 3
-  still hard-blocked on the research outcome, but the research itself
-  is no longer pending.
+  alongside Phase 0 at `RFC-025-provider-boundary-research.md`.
+  Both `provider_bindings` and `provider_connections` ship Projected
+  in Phase 3; `provider_pools` + `provider_health` remain Ephemeral.
 
-**Phase 0 shipped (PR TBD):**
+**Phase 0 shipped (PR #549):**
 - Projection registry at `crates/cairn-store/src/projection_registry.rs`
-  with all 156 `RuntimeEvent` variants classified (48 Projected, 31
-  Ephemeral, 77 Stubbed).
+  with all `RuntimeEvent` variants classified (see "Final projection
+  registry counts" above for current 95 / 18 / 45).
 - Compile-time exhaustiveness via `crates/cairn-store/build.rs`
   (parses `cairn-domain/src/events.rs` and rejects the build when any
   variant drifts in or out of the registry).
@@ -35,19 +123,63 @@ Authored via iterated proposer/challenger debate (3 rounds). Final verdict:
 - `scripts/install-hooks.sh` points `git config core.hooksPath` at
   `.githooks/` so hooks update with `git pull`.
 - Parity harness at `crates/cairn-store/tests/projection_parity.rs`
-  exercising InMemory ↔ SQLite on a representative Projected
-  cross-section (session / run / task / approval / org-hierarchy); pg
-  parity gated behind `TEST_DATABASE_URL` for nightly CI.
+  exercising InMemory ↔ SQLite. Extended variant-by-variant by every
+  subsequent phase's migration so the harness always matches the live
+  projected set.
 - `AppState::new_with_runtime` calls
   `assert_no_stubs_for_persistent_backend` at boot and logs the
-  Stubbed variant list at WARN. Phase 2c flips to a hard boot failure
-  once Phase 1 + Phase 2a + Phase 2b empty the stub set.
+  Stubbed variant list at WARN. The Phase 2c flip to a hard boot
+  failure is descoped — the remaining Stubbed set is tracked by
+  dedicated follow-ups (#574) rather than blocked on RFC-025 closure.
+
+**Phase 4 shipped (this PR):**
+- `cairn_runtime::InMemoryServices` renamed to
+  `cairn_runtime::RuntimeServices`. The name was the RFC-025 motivating
+  misnomer — the aggregate is not in-memory-only.
+- `cairn_memory::InMemoryServices` is a separate type-alias for the
+  memory-pipeline-on-in-memory-backends bundle. The name there is
+  genuinely accurate and is left alone.
+- `cairn_store::InMemoryStore` (the actual in-memory event-log backend)
+  is untouched; that name is correct.
+- Operator-facing + developer-guide docs refreshed to use the new
+  name and to describe the post-RFC-025 storage contract honestly:
+  95 Projected event variants now write to durable pg/sqlite
+  read-model tables, the three hand-rolled walkers are gone, and
+  the startup in-memory-warm-up replay is explicitly flagged as
+  remaining (targeted by a follow-up refactor).
 
 ## Summary
 
-Today `RuntimeAggregate` (via the `InMemoryServices` struct at `crates/cairn-runtime/src/aggregate.rs:40`) hard-codes `Arc<InMemoryStore>` for ~30 non-execution services (approvals, evals, credentials, quotas, provider bindings, etc.), regardless of whether the operator configures Postgres, SQLite, or `--db memory`. Write paths persist to pg/sqlite correctly; read paths always go through an in-memory materialization rebuilt by O(N) replay of the full event log on every boot. Additionally, the eval subsystem mutates state in four handlers without emitting events, causing silent data loss on restart (#435, #337 class).
+Historically (pre-RFC-025), the runtime service aggregate — then named
+`InMemoryServices` at `crates/cairn-runtime/src/aggregate.rs:40` —
+hard-coded `Arc<InMemoryStore>` for ~30 non-execution services
+(approvals, evals, credentials, quotas, provider bindings, etc.),
+regardless of whether the operator configured Postgres, SQLite, or
+`--db memory`. Write paths persisted to pg/sqlite correctly; read
+paths always went through an in-memory materialization rebuilt by
+O(N) replay of the full event log on every boot. Additionally, the
+eval subsystem mutated state in four handlers without emitting
+events, causing silent data loss on restart (#435, #337 class).
 
-This RFC migrates 27 services from in-memory-with-boot-replay to projection-backed reads, phases the work across 7 PRs (~8500 LOC total), and preserves `--db memory` as a first-class runtime mode. Boot goes from O(N) to O(1). Pg/sqlite gain parity with in-memory on eval + replay-based services. No new events or wire-format changes beyond 2 missing eval event types.
+This RFC moved the affected services off the three hand-rolled
+boot walkers onto durable `SyncProjection` read-models, phased the
+work across 10 PRs (delivered against an original 7-phase plan, with
+Phase 2a + Phase 2b subdivided after audit), and preserved
+`--db memory` as a first-class runtime mode. Every `Projected` event
+variant now writes to a named pg/sqlite read-model table inside the
+event-append transaction (95 Projected / 18 Ephemeral / 45 Stubbed in
+the registry as of Phase 4 close). The three hand-rolled walkers
+(`replay_evals`, `replay_graph`, `replay_triggers`) are deleted and
+the aggregate is renamed `RuntimeServices` to match.
+
+What this RFC **did not** promise and Phase 4 **does not claim**: an
+O(1) production boot today. `main.rs` still runs a full-log replay
+into the in-memory projections on pg/sqlite startup so handler
+reads (which still go through `*ServiceImpl<InMemoryStore>`) see a
+warm state on restart. Cutting handler reads over to the durable
+projection tables and removing the startup replay is a follow-up
+refactor that RFC-025's infrastructure enables — see the "Boot +
+read-path semantics" block above for the explicit accounting.
 
 ## Motivation
 
@@ -120,7 +252,9 @@ Services split into two classes.
 > boundary lives once all Phase 2a/2b projections ship.
 
 **Projected services** (backed by one or more SyncProjection read-model
-tables — pg/sqlite/in-memory byte-equal; boot is O(1)):
+tables — pg/sqlite/in-memory byte-equal; the abstraction's
+end-state target is O(1) boot, with the startup-replay removal tracked
+as a post-Phase-4 follow-up):
 
 - Approvals, approval_policies, checkpoints, tool_call_approvals
 - Prompt_assets, prompt_releases, prompt_versions
@@ -356,17 +490,66 @@ Hot-path read analysis in the research found no >1000/sec consumers — no extra
 
 **Risk + mitigation.** The ephemeral set must be genuinely ephemeral. Mitigation: audit each ephemeral service's field set against the registry declaration before PR.
 
-### Phase 4 — Cleanup (~400 LOC)
+### Phase 4 — Cleanup (IMPLEMENTED 2026-04-29, PR #585)
 
-**Scope.** Delete now-dead code. Confirm `RuntimeServices<Arc<dyn Store>>` alternative (if we ever need dynamic dispatch). Delete any ephemeral-only services' persistence stubs. Rename `InMemoryServices` → `RuntimeServices` throughout. Update CLAUDE.md, README, operator docs.
+**Scope delivered:**
 
-**Services.** All (cleanup pass).
+- `cairn_runtime::InMemoryServices` → `cairn_runtime::RuntimeServices`
+  rename across all call sites: `crates/cairn-runtime/src/aggregate.rs`
+  (struct + impl), `cairn-runtime/src/lib.rs` (re-export),
+  `cairn-runtime/src/runtime_config.rs` (doc-comment references),
+  `cairn-app/src/state.rs`, `cairn-app/src/router.rs`,
+  `cairn-app/src/main.rs`, `cairn-app/src/bin_main/bin_state.rs`, and
+  cairn-app integration tests (`support/mod.rs`,
+  `support/fake_fabric.rs`, `system_status.rs`). No struct-body
+  rewrites; the field types are unchanged from Phase 3.
+- Developer-facing docs updated: `docs/developer-guide.md`
+  ("AppState fields" table now reads `Arc<RuntimeServices>`),
+  `docs/design/CAIRN-FABRIC-FINALIZED.md` (current-state paragraphs
+  use `RuntimeServices`; historical prose keeps the old name in
+  past-tense context), CLAUDE.md (architecture section carries the
+  honest storage + boot accounting — durable dual-writes, the
+  startup warm-up replay that still runs today, and what the
+  aggregate rename unblocks), README (architecture
+  diagram + backends list + RFC-025 closure footnote).
+- Archived historical designs (`docs/design/archive/ORCHESTRATOR_DESIGN.md`
+  et al.) are left unchanged — they describe a past-tense state.
 
-**Tests added.** None new; existing suite must still pass.
+**Deliberately NOT in scope:**
 
-**Dependencies.** All prior phases.
+- A generic `RuntimeServices<S: Store>` abstraction. Every field in
+  `RuntimeServices` still type-parameterizes over `<InMemoryStore>`;
+  true backend-generic dispatch (`<Arc<dyn Store>>` or
+  `<S: Store>` per-field) is a further refactor outside RFC-025's
+  scope, tracked separately. What Phase 4 delivers is the naming
+  honesty — pg/sqlite reads already flow through the projection layer
+  installed by Phases 0–3, so the aggregate is correctly "runtime
+  services" regardless of where the read-model tables live.
+- Deleting ephemeral-only services' persistence stubs. Audited in
+  this PR and confirmed not present: every Ephemeral variant in the
+  registry lands in the pg/sqlite `=> {}` intentional-no-op arm, not
+  in a dead `save`/`load` path.
+- Deleting `replay_*` walkers. Already done in Phases 1 / 1.5a / 1.5b;
+  no additional walkers remain in `crates/cairn-app/src/{state.rs,main.rs}`.
 
-**Risk + mitigation.** Pure cleanup; risk is accidental behavioral change during rename. Mitigation: each commit in this PR is a pure rename or pure deletion, reviewable line-by-line.
+**Services.** None migrated in this phase; it is a symbol rename +
+doc refresh pass.
+
+**Tests added.** None new. The existing suite (cairn-runtime lib,
+cairn-app lib, cairn-app integration, cairn-store projection_registry,
+cairn-store projection_parity) must still pass byte-equal. The
+restart-durability tests added alongside Phases 1 / 1.5a / 2a / 2b /
+3 cover the read-path contract.
+
+**Dependencies.** All prior phases (0, 1, 1.5a, 1.5b, 2a.1, 2a.2, 2b.1,
+2b.2a, 3).
+
+**Risk + mitigation.** Pure cleanup; risk is accidental behavioral
+change during rename. Mitigation: `sed -i 's/\bInMemoryServices\b/RuntimeServices/g'`
+on a restricted file list (cairn-memory crate excluded — its
+identically-named type alias is legitimate), diff stat is pure symbol
+substitution, `cargo check --workspace --tests` green, pre-commit
+hook (fmt + clippy + stub guard) green.
 
 ## Open questions — RESOLVED 2026-04-28
 
@@ -404,7 +587,18 @@ Rejected: (b) runtime WARN-once — too easy to miss in logs, violates
 
 ### 2. Sprint cadence → ACCEPTED: full scope
 
-All 7 phases. 27 services migrate to projection-backed reads. Boot becomes O(1). Pg/sqlite reach true parity with in-memory. ~8500 LOC over 8-12 weeks at ~1 PR/week.
+All 7 phases (delivered as 10 PRs after 2a + 2b subdivision). 27
+services move off hand-rolled boot walkers onto durable
+`SyncProjection` read-models. Pg/sqlite gain byte-equal parity with
+in-memory at the read-model-table layer (verified via the parity
+harness). ~8500 LOC over 8-12 weeks at ~1 PR/week. The original
+design note "boot becomes O(1)" remains the intent of the abstraction
+but is a follow-up refactor — Phases 0-4 ship the substrate
+(projected tables + registry + guard rails + name) and delete the
+three domain-specific hand-rolled walkers; the full-log boot replay
+into the in-memory projections still runs in `main.rs` today. See the
+"Boot + read-path semantics after Phase 4 (honest accounting)" block
+in the Status section.
 
 ### 3. Provider bindings vs connections split → RESEARCH LANDED (2026-04-28)
 

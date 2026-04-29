@@ -22,7 +22,7 @@ use cairn_domain::ProviderBindingRecord;
 use cairn_graph::in_memory::InMemoryGraphStore;
 use cairn_memory::bundles::BundleEnvelope;
 use cairn_runtime::{
-    InMemoryServices, ProviderBindingService, ProviderConnectionConfig, ProviderConnectionService,
+    ProviderBindingService, ProviderConnectionConfig, ProviderConnectionService, RuntimeServices,
 };
 use std::{future::Future, net::SocketAddr, sync::Arc};
 use tokio::{net::TcpListener, runtime::Builder};
@@ -265,14 +265,14 @@ impl AppBootstrap {
 
     pub async fn router_with_runtime(
         config: BootstrapConfig,
-    ) -> Result<(Router, Arc<InMemoryServices>), String> {
+    ) -> Result<(Router, Arc<RuntimeServices>), String> {
         let (router, runtime, _) = Self::router_with_runtime_and_tokens(config).await?;
         Ok((router, runtime))
     }
 
     pub async fn router_with_runtime_and_tokens(
         config: BootstrapConfig,
-    ) -> Result<(Router, Arc<InMemoryServices>, Arc<ServiceTokenRegistry>), String> {
+    ) -> Result<(Router, Arc<RuntimeServices>, Arc<ServiceTokenRegistry>), String> {
         let (router, runtime, _graph, service_tokens) =
             Self::router_with_runtime_graph_and_tokens(config).await?;
         Ok((router, runtime, service_tokens))
@@ -283,7 +283,7 @@ impl AppBootstrap {
     ) -> Result<
         (
             Router,
-            Arc<InMemoryServices>,
+            Arc<RuntimeServices>,
             Arc<InMemoryGraphStore>,
             Arc<ServiceTokenRegistry>,
         ),
@@ -303,11 +303,11 @@ impl AppBootstrap {
     ///
     /// Lets test fixtures (see `crates/cairn-app/tests/support/fake_fabric.rs`)
     /// stand up an AppState without a live Valkey by injecting the
-    /// read-only trio via `InMemoryServices::with_store_and_core` and
+    /// read-only trio via `RuntimeServices::with_store_and_core` and
     /// passing it through here.
     pub async fn router_with_injected_runtime(
         config: BootstrapConfig,
-        runtime: Arc<InMemoryServices>,
+        runtime: Arc<RuntimeServices>,
         fabric: Option<Arc<cairn_fabric::FabricServices>>,
     ) -> Result<(Router, Arc<AppState>), String> {
         let state = Arc::new(AppState::new_with_runtime(config, runtime, fabric).await?);

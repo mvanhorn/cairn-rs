@@ -46,7 +46,7 @@ use cairn_memory::pipeline::{IngestPipeline, ParagraphChunker};
 
 use cairn_runtime::startup::ReadinessState;
 use cairn_runtime::{
-    InMemoryServices, LicenseService, MarketplaceService, ModelRegistry, ProjectService,
+    LicenseService, MarketplaceService, ModelRegistry, ProjectService, RuntimeServices,
     TenantService, TriggerService, WorkspaceService,
 };
 
@@ -208,7 +208,7 @@ pub struct RateLimitBucket {
 #[derive(Clone)]
 pub struct AppState {
     pub config: BootstrapConfig,
-    pub runtime: Arc<InMemoryServices>,
+    pub runtime: Arc<RuntimeServices>,
     pub evals: Arc<ProductEvalRunService>,
     pub eval_baselines: Arc<EvalBaselineServiceImpl>,
     pub eval_datasets: Arc<EvalDatasetServiceImpl>,
@@ -824,7 +824,7 @@ impl AppState {
     /// `build_runtime_with_optional_fabric` and then delegates here.
     pub async fn new_with_runtime(
         config: BootstrapConfig,
-        runtime: Arc<InMemoryServices>,
+        runtime: Arc<RuntimeServices>,
         fabric: Option<Arc<cairn_fabric::FabricServices>>,
     ) -> Result<Self, String> {
         // Surface any `Stubbed` RuntimeEvent variants at boot so pg/sqlite
@@ -1286,12 +1286,12 @@ pub(crate) fn default_snapshot_dir() -> PathBuf {
 /// Constructs `FabricServices` from env config, wires the
 /// `FabricRunServiceAdapter` / `Task` / `Session` trio on top of a shared
 /// `InMemoryStore`, and installs them via
-/// `InMemoryServices::with_store_and_core`. Boot failure on the Fabric
+/// `RuntimeServices::with_store_and_core`. Boot failure on the Fabric
 /// path (unreachable Valkey, HMAC validation, …) surfaces here before
 /// cairn-app serves traffic — no silent fall-back.
 ///
 /// Integration tests that need to stand up an AppState without a live
-/// Valkey build a `FakeFabric`-backed `InMemoryServices` (see
+/// Valkey build a `FakeFabric`-backed `RuntimeServices` (see
 /// `crates/cairn-app/tests/support/fake_fabric.rs`) and call
 /// [`AppBootstrap::router_with_injected_runtime`] directly, bypassing
 /// this constructor.
@@ -1299,7 +1299,7 @@ async fn build_runtime_with_optional_fabric(
     master_key: Arc<cairn_runtime::MasterKey>,
 ) -> Result<
     (
-        Arc<InMemoryServices>,
+        Arc<RuntimeServices>,
         Option<Arc<cairn_fabric::FabricServices>>,
     ),
     String,
@@ -1386,9 +1386,9 @@ async fn build_runtime_with_optional_fabric(
     );
 
     let mut services =
-        InMemoryServices::with_store_core_and_key(store, runs, tasks, sessions, master_key);
+        RuntimeServices::with_store_core_and_key(store, runs, tasks, sessions, master_key);
     // Also expose the raw fabric via the type-erased slot on
-    // InMemoryServices so non-trait surfaces (budgets, quotas, signals)
+    // RuntimeServices so non-trait surfaces (budgets, quotas, signals)
     // remain reachable from runtime-scoped code. Cast the Arc to Any here
     // because cairn-runtime does not name cairn-fabric types.
     services.fabric = Some(fabric.clone() as Arc<dyn std::any::Any + Send + Sync>);

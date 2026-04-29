@@ -195,13 +195,17 @@ cairn-fabric is the thin adapter.
 ```
 HTTP request
   └─► Command handler
-        ├─► append(events) ──► InMemoryStore projections ──► read models
-        │                  ──► Postgres event log          (when --db postgres://...)
-        │                  ──► broadcast channel           ──► SSE subscribers
-        └─► HTTP response  (returns latest projected state)
+        ├─► InMemoryStore::append(events)
+        │     ├─► SyncProjection → in-memory read-models   (primary, same call)
+        │     └─► secondary_log → Postgres / SQLite         (same call, durable dual-write)
+        │           └─► SyncProjection → pg/sqlite read-model tables (same tx)
+        ├─► broadcast channel ──► SSE subscribers
+        └─► HTTP response  (reads the in-memory read-model today)
 ```
 
-State is always derived from the log. Postgres stores events for durability and cursor-based replay; the in-memory store drives read models and the SSE broadcast. There is no separate synchronization step.
+State is always derived from the log. The in-memory store is the primary write target; its `set_secondary_log()` hook dual-writes every service-layer append to the durable backend (Postgres or SQLite). The durable backend's `SyncProjection` fires inside the same transaction as the event append, so a committed position is always projected. Boot on pg/sqlite streams the durable event log back into the in-memory projections in 10 k-event batches so restarts come up with a warm read model.
+
+**Post RFC-025 (2026-04-29).** The runtime service aggregate is `cairn_runtime::RuntimeServices` (renamed from `InMemoryServices` in Phase 4). Three hand-rolled boot walkers that sat outside the `SyncProjection` framework (`replay_evals`, `replay_graph`, `replay_triggers`) are deleted, and 95 event variants now write to named pg/sqlite read-model tables inside the event-append transaction. The boot-time full-log replay into the in-memory store still runs today — cutting handler reads over to the durable projection tables and removing that replay is the next refactor after Phase 4. See `docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md` for the full contract (Projected / Ephemeral / Stubbed counts, what Phase 4 delivered, and what remains).
 
 ---
 

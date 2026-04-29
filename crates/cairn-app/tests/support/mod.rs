@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::Router;
 use cairn_api::bootstrap::BootstrapConfig;
 use cairn_app::{AppBootstrap, AppState};
-use cairn_runtime::InMemoryServices;
+use cairn_runtime::RuntimeServices;
 use cairn_store::InMemoryStore;
 
 use crate::support::fake_fabric::build_fake_fabric;
@@ -30,7 +30,7 @@ use crate::support::fake_fabric::build_fake_fabric;
 pub async fn build_test_router_fake_fabric(config: BootstrapConfig) -> (Router, Arc<AppState>) {
     let store = Arc::new(InMemoryStore::new());
     let (runs, tasks, sessions) = build_fake_fabric(store.clone());
-    let runtime = Arc::new(InMemoryServices::with_store_and_core(
+    let runtime = Arc::new(RuntimeServices::with_store_and_core(
         store, runs, tasks, sessions,
     ));
     AppBootstrap::router_with_injected_runtime(config, runtime, None)

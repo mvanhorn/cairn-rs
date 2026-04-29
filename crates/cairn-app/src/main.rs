@@ -77,7 +77,7 @@ use cairn_runtime::provider_health::ProviderHealthService;
 use cairn_runtime::sessions::SessionService;
 use cairn_runtime::{CredentialService, DefaultsService};
 #[allow(unused_imports)]
-use cairn_runtime::{InMemoryServices, OllamaEmbeddingProvider, OllamaModel, OllamaProvider};
+use cairn_runtime::{OllamaEmbeddingProvider, OllamaModel, OllamaProvider, RuntimeServices};
 use cairn_store::pg::PgMigrationRunner;
 use cairn_store::pg::{PgAdapter, PgEventLog};
 use cairn_store::sqlite::{SqliteAdapter, SqliteEventLog};
