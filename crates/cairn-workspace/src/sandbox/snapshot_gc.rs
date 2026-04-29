@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use cairn_domain::{SessionId, WorkspaceSnapshotId};
 
 use crate::sandbox::f65::{F65SandboxEvent, F65SandboxEventSink};
-use crate::sandbox::service::{Clock, SandboxService};
+use crate::sandbox::service::{Clock, SandboxServiceApi};
 
 /// Reason recorded on a reaped snapshot. Rides on the cairn-workspace
 /// event shape; the domain `WorkspaceSnapshotReaped` carries only
@@ -139,7 +139,7 @@ impl std::fmt::Debug for SnapshotGcPolicy {
 /// the existing background workers. Graceful shutdown: abort the
 /// returned `JoinHandle`.
 pub struct SnapshotGcSweeper {
-    service: Arc<SandboxService>,
+    service: Arc<dyn SandboxServiceApi>,
     source: Arc<dyn SnapshotGcSource>,
     f65_event_sink: Arc<dyn F65SandboxEventSink>,
     policy: SnapshotGcPolicy,
@@ -147,7 +147,7 @@ pub struct SnapshotGcSweeper {
 
 impl SnapshotGcSweeper {
     pub fn new(
-        service: Arc<SandboxService>,
+        service: Arc<dyn SandboxServiceApi>,
         source: Arc<dyn SnapshotGcSource>,
         f65_event_sink: Arc<dyn F65SandboxEventSink>,
         policy: SnapshotGcPolicy,

@@ -256,7 +256,12 @@ pub struct AppState {
     /// shape); this map stores arbitrary directory paths so operators
     /// can point cairn at a local checkout as a pseudo-repo.
     pub project_local_paths: Arc<crate::repo_routes::ProjectLocalPaths>,
-    pub sandbox_service: Arc<cairn_workspace::SandboxService>,
+    /// Sandbox service accessed via the `SandboxServiceApi` trait (issue #443).
+    /// Holding the trait object keeps cairn-app from binding to the concrete
+    /// shape of `cairn_workspace::SandboxService` and enables mock-based
+    /// tests. The concrete instance is constructed in `AppState::new` and
+    /// widened to `Arc<dyn SandboxServiceApi>` at the assignment site.
+    pub sandbox_service: Arc<dyn cairn_workspace::SandboxServiceApi>,
     pub(crate) sqeq_sessions: Arc<Mutex<HashMap<String, SqEqSessionBinding>>>,
     pub(crate) a2a_tasks: Arc<Mutex<HashMap<String, A2aTaskBinding>>>,
     pub rate_limits: Arc<Mutex<HashMap<String, RateLimitBucket>>>,
@@ -1093,6 +1098,11 @@ impl AppState {
             .with_f65_event_sink(f65_event_sink)
             .with_snapshot_writer(f65_snapshot_writer),
         );
+        // Widen to the trait object for storage on `AppState`. Every
+        // consumer inside cairn-app only needs `SandboxServiceApi`; the
+        // concrete type stays live for the GC-sweeper wiring below (which
+        // takes `Arc<dyn SandboxServiceApi>` too, so no downcast needed).
+        let sandbox_service: Arc<dyn cairn_workspace::SandboxServiceApi> = sandbox_service;
         // RFC 015: marketplace service wrapping the plugin host.
         let marketplace = {
             let mut svc = MarketplaceService::new(runtime.store.clone());

@@ -268,6 +268,92 @@ struct RegistryEntry {
     base_revision_drift_handled: bool,
 }
 
+/// Object-safe façade over [`SandboxService`] exposing exactly the methods
+/// that consumers outside this crate (cairn-app runtime, GC sweeper,
+/// integration-test seed helpers) call.
+///
+/// Introduced for issue #443 so cairn-app's `AppState` can hold
+/// `Arc<dyn SandboxServiceApi>` instead of the concrete struct, which
+/// (a) enables mock-based tests without standing up the full providers/
+/// event-sink/clock stack and (b) keeps the upper layer from binding to
+/// the private shape of `SandboxService`.
+///
+/// The trait is intentionally narrow: only methods reached from outside
+/// `cairn-workspace` are on it. Internal helpers and builder setters stay
+/// as inherent `impl SandboxService` methods.
+#[async_trait::async_trait]
+pub trait SandboxServiceApi: Send + Sync {
+    /// Provision (or reconnect to an existing) sandbox bound to `run_id`.
+    /// See [`SandboxService::provision_or_reconnect`] for the real docs.
+    async fn provision_or_reconnect(
+        &self,
+        run_id: &RunId,
+        task_id: Option<TaskId>,
+        project: ProjectKey,
+        policy: SandboxPolicy,
+    ) -> Result<ProvisionedSandbox, WorkspaceError>;
+
+    /// Mark a provisioned sandbox as active and return the active handle.
+    async fn activate(
+        &self,
+        run_id: &RunId,
+        pid: Option<u32>,
+    ) -> Result<ProvisionedSandbox, WorkspaceError>;
+
+    /// Root directory under which per-sandbox directories live.
+    fn base_dir(&self) -> &PathBuf;
+
+    /// Crash-recovery sweep. See [`SandboxService::recover_all`].
+    async fn recover_all(&self) -> Result<SandboxRecoverySummary, WorkspaceError>;
+
+    /// Reap a workspace snapshot directory. Returns `Ok(true)` when the
+    /// directory was removed, `Ok(false)` when it did not exist or a
+    /// resume is in flight against it. See
+    /// [`SandboxService::reap_snapshot_dir`].
+    fn reap_snapshot_dir(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+    ) -> Result<bool, WorkspaceError>;
+
+    /// Integration-test helper. Registers a registry entry directly,
+    /// bypassing provisioning. See
+    /// [`SandboxService::seed_registry_entry_for_test`].
+    fn seed_registry_entry_for_test(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+    ) -> Result<(), WorkspaceError>;
+
+    /// Integration-test helper. Variant of
+    /// [`Self::seed_registry_entry_for_test`] that captures a bound
+    /// `repo_id`.
+    fn seed_registry_entry_for_test_with_repo(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+        repo_id: Option<RepoId>,
+    ) -> Result<(), WorkspaceError>;
+
+    /// Integration-test helper. Extended variant that also captures the
+    /// entry's stored `base_revision`.
+    fn seed_registry_entry_for_test_full(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+        repo_id: Option<RepoId>,
+        base_revision: Option<String>,
+    ) -> Result<(), WorkspaceError>;
+}
+
 pub struct SandboxService {
     providers: HashMap<SandboxStrategy, Box<dyn SandboxProvider>>,
     event_sink: Arc<dyn SandboxEventSink>,
@@ -2239,6 +2325,98 @@ fn recovery_policy(metadata: &SandboxMetadata) -> SandboxPolicy {
         on_resource_exhaustion: OnExhaustion::Destroy,
         preserve_on_failure: true,
         required_host_caps: crate::sandbox::HostCapabilityRequirements::default(),
+    }
+}
+
+// ── SandboxServiceApi impl (issue #443) ──────────────────────────────────
+//
+// Each arm forwards to the inherent method of the same name so the
+// behaviour is unchanged. The inherent methods stay on `impl SandboxService`
+// so the test suite and the builder-style `with_*` setters keep working
+// without any call-site churn.
+
+#[async_trait::async_trait]
+impl SandboxServiceApi for SandboxService {
+    async fn provision_or_reconnect(
+        &self,
+        run_id: &RunId,
+        task_id: Option<TaskId>,
+        project: ProjectKey,
+        policy: SandboxPolicy,
+    ) -> Result<ProvisionedSandbox, WorkspaceError> {
+        SandboxService::provision_or_reconnect(self, run_id, task_id, project, policy).await
+    }
+
+    async fn activate(
+        &self,
+        run_id: &RunId,
+        pid: Option<u32>,
+    ) -> Result<ProvisionedSandbox, WorkspaceError> {
+        SandboxService::activate(self, run_id, pid).await
+    }
+
+    fn base_dir(&self) -> &PathBuf {
+        SandboxService::base_dir(self)
+    }
+
+    async fn recover_all(&self) -> Result<SandboxRecoverySummary, WorkspaceError> {
+        SandboxService::recover_all(self).await
+    }
+
+    fn reap_snapshot_dir(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+    ) -> Result<bool, WorkspaceError> {
+        SandboxService::reap_snapshot_dir(self, snapshot_id)
+    }
+
+    fn seed_registry_entry_for_test(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+    ) -> Result<(), WorkspaceError> {
+        SandboxService::seed_registry_entry_for_test(
+            self, sandbox_id, run_id, project, strategy, path,
+        )
+    }
+
+    fn seed_registry_entry_for_test_with_repo(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+        repo_id: Option<RepoId>,
+    ) -> Result<(), WorkspaceError> {
+        SandboxService::seed_registry_entry_for_test_with_repo(
+            self, sandbox_id, run_id, project, strategy, path, repo_id,
+        )
+    }
+
+    fn seed_registry_entry_for_test_full(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+        repo_id: Option<RepoId>,
+        base_revision: Option<String>,
+    ) -> Result<(), WorkspaceError> {
+        SandboxService::seed_registry_entry_for_test_full(
+            self,
+            sandbox_id,
+            run_id,
+            project,
+            strategy,
+            path,
+            repo_id,
+            base_revision,
+        )
     }
 }
 

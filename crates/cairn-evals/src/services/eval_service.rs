@@ -239,6 +239,20 @@ impl EvalRunService {
         state.runs.get(eval_run_id.as_str()).cloned()
     }
 
+    /// Evict an eval run from the in-memory cache without emitting any
+    /// event. Used by handlers to recover from a cache-mutation failure
+    /// after a durable write has already landed: dropping the stale
+    /// entry forces the next read to go through the projection, which
+    /// is the source of truth. Returns `true` when an entry was removed.
+    ///
+    /// Introduced for issue #442 to close the split-brain window where
+    /// a failing cache update after a successful event-log append would
+    /// otherwise leave same-process reads returning pre-update state.
+    pub fn invalidate(&self, eval_run_id: &EvalRunId) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.runs.remove(eval_run_id.as_str()).is_some()
+    }
+
     /// Build a scorecard for a prompt asset, comparing eval results across releases.
     /// Archived runs are skipped (issue #244): a soft-deleted run must not
     /// continue to pad `entry_count` or inflate `best_task_success_rate` on
@@ -808,6 +822,33 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidate_drops_cache_entry_and_is_idempotent() {
+        // Issue #442 regression guard: `invalidate` must evict the run so
+        // a subsequent `get` returns None (forcing callers through the
+        // projection). Calling invalidate again must be a clean no-op.
+        let svc = EvalRunService::new();
+        let id = EvalRunId::new("eval_invalidate");
+        svc.create_run(
+            id.clone(),
+            ProjectId::new("proj_invalidate"),
+            EvalSubjectKind::PromptRelease,
+            "auto".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(svc.get(&id).is_some(), "run is cached after create_run");
+
+        assert!(svc.invalidate(&id), "invalidate reports removal");
+        assert!(svc.get(&id).is_none(), "invalidate evicted the cache entry");
+        assert!(
+            !svc.invalidate(&id),
+            "second invalidate is a no-op (returns false)"
+        );
+    }
 
     #[test]
     fn eval_run_lifecycle() {

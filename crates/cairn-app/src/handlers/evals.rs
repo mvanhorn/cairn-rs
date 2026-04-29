@@ -1,5 +1,37 @@
 //! Eval handlers: runs, datasets, baselines, rubrics, scorecards, matrices,
 //! trend/winner/export/report endpoints, and comparison utilities.
+//!
+//! # Cache/projection contract (issue #442)
+//!
+//! Post RFC-025 Phase 1 the durable source of truth for eval-run state is
+//! the `eval_runs` projection table (see `cairn_store::projections::
+//! EvalRunReadModel`). `state.evals` is a **process-local hot-path cache**
+//! carrying the richer `EvalRun` response shape (plugin_metrics,
+//! dataset_source, cost — fields that never flow through the event log).
+//!
+//! Every mutating eval handler follows the same ordering rule:
+//!
+//! 1. Build the `RuntimeEvent` and `state.runtime.store.append(&[ev])`.
+//!    The projection applier inside the transaction writes the durable
+//!    row. **This is the single authoritative write.** If step 1 returns
+//!    `Err`, the handler MUST return a 5xx without touching the cache.
+//! 2. Best-effort mirror the change onto `state.evals` so subsequent
+//!    same-process `state.evals.get(id)` calls see the new state without
+//!    a projection round-trip. A failure here is logged but never
+//!    promoted to a client-visible error — the cache is rebuildable
+//!    from the projection and a cold read goes via
+//!    [`hydrate_in_memory_from_projection`].
+//!
+//! The risk surfaced by issue #338 / audit #442 is that a new handler
+//! added in the future could forget step 2 and end up with a write
+//! that's only visible after a process restart (when the cache rehydrates
+//! from the projection). The *structural* fix is to make `state.evals` a
+//! subscriber of the SyncProjection so the applier fans out both updates
+//! from a single `append()` call; that conversion is a larger piece of
+//! work tracked as a follow-up. Until then, keep the pairing discipline:
+//! every `state.runtime.store.append(EvalRun*)` site in this file is
+//! immediately followed by the corresponding `state.evals.*` cache
+//! mutate — no exceptions.
 
 use axum::{
     extract::{Path, Query, State},
@@ -655,11 +687,24 @@ pub(crate) async fn delete_eval_run_handler(
     // run yet — e.g. a cross-process DELETE right after a restart) and
     // we do NOT surface it as 500. The projection already committed
     // the `archived_at` via the EvalRunArchived event above.
+    //
+    // Issue #442: today `EvalRunService::archive` only ever returns
+    // `NotFound` (idempotent on already-archived runs). If the service
+    // ever grows a failure mode that leaves the cache entry with a
+    // stale `archived_at = None` (e.g. a future state-transition
+    // guard), we'd have a split-brain: durable state is archived but
+    // same-process `state.evals.get(id)` would still surface the run.
+    //
+    // Belt + braces: on *any* archive error, drop the cache entry so
+    // the next read goes through the projection. For today's
+    // NotFound-only surface this is a no-op (the entry wasn't there
+    // anyway), which matches the invalidate contract.
     if let Err(err) = state.evals.archive(&eval_run_id, now) {
         tracing::debug!(
             %eval_run_id,
             "in-memory archive cache-miss (run not in state.evals); projection is canonical: {err}"
         );
+        state.evals.invalidate(&eval_run_id);
     }
 
     StatusCode::NO_CONTENT.into_response()

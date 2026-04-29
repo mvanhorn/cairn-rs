@@ -444,6 +444,30 @@ fn spawn_subprocess_internal(
         .expect("failed to spawn cairn-app binary — did cargo build it?")
 }
 
+/// Shared bare-bones `cairn-app` subprocess spawner for tests that
+/// deliberately cannot use [`LiveHarness`] (e.g. tests that assert the
+/// binary *refuses* to start and therefore never prints the listening
+/// banner — see `test_rfc020_independent.rs`).
+///
+/// Returns a [`Command`] pre-configured with:
+///   * the correct `cairn-app` binary path (`env!("CARGO_BIN_EXE_cairn-app")`)
+///   * `kill_on_drop(true)` (so a hung or still-running subprocess dies
+///     with the test)
+///   * stdout/stderr piped (callers capture or drain as needed)
+///
+/// Caller layers args and env vars on top. This is the minimum contract
+/// shared between [`LiveHarness`] and startup-refusal tests — centralising
+/// it here (per issue #446) protects against silent drift if the binary
+/// path env var or the kill-on-drop discipline ever changes.
+pub fn raw_cairn_app_command() -> Command {
+    let bin = env!("CARGO_BIN_EXE_cairn-app");
+    let mut cmd = Command::new(bin);
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd
+}
+
 /// Take `stderr` off the child, scan for the listening banner, return the
 /// child (with its stderr now background-drained) plus the bound URL.
 async fn read_listening_banner(mut child: Child) -> (Child, String) {

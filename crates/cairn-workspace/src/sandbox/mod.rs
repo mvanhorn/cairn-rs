@@ -16,7 +16,7 @@ pub use policy::{
 };
 pub use service::{
     BufferedSandboxEventSink, Clock, SandboxEventSink, SandboxRecoverySummary, SandboxService,
-    SystemClock,
+    SandboxServiceApi, SystemClock,
 };
 pub use types::{
     DestroyResult, ProvisionedSandbox, SandboxCheckpoint, SandboxHandle, SandboxId, SandboxState,

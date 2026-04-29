@@ -103,6 +103,14 @@ impl GraphQueryService for PgGraphStore {
             GraphQuery::EvalLineage { eval_run_node_id } => {
                 self.traverse_upstream(&eval_run_node_id, 10).await
             }
+            // MultiHop requires edge-confidence filtering, but V013 graph_edges
+            // has no confidence column yet. Return Internal until the schema
+            // migration lands. The in-memory backend supports it today.
+            GraphQuery::MultiHop { .. } => Err(GraphQueryError::Internal(
+                "MultiHop traversal is not yet supported by the Postgres graph backend \
+                 (edge confidence column pending schema migration)"
+                    .to_string(),
+            )),
         }
     }
 
@@ -142,6 +150,217 @@ impl GraphQueryService for PgGraphStore {
         };
 
         Ok(edges.into_iter().zip(nodes).collect())
+    }
+
+    async fn find_edges_by_source(
+        &self,
+        source_node_id: &str,
+        edge_filter: Option<EdgeKind>,
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>, GraphQueryError> {
+        let rows: Vec<EdgeRow> = if let Some(kind) = edge_filter {
+            sqlx::query_as(
+                "SELECT source_node_id, target_node_id, kind, created_at
+                 FROM graph_edges
+                 WHERE source_node_id = $1 AND kind = $2
+                 LIMIT $3",
+            )
+            .bind(source_node_id)
+            .bind(edge_kind_str(kind))
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as(
+                "SELECT source_node_id, target_node_id, kind, created_at
+                 FROM graph_edges
+                 WHERE source_node_id = $1
+                 LIMIT $2",
+            )
+            .bind(source_node_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| GraphQueryError::StorageError(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| r.into_graph_edge()).collect())
+    }
+
+    async fn find_edges_by_target(
+        &self,
+        target_node_id: &str,
+        edge_filter: Option<EdgeKind>,
+        limit: usize,
+    ) -> Result<Vec<GraphEdge>, GraphQueryError> {
+        let rows: Vec<EdgeRow> = if let Some(kind) = edge_filter {
+            sqlx::query_as(
+                "SELECT source_node_id, target_node_id, kind, created_at
+                 FROM graph_edges
+                 WHERE target_node_id = $1 AND kind = $2
+                 LIMIT $3",
+            )
+            .bind(target_node_id)
+            .bind(edge_kind_str(kind))
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as(
+                "SELECT source_node_id, target_node_id, kind, created_at
+                 FROM graph_edges
+                 WHERE target_node_id = $1
+                 LIMIT $2",
+            )
+            .bind(target_node_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| GraphQueryError::StorageError(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| r.into_graph_edge()).collect())
+    }
+
+    async fn shortest_path(
+        &self,
+        from_node_id: &str,
+        to_node_id: &str,
+        edge_filter: Option<EdgeKind>,
+        max_depth: u32,
+    ) -> Result<Option<Subgraph>, GraphQueryError> {
+        // Trivial case: same node.
+        if from_node_id == to_node_id {
+            if let Some(node) = fetch_node(&self.pool, from_node_id).await? {
+                return Ok(Some(Subgraph {
+                    nodes: vec![node],
+                    edges: vec![],
+                }));
+            }
+            return Ok(None);
+        }
+
+        // Layered BFS — matches the in-memory semantics: edges are treated
+        // as **undirected** so a query with `from=A, to=B` finds a path via
+        // either `A -> … -> B` or `A <- … <- B`. Using `source_node_id OR
+        // target_node_id` mirrors the in-memory helper `bfs_shortest_path`
+        // which walks either side of every edge.
+        //
+        // One SQL query per BFS layer (not per node): fetch every edge
+        // whose source *or* target is in the current frontier set in a
+        // single `= ANY($1)` query. On path hit, batch-fetch every node
+        // on the reconstructed path with a second `= ANY($1)` query.
+        // That keeps the query count at O(depth + 1) instead of O(V+E).
+        use std::collections::{HashMap, HashSet};
+
+        let mut parent: HashMap<String, (String, GraphEdge)> = HashMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(from_node_id.to_owned());
+
+        let mut frontier: Vec<String> = vec![from_node_id.to_owned()];
+        let filter_kind_str = edge_filter.map(edge_kind_str);
+        let target = to_node_id.to_owned();
+
+        for _depth in 0..max_depth {
+            if frontier.is_empty() {
+                break;
+            }
+
+            // Fetch every edge with either endpoint in the frontier.
+            let edges: Vec<EdgeRow> = if let Some(k) = filter_kind_str {
+                sqlx::query_as(
+                    "SELECT source_node_id, target_node_id, kind, created_at
+                     FROM graph_edges
+                     WHERE (source_node_id = ANY($1) OR target_node_id = ANY($1))
+                       AND kind = $2",
+                )
+                .bind(&frontier)
+                .bind(k)
+                .fetch_all(&self.pool)
+                .await
+            } else {
+                sqlx::query_as(
+                    "SELECT source_node_id, target_node_id, kind, created_at
+                     FROM graph_edges
+                     WHERE source_node_id = ANY($1) OR target_node_id = ANY($1)",
+                )
+                .bind(&frontier)
+                .fetch_all(&self.pool)
+                .await
+            }
+            .map_err(|e| GraphQueryError::StorageError(e.to_string()))?;
+
+            let frontier_set: HashSet<&String> = frontier.iter().collect();
+            let mut next_frontier: Vec<String> = Vec::new();
+
+            for row in edges {
+                // Figure out which endpoint is the "current" side and
+                // which is the "neighbour". Both-in-frontier is fine —
+                // deterministic tie-break to source keeps the parent
+                // pointer well-defined.
+                let (current, neighbour) = if frontier_set.contains(&row.source_node_id) {
+                    (row.source_node_id.clone(), row.target_node_id.clone())
+                } else if frontier_set.contains(&row.target_node_id) {
+                    (row.target_node_id.clone(), row.source_node_id.clone())
+                } else {
+                    // Shouldn't happen given the WHERE clause, but handle
+                    // it gracefully rather than trusting the query.
+                    continue;
+                };
+
+                if !visited.insert(neighbour.clone()) {
+                    continue;
+                }
+
+                let edge = row.into_graph_edge();
+                parent.insert(neighbour.clone(), (current, edge));
+
+                if neighbour == target {
+                    // Reconstruct path from target back to source.
+                    let mut path_edges: Vec<GraphEdge> = Vec::new();
+                    let mut path_node_ids: Vec<String> = vec![neighbour.clone()];
+                    let mut cursor = neighbour.clone();
+                    while let Some((prev, edge)) = parent.remove(&cursor) {
+                        path_edges.push(edge);
+                        path_node_ids.push(prev.clone());
+                        cursor = prev;
+                    }
+                    path_edges.reverse();
+                    path_node_ids.reverse();
+
+                    // Batch-fetch every node on the path in a single query.
+                    let node_rows: Vec<NodeRow> = sqlx::query_as(
+                        "SELECT node_id, kind, created_at
+                         FROM graph_nodes WHERE node_id = ANY($1)",
+                    )
+                    .bind(&path_node_ids)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| GraphQueryError::StorageError(e.to_string()))?;
+
+                    // Preserve path order (the SELECT doesn't guarantee it).
+                    let by_id: HashMap<String, GraphNode> = node_rows
+                        .into_iter()
+                        .map(|r| (r.node_id.clone(), r.into_graph_node()))
+                        .collect();
+                    let path_nodes: Vec<GraphNode> = path_node_ids
+                        .iter()
+                        .filter_map(|nid| by_id.get(nid).cloned())
+                        .collect();
+
+                    return Ok(Some(Subgraph {
+                        nodes: path_nodes,
+                        edges: path_edges,
+                    }));
+                }
+
+                next_frontier.push(neighbour);
+            }
+
+            frontier = next_frontier;
+        }
+
+        Ok(None)
     }
 }
 

@@ -1,7 +1,8 @@
 //! Source-code parser for `axum::Router::route` registrations.
 //!
 //! Used by the compat-inventory test to extract `(method, path)` pairs from
-//! `crates/cairn-app/src/router.rs` and `crates/cairn-app/src/bin_router.rs`
+//! `crates/cairn-app/src/router.rs` and
+//! `crates/cairn-app/src/bin_main/bin_router.rs`
 //! without booting the server or introspecting `axum::Router` (which does not
 //! expose a public iteration API on 0.7).
 //!

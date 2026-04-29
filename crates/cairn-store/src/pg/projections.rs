@@ -1220,18 +1220,29 @@ impl PgSyncProjection {
             // RFC 005 approval policies — no durable table yet
             | RuntimeEvent::ApprovalPolicyCreated(_)
             // RFC 001 gradual rollout — state tracked via prompt_releases table
-            | RuntimeEvent::PromptRolloutStarted(_)
-            // F65 PR-2: events without a dedicated projection table.
+            | RuntimeEvent::PromptRolloutStarted(_) => {}
+            // F65 PR-2: events without a dedicated projection table. Listed
+            // one-per-line (matching sqlite/in_memory) so a refactor that
+            // changes one variant's handling surfaces in review instead of
+            // hiding inside a shared or-pattern (#444).
+            //
             // `SessionAttemptCompleted` is visible via the event log +
-            // the subsequent `SessionOutcomeEmitted` row; the breaker/
-            // threshold/decision/fallback/degraded events are operator
-            // observability surfaces (SSE + metrics) with no read-model.
-            | RuntimeEvent::SessionAttemptCompleted(_)
-            | RuntimeEvent::CircuitBreakerTripped(_)
-            | RuntimeEvent::BudgetThresholdCrossed(_)
-            | RuntimeEvent::OrchestratorDecisionMade(_)
-            | RuntimeEvent::SummarizerFallback(_)
-            | RuntimeEvent::WorkspaceBackendDegraded(_) => {}
+            // the subsequent `SessionOutcomeEmitted` row.
+            RuntimeEvent::SessionAttemptCompleted(_) => {}
+            // Breaker trips are forensic — on the event log, and mirrored
+            // into the session outcome row when the trip terminates the
+            // attempt. No dedicated projection table.
+            RuntimeEvent::CircuitBreakerTripped(_) => {}
+            // Budget-threshold-crossed is purely observability (SSE).
+            RuntimeEvent::BudgetThresholdCrossed(_) => {}
+            // Orchestrator decisions are operator observability (SSE + audit).
+            RuntimeEvent::OrchestratorDecisionMade(_) => {}
+            // Summarizer fallback is audit-only (provenance of
+            // compacted_summary). Captured on the event log.
+            RuntimeEvent::SummarizerFallback(_) => {}
+            // Workspace-backend-degraded fires at sandbox init. Operator
+            // alerts via SSE + metrics; no projection row.
+            RuntimeEvent::WorkspaceBackendDegraded(_) => {}
 
             // F65 PR-2: bump attempts_used on the session row. Replay-safe
             // via `GREATEST(...)` — we only ever advance the counter, so

@@ -6,20 +6,10 @@
 //!   cairn-app --port 8080             # custom port
 //!   cairn-app --addr 0.0.0.0          # bind all interfaces
 //!
-mod bin_admin;
-mod bin_events;
-mod bin_export;
-mod bin_frontend;
-mod bin_handlers;
-mod bin_health;
-mod bin_providers;
-mod bin_router;
-#[cfg(target_os = "linux")]
-mod bin_sandboxed_agent;
-mod bin_seed;
-mod bin_state;
-mod bin_types;
-mod bin_websocket;
+// Binary-only modules live under `bin_main/` so the lib/bin boundary is
+// visible at the filesystem level (#445). The legacy `bin_` file-name
+// prefix is retained inside that directory for reader clarity.
+mod bin_main;
 #[allow(dead_code)]
 mod bundles;
 #[allow(dead_code)]
@@ -38,29 +28,29 @@ mod templates;
 mod validate;
 
 #[allow(unused_imports)]
-use bin_admin::*;
+use bin_main::bin_admin::*;
 #[allow(unused_imports)]
-use bin_events::*;
+use bin_main::bin_events::*;
 #[allow(unused_imports)]
-use bin_export::*;
+use bin_main::bin_export::*;
 #[allow(unused_imports)]
-use bin_frontend::*;
+use bin_main::bin_frontend::*;
 #[allow(unused_imports)]
-use bin_handlers::*;
+use bin_main::bin_handlers::*;
 #[allow(unused_imports)]
-use bin_health::*;
+use bin_main::bin_health::*;
 #[allow(unused_imports)]
-use bin_providers::*;
+use bin_main::bin_providers::*;
 #[allow(unused_imports)]
-use bin_router::*;
+use bin_main::bin_router::*;
 #[allow(unused_imports)]
-use bin_seed::*;
+use bin_main::bin_seed::*;
 #[allow(unused_imports)]
-use bin_state::*;
+use bin_main::bin_state::*;
 #[allow(unused_imports)]
-use bin_types::*;
+use bin_main::bin_types::*;
 #[allow(unused_imports)]
-use bin_websocket::*;
+use bin_main::bin_websocket::*;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -460,9 +450,9 @@ async fn flush_state_to_disk(state: &AppState) {
 /// app boot path runs.
 #[cfg(target_os = "linux")]
 fn maybe_run_sandboxed_agent(args: &[String]) -> Option<std::process::ExitCode> {
-    match bin_sandboxed_agent::detect_and_parse(args) {
+    match bin_main::bin_sandboxed_agent::detect_and_parse(args) {
         None => None,
-        Some(Ok(parsed)) => Some(bin_sandboxed_agent::run(parsed)),
+        Some(Ok(parsed)) => Some(bin_main::bin_sandboxed_agent::run(parsed)),
         Some(Err(err)) => {
             eprintln!("[sandboxed-agent] bad CLI: {err}");
             Some(std::process::ExitCode::from(1))
@@ -1192,7 +1182,7 @@ async fn real_main() {
             // admin /v1/events/append) can push notifications into this
             // same buffer.
             lib_state.notification_sink.install(Arc::new(
-                crate::bin_state::NotificationBufferSink {
+                crate::bin_main::bin_state::NotificationBufferSink {
                     buffer: buf.clone(),
                 },
             ));
