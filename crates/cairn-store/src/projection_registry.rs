@@ -779,26 +779,26 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "ExternalWorkerReactivated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (external workers — FF-owned live state, cairn-side projection)",
+        status: ProjectionStatus::Projected {
+            table: Some("external_workers"),
         },
     },
     ProjectionEntry {
         variant: "ExternalWorkerRegistered",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (external workers — FF-owned live state, cairn-side projection)",
+        status: ProjectionStatus::Projected {
+            table: Some("external_workers"),
         },
     },
     ProjectionEntry {
         variant: "ExternalWorkerReported",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (external workers — FF-owned live state, cairn-side projection)",
+        status: ProjectionStatus::Projected {
+            table: Some("external_workers"),
         },
     },
     ProjectionEntry {
         variant: "ExternalWorkerSuspended",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (external workers — FF-owned live state, cairn-side projection)",
+        status: ProjectionStatus::Projected {
+            table: Some("external_workers"),
         },
     },
     ProjectionEntry {
@@ -1369,17 +1369,23 @@ mod tests {
         //     Stubbed → Projected with backing table `entitlement_overrides`
         //     (pg V048 + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
         //     → 91 / 18 / 49.
+        //   * Phase 2b.2 milestone 1 flips the four `ExternalWorker*`
+        //     events (`Registered`, `Suspended`, `Reactivated`,
+        //     `Reported`) Stubbed → Projected with backing table
+        //     `external_workers` (pg V049 — renumbered from V045 after
+        //     Phase 2a.2 took V045-V048; sqlite schema.rs).
+        //     Net: +4 Projected, -4 Stubbed → 95 / 18 / 45.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 91,
+            projected, 95,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
             ephemeral, 18,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 49, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 45, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 
@@ -1387,9 +1393,9 @@ mod tests {
     fn error_display_includes_variant_list() {
         let err = assert_no_stubs_for_persistent_backend(Backend::Postgres).unwrap_err();
         let msg = err.to_string();
-        // Audits + scheduled tasks + outcomes + plan-reviews all left
-        // the Stubbed bucket in Phase 2b.1. Pick a Phase 2b.2 variant
-        // that still lives there.
+        // Audits + scheduled tasks + outcomes + plan-reviews + external
+        // workers all left the Stubbed bucket in Phases 2b.1/2b.2. Pick
+        // a Phase 2b.3+ variant that still lives there.
         assert!(msg.contains("SubagentSpawned"));
         assert!(msg.contains("Postgres") || msg.contains("postgres"));
     }

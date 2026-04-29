@@ -3725,3 +3725,88 @@ impl crate::projections::PlanReviewReadModel for PgAdapter {
         rows.into_iter().map(PlanReviewRow::into_record).collect()
     }
 }
+
+// ── RFC-025 Phase 2b.2 m1: external_workers read model (GAP-005) ──
+
+#[derive(sqlx::FromRow)]
+struct ExternalWorkerRow {
+    worker_id: String,
+    tenant_id: String,
+    display_name: String,
+    status: String,
+    registered_at: i64,
+    updated_at: i64,
+    last_heartbeat_ms: i64,
+    is_alive: bool,
+    active_task_count: i32,
+    current_task_id: Option<String>,
+}
+
+impl ExternalWorkerRow {
+    fn into_record(self) -> cairn_domain::workers::ExternalWorkerRecord {
+        cairn_domain::workers::ExternalWorkerRecord {
+            worker_id: cairn_domain::WorkerId::new(self.worker_id),
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            display_name: self.display_name,
+            status: self.status,
+            registered_at: self.registered_at.max(0) as u64,
+            updated_at: self.updated_at.max(0) as u64,
+            health: cairn_domain::workers::WorkerHealth {
+                last_heartbeat_ms: self.last_heartbeat_ms.max(0) as u64,
+                is_alive: self.is_alive,
+                active_task_count: self.active_task_count.max(0) as u32,
+            },
+            current_task_id: self.current_task_id.map(cairn_domain::TaskId::new),
+        }
+    }
+}
+
+const EXTERNAL_WORKER_SELECT_COLS: &str = "worker_id, tenant_id, display_name, status, \
+     registered_at, updated_at, last_heartbeat_ms, is_alive, active_task_count, current_task_id";
+
+#[async_trait]
+impl crate::projections::ExternalWorkerReadModel for PgAdapter {
+    async fn get(
+        &self,
+        id: &cairn_domain::WorkerId,
+    ) -> Result<Option<cairn_domain::workers::ExternalWorkerRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {EXTERNAL_WORKER_SELECT_COLS} FROM external_workers
+             WHERE worker_id = $1"
+        );
+        let row: Option<ExternalWorkerRow> = sqlx::query_as(&sql)
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(ExternalWorkerRow::into_record))
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::workers::ExternalWorkerRecord>, StoreError> {
+        // Sort ASC by registered_at to mirror the in-memory applier's
+        // `sort_by_key(|r| r.registered_at)`; tiebreak on worker_id for
+        // deterministic pagination at same-ms registration bursts.
+        let sql = format!(
+            "SELECT {EXTERNAL_WORKER_SELECT_COLS} FROM external_workers
+             WHERE tenant_id = $1
+             ORDER BY registered_at ASC, worker_id ASC
+             LIMIT $2 OFFSET $3"
+        );
+        let rows: Vec<ExternalWorkerRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(ExternalWorkerRow::into_record)
+            .collect())
+    }
+}

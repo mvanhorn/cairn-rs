@@ -305,16 +305,124 @@ impl PgSyncProjection {
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
             }
 
+            // ── RFC-025 Phase 2b.2 m1: external_workers (Projected) ──
+            //
+            // Keyed by `worker_id`. Four event arms share the table:
+            //  * Registered → INSERT ... ON CONFLICT (worker_id) DO UPDATE.
+            //    Re-registration resets the entire record — display_name,
+            //    status back to 'active', AND health + current_task_id
+            //    back to their zero-values — mirroring the in-memory
+            //    applier's `insert(.., fresh record)` overwrite. Without
+            //    resetting the health columns on conflict, pg would carry
+            //    stale heartbeat/alive/task state across a re-registration
+            //    and diverge from InMemory (Copilot #580).
+            //  * Suspended → UPDATE status = 'suspended'. No-op on
+            //    missing row (matches in-memory `if let Some(..)` guard).
+            //  * Reactivated → UPDATE status = 'active'. Same guard.
+            //  * Reported → UPDATE heartbeat columns + current_task_id.
+            //    The in-memory applier sets `current_task_id = Some(..)`
+            //    when `outcome.is_none()` (active work) and `None`
+            //    otherwise (terminal outcome). Mirror that so the
+            //    projection column agrees with the record.
+            //
+            // `updated_at` is overwritten on every arm (wall-clock `now`)
+            // to match the in-memory applier's `rec.updated_at = now`
+            // discipline; re-registration also overwrites `registered_at`
+            // with the latest event value.
+            RuntimeEvent::ExternalWorkerRegistered(e) => {
+                let registered_at = i64::try_from(e.registered_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ExternalWorkerRegistered.registered_at {} exceeds i64::MAX",
+                        e.registered_at
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO external_workers (
+                        worker_id, tenant_id, display_name, status,
+                        registered_at, updated_at,
+                        last_heartbeat_ms, is_alive, active_task_count, current_task_id
+                     ) VALUES ($1, $2, $3, 'active', $4, $5, 0, FALSE, 0, NULL)
+                     ON CONFLICT (worker_id) DO UPDATE SET
+                        tenant_id         = EXCLUDED.tenant_id,
+                        display_name      = EXCLUDED.display_name,
+                        status            = EXCLUDED.status,
+                        registered_at     = EXCLUDED.registered_at,
+                        updated_at        = EXCLUDED.updated_at,
+                        last_heartbeat_ms = 0,
+                        is_alive          = FALSE,
+                        active_task_count = 0,
+                        current_task_id   = NULL",
+                )
+                .bind(e.worker_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(&e.display_name)
+                .bind(registered_at)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ExternalWorkerSuspended(e) => {
+                sqlx::query(
+                    "UPDATE external_workers
+                        SET status = 'suspended', updated_at = $1
+                      WHERE worker_id = $2",
+                )
+                .bind(now)
+                .bind(e.worker_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ExternalWorkerReactivated(e) => {
+                sqlx::query(
+                    "UPDATE external_workers
+                        SET status = 'active', updated_at = $1
+                      WHERE worker_id = $2",
+                )
+                .bind(now)
+                .bind(e.worker_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ExternalWorkerReported(e) => {
+                let last_hb = i64::try_from(e.report.reported_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ExternalWorkerReported.reported_at_ms {} exceeds i64::MAX",
+                        e.report.reported_at_ms
+                    ))
+                })?;
+                // Mirror the in-memory invariant: terminal outcome clears
+                // `current_task_id`; ongoing work sets it to the reported task.
+                let current_task_id: Option<&str> = if e.report.outcome.is_none() {
+                    Some(e.report.task_id.as_str())
+                } else {
+                    None
+                };
+                sqlx::query(
+                    "UPDATE external_workers
+                        SET last_heartbeat_ms = $1,
+                            is_alive          = TRUE,
+                            current_task_id   = $2,
+                            updated_at        = $3
+                      WHERE worker_id = $4",
+                )
+                .bind(last_hb)
+                .bind(current_task_id)
+                .bind(now)
+                .bind(e.report.worker_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+
             // ── UNPROJECTED STUBS ──────────────────────────────────────
             // These variants commit to event_log but do NOT update any
             // projection table on the Postgres backend. Audit reference:
             // `.claude/audit-state/review-queue.md` §T2-H3. If you land on
             // this warning in production, extend this applier to cover the
             // specific variant and its projection table(s).
-            RuntimeEvent::ExternalWorkerRegistered(_) => log_stub("ExternalWorkerRegistered"),
-            RuntimeEvent::ExternalWorkerReported(_) => log_stub("ExternalWorkerReported"),
-            RuntimeEvent::ExternalWorkerSuspended(_) => log_stub("ExternalWorkerSuspended"),
-            RuntimeEvent::ExternalWorkerReactivated(_) => log_stub("ExternalWorkerReactivated"),
             RuntimeEvent::SoulPatchProposed(_) => log_stub("SoulPatchProposed"),
             RuntimeEvent::SoulPatchApplied(_) => log_stub("SoulPatchApplied"),
             // F29 CD-2: upsert the per-session record + fold into the

@@ -345,14 +345,106 @@ impl SqliteSyncProjection {
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
             }
 
+            // ── RFC-025 Phase 2b.2 m1: external_workers (Projected) ──
+            //
+            // Mirrors the pg applier — see pg/projections.rs for the
+            // full semantic contract (status canonicalisation on re-
+            // registration, terminal-outcome `current_task_id` clearing,
+            // health-column reset on conflict). `is_alive` is INTEGER 0/1
+            // on sqlite (no native BOOLEAN).
+            RuntimeEvent::ExternalWorkerRegistered(e) => {
+                let registered_at = i64::try_from(e.registered_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ExternalWorkerRegistered.registered_at {} exceeds i64::MAX",
+                        e.registered_at
+                    ))
+                })?;
+                // On conflict, reset health + current_task_id to their
+                // zero-values so re-registration matches the in-memory
+                // applier's whole-record overwrite (Copilot #580).
+                sqlx::query(
+                    "INSERT INTO external_workers (
+                        worker_id, tenant_id, display_name, status,
+                        registered_at, updated_at,
+                        last_heartbeat_ms, is_alive, active_task_count, current_task_id
+                     ) VALUES (?, ?, ?, 'active', ?, ?, 0, 0, 0, NULL)
+                     ON CONFLICT (worker_id) DO UPDATE SET
+                        tenant_id         = excluded.tenant_id,
+                        display_name      = excluded.display_name,
+                        status            = excluded.status,
+                        registered_at     = excluded.registered_at,
+                        updated_at        = excluded.updated_at,
+                        last_heartbeat_ms = 0,
+                        is_alive          = 0,
+                        active_task_count = 0,
+                        current_task_id   = NULL",
+                )
+                .bind(e.worker_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(&e.display_name)
+                .bind(registered_at)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ExternalWorkerSuspended(e) => {
+                sqlx::query(
+                    "UPDATE external_workers
+                        SET status = 'suspended', updated_at = ?
+                      WHERE worker_id = ?",
+                )
+                .bind(now)
+                .bind(e.worker_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ExternalWorkerReactivated(e) => {
+                sqlx::query(
+                    "UPDATE external_workers
+                        SET status = 'active', updated_at = ?
+                      WHERE worker_id = ?",
+                )
+                .bind(now)
+                .bind(e.worker_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ExternalWorkerReported(e) => {
+                let last_hb = i64::try_from(e.report.reported_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ExternalWorkerReported.reported_at_ms {} exceeds i64::MAX",
+                        e.report.reported_at_ms
+                    ))
+                })?;
+                let current_task_id: Option<&str> = if e.report.outcome.is_none() {
+                    Some(e.report.task_id.as_str())
+                } else {
+                    None
+                };
+                sqlx::query(
+                    "UPDATE external_workers
+                        SET last_heartbeat_ms = ?,
+                            is_alive          = 1,
+                            current_task_id   = ?,
+                            updated_at        = ?
+                      WHERE worker_id = ?",
+                )
+                .bind(last_hb)
+                .bind(current_task_id)
+                .bind(now)
+                .bind(e.report.worker_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+
             // ── UNPROJECTED STUBS ──────────────────────────────────────
             // These variants commit to event_log but do NOT update any
             // projection table on the SQLite backend. See the struct
             // docstring for the coverage-gap rationale and logging.
-            RuntimeEvent::ExternalWorkerRegistered(_) => log_stub("ExternalWorkerRegistered"),
-            RuntimeEvent::ExternalWorkerReported(_) => log_stub("ExternalWorkerReported"),
-            RuntimeEvent::ExternalWorkerSuspended(_) => log_stub("ExternalWorkerSuspended"),
-            RuntimeEvent::ExternalWorkerReactivated(_) => log_stub("ExternalWorkerReactivated"),
             RuntimeEvent::SoulPatchProposed(_) => log_stub("SoulPatchProposed"),
             RuntimeEvent::SoulPatchApplied(_) => log_stub("SoulPatchApplied"),
             // F29 CD-2: see pg/projections.rs for the full contract —

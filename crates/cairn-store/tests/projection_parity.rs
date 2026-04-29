@@ -91,19 +91,22 @@ mod in_memory_vs_sqlite {
     //! Cross-backend parity for Projected read models.
 
     use cairn_domain::{
-        audit::AuditOutcome, events::ActualOutcome, ApprovalId, ApprovalRequested,
-        ApprovalRequirement, AuditLogEntryRecorded, EventEnvelope, EventId, EventSource,
-        OperatorId, OutcomeId, OutcomeRecorded, PlanApproved, PlanProposed, PlanRejected,
-        PlanRevisionRequested, ProjectCreated, ProjectKey, RunCreated, RunId, RunState,
-        RunStateChanged, RuntimeEvent, ScheduledTaskCreated, ScheduledTaskId, SessionCreated,
-        SessionId, SessionState, SessionStateChanged, StateTransition, TaskCreated, TaskId,
-        TaskState, TaskStateChanged, TenantCreated, TenantId, WorkspaceCreated, WorkspaceId,
+        audit::AuditOutcome, events::ActualOutcome, workers::ExternalWorkerReport, ApprovalId,
+        ApprovalRequested, ApprovalRequirement, AuditLogEntryRecorded, EventEnvelope, EventId,
+        EventSource, ExternalWorkerReactivated, ExternalWorkerRegistered, ExternalWorkerReported,
+        ExternalWorkerSuspended, OperatorId, OutcomeId, OutcomeRecorded, PlanApproved,
+        PlanProposed, PlanRejected, PlanRevisionRequested, ProjectCreated, ProjectKey, RunCreated,
+        RunId, RunState, RunStateChanged, RuntimeEvent, ScheduledTaskCreated, ScheduledTaskId,
+        SessionCreated, SessionId, SessionState, SessionStateChanged, StateTransition, TaskCreated,
+        TaskId, TaskState, TaskStateChanged, TenantCreated, TenantId, WorkerId, WorkspaceCreated,
+        WorkspaceId,
     };
     use cairn_store::event_log::EventLog;
     use cairn_store::in_memory::InMemoryStore;
     use cairn_store::projections::{
-        ApprovalReadModel, AuditLogReadModel, OutcomeReadModel, PlanReviewReadModel,
-        PlanReviewState, RunReadModel, ScheduledTaskReadModel, SessionReadModel, TaskReadModel,
+        ApprovalReadModel, AuditLogReadModel, ExternalWorkerReadModel, OutcomeReadModel,
+        PlanReviewReadModel, PlanReviewState, RunReadModel, ScheduledTaskReadModel,
+        SessionReadModel, TaskReadModel,
     };
     use cairn_store::sqlite::SqliteAdapter;
 
@@ -436,6 +439,11 @@ mod in_memory_vs_sqlite {
             // RFC-025 Phase 2a.2 milestone 4: entitlement override fixture
             // below.
             "EntitlementOverrideSet",
+            // RFC-025 Phase 2b.2 m1: external-worker fixtures below.
+            "ExternalWorkerRegistered",
+            "ExternalWorkerReported",
+            "ExternalWorkerSuspended",
+            "ExternalWorkerReactivated",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -2434,6 +2442,362 @@ mod in_memory_vs_sqlite {
         assert!(
             !binding.active,
             "replay of ProviderBindingCreated after StateChanged must preserve active=false"
+        );
+    }
+
+    // ── RFC-025 Phase 2b.2 m1: external_workers projection parity. ──
+
+    /// Sentinel ProjectKey used on tenant-scoped `ExternalWorker*` events
+    /// (mirrors the helper in `external_worker_lifecycle.rs`). Worker
+    /// events are tenant-scoped so the event carries a placeholder
+    /// `(tenant, "_", "_")` triplet rather than a real project.
+    fn sentinel(tenant: &str) -> ProjectKey {
+        ProjectKey::new(tenant, "_", "_")
+    }
+
+    /// Full lifecycle (Register → Heartbeat → Suspend → Reactivate) on
+    /// both backends must yield a field-equal record. Covers the
+    /// canonicalisation/clearing semantics exercised by the applier:
+    /// status reset to "active" on registration replay, heartbeat
+    /// setting `is_alive` + `current_task_id`, suspension toggling
+    /// `status`, and reactivation restoring `status = "active"`.
+    #[tokio::test]
+    async fn external_worker_full_lifecycle_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_worker_parity");
+        let worker_id = WorkerId::new("w_parity_1");
+
+        let events = vec![
+            env(RuntimeEvent::ExternalWorkerRegistered(
+                ExternalWorkerRegistered {
+                    sentinel_project: sentinel("t_worker_parity"),
+                    worker_id: worker_id.clone(),
+                    tenant_id: tenant.clone(),
+                    display_name: "Parity Bot".to_owned(),
+                    registered_at: 1_700_000_000_000,
+                },
+            )),
+            env(RuntimeEvent::ExternalWorkerReported(
+                ExternalWorkerReported {
+                    report: ExternalWorkerReport {
+                        project: sentinel("t_worker_parity"),
+                        worker_id: worker_id.clone(),
+                        run_id: None,
+                        task_id: TaskId::new("task_parity_1"),
+                        lease_token: 1,
+                        reported_at_ms: 1_700_000_001_000,
+                        progress: None,
+                        outcome: None,
+                    },
+                },
+            )),
+            env(RuntimeEvent::ExternalWorkerSuspended(
+                ExternalWorkerSuspended {
+                    sentinel_project: sentinel("t_worker_parity"),
+                    worker_id: worker_id.clone(),
+                    tenant_id: tenant.clone(),
+                    suspended_at: 1_700_000_002_000,
+                    reason: Some("maintenance".to_owned()),
+                },
+            )),
+            env(RuntimeEvent::ExternalWorkerReactivated(
+                ExternalWorkerReactivated {
+                    sentinel_project: sentinel("t_worker_parity"),
+                    worker_id: worker_id.clone(),
+                    tenant_id: tenant.clone(),
+                    reactivated_at: 1_700_000_003_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get() parity — every field except `updated_at` (wall-clock at
+        // applier-run time differs across the two appends, which is
+        // expected and documented in the applier comments).
+        let mem_row = ExternalWorkerReadModel::get(&mem, &worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = ExternalWorkerReadModel::get(&adapter, &worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row.worker_id, sqlite_row.worker_id);
+        assert_eq!(mem_row.tenant_id, sqlite_row.tenant_id);
+        assert_eq!(mem_row.display_name, sqlite_row.display_name);
+        assert_eq!(mem_row.status, sqlite_row.status);
+        assert_eq!(mem_row.registered_at, sqlite_row.registered_at);
+        assert_eq!(
+            mem_row.health.last_heartbeat_ms,
+            sqlite_row.health.last_heartbeat_ms
+        );
+        assert_eq!(mem_row.health.is_alive, sqlite_row.health.is_alive);
+        assert_eq!(
+            mem_row.health.active_task_count,
+            sqlite_row.health.active_task_count
+        );
+        assert_eq!(mem_row.current_task_id, sqlite_row.current_task_id);
+
+        // Terminal state: reactivated so status is "active"; last
+        // heartbeat preserves is_alive=true; current_task_id is still
+        // set (no terminal outcome reported on task_parity_1).
+        assert_eq!(mem_row.status, "active");
+        assert!(mem_row.health.is_alive);
+        assert_eq!(mem_row.health.last_heartbeat_ms, 1_700_000_001_000);
+        assert_eq!(mem_row.current_task_id, Some(TaskId::new("task_parity_1")));
+    }
+
+    /// Heartbeat with terminal outcome must clear `current_task_id` on
+    /// both backends (mirrors the `outcome.is_none()` branch in the
+    /// applier). Regression: an earlier draft unconditionally set
+    /// `current_task_id = Some(..)`, which left stale task pointers on
+    /// completed workers.
+    #[tokio::test]
+    async fn external_worker_terminal_report_clears_current_task_across_backends() {
+        use cairn_domain::workers::ExternalWorkerOutcome;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_term_parity");
+        let worker_id = WorkerId::new("w_term_parity");
+
+        let events = vec![
+            env(RuntimeEvent::ExternalWorkerRegistered(
+                ExternalWorkerRegistered {
+                    sentinel_project: sentinel("t_term_parity"),
+                    worker_id: worker_id.clone(),
+                    tenant_id: tenant.clone(),
+                    display_name: "Finisher".to_owned(),
+                    registered_at: 1_700_000_100_000,
+                },
+            )),
+            // Heartbeat with an active report — sets current_task_id.
+            env(RuntimeEvent::ExternalWorkerReported(
+                ExternalWorkerReported {
+                    report: ExternalWorkerReport {
+                        project: sentinel("t_term_parity"),
+                        worker_id: worker_id.clone(),
+                        run_id: None,
+                        task_id: TaskId::new("task_term_1"),
+                        lease_token: 1,
+                        reported_at_ms: 1_700_000_101_000,
+                        progress: None,
+                        outcome: None,
+                    },
+                },
+            )),
+            // Terminal report — must clear current_task_id on both backends.
+            env(RuntimeEvent::ExternalWorkerReported(
+                ExternalWorkerReported {
+                    report: ExternalWorkerReport {
+                        project: sentinel("t_term_parity"),
+                        worker_id: worker_id.clone(),
+                        run_id: None,
+                        task_id: TaskId::new("task_term_1"),
+                        lease_token: 1,
+                        reported_at_ms: 1_700_000_102_000,
+                        progress: None,
+                        outcome: Some(ExternalWorkerOutcome::Completed),
+                    },
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = ExternalWorkerReadModel::get(&mem, &worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = ExternalWorkerReadModel::get(&adapter, &worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row.current_task_id, None);
+        assert_eq!(sqlite_row.current_task_id, None);
+        assert_eq!(
+            mem_row.health.last_heartbeat_ms,
+            sqlite_row.health.last_heartbeat_ms
+        );
+        assert_eq!(mem_row.health.is_alive, sqlite_row.health.is_alive);
+    }
+
+    /// `list_by_tenant` ordering must match across backends under
+    /// same-millisecond `registered_at` collisions. Tiebreaker is
+    /// ASCENDING `worker_id` (asserted in both adapters + the
+    /// in-memory impl).
+    #[tokio::test]
+    async fn external_worker_list_by_tenant_ordering_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_list_parity");
+        // Same `registered_at` forces the worker_id tiebreak path.
+        let events = vec![
+            env(RuntimeEvent::ExternalWorkerRegistered(
+                ExternalWorkerRegistered {
+                    sentinel_project: sentinel("t_list_parity"),
+                    worker_id: WorkerId::new("w_list_c"),
+                    tenant_id: tenant.clone(),
+                    display_name: "C".to_owned(),
+                    registered_at: 1_700_000_500_000,
+                },
+            )),
+            env(RuntimeEvent::ExternalWorkerRegistered(
+                ExternalWorkerRegistered {
+                    sentinel_project: sentinel("t_list_parity"),
+                    worker_id: WorkerId::new("w_list_a"),
+                    tenant_id: tenant.clone(),
+                    display_name: "A".to_owned(),
+                    registered_at: 1_700_000_500_000,
+                },
+            )),
+            env(RuntimeEvent::ExternalWorkerRegistered(
+                ExternalWorkerRegistered {
+                    sentinel_project: sentinel("t_list_parity"),
+                    worker_id: WorkerId::new("w_list_b"),
+                    tenant_id: tenant.clone(),
+                    display_name: "B".to_owned(),
+                    registered_at: 1_700_000_500_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = ExternalWorkerReadModel::list_by_tenant(&mem, &tenant, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = ExternalWorkerReadModel::list_by_tenant(&adapter, &tenant, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 3);
+        assert_eq!(sqlite_list.len(), 3);
+        let mem_ids: Vec<_> = mem_list.iter().map(|r| r.worker_id.as_str()).collect();
+        let sqlite_ids: Vec<_> = sqlite_list.iter().map(|r| r.worker_id.as_str()).collect();
+        assert_eq!(mem_ids, sqlite_ids, "ordering must match across backends");
+        // The two backends must agree on the in-memory order, which is
+        // ASCENDING worker_id under same-ms registered_at.
+        assert_eq!(mem_ids, vec!["w_list_a", "w_list_b", "w_list_c"]);
+
+        // Pagination parity: `limit=2, offset=1` must return the same
+        // two rows on both backends.
+        let mem_page = ExternalWorkerReadModel::list_by_tenant(&mem, &tenant, 2, 1)
+            .await
+            .unwrap();
+        let sqlite_page = ExternalWorkerReadModel::list_by_tenant(&adapter, &tenant, 2, 1)
+            .await
+            .unwrap();
+        let mem_page_ids: Vec<_> = mem_page.iter().map(|r| r.worker_id.as_str()).collect();
+        let sqlite_page_ids: Vec<_> = sqlite_page.iter().map(|r| r.worker_id.as_str()).collect();
+        assert_eq!(mem_page_ids, sqlite_page_ids);
+        assert_eq!(mem_page_ids, vec!["w_list_b", "w_list_c"]);
+    }
+
+    /// Re-registration parity (Copilot #580 regression): the in-memory
+    /// applier overwrites the entire record on `ExternalWorkerRegistered`
+    /// — health resets to `WorkerHealth::default()` (is_alive=false,
+    /// last_heartbeat_ms=0, active_task_count=0) and current_task_id
+    /// returns to `None`. The pg/sqlite appliers must match that
+    /// semantic on `ON CONFLICT ... DO UPDATE` or persistent backends
+    /// silently diverge from InMemory. This test registers a worker,
+    /// heartbeats it (setting is_alive + current_task_id), then
+    /// re-registers and asserts every field is back to its zero-value
+    /// on both backends.
+    #[tokio::test]
+    async fn external_worker_re_registration_resets_health_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_rereg");
+        let worker_id = WorkerId::new("w_rereg_1");
+
+        let events = vec![
+            env(RuntimeEvent::ExternalWorkerRegistered(
+                ExternalWorkerRegistered {
+                    sentinel_project: sentinel("t_rereg"),
+                    worker_id: worker_id.clone(),
+                    tenant_id: tenant.clone(),
+                    display_name: "Initial Name".to_owned(),
+                    registered_at: 1_700_000_000_000,
+                },
+            )),
+            env(RuntimeEvent::ExternalWorkerReported(
+                ExternalWorkerReported {
+                    report: ExternalWorkerReport {
+                        project: sentinel("t_rereg"),
+                        worker_id: worker_id.clone(),
+                        run_id: None,
+                        task_id: TaskId::new("task_pre_rereg"),
+                        lease_token: 1,
+                        reported_at_ms: 1_700_000_001_000,
+                        progress: None,
+                        outcome: None,
+                    },
+                },
+            )),
+            env(RuntimeEvent::ExternalWorkerSuspended(
+                ExternalWorkerSuspended {
+                    sentinel_project: sentinel("t_rereg"),
+                    worker_id: worker_id.clone(),
+                    tenant_id: tenant.clone(),
+                    suspended_at: 1_700_000_002_000,
+                    reason: None,
+                },
+            )),
+            // Re-registration — must reset the whole record.
+            env(RuntimeEvent::ExternalWorkerRegistered(
+                ExternalWorkerRegistered {
+                    sentinel_project: sentinel("t_rereg"),
+                    worker_id: worker_id.clone(),
+                    tenant_id: tenant.clone(),
+                    display_name: "Renamed Bot".to_owned(),
+                    registered_at: 1_700_000_003_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = ExternalWorkerReadModel::get(&mem, &worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = ExternalWorkerReadModel::get(&adapter, &worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Latest registration wins on all four canonicalised columns.
+        assert_eq!(mem_row.display_name, "Renamed Bot");
+        assert_eq!(sqlite_row.display_name, "Renamed Bot");
+        assert_eq!(mem_row.status, "active", "re-register forces active");
+        assert_eq!(sqlite_row.status, "active");
+        assert_eq!(mem_row.registered_at, 1_700_000_003_000);
+        assert_eq!(sqlite_row.registered_at, 1_700_000_003_000);
+
+        // Health + current_task_id reset on both backends (the Copilot
+        // #580 catch — pg/sqlite previously left these stale).
+        assert!(
+            !mem_row.health.is_alive,
+            "in-memory re-register resets is_alive"
+        );
+        assert!(
+            !sqlite_row.health.is_alive,
+            "sqlite re-register must reset is_alive"
+        );
+        assert_eq!(mem_row.health.last_heartbeat_ms, 0);
+        assert_eq!(sqlite_row.health.last_heartbeat_ms, 0);
+        assert_eq!(mem_row.health.active_task_count, 0);
+        assert_eq!(sqlite_row.health.active_task_count, 0);
+        assert_eq!(mem_row.current_task_id, None);
+        assert_eq!(
+            sqlite_row.current_task_id, None,
+            "sqlite re-register must clear current_task_id"
         );
     }
 }

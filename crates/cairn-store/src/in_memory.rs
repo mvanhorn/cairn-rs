@@ -4522,7 +4522,16 @@ impl ExternalWorkerReadModel for InMemoryStore {
             .filter(|w| w.tenant_id == *tenant_id)
             .cloned()
             .collect();
-        results.sort_by_key(|r| r.registered_at);
+        // Deterministic tiebreak on worker_id — matches the pg + sqlite
+        // `ORDER BY registered_at ASC, worker_id ASC` clause. Without
+        // the tiebreak, HashMap iteration order leaks into the result
+        // under same-ms registration bursts (projection_parity test
+        // caught this).
+        results.sort_by(|a, b| {
+            a.registered_at
+                .cmp(&b.registered_at)
+                .then_with(|| a.worker_id.as_str().cmp(b.worker_id.as_str()))
+        });
         Ok(results.into_iter().skip(offset).take(limit).collect())
     }
 }

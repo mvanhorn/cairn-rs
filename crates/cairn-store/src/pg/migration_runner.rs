@@ -290,6 +290,18 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_entitlement_overrides",
         include_str!("migrations/V048__create_entitlement_overrides.sql"),
     ),
+    // RFC-025 Phase 2b.2 milestone 1: external_workers projection
+    // (GAP-005). The four `ExternalWorker*` event variants projected
+    // into `InMemoryStore.external_workers` but `log_stub`-ed on pg/
+    // sqlite — restart wiped the fleet catalog. `worker_id` is the PK
+    // with a tenant_id index for the list-by-tenant hot path.
+    // Renumbered V045 → V049 after main published Phase 2a.2
+    // (V045-V048) during this PR's review cycle.
+    (
+        49,
+        "create_external_workers",
+        include_str!("migrations/V049__create_external_workers.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

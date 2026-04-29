@@ -1119,4 +1119,25 @@ CREATE TABLE IF NOT EXISTS entitlement_overrides (
     updated_at  INTEGER NOT NULL,
     PRIMARY KEY (tenant_id, feature)
 );
+
+-- RFC-025 Phase 2b.2 m1: external_workers parity table (pg V049 —
+-- renumbered from V045 after Phase 2a.2 landed on main mid-review).
+-- Booleans use INTEGER 0/1 on sqlite (no native BOOLEAN). The
+-- corresponding pg column is BOOLEAN — sqlx reads both into Rust `bool`
+-- transparently.
+CREATE TABLE IF NOT EXISTS external_workers (
+    worker_id           TEXT    PRIMARY KEY,
+    tenant_id           TEXT    NOT NULL,
+    display_name        TEXT    NOT NULL,
+    status              TEXT    NOT NULL DEFAULT 'active',
+    registered_at       INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    last_heartbeat_ms   INTEGER NOT NULL DEFAULT 0,
+    is_alive            INTEGER NOT NULL DEFAULT 0,
+    active_task_count   INTEGER NOT NULL DEFAULT 0,
+    current_task_id     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_workers_tenant
+    ON external_workers (tenant_id, registered_at, worker_id);
 "#;
