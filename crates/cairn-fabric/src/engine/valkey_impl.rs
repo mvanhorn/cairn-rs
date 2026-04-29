@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use flowfabric::core::keys::{self, ExecKeyContext, FlowKeyContext};
 use flowfabric::core::partition::{execution_partition, flow_partition};
 use flowfabric::core::types::{
-    AttemptId, AttemptIndex, EdgeId, ExecutionId, FlowId, LeaseEpoch, LeaseId, Namespace,
+    AttemptId, AttemptIndex, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId, Namespace,
     TimestampMs, WaitpointId, WorkerId, WorkerInstanceId,
 };
 
@@ -205,6 +205,18 @@ impl Engine for ValkeyEngine {
             .await
             .map_err(|e| FabricError::Internal(format!("valkey HGET exec_tags.{key}: {e}")))?;
         Ok(value.filter(|s| !s.is_empty()))
+    }
+
+    async fn get_execution_lane_id(&self, id: &ExecutionId) -> Result<Option<LaneId>, FabricError> {
+        let partition = execution_partition(id, &self.runtime.partition_config);
+        let ctx = ExecKeyContext::new(&partition, id);
+        let value: Option<String> = self
+            .runtime
+            .client
+            .hget(&ctx.core(), "lane_id")
+            .await
+            .map_err(|e| FabricError::Internal(format!("valkey HGET exec_core.lane_id: {e}")))?;
+        Ok(value.filter(|s| !s.is_empty()).map(LaneId::new))
     }
 
     async fn set_execution_tag(

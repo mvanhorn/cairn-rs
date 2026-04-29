@@ -308,15 +308,6 @@ impl FabricRuntime {
         }
     }
 
-    pub async fn health_check(&self) -> Result<(), FabricError> {
-        let _: Option<String> = self
-            .client
-            .hget("ff:health_check", "noop")
-            .await
-            .map_err(|e| FabricError::Valkey(format!("health check: {e}")))?;
-        Ok(())
-    }
-
     pub async fn shutdown(self) {
         tracing::info!("shutting down fabric runtime");
         self.engine.shutdown().await;

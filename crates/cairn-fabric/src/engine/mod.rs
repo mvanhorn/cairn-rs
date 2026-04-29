@@ -59,7 +59,7 @@ pub mod valkey_impl;
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use flowfabric::core::types::{EdgeId, ExecutionId, FlowId, WorkerId, WorkerInstanceId};
+use flowfabric::core::types::{EdgeId, ExecutionId, FlowId, LaneId, WorkerId, WorkerInstanceId};
 
 use crate::error::FabricError;
 
@@ -146,6 +146,26 @@ pub trait Engine: Send + Sync {
         id: &ExecutionId,
         key: &str,
     ) -> Result<Option<String>, FabricError>;
+
+    /// Fetch the `lane_id` stamped on an execution's core hash.
+    ///
+    /// Targeted read — cheaper than
+    /// [`Self::describe_execution`](Engine::describe_execution) when
+    /// the caller only needs the lane (e.g. `SignalBridge` assembling
+    /// an FCALL that routes through a lane-scoped index). Avoids the
+    /// full `HGETALL exec_core` + `HGETALL exec_tags` amplification
+    /// paid on every signal delivery on the hot path.
+    ///
+    /// FF stamps `lane_id` on the core hash at
+    /// `ff_create_flow` / `ff_create_execution` time and never
+    /// rewrites it — callers can cache the result per-execution for
+    /// the lifetime of the process without worrying about staleness.
+    ///
+    /// Returns `Ok(None)` if the execution's core hash doesn't exist
+    /// or the field is absent. Empty-string values are normalised to
+    /// `None` so callers can fall back to a default lane (cairn uses
+    /// `"cairn"`) via `.unwrap_or_else(|| LaneId::new("cairn"))`.
+    async fn get_execution_lane_id(&self, id: &ExecutionId) -> Result<Option<LaneId>, FabricError>;
 
     /// Set a single tag on an execution's tag hash.
     ///
