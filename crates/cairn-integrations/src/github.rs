@@ -10,10 +10,12 @@
 //! stays integration-agnostic.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use async_trait::async_trait;
+use cairn_workspace::{AllowlistPersistence, JsonFileAllowlistStore, ProjectRepoAccessService};
 use tokio::sync::{RwLock, Semaphore};
 
 use crate::{
@@ -176,6 +178,62 @@ impl GitHubPlugin {
     ) -> cairn_github::GitHubClient {
         let token = self.token_for_installation(installation_id).await;
         cairn_github::GitHubClient::with_http(token, self.http.clone())
+    }
+
+    /// Name of the subdirectory under `CAIRN_PLUGIN_STATE_DIR` that this
+    /// plugin owns. Public so callers can build the same path the
+    /// plugin uses (e.g. test harnesses).
+    pub const STATE_SUBDIR: &'static str = "github";
+
+    /// Name of the allowlist JSON file inside the plugin state subdir.
+    pub const ALLOWLIST_FILE: &'static str = "allowlist.json";
+
+    /// Compute the canonical plugin-state path for this plugin's repo
+    /// allowlist file, given a `CAIRN_PLUGIN_STATE_DIR` root.
+    pub fn allowlist_path(plugin_state_dir: &Path) -> PathBuf {
+        plugin_state_dir
+            .join(Self::STATE_SUBDIR)
+            .join(Self::ALLOWLIST_FILE)
+    }
+
+    /// Install plugin-owned durable persistence on the process-wide
+    /// repo allowlist (closes #556).
+    ///
+    /// This is the integration's entry point into the persistence seam
+    /// on `ProjectRepoAccessService`: the access service itself is a
+    /// pure in-memory projection owned by `cairn-workspace`; the plugin
+    /// supplies the durability by installing a `JsonFileAllowlistStore`
+    /// at `<plugin_state_dir>/github/allowlist.json`.
+    ///
+    /// Called exactly once at plugin-wire time (cairn-app's `main.rs`)
+    /// before the HTTP server starts accepting traffic. The access
+    /// service is rehydrated from disk in the install call, so the
+    /// first inbound `POST /v1/projects/.../repos` already sees every
+    /// prior grant.
+    ///
+    /// Failure to open the state directory / parse the file is fatal —
+    /// the GitHub plugin is a top-level integration and silent loss of
+    /// its persistent allowlist would violate the RFC 016 recovery
+    /// contract.
+    pub fn install_allowlist_persistence(
+        access: &ProjectRepoAccessService,
+        plugin_state_dir: &Path,
+    ) -> Result<PathBuf, IntegrationError> {
+        let path = Self::allowlist_path(plugin_state_dir);
+        let store = JsonFileAllowlistStore::open(&path).map_err(|e| {
+            IntegrationError::Other(format!(
+                "github plugin: open allowlist persistence at {}: {e}",
+                path.display()
+            ))
+        })?;
+        access
+            .install_persistence(Arc::new(store) as Arc<dyn AllowlistPersistence>)
+            .map_err(|e| {
+                IntegrationError::Other(format!(
+                    "github plugin: install allowlist persistence: {e}"
+                ))
+            })?;
+        Ok(path)
     }
 
     /// Check if a webhook event key matches a pattern (supports `*` wildcard).
@@ -541,6 +599,66 @@ mod tests {
         let plugin = make_test_plugin();
         let paths = plugin.auth_exempt_paths();
         assert!(paths.contains(&"/v1/webhooks/github".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn install_allowlist_persistence_roundtrips_across_instances() {
+        use cairn_domain::{ActorRef, OperatorId, ProjectKey, RepoAccessContext};
+        use cairn_workspace::RepoId;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // First boot — install persistence, grant a repo, drop the
+        // access service.
+        {
+            let access = ProjectRepoAccessService::new();
+            let path = GitHubPlugin::install_allowlist_persistence(&access, tmp.path()).unwrap();
+            assert_eq!(
+                path.file_name().unwrap().to_str(),
+                Some("allowlist.json"),
+                "canonical allowlist filename must not drift"
+            );
+            assert!(
+                path.parent().unwrap().ends_with("github"),
+                "plugin state subdir must be 'github'"
+            );
+
+            access
+                .allow(
+                    &RepoAccessContext {
+                        project: ProjectKey::new("t", "w", "p"),
+                    },
+                    &RepoId::new("org/repo-1"),
+                    ActorRef::Operator {
+                        operator_id: OperatorId::new("op"),
+                    },
+                )
+                .await
+                .expect("allow must succeed with persistence installed");
+        }
+
+        // Second boot — fresh access service over the same state dir
+        // sees the prior grant.
+        let access = ProjectRepoAccessService::new();
+        GitHubPlugin::install_allowlist_persistence(&access, tmp.path()).unwrap();
+        assert!(
+            access
+                .is_allowed(
+                    &RepoAccessContext {
+                        project: ProjectKey::new("t", "w", "p"),
+                    },
+                    &RepoId::new("org/repo-1"),
+                )
+                .await,
+            "allowlist must survive across process boundaries"
+        );
+    }
+
+    #[test]
+    fn allowlist_path_is_canonical() {
+        let root = std::path::Path::new("/tmp/cairn-plugins-test");
+        let path = GitHubPlugin::allowlist_path(root);
+        assert_eq!(path, root.join("github").join("allowlist.json"));
     }
 
     #[tokio::test]

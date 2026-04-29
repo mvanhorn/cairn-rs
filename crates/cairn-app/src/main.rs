@@ -1083,6 +1083,39 @@ async fn real_main() {
                                 }
                             };
                             registry.register_sync(Arc::new(github_plugin));
+
+                            // #556: install plugin-owned durable persistence
+                            // for the repo allowlist. The allowlist is plugin
+                            // runtime state (the GitHub integration owns
+                            // which repos an operator has granted a given
+                            // project access to) and therefore does not
+                            // travel through the core RuntimeEvent log. The
+                            // plugin persists to
+                            // `<CAIRN_PLUGIN_STATE_DIR>/github/allowlist.json`
+                            // and rehydrates the in-memory access service on
+                            // every boot before HTTP traffic starts.
+                            let plugin_state_dir = cairn_app::state::default_plugin_state_dir();
+                            match cairn_integrations::github::GitHubPlugin::install_allowlist_persistence(
+                                &lib_mut.project_repo_access,
+                                &plugin_state_dir,
+                            ) {
+                                Ok(path) => {
+                                    eprintln!(
+                                        "GitHub App: allowlist persistence installed at {}",
+                                        path.display()
+                                    );
+                                }
+                                Err(e) => {
+                                    // Fail loud — operators would otherwise
+                                    // see an allowlist silently rehydrate-
+                                    // to-empty on every restart.
+                                    eprintln!(
+                                        "fatal: GitHub App allowlist persistence install failed: {e}"
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
+
                             eprintln!("GitHub App: wired (app_id={app_id})");
                         }
                         Err(e) => {
@@ -2066,11 +2099,19 @@ async fn seed_allowlist_revoked_sandbox_for_test(
     let session_id = SessionId::new(format!("sess-{}", parts[0]));
     let sandbox_id = format!("sbx-{}", parts[0]);
 
-    // Seed an *unrelated* repo into the allowlist so the project is
-    // "authoritative" under the Bugbot high-1 gate in
-    // `SandboxService::recover_all`. The bound repo (`parts[4]`) is
-    // deliberately NOT added; `is_allowed(bound_repo) == false` is
-    // what makes recovery emit `SandboxAllowlistRevoked`.
+    // Seed an *unrelated* repo into the allowlist so the project
+    // has at least one surviving grant. Without this, the
+    // non-authoritative fallback in `SandboxService::recover_all`
+    // (which preserves the pre-#556 conservative semantic when
+    // plugin-layer persistence hasn't installed itself — the GitHub
+    // plugin isn't wired in this test harness) would skip the project
+    // and the integration test would never see the AllowlistRevoked
+    // transition it's asserting.
+    //
+    // In production the GitHub plugin installs persistence at boot
+    // and `is_authoritative()` returns true; an empty project
+    // allowlist is treated as "operator revoked everything" without
+    // needing this sentinel.
     {
         use cairn_domain::{ActorRef, OperatorId, RepoAccessContext};
         let ctx = RepoAccessContext {
@@ -2350,6 +2391,16 @@ async fn seed_base_revision_drift_sandbox_for_test(
     // 1. Ensure the clone exists so `current_head()` returns `Some(head)`.
     //    `ensure_cloned` is idempotent so a second boot after sigkill is a
     //    no-op — HEAD survives from boot 1.
+    //
+    //    Note: we do NOT add `repo_id` to the project allowlist here.
+    //    The integration test deliberately exercises drift-vs-
+    //    allowlist routing without a GitHub plugin wired, so the
+    //    `ProjectRepoAccessService` is non-authoritative
+    //    (`is_authoritative() == false`). `SandboxService::recover_all`
+    //    falls back to the pre-#556 conservative behaviour — a
+    //    project with an empty allowlist is skipped, so drift is the
+    //    sweep that transitions the overlay run and the reflink
+    //    sibling is left alone per RFC 016.
     lib_state
         .repo_clone_cache
         .ensure_cloned(&tenant, &repo_id)

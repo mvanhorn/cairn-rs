@@ -1088,6 +1088,44 @@ fn default_sandbox_base_dir() -> PathBuf {
     std::env::temp_dir().join("cairn-workspace-sandboxes")
 }
 
+/// Resolve the plugin-state root under which each integration plugin
+/// persists its own per-process state (closes #556).
+///
+/// Production default: `~/.cairn/plugins`. Override via
+/// `CAIRN_PLUGIN_STATE_DIR` for dev / integration tests. When the
+/// home directory cannot be detected (neither `HOME` on Unix nor
+/// `USERPROFILE` on Windows is set), falls back to
+/// `$TMPDIR/cairn-plugins`.
+///
+/// The home-detection order mirrors `cairn_runtime::FileConfigStore::
+/// open_default` so operator-state directories (`config.toml`,
+/// `models.toml`, plugin allowlists) all resolve to the same root.
+///
+/// Each plugin owns a subdirectory under this root (e.g.
+/// `<root>/github/allowlist.json`) — the root itself is shared across
+/// plugins, but filenames never collide because the subdir is plugin-
+/// specific. See `cairn_integrations::github::GitHubPlugin::STATE_SUBDIR`.
+pub fn default_plugin_state_dir() -> PathBuf {
+    if let Ok(override_path) = std::env::var("CAIRN_PLUGIN_STATE_DIR") {
+        if !override_path.is_empty() {
+            return PathBuf::from(override_path);
+        }
+    }
+    // Unix: HOME. Windows: USERPROFILE (the convention every other
+    // cross-platform cairn path helper uses). Falling through to
+    // `$TMPDIR` under a misconfigured Windows box would silently
+    // persist the allowlist to a temp directory that may be wiped on
+    // reboot — a subtle restart-durability regression.
+    for var in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(var) {
+            if !home.is_empty() {
+                return PathBuf::from(home).join(".cairn").join("plugins");
+            }
+        }
+    }
+    std::env::temp_dir().join("cairn-plugins")
+}
+
 /// F65 PR-5: resolve the snapshot root for durable workspace snapshots.
 /// Production default: `~/.cairn/snapshots`. Override via
 /// `CAIRN_SNAPSHOT_DIR` for dev / integration tests. Falls back to

@@ -694,6 +694,7 @@ dependencies = [
  "cairn-domain",
  "cairn-github",
  "cairn-tools",
+ "cairn-workspace",
  "http",
  "reqwest",
  "serde",
