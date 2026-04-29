@@ -185,6 +185,49 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_eval_runs",
         include_str!("migrations/V034__create_eval_runs.sql"),
     ),
+    // RFC-025 Phase 2a.1 milestone 1 (credentials): durable credentials +
+    // credential_rotations projection.
+    (
+        35,
+        "create_credentials",
+        include_str!("migrations/V035__create_credentials.sql"),
+    ),
+    // RFC-025 Phase 2a.1 milestone 2 (tenant quotas): tenant_quotas +
+    // tenant_quota_violations.
+    (
+        36,
+        "create_tenant_quotas",
+        include_str!("migrations/V036__create_tenant_quotas.sql"),
+    ),
+    // RFC-025 Phase 2a.1 milestone 3 (provider budgets): provider_budgets.
+    (
+        37,
+        "create_provider_budgets",
+        include_str!("migrations/V037__create_provider_budgets.sql"),
+    ),
+    // RFC-025 Phase 2a.1 milestone 4 (licenses).
+    (
+        38,
+        "create_licenses",
+        include_str!("migrations/V038__create_licenses.sql"),
+    ),
+    // RFC-025 Phase 1.5a (triggers): triggers + run_templates +
+    // trigger_fires. Renamed from V035 in Phase 3 to resolve a version
+    // collision with the credentials migration above. The underlying DDL
+    // is unchanged — this is a rename only; the governance + trigger
+    // migrations were never wired into the runner before Phase 3.
+    (
+        39,
+        "create_trigger_projections",
+        include_str!("migrations/V039__create_trigger_projections.sql"),
+    ),
+    // RFC-025 Phase 3 (provider bindings + connections): projection
+    // tables so operator-configured provider state survives restart.
+    (
+        40,
+        "create_provider_bindings_and_connections",
+        include_str!("migrations/V040__create_provider_bindings_and_connections.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

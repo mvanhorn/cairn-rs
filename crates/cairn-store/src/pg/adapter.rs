@@ -2711,3 +2711,255 @@ impl crate::projections::CredentialRotationReadModel for PgAdapter {
             .collect())
     }
 }
+
+// ── RFC-025 Phase 3: ProviderConnectionReadModel + ProviderBindingReadModel ──
+//
+// Backs the V040 projection. Both surfaces share the row-struct pattern
+// established for evals / credentials / licenses: `FromRow` extracts
+// column values, `into_record` hydrates the domain type with enum +
+// JSON parsing. Failing to decode is surfaced as `StoreError::Internal`
+// with a column-scoped message so operators can see which row + field
+// tripped.
+
+#[derive(sqlx::FromRow)]
+struct ProviderConnectionRow {
+    provider_connection_id: String,
+    tenant_id: String,
+    provider_family: String,
+    adapter_type: String,
+    supported_models_json: String,
+    status: String,
+    created_at: i64,
+}
+
+impl ProviderConnectionRow {
+    fn into_record(self) -> Result<cairn_domain::providers::ProviderConnectionRecord, StoreError> {
+        let status = match self.status.as_str() {
+            "active" => cairn_domain::providers::ProviderConnectionStatus::Active,
+            "disabled" => cairn_domain::providers::ProviderConnectionStatus::Disabled,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "provider_connections.status: unknown value {other:?}"
+                )))
+            }
+        };
+        let supported_models: Vec<String> = serde_json::from_str(&self.supported_models_json)
+            .map_err(|e| {
+                StoreError::Internal(format!(
+                    "provider_connections.supported_models_json parse error: {e}"
+                ))
+            })?;
+        Ok(cairn_domain::providers::ProviderConnectionRecord {
+            provider_connection_id: cairn_domain::ProviderConnectionId::new(
+                self.provider_connection_id,
+            ),
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            provider_family: self.provider_family,
+            adapter_type: self.adapter_type,
+            supported_models,
+            status,
+            created_at: self.created_at.max(0) as u64,
+        })
+    }
+}
+
+const PROVIDER_CONNECTION_SELECT_COLS: &str = "provider_connection_id, tenant_id, \
+     provider_family, adapter_type, supported_models_json, status, created_at";
+
+#[async_trait]
+impl crate::projections::ProviderConnectionReadModel for PgAdapter {
+    async fn get(
+        &self,
+        id: &cairn_domain::ProviderConnectionId,
+    ) -> Result<Option<cairn_domain::providers::ProviderConnectionRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PROVIDER_CONNECTION_SELECT_COLS} FROM provider_connections
+             WHERE provider_connection_id = $1"
+        );
+        let row: Option<ProviderConnectionRow> = sqlx::query_as(&sql)
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(ProviderConnectionRow::into_record).transpose()
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::providers::ProviderConnectionRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PROVIDER_CONNECTION_SELECT_COLS} FROM provider_connections
+             WHERE tenant_id = $1
+             ORDER BY created_at ASC, provider_connection_id ASC
+             LIMIT $2 OFFSET $3"
+        );
+        let rows: Vec<ProviderConnectionRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(ProviderConnectionRow::into_record)
+            .collect()
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ProviderBindingRow {
+    provider_binding_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    provider_connection_id: String,
+    provider_model_id: String,
+    operation_kind: String,
+    settings_json: String,
+    active: bool,
+    created_at: i64,
+}
+
+impl ProviderBindingRow {
+    fn into_record(self) -> Result<cairn_domain::providers::ProviderBindingRecord, StoreError> {
+        let operation_kind = match self.operation_kind.as_str() {
+            "generate" => cairn_domain::providers::OperationKind::Generate,
+            "embed" => cairn_domain::providers::OperationKind::Embed,
+            "rerank" => cairn_domain::providers::OperationKind::Rerank,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "provider_bindings.operation_kind: unknown value {other:?}"
+                )))
+            }
+        };
+        let settings: cairn_domain::providers::ProviderBindingSettings =
+            serde_json::from_str(&self.settings_json).map_err(|e| {
+                StoreError::Internal(format!("provider_bindings.settings_json parse error: {e}"))
+            })?;
+        Ok(cairn_domain::providers::ProviderBindingRecord {
+            provider_binding_id: cairn_domain::ProviderBindingId::new(self.provider_binding_id),
+            project: cairn_domain::ProjectKey {
+                tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+                workspace_id: cairn_domain::WorkspaceId::new(self.workspace_id),
+                project_id: cairn_domain::ProjectId::new(self.project_id),
+            },
+            provider_connection_id: cairn_domain::ProviderConnectionId::new(
+                self.provider_connection_id,
+            ),
+            provider_model_id: cairn_domain::ProviderModelId::new(self.provider_model_id),
+            operation_kind,
+            settings,
+            active: self.active,
+            created_at: self.created_at.max(0) as u64,
+        })
+    }
+}
+
+const PROVIDER_BINDING_SELECT_COLS: &str = "provider_binding_id, tenant_id, workspace_id, \
+     project_id, provider_connection_id, provider_model_id, operation_kind, \
+     settings_json, active, created_at";
+
+#[async_trait]
+impl crate::projections::ProviderBindingReadModel for PgAdapter {
+    async fn get(
+        &self,
+        id: &cairn_domain::ProviderBindingId,
+    ) -> Result<Option<cairn_domain::providers::ProviderBindingRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PROVIDER_BINDING_SELECT_COLS} FROM provider_bindings
+             WHERE provider_binding_id = $1"
+        );
+        let row: Option<ProviderBindingRow> = sqlx::query_as(&sql)
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(ProviderBindingRow::into_record).transpose()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::providers::ProviderBindingRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PROVIDER_BINDING_SELECT_COLS} FROM provider_bindings
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+             ORDER BY created_at ASC, provider_binding_id ASC
+             LIMIT $4 OFFSET $5"
+        );
+        let rows: Vec<ProviderBindingRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(ProviderBindingRow::into_record)
+            .collect()
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::providers::ProviderBindingRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PROVIDER_BINDING_SELECT_COLS} FROM provider_bindings
+             WHERE tenant_id = $1
+             ORDER BY created_at ASC, provider_binding_id ASC
+             LIMIT $2 OFFSET $3"
+        );
+        let rows: Vec<ProviderBindingRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(ProviderBindingRow::into_record)
+            .collect()
+    }
+
+    async fn list_active(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        operation: cairn_domain::providers::OperationKind,
+    ) -> Result<Vec<cairn_domain::providers::ProviderBindingRecord>, StoreError> {
+        let operation_str = match operation {
+            cairn_domain::providers::OperationKind::Generate => "generate",
+            cairn_domain::providers::OperationKind::Embed => "embed",
+            cairn_domain::providers::OperationKind::Rerank => "rerank",
+        };
+        // Sort tiebreaker matches in_memory (list_active sorts by
+        // created_at then provider_binding_id) — cross-backend parity
+        // test in projection_parity.rs asserts this.
+        let sql = format!(
+            "SELECT {PROVIDER_BINDING_SELECT_COLS} FROM provider_bindings
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+               AND active = TRUE
+               AND operation_kind = $4
+             ORDER BY created_at ASC, provider_binding_id ASC"
+        );
+        let rows: Vec<ProviderBindingRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(operation_str)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(ProviderBindingRow::into_record)
+            .collect()
+    }
+}

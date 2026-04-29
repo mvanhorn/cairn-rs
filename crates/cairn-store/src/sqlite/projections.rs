@@ -1101,8 +1101,60 @@ impl SqliteSyncProjection {
             RuntimeEvent::OperatorProfileUpdated(_) => log_stub("OperatorProfileUpdated"),
             RuntimeEvent::PauseScheduled(_) => log_stub("PauseScheduled"),
             RuntimeEvent::PermissionDecisionRecorded(_) => log_stub("PermissionDecisionRecorded"),
-            RuntimeEvent::ProviderBindingCreated(_) => log_stub("ProviderBindingCreated"),
-            RuntimeEvent::ProviderBindingStateChanged(_) => log_stub("ProviderBindingStateChanged"),
+            // RFC-025 Phase 3: provider_bindings projection (sqlite
+            // parity with pg). Keep the ON CONFLICT semantics symmetric
+            // with pg — replaying `ProviderBindingCreated` after a later
+            // `ProviderBindingStateChanged` must NOT overwrite `active`
+            // back to the created/default flag. SQLite's `excluded`
+            // pseudo-table behaves the same as pg's.
+            RuntimeEvent::ProviderBindingCreated(e) => {
+                let created_at = i64::try_from(e.created_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderBindingCreated.created_at {} exceeds i64::MAX",
+                        e.created_at
+                    ))
+                })?;
+                let operation_kind = enum_to_str(&e.operation_kind)?;
+                let settings_json = serde_json::to_string(&e.settings)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO provider_bindings (
+                        provider_binding_id, tenant_id, workspace_id, project_id,
+                        provider_connection_id, provider_model_id, operation_kind,
+                        settings_json, active, created_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(provider_binding_id) DO UPDATE SET
+                        provider_connection_id = excluded.provider_connection_id,
+                        provider_model_id      = excluded.provider_model_id,
+                        operation_kind         = excluded.operation_kind,
+                        settings_json          = excluded.settings_json",
+                )
+                .bind(e.provider_binding_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.provider_connection_id.as_str())
+                .bind(e.provider_model_id.as_str())
+                .bind(&operation_kind)
+                .bind(&settings_json)
+                .bind(e.active)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ProviderBindingStateChanged(e) => {
+                sqlx::query(
+                    "UPDATE provider_bindings
+                     SET active = ?
+                     WHERE provider_binding_id = ?",
+                )
+                .bind(e.active)
+                .bind(e.provider_binding_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::ProviderBudgetAlertTriggered(e) => {
                 let triggered_at = i64::try_from(e.triggered_at_ms).map_err(|_| {
                     StoreError::Internal(format!(
@@ -1159,10 +1211,48 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderConnectionRegistered(_) => {
-                log_stub("ProviderConnectionRegistered")
+            // RFC-025 Phase 3: provider_connections projection (sqlite
+            // parity with pg). Upsert-on-id so replay is safe.
+            RuntimeEvent::ProviderConnectionRegistered(e) => {
+                let registered_at = i64::try_from(e.registered_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderConnectionRegistered.registered_at {} exceeds i64::MAX",
+                        e.registered_at
+                    ))
+                })?;
+                let status = enum_to_str(&e.status)?;
+                let supported_models_json = serde_json::to_string(&e.supported_models)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO provider_connections (
+                        provider_connection_id, tenant_id, provider_family,
+                        adapter_type, supported_models_json, status, created_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(provider_connection_id) DO UPDATE SET
+                        provider_family       = excluded.provider_family,
+                        adapter_type          = excluded.adapter_type,
+                        supported_models_json = excluded.supported_models_json,
+                        status                = excluded.status",
+                )
+                .bind(e.provider_connection_id.as_str())
+                .bind(e.tenant.tenant_id.as_str())
+                .bind(&e.provider_family)
+                .bind(&e.adapter_type)
+                .bind(&supported_models_json)
+                .bind(&status)
+                .bind(registered_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderConnectionDeleted(_) => log_stub("ProviderConnectionDeleted"),
+            RuntimeEvent::ProviderConnectionDeleted(e) => {
+                // Hard-delete so the connection id can be re-used. F40.
+                sqlx::query("DELETE FROM provider_connections WHERE provider_connection_id = ?")
+                    .bind(e.provider_connection_id.as_str())
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::ProviderHealthChecked(_) => log_stub("ProviderHealthChecked"),
             RuntimeEvent::ProviderHealthScheduleSet(_) => log_stub("ProviderHealthScheduleSet"),
             RuntimeEvent::ProviderHealthScheduleTriggered(_) => {

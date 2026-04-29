@@ -405,6 +405,12 @@ mod in_memory_vs_sqlite {
             "ProviderBudgetExceeded",
             // RFC-025 Phase 2a.1 milestone 4: license fixture below.
             "LicenseActivated",
+            // RFC-025 Phase 3: provider binding + connection fixtures
+            // below.
+            "ProviderBindingCreated",
+            "ProviderBindingStateChanged",
+            "ProviderConnectionRegistered",
+            "ProviderConnectionDeleted",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -1175,6 +1181,356 @@ mod in_memory_vs_sqlite {
         assert_eq!(sqlite_lic.expires_at, None);
         assert_eq!(mem_lic.license_key.as_deref(), Some("lic_parity_2"));
         assert_eq!(sqlite_lic.license_key.as_deref(), Some("lic_parity_2"));
+    }
+
+    // ── RFC-025 Phase 3: provider_connections + provider_bindings parity. ───
+    use cairn_domain::providers::{
+        OperationKind, ProviderBindingSettings, ProviderConnectionStatus, StructuredOutputMode,
+    };
+    use cairn_domain::tenancy::TenantKey;
+    use cairn_domain::{
+        ProviderBindingCreated, ProviderBindingId, ProviderBindingStateChanged,
+        ProviderConnectionDeleted, ProviderConnectionId, ProviderConnectionRegistered,
+        ProviderModelId,
+    };
+    use cairn_store::projections::{ProviderBindingReadModel, ProviderConnectionReadModel};
+
+    fn provider_settings_fixture() -> ProviderBindingSettings {
+        ProviderBindingSettings {
+            temperature_milli: Some(700),
+            max_output_tokens: Some(4096),
+            timeout_ms: Some(30_000),
+            structured_output_mode: StructuredOutputMode::Preferred,
+            required_capabilities: vec![],
+            disabled_capabilities: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_connection_registered_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_conn");
+        let conn_id = ProviderConnectionId::new("conn_parity_1");
+        let events = vec![env(RuntimeEvent::ProviderConnectionRegistered(
+            ProviderConnectionRegistered {
+                tenant: TenantKey::new(tenant_id.as_str()),
+                provider_connection_id: conn_id.clone(),
+                provider_family: "openai".to_owned(),
+                adapter_type: "responses".to_owned(),
+                supported_models: vec!["gpt-4o".to_owned(), "gpt-4o-mini".to_owned()],
+                status: ProviderConnectionStatus::Active,
+                registered_at: 1_700_000_000_000,
+            },
+        ))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_c = ProviderConnectionReadModel::get(&mem, &conn_id)
+            .await
+            .unwrap()
+            .expect("memory connection");
+        let sqlite_c = ProviderConnectionReadModel::get(&adapter, &conn_id)
+            .await
+            .unwrap()
+            .expect("sqlite connection");
+
+        assert_eq!(
+            mem_c, sqlite_c,
+            "connection records diverged across backends"
+        );
+        assert_eq!(mem_c.provider_family, "openai");
+        assert_eq!(mem_c.adapter_type, "responses");
+        assert_eq!(mem_c.supported_models, vec!["gpt-4o", "gpt-4o-mini"]);
+        assert_eq!(mem_c.status, ProviderConnectionStatus::Active);
+        assert_eq!(mem_c.created_at, 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn provider_connection_deleted_removes_row_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_conn_del");
+        let conn_id = ProviderConnectionId::new("conn_parity_del_1");
+        let events = vec![
+            env(RuntimeEvent::ProviderConnectionRegistered(
+                ProviderConnectionRegistered {
+                    tenant: TenantKey::new(tenant_id.as_str()),
+                    provider_connection_id: conn_id.clone(),
+                    provider_family: "anthropic".to_owned(),
+                    adapter_type: "messages".to_owned(),
+                    supported_models: vec!["claude-opus-4".to_owned()],
+                    status: ProviderConnectionStatus::Active,
+                    registered_at: 1_700_000_100_000,
+                },
+            )),
+            env(RuntimeEvent::ProviderConnectionDeleted(
+                ProviderConnectionDeleted {
+                    tenant: TenantKey::new(tenant_id.as_str()),
+                    provider_connection_id: conn_id.clone(),
+                    deleted_at: 1_700_000_200_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // Both backends hard-delete the row (F40: id may be re-created).
+        let mem_c = ProviderConnectionReadModel::get(&mem, &conn_id)
+            .await
+            .unwrap();
+        let sqlite_c = ProviderConnectionReadModel::get(&adapter, &conn_id)
+            .await
+            .unwrap();
+        assert!(mem_c.is_none(), "in-memory should hard-delete the row");
+        assert!(sqlite_c.is_none(), "sqlite should hard-delete the row");
+    }
+
+    #[tokio::test]
+    async fn provider_binding_created_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = ProjectKey::new("t_parity_bind", "w_parity_bind", "p_parity_bind");
+        let binding_id = ProviderBindingId::new("pb_parity_1");
+        let conn_id = ProviderConnectionId::new("conn_parity_bind_1");
+        let model_id = ProviderModelId::new("gpt-4o");
+        let events = vec![env(RuntimeEvent::ProviderBindingCreated(
+            ProviderBindingCreated {
+                project: proj.clone(),
+                provider_binding_id: binding_id.clone(),
+                provider_connection_id: conn_id.clone(),
+                provider_model_id: model_id.clone(),
+                operation_kind: OperationKind::Generate,
+                settings: provider_settings_fixture(),
+                policy_id: None,
+                active: true,
+                created_at: 1_700_000_300_000,
+                estimated_cost_micros: None,
+            },
+        ))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_b = ProviderBindingReadModel::get(&mem, &binding_id)
+            .await
+            .unwrap()
+            .expect("memory binding");
+        let sqlite_b = ProviderBindingReadModel::get(&adapter, &binding_id)
+            .await
+            .unwrap()
+            .expect("sqlite binding");
+
+        assert_eq!(mem_b, sqlite_b, "binding records diverged across backends");
+        assert_eq!(mem_b.provider_binding_id, binding_id);
+        assert_eq!(mem_b.project, proj);
+        assert_eq!(mem_b.provider_connection_id, conn_id);
+        assert_eq!(mem_b.provider_model_id, model_id);
+        assert_eq!(mem_b.operation_kind, OperationKind::Generate);
+        assert!(mem_b.active);
+        assert_eq!(mem_b.settings, provider_settings_fixture());
+    }
+
+    #[tokio::test]
+    async fn provider_binding_state_changed_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = ProjectKey::new(
+            "t_parity_bind_state",
+            "w_parity_bind_state",
+            "p_parity_bind_state",
+        );
+        let binding_id = ProviderBindingId::new("pb_parity_state_1");
+        let events = vec![
+            env(RuntimeEvent::ProviderBindingCreated(
+                ProviderBindingCreated {
+                    project: proj.clone(),
+                    provider_binding_id: binding_id.clone(),
+                    provider_connection_id: ProviderConnectionId::new("conn_state"),
+                    provider_model_id: ProviderModelId::new("gpt-4o"),
+                    operation_kind: OperationKind::Embed,
+                    settings: provider_settings_fixture(),
+                    policy_id: None,
+                    active: true,
+                    created_at: 1_700_000_400_000,
+                    estimated_cost_micros: None,
+                },
+            )),
+            env(RuntimeEvent::ProviderBindingStateChanged(
+                ProviderBindingStateChanged {
+                    project: proj.clone(),
+                    provider_binding_id: binding_id.clone(),
+                    active: false,
+                    changed_at: 1_700_000_500_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_b = ProviderBindingReadModel::get(&mem, &binding_id)
+            .await
+            .unwrap()
+            .expect("memory binding");
+        let sqlite_b = ProviderBindingReadModel::get(&adapter, &binding_id)
+            .await
+            .unwrap()
+            .expect("sqlite binding");
+
+        assert!(!mem_b.active, "in-memory: StateChanged must flip active");
+        assert!(!sqlite_b.active, "sqlite: StateChanged must flip active");
+        assert_eq!(
+            mem_b, sqlite_b,
+            "binding after state change diverged across backends"
+        );
+
+        // list_active with the binding's operation must exclude a
+        // deactivated binding on both backends.
+        let mem_active = ProviderBindingReadModel::list_active(&mem, &proj, OperationKind::Embed)
+            .await
+            .unwrap();
+        let sqlite_active =
+            ProviderBindingReadModel::list_active(&adapter, &proj, OperationKind::Embed)
+                .await
+                .unwrap();
+        assert!(mem_active.is_empty(), "in-memory list_active must be empty");
+        assert!(sqlite_active.is_empty(), "sqlite list_active must be empty");
+    }
+
+    #[tokio::test]
+    async fn provider_binding_list_active_sort_matches_across_backends() {
+        // Regression guard: the `list_active` tiebreaker must be
+        // (created_at ASC, provider_binding_id ASC) across all three
+        // backends. Any drift breaks deterministic routing.
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = ProjectKey::new("t_sort", "w_sort", "p_sort");
+
+        // Two bindings with the same created_at — ties break on id ASC.
+        // A third binding has a later created_at to confirm temporal
+        // ordering wins over id ordering.
+        let events = vec![
+            env(RuntimeEvent::ProviderBindingCreated(
+                ProviderBindingCreated {
+                    project: proj.clone(),
+                    provider_binding_id: ProviderBindingId::new("pb_sort_b"),
+                    provider_connection_id: ProviderConnectionId::new("conn_sort"),
+                    provider_model_id: ProviderModelId::new("gpt-4o"),
+                    operation_kind: OperationKind::Generate,
+                    settings: provider_settings_fixture(),
+                    policy_id: None,
+                    active: true,
+                    created_at: 1_700_000_000_000,
+                    estimated_cost_micros: None,
+                },
+            )),
+            env(RuntimeEvent::ProviderBindingCreated(
+                ProviderBindingCreated {
+                    project: proj.clone(),
+                    provider_binding_id: ProviderBindingId::new("pb_sort_a"),
+                    provider_connection_id: ProviderConnectionId::new("conn_sort"),
+                    provider_model_id: ProviderModelId::new("gpt-4o"),
+                    operation_kind: OperationKind::Generate,
+                    settings: provider_settings_fixture(),
+                    policy_id: None,
+                    active: true,
+                    created_at: 1_700_000_000_000,
+                    estimated_cost_micros: None,
+                },
+            )),
+            env(RuntimeEvent::ProviderBindingCreated(
+                ProviderBindingCreated {
+                    project: proj.clone(),
+                    provider_binding_id: ProviderBindingId::new("pb_sort_c"),
+                    provider_connection_id: ProviderConnectionId::new("conn_sort"),
+                    provider_model_id: ProviderModelId::new("gpt-4o"),
+                    operation_kind: OperationKind::Generate,
+                    settings: provider_settings_fixture(),
+                    policy_id: None,
+                    active: true,
+                    created_at: 1_700_000_100_000,
+                    estimated_cost_micros: None,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = ProviderBindingReadModel::list_active(&mem, &proj, OperationKind::Generate)
+            .await
+            .unwrap();
+        let sqlite_list =
+            ProviderBindingReadModel::list_active(&adapter, &proj, OperationKind::Generate)
+                .await
+                .unwrap();
+
+        let mem_ids: Vec<&str> = mem_list
+            .iter()
+            .map(|b| b.provider_binding_id.as_str())
+            .collect();
+        let sqlite_ids: Vec<&str> = sqlite_list
+            .iter()
+            .map(|b| b.provider_binding_id.as_str())
+            .collect();
+        // Expected order: pb_sort_a, pb_sort_b (same created_at; id ASC),
+        // then pb_sort_c (later created_at).
+        assert_eq!(mem_ids, vec!["pb_sort_a", "pb_sort_b", "pb_sort_c"]);
+        assert_eq!(sqlite_ids, vec!["pb_sort_a", "pb_sort_b", "pb_sort_c"]);
+    }
+
+    #[tokio::test]
+    async fn provider_binding_replay_of_created_after_state_change_preserves_active() {
+        // Idempotency regression: replaying `ProviderBindingCreated` after
+        // `ProviderBindingStateChanged` must NOT reset active to the
+        // creation-time flag. The ON CONFLICT clause explicitly omits
+        // `active` on upsert; this test asserts it.
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = ProjectKey::new("t_replay", "w_replay", "p_replay");
+        let binding_id = ProviderBindingId::new("pb_replay_1");
+        let created_once = RuntimeEvent::ProviderBindingCreated(ProviderBindingCreated {
+            project: proj.clone(),
+            provider_binding_id: binding_id.clone(),
+            provider_connection_id: ProviderConnectionId::new("conn_replay"),
+            provider_model_id: ProviderModelId::new("gpt-4o"),
+            operation_kind: OperationKind::Generate,
+            settings: provider_settings_fixture(),
+            policy_id: None,
+            active: true,
+            created_at: 1_700_000_600_000,
+            estimated_cost_micros: None,
+        });
+        let events = vec![
+            env(created_once.clone()),
+            env(RuntimeEvent::ProviderBindingStateChanged(
+                ProviderBindingStateChanged {
+                    project: proj.clone(),
+                    provider_binding_id: binding_id.clone(),
+                    active: false,
+                    changed_at: 1_700_000_700_000,
+                },
+            )),
+            // Replay the creation event (different envelope id so append
+            // accepts it). On pg/sqlite this triggers the ON CONFLICT DO
+            // UPDATE path; `active` must stay false.
+            env(created_once),
+        ];
+        sqlite_log.append(&events).await.expect("sqlite append");
+
+        let binding = ProviderBindingReadModel::get(&adapter, &binding_id)
+            .await
+            .unwrap()
+            .expect("binding present");
+        assert!(
+            !binding.active,
+            "replay of ProviderBindingCreated after StateChanged must preserve active=false"
+        );
     }
 }
 

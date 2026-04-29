@@ -914,4 +914,41 @@ CREATE TABLE IF NOT EXISTS licenses (
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL
 );
+
+-- RFC-025 Phase 3 (provider bindings + connections): sqlite parity with
+-- pg V040. See that migration for the full rationale; TL;DR: operator
+-- provider config must survive restart. Complex fields ride on TEXT /
+-- JSON (no JSONB in SQLite, no pg-array types either — keeps the
+-- schema-parity contract portable).
+CREATE TABLE IF NOT EXISTS provider_connections (
+    provider_connection_id  TEXT    PRIMARY KEY,
+    tenant_id               TEXT    NOT NULL,
+    provider_family         TEXT    NOT NULL,
+    adapter_type            TEXT    NOT NULL,
+    supported_models_json   TEXT    NOT NULL DEFAULT '[]',
+    status                  TEXT    NOT NULL,
+    created_at              INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_connections_tenant
+    ON provider_connections (tenant_id, created_at, provider_connection_id);
+
+CREATE TABLE IF NOT EXISTS provider_bindings (
+    provider_binding_id     TEXT    PRIMARY KEY,
+    tenant_id               TEXT    NOT NULL,
+    workspace_id            TEXT    NOT NULL,
+    project_id              TEXT    NOT NULL,
+    provider_connection_id  TEXT    NOT NULL,
+    provider_model_id       TEXT    NOT NULL,
+    operation_kind          TEXT    NOT NULL,
+    settings_json           TEXT    NOT NULL DEFAULT '{}',
+    active                  BOOLEAN NOT NULL DEFAULT 1,
+    created_at              INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_bindings_project_active
+    ON provider_bindings (tenant_id, workspace_id, project_id, active, operation_kind, created_at, provider_binding_id);
+
+CREATE INDEX IF NOT EXISTS idx_provider_bindings_tenant
+    ON provider_bindings (tenant_id, created_at, provider_binding_id);
 "#;

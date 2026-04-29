@@ -903,16 +903,38 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             tracking: "RFC-025 Phase 2b (plan review events — RFC 018)",
         },
     },
+    // RFC-025 Phase 3 (2026-04-28): 4 provider-state variants flipped
+    // Stubbed → Projected. Operator-configured provider state now
+    // survives restart (the core F40 contract). See
+    // `docs/design/rfcs/RFC-025-provider-boundary-research.md` for the
+    // research underpinning this classification:
+    //   * Bindings + connections are PROJECTED (persistent config) —
+    //     this is what Phase 3 ships.
+    //   * Pools (ProviderPool*) stay STUBBED for now; they are intended
+    //     to become EPHEMERAL in Phase 3b (live HTTP-client state is
+    //     not persistable and is rebuilt from bindings + connections
+    //     at boot — but flipping the registry status to Ephemeral
+    //     without the accompanying pool read-model would drop the
+    //     stub-guard alert that tracks Phase 3b scope).
+    //   * Health probes (ProviderHealthChecked, ProviderMarkedDegraded,
+    //     ProviderRecovered, ProviderHealthSchedule*) stay STUBBED for
+    //     now; they are intended to become EPHEMERAL in Phase 3b (next
+    //     probe cycle rebuilds state; no operator-visible read after
+    //     restart).
+    // Flipping the pool / health variants to Ephemeral is deferred to
+    // Phase 3b so the stub-guard CI job continues to track the Phase 3b
+    // scope explicitly rather than silently absorbing it into the
+    // Ephemeral bucket.
     ProjectionEntry {
         variant: "ProviderBindingCreated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider bindings vs connections split)",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_bindings"),
         },
     },
     ProjectionEntry {
         variant: "ProviderBindingStateChanged",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider bindings vs connections split)",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_bindings"),
         },
     },
     ProjectionEntry {
@@ -935,14 +957,14 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "ProviderConnectionDeleted",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider connections — ephemeral vs projected pending research)",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_connections"),
         },
     },
     ProjectionEntry {
         variant: "ProviderConnectionRegistered",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider connections — ephemeral vs projected pending research)",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_connections"),
         },
     },
     ProjectionEntry {
@@ -1303,17 +1325,24 @@ mod tests {
         //     is "backed by a read-model table updated synchronously",
         //     not "runtime replays from the table"). Net: +13 Projected,
         //     -13 Ephemeral → 75 / 18 / 65.
+        //   * Phase 3 (this PR) flips the four provider-state variants
+        //     (ProviderBindingCreated / StateChanged, ProviderConnection
+        //     Registered / Deleted) Stubbed → Projected with backing
+        //     tables `provider_bindings` / `provider_connections`. Pools
+        //     and health probes stay Stubbed (Phase 3b will flip them
+        //     to Ephemeral once the pool / health read-models land).
+        //     Net: +4 Projected, -4 Stubbed → 79 / 18 / 61.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 75,
+            projected, 79,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
             ephemeral, 18,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 65, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 61, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 

@@ -780,9 +780,72 @@ impl PgSyncProjection {
             RuntimeEvent::PermissionDecisionRecorded(_) => {
                 log_stub("PermissionDecisionRecorded")
             }
-            RuntimeEvent::ProviderBindingCreated(_) => log_stub("ProviderBindingCreated"),
-            RuntimeEvent::ProviderBindingStateChanged(_) => {
-                log_stub("ProviderBindingStateChanged")
+            // RFC-025 Phase 3: provider_bindings projection. Project-level
+            // routing record linking (project, operation) → (connection,
+            // model). `settings_json` carries the full
+            // `ProviderBindingSettings` struct as a JSON TEXT column —
+            // portable (no JSONB) and compatible with the settings-set
+            // growing without a schema change.
+            //
+            // `ON CONFLICT (provider_binding_id) DO UPDATE` is idempotent
+            // on replay: the creation event re-upserts the row *without*
+            // overwriting the `active` column, so a later
+            // `ProviderBindingStateChanged` stays intact when the log is
+            // re-applied. This matches in_memory's semantics (the
+            // `ProviderBindingCreated` arm there clobbers active by design
+            // because it precedes the state-change arm in the log; our
+            // projection preserves that ordering by omitting `active`
+            // from the `DO UPDATE SET` list specifically).
+            RuntimeEvent::ProviderBindingCreated(e) => {
+                let created_at = i64::try_from(e.created_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderBindingCreated.created_at {} exceeds i64::MAX",
+                        e.created_at
+                    ))
+                })?;
+                let operation_kind = enum_to_str(&e.operation_kind)?;
+                let settings_json = serde_json::to_string(&e.settings)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO provider_bindings (
+                        provider_binding_id, tenant_id, workspace_id, project_id,
+                        provider_connection_id, provider_model_id, operation_kind,
+                        settings_json, active, created_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     ON CONFLICT (provider_binding_id) DO UPDATE SET
+                        provider_connection_id = excluded.provider_connection_id,
+                        provider_model_id      = excluded.provider_model_id,
+                        operation_kind         = excluded.operation_kind,
+                        settings_json          = excluded.settings_json",
+                )
+                .bind(e.provider_binding_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.provider_connection_id.as_str())
+                .bind(e.provider_model_id.as_str())
+                .bind(&operation_kind)
+                .bind(&settings_json)
+                .bind(e.active)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ProviderBindingStateChanged(e) => {
+                // UPDATE no-op if binding_id is unknown (mirrors
+                // in_memory's `get_mut.map(..)`). Replay is safe because
+                // the assignment is overwrite-stable for the same event.
+                sqlx::query(
+                    "UPDATE provider_bindings
+                     SET active = $1
+                     WHERE provider_binding_id = $2",
+                )
+                .bind(e.active)
+                .bind(e.provider_binding_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
             RuntimeEvent::ProviderBudgetAlertTriggered(e) => {
                 let triggered_at = i64::try_from(e.triggered_at_ms).map_err(|_| {
@@ -844,11 +907,58 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderConnectionRegistered(_) => {
-                log_stub("ProviderConnectionRegistered")
+            // RFC-025 Phase 3: provider_connections projection. Tenant-level
+            // endpoint registration. `supported_models_json` is a TEXT
+            // column carrying a serde_json array of model identifiers;
+            // stays portable (no pg arrays, no JSONB).
+            //
+            // Upsert on `provider_connection_id` because
+            // `ProviderConnectionRegistered` is append-only under normal
+            // operation — replay of the same event must not fail.
+            RuntimeEvent::ProviderConnectionRegistered(e) => {
+                let registered_at = i64::try_from(e.registered_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderConnectionRegistered.registered_at {} exceeds i64::MAX",
+                        e.registered_at
+                    ))
+                })?;
+                let status = enum_to_str(&e.status)?;
+                let supported_models_json = serde_json::to_string(&e.supported_models)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO provider_connections (
+                        provider_connection_id, tenant_id, provider_family,
+                        adapter_type, supported_models_json, status, created_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     ON CONFLICT (provider_connection_id) DO UPDATE SET
+                        provider_family       = excluded.provider_family,
+                        adapter_type          = excluded.adapter_type,
+                        supported_models_json = excluded.supported_models_json,
+                        status                = excluded.status",
+                )
+                .bind(e.provider_connection_id.as_str())
+                .bind(e.tenant.tenant_id.as_str())
+                .bind(&e.provider_family)
+                .bind(&e.adapter_type)
+                .bind(&supported_models_json)
+                .bind(&status)
+                .bind(registered_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderConnectionDeleted(_) => {
-                log_stub("ProviderConnectionDeleted")
+            RuntimeEvent::ProviderConnectionDeleted(e) => {
+                // F40: hard-remove so the id can be re-created. History
+                // stays in the event log for audit. Matches in_memory
+                // (which `.remove()`s the key). Replay is safe because
+                // DELETE on a missing row is a no-op.
+                sqlx::query(
+                    "DELETE FROM provider_connections WHERE provider_connection_id = $1",
+                )
+                .bind(e.provider_connection_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
             RuntimeEvent::ProviderHealthChecked(_) => log_stub("ProviderHealthChecked"),
             RuntimeEvent::ProviderHealthScheduleSet(_) => log_stub("ProviderHealthScheduleSet"),
