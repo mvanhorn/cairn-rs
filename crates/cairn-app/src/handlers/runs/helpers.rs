@@ -1,0 +1,220 @@
+//! Shared internals for the runs handler sub-modules.
+//!
+//! Anything that two or more domain sub-modules need to reach — the
+//! stuck-run threshold default, the provider-error redactor, the
+//! failure-class classifier, and the run-fail finalizer — lives here.
+
+use crate::state::AppState;
+
+// ── Stuck-run threshold ─────────────────────────────────────────────────────
+
+/// Settings-defaults key for the stuck-run threshold (system scope, milliseconds).
+pub(crate) const STUCK_RUN_THRESHOLD_KEY: &str = "stuck_run_threshold_ms";
+
+/// Read the system-scope `stuck_run_threshold_ms` default, if set.
+///
+/// Returns `None` when unset, when the stored value is not a non-negative
+/// whole number, OR when the projection read fails — in the last case the
+/// error is logged at `warn` and callers fall back to the hard-coded
+/// default so a transient store outage never turns `/v1/runs/stalled` into
+/// a 500. An operator-visible store outage is already surfaced by the
+/// dedicated store-health surface (`GET /v1/status`).
+pub(crate) async fn resolve_stuck_run_threshold_ms(state: &AppState) -> Option<u64> {
+    use cairn_domain::Scope;
+    use cairn_store::projections::DefaultsReadModel;
+
+    let record = match DefaultsReadModel::get(
+        state.runtime.store.as_ref(),
+        Scope::System,
+        "system",
+        STUCK_RUN_THRESHOLD_KEY,
+    )
+    .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                key = STUCK_RUN_THRESHOLD_KEY,
+                "failed to read stuck-run threshold default; falling back to hard-coded value"
+            );
+            return None;
+        }
+    };
+    // Accept both JSON integer and JSON float forms — validation
+    // guarantees the stored number is whole and within u64 range.
+    record.value.as_u64().or_else(|| {
+        record.value.as_f64().and_then(|n| {
+            if n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u64::MAX as f64 {
+                Some(n as u64)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+// ── Telemetry redactor ──────────────────────────────────────────────────────
+
+/// Redact unsafe provider error strings for telemetry responses.
+///
+/// Provider-layer errors already flow through `cairn_providers::redact` —
+/// this is the belt-and-suspenders guard at the API boundary:
+///
+/// - `None` input → `None` output.
+/// - String with a live-looking `bearer ... sk-...` pattern → replaced
+///   with the fixed marker `"<redacted: leaked credential pattern>"`.
+///   The returned `Option` is always `Some` here — downstream JSON
+///   callers see the marker, not `null`, so the UI can distinguish
+///   "redacted" from "no error at all".
+/// - Otherwise → pass through; if longer than 1024 chars, truncate
+///   with a trailing ellipsis.
+pub(super) fn redact_provider_error(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("bearer ") && lower.contains("sk-") {
+        // Likely still carries a live key. Drop rather than leak.
+        return Some("<redacted: leaked credential pattern>".to_owned());
+    }
+    const MAX: usize = 1024;
+    if raw.len() > MAX {
+        let mut s = raw.chars().take(MAX).collect::<String>();
+        s.push_str("...");
+        Some(s)
+    } else {
+        Some(raw.to_owned())
+    }
+}
+
+// ── Failure classification + finalizer ──────────────────────────────────────
+
+/// F53: heuristically map a `LoopTermination::Failed { reason }` string to
+/// a `FailureClass`. The reason is free-form from the orchestrator loop
+/// (provider errors, lease-expiry diagnostics, tool failures, …), so we
+/// substring-match the obvious cases and fall back to `ExecutionError`
+/// so operators can still filter failed runs by class.
+pub(super) fn classify_failed_reason(reason: &str) -> cairn_domain::FailureClass {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("lease") && (lower.contains("expir") || lower.contains("lost")) {
+        cairn_domain::FailureClass::LeaseExpired
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        cairn_domain::FailureClass::TimedOut
+    } else if lower.contains("approval") && lower.contains("reject") {
+        cairn_domain::FailureClass::ApprovalRejected
+    } else if lower.contains("policy") && lower.contains("denied") {
+        cairn_domain::FailureClass::PolicyDenied
+    } else {
+        cairn_domain::FailureClass::ExecutionError
+    }
+}
+
+/// F53: flip the run to the terminal `Failed` state via
+/// `RunService::fail`. Called from every non-success
+/// `LoopTermination` branch (Failed / MaxIterationsReached / TimedOut)
+/// so the run projection catches up to the orchestrate response body
+/// (previously runs stayed `Running` forever, forcing operators to
+/// manually cancel).
+///
+/// Swallows errors: a transient store blip or an already-terminal run
+/// (e.g. `runs.complete` already fired inside the loop) must not turn
+/// an orchestrate response into a 5xx for the operator. All failure
+/// paths are logged so ops can spot the drift.
+pub(super) async fn finalize_run_failure(
+    state: &AppState,
+    session_id: &cairn_domain::SessionId,
+    run_id: &cairn_domain::RunId,
+    failure_class: cairn_domain::FailureClass,
+) {
+    if let Err(e) = state
+        .runtime
+        .runs
+        .fail(session_id, run_id, failure_class)
+        .await
+    {
+        // `InvalidTransition` is the common benign case: the loop already
+        // reached a terminal state (Completed / Canceled) before we got
+        // here. Log at debug. Anything else is operator-visible.
+        match &e {
+            cairn_runtime::error::RuntimeError::InvalidTransition { .. } => {
+                tracing::debug!(
+                    run_id = %run_id,
+                    failure_class = ?failure_class,
+                    error = %e,
+                    "F53: run already in terminal state; skip fail-flip"
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    failure_class = ?failure_class,
+                    error = %e,
+                    "F53: failed to flip run to Failed after terminal orchestrate; \
+                     GET /v1/runs/:id may report stale state=running"
+                );
+            }
+        }
+    }
+}
+
+// ── SLA DTO default ─────────────────────────────────────────────────────────
+
+/// Default `alert_at_percent` for [`SetRunSlaRequest`].
+pub(super) fn default_alert_pct() -> u8 {
+    80
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── F29 CD: redact_provider_error ───────────────────────────────
+    //
+    // Security-sensitive: this function is the last line of defence
+    // against an upstream provider echoing a live Authorization header
+    // into an error payload. The matrix below locks in the three cases
+    // the telemetry handler relies on.
+
+    #[test]
+    fn redact_provider_error_drops_leaked_bearer_key() {
+        // Build the leaked marker at runtime so GitGuardian static scans
+        // don't flag this literal as a real credential.
+        let marker = format!("sk-{}", "fake-test-only-".to_owned() + &"x".repeat(24));
+        let leaked = format!("upstream returned: Authorization: Bearer {marker} denied");
+        let out = redact_provider_error(Some(&leaked)).expect("some");
+        assert!(
+            !out.contains(&marker),
+            "leaked credential pattern must not survive: {out}"
+        );
+        assert!(
+            out.contains("<redacted"),
+            "expected explicit redaction marker, got: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_provider_error_truncates_oversize_payload() {
+        let huge = "x".repeat(4096);
+        let out = redact_provider_error(Some(&huge)).expect("some");
+        // Truncation cap is 1024 chars + 3-char ellipsis.
+        assert!(out.len() <= 1024 + 3, "length cap broken: {}", out.len());
+        assert!(out.ends_with("..."), "ellipsis marker missing: {out}");
+    }
+
+    #[test]
+    fn redact_provider_error_passes_clean_message_through() {
+        let msg = "provider returned 500: upstream timeout";
+        assert_eq!(
+            redact_provider_error(Some(msg)).as_deref(),
+            Some(msg),
+            "clean message must pass through verbatim"
+        );
+    }
+
+    #[test]
+    fn redact_provider_error_none_stays_none() {
+        assert_eq!(redact_provider_error(None), None);
+    }
+}
