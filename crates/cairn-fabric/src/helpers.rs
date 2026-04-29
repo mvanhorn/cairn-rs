@@ -126,11 +126,21 @@ pub fn try_parse_project_key(s: &str) -> Option<ProjectKey> {
     }
 }
 
-pub fn read_hgetall_field(
-    fields: &std::collections::HashMap<String, String>,
+/// Look up `key` in the HGETALL-shaped map, returning the borrowed value
+/// iff it exists and is non-empty.
+///
+/// Returns `Option<&str>` (was `Option<String>`, which cloned on every
+/// call — see issue #509). Callers that genuinely need to own the string
+/// can write `.map(str::to_owned)` at the call site; nothing in-tree
+/// does today.
+pub fn read_hgetall_field<'a>(
+    fields: &'a std::collections::HashMap<String, String>,
     key: &str,
-) -> Option<String> {
-    fields.get(key).filter(|v| !v.is_empty()).cloned()
+) -> Option<&'a str> {
+    fields
+        .get(key)
+        .map(String::as_str)
+        .filter(|v| !v.is_empty())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +197,15 @@ pub fn value_to_string(v: &ferriskey::Value) -> Option<String> {
 /// and `Value::Set(Vec<Value>)` (SMEMBERS, SINTER…). Errored or
 /// non-string entries are skipped silently — missing/garbled members
 /// shouldn't crash the read.
+///
+/// Allocates N+1 `String`s and — on the BulkString arm — performs a
+/// lossy UTF-8 decode that copies even when the bytes are already valid
+/// UTF-8. For bounded responses (e.g. SMEMBERS of a project-scoped set,
+/// typically <100 elements) this is fine. For unbounded reads or for
+/// callers that can work with `&str` directly, prefer
+/// [`parse_string_array_borrowed`] — it yields a
+/// `Cow<'_, str>` per element, borrowing on the valid-UTF-8 hot path
+/// (#514).
 pub fn parse_string_array(raw: &ferriskey::Value) -> Vec<String> {
     match raw {
         ferriskey::Value::Array(items) => items
@@ -196,6 +215,66 @@ pub fn parse_string_array(raw: &ferriskey::Value) -> Vec<String> {
             .collect(),
         ferriskey::Value::Set(items) => items.iter().filter_map(value_to_string).collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Streaming / borrow-preferring variant of [`parse_string_array`].
+/// Yields `Cow<'_, str>` per element:
+/// - `Cow::Borrowed` when the underlying value is a valid-UTF-8
+///   BulkString, or a SimpleString / VerbatimString (both already
+///   owned `String` inside the `Value`) — no allocation.
+/// - `Cow::Owned` when the BulkString carries non-UTF-8 bytes and
+///   we fall back to `from_utf8_lossy` (same fallback semantics as
+///   [`parse_string_array`], to keep behavior identical between the
+///   two entry points).
+///
+/// Use this when the response is unbounded, when the caller wants to
+/// filter/`take_while`/`any` without materializing the full list, or
+/// when downstream code prefers a typed container other than
+/// `Vec<String>` (e.g. `.map(MyId::from).collect()`).
+///
+/// Returns `impl Iterator` (static dispatch) rather than
+/// `Box<dyn Iterator>` — the whole point of this helper is to avoid
+/// per-call allocation on the hot path, and the boxed form would have
+/// added a heap allocation at every call site, undermining the intent
+/// (see review on #561).
+pub fn parse_string_array_borrowed(
+    raw: &ferriskey::Value,
+) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
+    let array_items = match raw {
+        ferriskey::Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .filter_map(value_to_cow_str),
+        ),
+        _ => None,
+    };
+
+    let set_items = match raw {
+        ferriskey::Value::Set(items) => Some(items.iter().filter_map(value_to_cow_str)),
+        _ => None,
+    };
+
+    array_items
+        .into_iter()
+        .flatten()
+        .chain(set_items.into_iter().flatten())
+}
+
+/// Borrow-preferring sibling of [`value_to_string`]. Returns a
+/// [`std::borrow::Cow`] that borrows from `v` on the hot path and only
+/// allocates on the lossy-UTF-8 fallback.
+fn value_to_cow_str(v: &ferriskey::Value) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    match v {
+        ferriskey::Value::BulkString(b) => Some(match std::str::from_utf8(b) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(String::from_utf8_lossy(b).into_owned()),
+        }),
+        ferriskey::Value::SimpleString(s) => Some(Cow::Borrowed(s.as_str())),
+        ferriskey::Value::VerbatimString { text, .. } => Some(Cow::Borrowed(text.as_str())),
+        _ => None,
     }
 }
 
@@ -574,5 +653,112 @@ mod tests {
             fcall_error_code(&raw).as_deref(),
             Some("use_claim_resumed_execution"),
         );
+    }
+
+    // ── read_hgetall_field (#509) ───────────────────────────────────────
+
+    #[test]
+    fn read_hgetall_field_returns_borrowed_populated_value() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("state".to_owned(), "active".to_owned());
+        let got = read_hgetall_field(&fields, "state");
+        assert_eq!(got, Some("active"));
+        // The returned &str must borrow from `fields`, not be a clone.
+        let expected_ptr = fields.get("state").unwrap().as_ptr();
+        assert_eq!(
+            got.unwrap().as_ptr(),
+            expected_ptr,
+            "must borrow, not clone"
+        );
+    }
+
+    #[test]
+    fn read_hgetall_field_filters_empty_value() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("state".to_owned(), String::new());
+        assert_eq!(read_hgetall_field(&fields, "state"), None);
+    }
+
+    #[test]
+    fn read_hgetall_field_missing_key_returns_none() {
+        let fields = std::collections::HashMap::<String, String>::new();
+        assert_eq!(read_hgetall_field(&fields, "state"), None);
+    }
+
+    // ── parse_string_array_borrowed (#514) ──────────────────────────────
+
+    #[test]
+    fn parse_string_array_borrowed_yields_borrowed_on_valid_utf8() {
+        use std::borrow::Cow;
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::BulkString(b"alpha".to_vec().into())),
+            Ok(ferriskey::Value::BulkString(b"beta".to_vec().into())),
+            Ok(ferriskey::Value::SimpleString("gamma".into())),
+        ]);
+        let items: Vec<Cow<'_, str>> = parse_string_array_borrowed(&raw).collect();
+        assert_eq!(items.len(), 3);
+        for item in &items {
+            assert!(
+                matches!(item, Cow::Borrowed(_)),
+                "valid-UTF-8 entries must be borrowed, got Cow::Owned for {item:?}",
+            );
+        }
+        assert_eq!(items[0].as_ref(), "alpha");
+        assert_eq!(items[1].as_ref(), "beta");
+        assert_eq!(items[2].as_ref(), "gamma");
+    }
+
+    #[test]
+    fn parse_string_array_borrowed_falls_back_to_owned_on_invalid_utf8() {
+        use std::borrow::Cow;
+        // Invalid UTF-8 (lone continuation byte): must round-trip via
+        // from_utf8_lossy into an owned Cow — same semantics as the
+        // legacy owning variant, so behaviour is identical on the
+        // garbled-bytes path.
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::BulkString(b"ok".to_vec().into())),
+            Ok(ferriskey::Value::BulkString(vec![0xFFu8].into())),
+        ]);
+        let items: Vec<Cow<'_, str>> = parse_string_array_borrowed(&raw).collect();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], Cow::Borrowed(_)));
+        assert!(matches!(items[1], Cow::Owned(_)));
+    }
+
+    #[test]
+    fn parse_string_array_borrowed_equivalent_to_owning_variant() {
+        // Parity assertion: the two entry points must agree on the
+        // ordered string contents for the typical bounded case.
+        let raw = ferriskey::Value::Array(vec![
+            Ok(ferriskey::Value::BulkString(b"a".to_vec().into())),
+            Ok(ferriskey::Value::SimpleString("b".into())),
+            Ok(ferriskey::Value::BulkString(b"c".to_vec().into())),
+        ]);
+        let borrowed: Vec<String> = parse_string_array_borrowed(&raw)
+            .map(|c| c.into_owned())
+            .collect();
+        let owning: Vec<String> = parse_string_array(&raw);
+        assert_eq!(borrowed, owning);
+    }
+
+    #[test]
+    fn parse_string_array_borrowed_supports_set_shape() {
+        use std::borrow::Cow;
+        let raw = ferriskey::Value::Set(vec![
+            ferriskey::Value::BulkString(b"x".to_vec().into()),
+            ferriskey::Value::BulkString(b"y".to_vec().into()),
+        ]);
+        let items: Vec<Cow<'_, str>> = parse_string_array_borrowed(&raw).collect();
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert!(matches!(item, Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn parse_string_array_borrowed_empty_on_other_shapes() {
+        let raw = ferriskey::Value::Int(42);
+        let items: Vec<_> = parse_string_array_borrowed(&raw).collect();
+        assert!(items.is_empty());
     }
 }

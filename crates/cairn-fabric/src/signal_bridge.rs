@@ -259,7 +259,7 @@ impl SignalBridge {
         &self,
         execution_id: &ExecutionId,
         waitpoint_id: &WaitpointId,
-        signal: Signal,
+        mut signal: Signal,
     ) -> Result<SignalOutcome, FabricError> {
         let partition = flowfabric::core::partition::execution_partition(
             execution_id,
@@ -284,11 +284,11 @@ impl SignalBridge {
             .unwrap_or_else(|| derived_idem.clone());
         let idem_key = ctx.signal_dedup(waitpoint_id, &effective_idem);
 
-        let payload_str = signal
-            .payload
-            .as_ref()
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .unwrap_or_default();
+        // Consume the owned payload instead of borrowing-then-copying
+        // (#516). Extracted into a pure helper so the conversion
+        // (including the lossy-UTF-8 fallback) can be unit-tested
+        // without a live Valkey.
+        let payload_str = payload_bytes_to_string(signal.payload.take());
 
         let (keys, args) = crate::fcall::suspension::build_deliver_signal(
             &ctx,
@@ -322,6 +322,23 @@ impl SignalBridge {
             .await?;
 
         parse_signal_result(&raw)
+    }
+}
+
+/// Convert an owned signal payload into the `String` form FF's fcall
+/// expects. Consumes the bytes (one allocation on the valid-UTF-8 hot
+/// path — just the `String` shell — vs the previous
+/// `as_ref().map(from_utf8_lossy.into_owned())` which copied every
+/// byte). Falls back to `from_utf8_lossy` only when the bytes are not
+/// valid UTF-8, preserving the lossy-decode behaviour of the original
+/// implementation for robustness (#516).
+fn payload_bytes_to_string(payload: Option<Vec<u8>>) -> String {
+    match payload {
+        None => String::new(),
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+        },
     }
 }
 
@@ -614,6 +631,52 @@ mod tests {
         // Out-of-bounds or wrong shape never panics or allocates.
         let empty: Vec<Result<ferriskey::Value, ferriskey::Error>> = vec![];
         assert!(!is_tag(&empty, 1, b"DUPLICATE"));
+    }
+
+    // ── #516 regression: payload conversion consumes bytes ────────────
+    //
+    // `deliver_signal` used to do
+    // `payload.as_ref().map(|p| from_utf8_lossy(p).into_owned())` which
+    // always copied the payload — `from_utf8_lossy` on a `&[u8]` yields
+    // a `Cow::Borrowed` for valid UTF-8, and `.into_owned()` then clones
+    // it. `payload_bytes_to_string` consumes the owned `Vec<u8>` via
+    // `String::from_utf8` — O(1) on the valid-UTF-8 hot path (the
+    // allocation is reused as the String's backing buffer).
+
+    #[test]
+    fn payload_bytes_to_string_none_returns_empty() {
+        assert_eq!(payload_bytes_to_string(None), "");
+    }
+
+    #[test]
+    fn payload_bytes_to_string_valid_utf8_round_trips_without_realloc() {
+        // Valid-UTF-8 payload (the common case: JSON approval envelope).
+        // Build a distinctive Vec, capture its pointer, then confirm that
+        // the returned String reuses the same heap buffer — which proves
+        // we are consuming rather than copying.
+        let src = br#"{"approved":true,"note":"all good"}"#.to_vec();
+        let src_ptr = src.as_ptr();
+        let src_len = src.len();
+
+        let s = payload_bytes_to_string(Some(src));
+        assert_eq!(s.as_str(), r#"{"approved":true,"note":"all good"}"#);
+        assert_eq!(s.as_ptr(), src_ptr, "must consume the Vec, not copy it");
+        assert_eq!(s.len(), src_len);
+    }
+
+    #[test]
+    fn payload_bytes_to_string_invalid_utf8_falls_back_to_lossy() {
+        // Lone continuation byte. `String::from_utf8` returns Err and
+        // we fall back to lossy-decode — matches the pre-#516 behaviour.
+        let src = vec![b'o', b'k', 0xFFu8, b'!'];
+        let s = payload_bytes_to_string(Some(src));
+        // `U+FFFD` REPLACEMENT CHARACTER is 3 bytes in UTF-8: EF BF BD.
+        assert!(s.starts_with("ok"));
+        assert!(s.ends_with("!"));
+        assert!(
+            s.contains('\u{FFFD}'),
+            "expected replacement char, got {s:?}"
+        );
     }
 
     #[test]

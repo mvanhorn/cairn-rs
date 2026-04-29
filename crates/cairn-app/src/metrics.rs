@@ -358,6 +358,37 @@ pub(crate) fn record_breaker_threshold_warn(
     *m.entry(label.to_owned()).or_insert(0) += 1;
 }
 
+/// Record one observation into a breaker histogram using **sparse
+/// storage**: only the first matching bucket gets incremented. The
+/// final Prometheus `le="x"` counts are then materialised
+/// cumulatively at render time by [`render_breaker_histogram`].
+///
+/// # Storage strategy (#517)
+///
+/// Cairn runs **two different histogram storage strategies** and a
+/// future refactor that "normalises" one to match the other would
+/// silently break the render path for that histogram. The two
+/// strategies — both produce identical Prometheus output — are:
+///
+/// | Histogram | Record-time | Render-time |
+/// |-----------|-------------|-------------|
+/// | HTTP request duration ([`AppMetrics::record_request`]) | **Cumulative** — increment every bucket where `value ≤ edge` (~N/2 writes) | Read `bucket_counts[idx]` directly |
+/// | Provider duration (`record_provider_call`) | **Cumulative** — same as HTTP | Read `bucket_counts[idx]` directly |
+/// | Breaker round / tokens / wall_clock ([`observe_histogram`] — this fn) | **Sparse** — increment only the first matching bucket (1 write) | [`render_breaker_histogram`] runs a prefix sum |
+///
+/// Why two strategies? Historical. The HTTP + provider paths were
+/// added first with cumulative storage (cheaper render, more
+/// obvious `bucket_counts[i] = count_of_le_edge_i`). The F65 PR-3
+/// breaker histograms picked sparse storage to make record-time
+/// O(1) instead of O(N). Both are correct; unifying them is a
+/// larger refactor than this audit finding warrants.
+///
+/// If you are reading this because a lint or a test flagged the
+/// inconsistency: **do not change either side without updating the
+/// matching render path.** Test coverage in this module
+/// (`breaker_histogram_renders_cumulatively_from_sparse_storage`
+/// and `http_request_duration_buckets_are_monotonic_per_request`)
+/// pins the contract on both strategies.
 fn observe_histogram<const N: usize>(
     h: &mut BreakerHistogram<N>,
     buckets: &[u64; N],
@@ -434,6 +465,11 @@ impl AppMetrics {
             .or_default();
         sample.count += 1;
         sample.sum_ms = sample.sum_ms.saturating_add(latency_ms);
+        // Cumulative storage: increment every bucket whose edge covers
+        // this latency. At render time `bucket_counts[idx]` is read
+        // directly as the `le="edge_idx"` value. See the `observe_
+        // histogram` doc-comment (#517) for why the breaker path uses
+        // the sparse strategy instead, and why the two coexist.
         for (idx, bucket) in HTTP_DURATION_BUCKETS_MS.iter().enumerate() {
             if latency_ms <= *bucket {
                 sample.bucket_counts[idx] += 1;
@@ -635,6 +671,9 @@ impl AppMetrics {
             let sample = durations.entry(duration_key).or_default();
             sample.count += 1;
             sample.sum_ms = sample.sum_ms.saturating_add(latency_ms);
+            // Cumulative storage, same pattern as HTTP request
+            // duration — see `observe_histogram` (#517) for why this
+            // differs from the breaker sparse strategy.
             for (idx, bucket) in PROVIDER_DURATION_BUCKETS_MS.iter().enumerate() {
                 if latency_ms <= *bucket {
                     sample.bucket_counts[idx] += 1;
@@ -1706,5 +1745,170 @@ mod tests {
         assert_eq!(out.get(&succeeded), Some(&100));
         assert_eq!(out.get(&failed), Some(&10));
         assert_eq!(out.len(), 2);
+    }
+
+    // ── #517 regression: histogram storage strategies ──────────────────
+    //
+    // Two separate strategies coexist — HTTP + provider use cumulative
+    // storage, breaker uses sparse. Both paths MUST render identical
+    // Prometheus output shape: `le=edge` counts are monotonic
+    // non-decreasing. These tests pin each strategy's render contract
+    // so a maintainer can't silently collapse one into the other.
+
+    /// Breaker path: sparse-storage record, cumulative render.
+    ///
+    /// Round-breaker buckets are `[1, 5, 10, 20, 30, 50]`. Observe
+    /// {1, 10, 30}. Each observation hits exactly one slot — indices
+    /// 0, 2, 4. `render_breaker_histogram` must emit cumulative
+    /// counts: 1, 1, 2, 2, 3, 3, +Inf=3.
+    #[test]
+    fn breaker_histogram_renders_cumulatively_from_sparse_storage() {
+        let mut h: BreakerHistogram<{ BREAKER_ROUND_BUCKETS.len() }> = BreakerHistogram::default();
+        for v in [1u64, 10, 30] {
+            observe_histogram(&mut h, &BREAKER_ROUND_BUCKETS, v);
+        }
+
+        // Raw storage is sparse: each observation hit exactly one slot.
+        // Buckets: [1, 5, 10, 20, 30, 50]
+        //           idx 0    idx 2     idx 4
+        let nonzero_slots: Vec<usize> = h
+            .bucket_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v > 0 { Some(i) } else { None })
+            .collect();
+        assert_eq!(
+            nonzero_slots,
+            vec![0, 2, 4],
+            "sparse storage: observations land in exactly one slot each",
+        );
+
+        // Render and verify the Prometheus output is cumulative.
+        let mut lines = Vec::new();
+        render_breaker_histogram(
+            &mut lines,
+            "test_round",
+            "test round histogram",
+            &h,
+            &BREAKER_ROUND_BUCKETS,
+        );
+
+        let buckets: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| {
+                if l.starts_with("test_round_bucket{le=\"") && !l.contains("+Inf") {
+                    let v = l.rsplit(' ').next().unwrap();
+                    v.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Cumulative: 1, 1, 2, 2, 3, 3
+        assert_eq!(buckets, vec![1, 1, 2, 2, 3, 3]);
+
+        let inf_line = lines
+            .iter()
+            .find(|l| l.contains("le=\"+Inf\""))
+            .expect("+Inf line");
+        assert!(inf_line.ends_with(" 3"));
+        let sum_line = lines
+            .iter()
+            .find(|l| l.starts_with("test_round_sum"))
+            .unwrap();
+        assert!(sum_line.ends_with(&format!(" {}", 1 + 10 + 30)));
+        let count_line = lines
+            .iter()
+            .find(|l| l.starts_with("test_round_count"))
+            .unwrap();
+        assert!(count_line.ends_with(" 3"));
+    }
+
+    /// HTTP path: cumulative-storage record, direct render.
+    ///
+    /// Observe three requests with latencies {10, 500, 2500} ms. The
+    /// HTTP strategy writes to every bucket whose edge covers the
+    /// latency, so the raw `bucket_counts` already read as the
+    /// Prometheus `le="edge"` values. Bucket counts must be monotonic
+    /// non-decreasing — the contract every downstream dashboard
+    /// depends on.
+    #[test]
+    fn http_request_duration_buckets_are_monotonic_per_request() {
+        let metrics = AppMetrics::default();
+        metrics.record_request("GET", "/v1/runs", 200, 10);
+        metrics.record_request("GET", "/v1/runs", 200, 500);
+        metrics.record_request("GET", "/v1/runs", 200, 2500);
+
+        let durations = metrics
+            .request_durations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = RequestDurationKey {
+            method: "GET".to_owned(),
+            path: "/v1/runs".to_owned(),
+        };
+        let sample = durations.get(&key).expect("sample exists");
+
+        // Cumulative storage: each slot[i] must be >= slot[i-1].
+        for window in sample.bucket_counts.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "cumulative buckets must be monotonic: {:?}",
+                sample.bucket_counts,
+            );
+        }
+        // Final bucket covers all three observations.
+        assert_eq!(*sample.bucket_counts.last().unwrap(), 3);
+        assert_eq!(sample.count, 3);
+        assert_eq!(sample.sum_ms, 10 + 500 + 2500);
+    }
+
+    /// Parity: running the sparse-then-render pipeline (breaker) and
+    /// the cumulative-increment pipeline (HTTP) over the **same
+    /// observations against the same bucket edges** MUST yield
+    /// identical `le="edge"` counts. If they diverge, swapping one
+    /// strategy for the other would silently change dashboard values
+    /// — the whole point of keeping both is that they produce
+    /// identical Prometheus output.
+    #[test]
+    fn sparse_and_cumulative_strategies_produce_identical_output() {
+        let observations = [1u64, 10, 30, 30, 1, 50, 100];
+
+        // Sparse side (breaker pipeline):
+        // record into sparse storage, then cumulate at render.
+        let mut h: BreakerHistogram<{ BREAKER_ROUND_BUCKETS.len() }> = BreakerHistogram::default();
+        for v in observations {
+            observe_histogram(&mut h, &BREAKER_ROUND_BUCKETS, v);
+        }
+        let mut lines = Vec::new();
+        render_breaker_histogram(&mut lines, "parity", "parity", &h, &BREAKER_ROUND_BUCKETS);
+        let sparse_rendered: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| {
+                if l.starts_with("parity_bucket{le=\"") && !l.contains("+Inf") {
+                    l.rsplit(' ').next().unwrap().parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Cumulative side (HTTP pipeline, inlined with the same bucket
+        // edges so we can compare — AppMetrics::record_request uses
+        // HTTP_DURATION_BUCKETS_MS which are different widths).
+        let mut cumulative = [0u64; BREAKER_ROUND_BUCKETS.len()];
+        for v in observations {
+            for (idx, edge) in BREAKER_ROUND_BUCKETS.iter().enumerate() {
+                if v <= *edge {
+                    cumulative[idx] += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            sparse_rendered,
+            cumulative.to_vec(),
+            "sparse-then-render MUST equal cumulative-increment for the same input",
+        );
     }
 }

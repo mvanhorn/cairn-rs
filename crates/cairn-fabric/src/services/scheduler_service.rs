@@ -21,11 +21,23 @@
 //! loop against the `ControlPlaneBackend` trait directly) would
 //! revisit the exception — but that's a Phase E / F scope, not
 //! Phase D.
+//!
+//! # API surface (#507)
+//!
+//! The only public constructor is [`FabricSchedulerService::new`],
+//! which takes `&Arc<FabricRuntime>` — a cairn-owned type that hides
+//! the FF client, partition config, and capabilities behind its own
+//! boundary. The previously-public `from_parts(ferriskey::Client, _)`
+//! constructor has been deleted because it leaked `ferriskey::Client`
+//! into cairn's public API (an FF-side concrete type) with zero
+//! in-tree callers. The test-only
+//! [`FabricSchedulerService::from_parts_with_capabilities`] remains
+//! behind `#[cfg(test)]` — it is unreachable from dependent crates
+//! and therefore does not widen the public surface.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use flowfabric::core::partition::PartitionConfig;
 use flowfabric::core::types::{LaneId, WorkerId, WorkerInstanceId};
 use flowfabric::scheduler::claim::{ClaimGrant, Scheduler};
 
@@ -52,19 +64,14 @@ impl FabricSchedulerService {
         }
     }
 
-    pub fn from_parts(client: ferriskey::Client, partition_config: PartitionConfig) -> Self {
-        let scheduler = Scheduler::new(client, partition_config);
-        Self {
-            scheduler,
-            worker_capabilities: BTreeSet::new(),
-        }
-    }
-
-    /// Construct for tests with an explicit capability set.
+    /// Construct for tests with an explicit capability set. Test-only
+    /// (gated behind `#[cfg(test)]`) so `ferriskey::Client` never
+    /// appears in cairn's public API — see the module doc-comment
+    /// `API surface (#507)` section.
     #[cfg(test)]
     pub fn from_parts_with_capabilities(
         client: ferriskey::Client,
-        partition_config: PartitionConfig,
+        partition_config: flowfabric::core::partition::PartitionConfig,
         worker_capabilities: BTreeSet<String>,
     ) -> Self {
         let scheduler = Scheduler::new(client, partition_config);
@@ -124,6 +131,45 @@ impl FabricSchedulerService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #507 regression: `ferriskey::Client` MUST NOT leak into a
+    /// non-test-gated public fn on `FabricSchedulerService`. The audit
+    /// flagged the old `pub fn from_parts(ferriskey::Client, _)` as an
+    /// encapsulation leak — any future refactor that re-introduces that
+    /// shape (or adds another ferriskey-typed public constructor)
+    /// should be caught here.
+    ///
+    /// Reads the source file, removes all `#[cfg(test)]`-gated blocks
+    /// (the test-only `from_parts_with_capabilities` is permitted), and
+    /// asserts that `ferriskey::Client` does not appear in the
+    /// remaining public surface.
+    #[test]
+    fn public_api_does_not_expose_ferriskey_client() {
+        let src = include_str!("scheduler_service.rs");
+        // Strip every `#[cfg(test)]` item (one-arm cheap approximation:
+        // cut at the first `#[cfg(test)]` token — everything after that
+        // is test-only). Good enough because all #[cfg(test)] items in
+        // this file live in the trailing `tests` module + the one
+        // test-only constructor above it.
+        let public_surface = src.split("#[cfg(test)]").next().unwrap_or("");
+        // Module doc-comments mention `ferriskey::Client` to explain
+        // the API decision; strip the /// and //! comment lines before
+        // grepping so the doc doesn't produce a false positive.
+        let public_surface_no_docs: String = public_surface
+            .lines()
+            .filter(|l| {
+                let trimmed = l.trim_start();
+                !trimmed.starts_with("//!") && !trimmed.starts_with("///")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !public_surface_no_docs.contains("ferriskey::Client"),
+            "ferriskey::Client leaked into a non-test-gated public API on \
+             FabricSchedulerService — see issue #507. Wrap behind a cairn-owned \
+             type (e.g. FabricRuntime) or gate the entry point with #[cfg(test)].",
+        );
+    }
 
     #[test]
     fn priority_score_higher_priority_is_lower_score() {
@@ -200,13 +246,19 @@ mod tests {
     #[test]
     fn config_preserves_capability_set_verbatim() {
         use crate::config::FabricConfig;
+        use crate::test_support::default_test_backend;
         let mut caps = BTreeSet::new();
         caps.insert("gpu".to_owned());
         caps.insert("cuda-12".to_owned());
         caps.insert("linux-x86_64".to_owned());
 
         let config = FabricConfig {
-            backend: flowfabric::core::backend::BackendConfig::valkey("localhost", 6379),
+            // Route through the test-support helper instead of a hard-coded
+            // `BackendConfig::valkey(..)` literal. This test only exercises
+            // the `worker_capabilities` field; the backend variant is
+            // irrelevant. When PR-B feature-gates backends, the helper is
+            // the single switch point (see issue #508).
+            backend: default_test_backend(),
             lane_id: flowfabric::core::types::LaneId::new("test"),
             worker_id: flowfabric::core::types::WorkerId::new("w"),
             worker_instance_id: flowfabric::core::types::WorkerInstanceId::new("i"),
