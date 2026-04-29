@@ -690,10 +690,19 @@ async fn real_main() {
     let mut lib_state = Arc::new(match cairn_app::AppState::new(config.clone()).await {
         Ok(state) => state,
         Err(e) => {
-            // AppState::new returns the credential-key fatal error verbatim;
-            // print it on its own line so operators see exactly one message
-            // and exit non-zero.
-            eprintln!("{e}");
+            // #470: AppState::new returns the credential-key fatal error
+            // verbatim. Print it on its own line so operators see exactly
+            // one message and follow with a short checklist of the usual
+            // boot-time misconfigurations — DB, admin token, migrations.
+            // Exit non-zero so supervisors (systemd, docker) see the
+            // failure and restart/escalate per their own policy.
+            eprintln!("fatal: failed to initialise AppState: {e}");
+            eprintln!(
+                "hint: verify DATABASE_URL points at a reachable store, \
+                 CAIRN_ADMIN_TOKEN (or CAIRN_ADMIN_TOKEN_FILE) is set, and \
+                 all migrations applied cleanly (\"store: … migration\" \
+                 log lines above)"
+            );
             std::process::exit(1);
         }
     });
@@ -1044,11 +1053,11 @@ async fn real_main() {
     // The integration registry (`IntegrationRegistry`) is the canonical home for
     // all integrations. We register a `GitHubPlugin` there.
     //
-    // TODO(integration-migration): The legacy `state.github` (`GitHubIntegration`)
-    // is ALSO set here because the webhook/queue/scan handlers in lib.rs still
-    // access its concrete fields (credentials, installations, issue_queue, etc.)
-    // directly.  Once `Integration` trait exposes those fields (or we add
-    // `as_any()` for downcasting), migrate the handlers and remove `state.github`.
+    // The legacy `state.github` (`GitHubIntegration`) is ALSO set here because
+    // the webhook/queue/scan handlers in lib.rs still access its concrete
+    // fields directly. Canonical TODO(#557, integration-migration) lives on
+    // `AppState.github` in state.rs — once that lands, this duplicate
+    // registration block disappears.
     {
         let github_app_id = std::env::var("GITHUB_APP_ID").ok();
         let github_key_file = std::env::var("GITHUB_PRIVATE_KEY_FILE").ok();
@@ -1061,8 +1070,10 @@ async fn real_main() {
                 Ok(app_id) => match std::fs::read(&key_file) {
                     Ok(pem_bytes) => match cairn_github::AppCredentials::new(app_id, &pem_bytes) {
                         Ok(credentials) => {
-                            // Legacy shim — kept until handlers are migrated to the registry.
-                            // See TODO(integration-migration) above.
+                            // Legacy shim — kept until handlers are migrated to
+                            // the registry. See TODO(#557,
+                            // integration-migration) in state.rs for the
+                            // canonical tracking comment.
                             let github = cairn_app::GitHubIntegration {
                                 credentials: credentials.clone(),
                                 webhook_secret: webhook_secret.clone(),

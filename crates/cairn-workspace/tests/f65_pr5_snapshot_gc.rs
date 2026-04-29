@@ -155,7 +155,7 @@ async fn test_snapshot_created_on_termination_reflink_or_fallback() {
     std::fs::write(sandbox.upper.join("foo.txt"), b"hello world").expect("write payload file");
 
     let snapshot_id = svc
-        .terminate_for_session(&s.session_id, TerminationReason::Complete)
+        .terminate_for_session(&s.session_id, TerminationReason::CompleteRun)
         .await
         .expect("terminate_for_session");
 
@@ -232,7 +232,7 @@ async fn test_ext4_fallback_emits_degraded_event_once_across_resume() {
         .expect("provision 1");
     std::fs::write(sandbox.upper.join("payload.txt"), b"v1").expect("write v1");
     let _snap1 = svc
-        .terminate_for_session(&s.session_id, TerminationReason::Complete)
+        .terminate_for_session(&s.session_id, TerminationReason::CompleteRun)
         .await
         .expect("terminate 1");
 
@@ -253,7 +253,7 @@ async fn test_ext4_fallback_emits_degraded_event_once_across_resume() {
         .expect("provision 2");
     std::fs::write(sandbox2.upper.join("payload.txt"), b"v2").expect("write v2");
     let _snap2 = svc
-        .terminate_for_session(&s2.session_id, TerminationReason::Complete)
+        .terminate_for_session(&s2.session_id, TerminationReason::CompleteRun)
         .await
         .expect("terminate 2");
 

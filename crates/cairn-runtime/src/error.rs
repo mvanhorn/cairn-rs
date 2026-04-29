@@ -176,6 +176,21 @@ impl RuntimeError {
     }
 }
 
+/// Upstream FF tracker for the `terminal_write_deadlock` wedged state.
+///
+/// The URL lives as a `macro_rules!` literal (rather than a `const`)
+/// because the hint message body is built with `concat!`, and `concat!`
+/// only accepts literal-string inputs — not `const` references. When
+/// the FF tracker resolves or renumbers the issue, update the literal
+/// on the single line below and every grep hit (the hint body + any
+/// tests that assert the URL) picks up the new value automatically via
+/// the macro expansion. See issue #489.
+macro_rules! upstream_ff_terminal_write_deadlock_url {
+    () => {
+        "https://github.com/avifenesh/FlowFabric/issues/371"
+    };
+}
+
 /// Map a FF / cairn state-transition rejection code to an operator-
 /// actionable prose hint.
 ///
@@ -232,14 +247,18 @@ fn invalid_transition_hint(from: &str, to: &str, entity: &str) -> Option<&'stati
         // already exist on disk from the tool calls that ran before the
         // lease died) and points at the tracked FF upstream issue so
         // operators can correlate.
-        "terminal_write_deadlock" => Some(
+        // #489: the URL is the `upstream_ff_terminal_write_deadlock_url!()`
+        // macro — one-line change when FF resolves the tracker. `concat!`
+        // keeps the return type `&'static str` unchanged.
+        "terminal_write_deadlock" => Some(concat!(
             "the orchestrator produced artifacts successfully but the \
              fabric refuses both the terminal write and the lease \
              re-claim. Files written by earlier tool calls may still \
              be visible on the operator's filesystem, but the run \
              cannot be closed without an upstream fabric fix. Tracked \
-             at https://github.com/avifenesh/FlowFabric/issues/371",
-        ),
+             at ",
+            upstream_ff_terminal_write_deadlock_url!(),
+        )),
         "lease_revoked" => Some(
             "the execution's lease was revoked by an operator or \
              scanner before this request completed. Check the run's \
@@ -498,9 +517,13 @@ mod tests {
                 msg.contains("artifacts") || msg.contains("filesystem"),
                 "F62: missing artifact-preservation hint for to={to}: {msg}"
             );
+            // #489: pull the URL from the same source-of-truth macro the
+            // production code uses, so renumbering the FF tracker flows
+            // through both sites in one edit.
+            let expected_url = upstream_ff_terminal_write_deadlock_url!();
             assert!(
-                msg.contains("FlowFabric/issues/371"),
-                "F62: missing FF upstream issue link for to={to}: {msg}"
+                msg.contains(expected_url),
+                "F62: missing FF upstream issue link ({expected_url}) for to={to}: {msg}"
             );
             assert!(
                 msg.contains("code=terminal_write_deadlock"),

@@ -1887,6 +1887,9 @@ fn all_variants() -> Vec<RuntimeEvent> {
             workspace_id: WorkspaceId::new("w_exh"),
             session_id: sess(),
             at_ms: ts,
+            bytes: 0,
+            reflink_used: false,
+            parent_snapshot_id: None,
         }),
         RuntimeEvent::WorkspaceSnapshotReaped(cairn_domain::events::WorkspaceSnapshotReaped {
             project: p(),

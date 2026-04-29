@@ -234,11 +234,11 @@ mod f65_sqlite {
         seed_session(&log, session_id).await;
         seed_session(&mem, session_id).await;
 
-        // Three-generation snapshot chain. Parent linkage is carried via
-        // the `parent_snapshot_id` column — the current `WorkspaceSnapshotCreated`
-        // event does NOT include a parent pointer (that's PR-5 wiring), so
-        // we backfill with direct UPDATEs to exercise the lineage reader.
-        for (sid, _parent) in [
+        // Three-generation snapshot chain. #482 now carries
+        // `parent_snapshot_id` on the `WorkspaceSnapshotCreated` event
+        // itself, so the projection row is fully populated after the
+        // event-log append — no post-insert UPDATEs needed.
+        for (sid, parent) in [
             ("snap_root", None::<&str>),
             ("snap_mid", Some("snap_root")),
             ("snap_leaf", Some("snap_mid")),
@@ -250,35 +250,19 @@ mod f65_sqlite {
                     workspace_id: WorkspaceId::new("ws_live"),
                     session_id: SessionId::new(session_id),
                     at_ms: 1_000,
+                    bytes: 0,
+                    reflink_used: false,
+                    parent_snapshot_id: parent.map(WorkspaceSnapshotId::new),
                 },
             ));
             log.append(std::slice::from_ref(&evt)).await.unwrap();
             mem.append(std::slice::from_ref(&evt)).await.unwrap();
         }
 
-        // Backfill parent pointers on both backends. This mirrors the PR-5
-        // service-layer fill; for PR-2 we only need to prove the column is
-        // there and the lineage walker is correct.
-        sqlx::query(
-            "UPDATE workspace_snapshots SET parent_snapshot_id = 'snap_root' WHERE snapshot_id = 'snap_mid'",
-        )
-        .execute(adapter.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE workspace_snapshots SET parent_snapshot_id = 'snap_mid' WHERE snapshot_id = 'snap_leaf'",
-        )
-        .execute(adapter.pool())
-        .await
-        .unwrap();
-
-        // Lineage walk validation. The SQL path has been backfilled
-        // above; for the in-memory path we do not have a `parent_snapshot_id`
-        // channel in `WorkspaceSnapshotCreated` (it lands in PR-5), so
-        // the walker is only exercised against SQLite in this test. The
-        // `lineage()` impl on `InMemoryStore` has its own unit-level
-        // assurance via the `WorkspaceSnapshotReadModel` trait contract
-        // (see `list_by_session` below which does run cross-backend).
+        // Lineage walk validation. The parent pointer now rides on the
+        // event itself (#482), so both sqlite and in-memory backends
+        // have the column populated at insert time — the walker runs
+        // cross-backend.
 
         let sqlite_lineage = WorkspaceSnapshotReadModel::lineage(
             &adapter,
@@ -289,6 +273,24 @@ mod f65_sqlite {
         .unwrap();
         assert_eq!(
             sqlite_lineage
+                .iter()
+                .map(|r| r.snapshot_id.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["snap_leaf", "snap_mid", "snap_root"],
+        );
+
+        // #482: the in-memory walker now sees the same parent chain —
+        // before this landing the InMemoryStore row stayed at
+        // `parent_snapshot_id: None` because the event didn't carry it.
+        let mem_lineage = WorkspaceSnapshotReadModel::lineage(
+            &mem,
+            &project(),
+            &WorkspaceSnapshotId::new("snap_leaf"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mem_lineage
                 .iter()
                 .map(|r| r.snapshot_id.as_str().to_owned())
                 .collect::<Vec<_>>(),
@@ -333,6 +335,84 @@ mod f65_sqlite {
         assert!(mem_hit.is_some());
     }
 
+    /// #482: WorkspaceSnapshotCreated must carry bytes / reflink_used /
+    /// parent_snapshot_id so a replay from an empty projection store
+    /// rebuilds the row with the SAME metadata the live writer produced.
+    /// Pre-#482, the projection inserted these columns at 0 / FALSE /
+    /// NULL and waited for an out-of-band stamp_metadata call that
+    /// never fires on replay.
+    #[tokio::test]
+    async fn test_workspace_snapshot_created_carries_metadata_across_backends() {
+        let (adapter, log) = fresh_sqlite().await;
+        let mem = InMemoryStore::new();
+        seed_session(&log, "sess_meta").await;
+        seed_session(&mem, "sess_meta").await;
+
+        let parent = WorkspaceSnapshotId::new("snap_parent");
+        // Seed the parent first so the lineage pointer resolves.
+        let parent_evt = env(RuntimeEvent::WorkspaceSnapshotCreated(
+            WorkspaceSnapshotCreated {
+                project: project(),
+                snapshot_id: parent.clone(),
+                workspace_id: WorkspaceId::new("ws_meta"),
+                session_id: SessionId::new("sess_meta"),
+                at_ms: 100,
+                bytes: 0,
+                reflink_used: false,
+                parent_snapshot_id: None,
+            },
+        ));
+        log.append(std::slice::from_ref(&parent_evt)).await.unwrap();
+        mem.append(std::slice::from_ref(&parent_evt)).await.unwrap();
+
+        // The payload carries concrete metadata — pre-#482, these would
+        // have been dropped by the projection and zeros landed in the
+        // row regardless of what the writer observed.
+        let child_snap = WorkspaceSnapshotId::new("snap_child");
+        let child_evt = env(RuntimeEvent::WorkspaceSnapshotCreated(
+            WorkspaceSnapshotCreated {
+                project: project(),
+                snapshot_id: child_snap.clone(),
+                workspace_id: WorkspaceId::new("ws_meta"),
+                session_id: SessionId::new("sess_meta"),
+                at_ms: 200,
+                bytes: 42_000,
+                reflink_used: true,
+                parent_snapshot_id: Some(parent.clone()),
+            },
+        ));
+        log.append(std::slice::from_ref(&child_evt)).await.unwrap();
+        mem.append(std::slice::from_ref(&child_evt)).await.unwrap();
+
+        for (label, rec) in [
+            (
+                "sqlite",
+                WorkspaceSnapshotReadModel::get(&adapter, &project(), &child_snap)
+                    .await
+                    .unwrap()
+                    .expect("sqlite row"),
+            ),
+            (
+                "in-memory",
+                WorkspaceSnapshotReadModel::get(&mem, &project(), &child_snap)
+                    .await
+                    .unwrap()
+                    .expect("in-memory row"),
+            ),
+        ] {
+            assert_eq!(rec.bytes, 42_000, "{label}: bytes must round-trip on event");
+            assert!(
+                rec.reflink_used,
+                "{label}: reflink_used must round-trip on event"
+            );
+            assert_eq!(
+                rec.parent_snapshot_id.as_ref().map(|p| p.as_str()),
+                Some(parent.as_str()),
+                "{label}: parent_snapshot_id must round-trip on event"
+            );
+        }
+    }
+
     // ── snapshot reaping marks reaped_at ───────────────────────────────────
 
     #[tokio::test]
@@ -349,6 +429,9 @@ mod f65_sqlite {
                 workspace_id: WorkspaceId::new("ws_live"),
                 session_id: SessionId::new("sess_reap"),
                 at_ms: 500,
+                bytes: 0,
+                reflink_used: false,
+                parent_snapshot_id: None,
             },
         ));
         log.append(std::slice::from_ref(&created)).await.unwrap();
@@ -425,6 +508,9 @@ mod f65_sqlite {
                 workspace_id: WorkspaceId::new("ws_final"),
                 session_id: SessionId::new(session_id),
                 at_ms: 750,
+                bytes: 0,
+                reflink_used: false,
+                parent_snapshot_id: None,
             },
         ));
         for evt in [&ck_evt, &snap_evt] {

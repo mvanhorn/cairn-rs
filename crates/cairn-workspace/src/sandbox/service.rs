@@ -1104,13 +1104,19 @@ impl SandboxService {
         }
 
         // Emit WorkspaceSnapshotCreated. cairn-app translates this to the
-        // domain event + projection insert.
+        // domain event + projection insert. #482: carry bytes /
+        // reflink_used / parent_snapshot_id on the event itself so a
+        // fresh log replay rebuilds the projection row with the same
+        // metadata the live writer produced.
         self.f65_event_sink.publish(
             crate::sandbox::f65::F65SandboxEvent::WorkspaceSnapshotCreated {
                 project: session_sandbox.project.clone(),
                 snapshot_id: snapshot_id.clone(),
                 workspace_id: session_sandbox.workspace_id.clone(),
                 session_id: session_id.clone(),
+                bytes: outcome.bytes_copied,
+                reflink_used: outcome.reflink_used,
+                parent_snapshot_id: session_sandbox.base_snapshot_id.clone(),
             },
         );
 
@@ -1661,9 +1667,9 @@ impl SandboxService {
         // (false negatives, no false positives) — the exact opposite of
         // the failure mode the bug report flagged.
         //
-        // TODO(RFC 016 persistence): when the allowlist gains durable
-        // storage, remove the "non-empty project" gate and rely on the
-        // allowlist's own authoritative semantics.
+        // TODO(#556, RFC 016 persistence): when the allowlist gains
+        // durable storage, remove the "non-empty project" gate and
+        // rely on the allowlist's own authoritative semantics.
         if let Some(allowlist) = self.allowlist.clone() {
             let entries = self.list_registry_entries()?;
             // Cache per-project "is the allowlist authoritative?" answers

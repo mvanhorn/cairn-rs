@@ -2090,6 +2090,9 @@ mod tests {
             workspace_id: ws.clone(),
             session_id: session_id.clone(),
             at_ms: 0,
+            bytes: 0,
+            reflink_used: false,
+            parent_snapshot_id: None,
         });
         assert_eq!(
             event_message(&snap_created),
@@ -2259,6 +2262,9 @@ mod tests {
                     workspace_id: WorkspaceId::new("w"),
                     session_id: session_id.clone(),
                     at_ms: 0,
+                    bytes: 0,
+                    reflink_used: false,
+                    parent_snapshot_id: None,
                 }),
                 "workspace_snapshot_created",
             ),

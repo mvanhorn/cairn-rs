@@ -58,6 +58,9 @@ pub const KEY_ORCHESTRATOR_TOKEN_CAP: &str = "orchestrator_token_cap";
 pub const KEY_ORCHESTRATOR_NO_TOOL_USE_STREAK: &str = "orchestrator_no_tool_use_streak";
 /// DefaultsService key for the default orchestrator WallClock-cap breaker (ms).
 pub const KEY_ORCHESTRATOR_WALL_CLOCK_MS: &str = "orchestrator_wall_clock_ms";
+/// DefaultsService key for the default orchestrator warning-threshold ratio
+/// in basis points (10_000 = 100 %). See issue #479.
+pub const KEY_ORCHESTRATOR_WARN_RATIO_BPS: &str = "orchestrator_warn_ratio_bps";
 
 /// Hardcoded default orchestrator Round cap — matches `BreakerConfig::default()`.
 pub const DEFAULT_ORCHESTRATOR_ROUND_CAP: u32 = 30;
@@ -67,6 +70,10 @@ pub const DEFAULT_ORCHESTRATOR_TOKEN_CAP: u64 = 200_000;
 pub const DEFAULT_ORCHESTRATOR_NO_TOOL_USE_STREAK: u32 = 3;
 /// Hardcoded default orchestrator WallClock cap (ms) — matches `BreakerConfig::default()`.
 pub const DEFAULT_ORCHESTRATOR_WALL_CLOCK_MS: u64 = 15 * 60 * 1_000;
+/// Hardcoded default orchestrator warning-threshold ratio, in basis points
+/// (10_000 = 100 %). `8_000` = 80 %, matching the historical const in
+/// `cairn-orchestrator::breakers` before #479 promoted it to a runtime-tunable.
+pub const DEFAULT_ORCHESTRATOR_WARN_RATIO_BPS: u32 = 8_000;
 
 // ── RuntimeConfig ─────────────────────────────────────────────────────────────
 
@@ -367,6 +374,26 @@ impl RuntimeConfig {
             KEY_ORCHESTRATOR_WALL_CLOCK_MS,
             "CAIRN_ORCHESTRATOR_WALL_CLOCK_MS",
             DEFAULT_ORCHESTRATOR_WALL_CLOCK_MS,
+        )
+        .await
+    }
+
+    /// Default orchestrator warning-threshold ratio in basis points
+    /// (10_000 = 100 %). `8_000` means the 80 %
+    /// `BudgetThresholdCrossed` warning fires when a breaker's measured
+    /// value reaches 80 % of its cap. Tunable so operators can run
+    /// quieter tracks (e.g. `9_000` for 90 %) or disable the warning
+    /// entirely (`10_000` — equal to the trip threshold). Per-run
+    /// overrides land via `breaker_overrides.warn_ratio_bps` on the
+    /// orchestrate request body.
+    ///
+    /// Key: `orchestrator_warn_ratio_bps` · Env:
+    /// `CAIRN_ORCHESTRATOR_WARN_RATIO_BPS` · Default: `8_000` (80 %).
+    pub async fn orchestrator_warn_ratio_bps(&self) -> u32 {
+        self.get_u32(
+            KEY_ORCHESTRATOR_WARN_RATIO_BPS,
+            "CAIRN_ORCHESTRATOR_WARN_RATIO_BPS",
+            DEFAULT_ORCHESTRATOR_WARN_RATIO_BPS,
         )
         .await
     }

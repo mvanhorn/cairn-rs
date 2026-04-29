@@ -30,7 +30,8 @@ use uuid::Uuid;
 
 use crate::errors::{
     api_error_with_details, bad_request_response, now_ms, operator_event_envelope, parse_run_state,
-    runtime_error_response, store_error_response, validation_error_response, AppApiError,
+    run_not_found_response, runtime_error_response, store_error_response,
+    validation_error_response, AppApiError,
 };
 use crate::extractors::{HasProjectScope, ProjectJson, ProjectScope, TenantCostQuery, TenantScope};
 use crate::helpers::{
@@ -510,6 +511,12 @@ pub(crate) struct BreakerOverrides {
     pub(crate) no_tool_use_streak: Option<u32>,
     #[serde(default)]
     pub(crate) wall_clock_ms: Option<u64>,
+    /// #479: per-run override for the warning-threshold ratio. Basis
+    /// points, 10_000 = 100 %. Tighten-only — the override MUST be less
+    /// than or equal to the configured default so callers can only make
+    /// warnings fire earlier, never later (lower bps = earlier warning).
+    #[serde(default)]
+    pub(crate) warn_ratio_bps: Option<u32>,
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -606,9 +613,7 @@ pub(crate) async fn get_run_handler(
                 Err(err) => store_error_response(err),
             }
         }
-        Ok(None) => {
-            AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found").into_response()
-        }
+        Ok(None) => run_not_found_response(),
         Err(response) => response,
     }
 }
@@ -827,18 +832,14 @@ pub(crate) async fn get_run_telemetry_handler(
 
     let run = match RunReadModel::get(store, &run_id).await {
         Ok(Some(r)) => r,
-        Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response()
-        }
+        Ok(None) => return run_not_found_response(),
         Err(err) => return store_error_response(err),
     };
 
     // Tenant scoping. Admin service account + System principals bypass —
     // operator tenants are restricted to their own runs.
     if !tenant_scope.is_admin && run.project.tenant_id != *tenant_scope.tenant_id() {
-        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-            .into_response();
+        return run_not_found_response();
     }
 
     // Stuck-flag derivation (reuse the stuck-threshold default).
@@ -1101,8 +1102,7 @@ pub(crate) async fn diagnose_run_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1125,8 +1125,7 @@ pub(crate) async fn get_run_audit_trail_handler(
     match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     }
@@ -1202,8 +1201,7 @@ pub(crate) async fn list_run_events_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1267,8 +1265,7 @@ pub(crate) async fn replay_run_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1302,8 +1299,7 @@ pub(crate) async fn replay_run_to_checkpoint_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1365,8 +1361,7 @@ pub(crate) async fn list_run_interventions_handler(
     match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     }
@@ -1404,8 +1399,7 @@ pub(crate) async fn intervene_run_handler(
             run
         }
         Ok(Some(_)) | Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(err) => return runtime_error_response(err),
     };
@@ -1635,8 +1629,7 @@ pub(crate) async fn cancel_run_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1692,8 +1685,7 @@ pub(crate) async fn claim_run_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1720,8 +1712,7 @@ pub(crate) async fn pause_run_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1760,8 +1751,7 @@ pub(crate) async fn resume_run_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(run)) => run,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1815,9 +1805,7 @@ pub(crate) async fn get_run_cost_handler(
                 Err(err) => store_error_response(err),
             }
         }
-        Ok(None) => {
-            AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found").into_response()
-        }
+        Ok(None) => run_not_found_response(),
         Err(response) => response,
     }
 }
@@ -1836,8 +1824,7 @@ pub(crate) async fn set_run_cost_alert_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1906,8 +1893,7 @@ pub(crate) async fn set_run_sla_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -1939,8 +1925,7 @@ pub(crate) async fn get_run_sla_handler(
     match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     }
@@ -2108,8 +2093,7 @@ pub(crate) async fn spawn_subagent_run_handler(
             run
         }
         Ok(Some(_)) | Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(err) => return runtime_error_response(err),
     };
@@ -2179,8 +2163,7 @@ pub(crate) async fn list_child_runs_handler(
         match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &parent_run_id).await {
             Ok(Some(run)) => run,
             Ok(None) => {
-                return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                    .into_response();
+                return run_not_found_response();
             }
             Err(response) => return response,
         };
@@ -2265,6 +2248,23 @@ fn resolve_breaker_overrides(
             ));
         }
         out.wall_clock_ms = v;
+    }
+    if let Some(v) = over.warn_ratio_bps {
+        // #479: tighten-only is "lower bps", which fires the warning
+        // earlier — the exact opposite of round_cap/token_cap (which
+        // tighten downward for the same safety reason: smaller cap =
+        // trips sooner). A request that RAISES the ratio (warning fires
+        // closer to the trip line) loosens the safety posture and is
+        // rejected.
+        if v > default_cfg.warn_ratio_bps {
+            return Err(format!(
+                "warn_ratio_bps override {v} exceeds configured default {}; \
+                 breaker overrides must tighten (lower) the warning threshold, \
+                 never raise it",
+                default_cfg.warn_ratio_bps
+            ));
+        }
+        out.warn_ratio_bps = v;
     }
     Ok(out)
 }
@@ -2508,8 +2508,7 @@ async fn orchestrate_run_handler_inner(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -3305,6 +3304,16 @@ async fn orchestrate_run_handler_inner(
             .runtime_config
             .orchestrator_wall_clock_ms()
             .await,
+        // #479: the warning ratio defaults to 80 % via RuntimeConfig (and
+        // env/CAIRN_ORCHESTRATOR_WARN_RATIO_BPS). Per-run override lands
+        // via `breaker_overrides.warn_ratio_bps` — `resolve_breaker_overrides`
+        // enforces tighten-only on this axis (lower bps = warning fires
+        // earlier, which is strictly safer).
+        warn_ratio_bps: state
+            .runtime
+            .runtime_config
+            .orchestrator_warn_ratio_bps()
+            .await,
     };
     let breakers =
         match resolve_breaker_overrides(&default_breakers, body.breaker_overrides.as_ref()) {
@@ -4059,10 +4068,7 @@ pub(crate) async fn recover_run_handler(
     let run_id = RunId::new(id);
     match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(_)) => {}
-        Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response()
-        }
+        Ok(None) => return run_not_found_response(),
         Err(response) => return response,
     }
 
@@ -4164,8 +4170,7 @@ pub(crate) async fn approve_plan_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -4241,8 +4246,7 @@ pub(crate) async fn reject_plan_handler(
     let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                .into_response();
+            return run_not_found_response();
         }
         Err(response) => return response,
     };
@@ -4317,8 +4321,7 @@ pub(crate) async fn revise_plan_handler(
         match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &original_run_id).await {
             Ok(Some(r)) => r,
             Ok(None) => {
-                return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                    .into_response();
+                return run_not_found_response();
             }
             Err(response) => return response,
         };

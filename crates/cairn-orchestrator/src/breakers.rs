@@ -30,9 +30,12 @@ use cairn_domain::session_orchestration::{BreakerKind, CircuitBreakerTrip};
 
 use crate::context::BreakerConfig;
 
-/// Basis-point threshold that triggers the once-per-run 80 % warning.
-/// 8_000 / 10_000 = 0.80.
-const WARN_RATIO_BPS: u32 = 8_000;
+// #479: the basis-point threshold that triggers the once-per-run
+// `BudgetThresholdCrossed` warning is now configurable per run via
+// `BreakerConfig.warn_ratio_bps`. The historical hardcoded `8_000`
+// (80 %) is the default on `BreakerConfig::default()` — tests still
+// exercise that value, but operators can tune it through the defaults
+// service or per-run overrides.
 
 /// Decision returned by `BreakerState::after_decide` /
 /// `BreakerState::check_pre_gather`.
@@ -76,9 +79,12 @@ pub(crate) struct BreakerState {
     /// Consecutive DECIDE rounds with zero tool-use proposals.
     no_tool_use_streak: u32,
     /// Once-per-run latches; flipped `true` when the corresponding
-    /// breaker's 80 % warning is emitted to prevent re-fire. Index
-    /// matches `BreakerKind as usize` via `kind_index`.
-    warn_fired: [bool; 4],
+    /// breaker's `BreakerConfig.warn_ratio_bps` warning is emitted to
+    /// prevent re-fire. Index matches `BreakerKind as usize` via
+    /// `kind_index`. Sized off `BreakerKind::COUNT` — now
+    /// `strum::EnumCount`-derived — so adding a variant to the enum
+    /// body mechanically grows this array at compile time (#467).
+    warn_fired: [bool; BreakerKind::COUNT],
 }
 
 impl BreakerState {
@@ -89,7 +95,7 @@ impl BreakerState {
             started_at: Instant::now(),
             tokens_used: 0,
             no_tool_use_streak: 0,
-            warn_fired: [false; 4],
+            warn_fired: [false; BreakerKind::COUNT],
         }
     }
 
@@ -244,7 +250,7 @@ impl BreakerState {
         // this on PR #348; the fix routes through the already-safe
         // shared helper instead of hand-rolling the arithmetic twice.
         let ratio = ratio_bps(measured, limit);
-        if ratio < WARN_RATIO_BPS {
+        if ratio < self.cfg.warn_ratio_bps {
             return None;
         }
         self.warn_fired[idx] = true;
@@ -295,6 +301,7 @@ mod tests {
             token_cap: 1_000,
             no_tool_use_streak: 3,
             wall_clock_ms: 60_000,
+            warn_ratio_bps: 8_000,
         }
     }
 
@@ -436,6 +443,7 @@ mod tests {
             token_cap: 1_000,
             no_tool_use_streak: 3,
             wall_clock_ms: 0, // Would trip instantly — but round must win.
+            warn_ratio_bps: 8_000,
         });
         match s.check_pre_gather(2) {
             BreakerCheck::Tripped(t) => assert_eq!(t.which, BreakerKind::Round),
@@ -457,6 +465,7 @@ mod tests {
             token_cap: 0,
             no_tool_use_streak: 3,
             wall_clock_ms: 60_000,
+            warn_ratio_bps: 8_000,
         });
         // First call trips immediately on the trip path (measured=0 >= limit=0).
         match s.after_decide(0, 0, 0, 1) {
@@ -480,6 +489,46 @@ mod tests {
         assert_eq!(ratio_bps(42, 0), 0);
     }
 
+    /// #479: the warning threshold is now a per-run tunable. Verify the
+    /// threshold is read from `BreakerConfig.warn_ratio_bps` rather than
+    /// a hardcoded const — a tighter 50 % setting fires the warning at
+    /// half the cap; a permissive 10_000 (100 %) suppresses it entirely.
+    #[test]
+    fn warn_ratio_bps_is_per_run_tunable() {
+        // Tighter: fire warning at 50 %. cap=10, so iteration=5 crosses.
+        let tight = BreakerConfig {
+            round_cap: 10,
+            token_cap: 1_000,
+            no_tool_use_streak: 3,
+            wall_clock_ms: 60_000,
+            warn_ratio_bps: 5_000, // 50 %
+        };
+        let mut s = BreakerState::new(tight);
+        match s.check_pre_gather(5) {
+            BreakerCheck::Warning {
+                which, ratio_bps, ..
+            } => {
+                assert_eq!(which, BreakerKind::Round);
+                assert_eq!(ratio_bps, 5_000);
+            }
+            other => panic!("expected Warning at 50% tight threshold, got {other:?}"),
+        }
+
+        // Permissive: never fire before trip. cap=5, warn threshold
+        // 10_000 bps = 100 %. At iteration=4 (80% of 5) no warning fires
+        // — contrast with the 8_000 default where the same iteration
+        // DOES fire (`round_warning_fires_once_at_80_percent` above).
+        let permissive = BreakerConfig {
+            round_cap: 5,
+            token_cap: 1_000,
+            no_tool_use_streak: 3,
+            wall_clock_ms: 60_000,
+            warn_ratio_bps: 10_000, // disabled
+        };
+        let mut s = BreakerState::new(permissive);
+        assert_eq!(s.check_pre_gather(4), BreakerCheck::Continue);
+    }
+
     #[test]
     fn kind_index_is_stable() {
         // Documents the warn_fired array layout so adding BreakerKind
@@ -488,5 +537,33 @@ mod tests {
         assert_eq!(kind_index(BreakerKind::Tokens), 1);
         assert_eq!(kind_index(BreakerKind::NoToolUseConsecutive), 2);
         assert_eq!(kind_index(BreakerKind::WallClock), 3);
+    }
+
+    /// #467: the warn_fired array is sized off `BreakerKind::COUNT`.
+    /// This test locks in the invariant that `kind_index` produces
+    /// indices strictly inside `[0, BreakerKind::COUNT)` for every
+    /// variant — adding a new variant without growing the array or
+    /// extending `kind_index` is caught here (the match in
+    /// `kind_index` also forces a compile error, but this test adds
+    /// a runtime safety net).
+    #[test]
+    fn kind_index_in_range_for_every_variant() {
+        let mut seen = 0usize;
+        for kind in BreakerKind::all() {
+            let idx = kind_index(kind);
+            assert!(
+                idx < BreakerKind::COUNT,
+                "kind_index({kind:?}) = {idx} >= BreakerKind::COUNT ({}); \
+                 adding a variant requires growing warn_fired + kind_index",
+                BreakerKind::COUNT
+            );
+            seen += 1;
+        }
+        // The `strum::EnumIter`-derived iterator must yield exactly
+        // COUNT variants — if someone adds a variant without growing
+        // the `kind_index` match (which is exhaustive, so it compile-
+        // errors first) this extra check catches any case where
+        // EnumIter and EnumCount drift from each other.
+        assert_eq!(seen, BreakerKind::COUNT);
     }
 }

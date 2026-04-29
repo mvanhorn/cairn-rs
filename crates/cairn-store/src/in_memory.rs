@@ -2315,7 +2315,10 @@ impl InMemoryStore {
                 // SQL backends use `ON CONFLICT (snapshot_id) DO NOTHING`,
                 // so a replayed event must not overwrite the existing
                 // row (or its `created_at`). Use `entry().or_insert_with`
-                // for the same create-only semantics.
+                // for the same create-only semantics. #482: bytes /
+                // reflink_used / parent_snapshot_id land on the event so
+                // the in-memory projection rebuilds identically to
+                // pg/sqlite on replay.
                 state
                     .workspace_snapshots
                     .entry(e.snapshot_id.as_str().to_owned())
@@ -2324,10 +2327,10 @@ impl InMemoryStore {
                         project: e.project.clone(),
                         session_id: e.session_id.clone(),
                         workspace_id: e.workspace_id.clone(),
-                        parent_snapshot_id: None,
+                        parent_snapshot_id: e.parent_snapshot_id.clone(),
                         snapshot_path: String::new(),
-                        bytes: 0,
-                        reflink_used: false,
+                        bytes: e.bytes,
+                        reflink_used: e.reflink_used,
                         created_at: e.at_ms,
                         reaped_at: None,
                     });

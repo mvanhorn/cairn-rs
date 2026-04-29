@@ -177,6 +177,15 @@ impl CreateProviderBindingRequest {
     }
 }
 
+/// Wire format for a single rule inside a `POST /v1/providers/route-policies`
+/// create request. Four fields (`preferred_model_ids`, `fallback_model_ids`,
+/// `max_cost_micros`, `require_provider_ids`) are accepted and deserialised
+/// to keep the request schema forward-compatible with the richer policy
+/// shape the routing engine will consume, but the current `From` impl
+/// below only threads `rule_id`, `policy_id`, `priority`, `description`,
+/// `capability` into `RoutePolicyRule`. The remaining fields are retained
+/// on the wire (operators can send them today without getting a 400) and
+/// will be wired in when RFC-013 lands those routing axes — see #487.
 #[derive(Clone, Debug, serde::Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct CreateRoutePolicyRuleRequest {
@@ -1000,34 +1009,5 @@ pub(crate) async fn evaluate_guardrail_policy_handler(
         Ok(decision) => (StatusCode::OK, Json(decision)).into_response(),
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
             .into_response(),
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) async fn check_provider_health_handler(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let _ = state.runtime.provider_health.run_due_health_checks().await;
-
-    let tenant_id = TenantId::new(DEFAULT_TENANT_ID);
-    match state
-        .runtime
-        .provider_health
-        .list(&tenant_id, 1000, 0)
-        .await
-    {
-        Ok(records) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "items":    records,
-                "has_more": false,
-                "checked_at_ms": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-            })),
-        )
-            .into_response(),
-        Err(err) => runtime_error_response(err),
     }
 }

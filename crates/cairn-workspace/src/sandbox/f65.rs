@@ -43,22 +43,21 @@ pub enum NetworkPolicy {
     Isolated,
 }
 
-/// Per-session termination reason passed to [`super::service::SandboxService::terminate_for_session`].
+/// Per-session termination reason passed to
+/// [`super::service::SandboxService::terminate_for_session`].
 ///
-/// Mirrors the shape the orchestrator will eventually serialize into the
-/// `SessionOutcomeEmitted` event body (PR-5). PR-4 only uses this to decide
-/// whether to preserve the upper dir on failure (for post-mortem) or reap.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TerminationReason {
-    /// Session ran to completion without tripping a breaker.
-    Complete,
-    /// Session terminated due to a circuit-breaker trip (PR-3 feature).
-    BreakerTripped { which: String },
-    /// Session was cancelled by the operator.
-    OperatorCancel,
-    /// Session crashed — agent process died.
-    Crashed { detail: String },
-}
+/// #468: prior to this landing, the workspace crate shadowed the canonical
+/// `cairn_domain::session_orchestration::TerminationReason` with its own
+/// 4-variant enum — consumers that imported both crates had to alias one,
+/// and the workspace variant `BreakerTripped { which: String }` was a
+/// stringly-typed cast of the domain `BreakerKind` enum. The canonical
+/// type is now re-exported here so the workspace terminate path and the
+/// orchestrator event log share a single shape. Callers construct
+/// variants directly (e.g. `TerminationReason::CompleteRun` or
+/// `TerminationReason::OperatorCancel`) — the provisioning sites are
+/// short enough that a thin wrapper function layer added no real
+/// clarity.
+pub use cairn_domain::TerminationReason;
 
 /// Returned to the orchestrator when a session sandbox has been provisioned.
 ///
@@ -131,6 +130,15 @@ pub enum F65SandboxEvent {
         snapshot_id: WorkspaceSnapshotId,
         workspace_id: WorkspaceId,
         session_id: SessionId,
+        /// #482: carried on the event so the projection row rebuilds
+        /// with the same metadata the live writer produced. Before
+        /// this landing, the writer stamped `bytes/reflink_used/
+        /// parent_snapshot_id` via an out-of-band call that doesn't
+        /// fire during replay — leaving replayed rows permanently at
+        /// `0` / `FALSE` / `NULL`.
+        bytes: u64,
+        reflink_used: bool,
+        parent_snapshot_id: Option<WorkspaceSnapshotId>,
     },
     /// F65 PR-5: a snapshot has been reaped either by the GC sweeper
     /// (`reason = "ttl_expired"`) or by the admin DELETE endpoint

@@ -1421,13 +1421,21 @@ impl SqliteSyncProjection {
                         e.at_ms
                     ))
                 })?;
+                let bytes_i64 = i64::try_from(e.bytes).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "WorkspaceSnapshotCreated.bytes {} exceeds i64::MAX",
+                        e.bytes
+                    ))
+                })?;
+                // #482: carry bytes / reflink_used / parent_snapshot_id
+                // from the event so replay rebuilds the full row.
                 sqlx::query(
                     "INSERT INTO workspace_snapshots (
                          snapshot_id, tenant_id, workspace_scope, project_id,
                          session_id, workspace_id, parent_snapshot_id,
                          snapshot_path, bytes, reflink_used, created_at
                      )
-                     VALUES (?, ?, ?, ?, ?, ?, NULL, '', 0, 0, ?)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)
                      ON CONFLICT (snapshot_id) DO NOTHING",
                 )
                 .bind(e.snapshot_id.as_str())
@@ -1436,6 +1444,9 @@ impl SqliteSyncProjection {
                 .bind(e.project.project_id.as_str())
                 .bind(e.session_id.as_str())
                 .bind(e.workspace_id.as_str())
+                .bind(e.parent_snapshot_id.as_ref().map(|p| p.as_str()))
+                .bind(bytes_i64)
+                .bind(if e.reflink_used { 1_i64 } else { 0_i64 })
                 .bind(at_ms)
                 .execute(&mut **tx)
                 .await

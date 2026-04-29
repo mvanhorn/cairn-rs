@@ -292,10 +292,15 @@ pub struct AppState {
     /// fields directly (credentials, installations, issue_queue, etc.) and the
     /// `Integration` trait does not yet expose them.
     ///
-    /// TODO(integration-migration): add `as_any()` to the `Integration` trait (or
-    /// surface the needed fields through trait methods), migrate the handlers to
-    /// look up GitHub via `state.integrations.get("github")`, then delete this
-    /// field and the `GitHubIntegration` struct.
+    /// TODO(#557, integration-migration): add `as_any()` to the
+    /// `Integration` trait (or surface the needed fields through trait
+    /// methods), migrate the handlers to look up GitHub via
+    /// `state.integrations.get("github")`, then delete this field and
+    /// the `GitHubIntegration` struct. Tracking issue lists the three
+    /// candidate migration strategies; pick one and land it end-to-end
+    /// (the duplicated registration in `main.rs` disappears with this
+    /// field). This is the **canonical** location of the TODO — the two
+    /// references in `main.rs` cite this one.
     pub github: Option<Arc<GitHubIntegration>>,
     /// Integration plugin registry -- holds all configured integrations (GitHub, Linear, etc.).
     pub integrations: Arc<cairn_integrations::IntegrationRegistry>,

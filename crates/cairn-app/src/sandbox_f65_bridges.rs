@@ -92,12 +92,18 @@ impl F65SandboxEventSink for StoreF65EventSink {
                 snapshot_id,
                 workspace_id,
                 session_id,
+                bytes,
+                reflink_used,
+                parent_snapshot_id,
             } => RuntimeEvent::WorkspaceSnapshotCreated(WorkspaceSnapshotCreated {
                 project,
                 snapshot_id,
                 workspace_id,
                 session_id,
                 at_ms,
+                bytes,
+                reflink_used,
+                parent_snapshot_id,
             }),
             F65SandboxEvent::WorkspaceSnapshotReaped {
                 project,

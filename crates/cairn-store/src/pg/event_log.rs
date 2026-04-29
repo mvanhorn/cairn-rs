@@ -296,11 +296,25 @@ impl EventLog for PgEventLog {
 }
 
 /// Raw row from the event_log table.
+///
+/// The shape must stay byte-for-byte aligned with the SELECT lists in
+/// `read_entity_stream` / `read_stream` because sqlx::FromRow matches
+/// by column order. `source_type` is denormalised from `source_meta`
+/// for index-backed filtering in future debug queries — it is not
+/// consumed by `into_stored_event` yet, hence the single-field
+/// `#[allow(dead_code)]` (#480). `event_id` was flagged as dead by an
+/// earlier sweep, but it IS consumed below (line 327) — the annotation
+/// is stale and removed.
 #[derive(sqlx::FromRow)]
 struct EventRow {
     position: i64,
-    #[allow(dead_code)]
     event_id: String,
+    /// Denormalised from `source_meta` for future index-backed debug
+    /// queries (e.g. "all events produced by the Runtime source").
+    /// Present in the SELECT list so adding a future reader doesn't
+    /// have to re-audit every query — but not read by the current
+    /// rehydrator, which reconstructs the full `EventSource` from
+    /// `source_meta`.
     #[allow(dead_code)]
     source_type: String,
     source_meta: serde_json::Value,

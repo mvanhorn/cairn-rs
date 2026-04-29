@@ -39,8 +39,8 @@ use cairn_store::projections::{
 use cairn_store::EventLog;
 
 use crate::errors::{
-    bad_request_response, now_ms, operator_event_envelope, runtime_error_response,
-    store_error_response, validation_error_response, AppApiError,
+    bad_request_response, now_ms, operator_event_envelope, run_not_found_response,
+    runtime_error_response, store_error_response, validation_error_response, AppApiError,
 };
 use crate::extractors::TenantScope;
 use crate::helpers::{build_run_replay_result, checkpoint_recorded_position};
@@ -67,10 +67,6 @@ fn tool_invocation_not_found_response() -> axum::response::Response {
 
 fn checkpoint_not_found_response() -> axum::response::Response {
     AppApiError::new(StatusCode::NOT_FOUND, "not_found", "checkpoint not found").into_response()
-}
-
-fn run_not_found_response() -> axum::response::Response {
-    AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found").into_response()
 }
 
 fn tool_invocation_progress_not_found_response() -> axum::response::Response {

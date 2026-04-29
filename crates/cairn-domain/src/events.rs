@@ -2914,6 +2914,16 @@ pub struct CheckpointPersisted {
 /// local filesystem detail that belongs to the workspace projection, not the
 /// portable event log. Readers who need the path resolve it via
 /// [`crate::session_orchestration::WorkspaceSnapshot`].
+///
+/// `bytes`, `reflink_used`, and `parent_snapshot_id` ARE carried on the
+/// event so a fresh log replay from an empty projection store rebuilds
+/// the `workspace_snapshots` row with the same metadata the live writer
+/// produced — satisfying the CLAUDE.md "all state derives from the
+/// event log" invariant. See #482 for the gap this closes. Before this
+/// change, the projection inserted the row with `bytes=0` /
+/// `reflink_used=false` / `parent_snapshot_id=NULL` and waited for an
+/// out-of-band `WorkspaceSnapshotWriter::stamp_metadata` call to fill
+/// them — a call that never fires during replay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceSnapshotCreated {
     pub project: crate::tenancy::ProjectKey,
@@ -2921,6 +2931,25 @@ pub struct WorkspaceSnapshotCreated {
     pub workspace_id: crate::ids::WorkspaceId,
     pub session_id: crate::ids::SessionId,
     pub at_ms: u64,
+    /// Byte count of the persisted reflink snapshot directory at the
+    /// moment it was finalised. `0` is a valid value (empty workspace);
+    /// it means the live writer observed no files, not "data unknown".
+    /// `#[serde(default)]` keeps the event deserialisable against older
+    /// rows that pre-date #482 (0 is the documented legacy value).
+    #[serde(default)]
+    pub bytes: u64,
+    /// `true` when the snapshot used a reflink (O(1) CoW) rather than
+    /// a full copy. Tracks per-project backend capability so
+    /// post-incident audit can correlate snapshot provenance with
+    /// `SandboxBackendDegraded` events.
+    #[serde(default)]
+    pub reflink_used: bool,
+    /// On the resume path, the snapshot the new one derives from.
+    /// `None` for a fresh-provision snapshot. Rebuilds the snapshot
+    /// lineage on replay (used by the F65 GC policy to defer reap
+    /// until descendants are also reaped).
+    #[serde(default)]
+    pub parent_snapshot_id: Option<crate::ids::WorkspaceSnapshotId>,
 }
 
 /// F65: a workspace snapshot was reaped by the GC.

@@ -399,6 +399,16 @@ pub struct BreakerConfig {
     /// breaker trips. Measured with a monotonic `std::time::Instant`
     /// captured at loop entry.
     pub wall_clock_ms: u64,
+    /// Basis-point threshold that fires the once-per-run
+    /// `BudgetThresholdCrossed` warning. `10_000` = 100 %; `8_000` = 80 %.
+    /// Default `8_000` matches the historical const before #479 promoted
+    /// it to a tunable. Set `>= 10_000` to suppress the warning (it will
+    /// never fire before the trip path runs).
+    ///
+    /// Only Round / WallClock / Tokens participate in the warning —
+    /// `NoToolUseConsecutive` skips it by design (see rustdoc on
+    /// `no_tool_use_streak` + arch-doc §4.1).
+    pub warn_ratio_bps: u32,
 }
 
 impl Default for BreakerConfig {
@@ -408,6 +418,7 @@ impl Default for BreakerConfig {
             token_cap: 200_000,
             no_tool_use_streak: 3,
             wall_clock_ms: 15 * 60 * 1_000, // 15 minutes
+            warn_ratio_bps: 8_000,          // 80 %
         }
     }
 }

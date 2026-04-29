@@ -1315,16 +1315,30 @@ impl PgSyncProjection {
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
 
-            // F65 PR-2: insert the snapshot row. `snapshot_path`, `bytes`,
-            // and `parent_snapshot_id` are left at empty-string / 0 / NULL
-            // on PR-2 — the sandbox runtime in PR-4/PR-5 fills them when
-            // it persists the actual reflink. `reflink_used` defaults to
-            // FALSE until PR-4 writes it through a dedicated service call.
+            // #482: insert the snapshot row with the metadata carried on
+            // the event. `snapshot_path` remains empty because it is
+            // host-local filesystem detail (see the rustdoc on
+            // `cairn_domain::WorkspaceSnapshotCreated`) — operators
+            // resolve it via `cairn_domain::session_orchestration::WorkspaceSnapshot`.
+            // `bytes`, `reflink_used`, `parent_snapshot_id` now round-trip
+            // on the event itself so a fresh replay from an empty DB
+            // rebuilds the row with the same metadata the live writer
+            // produced, closing the event-sourcing gap audited in #482.
+            // The runtime's `WorkspaceSnapshotWriter::stamp_metadata` call
+            // still fires once in live mode to fill `snapshot_path`; its
+            // `bytes` / `reflink_used` / `parent_snapshot_id` arguments
+            // are now redundant with the event body but harmless.
             RuntimeEvent::WorkspaceSnapshotCreated(e) => {
                 let at_ms = i64::try_from(e.at_ms).map_err(|_| {
                     StoreError::Internal(format!(
                         "WorkspaceSnapshotCreated.at_ms {} exceeds i64::MAX",
                         e.at_ms
+                    ))
+                })?;
+                let bytes_i64 = i64::try_from(e.bytes).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "WorkspaceSnapshotCreated.bytes {} exceeds i64::MAX",
+                        e.bytes
                     ))
                 })?;
                 sqlx::query(
@@ -1333,7 +1347,7 @@ impl PgSyncProjection {
                          session_id, workspace_id, parent_snapshot_id,
                          snapshot_path, bytes, reflink_used, created_at
                      )
-                     VALUES ($1, $2, $3, $4, $5, $6, NULL, '', 0, FALSE, $7)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, '', $8, $9, $10)
                      ON CONFLICT (snapshot_id) DO NOTHING",
                 )
                 .bind(e.snapshot_id.as_str())
@@ -1342,6 +1356,9 @@ impl PgSyncProjection {
                 .bind(e.project.project_id.as_str())
                 .bind(e.session_id.as_str())
                 .bind(e.workspace_id.as_str())
+                .bind(e.parent_snapshot_id.as_ref().map(|p| p.as_str()))
+                .bind(bytes_i64)
+                .bind(e.reflink_used)
                 .bind(at_ms)
                 .execute(&mut **tx)
                 .await

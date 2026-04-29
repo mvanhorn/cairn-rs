@@ -95,6 +95,14 @@ pub(crate) fn bad_request_response(message: impl Into<String>) -> axum::response
     validation_error_response(message)
 }
 
+/// #486: canonical 404 `run not found` envelope, extracted from 18+
+/// hand-rolled call sites across the runs handler and its siblings.
+/// Single choke point so a future rename of the \`not_found\` code or
+/// the message text is a 1-file change.
+pub(crate) fn run_not_found_response() -> Response {
+    AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found").into_response()
+}
+
 pub(crate) fn memory_api_error_response(err: String) -> Response {
     if err.starts_with("memory not found:") {
         return AppApiError::new(StatusCode::NOT_FOUND, "not_found", err).into_response();

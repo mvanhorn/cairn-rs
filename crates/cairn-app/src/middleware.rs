@@ -190,8 +190,14 @@ pub(crate) async fn rate_limit_middleware(
 // ── Request ID / tracing ────────────────────────────────────────────────────
 
 /// RFC 011 extension types for tracing context in request extensions.
+///
+/// `RequestId.0` IS consumed — see [`observability_middleware`] further
+/// down this file, which reads the id off the request extensions via
+/// `.get::<RequestId>()` and threads it into the audit log record. The
+/// `#[allow(dead_code)]` that previously lived on the inner field was
+/// stale; removed (#485).
 #[derive(Clone, Debug)]
-pub(crate) struct RequestId(#[allow(dead_code)] pub(crate) String);
+pub(crate) struct RequestId(pub(crate) String);
 #[derive(Clone, Debug)]
 pub(crate) struct TraceId(String);
 
@@ -200,8 +206,22 @@ impl TraceId {
         self.0.as_str()
     }
 }
+
+/// `SpanId.0` is a per-request short hex identifier surfaced on the
+/// `x-span-id` response header and reserved for correlation inside
+/// handler-level tracing spans. No handler reads it off the extensions
+/// map today, but the value is already computed and inserted by the
+/// request-id middleware — exposing `as_str` lets a future tracing
+/// subscriber correlate without reworking the middleware (#485).
 #[derive(Clone, Debug)]
-pub(crate) struct SpanId(#[allow(dead_code)] String);
+pub(crate) struct SpanId(String);
+
+impl SpanId {
+    #[allow(dead_code)] // reserved for handler-level tracing spans; see struct docstring
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 pub(crate) async fn request_id_middleware(mut request: Request, next: Next) -> Response {
     // Accept an incoming X-Trace-Id or generate a new one (RFC 011).

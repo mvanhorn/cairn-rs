@@ -122,6 +122,9 @@ async fn seed_session_with_outcome(
                 workspace_id: ws.clone(),
                 session_id: session.clone(),
                 at_ms: 1_300,
+                bytes: 0,
+                reflink_used: false,
+                parent_snapshot_id: None,
             },
         )),
         env(RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {

@@ -50,7 +50,9 @@ pub struct IssueBudget {
 /// Each variant corresponds to a distinct limit enforced by the orchestrator
 /// loop in PR-3. The trip reason flows through [`TerminationReason`] into the
 /// [`SessionOutcome`] and is surfaced to operators.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, strum::EnumCount, strum::EnumIter,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum BreakerKind {
     /// Orchestrator iteration count exceeded the per-attempt round cap.
@@ -61,6 +63,26 @@ pub enum BreakerKind {
     NoToolUseConsecutive,
     /// Wall-clock elapsed time exceeded the configured budget.
     WallClock,
+}
+
+impl BreakerKind {
+    /// Number of variants on this enum. #467: derived via
+    /// `strum::EnumCount` so adding a variant to the enum body
+    /// mechanically increments the count — the previous hand-rolled
+    /// `const COUNT: usize = 4` let a new variant compile without
+    /// updating the latch grid in `cairn-orchestrator::breakers`.
+    pub const COUNT: usize = <Self as strum::EnumCount>::COUNT;
+
+    /// All variants in a fixed, stable order (derived by `strum::EnumIter`).
+    /// The order MUST match `kind_index` in `cairn-orchestrator::breakers`;
+    /// the `kind_index_in_range_for_every_variant` test guards the
+    /// invariant. Exposed so callers that need to iterate the variants
+    /// (tests, the warn-latch array size check, CLI dumps) have one
+    /// source of truth.
+    pub fn all() -> impl Iterator<Item = BreakerKind> {
+        use strum::IntoEnumIterator;
+        <Self as IntoEnumIterator>::iter()
+    }
 }
 
 /// One circuit-breaker trip event.
