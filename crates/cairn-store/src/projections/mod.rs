@@ -53,10 +53,14 @@ pub mod sharing;
 pub mod signal;
 pub mod signal_subscription;
 pub mod snapshot;
+pub mod soul_patch;
+pub mod subagent;
 pub mod task;
 pub mod tool_call_approval;
 pub mod tool_invocation;
+pub mod tool_recovery;
 pub mod trigger;
+pub mod user_message;
 pub mod workspace_membership;
 
 pub use approval::*;
@@ -106,16 +110,20 @@ pub use sharing::*;
 pub use signal::*;
 pub use signal_subscription::{SignalSubscriptionReadModel, SignalSubscriptionRecord};
 pub use snapshot::*;
+pub use soul_patch::{SoulPatchReadModel, SoulPatchRecord, SoulPatchState};
+pub use subagent::{SubagentSpawnReadModel, SubagentSpawnRecord};
 pub use task::*;
 pub use tool_call_approval::{
     ToolCallApprovalReadModel, ToolCallApprovalRecord, ToolCallApprovalState,
 };
 pub use tool_invocation::*;
+pub use tool_recovery::{ToolRecoveryPauseReadModel, ToolRecoveryPauseRecord};
 pub use trigger::{
     skip_reason_discriminant, suspension_reason_discriminant, RunTemplateReadModel,
     RunTemplateRecord, TriggerFireOutcome, TriggerFireReadModel, TriggerFireRecord,
     TriggerReadModel, TriggerRecord, TriggerStateKind,
 };
+pub use user_message::{UserMessageReadModel, UserMessageRecord};
 pub use workspace_membership::{WorkspaceMemberRecord, WorkspaceMembershipReadModel};
 
 use crate::error::StoreError;

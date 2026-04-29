@@ -3871,3 +3871,511 @@ impl crate::projections::ExternalWorkerReadModel for PgAdapter {
             .collect())
     }
 }
+
+// ── RFC-025 Phase 2b.2b m1: resource_shares read model (RFC 008) ──
+
+#[derive(sqlx::FromRow)]
+struct ResourceShareRow {
+    share_id: String,
+    tenant_id: String,
+    source_workspace_id: String,
+    target_workspace_id: String,
+    resource_type: String,
+    resource_id: String,
+    permissions_json: String,
+    shared_at_ms: i64,
+}
+
+impl ResourceShareRow {
+    fn into_record(self) -> Result<cairn_domain::resource_sharing::SharedResource, StoreError> {
+        let permissions: Vec<String> =
+            serde_json::from_str(&self.permissions_json).map_err(|err| {
+                StoreError::Serialization(format!(
+                    "resource_shares.permissions_json decode for share_id={}: {err}",
+                    self.share_id
+                ))
+            })?;
+        Ok(cairn_domain::resource_sharing::SharedResource {
+            share_id: self.share_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            source_workspace_id: cairn_domain::WorkspaceId::new(self.source_workspace_id),
+            target_workspace_id: cairn_domain::WorkspaceId::new(self.target_workspace_id),
+            resource_type: self.resource_type,
+            resource_id: self.resource_id,
+            permissions,
+            shared_at_ms: self.shared_at_ms.max(0) as u64,
+        })
+    }
+}
+
+const RESOURCE_SHARE_SELECT_COLS: &str =
+    "share_id, tenant_id, source_workspace_id, target_workspace_id, \
+     resource_type, resource_id, permissions_json, shared_at_ms";
+
+#[async_trait]
+impl crate::projections::ResourceSharingReadModel for PgAdapter {
+    async fn get_share(
+        &self,
+        share_id: &str,
+    ) -> Result<Option<cairn_domain::resource_sharing::SharedResource>, StoreError> {
+        let sql = format!(
+            "SELECT {RESOURCE_SHARE_SELECT_COLS} FROM resource_shares
+             WHERE share_id = $1"
+        );
+        let row: Option<ResourceShareRow> = sqlx::query_as(&sql)
+            .bind(share_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(ResourceShareRow::into_record).transpose()
+    }
+
+    async fn list_shares_for_workspace(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        target_workspace_id: &cairn_domain::WorkspaceId,
+    ) -> Result<Vec<cairn_domain::resource_sharing::SharedResource>, StoreError> {
+        // Sort by (shared_at_ms, share_id) to match the in-memory
+        // applier's sort and the tenant-scoped index.
+        let sql = format!(
+            "SELECT {RESOURCE_SHARE_SELECT_COLS} FROM resource_shares
+             WHERE tenant_id = $1 AND target_workspace_id = $2
+             ORDER BY shared_at_ms ASC, share_id ASC"
+        );
+        let rows: Vec<ResourceShareRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(target_workspace_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(ResourceShareRow::into_record)
+            .collect()
+    }
+
+    async fn get_share_for_resource(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        target_workspace_id: &cairn_domain::WorkspaceId,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<Option<cairn_domain::resource_sharing::SharedResource>, StoreError> {
+        // Same index as list_shares_for_workspace — tenant-scoped
+        // resource-type+resource-id lookup. Pick lowest shared_at_ms
+        // deterministically if duplicates ever slip through (the
+        // service layer issues unique share_ids per share call, so
+        // duplicates are only possible via event-log replay after a
+        // Revoke — in which case the Revoke DELETE already won).
+        let sql = format!(
+            "SELECT {RESOURCE_SHARE_SELECT_COLS} FROM resource_shares
+             WHERE tenant_id = $1 AND target_workspace_id = $2
+               AND resource_type = $3 AND resource_id = $4
+             ORDER BY shared_at_ms ASC, share_id ASC
+             LIMIT 1"
+        );
+        let row: Option<ResourceShareRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(target_workspace_id.as_str())
+            .bind(resource_type)
+            .bind(resource_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(ResourceShareRow::into_record).transpose()
+    }
+}
+
+// ── RFC-025 Phase 2b.2b m2: signal_ingestions read model ──
+
+#[derive(sqlx::FromRow)]
+struct SignalIngestionRow {
+    signal_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    source: String,
+    payload_json: String,
+    timestamp_ms: i64,
+}
+
+impl SignalIngestionRow {
+    fn into_record(self) -> Result<cairn_domain::SignalRecord, StoreError> {
+        let payload: serde_json::Value =
+            serde_json::from_str(&self.payload_json).map_err(|err| {
+                StoreError::Serialization(format!(
+                    "signal_ingestions.payload_json decode for signal_id={}: {err}",
+                    self.signal_id
+                ))
+            })?;
+        Ok(cairn_domain::SignalRecord {
+            id: cairn_domain::SignalId::new(self.signal_id),
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            source: self.source,
+            payload,
+            timestamp_ms: self.timestamp_ms.max(0) as u64,
+        })
+    }
+}
+
+const SIGNAL_INGESTION_SELECT_COLS: &str =
+    "signal_id, tenant_id, workspace_id, project_id, source, payload_json, timestamp_ms";
+
+#[async_trait]
+impl crate::projections::SignalReadModel for PgAdapter {
+    async fn get(
+        &self,
+        signal_id: &cairn_domain::SignalId,
+    ) -> Result<Option<cairn_domain::SignalRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {SIGNAL_INGESTION_SELECT_COLS} FROM signal_ingestions
+             WHERE signal_id = $1"
+        );
+        let row: Option<SignalIngestionRow> = sqlx::query_as(&sql)
+            .bind(signal_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(SignalIngestionRow::into_record).transpose()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::SignalRecord>, StoreError> {
+        // Sort by (timestamp_ms, signal_id) — parity with in-memory
+        // and the composite project index.
+        let sql = format!(
+            "SELECT {SIGNAL_INGESTION_SELECT_COLS} FROM signal_ingestions
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+             ORDER BY timestamp_ms ASC, signal_id ASC
+             LIMIT $4 OFFSET $5"
+        );
+        let rows: Vec<SignalIngestionRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(SignalIngestionRow::into_record)
+            .collect()
+    }
+}
+
+// ── RFC-025 Phase 2b.2b m3: subagent_spawns read model (RFC 014) ──
+
+#[derive(sqlx::FromRow)]
+struct SubagentSpawnRow {
+    child_task_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    parent_run_id: String,
+    parent_task_id: Option<String>,
+    child_session_id: String,
+    child_run_id: Option<String>,
+    spawned_at_ms: i64,
+}
+
+impl SubagentSpawnRow {
+    fn into_record(self) -> crate::projections::SubagentSpawnRecord {
+        crate::projections::SubagentSpawnRecord {
+            child_task_id: cairn_domain::TaskId::new(self.child_task_id),
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            parent_run_id: cairn_domain::RunId::new(self.parent_run_id),
+            parent_task_id: self.parent_task_id.map(cairn_domain::TaskId::new),
+            child_session_id: cairn_domain::SessionId::new(self.child_session_id),
+            child_run_id: self.child_run_id.map(cairn_domain::RunId::new),
+            spawned_at_ms: self.spawned_at_ms.max(0) as u64,
+        }
+    }
+}
+
+const SUBAGENT_SPAWN_SELECT_COLS: &str =
+    "child_task_id, tenant_id, workspace_id, project_id, parent_run_id, \
+     parent_task_id, child_session_id, child_run_id, spawned_at_ms";
+
+#[async_trait]
+impl crate::projections::SubagentSpawnReadModel for PgAdapter {
+    async fn get_by_child_task(
+        &self,
+        child_task_id: &cairn_domain::TaskId,
+    ) -> Result<Option<crate::projections::SubagentSpawnRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {SUBAGENT_SPAWN_SELECT_COLS} FROM subagent_spawns
+             WHERE child_task_id = $1"
+        );
+        let row: Option<SubagentSpawnRow> = sqlx::query_as(&sql)
+            .bind(child_task_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(SubagentSpawnRow::into_record))
+    }
+
+    async fn list_by_parent_run(
+        &self,
+        parent_run_id: &cairn_domain::RunId,
+    ) -> Result<Vec<crate::projections::SubagentSpawnRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {SUBAGENT_SPAWN_SELECT_COLS} FROM subagent_spawns
+             WHERE parent_run_id = $1
+             ORDER BY spawned_at_ms ASC, child_task_id ASC"
+        );
+        let rows: Vec<SubagentSpawnRow> = sqlx::query_as(&sql)
+            .bind(parent_run_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(SubagentSpawnRow::into_record)
+            .collect())
+    }
+}
+
+// ── RFC-025 Phase 2b.2b m4: user_messages read model ──
+
+#[derive(sqlx::FromRow)]
+struct UserMessageRow {
+    run_id: String,
+    sequence: i64,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    session_id: String,
+    event_id: String,
+    content: String,
+    appended_at_ms: i64,
+}
+
+impl UserMessageRow {
+    fn into_record(self) -> crate::projections::UserMessageRecord {
+        crate::projections::UserMessageRecord {
+            run_id: cairn_domain::RunId::new(self.run_id),
+            sequence: self.sequence.max(0) as u64,
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            session_id: cairn_domain::SessionId::new(self.session_id),
+            event_id: self.event_id,
+            content: self.content,
+            appended_at_ms: self.appended_at_ms.max(0) as u64,
+        }
+    }
+}
+
+const USER_MESSAGE_SELECT_COLS: &str = "run_id, sequence, tenant_id, workspace_id, project_id, \
+     session_id, event_id, content, appended_at_ms";
+
+#[async_trait]
+impl crate::projections::UserMessageReadModel for PgAdapter {
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::UserMessageRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {USER_MESSAGE_SELECT_COLS} FROM user_messages
+             WHERE run_id = $1
+             ORDER BY sequence ASC, appended_at_ms ASC
+             LIMIT $2 OFFSET $3"
+        );
+        let rows: Vec<UserMessageRow> = sqlx::query_as(&sql)
+            .bind(run_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(UserMessageRow::into_record).collect())
+    }
+
+    async fn count_by_run(&self, run_id: &cairn_domain::RunId) -> Result<u64, StoreError> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM user_messages WHERE run_id = $1")
+                .bind(run_id.as_str())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(count.max(0) as u64)
+    }
+}
+
+// ── RFC-025 Phase 2b.2b m5: soul_patches read model ──
+
+#[derive(sqlx::FromRow)]
+struct SoulPatchRow {
+    patch_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    state: String,
+    patch_content: String,
+    requires_approval: bool,
+    proposed_at_ms: i64,
+    applied_at_ms: Option<i64>,
+    new_version: Option<i32>,
+}
+
+impl SoulPatchRow {
+    fn into_record(self) -> Result<crate::projections::SoulPatchRecord, StoreError> {
+        let state =
+            crate::projections::SoulPatchState::from_str_opt(&self.state).ok_or_else(|| {
+                StoreError::Serialization(format!(
+                    "soul_patches.state {:?} unknown for patch_id={}",
+                    self.state, self.patch_id
+                ))
+            })?;
+        Ok(crate::projections::SoulPatchRecord {
+            patch_id: self.patch_id,
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            state,
+            patch_content: self.patch_content,
+            requires_approval: self.requires_approval,
+            proposed_at_ms: self.proposed_at_ms.max(0) as u64,
+            applied_at_ms: self.applied_at_ms.map(|v| v.max(0) as u64),
+            new_version: self.new_version.map(|v| v.max(0) as u32),
+        })
+    }
+}
+
+const SOUL_PATCH_SELECT_COLS: &str =
+    "patch_id, tenant_id, workspace_id, project_id, state, patch_content, \
+     requires_approval, proposed_at_ms, applied_at_ms, new_version";
+
+#[async_trait]
+impl crate::projections::SoulPatchReadModel for PgAdapter {
+    async fn get(
+        &self,
+        patch_id: &str,
+    ) -> Result<Option<crate::projections::SoulPatchRecord>, StoreError> {
+        let sql = format!("SELECT {SOUL_PATCH_SELECT_COLS} FROM soul_patches WHERE patch_id = $1");
+        let row: Option<SoulPatchRow> = sqlx::query_as(&sql)
+            .bind(patch_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(SoulPatchRow::into_record).transpose()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::tenancy::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::SoulPatchRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {SOUL_PATCH_SELECT_COLS} FROM soul_patches
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+             ORDER BY proposed_at_ms DESC, patch_id DESC
+             LIMIT $4 OFFSET $5"
+        );
+        let rows: Vec<SoulPatchRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(SoulPatchRow::into_record).collect()
+    }
+}
+
+// ── RFC-025 Phase 2b.2b m6: tool_recovery_pauses read model ──
+
+#[derive(sqlx::FromRow)]
+struct ToolRecoveryPauseRow {
+    tool_call_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    run_id: String,
+    task_id: Option<String>,
+    tool_name: String,
+    reason: String,
+    paused_at_ms: i64,
+}
+
+impl ToolRecoveryPauseRow {
+    fn into_record(self) -> crate::projections::ToolRecoveryPauseRecord {
+        crate::projections::ToolRecoveryPauseRecord {
+            tool_call_id: self.tool_call_id,
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            run_id: cairn_domain::RunId::new(self.run_id),
+            task_id: self.task_id.map(cairn_domain::TaskId::new),
+            tool_name: self.tool_name,
+            reason: self.reason,
+            paused_at_ms: self.paused_at_ms.max(0) as u64,
+        }
+    }
+}
+
+const TOOL_RECOVERY_PAUSE_SELECT_COLS: &str =
+    "tool_call_id, tenant_id, workspace_id, project_id, run_id, task_id, \
+     tool_name, reason, paused_at_ms";
+
+#[async_trait]
+impl crate::projections::ToolRecoveryPauseReadModel for PgAdapter {
+    async fn get(
+        &self,
+        tool_call_id: &str,
+    ) -> Result<Option<crate::projections::ToolRecoveryPauseRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {TOOL_RECOVERY_PAUSE_SELECT_COLS} FROM tool_recovery_pauses
+             WHERE tool_call_id = $1"
+        );
+        let row: Option<ToolRecoveryPauseRow> = sqlx::query_as(&sql)
+            .bind(tool_call_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(ToolRecoveryPauseRow::into_record))
+    }
+
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+    ) -> Result<Vec<crate::projections::ToolRecoveryPauseRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {TOOL_RECOVERY_PAUSE_SELECT_COLS} FROM tool_recovery_pauses
+             WHERE run_id = $1
+             ORDER BY paused_at_ms ASC, tool_call_id ASC"
+        );
+        let rows: Vec<ToolRecoveryPauseRow> = sqlx::query_as(&sql)
+            .bind(run_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(ToolRecoveryPauseRow::into_record)
+            .collect())
+    }
+}

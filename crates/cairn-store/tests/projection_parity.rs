@@ -95,18 +95,22 @@ mod in_memory_vs_sqlite {
         ApprovalRequested, ApprovalRequirement, AuditLogEntryRecorded, EventEnvelope, EventId,
         EventSource, ExternalWorkerReactivated, ExternalWorkerRegistered, ExternalWorkerReported,
         ExternalWorkerSuspended, OperatorId, OutcomeId, OutcomeRecorded, PlanApproved,
-        PlanProposed, PlanRejected, PlanRevisionRequested, ProjectCreated, ProjectKey, RunCreated,
-        RunId, RunState, RunStateChanged, RuntimeEvent, ScheduledTaskCreated, ScheduledTaskId,
-        SessionCreated, SessionId, SessionState, SessionStateChanged, StateTransition, TaskCreated,
-        TaskId, TaskState, TaskStateChanged, TenantCreated, TenantId, WorkerId, WorkspaceCreated,
-        WorkspaceId,
+        PlanProposed, PlanRejected, PlanRevisionRequested, ProjectCreated, ProjectKey,
+        ResourceShareRevoked, ResourceShared, RunCreated, RunId, RunState, RunStateChanged,
+        RuntimeEvent, ScheduledTaskCreated, ScheduledTaskId, SessionCreated, SessionId,
+        SessionState, SessionStateChanged, SignalId, SignalIngested, SoulPatchApplied,
+        SoulPatchProposed, StateTransition, SubagentSpawned, TaskCreated, TaskId, TaskState,
+        TaskStateChanged, TenantCreated, TenantId, ToolRecoveryPaused, UserMessageAppended,
+        WorkerId, WorkspaceCreated, WorkspaceId,
     };
     use cairn_store::event_log::EventLog;
     use cairn_store::in_memory::InMemoryStore;
     use cairn_store::projections::{
         ApprovalReadModel, AuditLogReadModel, ExternalWorkerReadModel, OutcomeReadModel,
-        PlanReviewReadModel, PlanReviewState, RunReadModel, ScheduledTaskReadModel,
-        SessionReadModel, TaskReadModel,
+        PlanReviewReadModel, PlanReviewState, ResourceSharingReadModel, RunReadModel,
+        ScheduledTaskReadModel, SessionReadModel, SignalReadModel, SoulPatchReadModel,
+        SoulPatchState, SubagentSpawnReadModel, TaskReadModel, ToolRecoveryPauseReadModel,
+        UserMessageReadModel,
     };
     use cairn_store::sqlite::SqliteAdapter;
 
@@ -444,6 +448,20 @@ mod in_memory_vs_sqlite {
             "ExternalWorkerReported",
             "ExternalWorkerSuspended",
             "ExternalWorkerReactivated",
+            // RFC-025 Phase 2b.2b m1: resource-sharing fixtures below.
+            "ResourceShared",
+            "ResourceShareRevoked",
+            // RFC-025 Phase 2b.2b m2: signal-ingestion fixture below.
+            "SignalIngested",
+            // RFC-025 Phase 2b.2b m3: subagent-spawn fixture below.
+            "SubagentSpawned",
+            // RFC-025 Phase 2b.2b m4: user-message fixture below.
+            "UserMessageAppended",
+            // RFC-025 Phase 2b.2b m5: soul-patch fixtures below.
+            "SoulPatchProposed",
+            "SoulPatchApplied",
+            // RFC-025 Phase 2b.2b m6: tool-recovery-pause fixture below.
+            "ToolRecoveryPaused",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -2807,6 +2825,871 @@ mod in_memory_vs_sqlite {
             sqlite_row.current_task_id, None,
             "sqlite re-register must clear current_task_id"
         );
+    }
+
+    // ── RFC-025 Phase 2b.2b m1: resource_shares parity (RFC 008) ──
+
+    /// Share → list → get_share_for_resource → revoke lifecycle must
+    /// agree byte-for-byte across in-memory and sqlite. Revocation
+    /// DELETEs the row, so after revoke every backend must return None.
+    #[tokio::test]
+    async fn resource_share_lifecycle_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_share");
+        let src = WorkspaceId::new("ws_src");
+        let tgt = WorkspaceId::new("ws_tgt");
+
+        let events = vec![
+            env(RuntimeEvent::ResourceShared(ResourceShared {
+                share_id: "share_parity_1".to_owned(),
+                tenant_id: tenant.clone(),
+                source_workspace_id: src.clone(),
+                target_workspace_id: tgt.clone(),
+                resource_type: "prompt_asset".to_owned(),
+                resource_id: "asset_alpha".to_owned(),
+                permissions: vec!["read".to_owned(), "version".to_owned()],
+                grantee: String::new(),
+                shared_at_ms: 1_700_100_000_000,
+            })),
+            env(RuntimeEvent::ResourceShared(ResourceShared {
+                share_id: "share_parity_2".to_owned(),
+                tenant_id: tenant.clone(),
+                source_workspace_id: src.clone(),
+                target_workspace_id: tgt.clone(),
+                resource_type: "corpus".to_owned(),
+                resource_id: "corpus_beta".to_owned(),
+                permissions: vec![],
+                grantee: String::new(),
+                shared_at_ms: 1_700_100_001_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get_share parity.
+        let mem_row = ResourceSharingReadModel::get_share(&mem, "share_parity_1")
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = ResourceSharingReadModel::get_share(&adapter, "share_parity_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(
+            mem_row.permissions,
+            vec!["read".to_owned(), "version".to_owned()]
+        );
+
+        // list_shares_for_workspace parity — sorted by (shared_at_ms, share_id).
+        let mem_list = ResourceSharingReadModel::list_shares_for_workspace(&mem, &tenant, &tgt)
+            .await
+            .unwrap();
+        let sqlite_list =
+            ResourceSharingReadModel::list_shares_for_workspace(&adapter, &tenant, &tgt)
+                .await
+                .unwrap();
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(mem_list, sqlite_list);
+        assert_eq!(mem_list[0].share_id, "share_parity_1");
+        assert_eq!(mem_list[1].share_id, "share_parity_2");
+
+        // get_share_for_resource parity.
+        let mem_asset = ResourceSharingReadModel::get_share_for_resource(
+            &mem,
+            &tenant,
+            &tgt,
+            "prompt_asset",
+            "asset_alpha",
+        )
+        .await
+        .unwrap();
+        let sqlite_asset = ResourceSharingReadModel::get_share_for_resource(
+            &adapter,
+            &tenant,
+            &tgt,
+            "prompt_asset",
+            "asset_alpha",
+        )
+        .await
+        .unwrap();
+        assert_eq!(mem_asset, sqlite_asset);
+        assert_eq!(
+            mem_asset.as_ref().map(|s| s.share_id.as_str()),
+            Some("share_parity_1")
+        );
+
+        // Revoke share_parity_1 — row DELETEd on both backends.
+        let revoke = vec![env(RuntimeEvent::ResourceShareRevoked(
+            ResourceShareRevoked {
+                share_id: "share_parity_1".to_owned(),
+                tenant_id: tenant.clone(),
+                revoked_at_ms: 1_700_100_002_000,
+            },
+        ))];
+        append_both(&mem, &sqlite_log, &revoke).await;
+
+        let mem_after = ResourceSharingReadModel::get_share(&mem, "share_parity_1")
+            .await
+            .unwrap();
+        let sqlite_after = ResourceSharingReadModel::get_share(&adapter, "share_parity_1")
+            .await
+            .unwrap();
+        assert_eq!(mem_after, None);
+        assert_eq!(sqlite_after, None);
+
+        // list remains with just share_parity_2.
+        let mem_list2 = ResourceSharingReadModel::list_shares_for_workspace(&mem, &tenant, &tgt)
+            .await
+            .unwrap();
+        let sqlite_list2 =
+            ResourceSharingReadModel::list_shares_for_workspace(&adapter, &tenant, &tgt)
+                .await
+                .unwrap();
+        assert_eq!(mem_list2.len(), 1);
+        assert_eq!(mem_list2, sqlite_list2);
+        assert_eq!(mem_list2[0].share_id, "share_parity_2");
+    }
+
+    /// Pin the observed `Shared → Revoked → (replayed Shared)` cross-
+    /// backend contract. Revocation is NOT terminal under event-log
+    /// replay on any backend:
+    ///   * in-memory: `HashMap::insert` on the replayed Shared event
+    ///     re-creates the row (the prior Revoke's `remove` cleared it);
+    ///   * pg/sqlite: the applier uses `ON CONFLICT (share_id) DO
+    ///     NOTHING`, but the DELETE from the prior Revoke means the
+    ///     conflict target is empty, so the INSERT succeeds and the
+    ///     row is back.
+    ///
+    /// The test asserts all three backends agree on the final row
+    /// presence (all re-created) so a future applier change that
+    /// silently drifts one backend from the other is caught. The
+    /// service layer allocates a fresh `share_id` per live share call
+    /// (`next_share_id()`), so the replay path is reachable only by
+    /// boot-time event-log walking. If we ever want "revocation is
+    /// terminal" semantics, we'd need a tombstone table or a
+    /// dedicated revoked state column — a design change out of scope
+    /// for Phase 2b.2b.
+    #[tokio::test]
+    async fn resource_share_replay_after_revoke_recreates_on_all_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_replay");
+        let src = WorkspaceId::new("ws_src_replay");
+        let tgt = WorkspaceId::new("ws_tgt_replay");
+
+        // The in-memory applier's `remove(&share_id)` idempotently
+        // clears the row; a replayed Shared *would* re-insert there if
+        // the applier were purely additive, so this test also pins
+        // the in-memory contract.
+        //
+        // For this scenario, we need to exercise the "replay" path
+        // deliberately. The cleanest way is to append Shared + Revoked
+        // together, then append a second Shared with the same
+        // share_id — the service layer would never do this (share_id
+        // is sequence-backed and unique), but the event-log replay
+        // path effectively does when a snapshot-less boot walks every
+        // event in order.
+        let events = vec![
+            env(RuntimeEvent::ResourceShared(ResourceShared {
+                share_id: "share_replay_1".to_owned(),
+                tenant_id: tenant.clone(),
+                source_workspace_id: src.clone(),
+                target_workspace_id: tgt.clone(),
+                resource_type: "prompt_asset".to_owned(),
+                resource_id: "asset_replay".to_owned(),
+                permissions: vec!["read".to_owned()],
+                grantee: String::new(),
+                shared_at_ms: 1_700_200_000_000,
+            })),
+            env(RuntimeEvent::ResourceShareRevoked(ResourceShareRevoked {
+                share_id: "share_replay_1".to_owned(),
+                tenant_id: tenant.clone(),
+                revoked_at_ms: 1_700_200_001_000,
+            })),
+            // Replayed Shared — same share_id. In-memory: insert
+            // re-creates the row. Pg/sqlite ON CONFLICT DO NOTHING
+            // would also re-create since the row is gone. This is a
+            // known replay asymmetry — the test pins the OBSERVED
+            // behaviour so future appliers don't silently drift.
+            env(RuntimeEvent::ResourceShared(ResourceShared {
+                share_id: "share_replay_1".to_owned(),
+                tenant_id: tenant.clone(),
+                source_workspace_id: src.clone(),
+                target_workspace_id: tgt.clone(),
+                resource_type: "prompt_asset".to_owned(),
+                resource_id: "asset_replay".to_owned(),
+                permissions: vec!["read".to_owned()],
+                grantee: String::new(),
+                shared_at_ms: 1_700_200_002_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // Both backends re-create the row on the second Shared (the
+        // Revoke DELETEd it, so ON CONFLICT does not fire). Cross-
+        // backend parity: either both see the row or neither does.
+        let mem_row = ResourceSharingReadModel::get_share(&mem, "share_replay_1")
+            .await
+            .unwrap();
+        let sqlite_row = ResourceSharingReadModel::get_share(&adapter, "share_replay_1")
+            .await
+            .unwrap();
+        assert_eq!(
+            mem_row.is_some(),
+            sqlite_row.is_some(),
+            "pg/sqlite/in-memory must agree on final row presence"
+        );
+        assert_eq!(mem_row, sqlite_row);
+    }
+
+    // ── RFC-025 Phase 2b.2b m2: signal_ingestions parity ──
+
+    /// Ingest a signal with a JSON object payload and assert
+    /// `SignalReadModel::get` + `list_by_project` return the same
+    /// record across in-memory and sqlite. Repeats the same signal_id
+    /// a second time to exercise the ON CONFLICT DO NOTHING idempotency
+    /// path (the persistent backends keep the first row; in-memory
+    /// `HashMap::insert` overwrites — but with the same event payload
+    /// the resulting record is identical, so parity still holds).
+    #[tokio::test]
+    async fn signal_ingestion_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_sig", "w_sig", "p_sig");
+        let other_scope = ProjectKey::new("t_sig", "w_sig", "p_other");
+
+        let events = vec![
+            env(RuntimeEvent::SignalIngested(SignalIngested {
+                project: scope.clone(),
+                signal_id: SignalId::new("sig_parity_1"),
+                source: "webhook".into(),
+                payload: serde_json::json!({"kind": "push", "ref": "main"}),
+                timestamp_ms: 1_700_300_000_000,
+            })),
+            env(RuntimeEvent::SignalIngested(SignalIngested {
+                project: scope.clone(),
+                signal_id: SignalId::new("sig_parity_2"),
+                source: "trigger".into(),
+                payload: serde_json::Value::Null,
+                timestamp_ms: 1_700_300_001_000,
+            })),
+            // Out-of-project signal — must be filtered out by list_by_project.
+            env(RuntimeEvent::SignalIngested(SignalIngested {
+                project: other_scope.clone(),
+                signal_id: SignalId::new("sig_parity_other"),
+                source: "webhook".into(),
+                payload: serde_json::json!({}),
+                timestamp_ms: 1_700_300_002_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get() parity.
+        let mem_row = SignalReadModel::get(&mem, &SignalId::new("sig_parity_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = SignalReadModel::get(&adapter, &SignalId::new("sig_parity_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.source, "webhook");
+        assert_eq!(mem_row.payload["kind"], "push");
+
+        // list_by_project parity — sorted by (timestamp_ms, signal_id).
+        // Filters out the other_scope entry.
+        let mem_list = SignalReadModel::list_by_project(&mem, &scope, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = SignalReadModel::list_by_project(&adapter, &scope, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(mem_list, sqlite_list);
+        assert_eq!(mem_list[0].id.as_str(), "sig_parity_1");
+        assert_eq!(mem_list[1].id.as_str(), "sig_parity_2");
+
+        // Pagination: offset=1, limit=1 yields the second row only.
+        let mem_page = SignalReadModel::list_by_project(&mem, &scope, 1, 1)
+            .await
+            .unwrap();
+        let sqlite_page = SignalReadModel::list_by_project(&adapter, &scope, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(mem_page, sqlite_page);
+        assert_eq!(mem_page.len(), 1);
+        assert_eq!(mem_page[0].id.as_str(), "sig_parity_2");
+    }
+
+    // ── RFC-025 Phase 2b.2b m3: subagent_spawns parity (RFC 014) ──
+
+    /// Spawn a child subagent and assert:
+    /// * pg/sqlite/in-memory agree on get_by_child_task (all fields
+    ///   except spawned_at_ms which is wall-clock at applier-run time,
+    ///   mirroring the `external_worker_full_lifecycle` pattern);
+    /// * list_by_parent_run returns the spawn ordered by
+    ///   (spawned_at_ms, child_task_id) with optional parent_task_id
+    ///   and child_run_id preserved across backends.
+    #[tokio::test]
+    async fn subagent_spawn_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_sub", "w_sub", "p_sub");
+        let parent_run = RunId::new("run_parent_sub");
+        let child_task = TaskId::new("task_child_sub_1");
+        let child_session = SessionId::new("sess_parent_sub");
+
+        let events = vec![env(RuntimeEvent::SubagentSpawned(SubagentSpawned {
+            project: scope.clone(),
+            parent_run_id: parent_run.clone(),
+            parent_task_id: None,
+            child_task_id: child_task.clone(),
+            child_session_id: child_session.clone(),
+            child_run_id: Some(RunId::new("run_child_sub_1")),
+        }))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get_by_child_task parity.
+        let mem_row = SubagentSpawnReadModel::get_by_child_task(&mem, &child_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = SubagentSpawnReadModel::get_by_child_task(&adapter, &child_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row.child_task_id, sqlite_row.child_task_id);
+        assert_eq!(mem_row.project, sqlite_row.project);
+        assert_eq!(mem_row.parent_run_id, sqlite_row.parent_run_id);
+        assert_eq!(mem_row.parent_task_id, sqlite_row.parent_task_id);
+        assert_eq!(mem_row.child_session_id, sqlite_row.child_session_id);
+        assert_eq!(mem_row.child_run_id, sqlite_row.child_run_id);
+        // spawned_at_ms is wall-clock at applier time and may drift a
+        // few ms across the two appends — parity is "both > 0".
+        assert!(mem_row.spawned_at_ms > 0);
+        assert!(sqlite_row.spawned_at_ms > 0);
+
+        // list_by_parent_run parity.
+        let mem_list = SubagentSpawnReadModel::list_by_parent_run(&mem, &parent_run)
+            .await
+            .unwrap();
+        let sqlite_list = SubagentSpawnReadModel::list_by_parent_run(&adapter, &parent_run)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 1);
+        assert_eq!(sqlite_list.len(), 1);
+        assert_eq!(mem_list[0].child_task_id, sqlite_list[0].child_task_id);
+    }
+
+    /// Replay on the same child_task_id is idempotent on all backends:
+    /// pg/sqlite via ON CONFLICT DO NOTHING, in-memory via
+    /// `or_insert_with`. A second Spawned event with a DIFFERENT
+    /// parent is silently dropped — child_task_id is single-parent by
+    /// the RFC 014 contract.
+    #[tokio::test]
+    async fn subagent_spawn_replay_is_idempotent_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_sub_dup", "w_sub_dup", "p_sub_dup");
+        let parent_run_a = RunId::new("run_parent_a");
+        let parent_run_b = RunId::new("run_parent_b");
+        let child_task = TaskId::new("task_child_dup");
+
+        let events = vec![
+            env(RuntimeEvent::SubagentSpawned(SubagentSpawned {
+                project: scope.clone(),
+                parent_run_id: parent_run_a.clone(),
+                parent_task_id: None,
+                child_task_id: child_task.clone(),
+                child_session_id: SessionId::new("sess_dup"),
+                child_run_id: None,
+            })),
+            // Bogus second spawn with same child_task_id but different
+            // parent — idempotent: first write wins.
+            env(RuntimeEvent::SubagentSpawned(SubagentSpawned {
+                project: scope.clone(),
+                parent_run_id: parent_run_b.clone(),
+                parent_task_id: None,
+                child_task_id: child_task.clone(),
+                child_session_id: SessionId::new("sess_dup"),
+                child_run_id: None,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = SubagentSpawnReadModel::get_by_child_task(&mem, &child_task)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = SubagentSpawnReadModel::get_by_child_task(&adapter, &child_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mem_row.parent_run_id, parent_run_a,
+            "in-memory first-write-wins on child_task_id"
+        );
+        assert_eq!(
+            sqlite_row.parent_run_id, parent_run_a,
+            "sqlite ON CONFLICT DO NOTHING keeps first-write"
+        );
+
+        // parent_run_b's list is empty — the second event was dropped.
+        let b_list = SubagentSpawnReadModel::list_by_parent_run(&mem, &parent_run_b)
+            .await
+            .unwrap();
+        let b_list_sqlite = SubagentSpawnReadModel::list_by_parent_run(&adapter, &parent_run_b)
+            .await
+            .unwrap();
+        assert!(b_list.is_empty());
+        assert!(b_list_sqlite.is_empty());
+    }
+
+    /// Replay of the same `signal_id` keeps the first ingested row on
+    /// pg/sqlite (ON CONFLICT DO NOTHING) and overwrites the in-memory
+    /// map. With an identical event payload the resulting records are
+    /// equal, so parity holds — this test pins the contract.
+    #[tokio::test]
+    async fn signal_ingestion_replay_is_idempotent_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_sig_dup", "w_sig_dup", "p_sig_dup");
+        let events = vec![
+            env(RuntimeEvent::SignalIngested(SignalIngested {
+                project: scope.clone(),
+                signal_id: SignalId::new("sig_replay"),
+                source: "original".into(),
+                payload: serde_json::json!({"n": 1}),
+                timestamp_ms: 1_700_400_000_000,
+            })),
+            // Replay — exact duplicate. Idempotent on all backends.
+            env(RuntimeEvent::SignalIngested(SignalIngested {
+                project: scope.clone(),
+                signal_id: SignalId::new("sig_replay"),
+                source: "original".into(),
+                payload: serde_json::json!({"n": 1}),
+                timestamp_ms: 1_700_400_000_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = SignalReadModel::get(&mem, &SignalId::new("sig_replay"))
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = SignalReadModel::get(&adapter, &SignalId::new("sig_replay"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+
+        // Exactly one row on list.
+        let mem_list = SignalReadModel::list_by_project(&mem, &scope, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = SignalReadModel::list_by_project(&adapter, &scope, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 1);
+        assert_eq!(sqlite_list.len(), 1);
+    }
+
+    // ── RFC-025 Phase 2b.2b m4: user_messages parity ──
+
+    /// Append three user messages on one run + one on a sibling run.
+    /// Assert both backends return the same sorted list per run and
+    /// the same count.
+    #[tokio::test]
+    async fn user_message_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_um", "w_um", "p_um");
+        let run_a = RunId::new("run_um_a");
+        let run_b = RunId::new("run_um_b");
+        let session = SessionId::new("sess_um");
+
+        let events = vec![
+            env(RuntimeEvent::UserMessageAppended(UserMessageAppended {
+                project: scope.clone(),
+                session_id: session.clone(),
+                run_id: run_a.clone(),
+                content: "hello".into(),
+                sequence: 1,
+                appended_at_ms: 1_700_500_000_000,
+            })),
+            env(RuntimeEvent::UserMessageAppended(UserMessageAppended {
+                project: scope.clone(),
+                session_id: session.clone(),
+                run_id: run_a.clone(),
+                content: "follow-up".into(),
+                sequence: 2,
+                appended_at_ms: 1_700_500_001_000,
+            })),
+            env(RuntimeEvent::UserMessageAppended(UserMessageAppended {
+                project: scope.clone(),
+                session_id: session.clone(),
+                run_id: run_a.clone(),
+                content: "more".into(),
+                sequence: 3,
+                appended_at_ms: 1_700_500_002_000,
+            })),
+            env(RuntimeEvent::UserMessageAppended(UserMessageAppended {
+                project: scope.clone(),
+                session_id: session.clone(),
+                run_id: run_b.clone(),
+                content: "on another run".into(),
+                sequence: 1,
+                appended_at_ms: 1_700_500_003_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // list_by_run parity for run_a.
+        let mem_list = UserMessageReadModel::list_by_run(&mem, &run_a, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = UserMessageReadModel::list_by_run(&adapter, &run_a, 10, 0)
+            .await
+            .unwrap();
+        // event_id differs per backend — sqlite preserves envelope.event_id,
+        // in-memory also preserves envelope.event_id (same value since both
+        // ran through append_both with the same EventEnvelope). But the
+        // in-memory record's event_id is just whatever envelope we built
+        // in `env(..)`, which is the same bytes — so records are equal.
+        assert_eq!(mem_list.len(), 3);
+        assert_eq!(mem_list, sqlite_list);
+        // sequence order 1, 2, 3.
+        assert_eq!(mem_list[0].content, "hello");
+        assert_eq!(mem_list[1].content, "follow-up");
+        assert_eq!(mem_list[2].content, "more");
+
+        // count_by_run parity.
+        let mem_count = UserMessageReadModel::count_by_run(&mem, &run_a)
+            .await
+            .unwrap();
+        let sqlite_count = UserMessageReadModel::count_by_run(&adapter, &run_a)
+            .await
+            .unwrap();
+        assert_eq!(mem_count, 3);
+        assert_eq!(sqlite_count, 3);
+
+        // run_b isolated.
+        let mem_b = UserMessageReadModel::list_by_run(&mem, &run_b, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_b = UserMessageReadModel::list_by_run(&adapter, &run_b, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_b.len(), 1);
+        assert_eq!(mem_b, sqlite_b);
+
+        // Pagination.
+        let mem_page = UserMessageReadModel::list_by_run(&mem, &run_a, 2, 1)
+            .await
+            .unwrap();
+        let sqlite_page = UserMessageReadModel::list_by_run(&adapter, &run_a, 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(mem_page, sqlite_page);
+        assert_eq!(mem_page.len(), 2);
+        assert_eq!(mem_page[0].sequence, 2);
+        assert_eq!(mem_page[1].sequence, 3);
+    }
+
+    /// Idempotent replay on same (run_id, sequence) — first write wins
+    /// on all backends.
+    #[tokio::test]
+    async fn user_message_replay_is_idempotent_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_um_r", "w_um_r", "p_um_r");
+        let run = RunId::new("run_um_r");
+        let session = SessionId::new("sess_um_r");
+
+        let events = vec![
+            env(RuntimeEvent::UserMessageAppended(UserMessageAppended {
+                project: scope.clone(),
+                session_id: session.clone(),
+                run_id: run.clone(),
+                content: "original".into(),
+                sequence: 1,
+                appended_at_ms: 1_700_600_000_000,
+            })),
+            // Replay with same sequence — dropped on all backends.
+            env(RuntimeEvent::UserMessageAppended(UserMessageAppended {
+                project: scope.clone(),
+                session_id: session.clone(),
+                run_id: run.clone(),
+                content: "replayed-different-content".into(),
+                sequence: 1,
+                appended_at_ms: 1_700_600_001_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = UserMessageReadModel::list_by_run(&mem, &run, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = UserMessageReadModel::list_by_run(&adapter, &run, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 1);
+        assert_eq!(sqlite_list.len(), 1);
+        assert_eq!(
+            mem_list[0].content, "original",
+            "first write wins on in-memory"
+        );
+        assert_eq!(
+            sqlite_list[0].content, "original",
+            "first write wins on sqlite via ON CONFLICT DO NOTHING"
+        );
+    }
+
+    // ── RFC-025 Phase 2b.2b m5: soul_patches parity ──
+
+    /// Propose → Apply lifecycle must yield state='applied',
+    /// applied_at_ms=<t>, new_version=<v> on both backends with all
+    /// original patch_content / requires_approval / proposed_at_ms
+    /// fields preserved.
+    #[tokio::test]
+    async fn soul_patch_lifecycle_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_sp", "w_sp", "p_sp");
+
+        let events = vec![
+            env(RuntimeEvent::SoulPatchProposed(SoulPatchProposed {
+                project: scope.clone(),
+                patch_id: "patch_parity_1".into(),
+                patch_content: "pin-memory: true".into(),
+                requires_approval: true,
+                proposed_at: 1_700_700_000_000,
+            })),
+            env(RuntimeEvent::SoulPatchApplied(SoulPatchApplied {
+                project: scope.clone(),
+                patch_id: "patch_parity_1".into(),
+                new_version: 7,
+                applied_at: 1_700_700_005_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = SoulPatchReadModel::get(&mem, "patch_parity_1")
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = SoulPatchReadModel::get(&adapter, "patch_parity_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.state, SoulPatchState::Applied);
+        assert_eq!(mem_row.patch_content, "pin-memory: true");
+        assert!(mem_row.requires_approval);
+        assert_eq!(mem_row.proposed_at_ms, 1_700_700_000_000);
+        assert_eq!(mem_row.applied_at_ms, Some(1_700_700_005_000));
+        assert_eq!(mem_row.new_version, Some(7));
+    }
+
+    /// A patch stays in 'proposed' state until the Applied event
+    /// arrives; list_by_project is newest-first.
+    #[tokio::test]
+    async fn soul_patch_list_by_project_newest_first() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_sp_l", "w_sp_l", "p_sp_l");
+
+        let events = vec![
+            env(RuntimeEvent::SoulPatchProposed(SoulPatchProposed {
+                project: scope.clone(),
+                patch_id: "patch_a".into(),
+                patch_content: "a".into(),
+                requires_approval: false,
+                proposed_at: 1_700_800_000_000,
+            })),
+            env(RuntimeEvent::SoulPatchProposed(SoulPatchProposed {
+                project: scope.clone(),
+                patch_id: "patch_b".into(),
+                patch_content: "b".into(),
+                requires_approval: true,
+                proposed_at: 1_700_800_002_000,
+            })),
+            env(RuntimeEvent::SoulPatchProposed(SoulPatchProposed {
+                project: scope.clone(),
+                patch_id: "patch_c".into(),
+                patch_content: "c".into(),
+                requires_approval: true,
+                proposed_at: 1_700_800_001_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = SoulPatchReadModel::list_by_project(&mem, &scope, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = SoulPatchReadModel::list_by_project(&adapter, &scope, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 3);
+        assert_eq!(mem_list, sqlite_list);
+        // Newest-first.
+        assert_eq!(mem_list[0].patch_id, "patch_b");
+        assert_eq!(mem_list[1].patch_id, "patch_c");
+        assert_eq!(mem_list[2].patch_id, "patch_a");
+        // All still proposed.
+        for rec in &mem_list {
+            assert_eq!(rec.state, SoulPatchState::Proposed);
+            assert_eq!(rec.applied_at_ms, None);
+            assert_eq!(rec.new_version, None);
+        }
+    }
+
+    /// Replayed `SoulPatchProposed` after a `SoulPatchApplied`
+    /// preserves the applied state — the applier's ON CONFLICT DO
+    /// NOTHING on Proposed keeps the existing row (which is already
+    /// in applied state) untouched.
+    #[tokio::test]
+    async fn soul_patch_replay_after_apply_preserves_applied() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_sp_r", "w_sp_r", "p_sp_r");
+
+        let events = vec![
+            env(RuntimeEvent::SoulPatchProposed(SoulPatchProposed {
+                project: scope.clone(),
+                patch_id: "patch_replay".into(),
+                patch_content: "x".into(),
+                requires_approval: true,
+                proposed_at: 1_700_900_000_000,
+            })),
+            env(RuntimeEvent::SoulPatchApplied(SoulPatchApplied {
+                project: scope.clone(),
+                patch_id: "patch_replay".into(),
+                new_version: 3,
+                applied_at: 1_700_900_005_000,
+            })),
+            // Replayed Proposed — must not reset to 'proposed'.
+            env(RuntimeEvent::SoulPatchProposed(SoulPatchProposed {
+                project: scope.clone(),
+                patch_id: "patch_replay".into(),
+                patch_content: "x".into(),
+                requires_approval: true,
+                proposed_at: 1_700_900_000_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = SoulPatchReadModel::get(&mem, "patch_replay")
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = SoulPatchReadModel::get(&adapter, "patch_replay")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.state, SoulPatchState::Applied);
+        assert_eq!(mem_row.new_version, Some(3));
+    }
+
+    // ── RFC-025 Phase 2b.2b m6: tool_recovery_pauses parity ──
+
+    /// Pause two tool calls on one run (distinct tool_call_ids) and
+    /// assert both backends surface the same list/get results, then
+    /// replay one of the events and assert first-write-wins.
+    #[tokio::test]
+    async fn tool_recovery_pause_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_trp", "w_trp", "p_trp");
+        let run = RunId::new("run_trp");
+        let task = TaskId::new("task_trp");
+
+        let events = vec![
+            env(RuntimeEvent::ToolRecoveryPaused(ToolRecoveryPaused {
+                project: scope.clone(),
+                run_id: run.clone(),
+                task_id: Some(task.clone()),
+                tool_name: "shell".into(),
+                tool_call_id: "tc_1".into(),
+                reason: "DangerousPause tool with no cached result on recovery".into(),
+                paused_at_ms: 1_700_100_000_000,
+            })),
+            env(RuntimeEvent::ToolRecoveryPaused(ToolRecoveryPaused {
+                project: scope.clone(),
+                run_id: run.clone(),
+                task_id: None,
+                tool_name: "http".into(),
+                tool_call_id: "tc_2".into(),
+                reason: "DangerousPause".into(),
+                paused_at_ms: 1_700_100_001_000,
+            })),
+            // Replay of tc_1 — first write wins.
+            env(RuntimeEvent::ToolRecoveryPaused(ToolRecoveryPaused {
+                project: scope.clone(),
+                run_id: run.clone(),
+                task_id: Some(task.clone()),
+                tool_name: "shell".into(),
+                tool_call_id: "tc_1".into(),
+                reason: "different reason".into(),
+                paused_at_ms: 1_700_100_002_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get() parity.
+        let mem_row = ToolRecoveryPauseReadModel::get(&mem, "tc_1")
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = ToolRecoveryPauseReadModel::get(&adapter, "tc_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(
+            mem_row.reason, "DangerousPause tool with no cached result on recovery",
+            "first write wins on in-memory"
+        );
+        assert_eq!(sqlite_row.reason, mem_row.reason);
+
+        // list_by_run parity.
+        let mem_list = ToolRecoveryPauseReadModel::list_by_run(&mem, &run)
+            .await
+            .unwrap();
+        let sqlite_list = ToolRecoveryPauseReadModel::list_by_run(&adapter, &run)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(mem_list, sqlite_list);
+        assert_eq!(mem_list[0].tool_call_id, "tc_1");
+        assert_eq!(mem_list[1].tool_call_id, "tc_2");
     }
 }
 

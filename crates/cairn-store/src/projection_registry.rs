@@ -773,8 +773,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "EventLogCompacted",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (event-log compaction audit)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Event-log compaction is a single-shot maintenance operation — the compaction boundary is visible in `event_log` via the first remaining position; no dedicated read-model row is needed and no operator UI queries by compaction timestamp.",
         },
     },
     ProjectionEntry {
@@ -1029,20 +1029,20 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "RecoveryEscalated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (recovery escalation audit)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "The event carries no tenant_id so a tenant-scoped read-model projection would require a new event version (domain change). Until then the `RecoveryEscalationReadModel` in-memory impl keeps the observability-only contract: escalations surface via SSE + metrics and the event log is the audit trail. Revisit post-v0.1 when RecoveryEscalated gains tenant_id.",
         },
     },
     ProjectionEntry {
         variant: "ResourceShareRevoked",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (resource sharing)",
+        status: ProjectionStatus::Projected {
+            table: Some("resource_shares"),
         },
     },
     ProjectionEntry {
         variant: "ResourceShared",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (resource sharing)",
+        status: ProjectionStatus::Projected {
+            table: Some("resource_shares"),
         },
     },
     ProjectionEntry {
@@ -1083,20 +1083,20 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "SignalIngested",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (signal ingest)",
+        status: ProjectionStatus::Projected {
+            table: Some("signal_ingestions"),
         },
     },
     ProjectionEntry {
         variant: "SoulPatchApplied",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (soul patches)",
+        status: ProjectionStatus::Projected {
+            table: Some("soul_patches"),
         },
     },
     ProjectionEntry {
         variant: "SoulPatchProposed",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (soul patches)",
+        status: ProjectionStatus::Projected {
+            table: Some("soul_patches"),
         },
     },
     ProjectionEntry {
@@ -1107,8 +1107,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "SubagentSpawned",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (subagents — RFC 014 parent/child run graph)",
+        status: ProjectionStatus::Projected {
+            table: Some("subagent_spawns"),
         },
     },
     ProjectionEntry {
@@ -1125,14 +1125,14 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "ToolRecoveryPaused",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (tool recovery audit)",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_recovery_pauses"),
         },
     },
     ProjectionEntry {
         variant: "UserMessageAppended",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (user messages)",
+        status: ProjectionStatus::Projected {
+            table: Some("user_messages"),
         },
     },
 ];
@@ -1243,15 +1243,17 @@ mod tests {
             !stubbed.is_empty(),
             "Phase 1 should surface at least one stubbed variant (Phase 2a/2b backlog)"
         );
-        // Spot-check variants still in the Stubbed bucket post-Phase-2b.1 m4.
-        // These stay Stubbed and are tracked as Phase 2b.2 follow-ups
-        // (skills, plugins, subagents, soul-patches, external-workers,
-        // signal-ingest, user-messages, tool-recovery-paused,
-        // recovery-escalated, event-log-compacted, resource-share).
-        for required in ["SubagentSpawned", "SoulPatchProposed", "SignalIngested"] {
+        // Spot-check variants still in the Stubbed bucket post-Phase-2b.2b.
+        // Resource-sharing + signal-ingest migrated in 2b.2b m1/m2; the
+        // skills + plugins surface is deliberately deferred to a
+        // follow-up PR (needs net-new `RuntimeEvent` variants — see
+        // issue #574 "needs new events before projection can land").
+        // Defaults / channels / provider-health / route-policy-Updated
+        // stay in the Stubbed bucket until later phases.
+        for required in ["DefaultSettingSet", "ChannelCreated"] {
             assert!(
                 stubbed.contains(&required),
-                "{required} should still be Stubbed post-Phase-2b.1 (Phase 2b.2 follow-up)"
+                "{required} should still be Stubbed post-Phase-2b.2b (later phase follow-up)"
             );
         }
         // Confirm Phase-1 eval migrations stayed out of Stubbed.
@@ -1375,17 +1377,46 @@ mod tests {
         //     `external_workers` (pg V049 — renumbered from V045 after
         //     Phase 2a.2 took V045-V048; sqlite schema.rs).
         //     Net: +4 Projected, -4 Stubbed → 95 / 18 / 45.
+        //   * Phase 2b.2b milestone 1 flips `ResourceShared` +
+        //     `ResourceShareRevoked` Stubbed → Projected with backing
+        //     table `resource_shares` (pg V051 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 97 / 18 / 43.
+        //   * Phase 2b.2b milestone 2 flips `SignalIngested` Stubbed →
+        //     Projected with backing table `signal_ingestions` (pg V052
+        //     + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 98 / 18 / 42.
+        //   * Phase 2b.2b milestone 3 flips `SubagentSpawned` Stubbed →
+        //     Projected with backing table `subagent_spawns` (pg V053
+        //     + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 99 / 18 / 41.
+        //   * Phase 2b.2b milestone 4 flips `UserMessageAppended`
+        //     Stubbed → Projected with backing table `user_messages`
+        //     (pg V054 + sqlite schema.rs). Net: +1 Projected,
+        //     -1 Stubbed → 100 / 18 / 40.
+        //   * Phase 2b.2b milestone 5 flips `SoulPatchProposed` +
+        //     `SoulPatchApplied` Stubbed → Projected with backing
+        //     table `soul_patches` (pg V055 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 102 / 18 / 38.
+        //   * Phase 2b.2b milestone 6 flips `ToolRecoveryPaused`
+        //     Stubbed → Projected with backing table
+        //     `tool_recovery_pauses` (pg V056 + sqlite schema.rs),
+        //     and flips `EventLogCompacted` + `RecoveryEscalated`
+        //     Stubbed → Ephemeral (see registry comments for each on
+        //     why no read-model row is needed / achievable without
+        //     domain changes).
+        //     Net: +1 Projected, +2 Ephemeral, -3 Stubbed
+        //     → 103 / 20 / 35.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 95,
+            projected, 103,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
-            ephemeral, 18,
+            ephemeral, 20,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 45, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 35, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 
@@ -1394,9 +1425,12 @@ mod tests {
         let err = assert_no_stubs_for_persistent_backend(Backend::Postgres).unwrap_err();
         let msg = err.to_string();
         // Audits + scheduled tasks + outcomes + plan-reviews + external
-        // workers all left the Stubbed bucket in Phases 2b.1/2b.2. Pick
-        // a Phase 2b.3+ variant that still lives there.
-        assert!(msg.contains("SubagentSpawned"));
+        // workers + resource-sharing + signal-ingest + subagents +
+        // soul-patches + user-messages + tool-recovery-paused +
+        // recovery-escalated + event-log-compacted all left the Stubbed
+        // bucket in Phases 2b.1/2b.2/2b.2b. Pick a later-phase variant
+        // that still lives there.
+        assert!(msg.contains("DefaultSettingSet"));
         assert!(msg.contains("Postgres") || msg.contains("postgres"));
     }
 }

@@ -1140,4 +1140,122 @@ CREATE TABLE IF NOT EXISTS external_workers (
 
 CREATE INDEX IF NOT EXISTS idx_external_workers_tenant
     ON external_workers (tenant_id, registered_at, worker_id);
+
+-- RFC-025 Phase 2b.2b m1: resource_shares parity table (pg V051).
+-- `permissions_json` is a JSON array stored as TEXT (no pg arrays, no
+-- JSONB) — portable across backends. `ResourceShareRevoked` DELETEs the
+-- row (matches the in-memory applier's `remove`).
+CREATE TABLE IF NOT EXISTS resource_shares (
+    share_id              TEXT    PRIMARY KEY,
+    tenant_id             TEXT    NOT NULL,
+    source_workspace_id   TEXT    NOT NULL,
+    target_workspace_id   TEXT    NOT NULL,
+    resource_type         TEXT    NOT NULL,
+    resource_id           TEXT    NOT NULL,
+    permissions_json      TEXT    NOT NULL DEFAULT '[]',
+    shared_at_ms          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_shares_target
+    ON resource_shares (tenant_id, target_workspace_id, shared_at_ms, share_id);
+
+CREATE INDEX IF NOT EXISTS idx_resource_shares_resource
+    ON resource_shares (tenant_id, target_workspace_id, resource_type, resource_id);
+
+-- RFC-025 Phase 2b.2b m2: signal_ingestions parity table (pg V052).
+-- `payload_json` is the event payload serialized as TEXT (no JSONB).
+-- Before this table, `GET /v1/signals` returned empty across restarts
+-- on pg/sqlite because SignalIngested was log_stubbed.
+CREATE TABLE IF NOT EXISTS signal_ingestions (
+    signal_id      TEXT    PRIMARY KEY,
+    tenant_id      TEXT    NOT NULL,
+    workspace_id   TEXT    NOT NULL,
+    project_id     TEXT    NOT NULL,
+    source         TEXT    NOT NULL,
+    payload_json   TEXT    NOT NULL DEFAULT 'null',
+    timestamp_ms   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_ingestions_project
+    ON signal_ingestions (tenant_id, workspace_id, project_id, timestamp_ms, signal_id);
+
+-- RFC-025 Phase 2b.2b m3: subagent_spawns parity table (pg V053 — RFC 014).
+CREATE TABLE IF NOT EXISTS subagent_spawns (
+    child_task_id     TEXT    PRIMARY KEY,
+    tenant_id         TEXT    NOT NULL,
+    workspace_id      TEXT    NOT NULL,
+    project_id        TEXT    NOT NULL,
+    parent_run_id     TEXT    NOT NULL,
+    parent_task_id    TEXT,
+    child_session_id  TEXT    NOT NULL,
+    child_run_id      TEXT,
+    spawned_at_ms     INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_subagent_spawns_parent_run
+    ON subagent_spawns (parent_run_id, spawned_at_ms, child_task_id);
+
+CREATE INDEX IF NOT EXISTS idx_subagent_spawns_project
+    ON subagent_spawns (tenant_id, workspace_id, project_id, spawned_at_ms, child_task_id);
+
+-- RFC-025 Phase 2b.2b m4: user_messages parity table (pg V054).
+CREATE TABLE IF NOT EXISTS user_messages (
+    run_id          TEXT    NOT NULL,
+    sequence        INTEGER NOT NULL,
+    tenant_id       TEXT    NOT NULL,
+    workspace_id    TEXT    NOT NULL,
+    project_id      TEXT    NOT NULL,
+    session_id      TEXT    NOT NULL,
+    event_id        TEXT    NOT NULL,
+    content         TEXT    NOT NULL DEFAULT '',
+    appended_at_ms  INTEGER NOT NULL,
+    PRIMARY KEY (run_id, sequence)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_messages_event_id
+    ON user_messages (event_id);
+
+CREATE INDEX IF NOT EXISTS idx_user_messages_session
+    ON user_messages (session_id, appended_at_ms, run_id, sequence);
+
+-- RFC-025 Phase 2b.2b m5: soul_patches parity table (pg V055).
+-- `requires_approval` maps BOOLEAN → INTEGER 0/1 on sqlite.
+CREATE TABLE IF NOT EXISTS soul_patches (
+    patch_id            TEXT    PRIMARY KEY,
+    tenant_id           TEXT    NOT NULL,
+    workspace_id        TEXT    NOT NULL,
+    project_id          TEXT    NOT NULL,
+    state               TEXT    NOT NULL DEFAULT 'proposed',
+    patch_content       TEXT    NOT NULL DEFAULT '',
+    requires_approval   INTEGER NOT NULL DEFAULT 1,
+    proposed_at_ms      INTEGER NOT NULL DEFAULT 0,
+    applied_at_ms       INTEGER,
+    new_version         INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_soul_patches_project
+    ON soul_patches (tenant_id, workspace_id, project_id, proposed_at_ms DESC, patch_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_soul_patches_state
+    ON soul_patches (state, proposed_at_ms, patch_id);
+
+-- RFC-025 Phase 2b.2b m6: tool_recovery_pauses parity table (pg V056).
+-- RFC 020 Track 3 audit: tool calls paused on recovery as DangerousPause.
+CREATE TABLE IF NOT EXISTS tool_recovery_pauses (
+    tool_call_id   TEXT    PRIMARY KEY,
+    tenant_id      TEXT    NOT NULL,
+    workspace_id   TEXT    NOT NULL,
+    project_id     TEXT    NOT NULL,
+    run_id         TEXT    NOT NULL,
+    task_id        TEXT,
+    tool_name      TEXT    NOT NULL,
+    reason         TEXT    NOT NULL,
+    paused_at_ms   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_recovery_pauses_run
+    ON tool_recovery_pauses (run_id, paused_at_ms, tool_call_id);
+
+CREATE INDEX IF NOT EXISTS idx_tool_recovery_pauses_project
+    ON tool_recovery_pauses (tenant_id, workspace_id, project_id, paused_at_ms, tool_call_id);
 "#;

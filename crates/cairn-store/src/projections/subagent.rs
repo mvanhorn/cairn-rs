@@ -1,0 +1,47 @@
+//! RFC 014 / RFC-025 Phase 2b.2b m3: read-model for subagent spawn linkage.
+//!
+//! `SubagentSpawned` records the parent→child linkage when an agent
+//! creates a subagent task. The cairn-store projection captures the
+//! spawn event itself (distinct from the `tasks` row's
+//! `parent_run_id` / `parent_task_id` fields which the in-memory
+//! applier also updates), giving operator dashboards a row-per-spawn
+//! audit surface without walking the event log.
+
+use async_trait::async_trait;
+use cairn_domain::tenancy::ProjectKey;
+use cairn_domain::{RunId, SessionId, TaskId};
+
+use crate::error::StoreError;
+
+/// One row per `SubagentSpawned` event. `spawned_at_ms` is the
+/// projection-time wall clock (millisecond) captured by the applier,
+/// mirroring the pattern used by `SessionCreated` + `RunCreated`
+/// which also have no on-event timestamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentSpawnRecord {
+    pub child_task_id: TaskId,
+    pub project: ProjectKey,
+    pub parent_run_id: RunId,
+    pub parent_task_id: Option<TaskId>,
+    pub child_session_id: SessionId,
+    pub child_run_id: Option<RunId>,
+    pub spawned_at_ms: u64,
+}
+
+#[async_trait]
+pub trait SubagentSpawnReadModel: Send + Sync {
+    /// Look up the spawn record by child task id. Used by the
+    /// orchestrator to resolve the parent lineage on subagent
+    /// completion.
+    async fn get_by_child_task(
+        &self,
+        child_task_id: &TaskId,
+    ) -> Result<Option<SubagentSpawnRecord>, StoreError>;
+
+    /// Enumerate all subagents spawned from a single parent run, in
+    /// `(spawned_at_ms ASC, child_task_id ASC)` order.
+    async fn list_by_parent_run(
+        &self,
+        parent_run_id: &RunId,
+    ) -> Result<Vec<SubagentSpawnRecord>, StoreError>;
+}

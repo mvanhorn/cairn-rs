@@ -423,8 +423,79 @@ impl PgSyncProjection {
             // `.claude/audit-state/review-queue.md` §T2-H3. If you land on
             // this warning in production, extend this applier to cover the
             // specific variant and its projection table(s).
-            RuntimeEvent::SoulPatchProposed(_) => log_stub("SoulPatchProposed"),
-            RuntimeEvent::SoulPatchApplied(_) => log_stub("SoulPatchApplied"),
+            // RFC-025 Phase 2b.2b m5: soul_patches projection. Proposed
+            // inserts a new row in state='proposed'; a replayed Proposed
+            // with the same patch_id keeps the existing row (ON CONFLICT
+            // DO NOTHING) — state intentionally does NOT reset to
+            // 'proposed' on replay, so a replayed Proposed after an
+            // Applied preserves the applied state.
+            RuntimeEvent::SoulPatchProposed(e) => {
+                let proposed_at = i64::try_from(e.proposed_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SoulPatchProposed.proposed_at {} exceeds i64::MAX",
+                        e.proposed_at
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO soul_patches (
+                        patch_id, tenant_id, workspace_id, project_id,
+                        state, patch_content, requires_approval,
+                        proposed_at_ms
+                     ) VALUES ($1, $2, $3, $4, 'proposed', $5, $6, $7)
+                     ON CONFLICT (patch_id) DO NOTHING",
+                )
+                .bind(&e.patch_id)
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.patch_content)
+                .bind(e.requires_approval)
+                .bind(proposed_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // Applied UPSERTs state='applied' + applied_at + new_version.
+            // Out-of-order delivery (Applied before Proposed — shouldn't
+            // happen under the service contract but the applier is
+            // defensive) synthesises a minimal row with proposed_at_ms=0
+            // and requires_approval=false so the row exists with state
+            // 'applied'. The project triplet is taken from the event's
+            // own ProjectKey.
+            RuntimeEvent::SoulPatchApplied(e) => {
+                let applied_at = i64::try_from(e.applied_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SoulPatchApplied.applied_at {} exceeds i64::MAX",
+                        e.applied_at
+                    ))
+                })?;
+                let new_version = i32::try_from(e.new_version).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SoulPatchApplied.new_version {} exceeds i32::MAX",
+                        e.new_version
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO soul_patches (
+                        patch_id, tenant_id, workspace_id, project_id,
+                        state, patch_content, requires_approval,
+                        proposed_at_ms, applied_at_ms, new_version
+                     ) VALUES ($1, $2, $3, $4, 'applied', '', FALSE, 0, $5, $6)
+                     ON CONFLICT (patch_id) DO UPDATE SET
+                        state         = 'applied',
+                        applied_at_ms = EXCLUDED.applied_at_ms,
+                        new_version   = EXCLUDED.new_version",
+                )
+                .bind(&e.patch_id)
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(applied_at)
+                .bind(new_version)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // F29 CD-2: upsert the per-session record + fold into the
             // project/workspace rollups in the same transaction. All three
             // upserts succeed together or the whole event append rolls
@@ -450,7 +521,62 @@ impl PgSyncProjection {
             }
             RuntimeEvent::RunCostUpdated(_) => log_stub("RunCostUpdated"),
             RuntimeEvent::SpendAlertTriggered(_) => log_stub("SpendAlertTriggered"),
-            RuntimeEvent::SubagentSpawned(_) => log_stub("SubagentSpawned"),
+            // RFC-025 Phase 2b.2b m3: subagent_spawns projection (RFC 014).
+            // Keyed on child_task_id (every spawn creates a distinct
+            // child task). Replay is idempotent via ON CONFLICT DO
+            // NOTHING — replaying a spawn event on an already-spawned
+            // child_task_id is a no-op, mirroring the in-memory applier
+            // which safely overwrites the same parent linkage.
+            //
+            // Parity with in-memory (in_memory.rs `SubagentSpawned`
+            // arm): also UPDATEs the child task's `parent_run_id` and
+            // `parent_task_id` columns on `tasks` so persistent-backend
+            // reads expose the same parent lineage as the in-memory
+            // store (Gemini PR #593 review). If the child task row
+            // doesn't exist yet (spawn arrives before TaskCreated),
+            // the UPDATE is a no-op and a subsequent TaskCreated
+            // projection will NOT back-fill the parent linkage —
+            // matches the in-memory `if let Some(rec) =
+            // state.tasks.get_mut` behaviour.
+            RuntimeEvent::SubagentSpawned(e) => {
+                sqlx::query(
+                    "INSERT INTO subagent_spawns (
+                        child_task_id, tenant_id, workspace_id, project_id,
+                        parent_run_id, parent_task_id, child_session_id,
+                        child_run_id, spawned_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT (child_task_id) DO NOTHING",
+                )
+                .bind(e.child_task_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.parent_run_id.as_str())
+                .bind(e.parent_task_id.as_ref().map(|t| t.as_str()))
+                .bind(e.child_session_id.as_str())
+                .bind(e.child_run_id.as_ref().map(|r| r.as_str()))
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+
+                // Mirror the in-memory applier's task linkage update.
+                sqlx::query(
+                    "UPDATE tasks
+                        SET parent_run_id  = $1,
+                            parent_task_id = $2,
+                            version        = version + 1,
+                            updated_at     = $3
+                      WHERE task_id = $4",
+                )
+                .bind(e.parent_run_id.as_str())
+                .bind(e.parent_task_id.as_ref().map(|t| t.as_str()))
+                .bind(now)
+                .bind(e.child_task_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // F39: durable projections for RFC 002 recovery audits.
             // Keys on envelope event_id so replay is idempotent. Nullable
             // run_id/task_id/boot_id mirror the event struct exactly; the
@@ -499,8 +625,82 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::SignalIngested(_) => log_stub("SignalIngested"),
-            RuntimeEvent::UserMessageAppended(_) => log_stub("UserMessageAppended"),
+            // RFC-025 Phase 2b.2b m2: signal_ingestions projection.
+            // Mirrors the in-memory `signals` map exactly; ON CONFLICT
+            // DO NOTHING keeps replay idempotent. `payload` is
+            // serialised as JSON text for portability (no pg JSONB —
+            // keeps SQLite parity trivial).
+            RuntimeEvent::SignalIngested(e) => {
+                let timestamp_ms = i64::try_from(e.timestamp_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "SignalIngested.timestamp_ms {} exceeds i64::MAX",
+                        e.timestamp_ms
+                    ))
+                })?;
+                let payload_json = serde_json::to_string(&e.payload).map_err(|err| {
+                    StoreError::Internal(format!("SignalIngested.payload JSON encode: {err}"))
+                })?;
+                sqlx::query(
+                    "INSERT INTO signal_ingestions (
+                        signal_id, tenant_id, workspace_id, project_id,
+                        source, payload_json, timestamp_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     ON CONFLICT (signal_id) DO NOTHING",
+                )
+                .bind(e.signal_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.source)
+                .bind(&payload_json)
+                .bind(timestamp_ms)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC-025 Phase 2b.2b m4: user_messages projection. Keyed
+            // on (run_id, sequence) — a replay with the same (run_id,
+            // sequence) is a no-op (ON CONFLICT DO NOTHING). The
+            // secondary UNIQUE INDEX on event_id does NOT share this
+            // conflict path: a duplicate event_id for a DIFFERENT
+            // (run_id, sequence) will fail the transaction rather than
+            // silently dedupe. That is the intended behaviour — a
+            // duplicate event_id is a bug to surface, not a condition
+            // to swallow. In practice event_id is globally unique by
+            // construction so this is a safety rail only.
+            RuntimeEvent::UserMessageAppended(e) => {
+                let appended_at = i64::try_from(e.appended_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "UserMessageAppended.appended_at_ms {} exceeds i64::MAX",
+                        e.appended_at_ms
+                    ))
+                })?;
+                let sequence = i64::try_from(e.sequence).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "UserMessageAppended.sequence {} exceeds i64::MAX",
+                        e.sequence
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO user_messages (
+                        run_id, sequence, tenant_id, workspace_id, project_id,
+                        session_id, event_id, content, appended_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT (run_id, sequence) DO NOTHING",
+                )
+                .bind(e.run_id.as_str())
+                .bind(sequence)
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.session_id.as_str())
+                .bind(envelope.event_id.as_str())
+                .bind(&e.content)
+                .bind(appended_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::IngestJobStarted(_) => log_stub("IngestJobStarted"),
             RuntimeEvent::IngestJobCompleted(_) => log_stub("IngestJobCompleted"),
             // RFC-025 Phase 1 (milestone 3): `eval_runs` projection.
@@ -1202,7 +1402,11 @@ impl PgSyncProjection {
             RuntimeEvent::EvalDatasetCreated(_) => log_stub("EvalDatasetCreated"),
             RuntimeEvent::EvalDatasetEntryAdded(_) => log_stub("EvalDatasetEntryAdded"),
             RuntimeEvent::EvalRubricCreated(_) => log_stub("EvalRubricCreated"),
-            RuntimeEvent::EventLogCompacted(_) => log_stub("EventLogCompacted"),
+            // RFC-025 Phase 2b.2b m6: Ephemeral — the compaction
+            // boundary is recoverable from `event_log`'s first
+            // remaining position; no read-model table is needed. See
+            // `projection_registry.rs` for the full rationale.
+            RuntimeEvent::EventLogCompacted(_) => {}
             // RFC-025 Phase 2a.2 milestone 2: guardrail_policies projection.
             // `rules_json` stores `Vec<GuardrailRule>` serialised as a JSON
             // array in a TEXT column — portable across pg/sqlite (no JSONB).
@@ -1465,9 +1669,65 @@ impl PgSyncProjection {
             RuntimeEvent::ProviderModelRegistered(_) => log_stub("ProviderModelRegistered"),
             RuntimeEvent::ProviderRecovered(_) => log_stub("ProviderRecovered"),
             RuntimeEvent::ProviderRetryPolicySet(_) => log_stub("ProviderRetryPolicySet"),
-            RuntimeEvent::RecoveryEscalated(_) => log_stub("RecoveryEscalated"),
-            RuntimeEvent::ResourceShareRevoked(_) => log_stub("ResourceShareRevoked"),
-            RuntimeEvent::ResourceShared(_) => log_stub("ResourceShared"),
+            // RFC-025 Phase 2b.2b m6: Ephemeral — the event carries
+            // no tenant_id so a tenant-scoped read-model cannot be
+            // built without a domain-layer event version bump.
+            // Escalations surface via SSE + metrics + the event log
+            // itself. See `projection_registry.rs` for the rationale.
+            RuntimeEvent::RecoveryEscalated(_) => {}
+            // RFC-025 Phase 2b.2b m1: resource_shares projection.
+            //
+            // `ResourceShared` inserts a new row with `ON CONFLICT
+            // (share_id) DO NOTHING`. The conflict path fires only
+            // when the row already exists (immediate replay or
+            // out-of-order delivery of the same Shared event); a
+            // `Shared → Revoked → (replayed Shared)` sequence RE-
+            // inserts the row because the Revoke DELETEd it — both
+            // the in-memory `HashMap::insert` and the pg ON CONFLICT
+            // path agree on this, so cross-backend parity holds. See
+            // the `resource_share_replay_after_revoke_*` parity test
+            // for the pinned contract. `ResourceShareRevoked` DELETEs
+            // the row, mirroring the in-memory `remove(&share_id)`.
+            // `permissions` is serialised as a JSON array string for
+            // portability (no pg arrays, no JSONB).
+            RuntimeEvent::ResourceShared(e) => {
+                let shared_at = i64::try_from(e.shared_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ResourceShared.shared_at_ms {} exceeds i64::MAX",
+                        e.shared_at_ms
+                    ))
+                })?;
+                let permissions_json = serde_json::to_string(&e.permissions).map_err(|err| {
+                    StoreError::Internal(format!(
+                        "ResourceShared.permissions JSON encode: {err}"
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO resource_shares (
+                        share_id, tenant_id, source_workspace_id, target_workspace_id,
+                        resource_type, resource_id, permissions_json, shared_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (share_id) DO NOTHING",
+                )
+                .bind(&e.share_id)
+                .bind(e.tenant_id.as_str())
+                .bind(e.source_workspace_id.as_str())
+                .bind(e.target_workspace_id.as_str())
+                .bind(&e.resource_type)
+                .bind(&e.resource_id)
+                .bind(&permissions_json)
+                .bind(shared_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ResourceShareRevoked(e) => {
+                sqlx::query("DELETE FROM resource_shares WHERE share_id = $1")
+                    .bind(&e.share_id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::RoutePolicyUpdated(_) => log_stub("RoutePolicyUpdated"),
             // Projection contract: one row per `ToolInvocationCacheHit`
             // keyed by `invocation_id`. Operators query cache activity
@@ -1509,7 +1769,37 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ToolRecoveryPaused(_) => log_stub("ToolRecoveryPaused"),
+            // RFC-025 Phase 2b.2b m6: tool_recovery_pauses projection
+            // (RFC 020 Track 3). Keyed on tool_call_id — each pause
+            // targets exactly one tool call. ON CONFLICT DO NOTHING so
+            // a replayed event is a no-op.
+            RuntimeEvent::ToolRecoveryPaused(e) => {
+                let paused_at = i64::try_from(e.paused_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ToolRecoveryPaused.paused_at_ms {} exceeds i64::MAX",
+                        e.paused_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO tool_recovery_pauses (
+                        tool_call_id, tenant_id, workspace_id, project_id,
+                        run_id, task_id, tool_name, reason, paused_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT (tool_call_id) DO NOTHING",
+                )
+                .bind(&e.tool_call_id)
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.run_id.as_str())
+                .bind(e.task_id.as_ref().map(|t| t.as_str()))
+                .bind(&e.tool_name)
+                .bind(&e.reason)
+                .bind(paused_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
 
             // #364: durable projection of `ToolInvocationProgressUpdated`
             // so `GET /v1/tool-invocations/:id/progress` can answer

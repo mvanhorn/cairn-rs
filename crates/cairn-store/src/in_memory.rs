@@ -240,6 +240,29 @@ struct State {
     /// in-memory — `GET /v1/runs/:id/plan` had zero authoritative
     /// state to read from.
     plan_reviews: HashMap<String, crate::projections::PlanReviewRecord>,
+    /// RFC-025 Phase 2b.2b m3: subagent spawn audit (RFC 014).
+    /// Keyed by `child_task_id`. Mirror of the `subagent_spawns`
+    /// pg/sqlite table. Pre-Phase-2b.2b the in-memory applier updated
+    /// only the child's `tasks` row; this map captures the spawn
+    /// event itself so operator dashboards can enumerate a run's
+    /// subagent graph without walking the event log.
+    subagent_spawns: HashMap<String, crate::projections::SubagentSpawnRecord>,
+    /// RFC-025 Phase 2b.2b m4: user message projection.
+    /// Keyed by `(run_id, sequence)`. Mirror of the `user_messages`
+    /// pg/sqlite table. Pre-Phase-2b.2b `GET /v1/runs/:id/messages`
+    /// walked the event log on every call — this map turns the read
+    /// into O(messages-in-run) instead of O(events-total).
+    user_messages: HashMap<(String, u64), crate::projections::UserMessageRecord>,
+    /// RFC-025 Phase 2b.2b m5: soul patch lifecycle projection.
+    /// Keyed by `patch_id`. Mirror of the `soul_patches` pg/sqlite
+    /// table. Pre-Phase-2b.2b both `SoulPatchProposed` and
+    /// `SoulPatchApplied` were no-ops on every backend — no durable
+    /// state carried the proposal audit trail.
+    soul_patches: HashMap<String, crate::projections::SoulPatchRecord>,
+    /// RFC-025 Phase 2b.2b m6: tool-recovery pause audit (RFC 020
+    /// Track 3). Keyed by `tool_call_id`. Mirror of the
+    /// `tool_recovery_pauses` pg/sqlite table.
+    tool_recovery_pauses: HashMap<String, crate::projections::ToolRecoveryPauseRecord>,
 }
 
 pub struct InMemoryStore {
@@ -359,6 +382,10 @@ impl InMemoryStore {
                 trigger_fires: Vec::new(),
                 audit_log_entries: HashMap::new(),
                 plan_reviews: HashMap::new(),
+                subagent_spawns: HashMap::new(),
+                user_messages: HashMap::new(),
+                soul_patches: HashMap::new(),
+                tool_recovery_pauses: HashMap::new(),
             }),
             usage_counters: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
@@ -791,7 +818,44 @@ impl InMemoryStore {
                     rec.updated_at = now;
                 }
             }
-            RuntimeEvent::SoulPatchProposed(_) | RuntimeEvent::SoulPatchApplied(_) => {}
+            // RFC-025 Phase 2b.2b m5: soul_patches projection. Proposed
+            // inserts a proposed-state row (first-write-wins on replay);
+            // Applied upgrades the state + applied_at + new_version
+            // in-place. An out-of-order Applied-before-Proposed
+            // synthesises a minimal row in 'applied' state.
+            RuntimeEvent::SoulPatchProposed(e) => {
+                state
+                    .soul_patches
+                    .entry(e.patch_id.clone())
+                    .or_insert_with(|| crate::projections::SoulPatchRecord {
+                        patch_id: e.patch_id.clone(),
+                        project: e.project.clone(),
+                        state: crate::projections::SoulPatchState::Proposed,
+                        patch_content: e.patch_content.clone(),
+                        requires_approval: e.requires_approval,
+                        proposed_at_ms: e.proposed_at,
+                        applied_at_ms: None,
+                        new_version: None,
+                    });
+            }
+            RuntimeEvent::SoulPatchApplied(e) => {
+                let rec = state
+                    .soul_patches
+                    .entry(e.patch_id.clone())
+                    .or_insert_with(|| crate::projections::SoulPatchRecord {
+                        patch_id: e.patch_id.clone(),
+                        project: e.project.clone(),
+                        state: crate::projections::SoulPatchState::Applied,
+                        patch_content: String::new(),
+                        requires_approval: false,
+                        proposed_at_ms: 0,
+                        applied_at_ms: Some(e.applied_at),
+                        new_version: Some(e.new_version),
+                    });
+                rec.state = crate::projections::SoulPatchState::Applied;
+                rec.applied_at_ms = Some(e.applied_at);
+                rec.new_version = Some(e.new_version);
+            }
             RuntimeEvent::SpendAlertTriggered(_) => {}
             RuntimeEvent::RunCostUpdated(e) => {
                 // Accumulate run cost from directly appended RunCostUpdated events.
@@ -1739,24 +1803,73 @@ impl InMemoryStore {
                 ws.provider_calls = ws.provider_calls.saturating_add(1);
                 ws.updated_at_ms = now;
             }
-            // RFC 005: link child task to parent run/task on subagent spawn.
+            // RFC 005 + RFC-025 Phase 2b.2b m3: link child task to
+            // parent run/task and record the spawn audit row.
             RuntimeEvent::SubagentSpawned(e) => {
                 if let Some(rec) = state.tasks.get_mut(e.child_task_id.as_str()) {
                     rec.parent_run_id = Some(e.parent_run_id.clone());
                     rec.parent_task_id = e.parent_task_id.clone();
                     rec.updated_at = now;
                 }
+                // Idempotent on replay via `or_insert_with` — the first
+                // delivery wins, a replayed event leaves the row
+                // untouched (mirrors ON CONFLICT DO NOTHING on pg/sqlite).
+                state
+                    .subagent_spawns
+                    .entry(e.child_task_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::SubagentSpawnRecord {
+                        child_task_id: e.child_task_id.clone(),
+                        project: e.project.clone(),
+                        parent_run_id: e.parent_run_id.clone(),
+                        parent_task_id: e.parent_task_id.clone(),
+                        child_session_id: e.child_session_id.clone(),
+                        child_run_id: e.child_run_id.clone(),
+                        spawned_at_ms: now,
+                    });
             }
             // Audit/linkage events that don't update core projections.
             RuntimeEvent::CheckpointRestored(_)
             | RuntimeEvent::RecoveryAttempted(_)
             | RuntimeEvent::RecoveryCompleted(_)
-            | RuntimeEvent::UserMessageAppended(_)
-            // RFC 020 Track 3: audit-only events; no in-memory projection update.
-            | RuntimeEvent::ToolRecoveryPaused(_)
             // RFC 020 Track 4: boot-level recovery audit event.
             | RuntimeEvent::RecoverySummaryEmitted(_)
             => {}
+
+            // RFC-025 Phase 2b.2b m6: tool_recovery_pauses projection
+            // (RFC 020 Track 3). Keyed by tool_call_id; first-write
+            // wins on replay.
+            RuntimeEvent::ToolRecoveryPaused(e) => {
+                state
+                    .tool_recovery_pauses
+                    .entry(e.tool_call_id.clone())
+                    .or_insert_with(|| crate::projections::ToolRecoveryPauseRecord {
+                        tool_call_id: e.tool_call_id.clone(),
+                        project: e.project.clone(),
+                        run_id: e.run_id.clone(),
+                        task_id: e.task_id.clone(),
+                        tool_name: e.tool_name.clone(),
+                        reason: e.reason.clone(),
+                        paused_at_ms: e.paused_at_ms,
+                    });
+            }
+
+            // RFC-025 Phase 2b.2b m4: user_messages projection. Keyed
+            // by `(run_id, sequence)` so a replayed append is
+            // idempotent — mirrors ON CONFLICT DO NOTHING on pg/sqlite.
+            RuntimeEvent::UserMessageAppended(e) => {
+                state
+                    .user_messages
+                    .entry((e.run_id.as_str().to_owned(), e.sequence))
+                    .or_insert_with(|| crate::projections::UserMessageRecord {
+                        run_id: e.run_id.clone(),
+                        sequence: e.sequence,
+                        project: e.project.clone(),
+                        session_id: e.session_id.clone(),
+                        event_id: event.envelope.event_id.as_str().to_owned(),
+                        content: e.content.clone(),
+                        appended_at_ms: e.appended_at_ms,
+                    });
+            }
 
             // ── RFC-025 Phase 2b.1 m4: plan_reviews projection (RFC 018) ──
             // Parity with pg/sqlite arms. Creation inserts; resolution
@@ -3868,7 +3981,14 @@ impl SignalReadModel for InMemoryStore {
             .filter(|s| s.project == *project)
             .cloned()
             .collect();
-        results.sort_by_key(|s| s.timestamp_ms);
+        // RFC-025 Phase 2b.2b m2: sort by (timestamp_ms ASC, signal_id
+        // ASC) so same-ms ingests pick a stable order; pg/sqlite
+        // adapters ORDER BY the same composite key for parity.
+        results.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
         let results = results.into_iter().skip(offset).take(limit).collect();
         Ok(results)
     }
@@ -5990,12 +6110,22 @@ impl crate::projections::ResourceSharingReadModel for InMemoryStore {
         target_workspace_id: &cairn_domain::WorkspaceId,
     ) -> Result<Vec<cairn_domain::resource_sharing::SharedResource>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.2b m1: sort by (shared_at_ms ASC, share_id ASC)
+        // to match pg/sqlite `ORDER BY shared_at_ms, share_id` so parity
+        // tests and operator dashboards see stable ordering under
+        // same-ms share bursts.
+        let mut out: Vec<_> = state
             .resource_shares
             .values()
             .filter(|s| &s.tenant_id == tenant_id && &s.target_workspace_id == target_workspace_id)
             .cloned()
-            .collect())
+            .collect();
+        out.sort_by(|a, b| {
+            a.shared_at_ms
+                .cmp(&b.shared_at_ms)
+                .then_with(|| a.share_id.cmp(&b.share_id))
+        });
+        Ok(out)
     }
     async fn get_share_for_resource(
         &self,
@@ -6015,6 +6145,140 @@ impl crate::projections::ResourceSharingReadModel for InMemoryStore {
                     && s.resource_id == resource_id
             })
             .cloned())
+    }
+}
+
+// -- RFC-025 Phase 2b.2b m3: SubagentSpawnReadModel --
+
+#[async_trait]
+impl crate::projections::SubagentSpawnReadModel for InMemoryStore {
+    async fn get_by_child_task(
+        &self,
+        child_task_id: &cairn_domain::TaskId,
+    ) -> Result<Option<crate::projections::SubagentSpawnRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.subagent_spawns.get(child_task_id.as_str()).cloned())
+    }
+
+    async fn list_by_parent_run(
+        &self,
+        parent_run_id: &cairn_domain::RunId,
+    ) -> Result<Vec<crate::projections::SubagentSpawnRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = state
+            .subagent_spawns
+            .values()
+            .filter(|r| r.parent_run_id == *parent_run_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.spawned_at_ms
+                .cmp(&b.spawned_at_ms)
+                .then_with(|| a.child_task_id.as_str().cmp(b.child_task_id.as_str()))
+        });
+        Ok(out)
+    }
+}
+
+// -- RFC-025 Phase 2b.2b m4: UserMessageReadModel --
+
+#[async_trait]
+impl crate::projections::UserMessageReadModel for InMemoryStore {
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::UserMessageRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = state
+            .user_messages
+            .values()
+            .filter(|m| m.run_id == *run_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.sequence
+                .cmp(&b.sequence)
+                .then_with(|| a.appended_at_ms.cmp(&b.appended_at_ms))
+        });
+        Ok(out.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn count_by_run(&self, run_id: &cairn_domain::RunId) -> Result<u64, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .user_messages
+            .values()
+            .filter(|m| m.run_id == *run_id)
+            .count() as u64)
+    }
+}
+
+// -- RFC-025 Phase 2b.2b m6: ToolRecoveryPauseReadModel --
+
+#[async_trait]
+impl crate::projections::ToolRecoveryPauseReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        tool_call_id: &str,
+    ) -> Result<Option<crate::projections::ToolRecoveryPauseRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.tool_recovery_pauses.get(tool_call_id).cloned())
+    }
+
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+    ) -> Result<Vec<crate::projections::ToolRecoveryPauseRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = state
+            .tool_recovery_pauses
+            .values()
+            .filter(|p| p.run_id == *run_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.paused_at_ms
+                .cmp(&b.paused_at_ms)
+                .then_with(|| a.tool_call_id.cmp(&b.tool_call_id))
+        });
+        Ok(out)
+    }
+}
+
+// -- RFC-025 Phase 2b.2b m5: SoulPatchReadModel --
+
+#[async_trait]
+impl crate::projections::SoulPatchReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        patch_id: &str,
+    ) -> Result<Option<crate::projections::SoulPatchRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.soul_patches.get(patch_id).cloned())
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::tenancy::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::SoulPatchRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = state
+            .soul_patches
+            .values()
+            .filter(|p| p.project == *project)
+            .cloned()
+            .collect();
+        // Newest-first by proposed_at_ms, tiebreak on patch_id DESC.
+        out.sort_by(|a, b| {
+            b.proposed_at_ms
+                .cmp(&a.proposed_at_ms)
+                .then_with(|| b.patch_id.cmp(&a.patch_id))
+        });
+        Ok(out.into_iter().skip(offset).take(limit).collect())
     }
 }
 
