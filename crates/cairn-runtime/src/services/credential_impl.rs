@@ -808,7 +808,9 @@ mod tests {
 
         let fetched = service.get(&stored.id).await.unwrap().unwrap();
         assert_eq!(stored, fetched);
-        assert_ne!(fetched.encrypted_value, plaintext.as_bytes());
+        // `encrypted_value` is a `RedactedCiphertext` (#579) that
+        // derefs to `[u8]`; compare through the slice view.
+        assert_ne!(&*fetched.encrypted_value, plaintext.as_bytes());
         assert!(fetched.active);
 
         let revoked = service.revoke(&stored.id).await.unwrap();

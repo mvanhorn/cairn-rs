@@ -60,7 +60,7 @@ impl std::fmt::Display for MigrationCheckError {
 /// `pg/migration_runner.rs::MIGRATIONS` is the authoritative list.
 ///
 /// **Split location caveat:** migrations V001–V017 live in
-/// `crates/cairn-store/migrations/`, V018–V020 live in
+/// `crates/cairn-store/migrations/`, V018+ live in
 /// `crates/cairn-store/src/pg/migrations/`. The `all_migrations_are_valid`
 /// test below embeds both directories explicitly. Consolidating to a
 /// single directory is tracked in the audit queue (T2-M1).

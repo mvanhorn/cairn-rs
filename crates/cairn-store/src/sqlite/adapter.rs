@@ -2254,7 +2254,11 @@ impl CredentialRow {
             tenant_id: cairn_domain::TenantId::new(self.tenant_id),
             name: self.name,
             credential_type: self.credential_type,
-            encrypted_value: self.encrypted_value,
+            // Wrap the ciphertext as soon as it leaves the DB driver so
+            // the projection heap copy is scrubbed on drop (#579).
+            encrypted_value: cairn_domain::credentials::RedactedCiphertext::from(
+                self.encrypted_value,
+            ),
             created_at: self.created_at.max(0) as u64,
             updated_at: self.updated_at.max(0) as u64,
             active: self.active,

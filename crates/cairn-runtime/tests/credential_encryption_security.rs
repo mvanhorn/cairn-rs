@@ -104,7 +104,9 @@ async fn ciphertext_under_key_a_is_not_decryptable_under_key_b() {
         .await
         .unwrap()
         .unwrap();
-    assert_ne!(row.encrypted_value.as_slice(), plaintext.as_bytes());
+    // `encrypted_value` is `RedactedCiphertext` (#579); compare through
+    // its slice view.
+    assert_ne!(&*row.encrypted_value, plaintext.as_bytes());
     // And the nonce prefix means the ciphertext is at least 12+16 bytes.
     assert!(row.encrypted_value.len() >= 28);
 }

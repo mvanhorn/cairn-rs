@@ -19,3 +19,9 @@ serde_json = "1.0.149"
 # exactly what we're trying to avoid.
 strum = { version = "0.28", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+# `Zeroizing<Vec<u8>>` for credential ciphertext in read models (#579).
+# Matches the version pinned by `cairn-runtime` and re-exports
+# `Zeroize{OnDrop}` for consistent handling across crates. The `serde`
+# feature is required because `CredentialRecord` is Serialize +
+# Deserialize.
+zeroize = { version = "1.7", features = ["derive", "serde"] }

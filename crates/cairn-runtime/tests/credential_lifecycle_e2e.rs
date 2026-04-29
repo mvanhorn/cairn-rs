@@ -75,8 +75,10 @@ async fn store_credential_encrypts_value_and_tags_key_version() {
         !stored.encrypted_value.is_empty(),
         "encrypted_value must be non-empty"
     );
+    // `encrypted_value` is a `RedactedCiphertext` (#579) that derefs
+    // to `[u8]`; compare through the slice view.
     assert_ne!(
-        stored.encrypted_value,
+        &*stored.encrypted_value,
         plaintext.as_bytes(),
         "RFC 011: stored value must be ciphertext, not plaintext"
     );

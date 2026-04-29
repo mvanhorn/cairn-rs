@@ -1058,7 +1058,16 @@ impl InMemoryStore {
                     Some(existing) => {
                         existing.name = e.provider_id.clone();
                         existing.provider_id = e.provider_id.clone();
-                        existing.encrypted_value = e.encrypted_value.clone();
+                        // Wrap in `RedactedCiphertext` so the
+                        // projection heap copy is scrubbed on drop
+                        // (#579) and redacts in Debug output. The
+                        // previous value in `existing.encrypted_value`
+                        // is dropped by the assignment, which triggers
+                        // its own `ZeroizeOnDrop` and scrubs the
+                        // superseded ciphertext.
+                        existing.encrypted_value = cairn_domain::credentials::RedactedCiphertext::from(
+                            e.encrypted_value.clone(),
+                        );
                         existing.encrypted_at_ms = Some(e.encrypted_at_ms);
                         existing.key_id = e.key_id.clone();
                         existing.key_version = e.key_version.clone();
@@ -1075,7 +1084,9 @@ impl InMemoryStore {
                                 tenant_id: e.tenant_id.clone(),
                                 name: e.provider_id.clone(),
                                 credential_type: "api_key".to_owned(),
-                                encrypted_value: e.encrypted_value.clone(),
+                                encrypted_value: cairn_domain::credentials::RedactedCiphertext::from(
+                                    e.encrypted_value.clone(),
+                                ),
                                 created_at: e.encrypted_at_ms,
                                 updated_at: e.encrypted_at_ms,
                                 active: true,

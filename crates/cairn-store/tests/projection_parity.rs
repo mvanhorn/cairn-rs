@@ -727,8 +727,16 @@ mod in_memory_vs_sqlite {
         assert_credential_records_match(&mem_rec, &sqlite_rec);
         assert!(mem_rec.active);
         assert!(sqlite_rec.active);
-        assert_eq!(mem_rec.encrypted_value, vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(sqlite_rec.encrypted_value, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        // `encrypted_value` is a `RedactedCiphertext` (#579) that
+        // derefs to `[u8]`; compare through the slice view.
+        assert_eq!(
+            &*mem_rec.encrypted_value,
+            [0xDE, 0xAD, 0xBE, 0xEF].as_slice()
+        );
+        assert_eq!(
+            &*sqlite_rec.encrypted_value,
+            [0xDE, 0xAD, 0xBE, 0xEF].as_slice()
+        );
         assert_eq!(mem_rec.key_id.as_deref(), Some("k1"));
         assert_eq!(sqlite_rec.key_id.as_deref(), Some("k1"));
 
@@ -866,8 +874,8 @@ mod in_memory_vs_sqlite {
         assert_eq!(sqlite_rec.revoked_at_ms, Some(2_000));
         // Fresh material landed — the re-store still updates the
         // encrypted payload and key bindings on the existing row.
-        assert_eq!(mem_rec.encrypted_value, vec![0xBB, 0xCC]);
-        assert_eq!(sqlite_rec.encrypted_value, vec![0xBB, 0xCC]);
+        assert_eq!(&*mem_rec.encrypted_value, [0xBB, 0xCC].as_slice());
+        assert_eq!(&*sqlite_rec.encrypted_value, [0xBB, 0xCC].as_slice());
         assert_eq!(mem_rec.key_id.as_deref(), Some("k_rotated"));
         assert_eq!(sqlite_rec.key_id.as_deref(), Some("k_rotated"));
         // `created_at` preserves the original store timestamp on both

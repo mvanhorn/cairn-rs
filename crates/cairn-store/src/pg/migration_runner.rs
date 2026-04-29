@@ -302,6 +302,22 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_external_workers",
         include_str!("migrations/V049__create_external_workers.sql"),
     ),
+    // Issue #578: add `workspaces.archived_at` on Postgres. The column
+    // backs the soft-delete flow shipped in #225 (issue #218). The
+    // original migration landed as `V020__workspace_archived_at.sql`
+    // under `crates/cairn-store/migrations/` but was never wired into
+    // this registry (the V020 slot was taken by
+    // `add_checkpoint_data_json`). Fresh Postgres installs therefore
+    // ran `UPDATE workspaces SET archived_at = …` against a non-existent
+    // column. SQLite sidestepped the bug via an inline pragma-gated
+    // ALTER in `sqlite/adapter.rs`. Renumbered V045 → V050 after main
+    // published Phase 2a.2 (V045-V048) and Phase 2b.2 (V049) during
+    // this PR's review cycle.
+    (
+        50,
+        "add_workspace_archived_at",
+        include_str!("migrations/V050__add_workspace_archived_at.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.
