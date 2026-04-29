@@ -505,6 +505,55 @@ impl RunReadModel for SqliteAdapter {
         .map_err(|e| StoreError::Internal(e.to_string()))?;
         rows.into_iter().map(RunRow::into_record).collect()
     }
+
+    async fn list_stalled(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        now_ms: u64,
+        stale_after_ms: u64,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RunRecord>, StoreError> {
+        // Issue #570: state + staleness + tenant composed at the SQL
+        // layer. Same contract as the pg adapter — see there for the
+        // rationale.
+        //
+        // Checked `u64 → i64` conversion (Copilot review on #589):
+        // a wrap to negative would flip the predicate silently. Fail
+        // loud rather than over-return.
+        let stale_cutoff = now_ms.saturating_sub(stale_after_ms);
+        let stale_cutoff_i64 = i64::try_from(stale_cutoff).map_err(|_| {
+            StoreError::Internal(format!(
+                "list_stalled: stale_cutoff_ms={stale_cutoff} exceeds i64::MAX"
+            ))
+        })?;
+        let limit_i64 = i64::try_from(limit).map_err(|_| {
+            StoreError::Internal(format!("list_stalled: limit={limit} exceeds i64::MAX"))
+        })?;
+        let offset_i64 = i64::try_from(offset).map_err(|_| {
+            StoreError::Internal(format!("list_stalled: offset={offset} exceeds i64::MAX"))
+        })?;
+        let rows = sqlx::query_as::<_, RunRow>(
+            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
+                    state, failure_class, version, created_at, updated_at,
+                    completion_summary, completion_verification_json, completion_annotated_at_ms,
+                    terminal_write_recovery_json
+             FROM runs
+             WHERE tenant_id = $1
+               AND state IN ('running', 'pending')
+               AND updated_at < $2
+             ORDER BY updated_at ASC, run_id ASC
+             LIMIT $3 OFFSET $4",
+        )
+        .bind(tenant_id.as_str())
+        .bind(stale_cutoff_i64)
+        .bind(limit_i64)
+        .bind(offset_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(RunRow::into_record).collect()
+    }
 }
 
 #[async_trait]

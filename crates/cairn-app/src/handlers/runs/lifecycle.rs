@@ -648,26 +648,68 @@ pub(crate) async fn list_due_run_resumes_handler(
     tenant_scope: TenantScope,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    match PauseScheduleReadModel::list_due(state.runtime.store.as_ref(), now_ms()).await {
+    // #570: tenant + `limit` moved into the projection. The handler
+    // no longer iterates across every tenant's paused runs to discard
+    // cross-tenant rows.
+    //
+    // `PauseScheduleReadModel::list_due` is derived from the event
+    // log and does NOT evict records when a run resumes (Copilot
+    // review on #589): so the raw projection set may include records
+    // whose runs are no longer Paused. The handler filters those
+    // post-fetch via `runs.get`, which means a page-by-page fetch
+    // with `limit + 1` could under-report `has_more` — an entire
+    // page of stale pause records would return 0 still-paused runs
+    // but has_more=false.
+    //
+    // Correct behaviour: fetch up to a safety cap that bounds the
+    // per-tenant scan, filter in memory, then paginate the
+    // still-paused set. The `DUE_BATCH_LIMIT` below matches the
+    // cap used by the post-processor at
+    // `process_scheduled_run_resumes_handler` so operator read
+    // and writer drain agree on the working-set size. Once the
+    // event-log `list_due` walker is replaced with an evict-on-
+    // resume projection this cap can drop back to `limit + 1`.
+    const DUE_SCAN_CAP: usize = 1_000;
+    let limit = query.limit();
+    let offset = query.offset();
+    match PauseScheduleReadModel::list_due(
+        state.runtime.store.as_ref(),
+        tenant_scope.tenant_id(),
+        now_ms(),
+        DUE_SCAN_CAP,
+    )
+    .await
+    {
         Ok(due) => {
-            let mut all = Vec::new();
+            let mut still_paused = Vec::new();
             for record in due {
-                if record.project.tenant_id != *tenant_scope.tenant_id() {
-                    continue;
-                }
                 match state.runtime.runs.get(&record.run_id).await {
-                    Ok(Some(run)) if run.state == RunState::Paused => all.push(run),
+                    Ok(Some(run)) if run.state == RunState::Paused => still_paused.push(run),
                     Ok(_) => {}
                     Err(err) => return runtime_error_response(err),
                 }
             }
-            // #422: honest pagination against the filtered total.
-            let total = all.len();
-            let offset = query.offset();
-            let limit = query.limit();
-            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
-            let has_more = offset.saturating_add(items.len()) < total;
-            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+            // Paginate the filtered set. `has_more` is honest against
+            // the filtered total — an all-stale page no longer
+            // mis-reports has_more=false on the back of a truncated
+            // projection scan.
+            let total = still_paused.len();
+            let tail_start = offset.min(total);
+            let page: Vec<_> = still_paused
+                .iter()
+                .skip(tail_start)
+                .take(limit)
+                .cloned()
+                .collect();
+            let has_more = tail_start.saturating_add(page.len()) < total;
+            (
+                StatusCode::OK,
+                Json(ListResponse {
+                    items: page,
+                    has_more,
+                }),
+            )
+                .into_response()
         }
         Err(err) => store_error_response(err),
     }
@@ -677,7 +719,28 @@ pub(crate) async fn process_scheduled_run_resumes_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
 ) -> impl IntoResponse {
-    let due = match PauseScheduleReadModel::list_due(state.runtime.store.as_ref(), now_ms()).await {
+    // #570: tenant filter moved into the projection. The limit
+    // parameter here is `usize::MAX` — effectively unbounded —
+    // which preserves the pre-#570 semantic of "process every
+    // due record in one call" and sidesteps a Copilot-flagged
+    // starvation risk:
+    //
+    // > the batch may be dominated by non-resumable rows, which
+    // > starves genuinely-due paused runs that sort after them
+    //
+    // …because the current `list_due` walker reads the full event
+    // log regardless of the returned set size (it does not evict
+    // rows when a run resumes), so an unbounded return doesn't
+    // change the scan cost. Once a dedicated evict-on-resume
+    // projection lands we can drop this to a small batch cap.
+    let due = match PauseScheduleReadModel::list_due(
+        state.runtime.store.as_ref(),
+        tenant_scope.tenant_id(),
+        now_ms(),
+        usize::MAX,
+    )
+    .await
+    {
         Ok(due) => due,
         Err(err) => return store_error_response(err),
     };
@@ -689,9 +752,6 @@ pub(crate) async fn process_scheduled_run_resumes_handler(
     // SSE frame and leaves the caller guessing about partial success.
     let mut failures: Vec<serde_json::Value> = Vec::new();
     for record in due {
-        if record.project.tenant_id != *tenant_scope.tenant_id() {
-            continue;
-        }
         let session_id = match state.runtime.runs.get(&record.run_id).await {
             Ok(Some(run)) => run.session_id,
             Ok(None) => continue,

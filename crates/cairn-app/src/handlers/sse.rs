@@ -124,6 +124,22 @@ pub(crate) async fn publish_runtime_frames_since(
     state: &Arc<AppState>,
     after: Option<EventPosition>,
 ) {
+    // Issue #568: cairn-fabric's EventBridge emits runtime events on a
+    // tokio mpsc; the consumer task appends to the event store
+    // asynchronously. A handler that calls this immediately after a
+    // service method (which does `bridge.emit(...)` internally) can
+    // miss its own event — the store's head hasn't advanced yet.
+    // `EventBridge::flush` enqueues a FIFO marker and awaits the
+    // consumer's ack, so every event emitted before the flush has
+    // reached the event log by the time flush returns.
+    //
+    // Fabric is `None` in no-fabric test fixtures (see
+    // `tests/support/fake_fabric.rs`); the bridge isn't wired there so
+    // there's nothing to flush.
+    if let Some(fabric) = state.fabric.as_ref() {
+        fabric.bridge.flush().await;
+    }
+
     let Ok(events) = state.runtime.store.read_stream(after, 64).await else {
         return;
     };

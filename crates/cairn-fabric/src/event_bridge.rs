@@ -10,7 +10,7 @@ use cairn_domain::ids::{EventId, RunId, SessionId, TaskId};
 use cairn_domain::lifecycle::{FailureClass, RunState, SessionState, TaskState};
 use cairn_domain::tenancy::ProjectKey;
 use cairn_store::event_log::EventLog;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -139,8 +139,22 @@ pub enum BridgeEvent {
     },
 }
 
+/// Internal consumer-channel payload. Wraps `BridgeEvent` with an
+/// in-band flush marker so `EventBridge::flush()` can observe that all
+/// previously-emitted events have been appended to the event log.
+///
+/// FIFO on the mpsc channel guarantees ordering: every event `emit`ted
+/// before a flush lands in the store before the flush ack fires, and
+/// every event `emit`ted after the flush lands after. Callers can thus
+/// safely read-after-write against their own emit by awaiting a flush
+/// between the emit and the store read (issue #568).
+enum ConsumerItem {
+    Event(BridgeEvent),
+    Flush(oneshot::Sender<()>),
+}
+
 pub struct EventBridge {
-    tx: mpsc::Sender<BridgeEvent>,
+    tx: mpsc::Sender<ConsumerItem>,
     cancel: CancellationToken,
     append_failures: Arc<AtomicU64>,
     /// Counts events dropped because the consumer channel was closed
@@ -155,7 +169,7 @@ const RETRY_BACKOFF_MS: u64 = 100;
 
 impl EventBridge {
     pub fn start(event_log: Arc<dyn EventLog + Send + Sync>) -> (Self, JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel::<BridgeEvent>(1024);
+        let (tx, rx) = mpsc::channel::<ConsumerItem>(1024);
         let cancel = CancellationToken::new();
         let append_failures = Arc::new(AtomicU64::new(0));
 
@@ -182,13 +196,13 @@ impl EventBridge {
     }
 
     async fn run_consumer(
-        mut rx: mpsc::Receiver<BridgeEvent>,
+        mut rx: mpsc::Receiver<ConsumerItem>,
         event_log: Arc<dyn EventLog + Send + Sync>,
         cancel: CancellationToken,
         append_failures: Arc<AtomicU64>,
     ) {
         loop {
-            let event = tokio::select! {
+            let item = tokio::select! {
                 biased;
                 ev = rx.recv() => match ev {
                     Some(e) => e,
@@ -198,13 +212,34 @@ impl EventBridge {
                     break;
                 }
             };
-            Self::append_with_retry(&event_log, &event, &append_failures).await;
+            Self::handle_item(&event_log, item, &append_failures).await;
         }
 
-        // Drain remaining events after stop signal.
+        // Drain remaining events after stop signal. Flush acks still
+        // fire on remaining items so any flush waiter that slipped in
+        // before stop does not hang forever.
         rx.close();
-        while let Some(event) = rx.recv().await {
-            Self::append_with_retry(&event_log, &event, &append_failures).await;
+        while let Some(item) = rx.recv().await {
+            Self::handle_item(&event_log, item, &append_failures).await;
+        }
+    }
+
+    async fn handle_item(
+        event_log: &Arc<dyn EventLog + Send + Sync>,
+        item: ConsumerItem,
+        append_failures: &AtomicU64,
+    ) {
+        match item {
+            ConsumerItem::Event(event) => {
+                Self::append_with_retry(event_log, &event, append_failures).await;
+            }
+            ConsumerItem::Flush(ack) => {
+                // All items enqueued before this flush have been handled
+                // by the consumer loop (mpsc is FIFO). Signal the waiter;
+                // ignore a closed receiver — the caller dropped the
+                // oneshot, no one is listening.
+                let _ = ack.send(());
+            }
         }
     }
 
@@ -255,7 +290,7 @@ impl EventBridge {
 
     pub async fn emit(&self, event: BridgeEvent) {
         let event_type = bridge_event_type_name(&event);
-        if let Err(e) = self.tx.send(event).await {
+        if let Err(e) = self.tx.send(ConsumerItem::Event(event)).await {
             // `fetch_add` returns the previous value; add 1 for the
             // post-increment count without a separate (race-prone) load.
             let total = self.emit_failures.fetch_add(1, Ordering::Relaxed) + 1;
@@ -265,6 +300,40 @@ impl EventBridge {
                 total_emit_failures = total,
                 "event bridge: channel closed — event dropped, projection will have a gap"
             );
+        }
+    }
+
+    /// Wait for every event previously passed to [`Self::emit`] from the
+    /// calling task to reach the event store. Enqueues a FIFO marker on
+    /// the consumer channel and awaits the consumer's ack.
+    ///
+    /// Issue #568: the bridge is a tokio mpsc + async consumer, so an
+    /// immediate `bridge.emit(X); read_store()` can miss `X` — the
+    /// consumer hasn't run yet. Callers that need read-after-write on
+    /// their own emit (every caller of `publish_runtime_frames_since`)
+    /// must await `flush` between the emit and the read.
+    ///
+    /// Returns immediately (no-op) if the consumer channel is closed —
+    /// the bridge has already been stopped and no new events will land.
+    /// Callers degrade gracefully: the subsequent store read will simply
+    /// see whatever was there before shutdown, matching the pre-flush
+    /// behaviour on a shutting-down bridge.
+    pub async fn flush(&self) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self.tx.send(ConsumerItem::Flush(ack_tx)).await.is_err() {
+            // Consumer gone — nothing to wait for. Caller will fall
+            // through to the store read with whatever is already there.
+            tracing::debug!(
+                "event bridge: flush requested on closed consumer channel — returning immediately"
+            );
+            return;
+        }
+        // Error only if the consumer dropped the sender without calling
+        // `send(())` — that happens when the consumer task exits mid-drain
+        // (stop + task abort). Treat as the same degradation case as a
+        // closed producer channel: degrade gracefully rather than hang.
+        if ack_rx.await.is_err() {
+            tracing::debug!("event bridge: flush ack lost (consumer exited mid-drain) — returning");
         }
     }
 
@@ -898,5 +967,92 @@ mod tests {
             .expect("SessionCreated must populate SessionReadModel");
         assert_eq!(record.session_id, session_id);
         assert_eq!(record.project, project);
+    }
+
+    // Issue #568 regression: without `flush`, a read immediately after
+    // `emit` can miss its own event because the consumer runs on a
+    // separate task. `flush` must guarantee every event `emit`ted
+    // before the flush is visible to a subsequent store read.
+    //
+    // The test uses a store-head probe because the append-to-store
+    // side of the bridge is the only observable artefact on the
+    // cairn-store trait surface. If the assertion `head_before_flush
+    // < head_after_flush` does not hold deterministically, the race
+    // is still live.
+    #[tokio::test]
+    async fn flush_blocks_until_prior_emits_reach_store() {
+        use cairn_store::InMemoryStore;
+
+        let store = Arc::new(InMemoryStore::new());
+        let event_log: Arc<dyn EventLog + Send + Sync> = store.clone();
+        let (bridge, handle) = EventBridge::start(event_log);
+
+        let head_before = store.head_position().await.expect("head read").map(|p| p.0);
+
+        // Emit two events back-to-back. Without `flush` the consumer
+        // may not have processed either by the time the next line
+        // runs; `flush` must drain both before returning.
+        bridge
+            .emit(BridgeEvent::SessionCreated {
+                session_id: SessionId::new("sess_flush_a"),
+                project: ProjectKey::new("t", "w", "p"),
+            })
+            .await;
+        bridge
+            .emit(BridgeEvent::SessionCreated {
+                session_id: SessionId::new("sess_flush_b"),
+                project: ProjectKey::new("t", "w", "p"),
+            })
+            .await;
+
+        bridge.flush().await;
+
+        let head_after = store.head_position().await.expect("head read").map(|p| p.0);
+        assert!(
+            head_after > head_before,
+            "flush must block until the event log head has advanced past the emitted events \
+             (before={head_before:?}, after={head_after:?})"
+        );
+
+        // Both session projections must also be visible — flush is a
+        // store-level barrier, not just a channel-drain barrier.
+        use cairn_store::projections::SessionReadModel;
+        for sid in ["sess_flush_a", "sess_flush_b"] {
+            let record = SessionReadModel::get(store.as_ref(), &SessionId::new(sid))
+                .await
+                .expect("projection read");
+            assert!(
+                record.is_some(),
+                "session {sid} must be visible in the projection after flush",
+            );
+        }
+
+        bridge.stop();
+        let _ = handle.await;
+    }
+
+    // Flush on a closed consumer must not hang — it must degrade to a
+    // no-op. This proves the graceful-degradation contract documented
+    // on `EventBridge::flush` so callers can reach publish after stop
+    // without deadlocking the handler.
+    #[tokio::test]
+    async fn flush_after_stop_returns_immediately() {
+        use cairn_store::InMemoryStore;
+
+        let store = Arc::new(InMemoryStore::new());
+        let event_log: Arc<dyn EventLog + Send + Sync> = store.clone();
+        let (bridge, handle) = EventBridge::start(event_log);
+
+        bridge.stop();
+        let _ = handle.await;
+
+        // If `flush` doesn't return within the timeout the degradation
+        // contract is broken and callers will hang forever on a stopped
+        // bridge.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), bridge.flush()).await;
+        assert!(
+            result.is_ok(),
+            "flush must return (not hang) when the consumer channel is already closed"
+        );
     }
 }

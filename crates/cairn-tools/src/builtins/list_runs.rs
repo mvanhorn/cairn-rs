@@ -235,6 +235,27 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn list_stalled(
+            &self,
+            tenant_id: &cairn_domain::TenantId,
+            now_ms: u64,
+            stale_after_ms: u64,
+            limit: usize,
+            offset: usize,
+        ) -> Result<Vec<RunRecord>, StoreError> {
+            Ok(self
+                .records
+                .iter()
+                .filter(|r| {
+                    r.project.tenant_id == *tenant_id
+                        && matches!(r.state, RunState::Running | RunState::Pending)
+                        && now_ms.saturating_sub(r.updated_at) > stale_after_ms
+                })
+                .skip(offset)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
     }
 
     fn run_record(id: &str, state: RunState) -> RunRecord {

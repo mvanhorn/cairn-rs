@@ -3402,6 +3402,44 @@ impl RunReadModel for InMemoryStore {
         });
         Ok(refs.into_iter().take(limit).cloned().collect())
     }
+
+    async fn list_stalled(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        now_ms: u64,
+        stale_after_ms: u64,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RunRecord>, StoreError> {
+        // Issue #570: combines state + staleness + tenant at the
+        // projection surface so handlers no longer scan 20 000 rows
+        // (Running + Pending) in memory before filtering by tenant +
+        // staleness. `updated_at` is epoch-ms on `RunRecord` and
+        // `now_ms > updated_at + stale_after_ms` is the canonical
+        // stuck-run predicate used by the handler + the operator UI.
+        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut refs: Vec<&RunRecord> = store
+            .runs
+            .values()
+            .filter(|r| {
+                r.project.tenant_id == *tenant_id
+                    && matches!(
+                        r.state,
+                        cairn_domain::RunState::Running | cairn_domain::RunState::Pending
+                    )
+                    && now_ms.saturating_sub(r.updated_at) > stale_after_ms
+            })
+            .collect();
+        // Most-stale first so page 1 surfaces the runs that have been
+        // silent longest — matches the operator dashboard's "worst
+        // offenders" expectation.
+        refs.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(refs.into_iter().skip(offset).take(limit).cloned().collect())
+    }
 }
 
 // -- TaskReadModel --
@@ -5253,14 +5291,25 @@ impl crate::projections::RunSlaReadModel for InMemoryStore {
     async fn list_breached_by_tenant(
         &self,
         tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<cairn_domain::sla::SlaBreach>, StoreError> {
+        // Issue #570: pagination moved into the projection — handlers no
+        // longer fetch every row then slice in memory.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        let mut filtered: Vec<cairn_domain::sla::SlaBreach> = state
             .run_sla_breaches
             .values()
             .filter(|b| &b.tenant_id == tenant_id)
             .cloned()
-            .collect())
+            .collect();
+        // Newest-first order so page 1 is the most-recent breaches.
+        filtered.sort_by(|a, b| {
+            b.breached_at_ms
+                .cmp(&a.breached_at_ms)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(filtered.into_iter().skip(offset).take(limit).collect())
     }
 }
 
@@ -5455,14 +5504,25 @@ impl crate::projections::RunCostAlertReadModel for InMemoryStore {
     async fn list_triggered_by_tenant(
         &self,
         tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<cairn_domain::providers::RunCostAlert>, StoreError> {
+        // Issue #570: pagination at the projection — callers pass
+        // `limit + 1` to detect `has_more` without re-scanning.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        let mut filtered: Vec<cairn_domain::providers::RunCostAlert> = state
             .run_cost_alerts
             .values()
             .filter(|a| &a.tenant_id == tenant_id && a.triggered_at_ms > 0)
             .cloned()
-            .collect())
+            .collect();
+        // Newest-first so page 1 is the most-recent triggers.
+        filtered.sort_by(|a, b| {
+            b.triggered_at_ms
+                .cmp(&a.triggered_at_ms)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(filtered.into_iter().skip(offset).take(limit).collect())
     }
 }
 
@@ -5701,8 +5761,13 @@ impl crate::projections::OperatorInterventionReadModel for InMemoryStore {
 impl crate::projections::PauseScheduleReadModel for InMemoryStore {
     async fn list_due(
         &self,
+        tenant_id: &cairn_domain::TenantId,
         before_ms: u64,
+        limit: usize,
     ) -> Result<Vec<crate::projections::PauseScheduledRecord>, StoreError> {
+        // Issue #570: tenant filter + `limit` now live on the trait so
+        // handlers no longer iterate over every tenant's paused runs to
+        // then discard the ones that don't belong.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         // Find all RunStateChanged(to=Paused) events with resume_after_ms set.
         // Use a map to keep only the latest pause event per run.
@@ -5712,6 +5777,13 @@ impl crate::projections::PauseScheduleReadModel for InMemoryStore {
         > = std::collections::HashMap::new();
         for stored in &state.events {
             if let RuntimeEvent::RunStateChanged(e) = &stored.envelope.payload {
+                // Tenant gate: events outside the caller's tenant never
+                // contribute to the paused set, so resumes on a
+                // different tenant can't evict a still-paused row
+                // belonging to ours either.
+                if e.project.tenant_id != *tenant_id {
+                    continue;
+                }
                 if e.transition.to == cairn_domain::RunState::Paused {
                     if let Some(reason) = &e.pause_reason {
                         if let Some(resume_after_ms) = reason.resume_after_ms {
@@ -5738,11 +5810,17 @@ impl crate::projections::PauseScheduleReadModel for InMemoryStore {
                 }
             }
         }
-        let due: Vec<_> = paused
+        let mut due: Vec<_> = paused
             .into_values()
             .filter(|r| r.resume_at_ms <= before_ms)
             .collect();
-        Ok(due)
+        // Deterministic order so page-by-page iteration is stable.
+        due.sort_by(|a, b| {
+            a.resume_at_ms
+                .cmp(&b.resume_at_ms)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(due.into_iter().take(limit).collect())
     }
 }
 
@@ -5759,7 +5837,13 @@ impl crate::projections::RecoveryEscalationReadModel for InMemoryStore {
     async fn list_by_tenant(
         &self,
         _tenant_id: &cairn_domain::TenantId,
+        _limit: usize,
+        _offset: usize,
     ) -> Result<Vec<cairn_domain::RecoveryEscalation>, StoreError> {
+        // Issue #570: trait shape updated to carry storage-layer
+        // pagination. The InMemoryStore impl is a no-op stub —
+        // recovery escalations are not projected here today. Callers
+        // always see an empty list regardless of page params.
         Ok(vec![])
     }
 }
@@ -8458,5 +8542,251 @@ mod tests {
             1,
             "primary projection must still reflect the in-memory write so diagnosis + retry see consistent state"
         );
+    }
+
+    // Issue #570: PauseScheduleReadModel::list_due must filter by
+    // tenant and apply the `limit` at the trait layer.
+    //
+    // The cairn-app integration test for the resume-due endpoint is
+    // stuck behind a separate latent bug: the bridge converter
+    // `bridge_event_to_runtime_event` drops `pause_reason` when
+    // emitting `ExecutionSuspended → RunStateChanged`, so the
+    // service-layer path never lands a pause_reason on the cairn-store
+    // event log. This test bypasses the bridge by appending raw
+    // RunStateChanged envelopes directly — same shape `list_due`
+    // walks — so the pagination contract is still exercised.
+    #[tokio::test]
+    async fn pause_schedule_list_due_filters_by_tenant_and_respects_limit() {
+        use crate::projections::PauseScheduleReadModel;
+        use cairn_domain::lifecycle::{PauseReason, PauseReasonKind};
+
+        let store = InMemoryStore::new();
+        let tenant_a = cairn_domain::TenantId::new("tenant_a");
+        let tenant_b = cairn_domain::TenantId::new("tenant_b");
+
+        // Helper: append a RunStateChanged(Running→Paused) with a
+        // scheduled resume under the given project.
+        let append_paused = |project: ProjectKey, run_id: &str, resume_after_ms: u64| {
+            let envelope = make_envelope(RuntimeEvent::RunStateChanged(RunStateChanged {
+                project,
+                run_id: RunId::new(run_id),
+                transition: StateTransition {
+                    from: Some(RunState::Running),
+                    to: RunState::Paused,
+                },
+                failure_class: None,
+                pause_reason: Some(PauseReason {
+                    kind: PauseReasonKind::OperatorPause,
+                    detail: None,
+                    resume_after_ms: Some(resume_after_ms),
+                    actor: None,
+                }),
+                resume_trigger: None,
+            }));
+            let store = &store;
+            async move { store.append(&[envelope]).await.unwrap() }
+        };
+
+        // Seed 4 paused runs under tenant_a and 2 under tenant_b.
+        let project_a = ProjectKey::new(tenant_a.as_str(), "w", "p");
+        let project_b = ProjectKey::new(tenant_b.as_str(), "w", "p");
+        for i in 0..4u32 {
+            append_paused(project_a.clone(), &format!("run_a_{i}"), 0).await;
+        }
+        for i in 0..2u32 {
+            append_paused(project_b.clone(), &format!("run_b_{i}"), 0).await;
+        }
+
+        // now_ms is 1 s after the append — `resume_at_ms = stored_at +
+        // resume_after_ms(0) = stored_at`, which is before `now_ms`,
+        // so every paused row is due.
+        let now_ms = u64::MAX / 2; // well past any wall-clock append time
+
+        let a_page = PauseScheduleReadModel::list_due(&store, &tenant_a, now_ms, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            a_page.len(),
+            4,
+            "tenant_a sees all 4 of its own paused runs, never tenant_b's"
+        );
+        assert!(
+            a_page.iter().all(|r| r.project.tenant_id == tenant_a),
+            "cross-tenant leak: {a_page:?}"
+        );
+
+        let b_page = PauseScheduleReadModel::list_due(&store, &tenant_b, now_ms, 100)
+            .await
+            .unwrap();
+        assert_eq!(b_page.len(), 2, "tenant_b sees its 2 runs");
+
+        // Limit enforcement: 4 rows under tenant_a, limit=2 → 2 rows.
+        let a_limited = PauseScheduleReadModel::list_due(&store, &tenant_a, now_ms, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            a_limited.len(),
+            2,
+            "limit bound at projection, not handler: {a_limited:?}"
+        );
+    }
+
+    // Issue #570: RecoveryEscalationReadModel's trait now takes
+    // `limit` + `offset`. The InMemoryStore impl is a stub that
+    // always returns empty — assert that still holds post-#570 so a
+    // future projection-backed impl doesn't change the no-escalations
+    // wire contract without conscious migration.
+    #[tokio::test]
+    async fn recovery_escalation_list_by_tenant_paginated_stub_is_empty() {
+        use crate::projections::RecoveryEscalationReadModel;
+        let store = InMemoryStore::new();
+        let tenant = cairn_domain::TenantId::new("tenant_stub");
+        let page = RecoveryEscalationReadModel::list_by_tenant(&store, &tenant, 10, 0)
+            .await
+            .unwrap();
+        assert!(page.is_empty(), "InMemoryStore stub must stay empty");
+    }
+
+    // Issue #570: RunSlaReadModel::list_breached_by_tenant orders
+    // newest-first and respects limit + offset.
+    #[tokio::test]
+    async fn run_sla_list_breached_newest_first_with_pagination() {
+        use crate::projections::RunSlaReadModel;
+        let store = InMemoryStore::new();
+        let tenant = cairn_domain::TenantId::new("tenant_sla");
+
+        // Seed 5 breaches with strictly increasing breached_at_ms so
+        // newest-first ordering is unambiguous.
+        for i in 0..5u32 {
+            let envelope = make_envelope(RuntimeEvent::RunSlaBreached(
+                cairn_domain::events::RunSlaBreached {
+                    run_id: RunId::new(format!("run_sla_{i}")),
+                    tenant_id: tenant.clone(),
+                    elapsed_ms: 60_000 + i as u64,
+                    target_ms: 30_000,
+                    breached_at_ms: 1_700_000_000_000 + (i as u64) * 1_000,
+                },
+            ));
+            store.append(&[envelope]).await.unwrap();
+        }
+
+        // Page 1 of 2 — newest-first: run_sla_4, run_sla_3.
+        let page1 = RunSlaReadModel::list_breached_by_tenant(&store, &tenant, 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].run_id.as_str(), "run_sla_4");
+        assert_eq!(page1[1].run_id.as_str(), "run_sla_3");
+
+        // Offset 2 → page 2: run_sla_2, run_sla_1.
+        let page2 = RunSlaReadModel::list_breached_by_tenant(&store, &tenant, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[0].run_id.as_str(), "run_sla_2");
+        assert_eq!(page2[1].run_id.as_str(), "run_sla_1");
+
+        // Offset 4 → tail: single row (run_sla_0).
+        let tail = RunSlaReadModel::list_breached_by_tenant(&store, &tenant, 2, 4)
+            .await
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].run_id.as_str(), "run_sla_0");
+    }
+
+    // Issue #570: RunReadModel::list_stalled composes state +
+    // staleness + tenant at the projection surface with pagination.
+    #[tokio::test]
+    async fn run_list_stalled_combines_state_staleness_tenant_with_pagination() {
+        let store = InMemoryStore::new();
+        let tenant = cairn_domain::TenantId::new("tenant_stall");
+        let project = ProjectKey::new(tenant.as_str(), "w", "p");
+        let session_id = SessionId::new("sess_stall");
+
+        // Seed 5 runs: 3 Running, 1 Pending, 1 Completed (not stalled).
+        for (i, state) in [
+            RunState::Running,
+            RunState::Running,
+            RunState::Running,
+            RunState::Pending,
+            RunState::Completed, // terminal — must be excluded
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let run_id = RunId::new(format!("run_stall_{i}"));
+            store
+                .append(&[make_envelope(RuntimeEvent::RunCreated(RunCreated {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    parent_run_id: None,
+                    agent_role_id: None,
+                    prompt_release_id: None,
+                }))])
+                .await
+                .unwrap();
+            if state != RunState::Pending {
+                // RunCreated starts the run in Pending; transition to
+                // the target state for the non-Pending cases.
+                store
+                    .append(&[make_envelope(RuntimeEvent::RunStateChanged(
+                        RunStateChanged {
+                            project: project.clone(),
+                            run_id,
+                            transition: StateTransition {
+                                from: Some(RunState::Pending),
+                                to: state,
+                            },
+                            failure_class: None,
+                            pause_reason: None,
+                            resume_trigger: None,
+                        },
+                    ))])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // now_ms far into the future so every non-terminal run is
+        // considered stale against a 0ms staleness window.
+        let now_ms = u64::MAX / 2;
+
+        // Tenant filter: wrong tenant sees 0 runs.
+        let other_tenant = cairn_domain::TenantId::new("tenant_other");
+        let other = RunReadModel::list_stalled(&store, &other_tenant, now_ms, 0, 100, 0)
+            .await
+            .unwrap();
+        assert!(other.is_empty(), "cross-tenant leak: {other:?}");
+
+        // Correct tenant sees 3 Running + 1 Pending = 4 non-terminal
+        // stalled runs. Completed is excluded by the SQL-equivalent
+        // predicate.
+        let all_stalled = RunReadModel::list_stalled(&store, &tenant, now_ms, 0, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(all_stalled.len(), 4, "{all_stalled:?}");
+        assert!(
+            all_stalled
+                .iter()
+                .all(|r| matches!(r.state, RunState::Running | RunState::Pending)),
+            "terminal runs leaked: {all_stalled:?}"
+        );
+
+        // Pagination: limit=2 → 2 rows, offset=2 → next 2 rows.
+        let page1 = RunReadModel::list_stalled(&store, &tenant, now_ms, 0, 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        let page2 = RunReadModel::list_stalled(&store, &tenant, now_ms, 0, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        let union: std::collections::HashSet<_> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|r| r.run_id.as_str().to_owned())
+            .collect();
+        assert_eq!(union.len(), 4, "pages must be disjoint");
     }
 }

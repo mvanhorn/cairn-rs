@@ -81,40 +81,81 @@ pub(crate) async fn list_stalled_runs_handler(
             .unwrap_or_else(|| query.stale_after_ms())
     };
 
-    // Cover both Running and Pending so zombie pending runs (that never
-    // started) surface as stalled — see F29 CD dogfood blocker.
-    let mut candidate_runs = Vec::new();
-    for target_state in [RunState::Running, RunState::Pending] {
-        match RunReadModel::list_by_state(state.runtime.store.as_ref(), target_state, 10_000).await
+    // #570: storage-layer candidate fetch. `RunReadModel::list_stalled`
+    // composes state (Running ∪ Pending) + staleness + tenant at the
+    // projection surface, so the handler stops fetching 20 000 rows
+    // (10k Running + 10k Pending) and filtering in memory.
+    //
+    // Admin operators with no tenant-scope still need cross-tenant
+    // visibility; their bearer identity never resolves to a concrete
+    // tenant_id via `tenant_scope.tenant_id()`, so when `is_admin`
+    // the handler falls back to the old dual-state scan.
+    //
+    // `build_diagnosis_report` refines the stalled predicate with
+    // per-run task activity (a run whose tasks are heartbeating is
+    // NOT stalled even if its own RunRecord.updated_at is cold —
+    // Copilot review on #589). The post-fetch filter can therefore
+    // discard projection rows. To keep `has_more` honest we fetch a
+    // larger candidate window than `limit + 1` and paginate the
+    // diagnosed-stalled set in memory. CANDIDATE_SCAN_CAP bounds the
+    // per-request scan so a pathological tenant can't stall the
+    // dashboard on a 100k-row fan-out.
+    const CANDIDATE_SCAN_CAP: usize = 10_000;
+    let limit = query.limit();
+    let offset = query.offset();
+    let now = now_ms();
+
+    let candidate_runs = if tenant_scope.is_admin {
+        // Admin: cross-tenant. `list_stalled` is tenant-scoped by
+        // design (per-tenant indexes are correctness + performance),
+        // so admin goes through the dual-state walk.
+        let mut all = Vec::new();
+        for target_state in [RunState::Running, RunState::Pending] {
+            match RunReadModel::list_by_state(
+                state.runtime.store.as_ref(),
+                target_state,
+                CANDIDATE_SCAN_CAP,
+            )
+            .await
+            {
+                Ok(runs) => all.extend(runs),
+                Err(err) => return store_error_response(err),
+            }
+        }
+        all.into_iter()
+            .filter(|r| now.saturating_sub(r.updated_at) > stale_after_ms)
+            .collect::<Vec<_>>()
+    } else {
+        match RunReadModel::list_stalled(
+            state.runtime.store.as_ref(),
+            tenant_scope.tenant_id(),
+            now,
+            stale_after_ms,
+            CANDIDATE_SCAN_CAP,
+            0,
+        )
+        .await
         {
-            Ok(runs) => candidate_runs.extend(runs),
+            Ok(runs) => runs,
             Err(err) => return store_error_response(err),
         }
-    }
+    };
 
-    let mut all = Vec::new();
+    // Per-run diagnosis (tasks + events) still assembled in memory —
+    // that cost is per-result, not per-candidate. Apply the refined
+    // stalled predicate BEFORE pagination so `has_more` reflects the
+    // true diagnosed-stalled total.
+    let mut reports = Vec::with_capacity(candidate_runs.len());
     for run in candidate_runs {
-        // Admin service account sees all tenants; operator tenants are
-        // restricted to their own runs.
-        if !tenant_scope.is_admin && run.project.tenant_id != *tenant_scope.tenant_id() {
-            continue;
-        }
-
         match build_diagnosis_report(state.as_ref(), &run, stale_after_ms).await {
-            Ok((report, true)) => all.push(report),
+            Ok((report, true)) => reports.push(report),
             Ok((_report, false)) => {}
             Err(err) => return store_error_response(err),
         }
     }
 
-    // #422: honest pagination. Stalled-run diagnosis is assembled in
-    // memory from two state scans (Running + Pending) filtered by
-    // staleness. Apply limit/offset against the filtered total so the
-    // UI load-more works for large backlogs.
-    let total = all.len();
-    let offset = query.offset();
-    let limit = query.limit();
-    let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+    let total = reports.len();
+    let items: Vec<_> = reports.into_iter().skip(offset).take(limit).collect();
     let has_more = offset.saturating_add(items.len()) < total;
 
     (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
@@ -341,21 +382,24 @@ pub(crate) async fn list_escalated_runs_handler(
     tenant_scope: TenantScope,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    // #422: escalations per tenant are small (typically <50), but the
-    // read model returns them all in one call. Apply limit/offset
-    // in-memory and emit an honest `has_more`.
+    // #570: storage-layer pagination. `RecoveryEscalationReadModel::
+    // list_by_tenant` now accepts `limit + 1` and `offset`; even when
+    // the InMemory impl returns a stub empty list today, the wire
+    // contract is future-proofed for the pg/sqlite implementations
+    // that will ingest RecoveryEscalation events.
+    let limit = query.limit();
+    let offset = query.offset();
     match RecoveryEscalationReadModel::list_by_tenant(
         state.runtime.store.as_ref(),
         tenant_scope.tenant_id(),
+        limit.saturating_add(1),
+        offset,
     )
     .await
     {
-        Ok(all) => {
-            let total = all.len();
-            let offset = query.offset();
-            let limit = query.limit();
-            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
-            let has_more = offset.saturating_add(items.len()) < total;
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
             (
                 StatusCode::OK,
                 Json(ListResponse::<cairn_domain::recovery::RecoveryEscalation> {

@@ -77,8 +77,17 @@ pub trait RunCostReadModel: Send + Sync {
 #[async_trait]
 pub trait RunCostAlertReadModel: Send + Sync {
     async fn get_alert(&self, run_id: &RunId) -> Result<Option<RunCostAlert>, StoreError>;
+
+    /// List triggered alerts for a tenant with storage-layer pagination
+    /// (issue #570). Callers pass `limit + 1` to detect `has_more` on
+    /// the wire without re-scanning — implementations apply `limit` +
+    /// `offset` at the query surface so the caller never materialises
+    /// every row for a busy tenant. Results are ordered by
+    /// `triggered_at_ms DESC` so page 1 is the most-recent triggers.
     async fn list_triggered_by_tenant(
         &self,
         tenant_id: &TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<RunCostAlert>, StoreError>;
 }

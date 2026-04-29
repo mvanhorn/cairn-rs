@@ -115,8 +115,19 @@ pub(crate) struct PaginationQuery {
 }
 
 impl PaginationQuery {
+    /// Default per-page cap when the client doesn't supply one.
+    pub const DEFAULT_LIMIT: usize = 100;
+
+    /// Maximum per-page cap (Copilot review on #589). Requests with
+    /// `limit` above this are clamped silently so `limit + 1` overflow
+    /// fetches can't wrap `usize` or force unbounded reads. Matches
+    /// the cap already applied to `TenantCostQuery::MAX_LIMIT`.
+    pub const MAX_LIMIT: usize = 1_000;
+
     pub fn limit(&self) -> usize {
-        self.limit.unwrap_or(100)
+        self.limit
+            .unwrap_or(Self::DEFAULT_LIMIT)
+            .min(Self::MAX_LIMIT)
     }
 
     pub fn offset(&self) -> usize {

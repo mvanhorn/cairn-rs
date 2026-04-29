@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use cairn_domain::{
     CompletionVerification, FailureClass, PauseReason, ProjectKey, PromptReleaseId, ResumeTrigger,
-    RunId, RunState, SessionId,
+    RunId, RunState, SessionId, TenantId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -139,5 +139,27 @@ pub trait RunReadModel: Send + Sync {
         &self,
         parent_run_id: &RunId,
         limit: usize,
+    ) -> Result<Vec<RunRecord>, StoreError>;
+
+    /// List stalled runs for a tenant — non-terminal runs that have
+    /// not updated their projection row for longer than
+    /// `stale_after_ms` relative to `now_ms` (issue #570).
+    ///
+    /// Combines state + staleness at the query surface so callers
+    /// stop scanning 10 000 Running + 10 000 Pending rows + filtering
+    /// in memory on every `/v1/runs/stalled` refresh (the pre-#570
+    /// shape). Results are ordered `updated_at ASC, run_id ASC` so
+    /// the most-stale runs surface on page 1.
+    ///
+    /// Callers pass `limit + 1` to detect `has_more`. The InMemory
+    /// implementation filters in-memory; pg/sqlite implementations
+    /// (if added later) should apply the predicate at the SQL layer.
+    async fn list_stalled(
+        &self,
+        tenant_id: &TenantId,
+        now_ms: u64,
+        stale_after_ms: u64,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<RunRecord>, StoreError>;
 }

@@ -148,20 +148,21 @@ pub(crate) async fn list_run_cost_alerts_handler(
     tenant_scope: TenantScope,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    // #422: the service returns every triggered alert for the tenant.
-    // Paginate in-memory and emit an honest `has_more`.
+    // #570: storage-layer pagination — the service now accepts
+    // `limit + 1` and computes `has_more` from overflow, so busy
+    // tenants never materialise every triggered alert on a single
+    // request.
+    let limit = query.limit();
+    let offset = query.offset();
     match state
         .runtime
         .run_cost_alerts
-        .list_triggered_by_tenant(tenant_scope.tenant_id())
+        .list_triggered_by_tenant(tenant_scope.tenant_id(), limit.saturating_add(1), offset)
         .await
     {
-        Ok(all) => {
-            let total = all.len();
-            let offset = query.offset();
-            let limit = query.limit();
-            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
-            let has_more = offset.saturating_add(items.len()) < total;
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
             (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
         Err(err) => runtime_error_response(err),
@@ -234,20 +235,20 @@ pub(crate) async fn list_sla_breached_handler(
     tenant_scope: TenantScope,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
-    // #422: service returns every breach for the tenant. Paginate in
-    // memory and emit an honest `has_more`.
+    // #570: storage-layer pagination — service accepts `limit + 1`
+    // and computes `has_more` from overflow. A tenant with months of
+    // breach history no longer materialises every row on each refresh.
+    let limit = query.limit();
+    let offset = query.offset();
     match state
         .runtime
         .run_sla
-        .list_breached_by_tenant(tenant_scope.tenant_id())
+        .list_breached_by_tenant(tenant_scope.tenant_id(), limit.saturating_add(1), offset)
         .await
     {
-        Ok(all) => {
-            let total = all.len();
-            let offset = query.offset();
-            let limit = query.limit();
-            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
-            let has_more = offset.saturating_add(items.len()) < total;
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
             (
                 StatusCode::OK,
                 Json(ListResponse::<cairn_domain::sla::SlaBreach> { items, has_more }),

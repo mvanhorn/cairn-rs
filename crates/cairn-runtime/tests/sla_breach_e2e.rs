@@ -130,7 +130,10 @@ async fn breached_run_appears_in_list_breached_by_tenant() {
     sleep(Duration::from_millis(100)).await;
     svc.check_and_breach(&run_id).await.unwrap();
 
-    let breaches = svc.list_breached_by_tenant(&tenant()).await.unwrap();
+    let breaches = svc
+        .list_breached_by_tenant(&tenant(), 100, 0)
+        .await
+        .unwrap();
     assert_eq!(breaches.len(), 1, "exactly one breach must be listed");
 
     let breach = &breaches[0];
@@ -168,7 +171,10 @@ async fn run_within_sla_does_not_trigger_breach() {
     );
 
     // list_breached returns empty.
-    let breaches = svc.list_breached_by_tenant(&tenant()).await.unwrap();
+    let breaches = svc
+        .list_breached_by_tenant(&tenant(), 100, 0)
+        .await
+        .unwrap();
     assert!(
         breaches.is_empty(),
         "on-track run must not appear in breach list"
@@ -295,8 +301,14 @@ async fn breaches_are_scoped_to_tenant() {
     svc.check_and_breach(&run_a).await.unwrap();
     svc.check_and_breach(&run_b).await.unwrap();
 
-    let a_breaches = svc.list_breached_by_tenant(&tenant_a).await.unwrap();
-    let b_breaches = svc.list_breached_by_tenant(&tenant_b).await.unwrap();
+    let a_breaches = svc
+        .list_breached_by_tenant(&tenant_a, 100, 0)
+        .await
+        .unwrap();
+    let b_breaches = svc
+        .list_breached_by_tenant(&tenant_b, 100, 0)
+        .await
+        .unwrap();
 
     assert_eq!(a_breaches.len(), 1, "tenant_a must see only its own breach");
     assert_eq!(b_breaches.len(), 1, "tenant_b must see only its own breach");
