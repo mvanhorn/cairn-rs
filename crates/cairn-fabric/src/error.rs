@@ -1,10 +1,20 @@
 use flowfabric::core::engine_error::{BackendError, EngineError};
+// `flowfabric::script` is re-exported only when the `valkey` or
+// `script-internals` feature is enabled on the umbrella crate. Cairn
+// gates it behind `fabric-valkey` so `--no-default-features` builds do
+// not require the FCALL-loader crate. The `Script` variant below is
+// gated symmetrically.
+#[cfg(feature = "fabric-valkey")]
 use flowfabric::script::ScriptError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FabricError {
     #[error("valkey: {0}")]
     Valkey(String),
+    /// FCALL script loader / dispatch error. Gated behind
+    /// `fabric-valkey`: `ScriptError` lives in `ff-script`, which is
+    /// only pulled in when the Valkey backend is linked.
+    #[cfg(feature = "fabric-valkey")]
     #[error("script: {0}")]
     Script(#[from] ScriptError),
     /// FF 0.9 typed backend-transport error (FF#277 adoption). Preferred
@@ -94,6 +104,7 @@ mod tests {
         assert!(err.to_string().contains("channel closed"));
     }
 
+    #[cfg(feature = "fabric-valkey")]
     #[test]
     fn script_error_converts() {
         let script_err = ScriptError::ExecutionNotFound;

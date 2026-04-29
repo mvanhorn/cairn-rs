@@ -1,7 +1,9 @@
+#[cfg(feature = "fabric-valkey")]
 use std::borrow::Cow;
 
 use cairn_domain::ProjectKey;
 
+#[cfg(feature = "fabric-valkey")]
 use crate::error::FabricError;
 
 /// Current wall-clock time in milliseconds since UNIX_EPOCH. On clock skew
@@ -18,6 +20,7 @@ pub fn now_ms() -> u64 {
     }
 }
 
+#[cfg(feature = "fabric-valkey")]
 pub fn check_fcall_success(raw: &ferriskey::Value, function_name: &str) -> Result<(), FabricError> {
     let arr = match raw {
         ferriskey::Value::Array(arr) => arr,
@@ -62,6 +65,7 @@ pub fn check_fcall_success(raw: &ferriskey::Value, function_name: &str) -> Resul
 /// }
 /// check_fcall_success(&raw, FF_…)?;
 /// ```
+#[cfg(feature = "fabric-valkey")]
 pub fn fcall_error_code(raw: &ferriskey::Value) -> Option<String> {
     fcall_error_code_ref(raw).map(Cow::into_owned)
 }
@@ -72,6 +76,7 @@ pub fn fcall_error_code(raw: &ferriskey::Value) -> Option<String> {
 /// `Cow::Owned` only for `BulkString` (which requires a UTF-8 validation
 /// copy). The success path stays alloc-free because the function
 /// short-circuits on `status == 1` before touching the error slot.
+#[cfg(feature = "fabric-valkey")]
 pub fn fcall_error_code_ref(raw: &ferriskey::Value) -> Option<Cow<'_, str>> {
     let arr = match raw {
         ferriskey::Value::Array(arr) => arr,
@@ -149,6 +154,7 @@ pub enum FailOutcome {
     TerminalFailed,
 }
 
+#[cfg(feature = "fabric-valkey")]
 pub fn is_already_satisfied(raw: &ferriskey::Value) -> bool {
     if let ferriskey::Value::Array(arr) = raw {
         if let Some(Ok(ferriskey::Value::BulkString(b))) = arr.get(1) {
@@ -161,6 +167,7 @@ pub fn is_already_satisfied(raw: &ferriskey::Value) -> bool {
     false
 }
 
+#[cfg(feature = "fabric-valkey")]
 pub fn parse_fail_outcome(raw: &ferriskey::Value) -> FailOutcome {
     if let ferriskey::Value::Array(arr) = raw {
         if let Some(Ok(ferriskey::Value::BulkString(b))) = arr.get(2) {
@@ -183,6 +190,7 @@ pub fn sanitize_signal_component(s: &str) -> String {
 
 /// Extract a `String` out of a ferriskey `Value` in bulk or simple
 /// string form. Returns `None` for other shapes.
+#[cfg(feature = "fabric-valkey")]
 pub fn value_to_string(v: &ferriskey::Value) -> Option<String> {
     match v {
         ferriskey::Value::BulkString(b) => Some(String::from_utf8_lossy(b).into_owned()),
@@ -206,6 +214,7 @@ pub fn value_to_string(v: &ferriskey::Value) -> Option<String> {
 /// [`parse_string_array_borrowed`] — it yields a
 /// `Cow<'_, str>` per element, borrowing on the valid-UTF-8 hot path
 /// (#514).
+#[cfg(feature = "fabric-valkey")]
 pub fn parse_string_array(raw: &ferriskey::Value) -> Vec<String> {
     match raw {
         ferriskey::Value::Array(items) => items
@@ -238,6 +247,7 @@ pub fn parse_string_array(raw: &ferriskey::Value) -> Vec<String> {
 /// per-call allocation on the hot path, and the boxed form would have
 /// added a heap allocation at every call site, undermining the intent
 /// (see review on #561).
+#[cfg(feature = "fabric-valkey")]
 pub fn parse_string_array_borrowed(
     raw: &ferriskey::Value,
 ) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
@@ -265,6 +275,7 @@ pub fn parse_string_array_borrowed(
 /// Borrow-preferring sibling of [`value_to_string`]. Returns a
 /// [`std::borrow::Cow`] that borrows from `v` on the hot path and only
 /// allocates on the lossy-UTF-8 fallback.
+#[cfg(feature = "fabric-valkey")]
 fn value_to_cow_str(v: &ferriskey::Value) -> Option<std::borrow::Cow<'_, str>> {
     use std::borrow::Cow;
     match v {
@@ -284,6 +295,7 @@ fn value_to_cow_str(v: &ferriskey::Value) -> Option<std::borrow::Cow<'_, str>> {
 /// helper (flowfabric.lua) wraps `(status=1, "OK", ...caller_args)`,
 /// so index 3 carries the second caller-supplied value. Returns
 /// `None` on malformed shape.
+#[cfg(feature = "fabric-valkey")]
 pub fn parse_stage_result_revision(raw: &ferriskey::Value) -> Option<u64> {
     let ferriskey::Value::Array(arr) = raw else {
         return None;
@@ -295,6 +307,7 @@ pub fn parse_stage_result_revision(raw: &ferriskey::Value) -> Option<u64> {
 /// Extract the eligibility state string from the
 /// `ff_evaluate_flow_eligibility` OK envelope `[1, "OK", "<state>"]`.
 /// Returns `None` on malformed shape.
+#[cfg(feature = "fabric-valkey")]
 pub fn parse_eligibility_result(raw: &ferriskey::Value) -> Option<String> {
     let ferriskey::Value::Array(arr) = raw else {
         return None;
@@ -303,6 +316,7 @@ pub fn parse_eligibility_result(raw: &ferriskey::Value) -> Option<String> {
     value_to_string(state_value)
 }
 
+#[cfg(feature = "fabric-valkey")]
 pub fn is_duplicate_result(raw: &ferriskey::Value) -> bool {
     if let ferriskey::Value::Array(arr) = raw {
         if let Some(Ok(ferriskey::Value::BulkString(b))) = arr.get(1) {
@@ -404,6 +418,18 @@ mod tests {
         assert!(try_parse_project_key("t//p").is_none());
         assert!(try_parse_project_key("/w/p").is_none());
     }
+
+    // ── ferriskey-Value parser tests ────────────────────────────────
+    //
+    // Everything in `valkey_value_tests` exercises helpers that take
+    // `&ferriskey::Value` — only meaningful when the `fabric-valkey`
+    // feature is on. Under `--no-default-features` the helpers
+    // themselves compile out, so the tests compile out too.
+}
+
+#[cfg(all(test, feature = "fabric-valkey"))]
+mod valkey_value_tests {
+    use super::*;
 
     #[test]
     fn is_duplicate_detects_duplicate_simple_string() {

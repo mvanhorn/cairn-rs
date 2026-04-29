@@ -6,49 +6,68 @@ license = "BSL-1.1"
 publish = false
 
 [features]
-default = []
-# Expose the Valkey testcontainers harness under `cairn_fabric::test_harness`.
-# Off by default — production binaries never link testcontainers. Consumers
-# that run live-Valkey integration tests (cairn-fabric's own test binary,
-# cairn-app's HTTP integration tests) turn this on via dev-dependencies.
-test-harness = ["dep:testcontainers"]
+# `fabric-valkey` enables the Valkey backend wiring (FabricRuntime,
+# FabricServices, worker SDK, services, engine impls, bridges) — every
+# code path that holds a `ferriskey::Client` or a
+# `flowfabric::valkey::ValkeyBackend` handle. Default-on so existing
+# builds of cairn-app (the only in-tree consumer) compile unchanged.
+#
+# `--no-default-features` yields a minimal backend-agnostic surface:
+# the `FabricError` type, the `Engine` / `ControlPlaneBackend` trait
+# definitions, the mirror `control_plane_types`, the `FabricConfig`
+# + `BackendConfig` env parsers, the id/state-map conversion types,
+# and the ferriskey-free fcall ARGV builders. This is the proof-point
+# for PR-B: the crate compiles without any Valkey code linked. PR-C
+# then wires a Postgres backend behind a sibling `fabric-postgres`
+# feature against FF 0.12's trait-routed entry points.
+#
+# `test-harness` exposes the Valkey testcontainers harness under
+# `cairn_fabric::test_harness`. Off by default — production binaries
+# never link testcontainers. Requires `fabric-valkey` because the
+# harness drives a live Valkey backend.
+default = ["fabric-valkey"]
+fabric-valkey = [
+    "dep:ferriskey",
+    "dep:ff-observability",
+    "flowfabric/valkey",
+    "flowfabric/engine",
+    "flowfabric/scheduler-internals",
+]
+test-harness = ["fabric-valkey", "dep:testcontainers"]
 
 [dependencies]
-# FlowFabric umbrella crate — CG-c (2026-04-26) bumped to 0.10 to
-# consume FF#322 (typed suspend_by_triple), FF#323 (v1_handle_for_tests
-# fixture), and FF#324 (ScannerFilter + typed subscribe_* events).
-# `valkey` is default; `engine` + `scheduler-internals` expose direct
-# access to `ff_engine` / `ff_scheduler` internals that cairn still
-# uses (Engine::start_with_completions, ClaimPolicy/ClaimGrant). The
-# `ff-observability` pin stays direct because the umbrella does not
-# re-export it — `Engine::start_with_completions` takes an
-# `Arc<ff_observability::Metrics>` and cairn wires that type through.
-flowfabric = { version = "0.11", features = ["engine", "scheduler-internals"] }
-# Needed for `Engine::start_with_completions` which takes an
-# `Arc<ff_observability::Metrics>`. The flowfabric umbrella does not
-# re-export ff-observability.
+# FlowFabric umbrella crate. The `valkey` / `engine` /
+# `scheduler-internals` features live under `fabric-valkey` above;
+# without that feature cairn-fabric consumes only the backend-agnostic
+# surface (core::types, core::contracts, sdk::task types, engine
+# traits) that FF exposes with default features.
+flowfabric = { version = "0.11", default-features = false }
+# `ff-observability` is only wired inside the Valkey runtime
+# (`FabricRuntime::start` constructs an `Arc<Metrics>` and hands it
+# to `Engine::start_with_completions`). Gate it behind
+# `fabric-valkey` so a `--no-default-features` build does not pull
+# the OTEL → Prometheus exporter.
 #
 # `enabled` turns on the real OTEL → Prometheus exporter. Without
 # this feature `Metrics::render()` returns an empty string (shim),
 # and no FF metrics surface on cairn-app's `/metrics` endpoint. The
 # shim exists for no-observability embedded builds; cairn is never
 # that, so we always want the real backend.
-ff-observability = { version = "0.11", features = ["enabled"] }
-# ferriskey 0.10 ships alongside FF 0.10 family. Still a direct pin
-# because cairn's Lua-glue control-plane path (signal_bridge, helpers,
-# version_check) constructs FCALL ARGV directly against
-# `ferriskey::Client`. CG-c migrated `lease_history_subscriber` onto
-# typed `EngineBackend::subscribe_lease_history`, but CH-2
-# (encapsulation collapse) is a separate PR; the remaining direct
-# `ferriskey::Client` users are:
+ff-observability = { version = "0.11", features = ["enabled"], optional = true }
+# ferriskey is the Valkey driver FF's control-plane path constructs
+# FCALL ARGV against. The remaining direct `ferriskey::Client` users
+# are gated behind `fabric-valkey`:
+#   - crates/cairn-fabric/src/boot.rs (FabricRuntime connection)
 #   - crates/cairn-fabric/src/signal_bridge.rs (FCALL ARGV for signal)
 #   - crates/cairn-fabric/src/helpers.rs (FCALL return parsers)
 #   - crates/cairn-fabric/src/version_check.rs (FUNCTION LIST probe)
+#   - crates/cairn-fabric/src/instance_tag_backfill.rs (SCAN/HMGET/HSET)
+#   - crates/cairn-fabric/src/engine/valkey_impl.rs (Engine + HGETALL)
 #   - crates/cairn-fabric/src/engine/valkey_control_plane_impl.rs
 #     (all legacy Lua FCALLs except suspend, which moved to typed).
 # Do not add new direct ferriskey usage; route through the engine
 # traits instead.
-ferriskey = "0.11"
+ferriskey = { version = "0.11", optional = true }
 
 # Cairn crates
 cairn-domain = { path = "../cairn-domain" }
@@ -81,8 +100,17 @@ testcontainers = { version = "0.23", optional = true }
 url = "2"
 
 [dev-dependencies]
-# Own integration suite consumes the same harness via the feature.
-cairn-fabric = { path = ".", features = ["test-harness"] }
+# `cairn-fabric` self dev-dep REMOVED intentionally. Previously this
+# block carried `cairn-fabric = { path=".", features=["test-harness"] }`
+# to pull `test-harness` into every test compile. That coupled every
+# integration test target to `fabric-valkey` (via `test-harness`), so
+# `cargo test -p cairn-fabric --no-default-features` could not
+# actually exercise the backend-agnostic surface — the dev-dep
+# re-enabled the Valkey gate. The `[[test]] required-features` blocks
+# below replace it: the heavy integration binary keeps `test-harness`
+# required (live-Valkey tests need it), while `backend_agnostic`
+# genuinely compiles without Valkey so a regression there trips the
+# `--no-default-features` build. (Copilot review, PR #583.)
 once_cell = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 uuid = { version = "1", features = ["v4"] }
@@ -101,3 +129,34 @@ futures = "0.3"
 # decode compat path still accepts it. The `test-fixtures` feature is
 # dev-only on ff-core — production binaries never link it.
 ff-core = { version = "0.11", features = ["test-fixtures"] }
+
+# ── Integration test targets ────────────────────────────────────────
+#
+# `integration.rs` drives a live Valkey container via
+# `cairn_fabric::test_harness`; it requires the `test-harness`
+# feature (which implies `fabric-valkey`). Without the feature the
+# test binary is skipped, leaving `backend_agnostic` as the only
+# target that runs under `cargo test -p cairn-fabric
+# --no-default-features`.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["test-harness"]
+
+# `backend_agnostic.rs` is the PR-B proof point: it references ONLY
+# symbols declared in always-on modules of cairn-fabric (see the
+# `#[cfg(feature = "fabric-valkey")]` gates in `src/lib.rs`). If a
+# symbol it uses is ever moved behind the `fabric-valkey` gate, this
+# file stops compiling. Listed explicitly (no required-features) so
+# Cargo picks it up under every feature configuration.
+#
+# NOTE: `--no-default-features` does not actually suppress the
+# `fabric-valkey` feature here because Cargo unifies dev-dep features
+# at the package level and the `cairn-orchestrator` dev-dep (needed
+# by `test_orchestrator_stream` inside the `integration` binary)
+# re-activates it. The source-level symbol check above is still
+# meaningful; the full Cargo-level suppression is a follow-up that
+# requires moving the orchestrator test out of this package.
+[[test]]
+name = "backend_agnostic"
+path = "tests/backend_agnostic.rs"

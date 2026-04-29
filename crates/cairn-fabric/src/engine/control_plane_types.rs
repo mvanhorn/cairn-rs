@@ -241,6 +241,13 @@ impl ExecutionLeaseContext {
     /// lines 2011-2021 in ff-script 0.3.4). Cairn's `cancel` callers
     /// all route through `resolve_lease_context`, so they get this
     /// unfenced shape and cleanly skip the lease gate.
+    // Consumed by `services::run_service` + `services::task_service`
+    // on the cancel/operator-override path — both gated behind
+    // `fabric-valkey`. Silence the dead-code lint under
+    // `--no-default-features` so the backend-agnostic crate compiles
+    // clean; the item itself stays available for any future backend
+    // (PR-C Postgres, etc.) that wires those services.
+    #[cfg_attr(not(feature = "fabric-valkey"), allow(dead_code))]
     pub(crate) fn unfenced(
         lane_id: flowfabric::core::types::LaneId,
         attempt_index: flowfabric::core::types::AttemptIndex,

@@ -61,35 +61,75 @@
 //! | [`suspension`] | Typed suspension builders for approval/subagent/tool-result waits |
 //! | [`signal_bridge`] | cairn domain events → FlowFabric signal delivery |
 
-pub mod aggregate;
-pub mod boot;
+// ── Always-compiled backend-agnostic surface ──────────────────────────
+//
+// These modules are pure types / trait definitions / configuration
+// parsers and do not pull in any `ferriskey` or `ff_backend_valkey`
+// symbols. They stay compiled under `--no-default-features` so the
+// crate can serve as the single source of truth for backend-agnostic
+// types (FabricError, FabricConfig, Engine + ControlPlaneBackend
+// traits, control_plane_types, snapshots, id_map, state_map,
+// suspension helpers, fcall ARGV builders, constants).
 pub mod config;
 pub mod constants;
 pub mod engine;
 pub mod error;
-pub mod event_bridge;
 pub mod fcall;
 pub mod helpers;
 pub mod id_map;
-pub mod instance_tag_backfill;
-pub mod lease_history_subscriber;
-pub mod services;
-pub mod signal_bridge;
 pub mod state_map;
-pub mod stream;
 pub mod suspension;
-/// Valkey testcontainers harness for integration tests. Gated on the
-/// `test-harness` cargo feature so production builds don't link
-/// `testcontainers`.
-#[cfg(feature = "test-harness")]
-pub mod test_harness;
-#[cfg(test)]
-pub(crate) mod test_support;
+
+// ── Valkey-backed runtime surface ────────────────────────────────────
+//
+// Everything below holds a `ferriskey::Client`, a
+// `flowfabric::valkey::ValkeyBackend`, or depends on them transitively
+// via `FabricRuntime`. Gated behind the `fabric-valkey` feature so a
+// `--no-default-features` build is a proof-of-backend-agnosticism
+// compile. PR-C adds the sibling `fabric-postgres` feature that wires
+// the PostgreSQL backend against FF 0.12's trait-routed entry points.
+#[cfg(feature = "fabric-valkey")]
+pub mod aggregate;
+#[cfg(feature = "fabric-valkey")]
+pub mod boot;
+#[cfg(feature = "fabric-valkey")]
+pub mod event_bridge;
+#[cfg(feature = "fabric-valkey")]
+pub mod instance_tag_backfill;
+#[cfg(feature = "fabric-valkey")]
+pub mod lease_history_subscriber;
+#[cfg(feature = "fabric-valkey")]
+pub mod services;
+#[cfg(feature = "fabric-valkey")]
+pub mod signal_bridge;
+#[cfg(feature = "fabric-valkey")]
+pub mod stream;
+#[cfg(feature = "fabric-valkey")]
 pub mod version_check;
+#[cfg(feature = "fabric-valkey")]
 pub mod worker_sdk;
 
+/// Valkey testcontainers harness for integration tests. Gated on the
+/// `test-harness` cargo feature (which in turn implies `fabric-valkey`)
+/// so production binaries don't link `testcontainers`.
+#[cfg(feature = "test-harness")]
+pub mod test_harness;
+// `test_support` stays on the plain `#[cfg(test)]` gate it had pre-PR-B:
+// unit-test modules inside always-on `src/fcall/*` and `src/services/*`
+// import `crate::test_support::{test_eid, default_test_backend}`. Those
+// helpers pull only backend-agnostic FF core types
+// (`core::backend::BackendConfig`, `core::partition::PartitionConfig`,
+// `core::types::*`) + `uuid` — no ferriskey — so the module compiles
+// under `--no-default-features` and unit tests stay reachable there.
+// (Copilot review, PR #583.)
+#[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(feature = "fabric-valkey")]
 pub use aggregate::FabricServices;
+#[cfg(feature = "fabric-valkey")]
 pub use boot::FabricRuntime;
 pub use config::FabricConfig;
 pub use error::FabricError;
+#[cfg(feature = "fabric-valkey")]
 pub use worker_sdk::{CairnTask, CairnWorker};

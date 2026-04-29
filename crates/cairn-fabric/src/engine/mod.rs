@@ -53,7 +53,14 @@
 pub mod control_plane;
 pub mod control_plane_types;
 pub mod snapshots;
+// Valkey-specific implementations of `Engine` + `ControlPlaneBackend`.
+// Gated behind `fabric-valkey` so the traits remain compilable under
+// `--no-default-features` without dragging in `ferriskey` or
+// `ff_backend_valkey`. PR-C will add a sibling `postgres_impl`
+// gated behind `fabric-postgres`.
+#[cfg(feature = "fabric-valkey")]
 pub mod valkey_control_plane_impl;
+#[cfg(feature = "fabric-valkey")]
 pub mod valkey_impl;
 
 use std::collections::BTreeMap;
@@ -76,6 +83,7 @@ pub use control_plane_types::{
 pub use snapshots::{
     AttemptSummary, EdgeSnapshot, EdgeState, ExecutionSnapshot, FlowSnapshot, LeaseSummary,
 };
+#[cfg(feature = "fabric-valkey")]
 pub use valkey_impl::ValkeyEngine;
 
 /// Cairn-side read abstraction over FF state.

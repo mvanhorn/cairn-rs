@@ -18,6 +18,16 @@
 //!    translation lives in cairn anymore; every suspension shape is
 //!    expressed as typed fields the FF trait validates on its side.
 
+// Every item in this module is `pub(crate)` and consumed exclusively
+// by `worker_sdk` + `services/*`, both gated behind `fabric-valkey`.
+// Under `--no-default-features` nothing links in these helpers, so
+// silence the dead-code lint for that build rather than scatter
+// per-item gates that would then need to be flipped again when
+// PR-C lands `fabric-postgres`. The items themselves remain
+// backend-agnostic (pure FF trait types + pure logic), so any
+// backend wired in a follow-up PR picks them up unchanged.
+#![cfg_attr(not(feature = "fabric-valkey"), allow(dead_code))]
+
 use flowfabric::core::contracts::{
     CompositeBody, CountKind, ResumeCondition, ResumePolicy, SignalMatcher, SuspendArgs,
     SuspensionReasonCode, SuspensionRequester, TimeoutBehavior, WaitpointBinding,

@@ -311,6 +311,10 @@ impl FabricConfig {
     /// break on non-Redis-cloud hosts that reject the `redis` scheme
     /// prefix. The builder accepts a bare host + port and applies TLS as
     /// an explicit flag, matching the ferriskey 0.2 public API.
+    ///
+    /// Gated behind `fabric-valkey` because ferriskey is not linked
+    /// under `--no-default-features`.
+    #[cfg(feature = "fabric-valkey")]
     pub fn client_builder(&self) -> Result<ferriskey::ClientBuilder, FabricError> {
         let vk = self.valkey_connection()?;
         let mut builder = ferriskey::ClientBuilder::new().host(&vk.host, vk.port);
@@ -905,6 +909,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fabric-valkey")]
     #[test]
     fn client_builder_without_tls() {
         // ferriskey's `ClientBuilder` does not expose public accessors on
@@ -922,6 +927,7 @@ mod tests {
         assert!(config.client_builder().unwrap().build_lazy().is_ok());
     }
 
+    #[cfg(feature = "fabric-valkey")]
     #[test]
     fn client_builder_with_tls() {
         // Same limitation as `client_builder_without_tls`: no public
@@ -936,6 +942,7 @@ mod tests {
         assert!(config.client_builder().unwrap().build_lazy().is_ok());
     }
 
+    #[cfg(feature = "fabric-valkey")]
     #[test]
     fn client_builder_build_lazy_rejects_empty_addresses() {
         // Confirms the synchronous validation path we rely on actually
@@ -1021,6 +1028,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fabric-valkey")]
     #[test]
     fn client_builder_rejects_non_valkey_backend() {
         // When the backend is not Valkey, `client_builder()` fails

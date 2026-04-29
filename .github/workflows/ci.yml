@@ -223,8 +223,23 @@ jobs:
             ${{ runner.os }}-cargo-fabric-
             ${{ runner.os }}-cargo-
       - name: cargo test --test integration (default — parallel)
-        run: cargo test -p cairn-fabric --test integration
+        # `--features test-harness` required: PR-B (#583) split
+        # cairn-fabric's test targets so the live-Valkey `integration`
+        # binary only compiles when test-harness is enabled. The
+        # sibling `backend_agnostic` binary carries no required-features
+        # so it runs under every feature configuration.
+        run: cargo test -p cairn-fabric --test integration --features test-harness
         timeout-minutes: 15
+      - name: cargo test --test backend_agnostic (PR-B proof point)
+        # The `backend_agnostic` binary asserts that cairn-fabric's
+        # public surface stays referenceable without the Valkey
+        # runtime — it imports only always-on symbols (FabricError,
+        # FabricConfig, Engine + ControlPlaneBackend traits, id_map,
+        # state_map, fcall ARGV builders, helpers). Runs here so a
+        # regression (e.g. a ferriskey type leaking into an always-on
+        # module signature) trips CI before merge.
+        run: cargo test -p cairn-fabric --test backend_agnostic
+        timeout-minutes: 5
       # HTTP-lifecycle integration tests: launch the real cairn-app
       # binary per harness on an ephemeral port, drive via reqwest,
       # share the Valkey testcontainer. Same runtime constraints as
