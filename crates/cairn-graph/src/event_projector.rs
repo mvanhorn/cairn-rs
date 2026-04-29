@@ -598,7 +598,7 @@ mod tests {
     use async_trait::async_trait;
     use cairn_domain::*;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
     struct MemGraph {
         nodes: Mutex<HashMap<String, GraphNode>>,
@@ -612,25 +612,38 @@ mod tests {
                 edges: Mutex::new(Vec::new()),
             }
         }
+
+        // #484: poison-tolerant accessors. A panic in any test that holds one
+        // of these locks will mark the Mutex poisoned; without this,
+        // subsequent tests that share the `Arc<MemGraph>` would cascade-panic
+        // on `.lock().unwrap()` and mask the real failure with a useless
+        // "second panic" message. This mirrors the pattern established in
+        // PR #544 (`BufferedF65EventSink::lock_or_recover`) and used across
+        // cairn-runtime (see `model_registry.rs`, `bandit.rs`, `worktree.rs`,
+        // `config_store.rs`).
+        fn nodes_lock(&self) -> MutexGuard<'_, HashMap<String, GraphNode>> {
+            self.nodes.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn edges_lock(&self) -> MutexGuard<'_, Vec<GraphEdge>> {
+            self.edges.lock().unwrap_or_else(PoisonError::into_inner)
+        }
     }
 
     #[async_trait]
     impl GraphProjection for Arc<MemGraph> {
         async fn add_node(&self, node: GraphNode) -> Result<(), GraphProjectionError> {
-            self.nodes
-                .lock()
-                .unwrap()
-                .insert(node.node_id.clone(), node);
+            self.nodes_lock().insert(node.node_id.clone(), node);
             Ok(())
         }
 
         async fn add_edge(&self, edge: GraphEdge) -> Result<(), GraphProjectionError> {
-            self.edges.lock().unwrap().push(edge);
+            self.edges_lock().push(edge);
             Ok(())
         }
 
         async fn node_exists(&self, node_id: &str) -> Result<bool, GraphProjectionError> {
-            Ok(self.nodes.lock().unwrap().contains_key(node_id))
+            Ok(self.nodes_lock().contains_key(node_id))
         }
     }
 
@@ -670,11 +683,11 @@ mod tests {
         assert_eq!(result.nodes_created, 2); // session + run
         assert_eq!(result.edges_created, 1); // run -> session
 
-        let nodes = graph.nodes.lock().unwrap();
+        let nodes = graph.nodes_lock();
         assert!(nodes.contains_key("sess_1"));
         assert!(nodes.contains_key("run_1"));
 
-        let edges = graph.edges.lock().unwrap();
+        let edges = graph.edges_lock();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].source_node_id, "run_1");
         assert_eq!(edges[0].target_node_id, "sess_1");
@@ -759,11 +772,11 @@ mod tests {
         assert_eq!(result.nodes_created, 1); // EvalRun node
         assert_eq!(result.edges_created, 1); // EvaluatedBy edge
 
-        let nodes = graph.nodes.lock().unwrap();
+        let nodes = graph.nodes_lock();
         assert!(nodes.contains_key("eval_1"));
         assert_eq!(nodes["eval_1"].kind, NodeKind::EvalRun);
 
-        let edges = graph.edges.lock().unwrap();
+        let edges = graph.edges_lock();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].source_node_id, "eval_1");
         assert_eq!(edges[0].target_node_id, "release_1");
@@ -856,13 +869,13 @@ mod tests {
         assert_eq!(result.nodes_created, 3);
         assert_eq!(result.edges_created, 3);
 
-        let nodes = graph.nodes.lock().unwrap();
+        let nodes = graph.nodes_lock();
         assert!(nodes.contains_key("sig_1"));
         assert!(nodes.contains_key("run_1"));
         assert!(nodes.contains_key("trigger:trigger_1"));
         assert_eq!(nodes["trigger:trigger_1"].kind, NodeKind::Trigger);
 
-        let edges = graph.edges.lock().unwrap();
+        let edges = graph.edges_lock();
         assert!(edges.iter().any(|edge| {
             edge.source_node_id == "sig_1"
                 && edge.target_node_id == "trigger:trigger_1"
@@ -873,5 +886,62 @@ mod tests {
                 && edge.target_node_id == "run_1"
                 && edge.kind == EdgeKind::Fired
         }));
+    }
+
+    // ── #484: poison-tolerance regression ─────────────────────────────────
+    //
+    // Verify that a panic inside a thread holding `nodes` / `edges` does
+    // not cascade into subsequent readers. If we regress back to
+    // `.lock().unwrap()`, this test prints `thread ... panicked at ...
+    // PoisonError { .. }` instead of passing.
+    #[tokio::test]
+    async fn mem_graph_survives_writer_panic() {
+        let graph = Arc::new(MemGraph::new());
+
+        // Poison the `edges` mutex by panicking while holding it. Spawn on
+        // a blocking worker so the panic is confined to that thread
+        // (`#[should_panic]` on the outer test would catch the whole
+        // runtime; the intent here is to poison the lock, not fail the
+        // test).
+        let poisoner_graph = graph.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner_graph.edges.lock().expect("first lock succeeds");
+            panic!("intentional panic to poison the edges mutex");
+        })
+        .join();
+
+        // Poison the `nodes` mutex the same way.
+        let poisoner_graph = graph.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner_graph.nodes.lock().expect("first lock succeeds");
+            panic!("intentional panic to poison the nodes mutex");
+        })
+        .join();
+
+        // Both mutexes are now poisoned — confirm that assumption so the
+        // test remains meaningful if `Mutex` semantics ever change.
+        assert!(graph.edges.is_poisoned(), "edges must be poisoned");
+        assert!(graph.nodes.is_poisoned(), "nodes must be poisoned");
+
+        // Reader path: must not panic. The projector writes via the
+        // trait, the asserts read via the helper — both flow through
+        // `unwrap_or_else(PoisonError::into_inner)` and succeed.
+        let projector = EventProjector::new(graph.clone());
+        let events = vec![make_stored(RuntimeEvent::SessionCreated(SessionCreated {
+            project: ProjectKey::new("t", "w", "p"),
+            session_id: SessionId::new("sess_after_poison"),
+        }))];
+
+        let result = projector
+            .project_events(&events)
+            .await
+            .expect("projection must succeed through a poisoned lock");
+        assert_eq!(result.nodes_created, 1);
+
+        // Readers must also succeed. A regression to `.lock().unwrap()`
+        // would panic here with a PoisonError.
+        let nodes = graph.nodes_lock();
+        assert!(nodes.contains_key("sess_after_poison"));
+        let _edges = graph.edges_lock();
     }
 }

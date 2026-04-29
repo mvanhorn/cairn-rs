@@ -1311,8 +1311,34 @@ pub(crate) async fn list_credentials_handler(
 pub(crate) async fn revoke_credential_handler(
     State(state): State<Arc<AppState>>,
     _role: AdminRoleGuard,
+    tenant_scope: TenantScope,
     Path((tenant_id, id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // Closes #494: align with the canonical tenant-check shape used by
+    // `list_credentials_handler`, `get_session_handler`, `delete_session_admin_handler`,
+    // etc. Two layers, both return 404 (NEVER 403) to avoid the
+    // id-enumeration oracle documented on PR #337 / PR #537:
+    //
+    //   1. Path-tenant vs caller-tenant — a caller that crafted a URL
+    //      for a foreign tenant gets 404 unless `scope.is_admin` (which
+    //      is true only for the admin service account / System
+    //      principal; see `is_admin_principal`). Workspace-admin-role
+    //      operators PASS `AdminRoleGuard` but do NOT set
+    //      `tenant_scope.is_admin`, so they remain tenant-scoped here —
+    //      they can revoke only within their own tenant. Only the
+    //      admin service account can cross tenants.
+    //   2. Record-tenant vs path-tenant — the record's own tenant_id
+    //      must match the `:tenant_id` path segment. Protects against
+    //      typos in admin tooling and keeps the URL contract honest.
+    //
+    // Non-admin operators without workspace-admin role are rejected
+    // earlier by `AdminRoleGuard` with 403 (role-level refusal).
+    let target = TenantId::new(tenant_id);
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "credential not found")
+            .into_response();
+    }
+
     let credential_id = CredentialId::new(id);
     let existing = match state.runtime.credentials.get(&credential_id).await {
         Ok(Some(record)) => record,
@@ -1323,7 +1349,7 @@ pub(crate) async fn revoke_credential_handler(
         Err(err) => return runtime_error_response(err),
     };
 
-    if existing.tenant_id != TenantId::new(tenant_id) {
+    if existing.tenant_id != target {
         return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "credential not found")
             .into_response();
     }

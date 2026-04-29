@@ -501,6 +501,48 @@ async fn tenant_b_operator_cannot_revoke_tenant_a_credential() {
     );
 }
 
+/// Closes #494: admin mis-addressing a credential under the wrong
+/// `:tenant_id` path segment must return 404 (the 404-over-403
+/// id-enumeration-safe convention), not 200, and not 403. This was
+/// already enforced by the `existing.tenant_id != path_tenant_id`
+/// check; the test pins the behaviour so the canonical-shape
+/// refactor doesn't silently re-open the hole. See also:
+/// `delete_session_admin_handler`, `list_credentials_handler`.
+#[tokio::test]
+async fn admin_cross_tenant_revoke_returns_404_when_path_tenant_mismatches_record() {
+    let h = LiveHarness::setup().await;
+    // Credential is seeded under `default_tenant` (see `seed_credential`).
+    let cred_id = seed_credential(&h).await;
+
+    // Admin addresses the credential under the WRONG :tenant_id path
+    // segment. The handler must refuse with 404 — revealing neither
+    // the existence of the credential id nor whether the other tenant
+    // exists. A 200 here would mean an admin tool-typo silently
+    // revoked a credential that wasn't the one it meant to address.
+    let url = format!(
+        "{}/v1/admin/tenants/{}/credentials/{}",
+        h.base_url, "wrong_tenant_xt_494", cred_id,
+    );
+    let status = status_only(&h, reqwest::Method::DELETE, &url, &h.admin_token, None).await;
+    assert_eq!(
+        status, 404,
+        "admin mis-addressing a credential under the wrong tenant_id must get 404, not 200/403",
+    );
+
+    // Confirm the credential still exists by revoking it under the
+    // correct path — proves the first request didn't accidentally
+    // revoke it even though it returned 404.
+    let url = format!(
+        "{}/v1/admin/tenants/{}/credentials/{}",
+        h.base_url, "default_tenant", cred_id,
+    );
+    let status = status_only(&h, reqwest::Method::DELETE, &url, &h.admin_token, None).await;
+    assert_eq!(
+        status, 200,
+        "credential must still be revocable under the correct tenant path",
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Checkpoint — cross-tenant restore must be 404
 // ═══════════════════════════════════════════════════════════════════════════

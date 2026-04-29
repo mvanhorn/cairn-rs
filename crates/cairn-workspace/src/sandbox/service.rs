@@ -26,12 +26,50 @@ pub trait Clock: Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
+/// Fires the clock-before-epoch WARN at most once per process. `now_millis`
+/// is called on hot paths (heartbeat, leak-detection sweep, overdue scan)
+/// that can tick tens of times per second; without this latch a stuck RTC
+/// would spam the log. The WARN still covers the transition edge (the
+/// first bad tick after the clock goes bad), which is the operator signal
+/// that matters. Reset-on-recovery is intentionally NOT attempted — a
+/// clock that flaps across UNIX_EPOCH is a pathological scenario and
+/// re-firing the WARN on every flap would re-introduce the spam.
+static CLOCK_BEFORE_EPOCH_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Clock for SystemClock {
+    /// Returns the number of milliseconds since UNIX_EPOCH.
+    ///
+    /// # Clock-before-epoch fallback
+    ///
+    /// If the host clock reads *before* UNIX_EPOCH (1970-01-01T00:00:00Z),
+    /// `duration_since(UNIX_EPOCH)` returns `Err(SystemTimeError)`. This
+    /// is practically only reachable on hardware whose RTC battery dies
+    /// and re-initialises to a pre-1970 value on reboot. We emit a WARN
+    /// (once per process — see `CLOCK_BEFORE_EPOCH_WARNED`) and return
+    /// `0` rather than panicking. Every sandbox event timestamp flows
+    /// through this method; a panic here would take down the sandbox
+    /// service at boot. A bogus `0` timestamp is distinctly visible in
+    /// event logs but keeps the host alive and lets operators see the
+    /// problem (closes #466). A clock stuck at exactly UNIX_EPOCH
+    /// (equal, not before) does NOT trigger the fallback — it's a valid
+    /// `Duration::ZERO`.
     fn now_millis(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after unix epoch")
-            .as_millis() as u64
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|err| {
+                // Latch: WARN exactly once per process to avoid spamming
+                // log aggregators when a stuck clock keeps this path hot
+                // (heartbeat / sweep ticks call `now_millis` frequently).
+                if !CLOCK_BEFORE_EPOCH_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        error = %err,
+                        "system clock is before UNIX_EPOCH; returning 0 (sandbox events will be timestamped 0 until the clock recovers). This warning fires once per process."
+                    );
+                }
+                0
+            })
     }
 }
 
@@ -2240,6 +2278,77 @@ mod tests {
             *guard += 10;
             *guard
         }
+    }
+
+    // ── #466: SystemClock no-panic regression ──────────────────────────────
+    //
+    // The clock-before-epoch path is not reachable on any live production
+    // host (it would require an RTC reset to before 1970-01-01 mid-run),
+    // but the `unwrap_or_else` fallback is still observable via the public
+    // contract: `now_millis` must return `0` — not panic — on a
+    // `SystemTimeError`. A full runtime-level reproduction would need us
+    // to travel the real clock backwards, which rustc/tokio don't permit.
+    // These two tests together keep the public contract honest:
+    //
+    //   * `system_clock_now_millis_happy_path` asserts the live path
+    //     returns a value after 2020-01-01 (a sanity check that the
+    //     conversion isn't silently broken).
+    //   * `system_clock_fallback_path_returns_zero` constructs a
+    //     synthetic `SystemTimeError` via a known-good recipe
+    //     (`earlier.duration_since(later)`) and asserts the same code
+    //     shape the production impl uses returns `0`.
+
+    #[test]
+    fn system_clock_now_millis_happy_path() {
+        use super::SystemClock;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Only assert when `SystemTime::now()` is actually after UNIX_EPOCH
+        // on this host — dev/CI containers with a skewed clock are still
+        // a valid test environment and shouldn't make this unit fail.
+        // Per Copilot review comment on PR #560: an absolute "post-2020"
+        // threshold coupled this test to wall-clock correctness. What
+        // matters is: the method returns a value and doesn't panic, and
+        // if the underlying call says we're after UNIX_EPOCH, `now_millis`
+        // returns a non-zero reflection of that.
+        if SystemTime::now().duration_since(UNIX_EPOCH).is_ok() {
+            let clock = SystemClock;
+            let now = clock.now_millis();
+            assert!(
+                now > 0,
+                "SystemClock must return a non-zero timestamp when the host clock is past UNIX_EPOCH; got {now}",
+            );
+        }
+    }
+
+    #[test]
+    fn system_clock_fallback_path_returns_zero() {
+        // Replay the production fallback shape against a synthetic
+        // `SystemTimeError`. We construct the error by asking
+        // `duration_since` about an instant in the future — the only
+        // portable way to produce a real `SystemTimeError` without
+        // mucking with the system clock.
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let future = UNIX_EPOCH + Duration::from_secs(60);
+        let err = UNIX_EPOCH
+            .duration_since(future)
+            .expect_err("duration_since a future instant must error");
+
+        // Same shape as `SystemClock::now_millis` — if this shape ever
+        // panics, the production call site panics too.
+        let result: u64 = Err::<Duration, _>(err)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|e| {
+                // In production this is a `tracing::warn!`. Under the
+                // test harness `tracing` emits to the registered
+                // subscriber (or nothing); we just mirror the sink
+                // path to prove it compiles.
+                let _ = format!("{e}");
+                0
+            });
+
+        assert_eq!(result, 0, "fallback path must return 0, got {result}");
     }
 
     #[derive(Debug)]

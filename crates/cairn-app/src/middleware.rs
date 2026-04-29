@@ -20,6 +20,7 @@ use cairn_runtime::set_current_trace_id;
 use cairn_runtime::TenantService;
 use cairn_runtime::WorkspaceService;
 use cairn_store::projections::{PromptReleaseReadModel, WorkspaceMembershipReadModel};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::errors::{
@@ -91,8 +92,22 @@ pub(crate) async fn rate_limit_middleware(
     // Derive rate-limit key + per-key limit.
     // Token-authenticated requests get a higher allowance (1 000/min).
     // Unauthenticated requests are keyed by IP (100/min).
+    //
+    // Closes #490: bearer tokens are hashed (SHA-256, hex) before they
+    // land in the rate-limit map. The map only lives in memory, but a
+    // heap dump / core file / swap page written to disk would otherwise
+    // carry the raw bearer bytes for up to 2× `RL_WINDOW_MS` (2 min)
+    // after the last matching request. Hashing is a defense-in-depth
+    // change — SHA-256 is collision-resistant (finding a collision is
+    // computationally infeasible at this cardinality), preserves
+    // observable behaviour (same token → same bucket key), and carries
+    // zero plaintext. IPs are already safe to use verbatim; only the
+    // token arm hashes.
     let (key, limit) = if let Some(token) = bearer_token(&request) {
-        (format!("tok:{token}"), RL_TOKEN_LIMIT)
+        (
+            format!("tok:{}", hash_rate_limit_token(&token)),
+            RL_TOKEN_LIMIT,
+        )
     } else if let Some(ip) = request_rate_limit_key(&request) {
         (format!("ip:{ip}"), RL_IP_LIMIT)
     } else {
@@ -434,6 +449,22 @@ pub(crate) fn request_rate_limit_key(request: &Request) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Returns a lowercase hex SHA-256 digest of `token`. Closes #490: the
+/// rate-limit map is keyed by this digest so the raw bearer never
+/// appears in the map (or in a heap dump / core file / swap page).
+/// SHA-256 is collision-resistant — finding a collision is
+/// computationally infeasible at this cardinality — and deterministic,
+/// so the rate-limit window still keys on identity.
+pub(crate) fn hash_rate_limit_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 pub(crate) fn bearer_token(request: &Request) -> Option<String> {
@@ -1030,5 +1061,68 @@ mod tests {
     #[test]
     fn member_id_none_for_system() {
         assert_eq!(principal_member_id(&AuthPrincipal::System), None);
+    }
+
+    // ── #490: rate-limit key hashing ───────────────────────────────────────
+
+    /// Two distinct bearer tokens must hash to distinct rate-limit keys.
+    /// Regression guard: if SHA-256 were ever swapped for a cheaper hash
+    /// with collisions at this cardinality the rate-limit windows would
+    /// merge and we'd silently pool traffic from unrelated tokens.
+    #[test]
+    fn distinct_tokens_produce_distinct_rate_limit_hashes() {
+        let h1 = hash_rate_limit_token("sk-alpha-abcdef0123456789");
+        let h2 = hash_rate_limit_token("sk-beta-fedcba9876543210");
+        assert_ne!(h1, h2);
+        // Hex-encoded SHA-256 is always 64 chars of [0-9a-f].
+        assert_eq!(h1.len(), 64);
+        assert_eq!(h2.len(), 64);
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(h2.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Identical bearer tokens must hash to the same rate-limit key
+    /// across calls, or the sliding-window bucket never matches.
+    #[test]
+    fn same_token_produces_same_rate_limit_hash() {
+        let token = "sk-stable-0123456789abcdef";
+        assert_eq!(
+            hash_rate_limit_token(token),
+            hash_rate_limit_token(token),
+            "hash must be deterministic",
+        );
+    }
+
+    /// The raw bearer token must NEVER appear in the rate-limit key —
+    /// that's the whole point of #490. A `contains` substring check is
+    /// the cheapest way to spot a regression (someone re-introducing
+    /// `format!("tok:{token}")` without hashing).
+    #[test]
+    fn hash_rate_limit_token_does_not_leak_plaintext() {
+        let token = "sk-leakproof-abcdef0123456789";
+        let hashed = hash_rate_limit_token(token);
+        assert!(
+            !hashed.contains(token),
+            "hashed key {hashed} must not contain raw token {token}",
+        );
+        // Also sanity-check a common substring that is NOT a hex char
+        // to rule out accidental printable-ASCII leakage.
+        assert!(
+            !hashed.contains("sk-"),
+            "hashed key {hashed} must not contain the 'sk-' prefix",
+        );
+    }
+
+    /// Empty tokens hash deterministically (SHA-256 of "") — an empty
+    /// token never reaches this function in practice because
+    /// `bearer_token` filters empties first, but the hasher itself
+    /// should still be defined.
+    #[test]
+    fn hash_rate_limit_token_handles_empty() {
+        // SHA-256 of the empty string (well-known vector).
+        assert_eq!(
+            hash_rate_limit_token(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
     }
 }
