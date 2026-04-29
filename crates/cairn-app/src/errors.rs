@@ -183,6 +183,18 @@ pub fn runtime_error_response(err: cairn_runtime::RuntimeError) -> axum::respons
         cairn_runtime::RuntimeError::Validation { .. } => {
             validation_error_response(err.to_string())
         }
+        // #353: provider connection referenced for generation but with
+        // no bound credential. Returns 422 (not 503) so callers that
+        // retry-on-5xx do not spin — this is a configuration fix, not
+        // an upstream outage. The `provider_credential_missing` code
+        // names the remediation path (link a credential) distinct from
+        // `provider_auth_failed` (rotate an existing credential).
+        cairn_runtime::RuntimeError::CredentialMissing { .. } => AppApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "provider_credential_missing",
+            err.to_string(),
+        )
+        .into_response(),
         cairn_runtime::RuntimeError::Store(store_err) => store_error_response(store_err),
         // SEC-007 (#419): `RuntimeError::Internal(msg)` carries free-form
         // runtime detail that can include internal paths, IDs, or

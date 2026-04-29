@@ -763,6 +763,28 @@ async fn orchestrate_run_handler_inner(
                 }
             }
         }
+        Err(cairn_runtime::error::RuntimeError::CredentialMissing { connection_id }) => {
+            // #353 + Gemini review on #587: the default
+            // `runtime_error_response` path renders `CredentialMissing`
+            // with the generic `:tenant` placeholder (the variant does
+            // not carry the tenant_id). Here we know it — interpolate
+            // the concrete tenant into the remediation URL so
+            // operators can copy-paste without substitution.
+            let tenant = run.project.tenant_id.as_str();
+            return AppApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "provider_credential_missing",
+                format!(
+                    "provider connection {connection_id} has no credential bound. \
+                     (1) Store an API key via POST /v1/admin/tenants/{tenant}/credentials, \
+                     then (2) link it by re-sending the full connection update to \
+                     PUT /v1/providers/connections/{connection_id} — include \
+                     provider_family, adapter_type, supported_models (required by \
+                     UpdateProviderConnectionRequest) alongside credential_id=<credential id>.",
+                ),
+            )
+            .into_response();
+        }
         Err(err) => return runtime_error_response(err),
     };
 
@@ -969,6 +991,11 @@ async fn orchestrate_run_handler_inner(
     // look up the selected backend's `reports_usage` flag without
     // re-walking the active-connection list.
     let mut preferred_connection_id: Option<String> = None;
+    // #353: lifted out of the routed-service closure so we can fail-fast
+    // with 422 `provider_credential_missing` if every registered
+    // connection for this tenant was rejected at build time for the
+    // same reason. See the block further down.
+    let mut credential_missing_connections: Vec<String> = Vec::new();
     let routed = {
         let scoped_cooldowns = state.provider_fallback_cooldown.clone();
         let tenant_key = run.project.tenant_id.as_str().to_owned();
@@ -1028,6 +1055,12 @@ async fn orchestrate_run_handler_inner(
             None => (0..summaries.len()).collect(),
         };
 
+        // #353: `credential_missing_connections` lives in the outer
+        // scope so the post-closure check can surface a 422 when no
+        // binding builds successfully AND at least one failed for
+        // `CredentialMissing`. Keeping the collection here (closure
+        // side) captures errors from `resolve_generation_for_connection`
+        // without propagating them through `RoutedGenerationService`.
         for idx in order {
             let (conn_id, supported) = &summaries[idx];
             // Resolve the adapter by EXACT connection ID. Previously we
@@ -1056,6 +1089,10 @@ async fn orchestrate_run_handler_inner(
                 .await
             {
                 Ok(Some(a)) => a,
+                Err(cairn_runtime::error::RuntimeError::CredentialMissing { .. }) => {
+                    credential_missing_connections.push(conn_id.clone());
+                    continue;
+                }
                 _ => continue,
             };
 
@@ -1096,7 +1133,14 @@ async fn orchestrate_run_handler_inner(
         // Fallback for self-hosted dev with no active-connection records
         // (CAIRN_BRAIN_URL / OPENROUTER_API_KEY env-only mode): wrap the
         // startup-resolved adapter as a single-binding chain.
-        if bindings.is_empty() {
+        //
+        // #353: we deliberately do NOT fall through to the startup
+        // fallback when at least one tenant-registered connection
+        // failed for `CredentialMissing` — the operator explicitly
+        // registered a connection; they want it to work. Surfacing
+        // startup-env fallback here would hide the configuration
+        // error. The post-closure branch below returns 422 in that case.
+        if bindings.is_empty() && credential_missing_connections.is_empty() {
             let cooldown = scoped_cooldowns.get_or_create(&tenant_key, "startup");
             bindings.push(cairn_runtime::RoutedBinding {
                 binding_id: "startup".to_owned(),
@@ -1107,6 +1151,30 @@ async fn orchestrate_run_handler_inner(
 
         cairn_runtime::RoutedGenerationService::new(bindings)
     };
+
+    // #353: every tenant-registered connection rejected the build with
+    // `CredentialMissing`. Return the dedicated 422 with the list of
+    // affected connections so the operator knows exactly which rows
+    // need a credential linked. Keeps the SDK retry-on-5xx loop from
+    // pinning on a configuration bug that only a human can fix.
+    if routed.is_empty() && !credential_missing_connections.is_empty() {
+        let conns = credential_missing_connections.join(", ");
+        let tenant = run.project.tenant_id.as_str();
+        return AppApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "provider_credential_missing",
+            format!(
+                "No provider connection for this tenant has a credential bound. \
+                 Affected connections: [{conns}]. \
+                 (1) Store an API key via POST /v1/admin/tenants/{tenant}/credentials, \
+                 then (2) link it by re-sending the full connection update to \
+                 PUT /v1/providers/connections/<id> — include provider_family, \
+                 adapter_type, supported_models (required by \
+                 UpdateProviderConnectionRequest) alongside credential_id=<credential id>.",
+            ),
+        )
+        .into_response();
+    }
 
     let decide = LlmDecidePhase::from_routed(routed).with_tools(registry.clone());
 

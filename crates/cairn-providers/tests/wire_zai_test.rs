@@ -312,16 +312,26 @@ async fn zai_streaming_preserves_reasoning_alongside_tool_calls() {
     assert!(saw_tool_call, "tool_call must still be emitted");
 }
 
-/// Live smoke against the coding endpoint.  Requires `ZAI_API_KEY` in env.
-/// Ignored by default — run with
-/// `ZAI_API_KEY=... cargo test -p cairn-providers --test wire_zai_test \
-///     zai_live_smoke -- --ignored --nocapture`.
+/// Live smoke against the coding endpoint. Requires `ZAI_API_KEY` in env.
 ///
-/// Un-ignore trigger tracked in issue #552 (scheduled-integration
-/// policy for live z.ai smokes).
+/// **CI policy (issue #552 resolved 2026-04-28):** run weekly via the
+/// `.github/workflows/zai-smoke.yml` scheduled workflow. Ignored for
+/// per-PR `cargo test --workspace` because (a) the test consumes
+/// tokens against a real operator-owned API key and (b) z.ai's
+/// `1305 overloaded` envelope would surface as CI noise on every
+/// green PR. The weekly cadence catches upstream wire-format changes
+/// (SSE envelope, reasoning_content + tool_calls interaction, usage
+/// field shape) without the noise.
+///
+/// Local reproduction:
+/// ```text
+/// ZAI_API_KEY=... cargo test -p cairn-providers --test wire_zai_test \
+///     zai_live_smoke -- --ignored --nocapture
+/// ```
 #[tokio::test]
 #[ignore = "hits real z.ai coding endpoint; requires ZAI_API_KEY. \
-            Un-ignore policy tracked in \
+            Runs weekly via .github/workflows/zai-smoke.yml; \
+            policy tracked in (now closed) \
             https://github.com/avifenesh/cairn-rs/issues/552"]
 async fn zai_live_smoke() {
     let key = match std::env::var("ZAI_API_KEY") {

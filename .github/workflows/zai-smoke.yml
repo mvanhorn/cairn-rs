@@ -1,0 +1,98 @@
+name: zai-smoke
+
+# Weekly live-smoke against the real z.ai coding endpoint.
+#
+# This catches upstream wire-format regressions (SSE envelope changes,
+# the 1305 overloaded-retry envelope, GLM-specific `prompt_tokens_details`
+# fields, reasoning_content + tool_calls same-frame interactions, etc.)
+# that our mock-based tests cannot see.
+#
+# Policy decided in issue #552:
+#   * Weekly cron, not per-PR — the test consumes tokens against a
+#     real API key and 1305s would be CI noise on every PR.
+#   * Failures surface via the standard Actions run status (red
+#     workflow icon + email to watchers); operators inspect the run
+#     logs directly. No auto-filed tracking issue in this revision —
+#     that would require an extra GitHub token scope we don't want
+#     to grant by default. Copilot review on #587.
+#   * Manual trigger (`workflow_dispatch`) for investigations.
+#
+# Requirements:
+#   * Repo secret `ZAI_API_KEY` — a key with the coding-plan entitlement.
+#     If the secret is absent, the job SKIPS without failing (so the
+#     workflow does not red-bar a repo that has not configured the key
+#     yet). See issue #552 for the follow-up to add the secret.
+
+"on":
+  schedule:
+    # Mondays 06:00 UTC. Low-traffic window for z.ai.
+    - cron: "0 6 * * 1"
+  # No `inputs:` — the cargo invocation always passes `--nocapture`
+  # (see the run step below) so there is nothing to toggle at dispatch
+  # time. Add an input back here only when the workflow starts branching
+  # on it. Copilot review on #587.
+  workflow_dispatch:
+
+concurrency:
+  # Only one smoke run at a time; a stuck run does not queue up a
+  # backlog. `cancel-in-progress: false` lets the in-flight run finish
+  # if a manual dispatch happens while cron is mid-flight — we want
+  # the evidence from both runs, not a cancelled one.
+  group: zai-smoke
+  cancel-in-progress: false
+
+jobs:
+  live-smoke:
+    name: zai_live_smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      SQLX_OFFLINE: "true"
+    steps:
+      - name: Probe for ZAI_API_KEY secret
+        id: has_key
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        # Secrets are not exposed to `if:` expressions directly; compare
+        # in a shell step and export a step output instead. Empty string
+        # is the sentinel for "secret not configured in this repo."
+        run: |
+          if [ -z "${ZAI_API_KEY:-}" ]; then
+            echo "ZAI_API_KEY secret is not configured in this repository."
+            echo "The smoke will skip. Follow-up: add the secret via \
+                  Settings → Secrets and variables → Actions."
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.has_key.outputs.has_key == 'true'
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.has_key.outputs.has_key == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.has_key.outputs.has_key == 'true'
+        with:
+          # Scope the cache to the smoke workflow so it doesn't evict
+          # the main CI cache on every weekly run.
+          prefix-key: "zai-smoke"
+
+      - name: Run zai_live_smoke
+        if: steps.has_key.outputs.has_key == 'true'
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Single-test invocation — the live smoke is the only
+          # `#[ignore]`-gated test that needs ZAI_API_KEY, so we do
+          # NOT run the full `--ignored` set (other ignored tests are
+          # unrelated soak/integration suites that have their own
+          # budgets and must not run inside this job).
+          cargo test \
+            -p cairn-providers \
+            --test wire_zai_test \
+            zai_live_smoke \
+            -- --ignored --nocapture

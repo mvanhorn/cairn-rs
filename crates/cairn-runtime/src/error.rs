@@ -40,6 +40,17 @@ pub enum RuntimeError {
     },
     /// Validation failure.
     Validation { reason: String },
+    /// A provider connection was referenced for generation but no
+    /// credential is bound to it. The operator created the connection
+    /// without supplying `credential_id` (or the link was removed), so
+    /// there is no secret for cairn to sign upstream requests with.
+    ///
+    /// This is deliberately distinct from an upstream-rejected-the-key
+    /// auth failure (`ProviderAdapterError::Auth`) — the two bite the
+    /// same operator with different recovery paths, and the old
+    /// "rotate the credential" message confused first-time setups
+    /// where there is nothing to rotate. Closes #353.
+    CredentialMissing { connection_id: String },
 }
 
 impl fmt::Display for RuntimeError {
@@ -85,6 +96,15 @@ impl fmt::Display for RuntimeError {
                 )
             }
             RuntimeError::Validation { reason } => write!(f, "validation error: {reason}"),
+            RuntimeError::CredentialMissing { connection_id } => write!(
+                f,
+                "provider connection {connection_id} has no credential bound; \
+                 (1) store an API key via POST /v1/admin/tenants/:tenant/credentials, then \
+                 (2) link it by re-sending the full connection update to \
+                 PUT /v1/providers/connections/{connection_id} — include \
+                 provider_family, adapter_type, supported_models (required by \
+                 UpdateProviderConnectionRequest) alongside credential_id=<id>"
+            ),
             RuntimeError::DependencyConflict(d) => write!(
                 f,
                 "dependency edge {} <- {} already exists with \

@@ -430,6 +430,18 @@ where
         let api_key = self
             .api_key_for_connection(&connection.provider_connection_id)
             .await?;
+        // #353: fail fast when a backend that needs a bearer key has no
+        // credential bound. Without this, the provider would be built
+        // with an empty api_key and the upstream 401 would surface as
+        // `ProviderAdapterError::Auth` — the operator would then see
+        // "rotate the credential" even though there is no credential
+        // to rotate. CredentialMissing produces a distinct 422 upstream
+        // pointing at the correct remediation (link a credential).
+        if api_key.is_none() && backend_requires_api_key(&backend) {
+            return Err(RuntimeError::CredentialMissing {
+                connection_id: connection.provider_connection_id.as_str().to_owned(),
+            });
+        }
         let configured_model = if !requested_model.is_empty()
             && connection
                 .supported_models
@@ -995,6 +1007,31 @@ fn map_provider_error(error: cairn_providers::error::ProviderError) -> ProviderA
             ProviderAdapterError::InvalidRequest(message)
         }
     }
+}
+
+/// Whether a given backend family needs a bearer API key to sign its
+/// outbound requests. Used to fail fast in `build_provider` with
+/// [`RuntimeError::CredentialMissing`] when the operator created a
+/// connection but never bound a credential to it — prevents the old
+/// "rotate the credential" (#353) misclassification where the upstream
+/// 401 was indistinguishable from a bad-key rejection.
+///
+/// Keyless backends:
+/// * `Ollama` — local-first; default `http://localhost:11434` deploy
+///   accepts requests without an `Authorization` header.
+///
+/// Bedrock / BedrockCompat are NOT keyless: the native Bedrock adapter
+/// requires `BEDROCK_API_KEY` / `AWS_BEARER_TOKEN_BEDROCK` and sends
+/// `Authorization: Bearer <token>` on every request (see
+/// `cairn_providers::backends::bedrock`). A connection with no bound
+/// credential must still surface `CredentialMissing` for those. Copilot
+/// review on #587.
+///
+/// Every other backend rejects requests without a bearer, so we surface
+/// the clearer "no credential bound" diagnostic before ever calling
+/// upstream. Add a new backend here when it supports no-auth operation.
+fn backend_requires_api_key(backend: &Backend) -> bool {
+    !matches!(backend, Backend::Ollama)
 }
 
 fn backend_for_connection(connection: &ProviderConnectionRecord) -> Result<Backend, RuntimeError> {

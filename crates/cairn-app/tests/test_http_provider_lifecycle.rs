@@ -400,3 +400,256 @@ async fn chat_stream_returns_422_when_model_not_supported_by_any_connection() {
         "422 body must enumerate active connections, got: {body}",
     );
 }
+
+/// Regression for issue #353: a provider connection created without a
+/// bound `credential_id` must not surface the misleading
+/// `provider_auth_failed` / "rotate the credential" error on
+/// orchestrate. Before the fix, orchestrate would silently build the
+/// provider with an empty api_key, hit upstream 401, and return 503
+/// with the rotate-credential remediation — which points the operator
+/// at the wrong next step (there is no credential to rotate yet).
+///
+/// Expected post-fix: orchestrate returns 422 `provider_credential_missing`
+/// naming the affected connection and telling the operator to link a
+/// credential. The upstream provider is NEVER called (assertion on the
+/// mock hit counter). A follow-up orchestrate after linking a credential
+/// must succeed end-to-end.
+#[tokio::test]
+async fn orchestrate_returns_422_provider_credential_missing_when_no_credential_bound() {
+    let h = LiveHarness::setup().await;
+    let (mock_url, hits) = spawn_openrouter_mock().await;
+
+    let suffix = h.project.clone();
+    let tenant = "default_tenant".to_owned();
+    let workspace = "default_workspace".to_owned();
+    let project = "default_project".to_owned();
+    let connection_id = format!("conn353_{suffix}");
+    let session_id = format!("sess353_{suffix}");
+    let run_id_1 = format!("run353a_{suffix}");
+    let run_id_2 = format!("run353b_{suffix}");
+
+    // 1. Register a provider connection WITHOUT a credential_id.
+    //    Exactly the shape #353 reproduced on 2026-04-27 when
+    //    registering z.ai without linking a credential.
+    let r = h
+        .client()
+        .post(format!("{}/v1/providers/connections", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": tenant,
+            "provider_connection_id": connection_id,
+            "provider_family": "openrouter",
+            "adapter_type": "openrouter",
+            "supported_models": [TEST_MODEL],
+            "endpoint_url": mock_url,
+            // Note: NO credential_id field. The handler must accept
+            // the create (register-first-link-later is a legitimate
+            // operator flow) but orchestrate must refuse cleanly.
+        }))
+        .send()
+        .await
+        .expect("connection reaches server");
+    assert_eq!(
+        r.status().as_u16(),
+        201,
+        "connection create without credential_id must still succeed: {}",
+        r.text().await.unwrap_or_default(),
+    );
+
+    // 2. Wire the system defaults so orchestrate resolves to this
+    //    model (and therefore this connection).
+    for key in ["generate_model", "brain_model"] {
+        let r = h
+            .client()
+            .put(format!(
+                "{}/v1/settings/defaults/system/system/{}",
+                h.base_url, key,
+            ))
+            .bearer_auth(&h.admin_token)
+            .json(&json!({ "value": TEST_MODEL }))
+            .send()
+            .await
+            .expect("settings put reaches server");
+        assert_eq!(r.status().as_u16(), 200);
+    }
+
+    // 3. Session + run.
+    let r = h
+        .client()
+        .post(format!("{}/v1/sessions", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": tenant,
+            "workspace_id": workspace,
+            "project_id": project,
+            "session_id": session_id,
+        }))
+        .send()
+        .await
+        .expect("session reaches server");
+    assert_eq!(r.status().as_u16(), 201);
+
+    let r = h
+        .client()
+        .post(format!("{}/v1/runs", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": tenant,
+            "workspace_id": workspace,
+            "project_id": project,
+            "session_id": session_id,
+            "run_id": run_id_1,
+        }))
+        .send()
+        .await
+        .expect("run reaches server");
+    assert_eq!(r.status().as_u16(), 201);
+
+    // 4. Orchestrate — must 422 with provider_credential_missing and
+    //    MUST NOT call the upstream mock (the credential check is
+    //    server-side before any outbound request).
+    let hits_before = hits.load(Ordering::SeqCst);
+    let r = h
+        .client()
+        .post(format!("{}/v1/runs/{}/orchestrate", h.base_url, run_id_1,))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "goal": "finish immediately",
+            "max_iterations": 1,
+        }))
+        .send()
+        .await
+        .expect("orchestrate reaches server");
+
+    let status = r.status().as_u16();
+    let body = r.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 422,
+        "expected 422 when connection has no credential, got {status}: {body}",
+    );
+    assert!(
+        body.contains("provider_credential_missing"),
+        "error code must be provider_credential_missing, got: {body}",
+    );
+    // The message must point the operator at the right remediation —
+    // not the old "rotate the credential" sentence that misled #353.
+    assert!(
+        !body.contains("Rotate the credential"),
+        "#353 regression: must not surface the rotate-credential message, got: {body}",
+    );
+    assert!(
+        body.contains("credential") && body.contains(connection_id.as_str()),
+        "422 body must name the affected connection and mention credentials, got: {body}",
+    );
+    assert!(
+        body.contains("POST /v1/admin/tenants")
+            || body.contains("credentials")
+            || body.contains("PUT /v1/providers/connections"),
+        "422 body must describe the remediation path, got: {body}",
+    );
+    // Gemini review on #587: the remediation path must carry the
+    // concrete tenant_id, not a `:tenant` placeholder that the
+    // operator has to mentally substitute. Regression-gate that
+    // here so a future drift back to placeholders is caught.
+    assert!(
+        body.contains(tenant.as_str()),
+        "422 body must interpolate the actual tenant_id ({tenant}) into the remediation URL, got: {body}",
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        hits_before,
+        "upstream mock must NOT be called when credential is missing — the check is server-side",
+    );
+
+    // 5. Sanity: after linking a credential, orchestrate succeeds.
+    //    Proves the 422 was strictly a configuration diagnosis, not a
+    //    persistent outage. This also asserts the OFFICIAL remediation
+    //    path (POST credential → PATCH connection) works end-to-end.
+    let r = h
+        .client()
+        .post(format!(
+            "{}/v1/admin/tenants/{}/credentials",
+            h.base_url, tenant,
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "provider_id": "openrouter",
+            "plaintext_value": format!("sk-test-353-{suffix}"),
+        }))
+        .send()
+        .await
+        .expect("credential reaches server");
+    assert_eq!(r.status().as_u16(), 201);
+    let credential_id = r
+        .json::<Value>()
+        .await
+        .unwrap()
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_owned();
+
+    let r = h
+        .client()
+        .put(format!(
+            "{}/v1/providers/connections/{}",
+            h.base_url, connection_id,
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "provider_family": "openrouter",
+            "adapter_type": "openrouter",
+            "supported_models": [TEST_MODEL],
+            "credential_id": credential_id,
+            "endpoint_url": mock_url,
+        }))
+        .send()
+        .await
+        .expect("put reaches server");
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "connection put must succeed: {}",
+        r.text().await.unwrap_or_default(),
+    );
+
+    // Second run + orchestrate must now route through the mock.
+    let r = h
+        .client()
+        .post(format!("{}/v1/runs", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": tenant,
+            "workspace_id": workspace,
+            "project_id": project,
+            "session_id": session_id,
+            "run_id": run_id_2,
+        }))
+        .send()
+        .await
+        .expect("run2 reaches server");
+    assert_eq!(r.status().as_u16(), 201);
+
+    let r = h
+        .client()
+        .post(format!("{}/v1/runs/{}/orchestrate", h.base_url, run_id_2,))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "goal": "finish immediately",
+            "max_iterations": 1,
+        }))
+        .send()
+        .await
+        .expect("orchestrate 2 reaches server");
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "post-link orchestrate must succeed: {}",
+        r.text().await.unwrap_or_default(),
+    );
+    assert!(
+        hits.load(Ordering::SeqCst) > hits_before,
+        "mock must be called after credential is linked, hits_before={hits_before} after={}",
+        hits.load(Ordering::SeqCst),
+    );
+}
