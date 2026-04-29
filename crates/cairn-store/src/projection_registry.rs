@@ -690,20 +690,20 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "CredentialKeyRotated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (credentials)",
+        status: ProjectionStatus::Projected {
+            table: Some("credential_rotations"),
         },
     },
     ProjectionEntry {
         variant: "CredentialRevoked",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (credentials)",
+        status: ProjectionStatus::Projected {
+            table: Some("credentials"),
         },
     },
     ProjectionEntry {
         variant: "CredentialStored",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (credentials)",
+        status: ProjectionStatus::Projected {
+            table: Some("credentials"),
         },
     },
     ProjectionEntry {
@@ -810,8 +810,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "LicenseActivated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (licenses)",
+        status: ProjectionStatus::Projected {
+            table: Some("licenses"),
         },
     },
     ProjectionEntry {
@@ -900,20 +900,20 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "ProviderBudgetAlertTriggered",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (provider budgets)",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_budgets"),
         },
     },
     ProjectionEntry {
         variant: "ProviderBudgetExceeded",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (provider budgets)",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_budgets"),
         },
     },
     ProjectionEntry {
         variant: "ProviderBudgetSet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (provider budgets)",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_budgets"),
         },
     },
     ProjectionEntry {
@@ -1074,14 +1074,14 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "TenantQuotaSet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (quotas)",
+        status: ProjectionStatus::Projected {
+            table: Some("tenant_quotas"),
         },
     },
     ProjectionEntry {
         variant: "TenantQuotaViolated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (quotas)",
+        status: ProjectionStatus::Projected {
+            table: Some("tenant_quota_violations"),
         },
     },
     ProjectionEntry {
@@ -1175,10 +1175,12 @@ mod tests {
         // `eval_runs` projection table is wired.
         let status = lookup("EvalRunStarted").expect("EvalRunStarted is Projected (Phase 1)");
         assert!(status.is_projected());
-        // CredentialStored is still Stubbed as of Phase 1 — Phase 2a
-        // migrates the credential surface.
-        let status = lookup("CredentialStored").expect("CredentialStored is Stubbed");
-        assert!(status.is_stubbed());
+        // RFC-025 Phase 2a.1 milestone 1: CredentialStored flipped from
+        // Stubbed → Projected now that pg V035 + sqlite schema carry the
+        // `credentials` read-model table.
+        let status =
+            lookup("CredentialStored").expect("CredentialStored is Projected (Phase 2a.1)");
+        assert!(status.is_projected());
         let status = lookup("CircuitBreakerTripped").expect("CircuitBreakerTripped is Ephemeral");
         assert!(status.is_ephemeral());
         assert!(lookup("NotAVariant").is_none());
@@ -1202,17 +1204,15 @@ mod tests {
             !stubbed.is_empty(),
             "Phase 1 should surface at least one stubbed variant (Phase 2a/2b backlog)"
         );
-        // Spot-check variants still in the Stubbed bucket post-Phase-1.
-        // EvalRunStarted moved to Projected in milestone 7 — pick
-        // credentials + audits instead, both owned by Phase 2a/2b.
-        for required in ["CredentialStored", "AuditLogEntryRecorded"] {
+        // Spot-check variants still in the Stubbed bucket post-Phase-2a.1.
+        // AuditLogEntryRecorded is Phase 2b (new table + events); still Stubbed.
+        for required in ["AuditLogEntryRecorded", "ScheduledTaskCreated"] {
             assert!(
                 stubbed.contains(&required),
-                "{required} should still be Stubbed after Phase 1 (Phase 2a/2b migrates)"
+                "{required} should still be Stubbed after Phase 2a.1 (Phase 2a.2/2b migrates)"
             );
         }
-        // And confirm the Phase-1 eval migrations left the Stubbed
-        // bucket (invariant test for milestone 7).
+        // Confirm Phase-1 eval migrations stayed out of Stubbed.
         for migrated in [
             "EvalRunStarted",
             "EvalRunCompleted",
@@ -1223,6 +1223,18 @@ mod tests {
             assert!(
                 !stubbed.contains(&migrated),
                 "{migrated} should be Projected after Phase 1 milestone 7"
+            );
+        }
+        // Confirm Phase-2a.1 milestone 1 credentials left the Stubbed
+        // bucket.
+        for migrated in [
+            "CredentialStored",
+            "CredentialRevoked",
+            "CredentialKeyRotated",
+        ] {
+            assert!(
+                !stubbed.contains(&migrated),
+                "{migrated} should be Projected after Phase 2a.1 milestone 1"
             );
         }
     }
@@ -1250,17 +1262,27 @@ mod tests {
         //   * Milestone 7 flips five eval variants (Started / Completed
         //     / Archived / Scored / RubricScored) to Projected, removing
         //     two Ephemeral + three Stubbed → 53 / 31 / 74.
+        //   * Phase 2a.1 milestone 1 flips three credential variants
+        //     (CredentialStored / Revoked / KeyRotated) to Projected,
+        //     removing three from Stubbed → 56 / 31 / 71.
+        //   * Phase 2a.1 milestone 2 flips two tenant-quota variants
+        //     (TenantQuotaSet / Violated) to Projected → 58 / 31 / 69.
+        //   * Phase 2a.1 milestone 3 flips three provider-budget variants
+        //     (ProviderBudgetSet / AlertTriggered / Exceeded) to Projected
+        //     → 61 / 31 / 66.
+        //   * Phase 2a.1 milestone 4 flips `LicenseActivated` to Projected
+        //     → 62 / 31 / 65.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 53,
+            projected, 62,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
             ephemeral, 31,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 74, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 65, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 
@@ -1268,9 +1290,9 @@ mod tests {
     fn error_display_includes_variant_list() {
         let err = assert_no_stubs_for_persistent_backend(Backend::Postgres).unwrap_err();
         let msg = err.to_string();
-        // EvalRunStarted moved out of Stubbed in milestone 7; check a
-        // credential variant that stays Stubbed through Phase 2a.
-        assert!(msg.contains("CredentialStored"));
+        // CredentialStored moved out of Stubbed in Phase 2a.1 milestone 1;
+        // pick a Phase 2b audit variant that stays Stubbed.
+        assert!(msg.contains("AuditLogEntryRecorded"));
         assert!(msg.contains("Postgres") || msg.contains("postgres"));
     }
 }

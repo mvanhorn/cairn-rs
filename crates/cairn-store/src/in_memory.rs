@@ -138,6 +138,12 @@ struct State {
     provider_budgets: HashMap<String, cairn_domain::providers::ProviderBudget>,
     provider_connections: HashMap<String, cairn_domain::providers::ProviderConnectionRecord>,
     quotas: HashMap<String, cairn_domain::TenantQuota>,
+    /// RFC-025 Phase 2a.1 milestone 2: audit trail for
+    /// `TenantQuotaViolated` events. One entry per violation, pushed on
+    /// event apply. Matches the `tenant_quota_violations` projection on
+    /// pg/sqlite so `QuotaViolationReadModel::list_violations` returns
+    /// byte-equal results across backends.
+    quota_violations: Vec<crate::projections::QuotaViolationRecord>,
     provider_bindings: HashMap<String, cairn_domain::providers::ProviderBindingRecord>,
     provider_health_schedules: HashMap<String, cairn_domain::providers::ProviderHealthSchedule>,
     run_sla_configs: HashMap<String, cairn_domain::sla::SlaConfig>,
@@ -264,6 +270,7 @@ impl InMemoryStore {
                 provider_budgets: HashMap::new(),
                 provider_connections: HashMap::new(),
                 quotas: HashMap::new(),
+                quota_violations: Vec::new(),
                 provider_bindings: HashMap::new(),
                 provider_health_schedules: HashMap::new(),
                 run_sla_configs: HashMap::new(),
@@ -929,14 +936,22 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::ProviderBudgetSet(e) => {
-                let key = format!("{}:{:?}", e.tenant_id.as_str(), e.period);
+                // RFC-025 Phase 2a.1 milestone 3: key by `budget_id` so
+                // subsequent Alert/Exceeded events (which reference
+                // `budget_id`, not `tenant_id:period`) can update the
+                // matching row. Prior code keyed on `tenant_id:period`,
+                // silently orphaning Alert/Exceeded updates; the pg +
+                // sqlite projection tables own budget_id as primary key,
+                // so this brings the in-memory side into parity.
                 state.provider_budgets.insert(
-                    key,
+                    e.budget_id.clone(),
                     cairn_domain::providers::ProviderBudget {
                         tenant_id: e.tenant_id.clone(),
                         period: e.period,
                         limit_micros: e.limit_micros,
-                        alert_threshold_percent: e.alert_threshold_percent.unwrap_or(80),
+                        alert_threshold_percent: e
+                            .alert_threshold_percent
+                            .unwrap_or(cairn_domain::providers::DEFAULT_BUDGET_ALERT_THRESHOLD_PERCENT),
                         current_spend_micros: 0,
                         created_at: now,
                         updated_at: now,
@@ -957,24 +972,53 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::CredentialStored(e) => {
-                state.credentials.insert(
-                    e.credential_id.as_str().to_owned(),
-                    cairn_domain::credentials::CredentialRecord {
-                        id: e.credential_id.clone(),
-                        tenant_id: e.tenant_id.clone(),
-                        name: e.provider_id.clone(),
-                        credential_type: "api_key".to_owned(),
-                        encrypted_value: e.encrypted_value.clone(),
-                        created_at: e.encrypted_at_ms,
-                        updated_at: e.encrypted_at_ms,
-                        active: true,
-                        provider_id: e.provider_id.clone(),
-                        encrypted_at_ms: Some(e.encrypted_at_ms),
-                        key_id: e.key_id.clone(),
-                        key_version: e.key_version.clone(),
-                        revoked_at_ms: None,
-                    },
-                );
+                // RFC-025 Phase 2a.1 milestone 1 (Copilot review PR #565):
+                // preserve `active` + `revoked_at_ms` + `created_at` on
+                // re-store so a `Stored → Revoked → Stored` sequence ends
+                // in the revoked state on all three backends. Previously
+                // the in-memory applier reset to `active: true,
+                // revoked_at_ms: None` on every re-store, diverging from
+                // pg/sqlite (which preserve the revoke via ON CONFLICT DO
+                // UPDATE that excludes active/revoked columns).
+                //
+                // Operators who want to un-revoke must issue the
+                // dedicated reactivation flow; a duplicate `Stored` event
+                // is a no-op on revocation state.
+                let key = e.credential_id.as_str().to_owned();
+                match state.credentials.get_mut(&key) {
+                    Some(existing) => {
+                        existing.name = e.provider_id.clone();
+                        existing.provider_id = e.provider_id.clone();
+                        existing.encrypted_value = e.encrypted_value.clone();
+                        existing.encrypted_at_ms = Some(e.encrypted_at_ms);
+                        existing.key_id = e.key_id.clone();
+                        existing.key_version = e.key_version.clone();
+                        existing.updated_at = e.encrypted_at_ms;
+                        // `created_at`, `active`, `revoked_at_ms`
+                        // intentionally untouched — parity with pg/sqlite
+                        // ON CONFLICT DO UPDATE.
+                    }
+                    None => {
+                        state.credentials.insert(
+                            key,
+                            cairn_domain::credentials::CredentialRecord {
+                                id: e.credential_id.clone(),
+                                tenant_id: e.tenant_id.clone(),
+                                name: e.provider_id.clone(),
+                                credential_type: "api_key".to_owned(),
+                                encrypted_value: e.encrypted_value.clone(),
+                                created_at: e.encrypted_at_ms,
+                                updated_at: e.encrypted_at_ms,
+                                active: true,
+                                provider_id: e.provider_id.clone(),
+                                encrypted_at_ms: Some(e.encrypted_at_ms),
+                                key_id: e.key_id.clone(),
+                                key_version: e.key_version.clone(),
+                                revoked_at_ms: None,
+                            },
+                        );
+                    }
+                }
             }
             RuntimeEvent::CredentialRevoked(e) => {
                 if let Some(rec) = state.credentials.get_mut(e.credential_id.as_str()) {
@@ -1281,8 +1325,34 @@ impl InMemoryStore {
                     },
                 );
             }
-            RuntimeEvent::TenantQuotaViolated(_)
-            | RuntimeEvent::ApprovalDelegated(_)
+            RuntimeEvent::TenantQuotaViolated(e) => {
+                // RFC-025 Phase 2a.1 milestone 2: projection parity with
+                // pg/sqlite `tenant_quota_violations` table.
+                //
+                // The pg + sqlite tables enforce uniqueness on
+                // (tenant_id, quota_type, occurred_at_ms) via a PRIMARY
+                // KEY + `ON CONFLICT DO NOTHING`. Mirror that here so a
+                // replayed or duplicated event does not accumulate
+                // phantom rows on the in-memory side — Copilot PR #565
+                // flagged this as a cross-backend drift risk.
+                let already_recorded = state.quota_violations.iter().any(|record| {
+                    record.tenant_id == e.tenant_id
+                        && record.quota_type == e.quota_type
+                        && record.occurred_at_ms == e.occurred_at_ms
+                });
+                if !already_recorded {
+                    state
+                        .quota_violations
+                        .push(crate::projections::QuotaViolationRecord {
+                            tenant_id: e.tenant_id.clone(),
+                            quota_type: e.quota_type.clone(),
+                            current: e.current,
+                            limit: e.limit,
+                            occurred_at_ms: e.occurred_at_ms,
+                        });
+                }
+            }
+            RuntimeEvent::ApprovalDelegated(_)
             | RuntimeEvent::AuditLogEntryRecorded(_)
             | RuntimeEvent::EventLogCompacted(_)
             | RuntimeEvent::GuardrailPolicyEvaluated(_)
@@ -4951,20 +5021,56 @@ impl crate::projections::QuotaReadModel for InMemoryStore {
 }
 
 #[async_trait]
+impl crate::projections::QuotaViolationReadModel for InMemoryStore {
+    async fn list_violations(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::QuotaViolationRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Most-recent-first ordering matches the pg/sqlite
+        // `ORDER BY occurred_at_ms DESC, quota_type ASC` contract —
+        // Copilot PR #565 flagged the missing quota_type tiebreaker as
+        // a determinism/parity gap.
+        let mut rows: Vec<_> = state
+            .quota_violations
+            .iter()
+            .filter(|v| &v.tenant_id == tenant_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.occurred_at_ms
+                .cmp(&a.occurred_at_ms)
+                .then_with(|| a.quota_type.cmp(&b.quota_type))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+}
+
+#[async_trait]
 impl crate::projections::ProviderBudgetReadModel for InMemoryStore {
     async fn get_by_tenant_period(
         &self,
         tenant_id: &cairn_domain::TenantId,
         period: cairn_domain::providers::ProviderBudgetPeriod,
     ) -> Result<Option<cairn_domain::providers::ProviderBudget>, StoreError> {
-        let key = format!("{}:{period:?}", tenant_id.as_str());
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
+        // RFC-025 Phase 2a.1 milestone 3: provider_budgets are now keyed
+        // by `budget_id` (parity with pg/sqlite), so the tenant/period
+        // lookup scans the values map. Historical behaviour returned
+        // the single `tenant_id:period` row; to preserve deterministic
+        // selection when multiple budgets share (tenant, period), return
+        // the one with the earliest `created_at` so repeat calls always
+        // pick the same row.
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut candidates: Vec<_> = state
             .provider_budgets
-            .get(&key)
-            .cloned())
+            .values()
+            .filter(|b| &b.tenant_id == tenant_id && b.period == period)
+            .cloned()
+            .collect();
+        candidates.sort_by_key(|b| (b.created_at, b.limit_micros));
+        Ok(candidates.into_iter().next())
     }
     async fn list_by_tenant(
         &self,

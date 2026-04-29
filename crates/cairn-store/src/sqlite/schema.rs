@@ -743,4 +743,94 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 
 CREATE INDEX IF NOT EXISTS idx_eval_runs_project
     ON eval_runs (tenant_id, workspace_id, project_id, started_at);
+
+-- RFC-025 Phase 2a.1 (credentials): sqlite parity with pg migration V035.
+-- Portable types only (no BYTEA — sqlite takes BLOB). Mirror at
+-- `crates/cairn-store/src/pg/migrations/V035__create_credentials.sql`.
+CREATE TABLE IF NOT EXISTS credentials (
+    credential_id   TEXT    PRIMARY KEY,
+    tenant_id       TEXT    NOT NULL,
+    name            TEXT    NOT NULL,
+    provider_id     TEXT    NOT NULL,
+    credential_type TEXT    NOT NULL,
+    encrypted_value BLOB    NOT NULL,
+    key_id          TEXT,
+    key_version     TEXT,
+    active          INTEGER NOT NULL DEFAULT 1,
+    encrypted_at_ms INTEGER,
+    revoked_at_ms   INTEGER,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credentials_tenant_active
+    ON credentials (tenant_id, active);
+
+CREATE TABLE IF NOT EXISTS credential_rotations (
+    rotation_id         TEXT    PRIMARY KEY,
+    tenant_id           TEXT    NOT NULL,
+    credential_id       TEXT    NOT NULL DEFAULT '',
+    old_key_id          TEXT    NOT NULL,
+    new_key_id          TEXT    NOT NULL,
+    rotated_credentials INTEGER NOT NULL DEFAULT 0,
+    started_at_ms       INTEGER NOT NULL,
+    completed_at_ms     INTEGER,
+    rotated_at          INTEGER NOT NULL,
+    rotated_by          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_rotations_tenant
+    ON credential_rotations (tenant_id, rotated_at);
+
+-- RFC-025 Phase 2a.1 milestone 2 (quotas): sqlite parity with pg V036.
+CREATE TABLE IF NOT EXISTS tenant_quotas (
+    tenant_id              TEXT    PRIMARY KEY,
+    max_concurrent_runs    INTEGER NOT NULL,
+    max_sessions_per_hour  INTEGER NOT NULL,
+    max_tasks_per_run      INTEGER NOT NULL,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tenant_quota_violations (
+    tenant_id      TEXT    NOT NULL,
+    quota_type     TEXT    NOT NULL,
+    occurred_at_ms INTEGER NOT NULL,
+    current_value  INTEGER NOT NULL,
+    limit_value    INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, quota_type, occurred_at_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_quota_violations_tenant_time
+    ON tenant_quota_violations (tenant_id, occurred_at_ms DESC);
+
+-- RFC-025 Phase 2a.1 milestone 3 (provider budgets): sqlite parity
+-- with pg V037.
+CREATE TABLE IF NOT EXISTS provider_budgets (
+    budget_id               TEXT    PRIMARY KEY,
+    tenant_id               TEXT    NOT NULL,
+    period                  TEXT    NOT NULL,
+    limit_micros            INTEGER NOT NULL,
+    alert_threshold_percent INTEGER NOT NULL DEFAULT 80,
+    current_spend_micros    INTEGER NOT NULL DEFAULT 0,
+    alert_triggered_at_ms   INTEGER,
+    exceeded_at_ms          INTEGER,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_budgets_tenant_period
+    ON provider_budgets (tenant_id, period);
+
+-- RFC-025 Phase 2a.1 milestone 4 (licenses): sqlite parity with pg V038.
+CREATE TABLE IF NOT EXISTS licenses (
+    tenant_id         TEXT    PRIMARY KEY,
+    license_key       TEXT,
+    tier              TEXT    NOT NULL,
+    entitlements_json TEXT    NOT NULL DEFAULT '[]',
+    issued_at         INTEGER NOT NULL,
+    expires_at        INTEGER,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
 "#;

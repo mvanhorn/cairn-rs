@@ -392,6 +392,19 @@ mod in_memory_vs_sqlite {
             "EvalRunArchived",
             "EvalRunScored",
             "EvalRubricScored",
+            // RFC-025 Phase 2a.1 milestone 1: credentials fixtures below.
+            "CredentialStored",
+            "CredentialRevoked",
+            "CredentialKeyRotated",
+            // RFC-025 Phase 2a.1 milestone 2: tenant-quota fixtures below.
+            "TenantQuotaSet",
+            "TenantQuotaViolated",
+            // RFC-025 Phase 2a.1 milestone 3: provider-budget fixtures below.
+            "ProviderBudgetSet",
+            "ProviderBudgetAlertTriggered",
+            "ProviderBudgetExceeded",
+            // RFC-025 Phase 2a.1 milestone 4: license fixture below.
+            "LicenseActivated",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -608,6 +621,560 @@ mod in_memory_vs_sqlite {
         assert_eq!(mem_rec.archived_at, Some(3_000_500));
         assert_eq!(sqlite_rec.archived_at, Some(3_000_500));
         assert_eq!(mem_rec.archived_at, sqlite_rec.archived_at);
+    }
+
+    // ── RFC-025 Phase 2a.1 milestone 1: credentials projection parity.
+    //    For each of the three credential lifecycle variants, emit the
+    //    event into both backends and assert the read-model record is
+    //    field-by-field equal.
+    use cairn_domain::credentials::CredentialRecord;
+    use cairn_domain::{CredentialId, CredentialKeyRotated, CredentialRevoked, CredentialStored};
+    use cairn_store::projections::{CredentialReadModel, CredentialRotationReadModel};
+
+    fn assert_credential_records_match(mem: &CredentialRecord, sq: &CredentialRecord) {
+        assert_eq!(mem.id, sq.id);
+        assert_eq!(mem.tenant_id, sq.tenant_id);
+        assert_eq!(mem.name, sq.name);
+        assert_eq!(mem.provider_id, sq.provider_id);
+        assert_eq!(mem.credential_type, sq.credential_type);
+        assert_eq!(mem.encrypted_value, sq.encrypted_value);
+        assert_eq!(mem.key_id, sq.key_id);
+        assert_eq!(mem.key_version, sq.key_version);
+        assert_eq!(mem.active, sq.active);
+        assert_eq!(mem.encrypted_at_ms, sq.encrypted_at_ms);
+        assert_eq!(mem.revoked_at_ms, sq.revoked_at_ms);
+        // All three backends derive `created_at` and `updated_at`
+        // directly from the event's `encrypted_at_ms` (on initial
+        // store) and `revoked_at_ms` (on revoke), so they must agree
+        // byte-for-byte. The pg/sqlite ON CONFLICT DO UPDATE path
+        // refreshes `updated_at` from `EXCLUDED.updated_at`
+        // (= encrypted_at_ms of the re-store) but preserves
+        // `created_at`; the in_memory applier does the same via the
+        // get_mut branch. The equality assertions below lock that
+        // contract in place — Copilot PR #565 pushed back on the
+        // earlier "treat as projection-policy delta" phrasing.
+        assert_eq!(mem.created_at, sq.created_at);
+        assert_eq!(mem.updated_at, sq.updated_at);
+    }
+
+    #[tokio::test]
+    async fn credential_stored_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_cred");
+        let credential_id = CredentialId::new("cred_parity_1");
+        let events = vec![env(RuntimeEvent::CredentialStored(CredentialStored {
+            tenant_id: tenant_id.clone(),
+            credential_id: credential_id.clone(),
+            provider_id: "openai".into(),
+            encrypted_value: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            key_id: Some("k1".into()),
+            key_version: Some("v1".into()),
+            encrypted_at_ms: 1_000_000,
+        }))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = CredentialReadModel::get(&mem, &credential_id)
+            .await
+            .unwrap()
+            .expect("memory credential record");
+        let sqlite_rec = CredentialReadModel::get(&adapter, &credential_id)
+            .await
+            .unwrap()
+            .expect("sqlite credential record");
+
+        assert_credential_records_match(&mem_rec, &sqlite_rec);
+        assert!(mem_rec.active);
+        assert!(sqlite_rec.active);
+        assert_eq!(mem_rec.encrypted_value, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(sqlite_rec.encrypted_value, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(mem_rec.key_id.as_deref(), Some("k1"));
+        assert_eq!(sqlite_rec.key_id.as_deref(), Some("k1"));
+
+        // Tenant list surface matches too.
+        let mem_list = CredentialReadModel::list_by_tenant(&mem, &tenant_id, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = CredentialReadModel::list_by_tenant(&adapter, &tenant_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 1);
+        assert_eq!(sqlite_list.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn credential_revoked_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_cred_rev");
+        let credential_id = CredentialId::new("cred_parity_rev");
+        let events = vec![
+            env(RuntimeEvent::CredentialStored(CredentialStored {
+                tenant_id: tenant_id.clone(),
+                credential_id: credential_id.clone(),
+                provider_id: "anthropic".into(),
+                encrypted_value: vec![0xAA, 0xBB],
+                key_id: None,
+                key_version: None,
+                encrypted_at_ms: 2_000_000,
+            })),
+            env(RuntimeEvent::CredentialRevoked(CredentialRevoked {
+                tenant_id: tenant_id.clone(),
+                credential_id: credential_id.clone(),
+                revoked_at_ms: 2_000_500,
+            })),
+            // Second revocation — latest-wins semantics (mirrors the
+            // in_memory applier's `rec.revoked_at_ms = Some(..)` overwrite).
+            // Both backends must reflect the latest timestamp.
+            env(RuntimeEvent::CredentialRevoked(CredentialRevoked {
+                tenant_id: tenant_id.clone(),
+                credential_id: credential_id.clone(),
+                revoked_at_ms: 2_900_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = CredentialReadModel::get(&mem, &credential_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_rec = CredentialReadModel::get(&adapter, &credential_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!mem_rec.active);
+        assert!(!sqlite_rec.active);
+        assert_eq!(mem_rec.revoked_at_ms, Some(2_900_000));
+        assert_eq!(sqlite_rec.revoked_at_ms, Some(2_900_000));
+
+        // Active-only list must not surface the revoked credential.
+        let mem_active = CredentialReadModel::list_all_active(&mem, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_active = CredentialReadModel::list_all_active(&adapter, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !mem_active.iter().any(|c| c.id == credential_id),
+            "revoked credential must not appear in list_all_active (memory)"
+        );
+        assert!(
+            !sqlite_active.iter().any(|c| c.id == credential_id),
+            "revoked credential must not appear in list_all_active (sqlite)"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_stored_after_revoked_preserves_revocation_across_backends() {
+        // RFC-025 Phase 2a.1 milestone 1 (Copilot PR #565): a
+        // `CredentialStored` replayed after `CredentialRevoked` must not
+        // silently reactivate the credential on any backend. Lock the
+        // contract in both on in-memory and sqlite.
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_restore");
+        let credential_id = CredentialId::new("cred_parity_restore");
+        let events = vec![
+            env(RuntimeEvent::CredentialStored(CredentialStored {
+                tenant_id: tenant_id.clone(),
+                credential_id: credential_id.clone(),
+                provider_id: "openai".into(),
+                encrypted_value: vec![0xAA],
+                key_id: Some("k_init".into()),
+                key_version: Some("v1".into()),
+                encrypted_at_ms: 1_000,
+            })),
+            env(RuntimeEvent::CredentialRevoked(CredentialRevoked {
+                tenant_id: tenant_id.clone(),
+                credential_id: credential_id.clone(),
+                revoked_at_ms: 2_000,
+            })),
+            // Re-store with fresh material. Must NOT reactivate.
+            env(RuntimeEvent::CredentialStored(CredentialStored {
+                tenant_id: tenant_id.clone(),
+                credential_id: credential_id.clone(),
+                provider_id: "openai".into(),
+                encrypted_value: vec![0xBB, 0xCC],
+                key_id: Some("k_rotated".into()),
+                key_version: Some("v2".into()),
+                encrypted_at_ms: 3_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = CredentialReadModel::get(&mem, &credential_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_rec = CredentialReadModel::get(&adapter, &credential_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Revoked state preserved on both backends.
+        assert!(!mem_rec.active);
+        assert!(!sqlite_rec.active);
+        assert_eq!(mem_rec.revoked_at_ms, Some(2_000));
+        assert_eq!(sqlite_rec.revoked_at_ms, Some(2_000));
+        // Fresh material landed — the re-store still updates the
+        // encrypted payload and key bindings on the existing row.
+        assert_eq!(mem_rec.encrypted_value, vec![0xBB, 0xCC]);
+        assert_eq!(sqlite_rec.encrypted_value, vec![0xBB, 0xCC]);
+        assert_eq!(mem_rec.key_id.as_deref(), Some("k_rotated"));
+        assert_eq!(sqlite_rec.key_id.as_deref(), Some("k_rotated"));
+        // `created_at` preserves the original store timestamp on both
+        // backends (pg/sqlite via ON CONFLICT absent-update, in-memory
+        // via the get_mut branch introduced in this milestone).
+        assert_eq!(mem_rec.created_at, 1_000);
+        assert_eq!(sqlite_rec.created_at, 1_000);
+        assert_credential_records_match(&mem_rec, &sqlite_rec);
+    }
+
+    #[tokio::test]
+    async fn credential_key_rotated_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_rot");
+        let events = vec![
+            env(RuntimeEvent::CredentialKeyRotated(CredentialKeyRotated {
+                tenant_id: tenant_id.clone(),
+                rotation_id: "rot_parity_1".into(),
+                old_key_id: "k1".into(),
+                new_key_id: "k2".into(),
+                credential_ids_rotated: vec!["cred_a".into(), "cred_b".into()],
+            })),
+            env(RuntimeEvent::CredentialKeyRotated(CredentialKeyRotated {
+                tenant_id: tenant_id.clone(),
+                rotation_id: "rot_parity_2".into(),
+                old_key_id: "k2".into(),
+                new_key_id: "k3".into(),
+                credential_ids_rotated: vec!["cred_a".into()],
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = CredentialRotationReadModel::list_rotations(&mem, &tenant_id)
+            .await
+            .unwrap();
+        let sqlite_list = CredentialRotationReadModel::list_rotations(&adapter, &tenant_id)
+            .await
+            .unwrap();
+
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(sqlite_list.len(), 2);
+        // Both backends order by rotated_at ASC (pg/sqlite index) — the
+        // in-memory side keeps insertion order. Compare by set of rotation
+        // ids to avoid coupling the assertion to a brittle ordering claim.
+        let mem_ids: std::collections::BTreeSet<_> =
+            mem_list.iter().map(|r| r.rotation_id.clone()).collect();
+        let sqlite_ids: std::collections::BTreeSet<_> =
+            sqlite_list.iter().map(|r| r.rotation_id.clone()).collect();
+        assert_eq!(mem_ids, sqlite_ids);
+        for r in &sqlite_list {
+            assert_eq!(r.tenant_id, tenant_id);
+        }
+    }
+
+    // ── RFC-025 Phase 2a.1 milestone 2: tenant-quota projection parity.
+    use cairn_domain::{TenantQuotaSet, TenantQuotaViolated};
+    use cairn_store::projections::{QuotaReadModel, QuotaViolationReadModel};
+
+    #[tokio::test]
+    async fn tenant_quota_set_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_quota");
+        let events = vec![
+            env(RuntimeEvent::TenantQuotaSet(TenantQuotaSet {
+                tenant_id: tenant_id.clone(),
+                max_concurrent_runs: 25,
+                max_sessions_per_hour: 100,
+                max_tasks_per_run: 200,
+            })),
+            // Upsert: a second set must replace the baseline.
+            env(RuntimeEvent::TenantQuotaSet(TenantQuotaSet {
+                tenant_id: tenant_id.clone(),
+                max_concurrent_runs: 40,
+                max_sessions_per_hour: 120,
+                max_tasks_per_run: 250,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_q = QuotaReadModel::get_quota(&mem, &tenant_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_q = QuotaReadModel::get_quota(&adapter, &tenant_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Baseline fields must reflect the latest set.
+        assert_eq!(mem_q.tenant_id, sqlite_q.tenant_id);
+        assert_eq!(mem_q.max_concurrent_runs, 40);
+        assert_eq!(sqlite_q.max_concurrent_runs, 40);
+        assert_eq!(mem_q.max_sessions_per_hour, 120);
+        assert_eq!(sqlite_q.max_sessions_per_hour, 120);
+        assert_eq!(mem_q.max_tasks_per_run, 250);
+        assert_eq!(sqlite_q.max_tasks_per_run, 250);
+        // Dynamic counters are zero with no sessions or runs in either
+        // backend.
+        assert_eq!(mem_q.current_active_runs, 0);
+        assert_eq!(sqlite_q.current_active_runs, 0);
+        assert_eq!(mem_q.sessions_this_hour, 0);
+        assert_eq!(sqlite_q.sessions_this_hour, 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_quota_violation_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_viol");
+        let events = vec![
+            env(RuntimeEvent::TenantQuotaViolated(TenantQuotaViolated {
+                tenant_id: tenant_id.clone(),
+                quota_type: "max_concurrent_runs".into(),
+                current: 10,
+                limit: 10,
+                occurred_at_ms: 1_000,
+            })),
+            env(RuntimeEvent::TenantQuotaViolated(TenantQuotaViolated {
+                tenant_id: tenant_id.clone(),
+                quota_type: "max_sessions_per_hour".into(),
+                current: 50,
+                limit: 50,
+                occurred_at_ms: 2_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = QuotaViolationReadModel::list_violations(&mem, &tenant_id, 100)
+            .await
+            .unwrap();
+        let sqlite_list = QuotaViolationReadModel::list_violations(&adapter, &tenant_id, 100)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(sqlite_list.len(), 2);
+        // Most-recent first: occurred_at_ms = 2_000 sorts ahead of 1_000.
+        assert_eq!(mem_list[0].occurred_at_ms, 2_000);
+        assert_eq!(sqlite_list[0].occurred_at_ms, 2_000);
+        assert_eq!(mem_list[0].quota_type, "max_sessions_per_hour");
+        assert_eq!(sqlite_list[0].quota_type, "max_sessions_per_hour");
+        assert_eq!(mem_list[1].occurred_at_ms, 1_000);
+        assert_eq!(sqlite_list[1].occurred_at_ms, 1_000);
+        assert_eq!(mem_list, sqlite_list);
+    }
+
+    // ── RFC-025 Phase 2a.1 milestone 3: provider-budget projection parity.
+    use cairn_domain::providers::ProviderBudgetPeriod;
+    use cairn_domain::{ProviderBudgetAlertTriggered, ProviderBudgetExceeded, ProviderBudgetSet};
+    use cairn_store::projections::ProviderBudgetReadModel;
+
+    #[tokio::test]
+    async fn provider_budget_set_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_budget");
+        let events = vec![env(RuntimeEvent::ProviderBudgetSet(ProviderBudgetSet {
+            tenant_id: tenant_id.clone(),
+            budget_id: "bg_parity_1".into(),
+            period: ProviderBudgetPeriod::Monthly,
+            limit_micros: 5_000_000,
+            alert_threshold_percent: Some(75),
+        }))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_b = ProviderBudgetReadModel::get_by_tenant_period(
+            &mem,
+            &tenant_id,
+            ProviderBudgetPeriod::Monthly,
+        )
+        .await
+        .unwrap()
+        .expect("memory budget");
+        let sqlite_b = ProviderBudgetReadModel::get_by_tenant_period(
+            &adapter,
+            &tenant_id,
+            ProviderBudgetPeriod::Monthly,
+        )
+        .await
+        .unwrap()
+        .expect("sqlite budget");
+
+        assert_eq!(mem_b.tenant_id, sqlite_b.tenant_id);
+        assert_eq!(mem_b.period, sqlite_b.period);
+        assert_eq!(mem_b.limit_micros, 5_000_000);
+        assert_eq!(sqlite_b.limit_micros, 5_000_000);
+        assert_eq!(mem_b.alert_threshold_percent, 75);
+        assert_eq!(sqlite_b.alert_threshold_percent, 75);
+        assert_eq!(mem_b.current_spend_micros, 0);
+        assert_eq!(sqlite_b.current_spend_micros, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_budget_alert_triggered_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_budget_alert");
+        let events = vec![
+            env(RuntimeEvent::ProviderBudgetSet(ProviderBudgetSet {
+                tenant_id: tenant_id.clone(),
+                budget_id: "bg_alert_1".into(),
+                period: ProviderBudgetPeriod::Daily,
+                limit_micros: 1_000_000,
+                alert_threshold_percent: Some(80),
+            })),
+            env(RuntimeEvent::ProviderBudgetAlertTriggered(
+                ProviderBudgetAlertTriggered {
+                    budget_id: "bg_alert_1".into(),
+                    current_micros: 800_000,
+                    limit_micros: 1_000_000,
+                    triggered_at_ms: 5_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_b = ProviderBudgetReadModel::get_by_tenant_period(
+            &mem,
+            &tenant_id,
+            ProviderBudgetPeriod::Daily,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let sqlite_b = ProviderBudgetReadModel::get_by_tenant_period(
+            &adapter,
+            &tenant_id,
+            ProviderBudgetPeriod::Daily,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(mem_b.current_spend_micros, 800_000);
+        assert_eq!(sqlite_b.current_spend_micros, 800_000);
+    }
+
+    #[tokio::test]
+    async fn provider_budget_exceeded_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_budget_excess");
+        let events = vec![
+            env(RuntimeEvent::ProviderBudgetSet(ProviderBudgetSet {
+                tenant_id: tenant_id.clone(),
+                budget_id: "bg_excess_1".into(),
+                period: ProviderBudgetPeriod::Monthly,
+                limit_micros: 2_000_000,
+                alert_threshold_percent: None,
+            })),
+            env(RuntimeEvent::ProviderBudgetExceeded(
+                ProviderBudgetExceeded {
+                    budget_id: "bg_excess_1".into(),
+                    exceeded_by_micros: 500_000,
+                    exceeded_at_ms: 9_000,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_b = ProviderBudgetReadModel::get_by_tenant_period(
+            &mem,
+            &tenant_id,
+            ProviderBudgetPeriod::Monthly,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let sqlite_b = ProviderBudgetReadModel::get_by_tenant_period(
+            &adapter,
+            &tenant_id,
+            ProviderBudgetPeriod::Monthly,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // current_spend = limit + exceeded_by on both backends.
+        assert_eq!(mem_b.current_spend_micros, 2_500_000);
+        assert_eq!(sqlite_b.current_spend_micros, 2_500_000);
+        // Default threshold is 80 when the event omits it.
+        assert_eq!(mem_b.alert_threshold_percent, 80);
+        assert_eq!(sqlite_b.alert_threshold_percent, 80);
+    }
+
+    // ── RFC-025 Phase 2a.1 milestone 4: licenses projection parity.
+    use cairn_domain::commercial::ProductTier;
+    use cairn_domain::LicenseActivated;
+    use cairn_store::projections::LicenseReadModel;
+
+    #[tokio::test]
+    async fn license_activated_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_parity_lic");
+        let events = vec![
+            env(RuntimeEvent::LicenseActivated(LicenseActivated {
+                tenant_id: tenant_id.clone(),
+                license_id: "lic_parity_1".into(),
+                tier: ProductTier::TeamSelfHosted,
+                valid_from_ms: 1_000,
+                valid_until_ms: Some(10_000),
+            })),
+            // Upsert: a re-activation must replace the row.
+            env(RuntimeEvent::LicenseActivated(LicenseActivated {
+                tenant_id: tenant_id.clone(),
+                license_id: "lic_parity_2".into(),
+                tier: ProductTier::EnterpriseSelfHosted,
+                valid_from_ms: 2_000,
+                valid_until_ms: None,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_lic = LicenseReadModel::get_active(&mem, &tenant_id)
+            .await
+            .unwrap()
+            .expect("memory license");
+        let sqlite_lic = LicenseReadModel::get_active(&adapter, &tenant_id)
+            .await
+            .unwrap()
+            .expect("sqlite license");
+
+        assert_eq!(mem_lic.tenant_id, sqlite_lic.tenant_id);
+        assert_eq!(mem_lic.tier, ProductTier::EnterpriseSelfHosted);
+        assert_eq!(sqlite_lic.tier, ProductTier::EnterpriseSelfHosted);
+        assert_eq!(mem_lic.issued_at, 2_000);
+        assert_eq!(sqlite_lic.issued_at, 2_000);
+        assert_eq!(mem_lic.expires_at, None);
+        assert_eq!(sqlite_lic.expires_at, None);
+        assert_eq!(mem_lic.license_key.as_deref(), Some("lic_parity_2"));
+        assert_eq!(sqlite_lic.license_key.as_deref(), Some("lic_parity_2"));
     }
 }
 

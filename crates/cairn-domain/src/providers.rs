@@ -47,6 +47,14 @@ pub enum ProviderBudgetPeriod {
     Monthly,
 }
 
+/// Default alert threshold (as a percentage of `limit_micros`) when
+/// `ProviderBudgetSet.alert_threshold_percent` is `None`. Kept in the
+/// domain layer so every projection (InMemory + pg + sqlite) pulls the
+/// same constant and a cross-backend parity test can assert a single
+/// source of truth. Bumping the default is a one-line domain change,
+/// not a six-line projection scatter.
+pub const DEFAULT_BUDGET_ALERT_THRESHOLD_PERCENT: u32 = 80;
+
 /// Tenant-level LLM spend budget record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderBudget {

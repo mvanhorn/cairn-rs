@@ -2223,6 +2223,427 @@ fn sqlite_row_to_eval_run_record(
     })
 }
 
+// ── RFC-025 Phase 2a.1: CredentialReadModel + CredentialRotationReadModel ────
+//
+// sqlite parity with PgAdapter's credential impl. Same column list,
+// same ordering; `active` arrives as INTEGER 0/1 and is coerced through
+// bool via sqlx. The parity harness asserts byte-equality against the
+// pg adapter under TEST_DATABASE_URL.
+
+#[derive(sqlx::FromRow)]
+struct CredentialRow {
+    credential_id: String,
+    tenant_id: String,
+    name: String,
+    provider_id: String,
+    credential_type: String,
+    encrypted_value: Vec<u8>,
+    key_id: Option<String>,
+    key_version: Option<String>,
+    active: bool,
+    encrypted_at_ms: Option<i64>,
+    revoked_at_ms: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl CredentialRow {
+    fn into_record(self) -> cairn_domain::credentials::CredentialRecord {
+        cairn_domain::credentials::CredentialRecord {
+            id: cairn_domain::CredentialId::new(self.credential_id),
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            name: self.name,
+            credential_type: self.credential_type,
+            encrypted_value: self.encrypted_value,
+            created_at: self.created_at.max(0) as u64,
+            updated_at: self.updated_at.max(0) as u64,
+            active: self.active,
+            provider_id: self.provider_id,
+            encrypted_at_ms: self.encrypted_at_ms.map(|v| v.max(0) as u64),
+            key_id: self.key_id,
+            key_version: self.key_version,
+            revoked_at_ms: self.revoked_at_ms.map(|v| v.max(0) as u64),
+        }
+    }
+}
+
+const CREDENTIAL_SELECT_COLS: &str = "credential_id, tenant_id, name, provider_id, \
+     credential_type, encrypted_value, key_id, key_version, active, \
+     encrypted_at_ms, revoked_at_ms, created_at, updated_at";
+
+#[async_trait]
+impl crate::projections::CredentialReadModel for SqliteAdapter {
+    async fn get(
+        &self,
+        id: &cairn_domain::CredentialId,
+    ) -> Result<Option<cairn_domain::credentials::CredentialRecord>, StoreError> {
+        let sql =
+            format!("SELECT {CREDENTIAL_SELECT_COLS} FROM credentials WHERE credential_id = ?");
+        let row: Option<CredentialRow> = sqlx::query_as(&sql)
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(CredentialRow::into_record))
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::credentials::CredentialRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {CREDENTIAL_SELECT_COLS} FROM credentials
+             WHERE tenant_id = ?
+             ORDER BY created_at ASC, credential_id ASC
+             LIMIT ? OFFSET ?"
+        );
+        let rows: Vec<CredentialRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(CredentialRow::into_record).collect())
+    }
+
+    async fn list_all_active(
+        &self,
+        limit: usize,
+    ) -> Result<Option<Vec<cairn_domain::credentials::CredentialRecord>>, StoreError> {
+        let sql = format!(
+            "SELECT {CREDENTIAL_SELECT_COLS} FROM credentials
+             WHERE active = 1
+             ORDER BY created_at ASC, credential_id ASC
+             LIMIT ?"
+        );
+        let rows: Vec<CredentialRow> = sqlx::query_as(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(Some(
+            rows.into_iter().map(CredentialRow::into_record).collect(),
+        ))
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct CredentialRotationRow {
+    rotation_id: String,
+    tenant_id: String,
+    credential_id: String,
+    old_key_id: String,
+    new_key_id: String,
+    rotated_credentials: i32,
+    started_at_ms: i64,
+    completed_at_ms: Option<i64>,
+    rotated_at: i64,
+    rotated_by: Option<String>,
+}
+
+impl CredentialRotationRow {
+    fn into_record(self) -> cairn_domain::credentials::CredentialRotationRecord {
+        cairn_domain::credentials::CredentialRotationRecord {
+            rotation_id: self.rotation_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            credential_id: cairn_domain::CredentialId::new(self.credential_id),
+            rotated_at: self.rotated_at.max(0) as u64,
+            rotated_by: self.rotated_by,
+            old_key_id: self.old_key_id,
+            new_key_id: self.new_key_id,
+            rotated_credentials: self.rotated_credentials.max(0) as u32,
+            started_at_ms: self.started_at_ms.max(0) as u64,
+            completed_at_ms: self.completed_at_ms.map(|v| v.max(0) as u64),
+        }
+    }
+}
+
+const CREDENTIAL_ROTATION_SELECT_COLS: &str = "rotation_id, tenant_id, credential_id, \
+     old_key_id, new_key_id, rotated_credentials, \
+     started_at_ms, completed_at_ms, rotated_at, rotated_by";
+
+// ── RFC-025 Phase 2a.1 milestone 2: QuotaReadModel + QuotaViolationReadModel
+//    (sqlite parity with pg) ──────────────────────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct TenantQuotaRow {
+    max_concurrent_runs: i32,
+    max_sessions_per_hour: i32,
+    max_tasks_per_run: i32,
+}
+
+#[async_trait]
+impl crate::projections::QuotaReadModel for SqliteAdapter {
+    async fn get_quota(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Option<cairn_domain::TenantQuota>, StoreError> {
+        let baseline: Option<TenantQuotaRow> = sqlx::query_as(
+            "SELECT max_concurrent_runs, max_sessions_per_hour, max_tasks_per_run
+             FROM tenant_quotas
+             WHERE tenant_id = ?",
+        )
+        .bind(tenant_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        let Some(baseline) = baseline else {
+            return Ok(None);
+        };
+
+        let active_runs_row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM runs
+             WHERE tenant_id = ?
+               AND state NOT IN ('completed', 'failed', 'canceled', 'dead_lettered')",
+        )
+        .bind(tenant_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sessions_row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE tenant_id = ?")
+                .bind(tenant_id.as_str())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        Ok(Some(cairn_domain::TenantQuota {
+            tenant_id: tenant_id.clone(),
+            max_concurrent_runs: baseline.max_concurrent_runs.max(0) as u32,
+            max_sessions_per_hour: baseline.max_sessions_per_hour.max(0) as u32,
+            max_tasks_per_run: baseline.max_tasks_per_run.max(0) as u32,
+            current_active_runs: active_runs_row.0.max(0) as u32,
+            sessions_this_hour: sessions_row.0.max(0) as u32,
+        }))
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct QuotaViolationRow {
+    tenant_id: String,
+    quota_type: String,
+    occurred_at_ms: i64,
+    current_value: i32,
+    limit_value: i32,
+}
+
+impl QuotaViolationRow {
+    fn into_record(self) -> crate::projections::QuotaViolationRecord {
+        crate::projections::QuotaViolationRecord {
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            quota_type: self.quota_type,
+            current: self.current_value.max(0) as u32,
+            limit: self.limit_value.max(0) as u32,
+            occurred_at_ms: self.occurred_at_ms.max(0) as u64,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::projections::QuotaViolationReadModel for SqliteAdapter {
+    async fn list_violations(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::QuotaViolationRecord>, StoreError> {
+        let rows: Vec<QuotaViolationRow> = sqlx::query_as(
+            "SELECT tenant_id, quota_type, occurred_at_ms, current_value, limit_value
+             FROM tenant_quota_violations
+             WHERE tenant_id = ?
+             ORDER BY occurred_at_ms DESC, quota_type ASC
+             LIMIT ?",
+        )
+        .bind(tenant_id.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(QuotaViolationRow::into_record)
+            .collect())
+    }
+}
+
+// ── RFC-025 Phase 2a.1 milestone 3: ProviderBudgetReadModel (sqlite parity)
+
+#[derive(sqlx::FromRow)]
+struct ProviderBudgetRow {
+    tenant_id: String,
+    period: String,
+    limit_micros: i64,
+    alert_threshold_percent: i32,
+    current_spend_micros: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl ProviderBudgetRow {
+    fn into_record(self) -> Result<cairn_domain::providers::ProviderBudget, StoreError> {
+        let period = match self.period.as_str() {
+            "daily" => cairn_domain::providers::ProviderBudgetPeriod::Daily,
+            "monthly" => cairn_domain::providers::ProviderBudgetPeriod::Monthly,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "provider_budgets.period: unknown value {other:?}"
+                )))
+            }
+        };
+        Ok(cairn_domain::providers::ProviderBudget {
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            period,
+            limit_micros: self.limit_micros.max(0) as u64,
+            alert_threshold_percent: self.alert_threshold_percent.max(0) as u32,
+            current_spend_micros: self.current_spend_micros.max(0) as u64,
+            created_at: self.created_at.max(0) as u64,
+            updated_at: self.updated_at.max(0) as u64,
+        })
+    }
+}
+
+const PROVIDER_BUDGET_SELECT_COLS: &str = "tenant_id, period, limit_micros, \
+     alert_threshold_percent, current_spend_micros, created_at, updated_at";
+
+#[async_trait]
+impl crate::projections::ProviderBudgetReadModel for SqliteAdapter {
+    async fn get_by_tenant_period(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        period: cairn_domain::providers::ProviderBudgetPeriod,
+    ) -> Result<Option<cairn_domain::providers::ProviderBudget>, StoreError> {
+        let period_str = match period {
+            cairn_domain::providers::ProviderBudgetPeriod::Daily => "daily",
+            cairn_domain::providers::ProviderBudgetPeriod::Monthly => "monthly",
+        };
+        let sql = format!(
+            "SELECT {PROVIDER_BUDGET_SELECT_COLS} FROM provider_budgets
+             WHERE tenant_id = ? AND period = ?
+             ORDER BY created_at ASC, limit_micros ASC
+             LIMIT 1"
+        );
+        let row: Option<ProviderBudgetRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(period_str)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(ProviderBudgetRow::into_record).transpose()
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Vec<cairn_domain::providers::ProviderBudget>, StoreError> {
+        let sql = format!(
+            "SELECT {PROVIDER_BUDGET_SELECT_COLS} FROM provider_budgets
+             WHERE tenant_id = ?
+             ORDER BY created_at ASC, period ASC"
+        );
+        let rows: Vec<ProviderBudgetRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(ProviderBudgetRow::into_record)
+            .collect()
+    }
+}
+
+// ── RFC-025 Phase 2a.1 milestone 4: LicenseReadModel (sqlite parity) ─────────
+
+#[derive(sqlx::FromRow)]
+struct LicenseRow {
+    tenant_id: String,
+    license_key: Option<String>,
+    tier: String,
+    entitlements_json: String,
+    issued_at: i64,
+    expires_at: Option<i64>,
+}
+
+impl LicenseRow {
+    fn into_record(self) -> Result<cairn_domain::LicenseRecord, StoreError> {
+        let tier = match self.tier.as_str() {
+            "local_eval" => cairn_domain::commercial::ProductTier::LocalEval,
+            "team_self_hosted" => cairn_domain::commercial::ProductTier::TeamSelfHosted,
+            "enterprise_self_hosted" => cairn_domain::commercial::ProductTier::EnterpriseSelfHosted,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "licenses.tier: unknown value {other:?}"
+                )))
+            }
+        };
+        let entitlements: Vec<cairn_domain::commercial::Entitlement> =
+            serde_json::from_str(&self.entitlements_json).map_err(|e| {
+                StoreError::Internal(format!("licenses.entitlements_json parse error: {e}"))
+            })?;
+        Ok(cairn_domain::LicenseRecord {
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            tier,
+            entitlements,
+            issued_at: self.issued_at.max(0) as u64,
+            expires_at: self.expires_at.map(|v| v.max(0) as u64),
+            license_key: self.license_key,
+        })
+    }
+}
+
+const LICENSE_SELECT_COLS: &str = "tenant_id, license_key, tier, entitlements_json, \
+     issued_at, expires_at";
+
+#[async_trait]
+impl crate::projections::LicenseReadModel for SqliteAdapter {
+    async fn get_active(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Option<cairn_domain::LicenseRecord>, StoreError> {
+        let sql = format!("SELECT {LICENSE_SELECT_COLS} FROM licenses WHERE tenant_id = ?");
+        let row: Option<LicenseRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(LicenseRow::into_record).transpose()
+    }
+
+    async fn list_overrides(
+        &self,
+        _tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Vec<cairn_domain::EntitlementOverrideRecord>, StoreError> {
+        // See pg::adapter.rs — EntitlementOverrideSet migrates in
+        // Phase 2a.2 which wires the dedicated table + reader.
+        Ok(Vec::new())
+    }
+}
+
+#[async_trait]
+impl crate::projections::CredentialRotationReadModel for SqliteAdapter {
+    async fn list_rotations(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Vec<cairn_domain::credentials::CredentialRotationRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {CREDENTIAL_ROTATION_SELECT_COLS} FROM credential_rotations
+             WHERE tenant_id = ?
+             ORDER BY rotated_at ASC, rotation_id ASC"
+        );
+        let rows: Vec<CredentialRotationRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(CredentialRotationRow::into_record)
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

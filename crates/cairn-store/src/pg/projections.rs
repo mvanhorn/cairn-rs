@@ -502,13 +502,107 @@ impl PgSyncProjection {
             RuntimeEvent::PlanApproved(_) => log_stub("PlanApproved"),
             RuntimeEvent::PlanRejected(_) => log_stub("PlanRejected"),
             RuntimeEvent::PlanRevisionRequested(_) => log_stub("PlanRevisionRequested"),
-            RuntimeEvent::ProviderBudgetSet(_) => log_stub("ProviderBudgetSet"),
+            // RFC-025 Phase 2a.1 milestone 3: provider_budgets projection.
+            //
+            // Keyed by `budget_id` so subsequent Alert/Exceeded events can
+            // UPDATE the matching row. `alert_threshold_percent` defaults
+            // to 80% mirroring the in_memory applier. A replayed
+            // `ProviderBudgetSet` preserves the observed spend + flags
+            // (operators who reconfigure a budget do not want their
+            // running spend erased).
+            RuntimeEvent::ProviderBudgetSet(e) => {
+                let period_str = provider_budget_period_str(&e.period);
+                let limit_i64 = i64::try_from(e.limit_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderBudgetSet.limit_micros {} exceeds i64::MAX",
+                        e.limit_micros
+                    ))
+                })?;
+                // Centralised domain default lets all three projections
+                // agree on the fallback when the event omits the
+                // threshold — see
+                // `cairn_domain::providers::DEFAULT_BUDGET_ALERT_THRESHOLD_PERCENT`.
+                let threshold_u = e
+                    .alert_threshold_percent
+                    .unwrap_or(cairn_domain::providers::DEFAULT_BUDGET_ALERT_THRESHOLD_PERCENT);
+                let threshold = i32_from_u32("ProviderBudgetSet.alert_threshold_percent", threshold_u)?;
+                sqlx::query(
+                    "INSERT INTO provider_budgets (
+                        budget_id, tenant_id, period, limit_micros,
+                        alert_threshold_percent, current_spend_micros,
+                        alert_triggered_at_ms, exceeded_at_ms, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, $5, 0, NULL, NULL, $6, $6)
+                     ON CONFLICT (budget_id) DO UPDATE SET
+                        tenant_id               = EXCLUDED.tenant_id,
+                        period                  = EXCLUDED.period,
+                        limit_micros            = EXCLUDED.limit_micros,
+                        alert_threshold_percent = EXCLUDED.alert_threshold_percent,
+                        updated_at              = EXCLUDED.updated_at",
+                )
+                .bind(e.budget_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(period_str)
+                .bind(limit_i64)
+                .bind(threshold)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::ChannelCreated(_) => log_stub("ChannelCreated"),
             RuntimeEvent::ChannelMessageSent(_) => log_stub("ChannelMessageSent"),
             RuntimeEvent::ChannelMessageConsumed(_) => log_stub("ChannelMessageConsumed"),
             RuntimeEvent::DefaultSettingSet(_) => log_stub("DefaultSettingSet"),
             RuntimeEvent::DefaultSettingCleared(_) => log_stub("DefaultSettingCleared"),
-            RuntimeEvent::LicenseActivated(_) => log_stub("LicenseActivated"),
+            // RFC-025 Phase 2a.1 milestone 4: licenses projection.
+            //
+            // At most one row per tenant (upsert). `entitlements_json`
+            // ships as an empty array — the in_memory applier
+            // initialises `entitlements: vec![]` for `LicenseActivated`,
+            // so the projection carries the same shape for byte parity.
+            // Future events that carry concrete entitlements will
+            // populate the column.
+            RuntimeEvent::LicenseActivated(e) => {
+                let issued_at = i64::try_from(e.valid_from_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "LicenseActivated.valid_from_ms {} exceeds i64::MAX",
+                        e.valid_from_ms
+                    ))
+                })?;
+                let expires_at = e
+                    .valid_until_ms
+                    .map(|v| {
+                        i64::try_from(v).map_err(|_| {
+                            StoreError::Internal(format!(
+                                "LicenseActivated.valid_until_ms {v} exceeds i64::MAX"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                let tier_str = product_tier_str(&e.tier);
+                sqlx::query(
+                    "INSERT INTO licenses (
+                        tenant_id, license_key, tier, entitlements_json,
+                        issued_at, expires_at, created_at, updated_at
+                     ) VALUES ($1, $2, $3, '[]', $4, $5, $6, $6)
+                     ON CONFLICT (tenant_id) DO UPDATE SET
+                        license_key       = EXCLUDED.license_key,
+                        tier              = EXCLUDED.tier,
+                        entitlements_json = EXCLUDED.entitlements_json,
+                        issued_at         = EXCLUDED.issued_at,
+                        expires_at        = EXCLUDED.expires_at,
+                        updated_at        = EXCLUDED.updated_at",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.license_id.as_str())
+                .bind(tier_str)
+                .bind(issued_at)
+                .bind(expires_at)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::EntitlementOverrideSet(_) => log_stub("EntitlementOverrideSet"),
             RuntimeEvent::NotificationPreferenceSet(_) => log_stub("NotificationPreferenceSet"),
             RuntimeEvent::NotificationSent(_) => log_stub("NotificationSent"),
@@ -519,17 +613,158 @@ impl PgSyncProjection {
             RuntimeEvent::ProviderPoolConnectionRemoved(_) => {
                 log_stub("ProviderPoolConnectionRemoved")
             }
-            RuntimeEvent::TenantQuotaSet(_) => log_stub("TenantQuotaSet"),
-            RuntimeEvent::TenantQuotaViolated(_) => log_stub("TenantQuotaViolated"),
+            // RFC-025 Phase 2a.1: tenant quotas projection.
+            //
+            // `TenantQuotaSet` upserts the operator-configured baseline.
+            // The dynamic current_active_runs / sessions_this_hour
+            // counters are computed on read by joining sessions/runs
+            // (mirrors the in_memory QuotaReadModel::get_quota impl).
+            RuntimeEvent::TenantQuotaSet(e) => {
+                // Copilot PR #565: u32 → i32 via `as i32` silently wraps
+                // past i32::MAX. Quota limits that big are already a
+                // corrupted event, but wrapping a 2^31 limit to −1 then
+                // rehydrating via `.max(0) as u32` would resurrect it as
+                // 0 and silently disable the cap. Fail loudly instead.
+                let max_concurrent_runs = i32_from_u32("TenantQuotaSet.max_concurrent_runs", e.max_concurrent_runs)?;
+                let max_sessions_per_hour = i32_from_u32("TenantQuotaSet.max_sessions_per_hour", e.max_sessions_per_hour)?;
+                let max_tasks_per_run = i32_from_u32("TenantQuotaSet.max_tasks_per_run", e.max_tasks_per_run)?;
+                sqlx::query(
+                    "INSERT INTO tenant_quotas (
+                        tenant_id, max_concurrent_runs, max_sessions_per_hour,
+                        max_tasks_per_run, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, $5, $5)
+                     ON CONFLICT (tenant_id) DO UPDATE SET
+                        max_concurrent_runs   = EXCLUDED.max_concurrent_runs,
+                        max_sessions_per_hour = EXCLUDED.max_sessions_per_hour,
+                        max_tasks_per_run     = EXCLUDED.max_tasks_per_run,
+                        updated_at            = EXCLUDED.updated_at",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(max_concurrent_runs)
+                .bind(max_sessions_per_hour)
+                .bind(max_tasks_per_run)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::TenantQuotaViolated(e) => {
+                let occurred_at = i64::try_from(e.occurred_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "TenantQuotaViolated.occurred_at_ms {} exceeds i64::MAX",
+                        e.occurred_at_ms
+                    ))
+                })?;
+                let current = i32_from_u32("TenantQuotaViolated.current", e.current)?;
+                let limit = i32_from_u32("TenantQuotaViolated.limit", e.limit)?;
+                sqlx::query(
+                    "INSERT INTO tenant_quota_violations (
+                        tenant_id, quota_type, occurred_at_ms, current_value, limit_value
+                     ) VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT (tenant_id, quota_type, occurred_at_ms) DO NOTHING",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.quota_type.as_str())
+                .bind(occurred_at)
+                .bind(current)
+                .bind(limit)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::RetentionPolicySet(_) => log_stub("RetentionPolicySet"),
             RuntimeEvent::RunCostAlertSet(_) => log_stub("RunCostAlertSet"),
             RuntimeEvent::RunCostAlertTriggered(_) => log_stub("RunCostAlertTriggered"),
             RuntimeEvent::ApprovalDelegated(_) => log_stub("ApprovalDelegated"),
             RuntimeEvent::AuditLogEntryRecorded(_) => log_stub("AuditLogEntryRecorded"),
             RuntimeEvent::CheckpointStrategySet(_) => log_stub("CheckpointStrategySet"),
-            RuntimeEvent::CredentialKeyRotated(_) => log_stub("CredentialKeyRotated"),
-            RuntimeEvent::CredentialRevoked(_) => log_stub("CredentialRevoked"),
-            RuntimeEvent::CredentialStored(_) => log_stub("CredentialStored"),
+            // RFC-025 Phase 2a.1: credentials projection.
+            //
+            // `CredentialStored` is the create-or-refresh event. Replay
+            // preserves the active/revoked state — an event re-applied
+            // after a revocation must not silently flip `active` back
+            // to true. The ON CONFLICT path keeps the existing
+            // revoked_at_ms / active columns intact; live writes replace
+            // encrypted material + key bindings + updated_at.
+            RuntimeEvent::CredentialStored(e) => {
+                let encrypted_at = i64::try_from(e.encrypted_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "CredentialStored.encrypted_at_ms {} exceeds i64::MAX",
+                        e.encrypted_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO credentials (
+                        credential_id, tenant_id, name, provider_id, credential_type,
+                        encrypted_value, key_id, key_version, active,
+                        encrypted_at_ms, revoked_at_ms, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, 'api_key', $5, $6, $7, TRUE, $8, NULL, $8, $8)
+                     ON CONFLICT (credential_id) DO UPDATE SET
+                        encrypted_value  = EXCLUDED.encrypted_value,
+                        key_id           = EXCLUDED.key_id,
+                        key_version      = EXCLUDED.key_version,
+                        encrypted_at_ms  = EXCLUDED.encrypted_at_ms,
+                        updated_at       = EXCLUDED.updated_at",
+                )
+                .bind(e.credential_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(e.provider_id.as_str())
+                .bind(e.provider_id.as_str())
+                .bind(&e.encrypted_value)
+                .bind(e.key_id.as_deref())
+                .bind(e.key_version.as_deref())
+                .bind(encrypted_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::CredentialRevoked(e) => {
+                let revoked_at = i64::try_from(e.revoked_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "CredentialRevoked.revoked_at_ms {} exceeds i64::MAX",
+                        e.revoked_at_ms
+                    ))
+                })?;
+                // Latest-wins on revoked_at_ms to match in_memory
+                // semantics (`state.credentials.get_mut(..).revoked_at_ms
+                // = Some(e.revoked_at_ms)` in in_memory.rs). Replaying
+                // the same event is safe: UPDATE is idempotent against
+                // itself, and `active = FALSE` is absorbing.
+                sqlx::query(
+                    "UPDATE credentials
+                     SET active = FALSE,
+                         revoked_at_ms = $1,
+                         updated_at = $1
+                     WHERE credential_id = $2",
+                )
+                .bind(revoked_at)
+                .bind(e.credential_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::CredentialKeyRotated(e) => {
+                // One row per rotation event. Rotation is append-only —
+                // `ON CONFLICT (rotation_id) DO NOTHING` keeps replay
+                // idempotent without mutating the audit trail.
+                sqlx::query(
+                    "INSERT INTO credential_rotations (
+                        rotation_id, tenant_id, credential_id,
+                        old_key_id, new_key_id, rotated_credentials,
+                        started_at_ms, completed_at_ms, rotated_at, rotated_by
+                     ) VALUES ($1, $2, '', $3, $4, $5, $6, $6, $6, NULL)
+                     ON CONFLICT (rotation_id) DO NOTHING",
+                )
+                .bind(e.rotation_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(e.old_key_id.as_str())
+                .bind(e.new_key_id.as_str())
+                .bind(e.credential_ids_rotated.len() as i32)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::EvalBaselineLocked(_) => log_stub("EvalBaselineLocked"),
             RuntimeEvent::EvalBaselineSet(_) => log_stub("EvalBaselineSet"),
             RuntimeEvent::EvalDatasetCreated(_) => log_stub("EvalDatasetCreated"),
@@ -549,10 +784,66 @@ impl PgSyncProjection {
             RuntimeEvent::ProviderBindingStateChanged(_) => {
                 log_stub("ProviderBindingStateChanged")
             }
-            RuntimeEvent::ProviderBudgetAlertTriggered(_) => {
-                log_stub("ProviderBudgetAlertTriggered")
+            RuntimeEvent::ProviderBudgetAlertTriggered(e) => {
+                let triggered_at = i64::try_from(e.triggered_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderBudgetAlertTriggered.triggered_at_ms {} exceeds i64::MAX",
+                        e.triggered_at_ms
+                    ))
+                })?;
+                let current = i64::try_from(e.current_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderBudgetAlertTriggered.current_micros {} exceeds i64::MAX",
+                        e.current_micros
+                    ))
+                })?;
+                // UPDATE no-op if budget_id is unknown (mirrors
+                // in_memory's `get_mut.map(..)`). Replay is safe because
+                // the write is overwrite-stable on the same event.
+                sqlx::query(
+                    "UPDATE provider_budgets
+                     SET current_spend_micros = $1,
+                         alert_triggered_at_ms = $2,
+                         updated_at = $2
+                     WHERE budget_id = $3",
+                )
+                .bind(current)
+                .bind(triggered_at)
+                .bind(e.budget_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderBudgetExceeded(_) => log_stub("ProviderBudgetExceeded"),
+            RuntimeEvent::ProviderBudgetExceeded(e) => {
+                let exceeded_at = i64::try_from(e.exceeded_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderBudgetExceeded.exceeded_at_ms {} exceeds i64::MAX",
+                        e.exceeded_at_ms
+                    ))
+                })?;
+                let over = i64::try_from(e.exceeded_by_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ProviderBudgetExceeded.exceeded_by_micros {} exceeds i64::MAX",
+                        e.exceeded_by_micros
+                    ))
+                })?;
+                // current_spend = limit + exceeded_by (matches in_memory
+                // semantics). Use COALESCE so a missing exceeded_at_ms
+                // stays at the earliest observed overrun.
+                sqlx::query(
+                    "UPDATE provider_budgets
+                     SET current_spend_micros = limit_micros + $1,
+                         exceeded_at_ms = COALESCE(exceeded_at_ms, $2),
+                         updated_at = $2
+                     WHERE budget_id = $3",
+                )
+                .bind(over)
+                .bind(exceeded_at)
+                .bind(e.budget_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::ProviderConnectionRegistered(_) => {
                 log_stub("ProviderConnectionRegistered")
             }
@@ -1608,6 +1899,41 @@ fn tool_invocation_terminal_state_str(
     outcome: ToolInvocationOutcomeKind,
 ) -> Result<String, StoreError> {
     enum_to_str(&outcome.terminal_state())
+}
+
+/// Narrow a domain `u32` onto the projection's `INTEGER`/`i32` column
+/// without the silent `as i32` wrap. Any value above `i32::MAX` surfaces
+/// as a loud `StoreError` rather than rehydrating as 0 on read. Used by
+/// quota / budget projections — sqlite carries the same helper.
+fn i32_from_u32(field: &'static str, value: u32) -> Result<i32, StoreError> {
+    i32::try_from(value).map_err(|_| {
+        StoreError::Internal(format!(
+            "{field} = {value} exceeds i32::MAX; projection column is INTEGER"
+        ))
+    })
+}
+
+/// Stable TEXT encoding of `ProviderBudgetPeriod` for the
+/// `provider_budgets.period` column. Kept in lockstep with the sqlite
+/// helper (they share the same stored TEXT so parity is byte-equal).
+fn provider_budget_period_str(
+    period: &cairn_domain::providers::ProviderBudgetPeriod,
+) -> &'static str {
+    match period {
+        cairn_domain::providers::ProviderBudgetPeriod::Daily => "daily",
+        cairn_domain::providers::ProviderBudgetPeriod::Monthly => "monthly",
+    }
+}
+
+/// Stable TEXT encoding of `ProductTier` for the `licenses.tier`
+/// column. Matches the serde `rename_all = "snake_case"` contract so
+/// existing deserialisers still parse the value.
+fn product_tier_str(tier: &cairn_domain::commercial::ProductTier) -> &'static str {
+    match tier {
+        cairn_domain::commercial::ProductTier::LocalEval => "local_eval",
+        cairn_domain::commercial::ProductTier::TeamSelfHosted => "team_self_hosted",
+        cairn_domain::commercial::ProductTier::EnterpriseSelfHosted => "enterprise_self_hosted",
+    }
 }
 
 /// F29 CD-2: fold a (session_id, project, delta) tuple into
