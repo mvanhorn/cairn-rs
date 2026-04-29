@@ -228,6 +228,39 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_provider_bindings_and_connections",
         include_str!("migrations/V040__create_provider_bindings_and_connections.sql"),
     ),
+    // RFC-025 Phase 2b.1: read-model table for `AuditLogEntryRecorded`
+    // so audit records survive a pg/sqlite restart (previously `log_stub`
+    // on both SQL backends — silent loss on restart). V041 keeps the
+    // migration sequence gap-free (pg_migration_contract.rs invariant);
+    // the parallel Phase 2a.2 branch (#571, currently CONFLICTING) will
+    // rebase to V042+ when it lands.
+    (
+        41,
+        "create_audit_log_entries",
+        include_str!("migrations/V041__create_audit_log_entries.sql"),
+    ),
+    // RFC-025 Phase 2b.1 milestone 2: scheduled_tasks projection so the
+    // runtime recovery sweep can rehydrate due-task state on boot.
+    (
+        42,
+        "create_scheduled_tasks",
+        include_str!("migrations/V042__create_scheduled_tasks.sql"),
+    ),
+    // RFC-025 Phase 2b.1 milestone 3: outcomes projection so the
+    // evaluator-optimizer feedback loop keeps calibration inputs
+    // across restart.
+    (
+        43,
+        "create_outcomes",
+        include_str!("migrations/V043__create_outcomes.sql"),
+    ),
+    // RFC-025 Phase 2b.1 milestone 4: plan_reviews projection (RFC 018)
+    // so plan-mode artifacts + operator resolutions survive restart.
+    (
+        44,
+        "create_plan_reviews",
+        include_str!("migrations/V044__create_plan_reviews.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

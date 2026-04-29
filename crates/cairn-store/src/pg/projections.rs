@@ -496,12 +496,187 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::OutcomeRecorded(_) => log_stub("OutcomeRecorded"),
-            RuntimeEvent::ScheduledTaskCreated(_) => log_stub("ScheduledTaskCreated"),
-            RuntimeEvent::PlanProposed(_) => log_stub("PlanProposed"),
-            RuntimeEvent::PlanApproved(_) => log_stub("PlanApproved"),
-            RuntimeEvent::PlanRejected(_) => log_stub("PlanRejected"),
-            RuntimeEvent::PlanRevisionRequested(_) => log_stub("PlanRevisionRequested"),
+            // RFC-025 Phase 2b.1 m3: outcomes projection.
+            //
+            // ON CONFLICT DO NOTHING — `outcome_id` is globally unique
+            // (the eval_score tool mints it via a monotonic sequence),
+            // so a replay is a true duplicate. `actual_outcome` is a
+            // snake_case enum token via `enum_to_str`.
+            RuntimeEvent::OutcomeRecorded(e) => {
+                let recorded_at = i64::try_from(e.recorded_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "OutcomeRecorded.recorded_at {} exceeds i64::MAX",
+                        e.recorded_at
+                    ))
+                })?;
+                let actual = enum_to_str(&e.actual_outcome)?;
+                sqlx::query(
+                    "INSERT INTO outcomes (
+                        outcome_id, run_id, tenant_id, workspace_id, project_id,
+                        agent_type, predicted_confidence, actual_outcome, recorded_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     ON CONFLICT (outcome_id) DO NOTHING",
+                )
+                .bind(e.outcome_id.as_str())
+                .bind(e.run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.agent_type)
+                .bind(e.predicted_confidence)
+                .bind(&actual)
+                .bind(recorded_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC-025 Phase 2b.1 m2: scheduled_tasks projection.
+            //
+            // The event is fire-once (no Cancelled / LastRunUpdated
+            // companion events yet — those are tracked as Phase 2b.2
+            // follow-ups). ON CONFLICT DO NOTHING keeps replay safe;
+            // `enabled` / `updated_at` / `last_run_at` are defaulted at
+            // first insert to match the in-memory projection
+            // (`enabled=true`, `last_run_at=NULL`, `updated_at=created_at`).
+            RuntimeEvent::ScheduledTaskCreated(e) => {
+                let created_at = i64::try_from(e.created_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ScheduledTaskCreated.created_at {} exceeds i64::MAX",
+                        e.created_at
+                    ))
+                })?;
+                let next_run_at = e
+                    .next_run_at
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        StoreError::Internal(
+                            "ScheduledTaskCreated.next_run_at exceeds i64::MAX".into(),
+                        )
+                    })?;
+                sqlx::query(
+                    "INSERT INTO scheduled_tasks (
+                        scheduled_task_id, tenant_id, name, cron_expression,
+                        last_run_at, next_run_at, enabled, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, NULL, $5, TRUE, $6, $6)
+                     ON CONFLICT (scheduled_task_id) DO NOTHING",
+                )
+                .bind(e.scheduled_task_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(&e.name)
+                .bind(&e.cron_expression)
+                .bind(next_run_at)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC-025 Phase 2b.1 m4: plan_reviews projection (RFC 018).
+            //
+            // PlanProposed creates the row. PlanApproved / PlanRejected /
+            // PlanRevisionRequested mutate the in-place state. Replay of
+            // the creation event after a resolution must NOT overwrite
+            // the resolver fields — the ON CONFLICT DO NOTHING clause on
+            // the creation path enforces that.
+            RuntimeEvent::PlanProposed(e) => {
+                let proposed_at = i64::try_from(e.proposed_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "PlanProposed.proposed_at {} exceeds i64::MAX",
+                        e.proposed_at
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO plan_reviews (
+                        plan_run_id, tenant_id, workspace_id, project_id, session_id,
+                        plan_markdown, state, proposed_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, 'proposed', $7)
+                     ON CONFLICT (plan_run_id) DO NOTHING",
+                )
+                .bind(e.plan_run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.session_id.as_str())
+                .bind(&e.plan_markdown)
+                .bind(proposed_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::PlanApproved(e) => {
+                let approved_at = i64::try_from(e.approved_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "PlanApproved.approved_at {} exceeds i64::MAX",
+                        e.approved_at
+                    ))
+                })?;
+                // UPDATE is idempotent — applying the same resolution
+                // twice is a no-op at the SQL layer. `WHERE state =
+                // 'proposed'` guards against a late PlanApproved racing
+                // a prior PlanRejected / RevisionRequested; the first
+                // resolution wins (matches RFC 018 §"Terminal resolution").
+                sqlx::query(
+                    "UPDATE plan_reviews
+                     SET state             = 'approved',
+                         resolved_by       = $1,
+                         resolved_at       = $2,
+                         reviewer_comments = $3
+                     WHERE plan_run_id = $4 AND state = 'proposed'",
+                )
+                .bind(e.approved_by.as_str())
+                .bind(approved_at)
+                .bind(e.reviewer_comments.as_deref())
+                .bind(e.plan_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::PlanRejected(e) => {
+                let rejected_at = i64::try_from(e.rejected_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "PlanRejected.rejected_at {} exceeds i64::MAX",
+                        e.rejected_at
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE plan_reviews
+                     SET state            = 'rejected',
+                         resolved_by      = $1,
+                         resolved_at      = $2,
+                         rejection_reason = $3
+                     WHERE plan_run_id = $4 AND state = 'proposed'",
+                )
+                .bind(e.rejected_by.as_str())
+                .bind(rejected_at)
+                .bind(&e.reason)
+                .bind(e.plan_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::PlanRevisionRequested(e) => {
+                let requested_at = i64::try_from(e.requested_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "PlanRevisionRequested.requested_at {} exceeds i64::MAX",
+                        e.requested_at
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE plan_reviews
+                     SET state             = 'revision_requested',
+                         resolved_at       = $1,
+                         reviewer_comments = $2,
+                         revision_run_id   = $3
+                     WHERE plan_run_id = $4 AND state = 'proposed'",
+                )
+                .bind(requested_at)
+                .bind(&e.reviewer_comments)
+                .bind(e.new_plan_run_id.as_str())
+                .bind(e.original_plan_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 2a.1 milestone 3: provider_budgets projection.
             //
             // Keyed by `budget_id` so subsequent Alert/Exceeded events can
@@ -676,7 +851,47 @@ impl PgSyncProjection {
             RuntimeEvent::RunCostAlertSet(_) => log_stub("RunCostAlertSet"),
             RuntimeEvent::RunCostAlertTriggered(_) => log_stub("RunCostAlertTriggered"),
             RuntimeEvent::ApprovalDelegated(_) => log_stub("ApprovalDelegated"),
-            RuntimeEvent::AuditLogEntryRecorded(_) => log_stub("AuditLogEntryRecorded"),
+            // RFC-025 Phase 2b.1: audit_log_entries projection.
+            //
+            // ON CONFLICT DO NOTHING keeps replay idempotent. The event
+            // carries the full primary-key-identifying tuple (entry_id
+            // is globally unique via the AuditServiceImpl sequence) so
+            // a second delivery is a true duplicate — no mutable fields
+            // to reconcile.
+            //
+            // `metadata_json` defaults to '{}'. The `AuditLogEntryRecorded`
+            // event deliberately does not carry metadata (only Eq-able
+            // fields — `serde_json::Value` is not `Eq`); the projection
+            // persists the default so the read-model row shape matches
+            // the in-memory `AuditLogEntry { metadata: {} }` reconstruction
+            // byte-for-byte.
+            RuntimeEvent::AuditLogEntryRecorded(e) => {
+                let occurred_at = i64::try_from(e.occurred_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "AuditLogEntryRecorded.occurred_at_ms {} exceeds i64::MAX",
+                        e.occurred_at_ms
+                    ))
+                })?;
+                let outcome = enum_to_str(&e.outcome)?;
+                sqlx::query(
+                    "INSERT INTO audit_log_entries (
+                        entry_id, tenant_id, actor_id, action, resource_type,
+                        resource_id, outcome, occurred_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (entry_id) DO NOTHING",
+                )
+                .bind(&e.entry_id)
+                .bind(e.tenant_id.as_str())
+                .bind(&e.actor_id)
+                .bind(&e.action)
+                .bind(&e.resource_type)
+                .bind(&e.resource_id)
+                .bind(&outcome)
+                .bind(occurred_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::CheckpointStrategySet(_) => log_stub("CheckpointStrategySet"),
             // RFC-025 Phase 2a.1: credentials projection.
             //

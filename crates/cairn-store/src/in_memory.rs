@@ -197,6 +197,22 @@ struct State {
     /// boot, but the rows persist here so the counters stay consistent
     /// with pg/sqlite parity expectations.
     trigger_fires: Vec<crate::projections::TriggerFireRecord>,
+    /// RFC-025 Phase 2b.1: audit log read-model keyed by `entry_id`.
+    /// Mirror of the `audit_log_entries` pg/sqlite table. Replaces an
+    /// earlier read-time scan over `state.events` that grew linearly
+    /// with total event count and silently violated the trait's
+    /// "newest-first" ordering contract. The event itself does not
+    /// carry the full `AuditLogEntry.metadata` — the projection persists
+    /// the empty-object default so list/get reconstruct a byte-equal
+    /// record across backends.
+    audit_log_entries: HashMap<String, crate::projections::AuditLogEntryRecord>,
+    /// RFC-025 Phase 2b.1 m4: plan-review read model (RFC 018).
+    /// Keyed by `plan_run_id`. Pre-Phase-2b.1 the four Plan-lifecycle
+    /// events (`PlanProposed`, `PlanApproved`, `PlanRejected`,
+    /// `PlanRevisionRequested`) were no-ops on every backend including
+    /// in-memory — `GET /v1/runs/:id/plan` had zero authoritative
+    /// state to read from.
+    plan_reviews: HashMap<String, crate::projections::PlanReviewRecord>,
 }
 
 pub struct InMemoryStore {
@@ -310,6 +326,8 @@ impl InMemoryStore {
                 triggers: HashMap::new(),
                 run_templates: HashMap::new(),
                 trigger_fires: Vec::new(),
+                audit_log_entries: HashMap::new(),
+                plan_reviews: HashMap::new(),
             }),
             usage_counters: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
@@ -1373,7 +1391,6 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::ApprovalDelegated(_)
-            | RuntimeEvent::AuditLogEntryRecorded(_)
             | RuntimeEvent::EventLogCompacted(_)
             | RuntimeEvent::GuardrailPolicyEvaluated(_)
             | RuntimeEvent::OperatorIntervention(_)
@@ -1381,6 +1398,30 @@ impl InMemoryStore {
             | RuntimeEvent::PermissionDecisionRecorded(_)
             | RuntimeEvent::ProviderModelRegistered(_)
             | RuntimeEvent::ProviderRetryPolicySet(_) => {}
+            // RFC-025 Phase 2b.1: audit projection. Idempotent on
+            // replay (entry_id is globally unique — a duplicate delivery
+            // keeps the first insert). Metadata defaults to `{}` because
+            // `AuditLogEntryRecorded` does not carry it on the wire (the
+            // event was kept Eq-able at RFC 002 time). The
+            // `or_insert_with_key` form re-uses the HashMap key as the
+            // record's `entry_id` field so we don't clone the string
+            // twice (Gemini PR #573 review).
+            RuntimeEvent::AuditLogEntryRecorded(e) => {
+                state
+                    .audit_log_entries
+                    .entry(e.entry_id.clone())
+                    .or_insert_with_key(|entry_id| crate::projections::AuditLogEntryRecord {
+                        entry_id: entry_id.clone(),
+                        tenant_id: e.tenant_id.clone(),
+                        actor_id: e.actor_id.clone(),
+                        action: e.action.clone(),
+                        resource_type: e.resource_type.clone(),
+                        resource_id: e.resource_id.clone(),
+                        outcome: e.outcome,
+                        metadata: serde_json::json!({}),
+                        occurred_at_ms: e.occurred_at_ms,
+                    });
+            }
             RuntimeEvent::ResourceShared(e) => {
                 state.resource_shares.insert(
                     e.share_id.clone(),
@@ -1582,15 +1623,69 @@ impl InMemoryStore {
             | RuntimeEvent::RecoveryAttempted(_)
             | RuntimeEvent::RecoveryCompleted(_)
             | RuntimeEvent::UserMessageAppended(_)
-            | RuntimeEvent::PlanProposed(_)
-            | RuntimeEvent::PlanApproved(_)
-            | RuntimeEvent::PlanRejected(_)
-            | RuntimeEvent::PlanRevisionRequested(_)
             // RFC 020 Track 3: audit-only events; no in-memory projection update.
             | RuntimeEvent::ToolRecoveryPaused(_)
             // RFC 020 Track 4: boot-level recovery audit event.
             | RuntimeEvent::RecoverySummaryEmitted(_)
             => {}
+
+            // ── RFC-025 Phase 2b.1 m4: plan_reviews projection (RFC 018) ──
+            // Parity with pg/sqlite arms. Creation inserts; resolution
+            // events mutate the state + resolver fields in-place, but
+            // only when the row is still in `Proposed` — mirrors the
+            // `WHERE state = 'proposed'` clause on pg/sqlite so a late
+            // duplicate resolution does not overwrite an earlier one.
+            RuntimeEvent::PlanProposed(e) => {
+                state
+                    .plan_reviews
+                    .entry(e.plan_run_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::PlanReviewRecord {
+                        plan_run_id: e.plan_run_id.clone(),
+                        project: e.project.clone(),
+                        session_id: e.session_id.clone(),
+                        plan_markdown: e.plan_markdown.clone(),
+                        state: crate::projections::PlanReviewState::Proposed,
+                        proposed_at: e.proposed_at,
+                        resolved_by: None,
+                        resolved_at: None,
+                        reviewer_comments: None,
+                        rejection_reason: None,
+                        revision_run_id: None,
+                    });
+            }
+            RuntimeEvent::PlanApproved(e) => {
+                if let Some(rec) = state.plan_reviews.get_mut(e.plan_run_id.as_str()) {
+                    if rec.state == crate::projections::PlanReviewState::Proposed {
+                        rec.state = crate::projections::PlanReviewState::Approved;
+                        rec.resolved_by = Some(e.approved_by.clone());
+                        rec.resolved_at = Some(e.approved_at);
+                        rec.reviewer_comments = e.reviewer_comments.clone();
+                    }
+                }
+            }
+            RuntimeEvent::PlanRejected(e) => {
+                if let Some(rec) = state.plan_reviews.get_mut(e.plan_run_id.as_str()) {
+                    if rec.state == crate::projections::PlanReviewState::Proposed {
+                        rec.state = crate::projections::PlanReviewState::Rejected;
+                        rec.resolved_by = Some(e.rejected_by.clone());
+                        rec.resolved_at = Some(e.rejected_at);
+                        rec.rejection_reason = Some(e.reason.clone());
+                    }
+                }
+            }
+            RuntimeEvent::PlanRevisionRequested(e) => {
+                if let Some(rec) = state
+                    .plan_reviews
+                    .get_mut(e.original_plan_run_id.as_str())
+                {
+                    if rec.state == crate::projections::PlanReviewState::Proposed {
+                        rec.state = crate::projections::PlanReviewState::RevisionRequested;
+                        rec.resolved_at = Some(e.requested_at);
+                        rec.reviewer_comments = Some(e.reviewer_comments.clone());
+                        rec.revision_run_id = Some(e.new_plan_run_id.clone());
+                    }
+                }
+            }
 
             // ── RFC-025 Phase 1.5a: trigger + run_template + trigger_fires ─────
             // Parity with pg/sqlite projection arms. Eight state-carrying
@@ -3717,7 +3812,14 @@ impl OutcomeReadModel for InMemoryStore {
             .filter(|r| r.run_id == *run_id)
             .cloned()
             .collect();
-        results.sort_by_key(|r| r.recorded_at);
+        // Tiebreaker on outcome_id keeps cross-backend parity stable
+        // for events sharing a `recorded_at` timestamp (pg/sqlite
+        // ORDER BY uses the same compound key).
+        results.sort_by(|a, b| {
+            a.recorded_at
+                .cmp(&b.recorded_at)
+                .then_with(|| a.outcome_id.as_str().cmp(b.outcome_id.as_str()))
+        });
         results.truncate(limit);
         Ok(results)
     }
@@ -3735,7 +3837,11 @@ impl OutcomeReadModel for InMemoryStore {
             .filter(|r| r.project == *project)
             .cloned()
             .collect();
-        results.sort_by_key(|r| r.recorded_at);
+        results.sort_by(|a, b| {
+            a.recorded_at
+                .cmp(&b.recorded_at)
+                .then_with(|| a.outcome_id.as_str().cmp(b.outcome_id.as_str()))
+        });
         let results = results.into_iter().skip(offset).take(limit).collect();
         Ok(results)
     }
@@ -5158,42 +5264,26 @@ impl crate::projections::AuditLogReadModel for InMemoryStore {
         limit: usize,
     ) -> Result<Vec<cairn_domain::AuditLogEntry>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let entries: Vec<_> = state
-            .events
-            .iter()
-            .filter_map(|e| {
-                if let RuntimeEvent::AuditLogEntryRecorded(a) = &e.envelope.payload {
-                    if &a.tenant_id == tenant_id {
-                        if let Some(since) = since_ms {
-                            if a.occurred_at_ms < since {
-                                return None;
-                            }
-                        }
-                        if let Some(before) = before_ms {
-                            if a.occurred_at_ms >= before {
-                                return None;
-                            }
-                        }
-                        return Some(cairn_domain::AuditLogEntry {
-                            entry_id: a.entry_id.clone(),
-                            tenant_id: a.tenant_id.clone(),
-                            actor_id: a.actor_id.clone(),
-                            action: a.action.clone(),
-                            resource_type: a.resource_type.clone(),
-                            resource_id: a.resource_id.clone(),
-                            outcome: a.outcome,
-                            request_id: None,
-                            ip_address: None,
-                            occurred_at_ms: a.occurred_at_ms,
-                            metadata: serde_json::json!({}),
-                        });
-                    }
-                }
-                None
-            })
-            .take(limit)
+        let mut rows: Vec<&crate::projections::AuditLogEntryRecord> = state
+            .audit_log_entries
+            .values()
+            .filter(|rec| &rec.tenant_id == tenant_id)
+            .filter(|rec| since_ms.is_none_or(|since| rec.occurred_at_ms >= since))
+            .filter(|rec| before_ms.is_none_or(|before| rec.occurred_at_ms < before))
             .collect();
-        Ok(entries)
+        // Newest-first per trait doc. Tiebreak on entry_id so cross-backend
+        // parity does not flap on identical timestamps.
+        rows.sort_by(|a, b| {
+            b.occurred_at_ms
+                .cmp(&a.occurred_at_ms)
+                .then_with(|| b.entry_id.cmp(&a.entry_id))
+        });
+        Ok(rows
+            .into_iter()
+            .take(limit)
+            .cloned()
+            .map(crate::projections::AuditLogEntryRecord::into_entry)
+            .collect())
     }
 
     async fn list_by_resource(
@@ -5202,31 +5292,26 @@ impl crate::projections::AuditLogReadModel for InMemoryStore {
         resource_id: &str,
     ) -> Result<Vec<cairn_domain::AuditLogEntry>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let entries: Vec<_> = state
-            .events
-            .iter()
-            .filter_map(|e| {
-                if let RuntimeEvent::AuditLogEntryRecorded(a) = &e.envelope.payload {
-                    if a.resource_type == resource_type && a.resource_id == resource_id {
-                        return Some(cairn_domain::AuditLogEntry {
-                            entry_id: a.entry_id.clone(),
-                            tenant_id: a.tenant_id.clone(),
-                            actor_id: a.actor_id.clone(),
-                            action: a.action.clone(),
-                            resource_type: a.resource_type.clone(),
-                            resource_id: a.resource_id.clone(),
-                            outcome: a.outcome,
-                            request_id: None,
-                            ip_address: None,
-                            occurred_at_ms: a.occurred_at_ms,
-                            metadata: serde_json::json!({}),
-                        });
-                    }
-                }
-                None
-            })
+        let mut rows: Vec<&crate::projections::AuditLogEntryRecord> = state
+            .audit_log_entries
+            .values()
+            .filter(|rec| rec.resource_type == resource_type && rec.resource_id == resource_id)
             .collect();
-        Ok(entries)
+        rows.sort_by(|a, b| {
+            b.occurred_at_ms
+                .cmp(&a.occurred_at_ms)
+                .then_with(|| b.entry_id.cmp(&a.entry_id))
+        });
+        // Shared cap with pg + sqlite — see `LIST_BY_RESOURCE_MAX_ROWS`
+        // docs. Copilot PR #573 review flagged this as a cross-backend
+        // divergence + DoS vector on a pathological per-resource audit
+        // trail.
+        Ok(rows
+            .into_iter()
+            .take(crate::projections::LIST_BY_RESOURCE_MAX_ROWS)
+            .cloned()
+            .map(crate::projections::AuditLogEntryRecord::into_entry)
+            .collect())
     }
 }
 
@@ -6829,6 +6914,87 @@ impl crate::projections::TriggerFireReadModel for InMemoryStore {
                     && f.at_ms > since_ms
             })
             .count() as u32)
+    }
+}
+
+// ── RFC-025 Phase 2b.1 m4: plan_reviews read model (RFC 018) ────────
+
+#[async_trait]
+impl crate::projections::PlanReviewReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        plan_run_id: &cairn_domain::RunId,
+    ) -> Result<Option<crate::projections::PlanReviewRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.plan_reviews.get(plan_run_id.as_str()).cloned())
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::PlanReviewRecord> = state
+            .plan_reviews
+            .values()
+            .filter(|r| r.project == *project)
+            .cloned()
+            .collect();
+        // Newest-first on proposed_at, id DESC tiebreak so parity
+        // harness stays stable on identical timestamps (pg/sqlite
+        // ORDER BY uses the same compound key).
+        rows.sort_by(|a, b| {
+            b.proposed_at
+                .cmp(&a.proposed_at)
+                .then_with(|| b.plan_run_id.as_str().cmp(a.plan_run_id.as_str()))
+        });
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn list_pending_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::PlanReviewRecord> = state
+            .plan_reviews
+            .values()
+            .filter(|r| {
+                r.project == *project && r.state == crate::projections::PlanReviewState::Proposed
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.proposed_at
+                .cmp(&a.proposed_at)
+                .then_with(|| b.plan_run_id.as_str().cmp(a.plan_run_id.as_str()))
+        });
+        Ok(rows.into_iter().take(limit).collect())
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::PlanReviewRecord> = state
+            .plan_reviews
+            .values()
+            .filter(|r| r.session_id == *session_id)
+            .cloned()
+            .collect();
+        // Oldest-proposed-first on session lineage — callers walk the
+        // plan → revision chain in creation order.
+        rows.sort_by(|a, b| {
+            a.proposed_at
+                .cmp(&b.proposed_at)
+                .then_with(|| a.plan_run_id.as_str().cmp(b.plan_run_id.as_str()))
+        });
+        Ok(rows.into_iter().take(limit).collect())
     }
 }
 

@@ -677,8 +677,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "AuditLogEntryRecorded",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (audits — new table required)",
+        status: ProjectionStatus::Projected {
+            table: Some("audit_log_entries"),
         },
     },
     ProjectionEntry {
@@ -863,8 +863,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "OutcomeRecorded",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (outcomes)",
+        status: ProjectionStatus::Projected {
+            table: Some("outcomes"),
         },
     },
     ProjectionEntry {
@@ -881,26 +881,26 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "PlanApproved",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (plan review events — RFC 018)",
+        status: ProjectionStatus::Projected {
+            table: Some("plan_reviews"),
         },
     },
     ProjectionEntry {
         variant: "PlanProposed",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (plan review events — RFC 018)",
+        status: ProjectionStatus::Projected {
+            table: Some("plan_reviews"),
         },
     },
     ProjectionEntry {
         variant: "PlanRejected",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (plan review events — RFC 018)",
+        status: ProjectionStatus::Projected {
+            table: Some("plan_reviews"),
         },
     },
     ProjectionEntry {
         variant: "PlanRevisionRequested",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (plan review events — RFC 018)",
+        status: ProjectionStatus::Projected {
+            table: Some("plan_reviews"),
         },
     },
     // RFC-025 Phase 3 (2026-04-28): 4 provider-state variants flipped
@@ -1077,8 +1077,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "ScheduledTaskCreated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b (scheduled tasks)",
+        status: ProjectionStatus::Projected {
+            table: Some("scheduled_tasks"),
         },
     },
     ProjectionEntry {
@@ -1243,12 +1243,15 @@ mod tests {
             !stubbed.is_empty(),
             "Phase 1 should surface at least one stubbed variant (Phase 2a/2b backlog)"
         );
-        // Spot-check variants still in the Stubbed bucket post-Phase-2a.1.
-        // AuditLogEntryRecorded is Phase 2b (new table + events); still Stubbed.
-        for required in ["AuditLogEntryRecorded", "ScheduledTaskCreated"] {
+        // Spot-check variants still in the Stubbed bucket post-Phase-2b.1 m4.
+        // These stay Stubbed and are tracked as Phase 2b.2 follow-ups
+        // (skills, plugins, subagents, soul-patches, external-workers,
+        // signal-ingest, user-messages, tool-recovery-paused,
+        // recovery-escalated, event-log-compacted, resource-share).
+        for required in ["SubagentSpawned", "SoulPatchProposed", "SignalIngested"] {
             assert!(
                 stubbed.contains(&required),
-                "{required} should still be Stubbed after Phase 2a.1 (Phase 2a.2/2b migrates)"
+                "{required} should still be Stubbed post-Phase-2b.1 (Phase 2b.2 follow-up)"
             );
         }
         // Confirm Phase-1 eval migrations stayed out of Stubbed.
@@ -1332,17 +1335,34 @@ mod tests {
         //     and health probes stay Stubbed (Phase 3b will flip them
         //     to Ephemeral once the pool / health read-models land).
         //     Net: +4 Projected, -4 Stubbed → 79 / 18 / 61.
+        //   * Phase 2b.1 milestone 1 flips `AuditLogEntryRecorded`
+        //     Stubbed → Projected with backing table `audit_log_entries`
+        //     (pg V041 + sqlite schema.rs). Net: +1 Projected,
+        //     -1 Stubbed → 80 / 18 / 60.
+        //   * Phase 2b.1 milestone 2 flips `ScheduledTaskCreated`
+        //     Stubbed → Projected with backing table `scheduled_tasks`
+        //     (pg V042 + sqlite schema.rs). Net: +1 Projected,
+        //     -1 Stubbed → 81 / 18 / 59.
+        //   * Phase 2b.1 milestone 3 flips `OutcomeRecorded` Stubbed →
+        //     Projected with backing table `outcomes` (pg V043 +
+        //     sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 82 / 18 / 58.
+        //   * Phase 2b.1 milestone 4 flips the four RFC 018 Plan-review
+        //     events (`PlanProposed`, `PlanApproved`, `PlanRejected`,
+        //     `PlanRevisionRequested`) Stubbed → Projected with backing
+        //     table `plan_reviews` (pg V044 + sqlite schema.rs).
+        //     Net: +4 Projected, -4 Stubbed → 86 / 18 / 54.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 79,
+            projected, 86,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
             ephemeral, 18,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 61, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 54, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 
@@ -1350,9 +1370,10 @@ mod tests {
     fn error_display_includes_variant_list() {
         let err = assert_no_stubs_for_persistent_backend(Backend::Postgres).unwrap_err();
         let msg = err.to_string();
-        // CredentialStored moved out of Stubbed in Phase 2a.1 milestone 1;
-        // pick a Phase 2b audit variant that stays Stubbed.
-        assert!(msg.contains("AuditLogEntryRecorded"));
+        // Audits + scheduled tasks + outcomes + plan-reviews all left
+        // the Stubbed bucket in Phase 2b.1. Pick a Phase 2b.2 variant
+        // that still lives there.
+        assert!(msg.contains("SubagentSpawned"));
         assert!(msg.contains("Postgres") || msg.contains("postgres"));
     }
 }

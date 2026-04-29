@@ -2963,3 +2963,473 @@ impl crate::projections::ProviderBindingReadModel for PgAdapter {
             .collect()
     }
 }
+
+// ── RFC-025 Phase 2b.1: audit_log_entries read model ────────────────
+
+#[derive(sqlx::FromRow)]
+struct AuditLogEntryRow {
+    entry_id: String,
+    tenant_id: String,
+    actor_id: String,
+    action: String,
+    resource_type: String,
+    resource_id: String,
+    outcome: String,
+    metadata_json: String,
+    occurred_at_ms: i64,
+}
+
+impl AuditLogEntryRow {
+    fn into_record(self) -> Result<crate::projections::AuditLogEntryRecord, StoreError> {
+        let outcome = match self.outcome.as_str() {
+            "success" => cairn_domain::audit::AuditOutcome::Success,
+            "failure" => cairn_domain::audit::AuditOutcome::Failure,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "audit_log_entries.outcome: unknown value {other:?}"
+                )))
+            }
+        };
+        let metadata: serde_json::Value =
+            serde_json::from_str(&self.metadata_json).map_err(|e| {
+                StoreError::Internal(format!("audit_log_entries.metadata_json parse error: {e}"))
+            })?;
+        Ok(crate::projections::AuditLogEntryRecord {
+            entry_id: self.entry_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            actor_id: self.actor_id,
+            action: self.action,
+            resource_type: self.resource_type,
+            resource_id: self.resource_id,
+            outcome,
+            metadata,
+            occurred_at_ms: self.occurred_at_ms.max(0) as u64,
+        })
+    }
+}
+
+const AUDIT_LOG_SELECT_COLS: &str = "entry_id, tenant_id, actor_id, action, \
+     resource_type, resource_id, outcome, metadata_json, occurred_at_ms";
+
+#[async_trait]
+impl crate::projections::AuditLogReadModel for PgAdapter {
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        since_ms: Option<u64>,
+        before_ms: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<cairn_domain::AuditLogEntry>, StoreError> {
+        // Newest-first per trait doc; tiebreak on entry_id DESC matches
+        // the in-memory ordering so cross-backend parity is stable for
+        // identical timestamps. Overflow + unbounded defaults shared
+        // with sqlite via `window_bounds_ms` (Gemini PR #573 review).
+        let (since, before) = crate::projections::window_bounds_ms(since_ms, before_ms)?;
+        let sql = format!(
+            "SELECT {AUDIT_LOG_SELECT_COLS} FROM audit_log_entries
+             WHERE tenant_id = $1
+               AND occurred_at_ms >= $2
+               AND occurred_at_ms < $3
+             ORDER BY occurred_at_ms DESC, entry_id DESC
+             LIMIT $4"
+        );
+        let rows: Vec<AuditLogEntryRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(since)
+            .bind(before)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(|r| r.into_record().map(|rec| rec.into_entry()))
+            .collect()
+    }
+
+    async fn list_by_resource(
+        &self,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<Vec<cairn_domain::AuditLogEntry>, StoreError> {
+        // `list_by_resource` returns the full history for the resource
+        // (admin dashboard filters further downstream). Cap at the
+        // trait-level `LIST_BY_RESOURCE_MAX_ROWS` so pg / sqlite /
+        // in-memory converge on the same ceiling (Copilot PR #573
+        // review: the in-memory impl used to be unbounded).
+        let sql = format!(
+            "SELECT {AUDIT_LOG_SELECT_COLS} FROM audit_log_entries
+             WHERE resource_type = $1 AND resource_id = $2
+             ORDER BY occurred_at_ms DESC, entry_id DESC
+             LIMIT $3"
+        );
+        let rows: Vec<AuditLogEntryRow> = sqlx::query_as(&sql)
+            .bind(resource_type)
+            .bind(resource_id)
+            .bind(crate::projections::LIST_BY_RESOURCE_MAX_ROWS as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(|r| r.into_record().map(|rec| rec.into_entry()))
+            .collect()
+    }
+}
+
+// ── RFC-025 Phase 2b.1 m2: scheduled_tasks read model ──────────────
+
+#[derive(sqlx::FromRow)]
+struct ScheduledTaskRow {
+    scheduled_task_id: String,
+    tenant_id: String,
+    name: String,
+    cron_expression: String,
+    last_run_at: Option<i64>,
+    next_run_at: Option<i64>,
+    enabled: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl ScheduledTaskRow {
+    fn into_record(self) -> cairn_domain::ScheduledTaskRecord {
+        cairn_domain::ScheduledTaskRecord {
+            scheduled_task_id: cairn_domain::ScheduledTaskId::new(self.scheduled_task_id),
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            name: self.name,
+            cron_expression: self.cron_expression,
+            last_run_at: self.last_run_at.map(|v| v.max(0) as u64),
+            next_run_at: self.next_run_at.map(|v| v.max(0) as u64),
+            enabled: self.enabled,
+            created_at: self.created_at.max(0) as u64,
+            updated_at: self.updated_at.max(0) as u64,
+        }
+    }
+}
+
+const SCHEDULED_TASK_SELECT_COLS: &str = "scheduled_task_id, tenant_id, name, \
+     cron_expression, last_run_at, next_run_at, enabled, created_at, updated_at";
+
+#[async_trait]
+impl crate::projections::ScheduledTaskReadModel for PgAdapter {
+    async fn get(
+        &self,
+        id: &cairn_domain::ScheduledTaskId,
+    ) -> Result<Option<cairn_domain::ScheduledTaskRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {SCHEDULED_TASK_SELECT_COLS} FROM scheduled_tasks
+             WHERE scheduled_task_id = $1"
+        );
+        let row: Option<ScheduledTaskRow> = sqlx::query_as(&sql)
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(ScheduledTaskRow::into_record))
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::ScheduledTaskRecord>, StoreError> {
+        // Sort tiebreaker matches the in-memory sort_by_key(created_at)
+        // with a secondary id tiebreaker so parity tests are stable on
+        // identical created_at timestamps.
+        let sql = format!(
+            "SELECT {SCHEDULED_TASK_SELECT_COLS} FROM scheduled_tasks
+             WHERE tenant_id = $1
+             ORDER BY created_at ASC, scheduled_task_id ASC
+             LIMIT $2 OFFSET $3"
+        );
+        let rows: Vec<ScheduledTaskRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(ScheduledTaskRow::into_record)
+            .collect())
+    }
+
+    async fn list_due(
+        &self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<cairn_domain::ScheduledTaskRecord>, StoreError> {
+        let now = i64::try_from(now_ms)
+            .map_err(|_| StoreError::Internal("now_ms exceeds i64::MAX".into()))?;
+        // Enabled + next_run_at <= now. Sort by next_run_at so callers
+        // service the earliest-due first (matches in-memory ordering).
+        let sql = format!(
+            "SELECT {SCHEDULED_TASK_SELECT_COLS} FROM scheduled_tasks
+             WHERE enabled = TRUE AND next_run_at IS NOT NULL AND next_run_at <= $1
+             ORDER BY next_run_at ASC, scheduled_task_id ASC
+             LIMIT $2"
+        );
+        let rows: Vec<ScheduledTaskRow> = sqlx::query_as(&sql)
+            .bind(now)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(ScheduledTaskRow::into_record)
+            .collect())
+    }
+}
+
+// ── RFC-025 Phase 2b.1 m3: outcomes read model ────────────────────
+
+#[derive(sqlx::FromRow)]
+struct OutcomeRow {
+    outcome_id: String,
+    run_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    agent_type: String,
+    predicted_confidence: f64,
+    actual_outcome: String,
+    recorded_at: i64,
+}
+
+impl OutcomeRow {
+    fn into_record(self) -> Result<crate::projections::OutcomeRecord, StoreError> {
+        let actual_outcome = match self.actual_outcome.as_str() {
+            "success" => cairn_domain::events::ActualOutcome::Success,
+            "failure" => cairn_domain::events::ActualOutcome::Failure,
+            "partial" => cairn_domain::events::ActualOutcome::Partial,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "outcomes.actual_outcome: unknown value {other:?}"
+                )))
+            }
+        };
+        Ok(crate::projections::OutcomeRecord {
+            outcome_id: cairn_domain::OutcomeId::new(self.outcome_id),
+            run_id: cairn_domain::RunId::new(self.run_id),
+            project: cairn_domain::ProjectKey {
+                tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+                workspace_id: cairn_domain::WorkspaceId::new(self.workspace_id),
+                project_id: cairn_domain::ProjectId::new(self.project_id),
+            },
+            agent_type: self.agent_type,
+            predicted_confidence: self.predicted_confidence,
+            actual_outcome,
+            recorded_at: self.recorded_at.max(0) as u64,
+        })
+    }
+}
+
+const OUTCOME_SELECT_COLS: &str = "outcome_id, run_id, tenant_id, workspace_id, \
+     project_id, agent_type, predicted_confidence, actual_outcome, recorded_at";
+
+#[async_trait]
+impl crate::projections::OutcomeReadModel for PgAdapter {
+    async fn get(
+        &self,
+        outcome_id: &cairn_domain::OutcomeId,
+    ) -> Result<Option<crate::projections::OutcomeRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {OUTCOME_SELECT_COLS} FROM outcomes
+             WHERE outcome_id = $1"
+        );
+        let row: Option<OutcomeRow> = sqlx::query_as(&sql)
+            .bind(outcome_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(OutcomeRow::into_record).transpose()
+    }
+
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::OutcomeRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {OUTCOME_SELECT_COLS} FROM outcomes
+             WHERE run_id = $1
+             ORDER BY recorded_at ASC, outcome_id ASC
+             LIMIT $2"
+        );
+        let rows: Vec<OutcomeRow> = sqlx::query_as(&sql)
+            .bind(run_id.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(OutcomeRow::into_record).collect()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::OutcomeRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {OUTCOME_SELECT_COLS} FROM outcomes
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+             ORDER BY recorded_at ASC, outcome_id ASC
+             LIMIT $4 OFFSET $5"
+        );
+        let rows: Vec<OutcomeRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(OutcomeRow::into_record).collect()
+    }
+}
+
+// ── RFC-025 Phase 2b.1 m4: plan_reviews read model (RFC 018) ─────
+
+#[derive(sqlx::FromRow)]
+struct PlanReviewRow {
+    plan_run_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    session_id: String,
+    plan_markdown: String,
+    state: String,
+    proposed_at: i64,
+    resolved_by: Option<String>,
+    resolved_at: Option<i64>,
+    reviewer_comments: Option<String>,
+    rejection_reason: Option<String>,
+    revision_run_id: Option<String>,
+}
+
+impl PlanReviewRow {
+    fn into_record(self) -> Result<crate::projections::PlanReviewRecord, StoreError> {
+        let state = match self.state.as_str() {
+            "proposed" => crate::projections::PlanReviewState::Proposed,
+            "approved" => crate::projections::PlanReviewState::Approved,
+            "rejected" => crate::projections::PlanReviewState::Rejected,
+            "revision_requested" => crate::projections::PlanReviewState::RevisionRequested,
+            other => {
+                return Err(StoreError::Internal(format!(
+                    "plan_reviews.state: unknown value {other:?}"
+                )))
+            }
+        };
+        Ok(crate::projections::PlanReviewRecord {
+            plan_run_id: cairn_domain::RunId::new(self.plan_run_id),
+            project: cairn_domain::ProjectKey {
+                tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+                workspace_id: cairn_domain::WorkspaceId::new(self.workspace_id),
+                project_id: cairn_domain::ProjectId::new(self.project_id),
+            },
+            session_id: cairn_domain::SessionId::new(self.session_id),
+            plan_markdown: self.plan_markdown,
+            state,
+            proposed_at: self.proposed_at.max(0) as u64,
+            resolved_by: self.resolved_by.map(cairn_domain::OperatorId::new),
+            resolved_at: self.resolved_at.map(|v| v.max(0) as u64),
+            reviewer_comments: self.reviewer_comments,
+            rejection_reason: self.rejection_reason,
+            revision_run_id: self.revision_run_id.map(cairn_domain::RunId::new),
+        })
+    }
+}
+
+const PLAN_REVIEW_SELECT_COLS: &str = "plan_run_id, tenant_id, workspace_id, project_id, \
+     session_id, plan_markdown, state, proposed_at, resolved_by, resolved_at, \
+     reviewer_comments, rejection_reason, revision_run_id";
+
+#[async_trait]
+impl crate::projections::PlanReviewReadModel for PgAdapter {
+    async fn get(
+        &self,
+        plan_run_id: &cairn_domain::RunId,
+    ) -> Result<Option<crate::projections::PlanReviewRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PLAN_REVIEW_SELECT_COLS} FROM plan_reviews
+             WHERE plan_run_id = $1"
+        );
+        let row: Option<PlanReviewRow> = sqlx::query_as(&sql)
+            .bind(plan_run_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(PlanReviewRow::into_record).transpose()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PLAN_REVIEW_SELECT_COLS} FROM plan_reviews
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+             ORDER BY proposed_at DESC, plan_run_id DESC
+             LIMIT $4 OFFSET $5"
+        );
+        let rows: Vec<PlanReviewRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(PlanReviewRow::into_record).collect()
+    }
+
+    async fn list_pending_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PLAN_REVIEW_SELECT_COLS} FROM plan_reviews
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+               AND state = 'proposed'
+             ORDER BY proposed_at DESC, plan_run_id DESC
+             LIMIT $4"
+        );
+        let rows: Vec<PlanReviewRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(PlanReviewRow::into_record).collect()
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {PLAN_REVIEW_SELECT_COLS} FROM plan_reviews
+             WHERE session_id = $1
+             ORDER BY proposed_at ASC, plan_run_id ASC
+             LIMIT $2"
+        );
+        let rows: Vec<PlanReviewRow> = sqlx::query_as(&sql)
+            .bind(session_id.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(PlanReviewRow::into_record).collect()
+    }
+}

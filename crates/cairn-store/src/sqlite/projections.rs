@@ -810,12 +810,159 @@ impl SqliteSyncProjection {
                     .await?;
                 }
             }
-            RuntimeEvent::OutcomeRecorded(_) => log_stub("OutcomeRecorded"),
-            RuntimeEvent::ScheduledTaskCreated(_) => log_stub("ScheduledTaskCreated"),
-            RuntimeEvent::PlanProposed(_) => log_stub("PlanProposed"),
-            RuntimeEvent::PlanApproved(_) => log_stub("PlanApproved"),
-            RuntimeEvent::PlanRejected(_) => log_stub("PlanRejected"),
-            RuntimeEvent::PlanRevisionRequested(_) => log_stub("PlanRevisionRequested"),
+            // RFC-025 Phase 2b.1 m3: outcomes parity with pg.
+            RuntimeEvent::OutcomeRecorded(e) => {
+                let recorded_at = i64::try_from(e.recorded_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "OutcomeRecorded.recorded_at {} exceeds i64::MAX",
+                        e.recorded_at
+                    ))
+                })?;
+                let actual = enum_to_str(&e.actual_outcome)?;
+                sqlx::query(
+                    "INSERT INTO outcomes (
+                        outcome_id, run_id, tenant_id, workspace_id, project_id,
+                        agent_type, predicted_confidence, actual_outcome, recorded_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (outcome_id) DO NOTHING",
+                )
+                .bind(e.outcome_id.as_str())
+                .bind(e.run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.agent_type)
+                .bind(e.predicted_confidence)
+                .bind(&actual)
+                .bind(recorded_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC-025 Phase 2b.1 m2: scheduled_tasks parity with pg.
+            RuntimeEvent::ScheduledTaskCreated(e) => {
+                let created_at = i64::try_from(e.created_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ScheduledTaskCreated.created_at {} exceeds i64::MAX",
+                        e.created_at
+                    ))
+                })?;
+                let next_run_at = e.next_run_at.map(i64::try_from).transpose().map_err(|_| {
+                    StoreError::Internal("ScheduledTaskCreated.next_run_at exceeds i64::MAX".into())
+                })?;
+                sqlx::query(
+                    "INSERT INTO scheduled_tasks (
+                        scheduled_task_id, tenant_id, name, cron_expression,
+                        last_run_at, next_run_at, enabled, created_at, updated_at
+                     ) VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?)
+                     ON CONFLICT (scheduled_task_id) DO NOTHING",
+                )
+                .bind(e.scheduled_task_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(&e.name)
+                .bind(&e.cron_expression)
+                .bind(next_run_at)
+                .bind(created_at)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC-025 Phase 2b.1 m4: plan_reviews parity with pg.
+            RuntimeEvent::PlanProposed(e) => {
+                let proposed_at = i64::try_from(e.proposed_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "PlanProposed.proposed_at {} exceeds i64::MAX",
+                        e.proposed_at
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO plan_reviews (
+                        plan_run_id, tenant_id, workspace_id, project_id, session_id,
+                        plan_markdown, state, proposed_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?)
+                     ON CONFLICT (plan_run_id) DO NOTHING",
+                )
+                .bind(e.plan_run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.session_id.as_str())
+                .bind(&e.plan_markdown)
+                .bind(proposed_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::PlanApproved(e) => {
+                let approved_at = i64::try_from(e.approved_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "PlanApproved.approved_at {} exceeds i64::MAX",
+                        e.approved_at
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE plan_reviews
+                     SET state             = 'approved',
+                         resolved_by       = ?,
+                         resolved_at       = ?,
+                         reviewer_comments = ?
+                     WHERE plan_run_id = ? AND state = 'proposed'",
+                )
+                .bind(e.approved_by.as_str())
+                .bind(approved_at)
+                .bind(e.reviewer_comments.as_deref())
+                .bind(e.plan_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::PlanRejected(e) => {
+                let rejected_at = i64::try_from(e.rejected_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "PlanRejected.rejected_at {} exceeds i64::MAX",
+                        e.rejected_at
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE plan_reviews
+                     SET state            = 'rejected',
+                         resolved_by      = ?,
+                         resolved_at      = ?,
+                         rejection_reason = ?
+                     WHERE plan_run_id = ? AND state = 'proposed'",
+                )
+                .bind(e.rejected_by.as_str())
+                .bind(rejected_at)
+                .bind(&e.reason)
+                .bind(e.plan_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::PlanRevisionRequested(e) => {
+                let requested_at = i64::try_from(e.requested_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "PlanRevisionRequested.requested_at {} exceeds i64::MAX",
+                        e.requested_at
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE plan_reviews
+                     SET state             = 'revision_requested',
+                         resolved_at       = ?,
+                         reviewer_comments = ?,
+                         revision_run_id   = ?
+                     WHERE plan_run_id = ? AND state = 'proposed'",
+                )
+                .bind(requested_at)
+                .bind(&e.reviewer_comments)
+                .bind(e.new_plan_run_id.as_str())
+                .bind(e.original_plan_run_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 2a.1 milestone 3: provider budgets projection
             // (sqlite parity with pg).
             RuntimeEvent::ProviderBudgetSet(e) => {
@@ -1004,7 +1151,37 @@ impl SqliteSyncProjection {
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
             RuntimeEvent::ApprovalDelegated(_) => log_stub("ApprovalDelegated"),
-            RuntimeEvent::AuditLogEntryRecorded(_) => log_stub("AuditLogEntryRecorded"),
+            // RFC-025 Phase 2b.1: audit_log_entries parity with pg. Same
+            // ON CONFLICT DO NOTHING idempotency contract; `metadata_json`
+            // defaults to '{}' because `AuditLogEntryRecorded` does not
+            // carry metadata on the wire (non-Eq `serde_json::Value`).
+            RuntimeEvent::AuditLogEntryRecorded(e) => {
+                let occurred_at = i64::try_from(e.occurred_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "AuditLogEntryRecorded.occurred_at_ms {} exceeds i64::MAX",
+                        e.occurred_at_ms
+                    ))
+                })?;
+                let outcome = enum_to_str(&e.outcome)?;
+                sqlx::query(
+                    "INSERT INTO audit_log_entries (
+                        entry_id, tenant_id, actor_id, action, resource_type,
+                        resource_id, outcome, occurred_at_ms
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (entry_id) DO NOTHING",
+                )
+                .bind(&e.entry_id)
+                .bind(e.tenant_id.as_str())
+                .bind(&e.actor_id)
+                .bind(&e.action)
+                .bind(&e.resource_type)
+                .bind(&e.resource_id)
+                .bind(&outcome)
+                .bind(occurred_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::CheckpointStrategySet(_) => log_stub("CheckpointStrategySet"),
             // RFC-025 Phase 2a.1: credentials projection — sqlite parity
             // with pg. Keep `ON CONFLICT DO UPDATE` semantics identical

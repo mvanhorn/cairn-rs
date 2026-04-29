@@ -951,4 +951,87 @@ CREATE INDEX IF NOT EXISTS idx_provider_bindings_project_active
 
 CREATE INDEX IF NOT EXISTS idx_provider_bindings_tenant
     ON provider_bindings (tenant_id, created_at, provider_binding_id);
+
+-- RFC-025 Phase 2b.1: audit_log_entries parity table (pg V041). Mirror
+-- of the pg migration; TEXT + INTEGER only so the schema-parity test
+-- treats both backends as equivalent.
+CREATE TABLE IF NOT EXISTS audit_log_entries (
+    entry_id        TEXT    PRIMARY KEY,
+    tenant_id       TEXT    NOT NULL,
+    actor_id        TEXT    NOT NULL,
+    action          TEXT    NOT NULL,
+    resource_type   TEXT    NOT NULL,
+    resource_id     TEXT    NOT NULL,
+    outcome         TEXT    NOT NULL,
+    metadata_json   TEXT    NOT NULL DEFAULT '{}',
+    occurred_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_tenant
+    ON audit_log_entries (tenant_id, occurred_at_ms DESC, entry_id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_resource
+    ON audit_log_entries (resource_type, resource_id, occurred_at_ms DESC, entry_id DESC);
+
+-- RFC-025 Phase 2b.1 m2: scheduled_tasks parity table (pg V042).
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    scheduled_task_id  TEXT    PRIMARY KEY,
+    tenant_id          TEXT    NOT NULL,
+    name               TEXT    NOT NULL,
+    cron_expression    TEXT    NOT NULL,
+    last_run_at        INTEGER,
+    next_run_at        INTEGER,
+    enabled            BOOLEAN NOT NULL DEFAULT 1,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_tenant
+    ON scheduled_tasks (tenant_id, created_at, scheduled_task_id);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+    ON scheduled_tasks (enabled, next_run_at, scheduled_task_id);
+
+-- RFC-025 Phase 2b.1 m3: outcomes parity table (pg V043).
+-- SQLite uses REAL for f64; pg uses DOUBLE PRECISION.
+CREATE TABLE IF NOT EXISTS outcomes (
+    outcome_id             TEXT    PRIMARY KEY,
+    run_id                 TEXT    NOT NULL,
+    tenant_id              TEXT    NOT NULL,
+    workspace_id           TEXT    NOT NULL,
+    project_id             TEXT    NOT NULL,
+    agent_type             TEXT    NOT NULL,
+    predicted_confidence   REAL    NOT NULL,
+    actual_outcome         TEXT    NOT NULL,
+    recorded_at            INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_outcomes_run
+    ON outcomes (run_id, recorded_at, outcome_id);
+
+CREATE INDEX IF NOT EXISTS idx_outcomes_project
+    ON outcomes (tenant_id, workspace_id, project_id, recorded_at, outcome_id);
+
+-- RFC-025 Phase 2b.1 m4: plan_reviews parity table (pg V044).
+CREATE TABLE IF NOT EXISTS plan_reviews (
+    plan_run_id         TEXT    PRIMARY KEY,
+    tenant_id           TEXT    NOT NULL,
+    workspace_id        TEXT    NOT NULL,
+    project_id          TEXT    NOT NULL,
+    session_id          TEXT    NOT NULL,
+    plan_markdown       TEXT    NOT NULL,
+    state               TEXT    NOT NULL,
+    proposed_at         INTEGER NOT NULL,
+    resolved_by         TEXT,
+    resolved_at         INTEGER,
+    reviewer_comments   TEXT,
+    rejection_reason    TEXT,
+    revision_run_id     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_reviews_project_state
+    ON plan_reviews (tenant_id, workspace_id, project_id, state, proposed_at, plan_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_plan_reviews_session
+    ON plan_reviews (session_id, proposed_at, plan_run_id);
 "#;

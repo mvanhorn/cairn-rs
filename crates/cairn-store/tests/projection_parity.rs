@@ -91,16 +91,19 @@ mod in_memory_vs_sqlite {
     //! Cross-backend parity for Projected read models.
 
     use cairn_domain::{
-        ApprovalId, ApprovalRequested, ApprovalRequirement, EventEnvelope, EventId, EventSource,
-        ProjectCreated, ProjectKey, RunCreated, RunId, RunState, RunStateChanged, RuntimeEvent,
-        SessionCreated, SessionId, SessionState, SessionStateChanged, StateTransition, TaskCreated,
-        TaskId, TaskState, TaskStateChanged, TenantCreated, TenantId, WorkspaceCreated,
-        WorkspaceId,
+        audit::AuditOutcome, events::ActualOutcome, ApprovalId, ApprovalRequested,
+        ApprovalRequirement, AuditLogEntryRecorded, EventEnvelope, EventId, EventSource,
+        OperatorId, OutcomeId, OutcomeRecorded, PlanApproved, PlanProposed, PlanRejected,
+        PlanRevisionRequested, ProjectCreated, ProjectKey, RunCreated, RunId, RunState,
+        RunStateChanged, RuntimeEvent, ScheduledTaskCreated, ScheduledTaskId, SessionCreated,
+        SessionId, SessionState, SessionStateChanged, StateTransition, TaskCreated, TaskId,
+        TaskState, TaskStateChanged, TenantCreated, TenantId, WorkspaceCreated, WorkspaceId,
     };
     use cairn_store::event_log::EventLog;
     use cairn_store::in_memory::InMemoryStore;
     use cairn_store::projections::{
-        ApprovalReadModel, RunReadModel, SessionReadModel, TaskReadModel,
+        ApprovalReadModel, AuditLogReadModel, OutcomeReadModel, PlanReviewReadModel,
+        PlanReviewState, RunReadModel, ScheduledTaskReadModel, SessionReadModel, TaskReadModel,
     };
     use cairn_store::sqlite::SqliteAdapter;
 
@@ -411,6 +414,17 @@ mod in_memory_vs_sqlite {
             "ProviderBindingStateChanged",
             "ProviderConnectionRegistered",
             "ProviderConnectionDeleted",
+            // RFC-025 Phase 2b.1 m1: audit-log fixture below.
+            "AuditLogEntryRecorded",
+            // RFC-025 Phase 2b.1 m2: scheduled-tasks fixture below.
+            "ScheduledTaskCreated",
+            // RFC-025 Phase 2b.1 m3: outcomes fixture below.
+            "OutcomeRecorded",
+            // RFC-025 Phase 2b.1 m4: plan-review fixtures below.
+            "PlanProposed",
+            "PlanApproved",
+            "PlanRejected",
+            "PlanRevisionRequested",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -1481,6 +1495,573 @@ mod in_memory_vs_sqlite {
         // then pb_sort_c (later created_at).
         assert_eq!(mem_ids, vec!["pb_sort_a", "pb_sort_b", "pb_sort_c"]);
         assert_eq!(sqlite_ids, vec!["pb_sort_a", "pb_sort_b", "pb_sort_c"]);
+    }
+
+    // ── RFC-025 Phase 2b.1 m1: audit_log_entries projection parity. ──
+
+    /// Emit the same `AuditLogEntryRecorded` event into both backends and
+    /// assert list_by_tenant / list_by_resource return field-equal rows.
+    /// Also checks the trait-documented newest-first ordering — the
+    /// in-memory impl pre-Phase-2b.1 returned insertion order, which
+    /// drifted from the pg/sqlite `ORDER BY occurred_at_ms DESC`
+    /// semantics. Parity here proves the fix landed on every backend.
+    #[tokio::test]
+    async fn audit_log_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_audit_parity");
+        let events = vec![
+            env(RuntimeEvent::AuditLogEntryRecorded(AuditLogEntryRecorded {
+                entry_id: "audit_parity_1".to_owned(),
+                tenant_id: tenant.clone(),
+                actor_id: "op_alice".to_owned(),
+                action: "create_tenant".to_owned(),
+                resource_type: "tenant".to_owned(),
+                resource_id: "t_audit_parity".to_owned(),
+                outcome: AuditOutcome::Success,
+                occurred_at_ms: 1_700_000_001_000,
+            })),
+            env(RuntimeEvent::AuditLogEntryRecorded(AuditLogEntryRecorded {
+                entry_id: "audit_parity_2".to_owned(),
+                tenant_id: tenant.clone(),
+                actor_id: "op_bob".to_owned(),
+                action: "revoke_credential".to_owned(),
+                resource_type: "credential".to_owned(),
+                resource_id: "cred_123".to_owned(),
+                outcome: AuditOutcome::Failure,
+                occurred_at_ms: 1_700_000_002_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // list_by_tenant — newest-first, both entries in scope.
+        let mem_rows = AuditLogReadModel::list_by_tenant(&mem, &tenant, None, None, 10)
+            .await
+            .unwrap();
+        let sqlite_rows = AuditLogReadModel::list_by_tenant(&adapter, &tenant, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(mem_rows.len(), 2);
+        assert_eq!(sqlite_rows.len(), 2);
+        // Newest first: audit_parity_2 (t=2000) then audit_parity_1.
+        assert_eq!(mem_rows[0].entry_id, "audit_parity_2");
+        assert_eq!(sqlite_rows[0].entry_id, "audit_parity_2");
+        assert_eq!(mem_rows[1].entry_id, "audit_parity_1");
+        assert_eq!(sqlite_rows[1].entry_id, "audit_parity_1");
+
+        // Field-by-field parity across both rows.
+        for idx in 0..2 {
+            assert_eq!(mem_rows[idx].entry_id, sqlite_rows[idx].entry_id);
+            assert_eq!(mem_rows[idx].tenant_id, sqlite_rows[idx].tenant_id);
+            assert_eq!(mem_rows[idx].actor_id, sqlite_rows[idx].actor_id);
+            assert_eq!(mem_rows[idx].action, sqlite_rows[idx].action);
+            assert_eq!(mem_rows[idx].resource_type, sqlite_rows[idx].resource_type);
+            assert_eq!(mem_rows[idx].resource_id, sqlite_rows[idx].resource_id);
+            assert_eq!(mem_rows[idx].outcome, sqlite_rows[idx].outcome);
+            assert_eq!(
+                mem_rows[idx].occurred_at_ms,
+                sqlite_rows[idx].occurred_at_ms
+            );
+            assert_eq!(mem_rows[idx].metadata, sqlite_rows[idx].metadata);
+            // `request_id` / `ip_address` are always None (event does
+            // not carry them). Verified across both backends.
+            assert!(mem_rows[idx].request_id.is_none());
+            assert!(sqlite_rows[idx].request_id.is_none());
+        }
+
+        // since_ms / before_ms window.
+        let windowed =
+            AuditLogReadModel::list_by_tenant(&adapter, &tenant, Some(1_700_000_001_500), None, 10)
+                .await
+                .unwrap();
+        assert_eq!(windowed.len(), 1);
+        assert_eq!(windowed[0].entry_id, "audit_parity_2");
+
+        // list_by_resource — targets entry 2 only.
+        let mem_by_res = AuditLogReadModel::list_by_resource(&mem, "credential", "cred_123")
+            .await
+            .unwrap();
+        let sqlite_by_res = AuditLogReadModel::list_by_resource(&adapter, "credential", "cred_123")
+            .await
+            .unwrap();
+        assert_eq!(mem_by_res.len(), 1);
+        assert_eq!(sqlite_by_res.len(), 1);
+        assert_eq!(mem_by_res[0].entry_id, "audit_parity_2");
+        assert_eq!(sqlite_by_res[0].entry_id, "audit_parity_2");
+    }
+
+    // ── RFC-025 Phase 2b.1 m2: scheduled_tasks projection parity. ────
+
+    /// `ScheduledTaskCreated` fired once must produce a field-equal
+    /// row across InMemory ↔ SQLite. Covers: defaulted columns
+    /// (last_run_at=NULL, updated_at=created_at, enabled=true),
+    /// list_by_tenant ordering (created_at ASC), list_due filter.
+    #[tokio::test]
+    async fn scheduled_task_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_sched_parity");
+        let task_id_1 = ScheduledTaskId::new("sched_parity_1");
+        let task_id_2 = ScheduledTaskId::new("sched_parity_2");
+
+        let events = vec![
+            env(RuntimeEvent::ScheduledTaskCreated(ScheduledTaskCreated {
+                tenant_id: tenant.clone(),
+                scheduled_task_id: task_id_1.clone(),
+                name: "weekly_reflection".to_owned(),
+                cron_expression: "0 9 * * 1".to_owned(),
+                next_run_at: Some(1_700_000_100_000),
+                created_at: 1_700_000_000_000,
+            })),
+            env(RuntimeEvent::ScheduledTaskCreated(ScheduledTaskCreated {
+                tenant_id: tenant.clone(),
+                scheduled_task_id: task_id_2.clone(),
+                name: "daily_cleanup".to_owned(),
+                cron_expression: "0 2 * * *".to_owned(),
+                next_run_at: None,
+                created_at: 1_700_000_050_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get() parity.
+        let mem_row = ScheduledTaskReadModel::get(&mem, &task_id_1)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = ScheduledTaskReadModel::get(&adapter, &task_id_1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.name, "weekly_reflection");
+        assert!(mem_row.enabled);
+        assert_eq!(mem_row.last_run_at, None);
+        assert_eq!(mem_row.updated_at, mem_row.created_at);
+
+        // list_by_tenant parity (created_at ASC tiebreak).
+        let mem_list = ScheduledTaskReadModel::list_by_tenant(&mem, &tenant, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = ScheduledTaskReadModel::list_by_tenant(&adapter, &tenant, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list, sqlite_list);
+        assert_eq!(mem_list[0].scheduled_task_id, task_id_1);
+        assert_eq!(mem_list[1].scheduled_task_id, task_id_2);
+
+        // list_due parity — only task_1 has a next_run_at, so bumping
+        // `now_ms` past it should surface exactly one record.
+        let mem_due = ScheduledTaskReadModel::list_due(&mem, 1_700_000_100_000, 10)
+            .await
+            .unwrap();
+        let sqlite_due = ScheduledTaskReadModel::list_due(&adapter, 1_700_000_100_000, 10)
+            .await
+            .unwrap();
+        assert_eq!(mem_due, sqlite_due);
+        assert_eq!(mem_due.len(), 1);
+        assert_eq!(mem_due[0].scheduled_task_id, task_id_1);
+    }
+
+    // ── RFC-025 Phase 2b.1 m4: plan_reviews projection parity. ──────
+
+    /// `PlanProposed` → `PlanApproved` path: both backends observe the
+    /// row transition state=Approved with resolver identity + timestamp.
+    #[tokio::test]
+    async fn plan_review_proposed_then_approved_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = project();
+        let sid = SessionId::new("s_plan_parity");
+        let plan_run_id = RunId::new("r_plan_parity_1");
+        let events = vec![
+            env(RuntimeEvent::PlanProposed(PlanProposed {
+                project: proj.clone(),
+                plan_run_id: plan_run_id.clone(),
+                session_id: sid.clone(),
+                plan_markdown: "## Step 1\nDo the thing".to_owned(),
+                proposed_at: 1_700_000_001_000,
+            })),
+            env(RuntimeEvent::PlanApproved(PlanApproved {
+                project: proj.clone(),
+                plan_run_id: plan_run_id.clone(),
+                approved_by: OperatorId::new("op_reviewer"),
+                reviewer_comments: Some("LGTM".to_owned()),
+                approved_at: 1_700_000_002_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = PlanReviewReadModel::get(&mem, &plan_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = PlanReviewReadModel::get(&adapter, &plan_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.state, PlanReviewState::Approved);
+        assert_eq!(mem_row.resolved_by, Some(OperatorId::new("op_reviewer")));
+        assert_eq!(mem_row.reviewer_comments.as_deref(), Some("LGTM"));
+        assert!(mem_row.rejection_reason.is_none());
+        assert!(mem_row.revision_run_id.is_none());
+    }
+
+    /// `PlanRejected` populates `rejection_reason` + resolver fields.
+    /// The in-memory + sqlite state transitions stay lockstep.
+    #[tokio::test]
+    async fn plan_review_rejected_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = project();
+        let sid = SessionId::new("s_plan_rej");
+        let plan_run_id = RunId::new("r_plan_rej_1");
+        let events = vec![
+            env(RuntimeEvent::PlanProposed(PlanProposed {
+                project: proj.clone(),
+                plan_run_id: plan_run_id.clone(),
+                session_id: sid.clone(),
+                plan_markdown: "bad plan".to_owned(),
+                proposed_at: 1_700_000_010_000,
+            })),
+            env(RuntimeEvent::PlanRejected(PlanRejected {
+                project: proj.clone(),
+                plan_run_id: plan_run_id.clone(),
+                rejected_by: OperatorId::new("op_rejector"),
+                reason: "missing rollback steps".to_owned(),
+                rejected_at: 1_700_000_011_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = PlanReviewReadModel::get(&mem, &plan_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = PlanReviewReadModel::get(&adapter, &plan_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.state, PlanReviewState::Rejected);
+        assert_eq!(
+            mem_row.rejection_reason.as_deref(),
+            Some("missing rollback steps")
+        );
+    }
+
+    /// `PlanRevisionRequested` creates a new plan run and links the
+    /// predecessor via `revision_run_id`. list_by_session walks the
+    /// chain oldest-first.
+    #[tokio::test]
+    async fn plan_review_revision_requested_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = project();
+        let sid = SessionId::new("s_plan_rev");
+        let original_id = RunId::new("r_plan_rev_orig");
+        let new_id = RunId::new("r_plan_rev_new");
+        let events = vec![
+            env(RuntimeEvent::PlanProposed(PlanProposed {
+                project: proj.clone(),
+                plan_run_id: original_id.clone(),
+                session_id: sid.clone(),
+                plan_markdown: "v1".to_owned(),
+                proposed_at: 1_700_000_100_000,
+            })),
+            env(RuntimeEvent::PlanRevisionRequested(PlanRevisionRequested {
+                project: proj.clone(),
+                original_plan_run_id: original_id.clone(),
+                new_plan_run_id: new_id.clone(),
+                reviewer_comments: "needs v2".to_owned(),
+                requested_at: 1_700_000_101_000,
+            })),
+            env(RuntimeEvent::PlanProposed(PlanProposed {
+                project: proj.clone(),
+                plan_run_id: new_id.clone(),
+                session_id: sid.clone(),
+                plan_markdown: "v2".to_owned(),
+                proposed_at: 1_700_000_102_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_orig = PlanReviewReadModel::get(&mem, &original_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_orig = PlanReviewReadModel::get(&adapter, &original_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_orig, sqlite_orig);
+        assert_eq!(mem_orig.state, PlanReviewState::RevisionRequested);
+        assert_eq!(mem_orig.revision_run_id.as_ref(), Some(&new_id));
+
+        // The new plan run sits in Proposed.
+        let mem_new = PlanReviewReadModel::get(&mem, &new_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_new.state, PlanReviewState::Proposed);
+
+        // list_by_session surfaces both, oldest-first.
+        let mem_chain = PlanReviewReadModel::list_by_session(&mem, &sid, 10)
+            .await
+            .unwrap();
+        let sqlite_chain = PlanReviewReadModel::list_by_session(&adapter, &sid, 10)
+            .await
+            .unwrap();
+        assert_eq!(mem_chain.len(), 2);
+        assert_eq!(sqlite_chain.len(), 2);
+        assert_eq!(mem_chain[0].plan_run_id, original_id);
+        assert_eq!(mem_chain[1].plan_run_id, new_id);
+        assert_eq!(sqlite_chain[0].plan_run_id, original_id);
+        assert_eq!(sqlite_chain[1].plan_run_id, new_id);
+    }
+
+    /// Idempotency + terminal-resolution invariant: a late duplicate
+    /// resolution (e.g. PlanRejected applied after PlanApproved) must
+    /// NOT overwrite the terminal state. Covers the
+    /// `WHERE state = 'proposed'` guard on pg/sqlite and the
+    /// `if rec.state == Proposed` guard in-memory.
+    #[tokio::test]
+    async fn plan_review_late_resolution_does_not_overwrite_terminal() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = project();
+        let sid = SessionId::new("s_plan_late");
+        let plan_run_id = RunId::new("r_plan_late_1");
+        let events = vec![
+            env(RuntimeEvent::PlanProposed(PlanProposed {
+                project: proj.clone(),
+                plan_run_id: plan_run_id.clone(),
+                session_id: sid.clone(),
+                plan_markdown: "plan".to_owned(),
+                proposed_at: 1_700_000_200_000,
+            })),
+            env(RuntimeEvent::PlanApproved(PlanApproved {
+                project: proj.clone(),
+                plan_run_id: plan_run_id.clone(),
+                approved_by: OperatorId::new("op_first"),
+                reviewer_comments: None,
+                approved_at: 1_700_000_201_000,
+            })),
+            // Late duplicate: should be a no-op on both backends.
+            env(RuntimeEvent::PlanRejected(PlanRejected {
+                project: proj.clone(),
+                plan_run_id: plan_run_id.clone(),
+                rejected_by: OperatorId::new("op_second"),
+                reason: "too late".to_owned(),
+                rejected_at: 1_700_000_202_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = PlanReviewReadModel::get(&mem, &plan_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = PlanReviewReadModel::get(&adapter, &plan_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        // Approved wins — the late reject is dropped by the guard.
+        assert_eq!(mem_row.state, PlanReviewState::Approved);
+        assert_eq!(mem_row.resolved_by, Some(OperatorId::new("op_first")));
+        assert!(mem_row.rejection_reason.is_none());
+    }
+
+    // ── RFC-025 Phase 2b.1 m3: outcomes projection parity. ──────────
+
+    /// `OutcomeRecorded` emits produce field-equal rows across InMemory
+    /// ↔ SQLite. Compared field-by-field because `OutcomeRecord` does
+    /// not derive `PartialEq`.
+    #[tokio::test]
+    async fn outcome_projection_matches_across_backends() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let proj = project();
+        let run_id = RunId::new("r_outcome_parity");
+        let events = vec![
+            env(RuntimeEvent::OutcomeRecorded(OutcomeRecorded {
+                project: proj.clone(),
+                outcome_id: OutcomeId::new("out_parity_1"),
+                run_id: run_id.clone(),
+                agent_type: "code_review".to_owned(),
+                predicted_confidence: 0.85,
+                actual_outcome: ActualOutcome::Success,
+                recorded_at: 1_700_000_001_000,
+            })),
+            env(RuntimeEvent::OutcomeRecorded(OutcomeRecorded {
+                project: proj.clone(),
+                outcome_id: OutcomeId::new("out_parity_2"),
+                run_id: run_id.clone(),
+                agent_type: "research".to_owned(),
+                predicted_confidence: 0.55,
+                actual_outcome: ActualOutcome::Partial,
+                recorded_at: 1_700_000_002_000,
+            })),
+            env(RuntimeEvent::OutcomeRecorded(OutcomeRecorded {
+                project: proj.clone(),
+                outcome_id: OutcomeId::new("out_parity_3"),
+                run_id: run_id.clone(),
+                agent_type: "planner".to_owned(),
+                predicted_confidence: 0.10,
+                actual_outcome: ActualOutcome::Failure,
+                recorded_at: 1_700_000_003_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = OutcomeReadModel::list_by_run(&mem, &run_id, 10)
+            .await
+            .unwrap();
+        let sqlite_list = OutcomeReadModel::list_by_run(&adapter, &run_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 3);
+        assert_eq!(sqlite_list.len(), 3);
+
+        for (i, (m, s)) in mem_list.iter().zip(sqlite_list.iter()).enumerate() {
+            assert_eq!(m.outcome_id, s.outcome_id, "row {i}: outcome_id");
+            assert_eq!(m.run_id, s.run_id, "row {i}: run_id");
+            assert_eq!(m.project, s.project, "row {i}: project");
+            assert_eq!(m.agent_type, s.agent_type, "row {i}: agent_type");
+            assert!(
+                (m.predicted_confidence - s.predicted_confidence).abs() < f64::EPSILON,
+                "row {i}: predicted_confidence drift"
+            );
+            assert_eq!(
+                m.actual_outcome, s.actual_outcome,
+                "row {i}: actual_outcome"
+            );
+            assert_eq!(m.recorded_at, s.recorded_at, "row {i}: recorded_at");
+        }
+
+        // list_by_project parity — same rows, different filter surface.
+        let mem_proj = OutcomeReadModel::list_by_project(&mem, &proj, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_proj = OutcomeReadModel::list_by_project(&adapter, &proj, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_proj.len(), 3);
+        assert_eq!(sqlite_proj.len(), 3);
+        assert_eq!(
+            mem_proj[0].outcome_id.as_str(),
+            sqlite_proj[0].outcome_id.as_str()
+        );
+
+        // get() parity on a single id.
+        let mem_one = OutcomeReadModel::get(&mem, &OutcomeId::new("out_parity_2"))
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_one = OutcomeReadModel::get(&adapter, &OutcomeId::new("out_parity_2"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_one.agent_type, sqlite_one.agent_type);
+        assert_eq!(mem_one.actual_outcome, sqlite_one.actual_outcome);
+    }
+
+    /// Replay safety: re-delivering the same `ScheduledTaskCreated`
+    /// must not double-insert. Covers the `ON CONFLICT (scheduled_task_id)
+    /// DO NOTHING` clause on pg/sqlite and the `entry().or_insert_with`
+    /// on in-memory.
+    #[tokio::test]
+    async fn scheduled_task_replay_is_idempotent() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_sched_replay");
+        let task_id = ScheduledTaskId::new("sched_replay_1");
+        let payload = ScheduledTaskCreated {
+            tenant_id: tenant.clone(),
+            scheduled_task_id: task_id.clone(),
+            name: "noop".to_owned(),
+            cron_expression: "0 0 * * *".to_owned(),
+            next_run_at: None,
+            created_at: 1_700_000_200_000,
+        };
+        let events = vec![
+            env(RuntimeEvent::ScheduledTaskCreated(payload.clone())),
+            env(RuntimeEvent::ScheduledTaskCreated(payload)),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = ScheduledTaskReadModel::list_by_tenant(&mem, &tenant, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = ScheduledTaskReadModel::list_by_tenant(&adapter, &tenant, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list.len(), 1);
+        assert_eq!(sqlite_list.len(), 1);
+    }
+
+    /// Idempotency regression: replaying the same `AuditLogEntryRecorded`
+    /// twice (as happens during recovery / SSE catch-up) must not
+    /// duplicate the row. Covers the `ON CONFLICT (entry_id) DO NOTHING`
+    /// clause on pg/sqlite and the `entry().or_insert_with` on in-memory.
+    #[tokio::test]
+    async fn audit_log_replay_is_idempotent() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = TenantId::new("t_audit_replay");
+        let payload = AuditLogEntryRecorded {
+            entry_id: "audit_replay_1".to_owned(),
+            tenant_id: tenant.clone(),
+            actor_id: "op".to_owned(),
+            action: "noop".to_owned(),
+            resource_type: "tenant".to_owned(),
+            resource_id: "t_audit_replay".to_owned(),
+            outcome: AuditOutcome::Success,
+            occurred_at_ms: 1_700_000_003_000,
+        };
+        // Append twice (different event ids so append accepts both).
+        let events = vec![
+            env(RuntimeEvent::AuditLogEntryRecorded(payload.clone())),
+            env(RuntimeEvent::AuditLogEntryRecorded(payload)),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rows = AuditLogReadModel::list_by_tenant(&mem, &tenant, None, None, 10)
+            .await
+            .unwrap();
+        let sqlite_rows = AuditLogReadModel::list_by_tenant(&adapter, &tenant, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            mem_rows.len(),
+            1,
+            "in-memory projection must dedupe on entry_id"
+        );
+        assert_eq!(
+            sqlite_rows.len(),
+            1,
+            "sqlite projection must dedupe on entry_id"
+        );
     }
 
     #[tokio::test]
