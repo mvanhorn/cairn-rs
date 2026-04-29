@@ -94,6 +94,135 @@ Distro kernel versions last verified 2026-04-27.
 
 ---
 
+## AppArmor on Ubuntu 24.04+
+
+Ubuntu 24.04 LTS (and Debian 13+) ship with the sysctl
+
+```
+kernel.apparmor_restrict_unprivileged_userns = 1
+```
+
+enabled by default. The kernel's AppArmor LSM transitions any
+**unconfined** binary into the `unprivileged_userns` profile when it
+calls `unshare(CLONE_NEWUSER)` — which denies `CAP_SYS_ADMIN` inside the
+new userns and therefore blocks the mount operations that follow.
+
+cairn-rs's sub-agent sandbox (RFC 016 / F65 PR-4) relies on an
+unprivileged user namespace + mount namespace to confine the sub-agent.
+On an untouched Ubuntu 24.04 host the sandbox therefore fails at boot
+with:
+
+```
+FATAL: F65 kernel probe failed: kernel primitive `mount_namespace_unshare`
+failed: ... apparmor_restrict_unprivileged_userns=1 — unprivileged userns blocked ...
+```
+
+### Pick ONE remediation
+
+Listed in order from easiest/least-secure to cleanest/most-operator-friction:
+
+#### 1. Temporary: relax the sysctl for this boot
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+This change is lost on reboot. Use for dev/CI or a quick verification.
+
+#### 2. Persistent: drop a sysctl.d file (recommended for self-hosted cairn)
+
+```bash
+sudo tee /etc/sysctl.d/60-cairn-sandbox.conf <<'EOF'
+# Required by cairn-rs sandbox (F65 PR-4).
+# See https://github.com/avifenesh/cairn-rs/issues/358
+kernel.apparmor_restrict_unprivileged_userns = 0
+EOF
+sudo sysctl --system
+```
+
+Verify:
+
+```bash
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+# -> 0
+```
+
+This is a **host-wide** relaxation — any process on the host can now
+create an unprivileged user namespace. If your threat model assumes
+other untrusted workloads run on the same host, prefer option 3.
+
+#### 3. Scoped: run cairn-app under systemd with `AmbientCapabilities=CAP_SYS_ADMIN`
+
+Keep the AppArmor sysctl at its Ubuntu default (= 1) and grant cairn-app
+the capability it needs explicitly. This leaves the rest of the host
+locked down.
+
+In `/etc/systemd/system/cairn.service`, under `[Service]`, add:
+
+```ini
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=no
+```
+
+> `NoNewPrivileges=yes` (the systemd default used in the sample unit
+> below) strips ambient capabilities during `execve(2)` and prevents
+> file-capability elevation, so `NoNewPrivileges=yes` + CAP_SYS_ADMIN
+> is not achievable via systemd ambient caps OR a setcap'd launcher.
+> Pick one of: (a) keep `NoNewPrivileges=no` here and rely on the rest
+> of the hardening in the unit file; (b) keep `NoNewPrivileges=yes`
+> and instead apply remediation 2 (relax the host sysctl) or
+> remediation 4 (ship a per-binary AppArmor profile).
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart cairn
+```
+
+cairn-app will log `F65 kernel probe: all REQUIRED primitives pass`
+on the next boot.
+
+#### 4. Distribution-packaged: ship an AppArmor profile
+
+Long-term, cairn-rs may ship `/etc/apparmor.d/cairn-app` granting
+`userns_create` + the minimum mount-related capabilities to the
+cairn-app binary only. This is the cleanest outcome — no host-wide
+sysctl change, no ambient caps — but requires distro packaging effort.
+Tracked in #358; not yet shipped.
+
+### Verify the fix worked
+
+Check the sysctl directly:
+
+```bash
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+# -> 0
+```
+
+Then restart cairn-app and watch for:
+
+```
+F65 kernel probe: all REQUIRED primitives pass (kernel 6.8.0-...)
+```
+
+in the startup log. A failed boot instead logs `FATAL: F65 kernel
+probe failed: ...` naming the offending primitive and the suggested
+remediation — cross-reference against the list above.
+
+You can also exercise the sandbox kernel probe standalone before
+starting cairn-app:
+
+```bash
+cargo run -p cairn-workspace --bin f65_kernel_probe --features kernel-probe
+```
+
+See `docs/design/f65-kernel-probe-findings.md` for the canonical output
+format.
+
+---
+
 ## Filesystem choice for the sandbox workspace root
 
 cairn-rs stores per-session sandbox state under

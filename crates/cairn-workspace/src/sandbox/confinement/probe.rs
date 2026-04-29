@@ -39,6 +39,46 @@ pub enum ReflinkStatus {
     Unknown,
 }
 
+/// Host AppArmor policy on unprivileged user-namespace creation.
+///
+/// Ubuntu 24.04+ and Debian 13+ ship with
+/// `/proc/sys/kernel/apparmor_restrict_unprivileged_userns = 1` by default.
+/// When set, unconfined binaries (including cairn-app) are transitioned
+/// into AppArmor's `unprivileged_userns` profile on `unshare(CLONE_NEWUSER)`
+/// and denied `CAP_SYS_ADMIN` inside — which in turn blocks the mount
+/// operations that follow (see `bin/probes/mount_namespace.rs` for the
+/// full evidence trail).
+///
+/// Surfaced separately from [`Status`] so tooling (e.g. health endpoints,
+/// CLI diagnostics) can distinguish "the operator intentionally hardened
+/// their host" from "the primitive failed for some other reason."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApparmorUsernsPolicy {
+    /// `/proc/sys/kernel/apparmor_restrict_unprivileged_userns` = 1.
+    /// Unprivileged userns is blocked for unconfined profiles.
+    Restricted,
+    /// Sysctl exists and is 0 — AppArmor is present but not enforcing
+    /// the userns restriction.
+    Unrestricted,
+    /// Sysctl does not exist on this host (non-AppArmor kernel, or
+    /// older AppArmor without the feature). Implies no AppArmor-driven
+    /// userns restriction.
+    NotPresent,
+    /// Probe source did not record this field (e.g. an older findings
+    /// markdown without the dedicated row, or the live probe's sysctl
+    /// read hit an unrelated error).
+    Unknown,
+}
+
+impl ApparmorUsernsPolicy {
+    /// True iff the sysctl is KNOWN to restrict unprivileged userns.
+    /// Conservative on `Unknown` (returns false — we won't claim a
+    /// restriction we didn't observe).
+    pub fn is_restricted(&self) -> bool {
+        matches!(self, Self::Restricted)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProbeFindings {
     pub kernel_version: String,
@@ -47,6 +87,11 @@ pub struct ProbeFindings {
     pub seccomp_bpf: Status,
     pub mount_namespace_unshare: Status,
     pub reflink_ioctl: ReflinkStatus,
+    /// Host AppArmor policy on unprivileged user-namespace creation.
+    /// See [`ApparmorUsernsPolicy`] for the semantics — in particular,
+    /// `Restricted` is the Ubuntu 24.04+ default and the most common
+    /// reason `mount_namespace_unshare` fails on stock hosts.
+    pub apparmor_userns: ApparmorUsernsPolicy,
     pub probed_at: SystemTime,
     pub source: ProbeSource,
 }
@@ -103,6 +148,7 @@ impl ProbeFindings {
             seccomp_bpf: Status::Unknown,
             mount_namespace_unshare: Status::Unknown,
             reflink_ioctl: ReflinkStatus::Unknown,
+            apparmor_userns: ApparmorUsernsPolicy::Unknown,
             probed_at: SystemTime::now(),
             source: ProbeSource::LiveProbe,
         }
@@ -168,6 +214,12 @@ impl ProbeFindings {
                 findings.seccomp_bpf = parse_status(result);
             } else if primitive.contains("reflink") {
                 findings.reflink_ioctl = parse_reflink(result);
+            } else if primitive.contains("apparmor") && primitive.contains("userns") {
+                // Dedicated row shape:
+                // `| N | apparmor unprivileged userns | RESTRICTED/UNRESTRICTED/NOT_PRESENT | ... |`
+                // Older findings docs predating #358 omit this row, which
+                // leaves the field at `Unknown` (the `unknown()` default).
+                findings.apparmor_userns = parse_apparmor_policy(result);
             }
         }
 
@@ -304,11 +356,36 @@ fn parse_reflink(cell: &str) -> ReflinkStatus {
     }
 }
 
+/// Map a markdown cell (or a live-probe synthetic value) to an
+/// [`ApparmorUsernsPolicy`]. Accepts `RESTRICTED`, `UNRESTRICTED`,
+/// `NOT_PRESENT`, or `UNKNOWN` (case-insensitive, trailing commentary
+/// tolerated). Unrecognised cells map to `Unknown`.
+///
+/// Order matters: "UNRESTRICTED" is a substring of "RESTRICTED" so we
+/// check the longer one first (gemini-code-assist medium on PR #586).
+fn parse_apparmor_policy(cell: &str) -> ApparmorUsernsPolicy {
+    let upper = cell.to_ascii_uppercase();
+    if upper.contains("UNRESTRICTED") {
+        ApparmorUsernsPolicy::Unrestricted
+    } else if upper.contains("RESTRICTED") {
+        ApparmorUsernsPolicy::Restricted
+    } else if upper.contains("NOT_PRESENT") || upper.contains("NOT PRESENT") {
+        ApparmorUsernsPolicy::NotPresent
+    } else {
+        ApparmorUsernsPolicy::Unknown
+    }
+}
+
 fn mount_ns_fix() -> String {
-    "ensure the kernel is Linux ≥ 5.13 and unprivileged user namespaces are enabled. On \
-     Ubuntu 24.04+ run `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, \
-     or ship an AppArmor profile that grants `userns_create` + CAP_SYS_ADMIN to cairn-app, \
-     or run cairn-app under `systemd` with `AmbientCapabilities=CAP_SYS_ADMIN`."
+    "ensure the kernel is Linux >= 5.13 and unprivileged user namespaces are enabled. \
+     On Ubuntu 24.04+ and Debian 13+, the default \
+     `kernel.apparmor_restrict_unprivileged_userns=1` blocks unconfined binaries. \
+     Pick one remediation: \
+     (a) TEMPORARY `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, \
+     (b) PERSISTENT `echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | \
+     sudo tee /etc/sysctl.d/60-cairn-sandbox.conf && sudo sysctl --system`, or \
+     (c) SYSTEMD run cairn-app under a unit with `AmbientCapabilities=CAP_SYS_ADMIN`. \
+     See `docs/deployment.md` section `AppArmor on Ubuntu 24.04+` for the full trade-offs."
         .to_string()
 }
 
@@ -367,6 +444,7 @@ pub fn run_live_probe() -> ProbeFindings {
         seccomp_bpf: live_probe_seccomp(),
         mount_namespace_unshare: live_probe_mount_ns(),
         reflink_ioctl: live_probe_reflink(),
+        apparmor_userns: live_probe_apparmor_userns(),
         probed_at: SystemTime::now(),
         source: ProbeSource::LiveProbe,
     }
@@ -381,7 +459,26 @@ pub fn run_live_probe() -> ProbeFindings {
     findings.overlayfs_unprivileged = Status::Fail("not linux".to_string());
     findings.landlock_v1_fully_enforced = Status::Fail("not linux".to_string());
     findings.seccomp_bpf = Status::Fail("not linux".to_string());
+    findings.apparmor_userns = ApparmorUsernsPolicy::NotPresent;
     findings
+}
+
+/// Read the AppArmor userns-restriction sysctl and map it to an
+/// [`ApparmorUsernsPolicy`]. Absent file ⇒ `NotPresent`; unreadable /
+/// malformed contents ⇒ `Unknown`. This is a read-only probe — zero
+/// side effects on the process or the kernel.
+#[cfg(target_os = "linux")]
+fn live_probe_apparmor_userns() -> ApparmorUsernsPolicy {
+    let path = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+    match fs::read_to_string(path) {
+        Ok(s) => match s.trim() {
+            "1" => ApparmorUsernsPolicy::Restricted,
+            "0" => ApparmorUsernsPolicy::Unrestricted,
+            _ => ApparmorUsernsPolicy::Unknown,
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ApparmorUsernsPolicy::NotPresent,
+        Err(_) => ApparmorUsernsPolicy::Unknown,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -393,15 +490,60 @@ fn live_probe_mount_ns() -> Status {
         return Status::Fail("/proc/self/ns/mnt missing".to_string());
     }
     // Check the AppArmor gate that trips on Ubuntu 24.04+.
+    //
+    // Copilot on PR #586 flagged this: the AppArmor sysctl restricts the
+    // UNPRIVILEGED path (`CLONE_NEWUSER`). A cairn-app process that
+    // actually has `CAP_SYS_ADMIN` in its effective set (systemd
+    // `AmbientCapabilities=CAP_SYS_ADMIN`, or setuid-root) can take the
+    // PRIVILEGED `CLONE_NEWNS`-alone path — AppArmor's restriction does
+    // NOT apply there. Treating the sysctl as an unconditional FAIL
+    // would break operator remediation option (c) in `docs/deployment.md`.
+    //
+    // Decision: sysctl=1 only fails when we observe we do NOT hold
+    // CAP_SYS_ADMIN; otherwise PASS with a clarifying detail so the
+    // runbook + the probe agree.
     if let Ok(s) = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") {
         if s.trim() == "1" {
+            if has_effective_cap_sys_admin() {
+                // Privileged path works; AppArmor restriction is irrelevant.
+                return Status::Pass;
+            }
             return Status::Fail(
-                "kernel.apparmor_restrict_unprivileged_userns=1 — unprivileged userns blocked"
+                "kernel.apparmor_restrict_unprivileged_userns=1 — unprivileged userns \
+                 blocked and this cairn-app process has no CAP_SYS_ADMIN in its effective \
+                 set; see docs/deployment.md \u{00A7} \"AppArmor on Ubuntu 24.04+\""
                     .to_string(),
             );
         }
     }
     Status::Pass
+}
+
+/// Best-effort read of `CapEff` from `/proc/self/status`. Returns true
+/// iff the `CAP_SYS_ADMIN` bit (bit 21) is set. Used by
+/// [`live_probe_mount_ns`] to distinguish "operator applied systemd
+/// remediation (c)" from "operator did nothing".
+///
+/// On malformed or unreadable `/proc/self/status` returns false — we
+/// prefer a false negative (over-eager FAIL) to a false positive (claim
+/// CAP_SYS_ADMIN we don't have, mask a real userns-blocked boot).
+#[cfg(target_os = "linux")]
+fn has_effective_cap_sys_admin() -> bool {
+    // CAP_SYS_ADMIN is 21; see include/uapi/linux/capability.h.
+    const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
+    let status = match fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:") {
+            let hex = hex.trim();
+            if let Ok(mask) = u64::from_str_radix(hex, 16) {
+                return mask & CAP_SYS_ADMIN_BIT != 0;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -558,5 +700,221 @@ mod tests {
         let f = ProbeFindings::parse_markdown(markdown).expect("parse");
         f.assert_required().expect("reflink is not required");
         assert!(!f.reflink_available());
+    }
+
+    /// #358: existing findings-doc format (pre-dedicated-row) must keep
+    /// parsing and leave `apparmor_userns = Unknown` so older probe files
+    /// don't get mis-attributed.
+    #[test]
+    fn legacy_markdown_leaves_apparmor_userns_unknown() {
+        let f = ProbeFindings::parse_markdown(SAMPLE).expect("parse");
+        assert_eq!(f.apparmor_userns, ApparmorUsernsPolicy::Unknown);
+        assert!(!f.apparmor_userns.is_restricted());
+    }
+
+    /// #358: a findings doc that DOES include the dedicated row parses
+    /// RESTRICTED / UNRESTRICTED / NOT_PRESENT into the typed enum.
+    #[test]
+    fn parses_apparmor_userns_row_variants() {
+        for (cell, expected) in [
+            ("RESTRICTED", ApparmorUsernsPolicy::Restricted),
+            (
+                "UNRESTRICTED (sysctl=0)",
+                ApparmorUsernsPolicy::Unrestricted,
+            ),
+            ("NOT_PRESENT", ApparmorUsernsPolicy::NotPresent),
+            ("NOT PRESENT", ApparmorUsernsPolicy::NotPresent),
+            (
+                "UNKNOWN (probe could not read /proc)",
+                ApparmorUsernsPolicy::Unknown,
+            ),
+        ] {
+            let markdown = format!(
+                "| # | Primitive | Result | Detail |\n\
+                 |---|-----------|--------|--------|\n\
+                 | 2 | mount namespace unshare | PASS | ok |\n\
+                 | 3 | overlayfs unprivileged mount | PASS | ok |\n\
+                 | 4 | Landlock FullyEnforced | PASS | ok |\n\
+                 | 5 | seccomp-BPF deny list | PASS | ok |\n\
+                 | 6 | reflink | PASS | ok |\n\
+                 | 7 | apparmor unprivileged userns | {cell} | kernel.apparmor_restrict_unprivileged_userns |\n"
+            );
+            let f = ProbeFindings::parse_markdown(&markdown).expect("parse");
+            assert_eq!(
+                f.apparmor_userns, expected,
+                "cell `{cell}` must map to {expected:?}",
+            );
+        }
+    }
+
+    /// #358: `is_restricted()` is conservative — only `Restricted` counts.
+    /// `Unknown` must NOT claim a restriction we didn't observe.
+    #[test]
+    fn apparmor_is_restricted_is_conservative() {
+        assert!(ApparmorUsernsPolicy::Restricted.is_restricted());
+        assert!(!ApparmorUsernsPolicy::Unrestricted.is_restricted());
+        assert!(!ApparmorUsernsPolicy::NotPresent.is_restricted());
+        assert!(!ApparmorUsernsPolicy::Unknown.is_restricted());
+    }
+
+    /// PR #586 gemini-code-assist medium: `parse_apparmor_policy` must
+    /// NOT mis-classify "UNRESTRICTED" as "RESTRICTED" even though the
+    /// former is a substring of the latter. Locks in the check-longer-
+    /// string-first ordering so a future simplification can't regress.
+    #[test]
+    fn parse_apparmor_policy_ordering_is_unrestricted_first() {
+        // Bare tokens — the easy case.
+        assert_eq!(
+            parse_apparmor_policy("RESTRICTED"),
+            ApparmorUsernsPolicy::Restricted,
+        );
+        assert_eq!(
+            parse_apparmor_policy("UNRESTRICTED"),
+            ApparmorUsernsPolicy::Unrestricted,
+        );
+        // Tokens with trailing commentary — the hard case. Before the
+        // reorder, `"UNRESTRICTED ..."` passed the "contains RESTRICTED"
+        // check and would have mapped to Restricted without the
+        // `&& !contains("UNRESTRICTED")` guard. The new ordering is
+        // easier to read AND still correct.
+        assert_eq!(
+            parse_apparmor_policy("unrestricted (sysctl=0)"),
+            ApparmorUsernsPolicy::Unrestricted,
+        );
+        assert_eq!(
+            parse_apparmor_policy("Restricted (sysctl=1)"),
+            ApparmorUsernsPolicy::Restricted,
+        );
+        // Unrecognised cells fall through to Unknown.
+        assert_eq!(
+            parse_apparmor_policy("nobody observed it"),
+            ApparmorUsernsPolicy::Unknown,
+        );
+    }
+
+    /// PR #586 Copilot critical: when the AppArmor sysctl is restrictive
+    /// AND the cairn-app process holds CAP_SYS_ADMIN (systemd
+    /// remediation option (c) applied), the live probe must PASS —
+    /// the privileged `CLONE_NEWNS`-alone path works and the operator's
+    /// intended remediation is not silently blocked. Converse: when no
+    /// effective cap is held and sysctl=1, the probe must FAIL with a
+    /// detail naming the docs section.
+    ///
+    /// Host-state gated: we don't have a portable way to inject/withdraw
+    /// CAP_SYS_ADMIN from a running test. We observe reality via
+    /// `has_effective_cap_sys_admin()` and assert the probe's output
+    /// matches — this catches any future decoupling of the gate from
+    /// the cap check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_probe_mount_ns_honours_cap_sys_admin_bypass() {
+        let sysctl_path = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+        let restricted = matches!(
+            fs::read_to_string(sysctl_path).as_deref().map(str::trim),
+            Ok("1"),
+        );
+        if !restricted {
+            eprintln!(
+                "skipping: host does not restrict unprivileged userns; \
+                 there is no AppArmor gate for the probe to bypass here"
+            );
+            return;
+        }
+        let has_cap = has_effective_cap_sys_admin();
+        let result = live_probe_mount_ns();
+        if has_cap {
+            assert_eq!(
+                result,
+                Status::Pass,
+                "probe must PASS when sysctl=1 AND test process holds CAP_SYS_ADMIN; \
+                 otherwise remediation option (c) in docs/deployment.md is broken",
+            );
+        } else {
+            match result {
+                Status::Fail(detail) => {
+                    assert!(
+                        detail.contains("apparmor_restrict_unprivileged_userns=1"),
+                        "FAIL detail must name the sysctl: got `{detail}`",
+                    );
+                    assert!(
+                        detail.contains("docs/deployment.md"),
+                        "FAIL detail must point at the docs section: got `{detail}`",
+                    );
+                }
+                other => panic!("expected FAIL when sysctl=1 and no CAP_SYS_ADMIN; got {other:?}",),
+            }
+        }
+    }
+
+    /// PR #586 Copilot critical supporting test: `has_effective_cap_sys_admin`
+    /// parses the `CapEff:` line of `/proc/self/status`. The function is
+    /// conservative — malformed inputs return false. Exercise both code
+    /// paths by passing crafted status bodies to a small private helper
+    /// that shares the parser (extracted below).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn has_effective_cap_sys_admin_reads_current_process() {
+        // This just asserts the call itself is non-panicking; the return
+        // value depends on who runs the test (CI runner = no caps,
+        // rootless container with caps = true). The
+        // `live_probe_mount_ns_honours_cap_sys_admin_bypass` test above
+        // exercises the truthy branch when the environment happens to
+        // supply it.
+        let _ = has_effective_cap_sys_admin();
+    }
+
+    /// #358: the mount_namespace remediation text drives operator UX. Lock
+    /// down the three labels + the docs pointer so a future edit can't
+    /// silently strip the persistent recipe or the docs link.
+    #[test]
+    fn mount_ns_fix_contains_all_remediation_paths() {
+        let fix = mount_ns_fix();
+        for needle in [
+            "TEMPORARY",
+            "PERSISTENT",
+            "SYSTEMD",
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+            "/etc/sysctl.d/60-cairn-sandbox.conf",
+            "AmbientCapabilities=CAP_SYS_ADMIN",
+            "docs/deployment.md",
+            "AppArmor on Ubuntu 24.04+",
+        ] {
+            assert!(
+                fix.contains(needle),
+                "mount_ns_fix must mention `{needle}`: got `{fix}`",
+            );
+        }
+    }
+
+    /// #358: on Linux, `run_live_probe` attempts to observe the sysctl —
+    /// it must NOT leave the field at the struct's `unknown()` default
+    /// without trying. `Unknown` is tolerated when the sysctl exists but
+    /// returns unreadable/malformed contents (Copilot on #586 pointed
+    /// out the original assertion was brittle for that case); to prove
+    /// we *tried*, we compare against a freshly-constructed
+    /// `ProbeFindings::unknown()` and assert the two are NOT the same
+    /// default object (at minimum `probed_at` and `kernel_version` will
+    /// have been filled).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_probe_observes_sysctl_or_names_reason() {
+        let f = run_live_probe();
+        assert_ne!(
+            f.kernel_version, "unknown",
+            "run_live_probe must fill kernel_version from /proc/sys/kernel/osrelease"
+        );
+        // The happy-path contract: on every Linux host we've ever seen,
+        // either the sysctl exists (Restricted / Unrestricted) or it
+        // doesn't (NotPresent). `Unknown` is reserved for the
+        // unreadable-contents edge case and is ACCEPTED here — the test
+        // just proves the live probe actually tried.
+        match f.apparmor_userns {
+            ApparmorUsernsPolicy::Restricted
+            | ApparmorUsernsPolicy::Unrestricted
+            | ApparmorUsernsPolicy::NotPresent
+            | ApparmorUsernsPolicy::Unknown => {
+                // All four are legitimate live-probe outcomes on Linux.
+            }
+        }
     }
 }

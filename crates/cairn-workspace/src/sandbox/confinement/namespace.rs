@@ -29,12 +29,15 @@ use std::os::unix::io::RawFd;
 /// On Ubuntu 24.04+ with `kernel.apparmor_restrict_unprivileged_userns=1`
 /// this fails with `EPERM`; the caller is expected to surface a named
 /// primitive failure via the kernel probe (see `confinement/probe.rs`) rather
-/// than attempt to silently continue.
+/// than attempt to silently continue. When the failure is EPERM and the
+/// AppArmor sysctl is set, the returned error embeds a pointed remediation
+/// block (see [`apparmor_userns_hint`]) so the operator doesn't have to
+/// cross-reference the kernel log.
 #[cfg(target_os = "linux")]
 pub fn unshare_mount_ns() -> Result<(), ConfinementError> {
     use nix::sched::{unshare, CloneFlags};
     unshare(CloneFlags::CLONE_NEWNS)
-        .map_err(|err| ConfinementError::NamespaceUnshare(format!("CLONE_NEWNS: {err}")))
+        .map_err(|err| ConfinementError::NamespaceUnshare(format_unshare_error("CLONE_NEWNS", err)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -51,7 +54,7 @@ pub fn unshare_mount_ns() -> Result<(), ConfinementError> {
 pub fn unshare_mount_and_network() -> Result<(), ConfinementError> {
     use nix::sched::{unshare, CloneFlags};
     unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWNET).map_err(|err| {
-        ConfinementError::NamespaceUnshare(format!("CLONE_NEWNS|CLONE_NEWNET: {err}"))
+        ConfinementError::NamespaceUnshare(format_unshare_error("CLONE_NEWNS|CLONE_NEWNET", err))
     })
 }
 
@@ -59,6 +62,52 @@ pub fn unshare_mount_and_network() -> Result<(), ConfinementError> {
 pub fn unshare_mount_and_network() -> Result<(), ConfinementError> {
     Err(ConfinementError::UnsupportedPlatform(
         "unshare(CLONE_NEWNS|CLONE_NEWNET) requires Linux".to_string(),
+    ))
+}
+
+/// Format an `unshare(2)` failure message, embedding an actionable AppArmor
+/// remediation block when the failure is EPERM on a host where
+/// `/proc/sys/kernel/apparmor_restrict_unprivileged_userns = 1`.
+///
+/// The hint is only appended when the sysctl is actually set — we don't want
+/// to blame AppArmor on hosts where the real cause is something else (e.g.
+/// a container runtime that masks `/proc/self/ns`).
+#[cfg(target_os = "linux")]
+fn format_unshare_error(flags: &str, err: nix::errno::Errno) -> String {
+    let mut msg = format!("{flags}: {err}");
+    if err == nix::errno::Errno::EPERM {
+        if let Some(hint) = apparmor_userns_hint() {
+            msg.push('\n');
+            msg.push_str(&hint);
+        }
+    }
+    msg
+}
+
+/// If the host enables `kernel.apparmor_restrict_unprivileged_userns=1`,
+/// return a multi-line remediation block with the exact sysctl + the
+/// persistent `/etc/sysctl.d/` recipe. Returns `None` when the sysctl is
+/// absent (non-AppArmor host) or disabled (already allows userns).
+///
+/// Kept in sync with [`super::probe::mount_ns_fix`] and the deployment doc
+/// (`docs/deployment.md` § AppArmor on Ubuntu 24.04+).
+#[cfg(target_os = "linux")]
+pub(crate) fn apparmor_userns_hint() -> Option<String> {
+    let sysctl = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
+    let contents = std::fs::read_to_string(sysctl).ok()?;
+    if contents.trim() != "1" {
+        return None;
+    }
+    Some(format!(
+        "AppArmor on this host blocks unprivileged user-namespace creation \
+         ({sysctl} = 1). On Ubuntu 24.04+ and Debian 13+ this is the default.\n\
+         Fix (pick one):\n\
+         \u{2022} TEMPORARY:  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0\n\
+         \u{2022} PERSISTENT: echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | \
+         sudo tee /etc/sysctl.d/60-cairn-sandbox.conf && sudo sysctl --system\n\
+         \u{2022} SYSTEMD:    run cairn-app under a unit with AmbientCapabilities=CAP_SYS_ADMIN \
+         (grants the privileged unshare path; avoids relaxing host AppArmor).\n\
+         See docs/deployment.md \u{00A7} \"AppArmor on Ubuntu 24.04+\" for the full trade-offs."
     ))
 }
 
@@ -196,7 +245,10 @@ pub fn close_nonstandard_fds(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{close_nonstandard_fds, enumerate_nonstandard_fds};
+    use super::{
+        apparmor_userns_hint, close_nonstandard_fds, enumerate_nonstandard_fds,
+        format_unshare_error, unshare_mount_ns,
+    };
     use std::sync::{Mutex, OnceLock};
 
     /// Every test in this module inspects `/proc/self/fd/` of the
@@ -314,5 +366,146 @@ mod tests {
             msg.contains("keep_fd must be >= 3"),
             "error must call out the stdio-range gate: got `{msg}`",
         );
+    }
+
+    /// #358: a non-EPERM unshare failure must NOT embed the AppArmor hint
+    /// (it would mislead the operator into fiddling with a sysctl that has
+    /// nothing to do with the actual errno). We pass `EINVAL` through the
+    /// formatter and assert no remediation text is appended.
+    #[test]
+    fn format_unshare_error_does_not_blame_apparmor_on_non_eperm() {
+        let _serial = serial_guard();
+        let msg = format_unshare_error("CLONE_NEWNS", nix::errno::Errno::EINVAL);
+        assert!(
+            msg.starts_with("CLONE_NEWNS:"),
+            "prefix must carry the flag name for operator log-grep: got `{msg}`",
+        );
+        assert!(
+            !msg.contains("apparmor_restrict_unprivileged_userns"),
+            "EINVAL must not be mis-attributed to AppArmor: got `{msg}`",
+        );
+        assert!(
+            !msg.contains("sysctl"),
+            "EINVAL must not carry an AppArmor sysctl hint: got `{msg}`",
+        );
+    }
+
+    /// #358: EPERM + AppArmor sysctl set ⇒ hint must embed ALL three
+    /// remediation options (temporary sysctl, persistent /etc/sysctl.d
+    /// recipe, systemd ambient-caps path) plus a pointer to the docs.
+    /// This is the operator-UX contract: seeing EPERM in the log tells the
+    /// operator what to do next, without having to hunt for a runbook.
+    ///
+    /// Gated on host state — if the test host does NOT restrict userns
+    /// (e.g. a CI runner with the sysctl disabled) the hint correctly
+    /// returns `None` and this test skips; the negative case is covered
+    /// by `format_unshare_error_does_not_blame_apparmor_on_non_eperm`.
+    #[test]
+    fn format_unshare_error_embeds_actionable_apparmor_block_on_eperm() {
+        let _serial = serial_guard();
+        let Some(hint) = apparmor_userns_hint() else {
+            eprintln!(
+                "skipping: host does not restrict unprivileged userns \
+                 (kernel.apparmor_restrict_unprivileged_userns != 1)"
+            );
+            return;
+        };
+        // The helper hint alone must contain all three remediation labels
+        // + the doc pointer.
+        for needle in [
+            "TEMPORARY",
+            "PERSISTENT",
+            "SYSTEMD",
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+            "/etc/sysctl.d/60-cairn-sandbox.conf",
+            "AmbientCapabilities=CAP_SYS_ADMIN",
+            "docs/deployment.md",
+        ] {
+            assert!(
+                hint.contains(needle),
+                "apparmor_userns_hint must mention `{needle}`: got `{hint}`",
+            );
+        }
+
+        // The formatter MUST embed the hint as a trailing block when the
+        // errno is EPERM.
+        let msg = format_unshare_error("CLONE_NEWNS", nix::errno::Errno::EPERM);
+        assert!(
+            msg.starts_with("CLONE_NEWNS:"),
+            "prefix must be present: got `{msg}`",
+        );
+        assert!(
+            msg.contains("apparmor_restrict_unprivileged_userns"),
+            "EPERM + AppArmor-restricted host must embed the sysctl hint: got `{msg}`",
+        );
+    }
+
+    /// #358: end-to-end — on an AppArmor-restricted host, a real
+    /// `unshare(CLONE_NEWNS)` as the test process (no CAP_SYS_ADMIN) fails
+    /// with EPERM and the surfaced `ConfinementError::NamespaceUnshare`
+    /// carries the actionable block. On hosts where the test runner
+    /// happens to hold CAP_SYS_ADMIN (some rootless CI containers) the
+    /// unshare actually succeeds — in that case we'd pollute the mount
+    /// table of the cargo-test process, so we DO NOT call `unshare_mount_ns`
+    /// there and just log a skip.
+    ///
+    /// The detection is conservative: if `/proc/self/status` shows any
+    /// effective cap bits set, we skip to avoid the pollution.
+    #[test]
+    fn runtime_unshare_surface_actionable_error_on_apparmor_host() {
+        let _serial = serial_guard();
+        // Skip when the sysctl isn't restrictive (hint would be absent).
+        if apparmor_userns_hint().is_none() {
+            eprintln!(
+                "skipping: host does not restrict unprivileged userns; \
+                 runtime unshare would succeed and pollute the test process"
+            );
+            return;
+        }
+        // Skip when the test process holds any effective cap (common in
+        // rootless CI containers). Without CAP_SYS_ADMIN the unshare will
+        // EPERM and we can assert the error shape without mutating our own
+        // mount table.
+        if has_any_effective_cap() {
+            eprintln!(
+                "skipping: test process holds effective capabilities; \
+                 `unshare(CLONE_NEWNS)` would succeed and mutate the \
+                 cargo-test process's mount table"
+            );
+            return;
+        }
+
+        let err =
+            unshare_mount_ns().expect_err("EPERM expected on AppArmor-restricted host sans caps");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mount namespace unshare failed"),
+            "error display must carry the primitive name: got `{msg}`",
+        );
+        assert!(
+            msg.contains("apparmor_restrict_unprivileged_userns"),
+            "error must name the offending sysctl: got `{msg}`",
+        );
+        assert!(
+            msg.contains("sudo sysctl") && msg.contains("/etc/sysctl.d/"),
+            "error must include BOTH the temporary and persistent fix: got `{msg}`",
+        );
+    }
+
+    /// Read `/proc/self/status` and return true iff any bit is set in
+    /// `CapEff`. Used by the runtime-unshare test above to skip hosts
+    /// where the unshare would actually succeed.
+    fn has_any_effective_cap() -> bool {
+        let status = match std::fs::read_to_string("/proc/self/status") {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        for line in status.lines() {
+            if let Some(hex) = line.strip_prefix("CapEff:") {
+                let trimmed = hex.trim();
+                return u64::from_str_radix(trimmed, 16).unwrap_or(0) != 0;
+            }
+        }
+        false
     }
 }
