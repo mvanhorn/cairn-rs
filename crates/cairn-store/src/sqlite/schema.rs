@@ -744,6 +744,87 @@ CREATE TABLE IF NOT EXISTS eval_runs (
 CREATE INDEX IF NOT EXISTS idx_eval_runs_project
     ON eval_runs (tenant_id, workspace_id, project_id, started_at);
 
+-- RFC-025 Phase 1.5a: trigger + run_template + trigger_fires projections.
+-- Parity with pg V035; portable types only (no JSONB, no arrays).
+-- Conditions + allowlists + required-fields ride on TEXT columns as serde-JSON
+-- blobs. Mirror at
+-- `crates/cairn-store/src/pg/migrations/V035__create_trigger_projections.sql`.
+CREATE TABLE IF NOT EXISTS triggers (
+    trigger_id        TEXT    PRIMARY KEY,
+    tenant_id         TEXT    NOT NULL,
+    workspace_id      TEXT    NOT NULL,
+    project_id        TEXT    NOT NULL,
+    name              TEXT    NOT NULL,
+    description       TEXT,
+    signal_type       TEXT    NOT NULL,
+    plugin_id         TEXT,
+    conditions_json   TEXT    NOT NULL,
+    run_template_id   TEXT    NOT NULL,
+    state             TEXT    NOT NULL,
+    state_reason      TEXT,
+    suspension_reason TEXT,
+    state_since       INTEGER,
+    max_per_minute    INTEGER NOT NULL,
+    max_burst         INTEGER NOT NULL,
+    max_chain_depth   INTEGER NOT NULL,
+    created_by        TEXT    NOT NULL,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_triggers_project
+    ON triggers (tenant_id, workspace_id, project_id, trigger_id);
+CREATE INDEX IF NOT EXISTS idx_triggers_signal_match
+    ON triggers (tenant_id, workspace_id, project_id, signal_type);
+
+CREATE TABLE IF NOT EXISTS run_templates (
+    template_id                       TEXT    PRIMARY KEY,
+    tenant_id                         TEXT    NOT NULL,
+    workspace_id                      TEXT    NOT NULL,
+    project_id                        TEXT    NOT NULL,
+    name                              TEXT    NOT NULL,
+    description                       TEXT,
+    default_mode                      TEXT    NOT NULL,
+    system_prompt                     TEXT    NOT NULL,
+    initial_user_message              TEXT,
+    plugin_allowlist_json             TEXT,
+    tool_allowlist_json               TEXT,
+    budget_max_tokens                 INTEGER,
+    budget_max_wall_clock_ms          INTEGER,
+    budget_max_iterations             INTEGER,
+    budget_exploration_budget_share   REAL,
+    sandbox_hint                      TEXT,
+    required_fields_json              TEXT    NOT NULL,
+    created_by                        TEXT    NOT NULL,
+    created_at                        INTEGER NOT NULL,
+    updated_at                        INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_templates_project
+    ON run_templates (tenant_id, workspace_id, project_id, template_id);
+
+CREATE TABLE IF NOT EXISTS trigger_fires (
+    fire_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_id       TEXT    NOT NULL,
+    tenant_id        TEXT    NOT NULL,
+    workspace_id     TEXT    NOT NULL,
+    project_id       TEXT    NOT NULL,
+    signal_id        TEXT    NOT NULL,
+    outcome          TEXT    NOT NULL,
+    signal_type      TEXT,
+    metadata_json    TEXT,
+    at_ms            INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_trigger_fires_ledger
+    ON trigger_fires (trigger_id, signal_id, outcome);
+
+CREATE INDEX IF NOT EXISTS idx_trigger_fires_rate_limit
+    ON trigger_fires (trigger_id, at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_trigger_fires_project_budget
+    ON trigger_fires (tenant_id, workspace_id, project_id, at_ms);
+
 -- RFC-025 Phase 2a.1 (credentials): sqlite parity with pg migration V035.
 -- Portable types only (no BYTEA — sqlite takes BLOB). Mirror at
 -- `crates/cairn-store/src/pg/migrations/V035__create_credentials.sql`.

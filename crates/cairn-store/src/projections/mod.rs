@@ -55,6 +55,7 @@ pub mod snapshot;
 pub mod task;
 pub mod tool_call_approval;
 pub mod tool_invocation;
+pub mod trigger;
 pub mod workspace_membership;
 
 pub use approval::*;
@@ -108,6 +109,11 @@ pub use tool_call_approval::{
     ToolCallApprovalReadModel, ToolCallApprovalRecord, ToolCallApprovalState,
 };
 pub use tool_invocation::*;
+pub use trigger::{
+    skip_reason_discriminant, suspension_reason_discriminant, RunTemplateReadModel,
+    RunTemplateRecord, TriggerFireOutcome, TriggerFireReadModel, TriggerFireRecord,
+    TriggerReadModel, TriggerRecord, TriggerStateKind,
+};
 pub use workspace_membership::{WorkspaceMemberRecord, WorkspaceMembershipReadModel};
 
 use crate::error::StoreError;

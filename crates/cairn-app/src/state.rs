@@ -20,8 +20,7 @@ use cairn_api::onboarding::StarterTemplateRegistry;
 use cairn_api::sse::SseFrame;
 
 use cairn_domain::{
-    KnowledgeDocumentId, ProjectKey, PromptTemplateVar, RuntimeEvent, SourceId, TaskId, TenantId,
-    WorkspaceId,
+    KnowledgeDocumentId, ProjectKey, PromptTemplateVar, SourceId, TaskId, TenantId, WorkspaceId,
 };
 
 use cairn_evals::services::eval_service::{MemoryDiagnosticsSource, SourceQualitySnapshot};
@@ -246,7 +245,27 @@ pub struct AppState {
     /// RFC 015: plugin marketplace service -- manages discover/install/enable lifecycle.
     pub marketplace: Arc<Mutex<MarketplaceService<cairn_store::InMemoryStore>>>,
     /// RFC 022: trigger service -- manages triggers and run templates.
-    pub triggers: Arc<Mutex<TriggerService>>,
+    ///
+    /// RFC-025 Phase 1.5a: the service is projection-backed rather
+    /// than rebuilt from the event log at boot. The struct holds an
+    /// `Arc<InMemoryStore>` internally and issues async projection
+    /// reads / event log writes; no in-memory HashMaps are held here
+    /// and no outer `Mutex` is needed (the service is stateless +
+    /// clone-cheap). The concrete `InMemoryStore` type is the same
+    /// `Arc` that `runtime.store` holds, so the projection reads hit
+    /// the same rows as the rest of the runtime.
+    ///
+    /// The concrete `InMemoryStore` binding matches the rest of
+    /// `AppState` — every service-layer field on `AppState` is bound
+    /// to `InMemoryStore` today because `runtime.store` is an
+    /// `Arc<InMemoryStore>`. Persistent backends (pg/sqlite) are wired
+    /// via the dual-write `set_secondary_log` path on the primary
+    /// in-memory store; the primary projections + event log are still
+    /// the source of truth that every service reads from. Migrating
+    /// `AppState` to a generic `<S: Store>` or `Arc<dyn Store>` shape
+    /// is RFC-025 Phase 4 scope; flipping just the trigger service
+    /// here would create a lopsided seam.
+    pub triggers: Arc<TriggerService<cairn_store::InMemoryStore>>,
     pub repo_clone_cache: Arc<cairn_workspace::RepoCloneCache>,
     pub project_repo_access: Arc<cairn_workspace::ProjectRepoAccessService>,
     /// Per-project set of local-filesystem paths attached via
@@ -770,155 +789,13 @@ impl AppState {
     // the write path inside each handler; a process restart drops the cache
     // but every durable field reads back from the projection.
 
-    /// Replay trigger/template lifecycle and fire outcomes into the in-memory trigger service.
-    pub async fn replay_triggers(&self) {
-        use cairn_store::event_log::EventLog;
-
-        let events = match self.runtime.store.read_stream(None, usize::MAX).await {
-            Ok(events) => events,
-            Err(error) => {
-                tracing::warn!("trigger replay: failed to read events: {error}");
-                return;
-            }
-        };
-
-        let mut triggers = self.triggers.lock().unwrap_or_else(|e| e.into_inner());
-        *triggers = TriggerService::new();
-
-        let mut restored_templates = 0u32;
-        let mut restored_triggers = 0u32;
-        let mut restored_fires = 0u32;
-
-        for stored in &events {
-            match &stored.envelope.payload {
-                RuntimeEvent::RunTemplateCreated(event) => {
-                    triggers.create_template(cairn_runtime::RunTemplate {
-                        id: event.template_id.clone(),
-                        project: event.project.clone(),
-                        name: event.name.clone(),
-                        description: event.description.clone(),
-                        default_mode: event.default_mode.clone(),
-                        system_prompt: event.system_prompt.clone(),
-                        initial_user_message: event.initial_user_message.clone(),
-                        plugin_allowlist: event.plugin_allowlist.clone(),
-                        tool_allowlist: event.tool_allowlist.clone(),
-                        budget: cairn_runtime::TemplateBudget {
-                            max_tokens: event.budget_max_tokens,
-                            max_wall_clock_ms: event.budget_max_wall_clock_ms,
-                            max_iterations: event.budget_max_iterations,
-                            exploration_budget_share: event.budget_exploration_budget_share,
-                        },
-                        sandbox_hint: event.sandbox_hint.clone(),
-                        required_fields: event.required_fields.clone(),
-                        created_by: event.created_by.clone(),
-                        created_at: event.created_at,
-                        updated_at: event.created_at,
-                    });
-                    restored_templates += 1;
-                }
-                RuntimeEvent::RunTemplateDeleted(event) => {
-                    let _ = triggers.delete_template(&event.template_id, event.by.clone());
-                }
-                RuntimeEvent::TriggerCreated(event) => {
-                    let conditions = match crate::trigger_conditions_from_values(&event.conditions)
-                    {
-                        Ok(conditions) => conditions,
-                        Err(error) => {
-                            tracing::warn!(
-                                "trigger replay: failed to decode conditions for {}: {error}",
-                                event.trigger_id
-                            );
-                            continue;
-                        }
-                    };
-                    match triggers.create_trigger(cairn_runtime::Trigger {
-                        id: event.trigger_id.clone(),
-                        project: event.project.clone(),
-                        name: event.name.clone(),
-                        description: event.description.clone(),
-                        signal_pattern: cairn_runtime::SignalPattern {
-                            signal_type: event.signal_type.clone(),
-                            plugin_id: event.plugin_id.clone(),
-                        },
-                        conditions,
-                        run_template_id: event.run_template_id.clone(),
-                        state: cairn_runtime::TriggerState::Enabled,
-                        rate_limit: cairn_runtime::RateLimitConfig {
-                            max_per_minute: event.max_per_minute,
-                            max_burst: event.max_burst,
-                        },
-                        max_chain_depth: event.max_chain_depth,
-                        created_by: event.created_by.clone(),
-                        created_at: event.created_at,
-                        updated_at: event.created_at,
-                    }) {
-                        Ok(_) => restored_triggers += 1,
-                        Err(error) => tracing::warn!(
-                            "trigger replay: failed to restore trigger {}: {error}",
-                            event.trigger_id
-                        ),
-                    }
-                }
-                RuntimeEvent::TriggerEnabled(event) => {
-                    let _ = triggers.restore_trigger_state(
-                        &event.trigger_id,
-                        cairn_runtime::TriggerState::Enabled,
-                        event.at,
-                    );
-                }
-                RuntimeEvent::TriggerDisabled(event) => {
-                    let _ = triggers.restore_trigger_state(
-                        &event.trigger_id,
-                        cairn_runtime::TriggerState::Disabled {
-                            reason: event.reason.clone(),
-                            since: event.at,
-                        },
-                        event.at,
-                    );
-                }
-                RuntimeEvent::TriggerSuspended(event) => {
-                    let _ = triggers.restore_trigger_state(
-                        &event.trigger_id,
-                        cairn_runtime::TriggerState::Suspended {
-                            reason: crate::runtime_trigger_suspension_reason(&event.reason),
-                            since: event.at,
-                        },
-                        event.at,
-                    );
-                }
-                RuntimeEvent::TriggerResumed(event) => {
-                    let _ = triggers.restore_trigger_state(
-                        &event.trigger_id,
-                        cairn_runtime::TriggerState::Enabled,
-                        event.at,
-                    );
-                }
-                RuntimeEvent::TriggerDeleted(event) => {
-                    let _ = triggers.delete_trigger(&event.trigger_id, event.by.clone());
-                }
-                RuntimeEvent::TriggerFired(event) => {
-                    triggers.restore_fired_trigger(
-                        &event.project,
-                        &event.trigger_id,
-                        &event.signal_id,
-                        event.fired_at,
-                    );
-                    restored_fires += 1;
-                }
-                RuntimeEvent::TriggerSkipped(_)
-                | RuntimeEvent::TriggerDenied(_)
-                | RuntimeEvent::TriggerRateLimited(_)
-                | RuntimeEvent::TriggerPendingApproval(_) => {}
-                _ => {}
-            }
-        }
-
-        if restored_templates > 0 || restored_triggers > 0 || restored_fires > 0 {
-            tracing::info!(
-                "trigger replay: restored {restored_templates} templates, {restored_triggers} triggers, {restored_fires} fires"
-            );
-        }
-    }
+    // RFC-025 Phase 1.5a: `replay_triggers` deleted (2026-04-29).
+    //
+    // Durable trigger / run_template / trigger-fire state lives in the
+    // `triggers` / `run_templates` / `trigger_fires` projection tables
+    // created by pg V035 + sqlite/schema.rs. The service reads them
+    // directly on every query; no boot-time event-log walk is needed.
+    // See `crates/cairn-runtime/src/services/trigger_service.rs`.
 
     pub async fn new(config: BootstrapConfig) -> Result<Self, String> {
         // Load the credential master key BEFORE any runtime construction so
@@ -1195,7 +1072,7 @@ impl AppState {
             plugin_registry,
             plugin_host,
             marketplace,
-            triggers: Arc::new(Mutex::new(TriggerService::new())),
+            triggers: Arc::new(TriggerService::new(runtime.store.clone())),
             repo_clone_cache,
             project_repo_access,
             project_local_paths,

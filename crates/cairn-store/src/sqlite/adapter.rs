@@ -3077,3 +3077,296 @@ mod tests {
         assert_eq!(task_messages[0].message_id.as_str(), "msg_task");
     }
 }
+
+// ── RFC-025 Phase 1.5a: TriggerReadModel / RunTemplateReadModel /
+// TriggerFireReadModel ────────────────────────────────────────────────
+//
+// sqlite parity with the pg adapter. Same three read models, same
+// indexed predicates, same sort-order-by-trigger-id for deterministic
+// evaluation. Parity harness asserts byte-equal records across backends.
+
+#[derive(sqlx::FromRow)]
+struct TriggerRow {
+    trigger_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    name: String,
+    description: Option<String>,
+    signal_type: String,
+    plugin_id: Option<String>,
+    conditions_json: String,
+    run_template_id: String,
+    state: String,
+    state_reason: Option<String>,
+    suspension_reason: Option<String>,
+    state_since: Option<i64>,
+    max_per_minute: i64,
+    max_burst: i64,
+    max_chain_depth: i64,
+    created_by: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+const TRIGGER_SELECT_COLS: &str = "trigger_id, tenant_id, workspace_id, project_id, \
+    name, description, signal_type, plugin_id, conditions_json, run_template_id, \
+    state, state_reason, suspension_reason, state_since, \
+    max_per_minute, max_burst, max_chain_depth, created_by, created_at, updated_at";
+
+fn sqlite_row_to_trigger_record(
+    row: TriggerRow,
+) -> Result<crate::projections::TriggerRecord, StoreError> {
+    let state = crate::projections::TriggerStateKind::parse_str(&row.state)?;
+    Ok(crate::projections::TriggerRecord {
+        trigger_id: cairn_domain::ids::TriggerId::new(row.trigger_id),
+        project: ProjectKey::new(row.tenant_id, row.workspace_id, row.project_id),
+        name: row.name,
+        description: row.description,
+        signal_type: row.signal_type,
+        plugin_id: row.plugin_id,
+        conditions_json: row.conditions_json,
+        run_template_id: cairn_domain::ids::RunTemplateId::new(row.run_template_id),
+        state,
+        state_reason: row.state_reason,
+        suspension_reason: row.suspension_reason,
+        state_since: row.state_since.map(|v| v.max(0) as u64),
+        // Saturating down-casts so a corrupted / out-of-range row can't
+        // silently wrap to a tiny value (PR #569 review). `sqlite::i64`
+        // column type means we clamp to u32/u8 max rather than wrap.
+        max_per_minute: row.max_per_minute.clamp(0, u32::MAX as i64) as u32,
+        max_burst: row.max_burst.clamp(0, u32::MAX as i64) as u32,
+        max_chain_depth: row.max_chain_depth.clamp(0, u8::MAX as i64) as u8,
+        created_by: OperatorId::new(row.created_by),
+        created_at: row.created_at.max(0) as u64,
+        updated_at: row.updated_at.max(0) as u64,
+    })
+}
+
+#[async_trait]
+impl crate::projections::TriggerReadModel for SqliteAdapter {
+    async fn get_trigger(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+    ) -> Result<Option<crate::projections::TriggerRecord>, StoreError> {
+        let sql = format!("SELECT {TRIGGER_SELECT_COLS} FROM triggers WHERE trigger_id = ?");
+        let row: Option<TriggerRow> = sqlx::query_as(&sql)
+            .bind(trigger_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(sqlite_row_to_trigger_record).transpose()
+    }
+
+    async fn list_triggers_by_project(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::TriggerRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {TRIGGER_SELECT_COLS} FROM triggers \
+             WHERE tenant_id = ? AND workspace_id = ? AND project_id = ? \
+             ORDER BY trigger_id ASC"
+        );
+        let rows: Vec<TriggerRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(sqlite_row_to_trigger_record).collect()
+    }
+
+    async fn list_matching_enabled(
+        &self,
+        project: &ProjectKey,
+        signal_type: &str,
+        plugin_id: &str,
+    ) -> Result<Vec<crate::projections::TriggerRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {TRIGGER_SELECT_COLS} FROM triggers \
+             WHERE tenant_id = ? AND workspace_id = ? AND project_id = ? \
+             AND state = 'enabled' \
+             AND signal_type = ? \
+             AND (plugin_id IS NULL OR plugin_id = ?) \
+             ORDER BY trigger_id ASC"
+        );
+        let rows: Vec<TriggerRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(signal_type)
+            .bind(plugin_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(sqlite_row_to_trigger_record).collect()
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RunTemplateRow {
+    template_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    name: String,
+    description: Option<String>,
+    default_mode: String,
+    system_prompt: String,
+    initial_user_message: Option<String>,
+    plugin_allowlist_json: Option<String>,
+    tool_allowlist_json: Option<String>,
+    budget_max_tokens: Option<i64>,
+    budget_max_wall_clock_ms: Option<i64>,
+    budget_max_iterations: Option<i64>,
+    budget_exploration_budget_share: Option<f64>,
+    sandbox_hint: Option<String>,
+    required_fields_json: String,
+    created_by: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+const RUN_TEMPLATE_SELECT_COLS: &str = "template_id, tenant_id, workspace_id, project_id, \
+    name, description, default_mode, system_prompt, initial_user_message, \
+    plugin_allowlist_json, tool_allowlist_json, \
+    budget_max_tokens, budget_max_wall_clock_ms, budget_max_iterations, \
+    budget_exploration_budget_share, sandbox_hint, required_fields_json, \
+    created_by, created_at, updated_at";
+
+fn sqlite_row_to_run_template_record(row: RunTemplateRow) -> crate::projections::RunTemplateRecord {
+    crate::projections::RunTemplateRecord {
+        template_id: cairn_domain::ids::RunTemplateId::new(row.template_id),
+        project: ProjectKey::new(row.tenant_id, row.workspace_id, row.project_id),
+        name: row.name,
+        description: row.description,
+        default_mode: row.default_mode,
+        system_prompt: row.system_prompt,
+        initial_user_message: row.initial_user_message,
+        plugin_allowlist_json: row.plugin_allowlist_json,
+        tool_allowlist_json: row.tool_allowlist_json,
+        budget_max_tokens: row.budget_max_tokens.map(|v| v.max(0) as u64),
+        budget_max_wall_clock_ms: row.budget_max_wall_clock_ms.map(|v| v.max(0) as u64),
+        budget_max_iterations: row.budget_max_iterations.map(|v| v.max(0) as u32),
+        budget_exploration_budget_share: row.budget_exploration_budget_share.map(|v| v as f32),
+        sandbox_hint: row.sandbox_hint,
+        required_fields_json: row.required_fields_json,
+        created_by: OperatorId::new(row.created_by),
+        created_at: row.created_at.max(0) as u64,
+        updated_at: row.updated_at.max(0) as u64,
+    }
+}
+
+#[async_trait]
+impl crate::projections::RunTemplateReadModel for SqliteAdapter {
+    async fn get_template(
+        &self,
+        template_id: &cairn_domain::ids::RunTemplateId,
+    ) -> Result<Option<crate::projections::RunTemplateRecord>, StoreError> {
+        let sql =
+            format!("SELECT {RUN_TEMPLATE_SELECT_COLS} FROM run_templates WHERE template_id = ?");
+        let row: Option<RunTemplateRow> = sqlx::query_as(&sql)
+            .bind(template_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(sqlite_row_to_run_template_record))
+    }
+
+    async fn list_templates_by_project(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::RunTemplateRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {RUN_TEMPLATE_SELECT_COLS} FROM run_templates \
+             WHERE tenant_id = ? AND workspace_id = ? AND project_id = ? \
+             ORDER BY template_id ASC"
+        );
+        let rows: Vec<RunTemplateRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(sqlite_row_to_run_template_record)
+            .collect())
+    }
+
+    async fn triggers_referencing_template(
+        &self,
+        template_id: &cairn_domain::ids::RunTemplateId,
+    ) -> Result<Vec<cairn_domain::ids::TriggerId>, StoreError> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT trigger_id FROM triggers WHERE run_template_id = ?")
+                .bind(template_id.as_str())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id,)| cairn_domain::ids::TriggerId::new(id))
+            .collect())
+    }
+}
+
+#[async_trait]
+impl crate::projections::TriggerFireReadModel for SqliteAdapter {
+    async fn has_fired(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+        signal_id: &str,
+    ) -> Result<bool, StoreError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM trigger_fires \
+             WHERE trigger_id = ? AND signal_id = ? AND outcome = 'fired' \
+             LIMIT 1",
+        )
+        .bind(trigger_id.as_str())
+        .bind(signal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.is_some())
+    }
+
+    async fn count_fires_since(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+        since_ms: u64,
+    ) -> Result<u32, StoreError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM trigger_fires \
+             WHERE trigger_id = ? AND outcome = 'fired' AND at_ms > ?",
+        )
+        .bind(trigger_id.as_str())
+        .bind(since_ms as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.0.max(0) as u32)
+    }
+
+    async fn count_project_fires_since(
+        &self,
+        project: &ProjectKey,
+        since_ms: u64,
+    ) -> Result<u32, StoreError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM trigger_fires \
+             WHERE tenant_id = ? AND workspace_id = ? AND project_id = ? \
+             AND outcome = 'fired' AND at_ms > ?",
+        )
+        .bind(project.tenant_id.as_str())
+        .bind(project.workspace_id.as_str())
+        .bind(project.project_id.as_str())
+        .bind(since_ms as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.0.max(0) as u32)
+    }
+}

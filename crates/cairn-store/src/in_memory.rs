@@ -180,6 +180,23 @@ struct State {
     /// holds the RFC 005 per-run checkpoint metadata; this one holds the
     /// F65 body + schema version + session lineage.
     f65_checkpoints: HashMap<String, crate::projections::F65CheckpointRecord>,
+    /// RFC-025 Phase 1.5a: trigger projection, keyed by `trigger_id`.
+    /// Owns the state-carrying lifecycle (created/enabled/disabled/
+    /// suspended/resumed/deleted). Mirror of the `triggers` pg/sqlite
+    /// table.
+    triggers: HashMap<String, crate::projections::TriggerRecord>,
+    /// RFC-025 Phase 1.5a: run template projection, keyed by
+    /// `template_id`. Mirror of `run_templates` pg/sqlite table.
+    run_templates: HashMap<String, crate::projections::RunTemplateRecord>,
+    /// RFC-025 Phase 1.5a: append-only audit of every trigger fire
+    /// attempt (fired / skipped / denied / rate_limited /
+    /// pending_approval). Mirror of `trigger_fires` pg/sqlite table.
+    /// Backs the duplicate-fire ledger + rate-limit + project-budget
+    /// windowed COUNT queries. Classified Ephemeral in the registry
+    /// because no runtime state is recovered from individual rows at
+    /// boot, but the rows persist here so the counters stay consistent
+    /// with pg/sqlite parity expectations.
+    trigger_fires: Vec<crate::projections::TriggerFireRecord>,
 }
 
 pub struct InMemoryStore {
@@ -290,6 +307,9 @@ impl InMemoryStore {
                 workspaces: HashMap::new(),
                 projects: HashMap::new(),
                 snapshots: Vec::new(),
+                triggers: HashMap::new(),
+                run_templates: HashMap::new(),
+                trigger_fires: Vec::new(),
             }),
             usage_counters: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
@@ -1562,19 +1582,6 @@ impl InMemoryStore {
             | RuntimeEvent::RecoveryAttempted(_)
             | RuntimeEvent::RecoveryCompleted(_)
             | RuntimeEvent::UserMessageAppended(_)
-            | RuntimeEvent::TriggerCreated(_)
-            | RuntimeEvent::TriggerEnabled(_)
-            | RuntimeEvent::TriggerDisabled(_)
-            | RuntimeEvent::TriggerSuspended(_)
-            | RuntimeEvent::TriggerResumed(_)
-            | RuntimeEvent::TriggerDeleted(_)
-            | RuntimeEvent::TriggerFired(_)
-            | RuntimeEvent::TriggerSkipped(_)
-            | RuntimeEvent::TriggerDenied(_)
-            | RuntimeEvent::TriggerRateLimited(_)
-            | RuntimeEvent::TriggerPendingApproval(_)
-            | RuntimeEvent::RunTemplateCreated(_)
-            | RuntimeEvent::RunTemplateDeleted(_)
             | RuntimeEvent::PlanProposed(_)
             | RuntimeEvent::PlanApproved(_)
             | RuntimeEvent::PlanRejected(_)
@@ -1584,6 +1591,240 @@ impl InMemoryStore {
             // RFC 020 Track 4: boot-level recovery audit event.
             | RuntimeEvent::RecoverySummaryEmitted(_)
             => {}
+
+            // ── RFC-025 Phase 1.5a: trigger + run_template + trigger_fires ─────
+            // Parity with pg/sqlite projection arms. Eight state-carrying
+            // lifecycle variants mutate `state.triggers` / `state.run_templates`;
+            // five audit variants append into `state.trigger_fires`.
+            RuntimeEvent::TriggerCreated(e) => {
+                // serde_json::to_string on a Vec<Value> cannot fail in practice;
+                // fall back to an empty JSON array so an impossible serde error
+                // doesn't leave the in-memory row half-written. pg/sqlite use `?`
+                // via their Result-returning applier, so those backends surface
+                // the error. In-memory stays infallible to match the signature
+                // that the rest of apply_projection already depends on.
+                let conditions_json =
+                    serde_json::to_string(&e.conditions).unwrap_or_else(|_| "[]".to_owned());
+                state
+                    .triggers
+                    .entry(e.trigger_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::TriggerRecord {
+                        trigger_id: e.trigger_id.clone(),
+                        project: e.project.clone(),
+                        name: e.name.clone(),
+                        description: e.description.clone(),
+                        signal_type: e.signal_type.clone(),
+                        plugin_id: e.plugin_id.clone(),
+                        conditions_json,
+                        run_template_id: e.run_template_id.clone(),
+                        state: crate::projections::TriggerStateKind::Enabled,
+                        state_reason: None,
+                        suspension_reason: None,
+                        state_since: None,
+                        max_per_minute: e.max_per_minute,
+                        max_burst: e.max_burst,
+                        max_chain_depth: e.max_chain_depth,
+                        created_by: e.created_by.clone(),
+                        created_at: e.created_at,
+                        updated_at: e.created_at,
+                    });
+            }
+            RuntimeEvent::TriggerEnabled(e) => {
+                if let Some(rec) = state.triggers.get_mut(e.trigger_id.as_str()) {
+                    rec.state = crate::projections::TriggerStateKind::Enabled;
+                    rec.state_reason = None;
+                    rec.suspension_reason = None;
+                    rec.state_since = None;
+                    rec.updated_at = e.at;
+                }
+            }
+            RuntimeEvent::TriggerDisabled(e) => {
+                if let Some(rec) = state.triggers.get_mut(e.trigger_id.as_str()) {
+                    rec.state = crate::projections::TriggerStateKind::Disabled;
+                    rec.state_reason = e.reason.clone();
+                    rec.suspension_reason = None;
+                    rec.state_since = Some(e.at);
+                    rec.updated_at = e.at;
+                }
+            }
+            RuntimeEvent::TriggerSuspended(e) => {
+                if let Some(rec) = state.triggers.get_mut(e.trigger_id.as_str()) {
+                    // Use the shared discriminant helper so pg + sqlite
+                    // + in-memory store the exact same short name. The
+                    // `failure_count` payload for RepeatedFailures lives
+                    // on the event log and is not rehydrated into the
+                    // projection; the trigger service's
+                    // rehydrate-from-record path reconstructs a
+                    // zero-count value because in practice the service
+                    // emits a fresh TriggerSuspended event whenever the
+                    // count matters.
+                    rec.state = crate::projections::TriggerStateKind::Suspended;
+                    rec.state_reason = None;
+                    rec.suspension_reason = Some(
+                        crate::projections::trigger::suspension_reason_discriminant(&e.reason)
+                            .to_owned(),
+                    );
+                    rec.state_since = Some(e.at);
+                    rec.updated_at = e.at;
+                }
+            }
+            RuntimeEvent::TriggerResumed(e) => {
+                if let Some(rec) = state.triggers.get_mut(e.trigger_id.as_str()) {
+                    rec.state = crate::projections::TriggerStateKind::Enabled;
+                    rec.state_reason = None;
+                    rec.suspension_reason = None;
+                    rec.state_since = None;
+                    rec.updated_at = e.at;
+                }
+            }
+            RuntimeEvent::TriggerDeleted(e) => {
+                state.triggers.remove(e.trigger_id.as_str());
+            }
+            RuntimeEvent::RunTemplateCreated(e) => {
+                // Same "serde cannot fail in practice" fallback as
+                // TriggerCreated above — infallible here to match the
+                // apply_projection signature.
+                let plugin_allowlist_json = e
+                    .plugin_allowlist
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok());
+                let tool_allowlist_json = e
+                    .tool_allowlist
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok());
+                let required_fields_json =
+                    serde_json::to_string(&e.required_fields).unwrap_or_else(|_| "[]".to_owned());
+                let default_mode_str = serde_json::to_value(&e.default_mode)
+                    .ok()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string().trim_matches('"').to_owned(),
+                    })
+                    .unwrap_or_else(|| "chat".to_owned());
+                state
+                    .run_templates
+                    .entry(e.template_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::RunTemplateRecord {
+                        template_id: e.template_id.clone(),
+                        project: e.project.clone(),
+                        name: e.name.clone(),
+                        description: e.description.clone(),
+                        default_mode: default_mode_str,
+                        system_prompt: e.system_prompt.clone(),
+                        initial_user_message: e.initial_user_message.clone(),
+                        plugin_allowlist_json,
+                        tool_allowlist_json,
+                        budget_max_tokens: e.budget_max_tokens,
+                        budget_max_wall_clock_ms: e.budget_max_wall_clock_ms,
+                        budget_max_iterations: e.budget_max_iterations,
+                        budget_exploration_budget_share: e.budget_exploration_budget_share,
+                        sandbox_hint: e.sandbox_hint.clone(),
+                        required_fields_json,
+                        created_by: e.created_by.clone(),
+                        created_at: e.created_at,
+                        updated_at: e.created_at,
+                    });
+            }
+            RuntimeEvent::RunTemplateDeleted(e) => {
+                state.run_templates.remove(e.template_id.as_str());
+            }
+            RuntimeEvent::TriggerFired(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "run_id": e.run_id.as_str(),
+                    "chain_depth": e.chain_depth,
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::Fired,
+                    signal_type: Some(e.signal_type.clone()),
+                    metadata_json: metadata,
+                    at_ms: e.fired_at,
+                });
+            }
+            RuntimeEvent::TriggerSkipped(e) => {
+                // Shared discriminant helper + optional field metadata
+                // so the in-memory row shape matches pg + sqlite
+                // byte-for-byte. Prior version collapsed the
+                // MissingRequiredField payload into the `reason` string
+                // (e.g. `missing_required_field:issue.number`) which
+                // diverged from the two persistent backends (Copilot
+                // review PR #569).
+                let reason_str =
+                    crate::projections::trigger::skip_reason_discriminant(&e.reason);
+                let field =
+                    if let cairn_domain::events::TriggerSkipReason::MissingRequiredField {
+                        field,
+                    } = &e.reason
+                    {
+                        Some(field.as_str())
+                    } else {
+                        None
+                    };
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "reason": reason_str,
+                    "field": field,
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::Skipped,
+                    signal_type: None,
+                    metadata_json: metadata,
+                    at_ms: e.skipped_at,
+                });
+            }
+            RuntimeEvent::TriggerDenied(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "decision_id": e.decision_id.as_str(),
+                    "reason": e.reason,
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::Denied,
+                    signal_type: None,
+                    metadata_json: metadata,
+                    at_ms: e.denied_at,
+                });
+            }
+            RuntimeEvent::TriggerRateLimited(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "bucket_remaining": e.bucket_remaining,
+                    "bucket_capacity": e.bucket_capacity,
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::RateLimited,
+                    signal_type: None,
+                    metadata_json: metadata,
+                    at_ms: e.rate_limited_at,
+                });
+            }
+            RuntimeEvent::TriggerPendingApproval(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "approval_id": e.approval_id.as_str(),
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::PendingApproval,
+                    signal_type: None,
+                    metadata_json: metadata,
+                    at_ms: e.pending_at,
+                });
+            }
             // PR BP-2: project tool-call approval events into the
             // `tool_call_approvals` map.
             RuntimeEvent::ToolCallProposed(e) => {
@@ -5929,6 +6170,13 @@ impl InMemoryStore {
         state.resource_shares.clear();
         state.snapshots.clear();
         state.command_id_index.clear();
+        // RFC-025 Phase 1.5a: trigger / run_template / trigger_fires
+        // projections need to be part of compaction's clear-then-rebuild
+        // pass, otherwise a compact-while-running would leave stale rows
+        // for deleted triggers in place after the event log is pruned.
+        state.triggers.clear();
+        state.run_templates.clear();
+        state.trigger_fires.clear();
 
         // Rebuild projections from retained events.
         for event in state.events.clone() {
@@ -6083,6 +6331,11 @@ impl InMemoryStore {
             state.resource_shares.clear();
             state.snapshots.clear();
             state.command_id_index.clear();
+            // RFC-025 Phase 1.5a: rehydrate trigger / run_template /
+            // trigger_fires projections from the retained event log.
+            state.triggers.clear();
+            state.run_templates.clear();
+            state.trigger_fires.clear();
 
             for event in state.events.clone() {
                 Self::apply_projection(&mut state, &event);
@@ -6400,6 +6653,11 @@ impl InMemoryStore {
         state.workspaces.clear();
         state.projects.clear();
         state.snapshots.clear();
+        // RFC-025 Phase 1.5a: drop trigger/run_template/trigger_fires rows
+        // so the snapshot replay below rebuilds a fresh copy.
+        state.triggers.clear();
+        state.run_templates.clear();
+        state.trigger_fires.clear();
 
         // Replay events in order.
         let count = snap.events.len() as u64;
@@ -6413,6 +6671,167 @@ impl InMemoryStore {
         count
     }
 }
+
+// ── RFC-025 Phase 1.5a: TriggerReadModel / RunTemplateReadModel /
+// TriggerFireReadModel on InMemoryStore ────────────────────────────────
+//
+// Backs the same projection-first query path that pg/sqlite implement.
+// The HashMaps + Vec are written inside `apply_projection` above from
+// the 13 trigger / run_template / audit RuntimeEvent variants; read
+// paths below are simple HashMap lookups + linear Vec scans. The linear
+// scans are fine at this scale — the three bounded windows (duplicate
+// ledger by (trigger_id, signal_id), per-trigger 1-min rate-limit, and
+// per-project 1-hour budget) are microsecond-cheap even on tens of
+// thousands of rows.
+
+#[async_trait]
+impl crate::projections::TriggerReadModel for InMemoryStore {
+    async fn get_trigger(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+    ) -> Result<Option<crate::projections::TriggerRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.triggers.get(trigger_id.as_str()).cloned())
+    }
+
+    async fn list_triggers_by_project(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::TriggerRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<_> = state
+            .triggers
+            .values()
+            .filter(|r| r.project == *project)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| a.trigger_id.as_str().cmp(b.trigger_id.as_str()));
+        Ok(results)
+    }
+
+    async fn list_matching_enabled(
+        &self,
+        project: &ProjectKey,
+        signal_type: &str,
+        plugin_id: &str,
+    ) -> Result<Vec<crate::projections::TriggerRecord>, StoreError> {
+        // Linear scan over all triggers in the store. pg/sqlite use the
+        // `idx_triggers_signal_match` composite index on `(tenant_id,
+        // workspace_id, project_id, signal_type)` for a cheap lookup;
+        // the in-memory store scales with total trigger count across
+        // the process, which is fine at the `--db memory` scale (hundreds
+        // of triggers per dev box) but would be a hot spot if `--db memory`
+        // ever held tens-of-thousands of triggers. If that ever happens,
+        // swap in a `HashMap<(ProjectKey, String), Vec<TriggerId>>`
+        // index populated in the `TriggerCreated`/`Deleted` arms.
+        // (PR #569 review: noted explicitly so future readers don't
+        // need to rediscover the tradeoff.)
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<_> = state
+            .triggers
+            .values()
+            .filter(|r| {
+                r.project == *project
+                    && matches!(r.state, crate::projections::TriggerStateKind::Enabled)
+                    && r.signal_type == signal_type
+                    && r.plugin_id.as_ref().is_none_or(|pid| pid == plugin_id)
+            })
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| a.trigger_id.as_str().cmp(b.trigger_id.as_str()));
+        Ok(results)
+    }
+}
+
+#[async_trait]
+impl crate::projections::RunTemplateReadModel for InMemoryStore {
+    async fn get_template(
+        &self,
+        template_id: &cairn_domain::ids::RunTemplateId,
+    ) -> Result<Option<crate::projections::RunTemplateRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.run_templates.get(template_id.as_str()).cloned())
+    }
+
+    async fn list_templates_by_project(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::RunTemplateRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<_> = state
+            .run_templates
+            .values()
+            .filter(|r| r.project == *project)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| a.template_id.as_str().cmp(b.template_id.as_str()));
+        Ok(results)
+    }
+
+    async fn triggers_referencing_template(
+        &self,
+        template_id: &cairn_domain::ids::RunTemplateId,
+    ) -> Result<Vec<cairn_domain::ids::TriggerId>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .triggers
+            .values()
+            .filter(|t| &t.run_template_id == template_id)
+            .map(|t| t.trigger_id.clone())
+            .collect())
+    }
+}
+
+#[async_trait]
+impl crate::projections::TriggerFireReadModel for InMemoryStore {
+    async fn has_fired(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+        signal_id: &str,
+    ) -> Result<bool, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.trigger_fires.iter().any(|f| {
+            &f.trigger_id == trigger_id
+                && f.signal_id == signal_id
+                && matches!(f.outcome, crate::projections::TriggerFireOutcome::Fired)
+        }))
+    }
+
+    async fn count_fires_since(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+        since_ms: u64,
+    ) -> Result<u32, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .trigger_fires
+            .iter()
+            .filter(|f| {
+                &f.trigger_id == trigger_id
+                    && matches!(f.outcome, crate::projections::TriggerFireOutcome::Fired)
+                    && f.at_ms > since_ms
+            })
+            .count() as u32)
+    }
+
+    async fn count_project_fires_since(
+        &self,
+        project: &ProjectKey,
+        since_ms: u64,
+    ) -> Result<u32, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .trigger_fires
+            .iter()
+            .filter(|f| {
+                f.project == *project
+                    && matches!(f.outcome, crate::projections::TriggerFireOutcome::Fired)
+                    && f.at_ms > since_ms
+            })
+            .count() as u32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1211,19 +1211,289 @@ impl SqliteSyncProjection {
             RuntimeEvent::RunSlaSet(_) => log_stub("RunSlaSet"),
             RuntimeEvent::SignalRouted(_) => log_stub("SignalRouted"),
             RuntimeEvent::SignalSubscriptionCreated(_) => log_stub("SignalSubscriptionCreated"),
-            RuntimeEvent::TriggerCreated(_) => log_stub("TriggerCreated"),
-            RuntimeEvent::TriggerEnabled(_) => log_stub("TriggerEnabled"),
-            RuntimeEvent::TriggerDisabled(_) => log_stub("TriggerDisabled"),
-            RuntimeEvent::TriggerSuspended(_) => log_stub("TriggerSuspended"),
-            RuntimeEvent::TriggerResumed(_) => log_stub("TriggerResumed"),
-            RuntimeEvent::TriggerDeleted(_) => log_stub("TriggerDeleted"),
-            RuntimeEvent::TriggerFired(_) => log_stub("TriggerFired"),
-            RuntimeEvent::TriggerSkipped(_) => log_stub("TriggerSkipped"),
-            RuntimeEvent::TriggerDenied(_) => log_stub("TriggerDenied"),
-            RuntimeEvent::TriggerRateLimited(_) => log_stub("TriggerRateLimited"),
-            RuntimeEvent::TriggerPendingApproval(_) => log_stub("TriggerPendingApproval"),
-            RuntimeEvent::RunTemplateCreated(_) => log_stub("RunTemplateCreated"),
-            RuntimeEvent::RunTemplateDeleted(_) => log_stub("RunTemplateDeleted"),
+            // ── RFC-025 Phase 1.5a: trigger + run_template + trigger_fires ─────
+            // Parity with pg/projections.rs + V035 migration. Every
+            // lifecycle edge mutates `triggers` / `run_templates`; every
+            // audit edge INSERTs into `trigger_fires`. Portable-SQL-only
+            // per feedback_no_db_specific_features.md — JSON-in-TEXT for
+            // conditions / allowlists / required_fields / metadata.
+            RuntimeEvent::TriggerCreated(e) => {
+                sqlx::query(
+                    "INSERT INTO triggers
+                         (trigger_id, tenant_id, workspace_id, project_id,
+                          name, description, signal_type, plugin_id,
+                          conditions_json, run_template_id,
+                          state, state_reason, suspension_reason, state_since,
+                          max_per_minute, max_burst, max_chain_depth,
+                          created_by, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             'enabled', NULL, NULL, NULL,
+                             ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(trigger_id) DO NOTHING",
+                )
+                .bind(e.trigger_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.name)
+                .bind(e.description.as_deref())
+                .bind(&e.signal_type)
+                .bind(e.plugin_id.as_deref())
+                .bind(
+                    serde_json::to_string(&e.conditions)
+                        .map_err(|err| StoreError::Serialization(err.to_string()))?,
+                )
+                .bind(e.run_template_id.as_str())
+                .bind(e.max_per_minute as i64)
+                .bind(e.max_burst as i64)
+                .bind(e.max_chain_depth as i64)
+                .bind(e.created_by.as_str())
+                .bind(e.created_at as i64)
+                .bind(e.created_at as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::TriggerEnabled(e) => {
+                sqlx::query(
+                    "UPDATE triggers
+                     SET state = 'enabled',
+                         state_reason = NULL,
+                         suspension_reason = NULL,
+                         state_since = NULL,
+                         updated_at = ?
+                     WHERE trigger_id = ?",
+                )
+                .bind(e.at as i64)
+                .bind(e.trigger_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::TriggerDisabled(e) => {
+                sqlx::query(
+                    "UPDATE triggers
+                     SET state = 'disabled',
+                         state_reason = ?,
+                         suspension_reason = NULL,
+                         state_since = ?,
+                         updated_at = ?
+                     WHERE trigger_id = ?",
+                )
+                .bind(e.reason.as_deref())
+                .bind(e.at as i64)
+                .bind(e.at as i64)
+                .bind(e.trigger_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::TriggerSuspended(e) => {
+                // Short-name discriminant (PR #569 review) — parity
+                // with pg + in-memory.
+                let reason_str =
+                    crate::projections::trigger::suspension_reason_discriminant(&e.reason);
+                sqlx::query(
+                    "UPDATE triggers
+                     SET state = 'suspended',
+                         state_reason = NULL,
+                         suspension_reason = ?,
+                         state_since = ?,
+                         updated_at = ?
+                     WHERE trigger_id = ?",
+                )
+                .bind(reason_str)
+                .bind(e.at as i64)
+                .bind(e.at as i64)
+                .bind(e.trigger_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::TriggerResumed(e) => {
+                sqlx::query(
+                    "UPDATE triggers
+                     SET state = 'enabled',
+                         state_reason = NULL,
+                         suspension_reason = NULL,
+                         state_since = NULL,
+                         updated_at = ?
+                     WHERE trigger_id = ?",
+                )
+                .bind(e.at as i64)
+                .bind(e.trigger_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::TriggerDeleted(e) => {
+                sqlx::query("DELETE FROM triggers WHERE trigger_id = ?")
+                    .bind(e.trigger_id.as_str())
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::RunTemplateCreated(e) => {
+                let plugin_allowlist = e
+                    .plugin_allowlist
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let tool_allowlist = e
+                    .tool_allowlist
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let required_fields = serde_json::to_string(&e.required_fields)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let default_mode_str = enum_to_str(&e.default_mode)?;
+                sqlx::query(
+                    "INSERT INTO run_templates
+                         (template_id, tenant_id, workspace_id, project_id,
+                          name, description, default_mode, system_prompt,
+                          initial_user_message,
+                          plugin_allowlist_json, tool_allowlist_json,
+                          budget_max_tokens, budget_max_wall_clock_ms,
+                          budget_max_iterations, budget_exploration_budget_share,
+                          sandbox_hint, required_fields_json,
+                          created_by, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                             ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(template_id) DO NOTHING",
+                )
+                .bind(e.template_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.name)
+                .bind(e.description.as_deref())
+                .bind(default_mode_str)
+                .bind(&e.system_prompt)
+                .bind(e.initial_user_message.as_deref())
+                .bind(plugin_allowlist)
+                .bind(tool_allowlist)
+                .bind(e.budget_max_tokens.map(|v| v as i64))
+                .bind(e.budget_max_wall_clock_ms.map(|v| v as i64))
+                .bind(e.budget_max_iterations.map(|v| v as i64))
+                .bind(e.budget_exploration_budget_share.map(|v| v as f64))
+                .bind(e.sandbox_hint.as_deref())
+                .bind(required_fields)
+                .bind(e.created_by.as_str())
+                .bind(e.created_at as i64)
+                .bind(e.created_at as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::RunTemplateDeleted(e) => {
+                sqlx::query("DELETE FROM run_templates WHERE template_id = ?")
+                    .bind(e.template_id.as_str())
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::TriggerFired(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "run_id": e.run_id.as_str(),
+                    "chain_depth": e.chain_depth,
+                }))
+                .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                insert_trigger_fire_sqlite(
+                    tx,
+                    &e.trigger_id,
+                    &e.project,
+                    e.signal_id.as_str(),
+                    "fired",
+                    Some(e.signal_type.as_str()),
+                    Some(metadata.as_str()),
+                    e.fired_at,
+                )
+                .await?;
+            }
+            RuntimeEvent::TriggerSkipped(e) => {
+                // Short-name discriminant + optional field metadata (PR
+                // #569 review) — parity with pg + in-memory.
+                let reason_str = crate::projections::trigger::skip_reason_discriminant(&e.reason);
+                let field = if let cairn_domain::events::TriggerSkipReason::MissingRequiredField {
+                    field,
+                } = &e.reason
+                {
+                    Some(field.as_str())
+                } else {
+                    None
+                };
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "reason": reason_str,
+                    "field": field,
+                }))
+                .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                insert_trigger_fire_sqlite(
+                    tx,
+                    &e.trigger_id,
+                    &e.project,
+                    e.signal_id.as_str(),
+                    "skipped",
+                    None,
+                    Some(metadata.as_str()),
+                    e.skipped_at,
+                )
+                .await?;
+            }
+            RuntimeEvent::TriggerDenied(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "decision_id": e.decision_id.as_str(),
+                    "reason": e.reason,
+                }))
+                .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                insert_trigger_fire_sqlite(
+                    tx,
+                    &e.trigger_id,
+                    &e.project,
+                    e.signal_id.as_str(),
+                    "denied",
+                    None,
+                    Some(metadata.as_str()),
+                    e.denied_at,
+                )
+                .await?;
+            }
+            RuntimeEvent::TriggerRateLimited(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "bucket_remaining": e.bucket_remaining,
+                    "bucket_capacity": e.bucket_capacity,
+                }))
+                .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                insert_trigger_fire_sqlite(
+                    tx,
+                    &e.trigger_id,
+                    &e.project,
+                    e.signal_id.as_str(),
+                    "rate_limited",
+                    None,
+                    Some(metadata.as_str()),
+                    e.rate_limited_at,
+                )
+                .await?;
+            }
+            RuntimeEvent::TriggerPendingApproval(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "approval_id": e.approval_id.as_str(),
+                }))
+                .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                insert_trigger_fire_sqlite(
+                    tx,
+                    &e.trigger_id,
+                    &e.project,
+                    e.signal_id.as_str(),
+                    "pending_approval",
+                    None,
+                    Some(metadata.as_str()),
+                    e.pending_at,
+                )
+                .await?;
+            }
             RuntimeEvent::SnapshotCreated(_) => log_stub("SnapshotCreated"),
             RuntimeEvent::TaskDependencyAdded(_) => log_stub("TaskDependencyAdded"),
             RuntimeEvent::TaskDependencyResolved(_) => log_stub("TaskDependencyResolved"),
@@ -1924,6 +2194,40 @@ fn enum_to_str<T: serde::Serialize>(val: &T) -> Result<String, StoreError> {
         serde_json::Value::String(s) => Ok(s),
         _ => Ok(v.to_string().trim_matches('"').to_owned()),
     }
+}
+
+/// RFC-025 Phase 1.5a: shared INSERT into `trigger_fires` for all five
+/// audit variants on sqlite. Mirror of `insert_trigger_fire_pg`.
+#[allow(clippy::too_many_arguments)]
+async fn insert_trigger_fire_sqlite(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    trigger_id: &cairn_domain::ids::TriggerId,
+    project: &cairn_domain::tenancy::ProjectKey,
+    signal_id: &str,
+    outcome: &str,
+    signal_type: Option<&str>,
+    metadata_json: Option<&str>,
+    at_ms: u64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO trigger_fires
+             (trigger_id, tenant_id, workspace_id, project_id, signal_id,
+              outcome, signal_type, metadata_json, at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(trigger_id.as_str())
+    .bind(project.tenant_id.as_str())
+    .bind(project.workspace_id.as_str())
+    .bind(project.project_id.as_str())
+    .bind(signal_id)
+    .bind(outcome)
+    .bind(signal_type)
+    .bind(metadata_json)
+    .bind(at_ms as i64)
+    .execute(&mut **tx)
+    .await
+    .map_err(|err| StoreError::Internal(err.to_string()))?;
+    Ok(())
 }
 
 /// Narrow a domain `u32` onto the projection's `INTEGER`/`i32` column

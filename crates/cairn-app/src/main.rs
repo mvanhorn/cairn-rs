@@ -1534,9 +1534,13 @@ async fn real_main() {
     //     events (Ephemeral contract). See state.rs for the in-code
     //     rationale and RFC-025 for the full decision history.
     //
-    // `replay_triggers` will migrate to a sync projection in RFC-025
-    // Phase 1.5a; once it lands, this whole block goes away.
-    lib_state.replay_triggers().await;
+    //   * RFC-025 Phase 1.5a (this commit) deletes `replay_triggers`.
+    //     The `triggers` / `run_templates` / `trigger_fires`
+    //     projections (pg V035 + sqlite/schema.rs) are the canonical
+    //     read model; the async `TriggerService` reads them directly
+    //     and no boot-time event-log walk is needed. With this change
+    //     all three pre-projection walkers are gone, so the whole
+    //     "Startup replays" block collapses to the comment above.
 
     // ── META #461: legacy credential-format scan ─────────────────────────────
     // Report rows written under the pre-fix deterministic-nonce format so

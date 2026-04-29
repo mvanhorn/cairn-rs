@@ -8,7 +8,7 @@
 //! The trigger evaluator is a runtime worker that subscribes to the signal
 //! router (RFC 015) and creates runs for matching triggers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cairn_domain::decisions::RunMode;
@@ -344,14 +344,6 @@ pub enum SkipReason {
     MissingRequiredField { field: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TriggerPreDecisionStatus {
-    Ready,
-    Skipped(SkipReason),
-    RateLimited { bucket_capacity: u32 },
-    BudgetExceeded,
-}
-
 // ── Condition Evaluator ─────────────────────────────────────────────────────
 
 /// Evaluate a trigger condition against a JSON payload.
@@ -518,7 +510,7 @@ pub fn auto_approve_decision(
     }
 }
 
-// ── TriggerService ──────────────────────────────────────────────────────────
+// ── TriggerService (RFC-025 Phase 1.5a: projection-backed, async) ───────────
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -527,585 +519,21 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// In-memory trigger service managing triggers and run templates.
+/// Rolling-window sizes for the rate-limit + project-budget checks.
 ///
-/// State is rebuilt from the event log on startup via `AppState::replay_triggers()`.
-/// This is intentional — the event log is the durable source of truth, and this
-/// struct is a read-optimized projection rebuilt on every cold start. The fire
-/// ledger prevents duplicate runs even across replays.
-pub struct TriggerService {
-    triggers: HashMap<TriggerId, Trigger>,
-    templates: HashMap<RunTemplateId, RunTemplate>,
-    /// Durable fire ledger: (trigger_id, signal_id) → fired_at.
-    /// Prevents duplicate runs on webhook retry or signal replay.
-    fire_ledger: HashMap<(TriggerId, SignalId), u64>,
-    /// Per-trigger fire counts in the current rate-limit window.
-    fire_counts: HashMap<TriggerId, Vec<u64>>,
-    /// Per-project trigger budget: total fires in the last hour.
-    project_budgets: HashMap<ProjectKey, Vec<u64>>,
-    /// Default per-project trigger budget (runs/hour).
-    pub default_project_budget: u32,
-}
+/// These live at module scope (rather than inside `TriggerService`) so the
+/// in-memory test harness can override them in the rare case one day, and
+/// so they stay as a single source of truth across the hot path + the
+/// decision_candidates_for_signal preview path.
+const TRIGGER_RATE_LIMIT_WINDOW_MS: u64 = 60_000;
+const PROJECT_BUDGET_WINDOW_MS: u64 = 3_600_000;
+/// Default per-project budget (fires per hour). Equals the legacy
+/// in-memory service's value so the first cut of Phase 1.5a doesn't
+/// change observable behaviour. Config-driven override is out of scope;
+/// track via RFC-025 Phase 2.
+pub const DEFAULT_PROJECT_BUDGET_PER_HOUR: u32 = 100;
 
-impl TriggerService {
-    pub fn new() -> Self {
-        Self {
-            triggers: HashMap::new(),
-            templates: HashMap::new(),
-            fire_ledger: HashMap::new(),
-            fire_counts: HashMap::new(),
-            project_budgets: HashMap::new(),
-            default_project_budget: 100,
-        }
-    }
-
-    // ── Template CRUD ────────────────────────────────────────────────
-
-    pub fn create_template(&mut self, template: RunTemplate) -> TriggerEvent {
-        let event = TriggerEvent::RunTemplateCreated {
-            template_id: template.id.clone(),
-            project: template.project.clone(),
-            name: template.name.clone(),
-            default_mode: template.default_mode.clone(),
-            created_by: template.created_by.clone(),
-            created_at: template.created_at,
-        };
-        self.templates.insert(template.id.clone(), template);
-        event
-    }
-
-    pub fn get_template(&self, id: &RunTemplateId) -> Option<&RunTemplate> {
-        self.templates.get(id)
-    }
-
-    pub fn delete_template(
-        &mut self,
-        id: &RunTemplateId,
-        by: OperatorId,
-    ) -> Result<TriggerEvent, TriggerError> {
-        // Block deletion if any trigger references this template
-        let referencing: Vec<_> = self
-            .triggers
-            .values()
-            .filter(|t| &t.run_template_id == id)
-            .map(|t| t.id.clone())
-            .collect();
-
-        if !referencing.is_empty() {
-            return Err(TriggerError::TemplateInUse {
-                template_id: id.clone(),
-                trigger_ids: referencing,
-            });
-        }
-
-        self.templates
-            .remove(id)
-            .ok_or_else(|| TriggerError::TemplateNotFound(id.clone()))?;
-
-        Ok(TriggerEvent::RunTemplateDeleted {
-            template_id: id.clone(),
-            by,
-            at: now_ms(),
-        })
-    }
-
-    pub fn list_templates_for_project(&self, project: &ProjectKey) -> Vec<&RunTemplate> {
-        self.templates
-            .values()
-            .filter(|t| &t.project == project)
-            .collect()
-    }
-
-    // ── Trigger CRUD ────────────────────────────────────────────────
-
-    pub fn create_trigger(&mut self, trigger: Trigger) -> Result<TriggerEvent, TriggerError> {
-        // Verify template exists
-        if !self.templates.contains_key(&trigger.run_template_id) {
-            return Err(TriggerError::TemplateNotFound(
-                trigger.run_template_id.clone(),
-            ));
-        }
-
-        let event = TriggerEvent::TriggerCreated {
-            trigger_id: trigger.id.clone(),
-            project: trigger.project.clone(),
-            signal_pattern: trigger.signal_pattern.clone(),
-            run_template_id: trigger.run_template_id.clone(),
-            created_by: trigger.created_by.clone(),
-            created_at: trigger.created_at,
-        };
-        self.triggers.insert(trigger.id.clone(), trigger);
-        Ok(event)
-    }
-
-    pub fn get_trigger(&self, id: &TriggerId) -> Option<&Trigger> {
-        self.triggers.get(id)
-    }
-
-    pub fn enable_trigger(
-        &mut self,
-        id: &TriggerId,
-        by: OperatorId,
-    ) -> Result<TriggerEvent, TriggerError> {
-        let trigger = self
-            .triggers
-            .get_mut(id)
-            .ok_or_else(|| TriggerError::TriggerNotFound(id.clone()))?;
-        trigger.state = TriggerState::Enabled;
-        trigger.updated_at = now_ms();
-        Ok(TriggerEvent::TriggerEnabled {
-            trigger_id: id.clone(),
-            by,
-            at: trigger.updated_at,
-        })
-    }
-
-    pub fn disable_trigger(
-        &mut self,
-        id: &TriggerId,
-        by: OperatorId,
-        reason: Option<String>,
-    ) -> Result<TriggerEvent, TriggerError> {
-        let trigger = self
-            .triggers
-            .get_mut(id)
-            .ok_or_else(|| TriggerError::TriggerNotFound(id.clone()))?;
-        let now = now_ms();
-        trigger.state = TriggerState::Disabled {
-            reason: reason.clone(),
-            since: now,
-        };
-        trigger.updated_at = now;
-        Ok(TriggerEvent::TriggerDisabled {
-            trigger_id: id.clone(),
-            by,
-            reason,
-            at: now,
-        })
-    }
-
-    pub fn resume_trigger(&mut self, id: &TriggerId) -> Result<TriggerEvent, TriggerError> {
-        let trigger = self
-            .triggers
-            .get_mut(id)
-            .ok_or_else(|| TriggerError::TriggerNotFound(id.clone()))?;
-
-        if !matches!(trigger.state, TriggerState::Suspended { .. }) {
-            return Err(TriggerError::NotSuspended(id.clone()));
-        }
-
-        let now = now_ms();
-        trigger.state = TriggerState::Enabled;
-        trigger.updated_at = now;
-        Ok(TriggerEvent::TriggerResumed {
-            trigger_id: id.clone(),
-            at: now,
-        })
-    }
-
-    /// Restore a trigger state from durable event history.
-    pub fn restore_trigger_state(
-        &mut self,
-        id: &TriggerId,
-        state: TriggerState,
-        updated_at: u64,
-    ) -> Result<(), TriggerError> {
-        let trigger = self
-            .triggers
-            .get_mut(id)
-            .ok_or_else(|| TriggerError::TriggerNotFound(id.clone()))?;
-        trigger.state = state;
-        trigger.updated_at = updated_at;
-        Ok(())
-    }
-
-    pub fn delete_trigger(
-        &mut self,
-        id: &TriggerId,
-        by: OperatorId,
-    ) -> Result<TriggerEvent, TriggerError> {
-        self.triggers
-            .remove(id)
-            .ok_or_else(|| TriggerError::TriggerNotFound(id.clone()))?;
-        Ok(TriggerEvent::TriggerDeleted {
-            trigger_id: id.clone(),
-            by,
-            at: now_ms(),
-        })
-    }
-
-    pub fn list_triggers_for_project(&self, project: &ProjectKey) -> Vec<&Trigger> {
-        self.triggers
-            .values()
-            .filter(|t| &t.project == project)
-            .collect()
-    }
-
-    // ── Fire Ledger Snapshot / Restore (for recovery — RFC 020) ──────
-
-    /// Snapshot the fire ledger for durable persistence.
-    /// Returns all (trigger_id, signal_id) → fired_at entries.
-    pub fn fire_ledger_snapshot(&self) -> HashMap<(TriggerId, SignalId), u64> {
-        self.fire_ledger.clone()
-    }
-
-    /// Restore the fire ledger from a persisted snapshot.
-    /// Used during recovery to prevent duplicate fires after restart.
-    pub fn restore_fire_ledger(&mut self, ledger: HashMap<(TriggerId, SignalId), u64>) {
-        self.fire_ledger = ledger;
-    }
-
-    /// Rebuild fire-ledger and rolling counters from a durable TriggerFired event.
-    pub fn restore_fired_trigger(
-        &mut self,
-        project: &ProjectKey,
-        trigger_id: &TriggerId,
-        signal_id: &SignalId,
-        fired_at: u64,
-    ) {
-        self.fire_ledger
-            .insert((trigger_id.clone(), signal_id.clone()), fired_at);
-        // T3-H3: prune entries older than the widest rolling window we
-        // count against (1 hour for project budgets) before pushing, so
-        // the Vecs stay bounded. A busy trigger would otherwise accumulate
-        // timestamps forever, driving memory growth and O(n) scans on
-        // every pre-decision check.
-        const TRIGGER_WINDOW_MS: u64 = 60_000;
-        const PROJECT_WINDOW_MS: u64 = 3_600_000;
-        let trigger_cutoff = fired_at.saturating_sub(TRIGGER_WINDOW_MS);
-        let project_cutoff = fired_at.saturating_sub(PROJECT_WINDOW_MS);
-        let trigger_vec = self.fire_counts.entry(trigger_id.clone()).or_default();
-        trigger_vec.retain(|ts| *ts > trigger_cutoff);
-        trigger_vec.push(fired_at);
-        let project_vec = self.project_budgets.entry(project.clone()).or_default();
-        project_vec.retain(|ts| *ts > project_cutoff);
-        project_vec.push(fired_at);
-    }
-
-    fn matching_trigger_ids(
-        &self,
-        project: &ProjectKey,
-        signal_type: &str,
-        plugin_id: &str,
-    ) -> Vec<TriggerId> {
-        let mut trigger_ids: Vec<_> = self
-            .triggers
-            .values()
-            .filter(|trigger| {
-                &trigger.project == project
-                    && matches!(trigger.state, TriggerState::Enabled)
-                    && trigger.signal_pattern.signal_type == signal_type
-                    && trigger
-                        .signal_pattern
-                        .plugin_id
-                        .as_ref()
-                        .is_none_or(|pid| pid == plugin_id)
-            })
-            .map(|trigger| trigger.id.clone())
-            .collect();
-        trigger_ids.sort_unstable();
-        trigger_ids
-    }
-
-    fn pre_decision_status(
-        &self,
-        project: &ProjectKey,
-        trigger_id: &TriggerId,
-        signal_id: &SignalId,
-        payload: &serde_json::Value,
-        source_run_chain_depth: Option<u8>,
-        now: u64,
-    ) -> Option<TriggerPreDecisionStatus> {
-        let trigger = self.triggers.get(trigger_id)?;
-
-        let ledger_key = (trigger.id.clone(), signal_id.clone());
-        if self.fire_ledger.contains_key(&ledger_key) {
-            return Some(TriggerPreDecisionStatus::Skipped(SkipReason::AlreadyFired));
-        }
-
-        if !evaluate_conditions(&trigger.conditions, payload) {
-            return Some(TriggerPreDecisionStatus::Skipped(
-                SkipReason::ConditionMismatch,
-            ));
-        }
-
-        let next_depth = source_run_chain_depth.map_or(1u8, |depth| depth.saturating_add(1));
-        if next_depth > trigger.max_chain_depth {
-            return Some(TriggerPreDecisionStatus::Skipped(SkipReason::ChainTooDeep));
-        }
-
-        let window_start = now.saturating_sub(60_000);
-        let current_trigger_count = self
-            .fire_counts
-            .get(trigger_id)
-            .map(|counts| counts.iter().filter(|&&ts| ts > window_start).count())
-            .unwrap_or(0);
-        if current_trigger_count as u32 >= trigger.rate_limit.max_per_minute {
-            return Some(TriggerPreDecisionStatus::RateLimited {
-                bucket_capacity: trigger.rate_limit.max_per_minute,
-            });
-        }
-
-        let hour_ago = now.saturating_sub(3_600_000);
-        let current_project_budget = self
-            .project_budgets
-            .get(project)
-            .map(|entries| entries.iter().filter(|&&ts| ts > hour_ago).count())
-            .unwrap_or(0);
-        if current_project_budget as u32 >= self.default_project_budget {
-            return Some(TriggerPreDecisionStatus::BudgetExceeded);
-        }
-
-        let template = self.templates.get(&trigger.run_template_id)?;
-        if let Some(field) = template
-            .required_fields
-            .iter()
-            .find(|field| resolve_path(payload, field).is_none())
-        {
-            return Some(TriggerPreDecisionStatus::Skipped(
-                SkipReason::MissingRequiredField {
-                    field: field.clone(),
-                },
-            ));
-        }
-
-        Some(TriggerPreDecisionStatus::Ready)
-    }
-
-    /// Preview which triggers are eligible for decision-layer evaluation for a signal.
-    ///
-    /// This runs the pre-decision checks without mutating trigger state so callers
-    /// can consult an async decision service outside the trigger mutex, then call
-    /// `evaluate_signal()` with the resulting outcomes to apply the durable events.
-    pub fn decision_candidates_for_signal(
-        &self,
-        project: &ProjectKey,
-        signal_id: &SignalId,
-        signal_type: &str,
-        plugin_id: &str,
-        payload: &serde_json::Value,
-        source_run_chain_depth: Option<u8>,
-    ) -> Vec<TriggerId> {
-        let now = now_ms();
-        self.matching_trigger_ids(project, signal_type, plugin_id)
-            .into_iter()
-            .filter(|trigger_id| {
-                matches!(
-                    self.pre_decision_status(
-                        project,
-                        trigger_id,
-                        signal_id,
-                        payload,
-                        source_run_chain_depth,
-                        now,
-                    ),
-                    Some(TriggerPreDecisionStatus::Ready)
-                )
-            })
-            .collect()
-    }
-
-    // ── Trigger Evaluation ──────────────────────────────────────────
-
-    /// Evaluate a signal against all enabled triggers in the project.
-    ///
-    /// The `decision_fn` callback is called for each trigger that passes
-    /// condition matching, chain depth, and rate limit checks. It integrates
-    /// with RFC 019's decision layer — in production this calls
-    /// `DecisionService::evaluate()` with `DecisionKind::TriggerFire`.
-    ///
-    /// Use `auto_approve_decision` for tests or when no decision layer is configured.
-    pub fn evaluate_signal(
-        &mut self,
-        project: &ProjectKey,
-        signal_id: &SignalId,
-        signal_type: &str,
-        plugin_id: &str,
-        payload: &serde_json::Value,
-        source_run_chain_depth: Option<u8>,
-        decision_fn: &dyn Fn(&TriggerId, &str) -> TriggerDecisionOutcome,
-    ) -> Vec<TriggerEvent> {
-        self.evaluate_signal_inner(
-            project,
-            signal_id,
-            signal_type,
-            plugin_id,
-            payload,
-            source_run_chain_depth,
-            None,
-            decision_fn,
-        )
-    }
-
-    /// Evaluate a signal only against a previously prepared trigger snapshot.
-    ///
-    /// This lets callers gather decision outcomes asynchronously without letting
-    /// newly created/enabled triggers slip into the later fire pass without a
-    /// matching decision result.
-    pub fn evaluate_signal_for_candidates(
-        &mut self,
-        project: &ProjectKey,
-        signal_id: &SignalId,
-        signal_type: &str,
-        plugin_id: &str,
-        payload: &serde_json::Value,
-        source_run_chain_depth: Option<u8>,
-        prepared_trigger_ids: &HashSet<TriggerId>,
-        decision_fn: &dyn Fn(&TriggerId, &str) -> TriggerDecisionOutcome,
-    ) -> Vec<TriggerEvent> {
-        self.evaluate_signal_inner(
-            project,
-            signal_id,
-            signal_type,
-            plugin_id,
-            payload,
-            source_run_chain_depth,
-            Some(prepared_trigger_ids),
-            decision_fn,
-        )
-    }
-
-    fn evaluate_signal_inner(
-        &mut self,
-        project: &ProjectKey,
-        signal_id: &SignalId,
-        signal_type: &str,
-        plugin_id: &str,
-        payload: &serde_json::Value,
-        source_run_chain_depth: Option<u8>,
-        prepared_trigger_ids: Option<&HashSet<TriggerId>>,
-        decision_fn: &dyn Fn(&TriggerId, &str) -> TriggerDecisionOutcome,
-    ) -> Vec<TriggerEvent> {
-        let now = now_ms();
-        let mut events = Vec::new();
-
-        let mut matching_triggers = self.matching_trigger_ids(project, signal_type, plugin_id);
-        if let Some(prepared_trigger_ids) = prepared_trigger_ids {
-            matching_triggers.retain(|trigger_id| prepared_trigger_ids.contains(trigger_id));
-        }
-
-        for trigger_id in matching_triggers {
-            match self.pre_decision_status(
-                project,
-                &trigger_id,
-                signal_id,
-                payload,
-                source_run_chain_depth,
-                now,
-            ) {
-                Some(TriggerPreDecisionStatus::Ready) => {}
-                Some(TriggerPreDecisionStatus::Skipped(reason)) => {
-                    events.push(TriggerEvent::TriggerSkipped {
-                        trigger_id,
-                        signal_id: signal_id.clone(),
-                        reason,
-                        skipped_at: now,
-                    });
-                    continue;
-                }
-                Some(TriggerPreDecisionStatus::RateLimited { bucket_capacity }) => {
-                    events.push(TriggerEvent::TriggerRateLimited {
-                        trigger_id,
-                        signal_id: signal_id.clone(),
-                        bucket_remaining: 0,
-                        bucket_capacity,
-                        rate_limited_at: now,
-                    });
-                    continue;
-                }
-                Some(TriggerPreDecisionStatus::BudgetExceeded) => {
-                    if let Some(trigger) = self.triggers.get_mut(&trigger_id) {
-                        trigger.state = TriggerState::Suspended {
-                            reason: SuspensionReason::BudgetExceeded,
-                            since: now,
-                        };
-                        trigger.updated_at = now;
-                    }
-                    events.push(TriggerEvent::TriggerSuspended {
-                        trigger_id,
-                        reason: SuspensionReason::BudgetExceeded,
-                        at: now,
-                    });
-                    continue;
-                }
-                None => continue,
-            }
-
-            // Decision layer check (RFC 019 integration).
-            // The decision_fn callback simulates DecisionService::evaluate()
-            // for the TriggerFire decision kind. In production, this calls
-            // the actual DecisionService; in tests it can be overridden.
-            let next_depth = source_run_chain_depth.map_or(1u8, |depth| depth.saturating_add(1));
-            let decision_outcome = (decision_fn)(&trigger_id, signal_type);
-
-            match &decision_outcome {
-                TriggerDecisionOutcome::Approved { .. } => {
-                    // Approved — proceed to fire
-                }
-                TriggerDecisionOutcome::Denied {
-                    decision_id,
-                    reason,
-                } => {
-                    events.push(TriggerEvent::TriggerDenied {
-                        trigger_id,
-                        signal_id: signal_id.clone(),
-                        decision_id: decision_id.clone(),
-                        reason: reason.clone(),
-                        denied_at: now,
-                    });
-                    continue;
-                }
-                TriggerDecisionOutcome::PendingApproval { approval_id } => {
-                    events.push(TriggerEvent::TriggerPendingApproval {
-                        trigger_id,
-                        signal_id: signal_id.clone(),
-                        approval_id: approval_id.clone(),
-                        pending_at: now,
-                    });
-                    continue;
-                }
-            }
-
-            // Fire! Create a synthetic run_id (real impl integrates with RunService)
-            let run_id = RunId::new(format!("run_trigger_{}_{}", trigger_id.as_str(), now));
-
-            // Record in fire ledger
-            self.fire_ledger
-                .insert((trigger_id.clone(), signal_id.clone()), now);
-
-            // Record fire count + project budget, pruning stale entries
-            // outside the rolling windows so the Vecs stay bounded (T3-H3).
-            const TRIGGER_WINDOW_MS: u64 = 60_000;
-            const PROJECT_WINDOW_MS: u64 = 3_600_000;
-            let trigger_vec = self.fire_counts.entry(trigger_id.clone()).or_default();
-            trigger_vec.retain(|ts| *ts > now.saturating_sub(TRIGGER_WINDOW_MS));
-            trigger_vec.push(now);
-            let project_vec = self.project_budgets.entry(project.clone()).or_default();
-            project_vec.retain(|ts| *ts > now.saturating_sub(PROJECT_WINDOW_MS));
-            project_vec.push(now);
-
-            events.push(TriggerEvent::TriggerFired {
-                trigger_id,
-                signal_id: signal_id.clone(),
-                signal_type: signal_type.to_string(),
-                run_id,
-                chain_depth: next_depth,
-                fired_at: now,
-            });
-        }
-
-        events
-    }
-}
-
-impl Default for TriggerService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── Errors ──────────────────────────────────────────────────────────────────
-
+/// Errors raised by the async `TriggerService` CRUD + evaluation paths.
 #[derive(Clone, Debug)]
 pub enum TriggerError {
     TriggerNotFound(TriggerId),
@@ -1115,6 +543,10 @@ pub enum TriggerError {
         trigger_ids: Vec<TriggerId>,
     },
     NotSuspended(TriggerId),
+    /// Persistence failed (projection read, projection write, or event-log
+    /// append). Carries the upstream message so the operator sees an
+    /// actionable line rather than a bare "I/O".
+    Store(String),
 }
 
 impl std::fmt::Display for TriggerError {
@@ -1135,72 +567,899 @@ impl std::fmt::Display for TriggerError {
                     .join(", ")
             ),
             Self::NotSuspended(id) => write!(f, "trigger {id} is not suspended"),
+            Self::Store(msg) => write!(f, "trigger store error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for TriggerError {}
 
-// ── Tests ───────────────────────────────────────────────────────────────────
+impl From<cairn_store::StoreError> for TriggerError {
+    fn from(err: cairn_store::StoreError) -> Self {
+        TriggerError::Store(err.to_string())
+    }
+}
+
+/// Intermediate pre-decision outcome used by both the evaluator (which
+/// drives the fire path) and the preview (`decision_candidates_for_signal`).
+/// Private — callers see `TriggerEvent` variants in the return vector.
+#[derive(Clone, Debug)]
+enum PreDecision {
+    Ready,
+    Skipped(SkipReason),
+    RateLimited { bucket_capacity: u32 },
+    BudgetExceeded,
+}
+
+/// Runtime-side, projection-backed trigger service.
+///
+/// Previous in-memory `TriggerService` held four HashMaps + a Vec that
+/// had to be rebuilt on every process boot via `AppState::replay_triggers`
+/// (deleted in RFC-025 Phase 1.5a). Durable state now lives in the
+/// `triggers` / `run_templates` / `trigger_fires` projection tables; this
+/// struct is a thin stateless facade that issues projection reads and
+/// runs the sync decision logic (condition matching / chain-depth /
+/// rate-limit / project-budget / required-fields).
+///
+/// Write-path split between CRUD and evaluation:
+/// * **CRUD** (`create_template`, `create_trigger`, `enable_trigger`,
+///   `disable_trigger`, `resume_trigger`, `delete_trigger`,
+///   `delete_template`) — the service builds the `RuntimeEvent` and
+///   appends it through the event log itself. The projection applier
+///   updates `triggers` / `run_templates` inside the same transaction.
+///   Callers receive the `TriggerEvent` for HTTP response bodies.
+/// * **Evaluation** (`decision_candidates_for_signal`,
+///   `evaluate_signal_for_candidates`, `evaluate_signal`) — returns a
+///   `Vec<TriggerEvent>` for the caller to persist via the event log
+///   (see the signal handler for the standard write pattern). The
+///   evaluator does NOT append on its own because the caller often
+///   wants to record telemetry + append a single batched envelope for
+///   the whole signal (matching the pre-refactor behaviour).
+///
+/// The service is cheap to clone (wraps an `Arc<S>`) and holds no
+/// writable state of its own. Concurrent evaluate calls for the same
+/// project are serialised only by the projection's append transaction;
+/// the rate-limit + duplicate-fire window check relies on SQL COUNT(*)
+/// being consistent at that isolation level. True concurrency window:
+/// if two ingest paths evaluate the SAME `(trigger_id, signal_id)`
+/// pair simultaneously they can both clear the `has_fired` pre-check
+/// before either writes a 'fired' row — both will emit TriggerFired
+/// and both rows can land in `trigger_fires`. The event log does NOT
+/// deduplicate on signal_id, so a duplicate row is possible under
+/// race. Callers that need strict at-most-once per-signal semantics
+/// must serialise signal ingest on `signal_id` upstream of
+/// `evaluate_signal_for_candidates`. In practice cairn-app routes each
+/// signal through a single handler invocation so this race is not
+/// observed; the ledger check is a defensive barrier rather than a
+/// strong concurrency guarantee (PR #569 Copilot review).
+pub struct TriggerService<S> {
+    store: std::sync::Arc<S>,
+    /// Hourly budget cap used by `pre_decision_status` when the signal's
+    /// project lacks an explicit limit. Kept public so tests + future
+    /// config overrides can adjust it without reaching into the service.
+    pub default_project_budget: u32,
+}
+
+impl<S> Clone for TriggerService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            default_project_budget: self.default_project_budget,
+        }
+    }
+}
+
+impl<S> TriggerService<S>
+where
+    S: cairn_store::projections::TriggerReadModel
+        + cairn_store::projections::RunTemplateReadModel
+        + cairn_store::projections::TriggerFireReadModel
+        + cairn_store::EventLog
+        + 'static,
+{
+    pub fn new(store: std::sync::Arc<S>) -> Self {
+        Self {
+            store,
+            default_project_budget: DEFAULT_PROJECT_BUDGET_PER_HOUR,
+        }
+    }
+
+    /// Append a lifecycle event with `EventSource::Operator { operator_id }`
+    /// so the audit trail reflects who made the change. Preserves the
+    /// pre-refactor auditability (PR #569 review) — the previous handler
+    /// path wrapped events with the principal's operator id before
+    /// appending; the service now does the wrap internally.
+    async fn append_as_operator(
+        &self,
+        operator_id: cairn_domain::ids::OperatorId,
+        event: cairn_domain::RuntimeEvent,
+    ) -> Result<(), TriggerError> {
+        let event_id = super::event_helpers::next_event_id();
+        let mut envelope = cairn_domain::EventEnvelope::for_runtime_event(
+            event_id,
+            cairn_domain::EventSource::Operator { operator_id },
+            event,
+        );
+        let trace_id = crate::get_current_trace_id();
+        if !trace_id.is_empty() {
+            envelope = envelope.with_correlation_id(trace_id);
+        }
+        self.store
+            .append(&[envelope])
+            .await
+            .map(|_| ())
+            .map_err(TriggerError::from)
+    }
+
+    // ── Template CRUD ────────────────────────────────────────────────
+
+    pub async fn create_template(
+        &self,
+        template: RunTemplate,
+    ) -> Result<TriggerEvent, TriggerError> {
+        let event = cairn_domain::RuntimeEvent::RunTemplateCreated(
+            cairn_domain::events::RunTemplateCreated {
+                project: template.project.clone(),
+                template_id: template.id.clone(),
+                name: template.name.clone(),
+                description: template.description.clone(),
+                default_mode: template.default_mode.clone(),
+                system_prompt: template.system_prompt.clone(),
+                initial_user_message: template.initial_user_message.clone(),
+                plugin_allowlist: template.plugin_allowlist.clone(),
+                tool_allowlist: template.tool_allowlist.clone(),
+                budget_max_tokens: template.budget.max_tokens,
+                budget_max_wall_clock_ms: template.budget.max_wall_clock_ms,
+                budget_max_iterations: template.budget.max_iterations,
+                budget_exploration_budget_share: template.budget.exploration_budget_share,
+                sandbox_hint: template.sandbox_hint.clone(),
+                required_fields: template.required_fields.clone(),
+                created_by: template.created_by.clone(),
+                created_at: template.created_at,
+            },
+        );
+        self.append_as_operator(template.created_by.clone(), event)
+            .await?;
+        Ok(TriggerEvent::RunTemplateCreated {
+            template_id: template.id,
+            project: template.project,
+            name: template.name,
+            default_mode: template.default_mode,
+            created_by: template.created_by,
+            created_at: template.created_at,
+        })
+    }
+
+    pub async fn get_template(
+        &self,
+        id: &RunTemplateId,
+    ) -> Result<Option<RunTemplate>, TriggerError> {
+        let rec =
+            cairn_store::projections::RunTemplateReadModel::get_template(self.store.as_ref(), id)
+                .await?;
+        rec.map(run_template_from_record).transpose()
+    }
+
+    pub async fn list_templates_for_project(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<RunTemplate>, TriggerError> {
+        let records = cairn_store::projections::RunTemplateReadModel::list_templates_by_project(
+            self.store.as_ref(),
+            project,
+        )
+        .await?;
+        records.into_iter().map(run_template_from_record).collect()
+    }
+
+    pub async fn delete_template(
+        &self,
+        id: &RunTemplateId,
+        by: OperatorId,
+    ) -> Result<TriggerEvent, TriggerError> {
+        // Fetch once — carry the record forward for the event's
+        // `project` field so we don't issue a second read after the
+        // referential-integrity check (Copilot review PR #569).
+        let record = match cairn_store::projections::RunTemplateReadModel::get_template(
+            self.store.as_ref(),
+            id,
+        )
+        .await?
+        {
+            Some(rec) => rec,
+            None => return Err(TriggerError::TemplateNotFound(id.clone())),
+        };
+
+        // Referential integrity: block deletion while any trigger still
+        // points at the template. Projection read backs this check on
+        // all three backends.
+        let referencing =
+            cairn_store::projections::RunTemplateReadModel::triggers_referencing_template(
+                self.store.as_ref(),
+                id,
+            )
+            .await?;
+        if !referencing.is_empty() {
+            return Err(TriggerError::TemplateInUse {
+                template_id: id.clone(),
+                trigger_ids: referencing,
+            });
+        }
+
+        let at = now_ms();
+        let event = cairn_domain::RuntimeEvent::RunTemplateDeleted(
+            cairn_domain::events::RunTemplateDeleted {
+                project: record.project.clone(),
+                template_id: id.clone(),
+                by: by.clone(),
+                at,
+            },
+        );
+        self.append_as_operator(by.clone(), event).await?;
+        Ok(TriggerEvent::RunTemplateDeleted {
+            template_id: id.clone(),
+            by,
+            at,
+        })
+    }
+
+    // ── Trigger CRUD ────────────────────────────────────────────────
+
+    pub async fn create_trigger(&self, trigger: Trigger) -> Result<TriggerEvent, TriggerError> {
+        // Template must exist; matches the pre-refactor invariant.
+        if cairn_store::projections::RunTemplateReadModel::get_template(
+            self.store.as_ref(),
+            &trigger.run_template_id,
+        )
+        .await?
+        .is_none()
+        {
+            return Err(TriggerError::TemplateNotFound(
+                trigger.run_template_id.clone(),
+            ));
+        }
+
+        // Serialise each condition explicitly so a serde error surfaces
+        // as TriggerError::Store — the previous `unwrap_or(Null)` would
+        // have silently written a `null` condition that then failed to
+        // deserialise when the projection was read back, effectively
+        // bricking the trigger (Copilot review PR #569). In practice
+        // serde_json::to_value on a `TriggerCondition` (which has hand-
+        // rolled Serialize/Deserialize) cannot fail, but the error path
+        // is the correct shape.
+        let conditions: Result<Vec<serde_json::Value>, TriggerError> = trigger
+            .conditions
+            .iter()
+            .map(|c| {
+                serde_json::to_value(c).map_err(|err| {
+                    TriggerError::Store(format!(
+                        "trigger {} condition serialisation failed: {err}",
+                        trigger.id
+                    ))
+                })
+            })
+            .collect();
+        let event =
+            cairn_domain::RuntimeEvent::TriggerCreated(cairn_domain::events::TriggerCreated {
+                project: trigger.project.clone(),
+                trigger_id: trigger.id.clone(),
+                name: trigger.name.clone(),
+                description: trigger.description.clone(),
+                signal_type: trigger.signal_pattern.signal_type.clone(),
+                plugin_id: trigger.signal_pattern.plugin_id.clone(),
+                conditions: conditions?,
+                run_template_id: trigger.run_template_id.clone(),
+                max_per_minute: trigger.rate_limit.max_per_minute,
+                max_burst: trigger.rate_limit.max_burst,
+                max_chain_depth: trigger.max_chain_depth,
+                created_by: trigger.created_by.clone(),
+                created_at: trigger.created_at,
+            });
+        self.append_as_operator(trigger.created_by.clone(), event)
+            .await?;
+        Ok(TriggerEvent::TriggerCreated {
+            trigger_id: trigger.id,
+            project: trigger.project,
+            signal_pattern: trigger.signal_pattern,
+            run_template_id: trigger.run_template_id,
+            created_by: trigger.created_by,
+            created_at: trigger.created_at,
+        })
+    }
+
+    pub async fn get_trigger(&self, id: &TriggerId) -> Result<Option<Trigger>, TriggerError> {
+        let rec = cairn_store::projections::TriggerReadModel::get_trigger(self.store.as_ref(), id)
+            .await?;
+        rec.map(trigger_from_record).transpose()
+    }
+
+    pub async fn list_triggers_for_project(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<Trigger>, TriggerError> {
+        let records = cairn_store::projections::TriggerReadModel::list_triggers_by_project(
+            self.store.as_ref(),
+            project,
+        )
+        .await?;
+        records.into_iter().map(trigger_from_record).collect()
+    }
+
+    pub async fn enable_trigger(
+        &self,
+        id: &TriggerId,
+        by: OperatorId,
+    ) -> Result<TriggerEvent, TriggerError> {
+        let trigger = self.require_trigger(id).await?;
+        let at = now_ms();
+        let event =
+            cairn_domain::RuntimeEvent::TriggerEnabled(cairn_domain::events::TriggerEnabled {
+                project: trigger.project.clone(),
+                trigger_id: id.clone(),
+                by: by.clone(),
+                at,
+            });
+        self.append_as_operator(by.clone(), event).await?;
+        Ok(TriggerEvent::TriggerEnabled {
+            trigger_id: id.clone(),
+            by,
+            at,
+        })
+    }
+
+    pub async fn disable_trigger(
+        &self,
+        id: &TriggerId,
+        by: OperatorId,
+        reason: Option<String>,
+    ) -> Result<TriggerEvent, TriggerError> {
+        let trigger = self.require_trigger(id).await?;
+        let at = now_ms();
+        let event =
+            cairn_domain::RuntimeEvent::TriggerDisabled(cairn_domain::events::TriggerDisabled {
+                project: trigger.project.clone(),
+                trigger_id: id.clone(),
+                by: by.clone(),
+                reason: reason.clone(),
+                at,
+            });
+        self.append_as_operator(by.clone(), event).await?;
+        Ok(TriggerEvent::TriggerDisabled {
+            trigger_id: id.clone(),
+            by,
+            reason,
+            at,
+        })
+    }
+
+    /// Resume a suspended trigger. `by` is the operator attribution for
+    /// the resulting `TriggerResumed` event — cairn-app's
+    /// `resume_trigger_handler` passes the authenticated principal so
+    /// the audit trail reflects who pressed the resume button (PR #569
+    /// Copilot review; earlier draft used `EventSource::Runtime` which
+    /// lost the attribution). System-initiated resumes (e.g. automated
+    /// budget-window recovery) can still pass a synthetic "system"
+    /// operator id.
+    pub async fn resume_trigger(
+        &self,
+        id: &TriggerId,
+        by: OperatorId,
+    ) -> Result<TriggerEvent, TriggerError> {
+        let trigger = self.require_trigger(id).await?;
+        if !matches!(trigger.state, TriggerState::Suspended { .. }) {
+            return Err(TriggerError::NotSuspended(id.clone()));
+        }
+        let at = now_ms();
+        let event =
+            cairn_domain::RuntimeEvent::TriggerResumed(cairn_domain::events::TriggerResumed {
+                project: trigger.project,
+                trigger_id: id.clone(),
+                at,
+            });
+        self.append_as_operator(by, event).await?;
+        Ok(TriggerEvent::TriggerResumed {
+            trigger_id: id.clone(),
+            at,
+        })
+    }
+
+    pub async fn delete_trigger(
+        &self,
+        id: &TriggerId,
+        by: OperatorId,
+    ) -> Result<TriggerEvent, TriggerError> {
+        let trigger = self.require_trigger(id).await?;
+        let at = now_ms();
+        let event =
+            cairn_domain::RuntimeEvent::TriggerDeleted(cairn_domain::events::TriggerDeleted {
+                project: trigger.project,
+                trigger_id: id.clone(),
+                by: by.clone(),
+                at,
+            });
+        self.append_as_operator(by.clone(), event).await?;
+        Ok(TriggerEvent::TriggerDeleted {
+            trigger_id: id.clone(),
+            by,
+            at,
+        })
+    }
+
+    async fn require_trigger(&self, id: &TriggerId) -> Result<Trigger, TriggerError> {
+        match cairn_store::projections::TriggerReadModel::get_trigger(self.store.as_ref(), id)
+            .await?
+        {
+            Some(rec) => trigger_from_record(rec),
+            None => Err(TriggerError::TriggerNotFound(id.clone())),
+        }
+    }
+
+    // ── Pre-decision status + fire evaluation ────────────────────────
+
+    async fn pre_decision_status(
+        &self,
+        trigger: &Trigger,
+        signal_id: &SignalId,
+        payload: &serde_json::Value,
+        source_run_chain_depth: Option<u8>,
+        now: u64,
+    ) -> Result<PreDecision, TriggerError> {
+        // 1. Duplicate-fire ledger: if this (trigger_id, signal_id) ever
+        //    produced a 'fired' row, skip — the run was (or will be)
+        //    created on the first attempt.
+        if cairn_store::projections::TriggerFireReadModel::has_fired(
+            self.store.as_ref(),
+            &trigger.id,
+            signal_id.as_str(),
+        )
+        .await?
+        {
+            return Ok(PreDecision::Skipped(SkipReason::AlreadyFired));
+        }
+
+        // 2. Condition DSL match.
+        if !evaluate_conditions(&trigger.conditions, payload) {
+            return Ok(PreDecision::Skipped(SkipReason::ConditionMismatch));
+        }
+
+        // 3. Chain-depth guard.
+        let next_depth = source_run_chain_depth.map_or(1u8, |d| d.saturating_add(1));
+        if next_depth > trigger.max_chain_depth {
+            return Ok(PreDecision::Skipped(SkipReason::ChainTooDeep));
+        }
+
+        // 4. Per-trigger per-minute rate limit.
+        let window_start = now.saturating_sub(TRIGGER_RATE_LIMIT_WINDOW_MS);
+        let fires_in_window = cairn_store::projections::TriggerFireReadModel::count_fires_since(
+            self.store.as_ref(),
+            &trigger.id,
+            window_start,
+        )
+        .await?;
+        if fires_in_window >= trigger.rate_limit.max_per_minute {
+            return Ok(PreDecision::RateLimited {
+                bucket_capacity: trigger.rate_limit.max_per_minute,
+            });
+        }
+
+        // 5. Per-project per-hour budget.
+        let hour_ago = now.saturating_sub(PROJECT_BUDGET_WINDOW_MS);
+        let project_fires =
+            cairn_store::projections::TriggerFireReadModel::count_project_fires_since(
+                self.store.as_ref(),
+                &trigger.project,
+                hour_ago,
+            )
+            .await?;
+        if project_fires >= self.default_project_budget {
+            return Ok(PreDecision::BudgetExceeded);
+        }
+
+        // 6. Required-fields on the template.
+        let template = match cairn_store::projections::RunTemplateReadModel::get_template(
+            self.store.as_ref(),
+            &trigger.run_template_id,
+        )
+        .await?
+        {
+            Some(rec) => rec,
+            // Trigger referencing a deleted template — data corruption
+            // (delete_template is supposed to block on referencing
+            // triggers). Warn loudly so the operator sees the situation
+            // in logs rather than only through a silent skip. Surface
+            // as Store error so the caller's decision log records the
+            // real failure mode (Copilot review PR #569). The fire
+            // attempt is aborted before any run is materialised.
+            None => {
+                tracing::warn!(
+                    trigger_id = %trigger.id,
+                    run_template_id = %trigger.run_template_id,
+                    "trigger evaluation: run template missing; skipping fire (data corruption — delete_template is supposed to block on referencing triggers)"
+                );
+                return Err(TriggerError::TemplateNotFound(
+                    trigger.run_template_id.clone(),
+                ));
+            }
+        };
+        // Parse required_fields_json; surface a corrupted row as a
+        // Store error rather than silently treating it as "no required
+        // fields" (which would disable the validation until the next
+        // template write). PR #569 Copilot review.
+        let required_fields: Vec<String> = serde_json::from_str(&template.required_fields_json)
+            .map_err(|e| {
+                TriggerError::Store(format!(
+                    "template {} required_fields_json parse error: {e}",
+                    template.template_id
+                ))
+            })?;
+        if let Some(field) = required_fields
+            .iter()
+            .find(|field| resolve_path(payload, field).is_none())
+        {
+            return Ok(PreDecision::Skipped(SkipReason::MissingRequiredField {
+                field: field.clone(),
+            }));
+        }
+
+        Ok(PreDecision::Ready)
+    }
+
+    /// Preview which triggers are eligible for decision-layer evaluation for
+    /// a signal. Runs the pre-decision checks without mutating any state so
+    /// callers can consult an async decision service, then call
+    /// `evaluate_signal_for_candidates` with the resulting outcomes.
+    pub async fn decision_candidates_for_signal(
+        &self,
+        project: &ProjectKey,
+        signal_id: &SignalId,
+        signal_type: &str,
+        plugin_id: &str,
+        payload: &serde_json::Value,
+        source_run_chain_depth: Option<u8>,
+    ) -> Result<Vec<TriggerId>, TriggerError> {
+        let now = now_ms();
+        let matching = cairn_store::projections::TriggerReadModel::list_matching_enabled(
+            self.store.as_ref(),
+            project,
+            signal_type,
+            plugin_id,
+        )
+        .await?;
+
+        let mut ready = Vec::new();
+        for record in matching {
+            let trigger = trigger_from_record(record)?;
+            if matches!(
+                self.pre_decision_status(&trigger, signal_id, payload, source_run_chain_depth, now)
+                    .await?,
+                PreDecision::Ready
+            ) {
+                ready.push(trigger.id);
+            }
+        }
+        Ok(ready)
+    }
+
+    /// Evaluate a signal against the pre-selected trigger ids, applying the
+    /// provided decision outcomes. Emits the full `TriggerEvent` list (fired,
+    /// skipped, denied, rate-limited, pending-approval, possibly
+    /// suspended-for-budget). Each emitted durable `RuntimeEvent` is
+    /// persisted by the caller via `runtime_event_for_trigger_service_event`.
+    ///
+    /// The prepared_trigger_ids set is how the caller ensures a trigger
+    /// created/enabled between the preview and this call does not sneak in
+    /// without a matching decision outcome.
+    pub async fn evaluate_signal_for_candidates(
+        &self,
+        project: &ProjectKey,
+        signal_id: &SignalId,
+        signal_type: &str,
+        plugin_id: &str,
+        payload: &serde_json::Value,
+        source_run_chain_depth: Option<u8>,
+        prepared_trigger_ids: &HashSet<TriggerId>,
+        decision_fn: &(dyn Fn(&TriggerId, &str) -> TriggerDecisionOutcome + Send + Sync),
+    ) -> Result<Vec<TriggerEvent>, TriggerError> {
+        let matching = cairn_store::projections::TriggerReadModel::list_matching_enabled(
+            self.store.as_ref(),
+            project,
+            signal_type,
+            plugin_id,
+        )
+        .await?;
+        self.evaluate_with_matching(
+            signal_id,
+            signal_type,
+            payload,
+            source_run_chain_depth,
+            prepared_trigger_ids,
+            decision_fn,
+            matching,
+        )
+        .await
+    }
+
+    /// Private core of the signal evaluation loop. Takes the matching
+    /// set as an argument so callers that already have it (e.g.
+    /// `evaluate_signal`) don't issue a second
+    /// `list_matching_enabled` read (Copilot review PR #569).
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_with_matching(
+        &self,
+        signal_id: &SignalId,
+        signal_type: &str,
+        payload: &serde_json::Value,
+        source_run_chain_depth: Option<u8>,
+        prepared_trigger_ids: &HashSet<TriggerId>,
+        decision_fn: &(dyn Fn(&TriggerId, &str) -> TriggerDecisionOutcome + Send + Sync),
+        matching: Vec<cairn_store::projections::TriggerRecord>,
+    ) -> Result<Vec<TriggerEvent>, TriggerError> {
+        let now = now_ms();
+        let mut events = Vec::new();
+
+        for record in matching {
+            let trigger = trigger_from_record(record)?;
+            if !prepared_trigger_ids.contains(&trigger.id) {
+                continue;
+            }
+            match self
+                .pre_decision_status(&trigger, signal_id, payload, source_run_chain_depth, now)
+                .await?
+            {
+                PreDecision::Ready => {}
+                PreDecision::Skipped(reason) => {
+                    events.push(TriggerEvent::TriggerSkipped {
+                        trigger_id: trigger.id.clone(),
+                        signal_id: signal_id.clone(),
+                        reason,
+                        skipped_at: now,
+                    });
+                    continue;
+                }
+                PreDecision::RateLimited { bucket_capacity } => {
+                    events.push(TriggerEvent::TriggerRateLimited {
+                        trigger_id: trigger.id.clone(),
+                        signal_id: signal_id.clone(),
+                        bucket_remaining: 0,
+                        bucket_capacity,
+                        rate_limited_at: now,
+                    });
+                    continue;
+                }
+                PreDecision::BudgetExceeded => {
+                    events.push(TriggerEvent::TriggerSuspended {
+                        trigger_id: trigger.id.clone(),
+                        reason: SuspensionReason::BudgetExceeded,
+                        at: now,
+                    });
+                    continue;
+                }
+            }
+
+            let next_depth = source_run_chain_depth.map_or(1u8, |d| d.saturating_add(1));
+            let decision_outcome = (decision_fn)(&trigger.id, signal_type);
+
+            match &decision_outcome {
+                TriggerDecisionOutcome::Approved { .. } => {
+                    // Approved — proceed to fire.
+                }
+                TriggerDecisionOutcome::Denied {
+                    decision_id,
+                    reason,
+                } => {
+                    events.push(TriggerEvent::TriggerDenied {
+                        trigger_id: trigger.id.clone(),
+                        signal_id: signal_id.clone(),
+                        decision_id: decision_id.clone(),
+                        reason: reason.clone(),
+                        denied_at: now,
+                    });
+                    continue;
+                }
+                TriggerDecisionOutcome::PendingApproval { approval_id } => {
+                    events.push(TriggerEvent::TriggerPendingApproval {
+                        trigger_id: trigger.id.clone(),
+                        signal_id: signal_id.clone(),
+                        approval_id: approval_id.clone(),
+                        pending_at: now,
+                    });
+                    continue;
+                }
+            }
+
+            let run_id = RunId::new(format!("run_trigger_{}_{}", trigger.id.as_str(), now));
+            events.push(TriggerEvent::TriggerFired {
+                trigger_id: trigger.id.clone(),
+                signal_id: signal_id.clone(),
+                signal_type: signal_type.to_owned(),
+                run_id,
+                chain_depth: next_depth,
+                fired_at: now,
+            });
+        }
+
+        Ok(events)
+    }
+
+    /// Convenience: preview + evaluate in one call. Used by callers that
+    /// auto-approve every fire (tests + legacy callers that don't integrate
+    /// with the decision layer).
+    pub async fn evaluate_signal(
+        &self,
+        project: &ProjectKey,
+        signal_id: &SignalId,
+        signal_type: &str,
+        plugin_id: &str,
+        payload: &serde_json::Value,
+        source_run_chain_depth: Option<u8>,
+        decision_fn: &(dyn Fn(&TriggerId, &str) -> TriggerDecisionOutcome + Send + Sync),
+    ) -> Result<Vec<TriggerEvent>, TriggerError> {
+        // Review PR #569: `evaluate_signal` is a convenience that
+        // auto-approves every fire. Fetch the matching set exactly
+        // once and hand it to `evaluate_with_matching` — there's no
+        // second `list_matching_enabled` round-trip on the hot path.
+        let matching = cairn_store::projections::TriggerReadModel::list_matching_enabled(
+            self.store.as_ref(),
+            project,
+            signal_type,
+            plugin_id,
+        )
+        .await?;
+        let prepared: HashSet<TriggerId> = matching.iter().map(|t| t.trigger_id.clone()).collect();
+        self.evaluate_with_matching(
+            signal_id,
+            signal_type,
+            payload,
+            source_run_chain_depth,
+            &prepared,
+            decision_fn,
+            matching,
+        )
+        .await
+    }
+}
+
+// ── Record → domain conversions ─────────────────────────────────────────────
+
+fn trigger_from_record(
+    rec: cairn_store::projections::TriggerRecord,
+) -> Result<Trigger, TriggerError> {
+    let conditions: Vec<TriggerCondition> =
+        serde_json::from_str(&rec.conditions_json).map_err(|e| {
+            TriggerError::Store(format!(
+                "trigger {} conditions_json parse error: {e}",
+                rec.trigger_id
+            ))
+        })?;
+    let state = match rec.state {
+        cairn_store::projections::TriggerStateKind::Enabled => TriggerState::Enabled,
+        cairn_store::projections::TriggerStateKind::Disabled => TriggerState::Disabled {
+            reason: rec.state_reason.clone(),
+            since: rec.state_since.unwrap_or(0),
+        },
+        cairn_store::projections::TriggerStateKind::Suspended => {
+            let reason = match rec.suspension_reason.as_deref() {
+                Some("rate_limit_exceeded") => SuspensionReason::RateLimitExceeded,
+                Some("budget_exceeded") => SuspensionReason::BudgetExceeded,
+                Some("operator_paused") => SuspensionReason::OperatorPaused,
+                // RepeatedFailures carries a failure_count on the wire, but
+                // the projection row only keeps the discriminant string.
+                // Rehydrate with 0; the original count is still in the
+                // event log if anyone needs it for forensics.
+                Some("repeated_failures") => {
+                    SuspensionReason::RepeatedFailures { failure_count: 0 }
+                }
+                _ => SuspensionReason::OperatorPaused,
+            };
+            TriggerState::Suspended {
+                reason,
+                since: rec.state_since.unwrap_or(0),
+            }
+        }
+    };
+    Ok(Trigger {
+        id: rec.trigger_id,
+        project: rec.project,
+        name: rec.name,
+        description: rec.description,
+        signal_pattern: SignalPattern {
+            signal_type: rec.signal_type,
+            plugin_id: rec.plugin_id,
+        },
+        conditions,
+        run_template_id: rec.run_template_id,
+        state,
+        rate_limit: RateLimitConfig {
+            max_per_minute: rec.max_per_minute,
+            max_burst: rec.max_burst,
+        },
+        max_chain_depth: rec.max_chain_depth,
+        created_by: rec.created_by,
+        created_at: rec.created_at,
+        updated_at: rec.updated_at,
+    })
+}
+
+fn run_template_from_record(
+    rec: cairn_store::projections::RunTemplateRecord,
+) -> Result<RunTemplate, TriggerError> {
+    // Allowlists + required_fields + default_mode all round-trip
+    // through serde_json. If the projection row is corrupted (or a
+    // future RunMode variant is introduced that this binary can't
+    // deserialize), surface as `TriggerError::Store` rather than
+    // silently defaulting — a wrong RunMode would change which
+    // orchestrator picks up the triggered run (PR #569 Copilot review).
+    let plugin_allowlist: Option<Vec<String>> = rec
+        .plugin_allowlist_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|e| {
+            TriggerError::Store(format!(
+                "template {} plugin_allowlist_json parse error: {e}",
+                rec.template_id
+            ))
+        })?;
+    let tool_allowlist: Option<Vec<String>> = rec
+        .tool_allowlist_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|e| {
+            TriggerError::Store(format!(
+                "template {} tool_allowlist_json parse error: {e}",
+                rec.template_id
+            ))
+        })?;
+    let required_fields: Vec<String> =
+        serde_json::from_str(&rec.required_fields_json).map_err(|e| {
+            TriggerError::Store(format!(
+                "template {} required_fields_json parse error: {e}",
+                rec.template_id
+            ))
+        })?;
+    // RunMode is an internally-tagged enum (`#[serde(tag = "type")]`) so
+    // its serialised form is JSON like `{"type":"direct"}`. Parse it
+    // back as JSON rather than wrapping the raw string, matching how
+    // `enum_to_str` writes it into the `default_mode` TEXT column.
+    let default_mode: RunMode = serde_json::from_str(&rec.default_mode).map_err(|e| {
+        TriggerError::Store(format!(
+            "template {} default_mode `{}` parse error: {e}",
+            rec.template_id, rec.default_mode
+        ))
+    })?;
+    Ok(RunTemplate {
+        id: rec.template_id,
+        project: rec.project,
+        name: rec.name,
+        description: rec.description,
+        default_mode,
+        system_prompt: rec.system_prompt,
+        initial_user_message: rec.initial_user_message,
+        plugin_allowlist,
+        tool_allowlist,
+        budget: TemplateBudget {
+            max_tokens: rec.budget_max_tokens,
+            max_wall_clock_ms: rec.budget_max_wall_clock_ms,
+            max_iterations: rec.budget_max_iterations,
+            exploration_budget_share: rec.budget_exploration_budget_share,
+        },
+        sandbox_hint: rec.sandbox_hint,
+        required_fields,
+        created_by: rec.created_by,
+        created_at: rec.created_at,
+        updated_at: rec.updated_at,
+    })
+}
+
+// ── Pure-logic unit tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    fn operator() -> OperatorId {
-        OperatorId::new("op-1")
-    }
-
-    fn project() -> ProjectKey {
-        ProjectKey::new("t1", "w1", "p1")
-    }
-
-    fn make_template(id: &str) -> RunTemplate {
-        RunTemplate {
-            id: RunTemplateId::new(id),
-            project: project(),
-            name: format!("Template {id}"),
-            description: None,
-            default_mode: RunMode::Direct,
-            system_prompt: "You are responding to {{action}} on issue #{{issue.number}}".into(),
-            initial_user_message: None,
-            plugin_allowlist: None,
-            tool_allowlist: None,
-            budget: TemplateBudget::default(),
-            sandbox_hint: None,
-            required_fields: Vec::new(),
-            created_by: operator(),
-            created_at: 0,
-            updated_at: 0,
-        }
-    }
-
-    fn make_trigger(id: &str, template_id: &str) -> Trigger {
-        Trigger {
-            id: TriggerId::new(id),
-            project: project(),
-            name: format!("Trigger {id}"),
-            description: None,
-            signal_pattern: SignalPattern {
-                signal_type: "github.issue.labeled".into(),
-                plugin_id: Some("github".into()),
-            },
-            conditions: vec![TriggerCondition::Contains {
-                path: "labels[].name".into(),
-                value: json!("cairn-ready"),
-            }],
-            run_template_id: RunTemplateId::new(template_id),
-            state: TriggerState::Enabled,
-            rate_limit: RateLimitConfig::default(),
-            max_chain_depth: 5,
-            created_by: operator(),
-            created_at: 0,
-            updated_at: 0,
-        }
-    }
-
-    // ── Condition DSL Tests ──────────────────────────────────────────
+    // ── Condition DSL ─────────────────────────────────────────────────
 
     #[test]
     fn condition_equals_matches() {
@@ -1289,7 +1548,7 @@ mod tests {
         assert_eq!(restored, cond);
     }
 
-    // ── Variable Substitution Tests ─────────────────────────────────
+    // ── Variable substitution ─────────────────────────────────────────
 
     #[test]
     fn substitution_replaces_scalars() {
@@ -1331,237 +1590,5 @@ mod tests {
             substitute_variables("{{issue.number}}", &payload, &["issue.number".to_string()]);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), vec!["issue.number".to_string()]);
-    }
-
-    // ── Trigger Service Tests ───────────────────────────────────────
-
-    #[test]
-    fn create_trigger_requires_template() {
-        let mut svc = TriggerService::new();
-        let trigger = make_trigger("t1", "nonexistent");
-        assert!(matches!(
-            svc.create_trigger(trigger),
-            Err(TriggerError::TemplateNotFound(_))
-        ));
-    }
-
-    #[test]
-    fn create_and_evaluate_trigger() {
-        let mut svc = TriggerService::new();
-        svc.create_template(make_template("tmpl-1"));
-        svc.create_trigger(make_trigger("t1", "tmpl-1")).unwrap();
-
-        let payload = json!({
-            "action": "labeled",
-            "labels": [{"name": "cairn-ready"}]
-        });
-
-        let events = svc.evaluate_signal(
-            &project(),
-            &SignalId::new("sig-1"),
-            "github.issue.labeled",
-            "github",
-            &payload,
-            None,
-            &auto_approve_decision,
-        );
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            TriggerEvent::TriggerFired { chain_depth: 1, .. }
-        ));
-    }
-
-    #[test]
-    fn condition_mismatch_skips() {
-        let mut svc = TriggerService::new();
-        svc.create_template(make_template("tmpl-1"));
-        svc.create_trigger(make_trigger("t1", "tmpl-1")).unwrap();
-
-        // No "cairn-ready" label
-        let payload = json!({
-            "action": "labeled",
-            "labels": [{"name": "bug"}]
-        });
-
-        let events = svc.evaluate_signal(
-            &project(),
-            &SignalId::new("sig-2"),
-            "github.issue.labeled",
-            "github",
-            &payload,
-            None,
-            &auto_approve_decision,
-        );
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            TriggerEvent::TriggerSkipped {
-                reason: SkipReason::ConditionMismatch,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn fire_ledger_dedup_prevents_duplicate() {
-        let mut svc = TriggerService::new();
-        svc.create_template(make_template("tmpl-1"));
-        svc.create_trigger(make_trigger("t1", "tmpl-1")).unwrap();
-
-        let payload = json!({"labels": [{"name": "cairn-ready"}]});
-        let signal_id = SignalId::new("sig-dup");
-
-        // First eval fires
-        let events1 = svc.evaluate_signal(
-            &project(),
-            &signal_id,
-            "github.issue.labeled",
-            "github",
-            &payload,
-            None,
-            &auto_approve_decision,
-        );
-        assert!(matches!(&events1[0], TriggerEvent::TriggerFired { .. }));
-
-        // Second eval with same signal_id is deduped
-        let events2 = svc.evaluate_signal(
-            &project(),
-            &signal_id,
-            "github.issue.labeled",
-            "github",
-            &payload,
-            None,
-            &auto_approve_decision,
-        );
-        assert!(matches!(
-            &events2[0],
-            TriggerEvent::TriggerSkipped {
-                reason: SkipReason::AlreadyFired,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn chain_depth_prevents_loops() {
-        let mut svc = TriggerService::new();
-        svc.create_template(make_template("tmpl-1"));
-
-        let mut trigger = make_trigger("t1", "tmpl-1");
-        trigger.max_chain_depth = 3;
-        svc.create_trigger(trigger).unwrap();
-
-        let payload = json!({"labels": [{"name": "cairn-ready"}]});
-
-        // Depth 3 (source at 2, +1 = 3) — at limit, should still fire
-        let events = svc.evaluate_signal(
-            &project(),
-            &SignalId::new("sig-depth3"),
-            "github.issue.labeled",
-            "github",
-            &payload,
-            Some(2),
-            &auto_approve_decision,
-        );
-        assert!(matches!(
-            &events[0],
-            TriggerEvent::TriggerFired { chain_depth: 3, .. }
-        ));
-
-        // Depth 4 (source at 3, +1 = 4) — exceeds limit
-        let events = svc.evaluate_signal(
-            &project(),
-            &SignalId::new("sig-depth4"),
-            "github.issue.labeled",
-            "github",
-            &payload,
-            Some(3),
-            &auto_approve_decision,
-        );
-        assert!(matches!(
-            &events[0],
-            TriggerEvent::TriggerSkipped {
-                reason: SkipReason::ChainTooDeep,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn multiple_triggers_fan_out() {
-        let mut svc = TriggerService::new();
-        svc.create_template(make_template("tmpl-1"));
-        svc.create_template(make_template("tmpl-2"));
-        svc.create_trigger(make_trigger("t1", "tmpl-1")).unwrap();
-        svc.create_trigger(make_trigger("t2", "tmpl-2")).unwrap();
-
-        let payload = json!({"labels": [{"name": "cairn-ready"}]});
-
-        let events = svc.evaluate_signal(
-            &project(),
-            &SignalId::new("sig-fan"),
-            "github.issue.labeled",
-            "github",
-            &payload,
-            None,
-            &auto_approve_decision,
-        );
-
-        // Both triggers should fire
-        let fired_count = events
-            .iter()
-            .filter(|e| matches!(e, TriggerEvent::TriggerFired { .. }))
-            .count();
-        assert_eq!(fired_count, 2);
-    }
-
-    #[test]
-    fn delete_template_blocked_by_trigger() {
-        let mut svc = TriggerService::new();
-        svc.create_template(make_template("tmpl-1"));
-        svc.create_trigger(make_trigger("t1", "tmpl-1")).unwrap();
-
-        let result = svc.delete_template(&RunTemplateId::new("tmpl-1"), operator());
-        assert!(matches!(result, Err(TriggerError::TemplateInUse { .. })));
-    }
-
-    #[test]
-    fn delete_template_succeeds_after_trigger_removed() {
-        let mut svc = TriggerService::new();
-        svc.create_template(make_template("tmpl-1"));
-        svc.create_trigger(make_trigger("t1", "tmpl-1")).unwrap();
-
-        svc.delete_trigger(&TriggerId::new("t1"), operator())
-            .unwrap();
-        let result = svc.delete_template(&RunTemplateId::new("tmpl-1"), operator());
-        assert!(matches!(
-            result,
-            Ok(TriggerEvent::RunTemplateDeleted { .. })
-        ));
-    }
-
-    #[test]
-    fn cross_project_isolation() {
-        let mut svc = TriggerService::new();
-        svc.create_template(make_template("tmpl-1"));
-        svc.create_trigger(make_trigger("t1", "tmpl-1")).unwrap();
-
-        let payload = json!({"labels": [{"name": "cairn-ready"}]});
-        let other_project = ProjectKey::new("t1", "w1", "p2");
-
-        // Signal in the wrong project → no triggers match
-        let events = svc.evaluate_signal(
-            &other_project,
-            &SignalId::new("sig-other"),
-            "github.issue.labeled",
-            "github",
-            &payload,
-            None,
-            &auto_approve_decision,
-        );
-        assert!(events.is_empty());
     }
 }

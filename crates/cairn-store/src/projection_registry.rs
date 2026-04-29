@@ -504,16 +504,20 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             reason: "SLA set — policy-layer state, no dedicated runtime table",
         },
     },
+    // RFC-025 Phase 1.5a: RunTemplateCreated / RunTemplateDeleted flipped
+    // Ephemeral → Projected. Templates are durable state (the trigger
+    // service dereferences `run_template_id` on every fire) so the pg /
+    // sqlite / in_memory projections all write a row to `run_templates`.
     ProjectionEntry {
         variant: "RunTemplateCreated",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Run templates — service-layer in-memory registry; event log is audit trail",
+        status: ProjectionStatus::Projected {
+            table: Some("run_templates"),
         },
     },
     ProjectionEntry {
         variant: "RunTemplateDeleted",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Run templates — service-layer in-memory registry; event log is audit trail",
+        status: ProjectionStatus::Projected {
+            table: Some("run_templates"),
         },
     },
     ProjectionEntry {
@@ -576,70 +580,83 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             reason: "Priority changes — scheduler-layer concern; audit via event log",
         },
     },
+    // RFC-025 Phase 1.5a: 8 state-carrying variants flipped
+    // Ephemeral → Projected. Every lifecycle edge (Created, Enabled,
+    // Disabled, Suspended, Resumed, Deleted, RunTemplateCreated,
+    // RunTemplateDeleted) writes into the `triggers` / `run_templates`
+    // tables inside the event-append transaction. Restart reads go
+    // straight to the projection; `AppState::replay_triggers` is gone.
     ProjectionEntry {
         variant: "TriggerCreated",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Triggers — projection lives in cairn-signal TriggerService, rebuilt from log via replay_triggers (RFC-025 Phase 1.5a)",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
         },
     },
     ProjectionEntry {
         variant: "TriggerDeleted",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Triggers — projection lives in cairn-signal TriggerService",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
         },
     },
+    // RFC-025 Phase 1.5a: five audit variants write append-only rows
+    // into `trigger_fires` (read by the duplicate-fire ledger + rate-
+    // limit window + project-budget counter), so they now classify as
+    // Projected even though the runtime doesn't rebuild entity state
+    // from them at boot. The registry's Projected contract is "backed
+    // by a read-model table updated synchronously" — these five meet
+    // that contract via `trigger_fires`. (PR #569 review.)
     ProjectionEntry {
         variant: "TriggerDenied",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Trigger-fire audit — observability only",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
         },
     },
     ProjectionEntry {
         variant: "TriggerDisabled",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Triggers — projection lives in cairn-signal TriggerService",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
         },
     },
     ProjectionEntry {
         variant: "TriggerEnabled",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Triggers — projection lives in cairn-signal TriggerService",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
         },
     },
     ProjectionEntry {
         variant: "TriggerFired",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Trigger-fire audit — observability only",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
         },
     },
     ProjectionEntry {
         variant: "TriggerPendingApproval",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Trigger-fire audit — observability only",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
         },
     },
     ProjectionEntry {
         variant: "TriggerRateLimited",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Trigger-fire audit — observability only",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
         },
     },
     ProjectionEntry {
         variant: "TriggerResumed",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Triggers — projection lives in cairn-signal TriggerService",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
         },
     },
     ProjectionEntry {
         variant: "TriggerSkipped",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Trigger-fire audit — observability only",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
         },
     },
     ProjectionEntry {
         variant: "TriggerSuspended",
-        status: ProjectionStatus::Ephemeral {
-            reason: "Triggers — projection lives in cairn-signal TriggerService",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
         },
     },
     ProjectionEntry {
@@ -1272,14 +1289,28 @@ mod tests {
         //     → 61 / 31 / 66.
         //   * Phase 2a.1 milestone 4 flips `LicenseActivated` to Projected
         //     → 62 / 31 / 65.
+        //   * Phase 1.5a (this PR #569) flips 8 state-carrying trigger /
+        //     run_template variants (TriggerCreated, TriggerEnabled,
+        //     TriggerDisabled, TriggerSuspended, TriggerResumed,
+        //     TriggerDeleted, RunTemplateCreated, RunTemplateDeleted)
+        //     from Ephemeral to Projected with backing table `triggers`
+        //     / `run_templates`. The 5 audit variants (TriggerFired,
+        //     Skipped, Denied, RateLimited, PendingApproval) also flip
+        //     Ephemeral → Projected with backing table `trigger_fires`
+        //     — they write real projection rows even though the runtime
+        //     does not recover entity state from individual audit rows
+        //     at boot (per PR #569 Copilot review — Projected contract
+        //     is "backed by a read-model table updated synchronously",
+        //     not "runtime replays from the table"). Net: +13 Projected,
+        //     -13 Ephemeral → 75 / 18 / 65.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 62,
+            projected, 75,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
-            ephemeral, 31,
+            ephemeral, 18,
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 65, "Stubbed count drifted; update registry + RFC");
