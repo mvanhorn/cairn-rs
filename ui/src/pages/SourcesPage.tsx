@@ -6,7 +6,7 @@ import {
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { StatCard } from '../components/StatCard';
-import { defaultApi } from '../lib/api';
+import { defaultApi, unwrapList } from '../lib/api';
 import { useToast } from '../components/Toast';
 import { useScope } from '../hooks/useScope';
 import { useFocusTrap } from '../hooks/useFocusTrap';
@@ -334,7 +334,8 @@ function ChunksModal({ sourceId, onClose }: { sourceId: string; onClose: () => v
     queryKey: ['source', sourceId, 'chunks'],
     queryFn:  () => defaultApi.getSourceChunks(sourceId, { limit: 100 }),
   });
-  const items: SourceChunkView[] = data?.items ?? [];
+  // #425: shared list-shape normalizer.
+  const items: SourceChunkView[] = unwrapList<SourceChunkView>(data);
 
   return (
     <Modal title={`Chunks — ${sourceId}`} icon={<FileText size={14} className="text-indigo-400" />} onClose={onClose}>

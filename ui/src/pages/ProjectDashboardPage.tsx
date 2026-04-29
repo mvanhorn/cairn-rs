@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import { clsx } from "clsx";
 import { Card } from "../components/Card";
-import { defaultApi, summariseCostItems } from "../lib/api";
+import { defaultApi, summariseCostItems, unwrapList } from "../lib/api";
 import { sectionLabel } from "../lib/design-system";
 import { EventLog } from "../components/EventLog";
 import { StatCard } from "../components/StatCard";
@@ -255,7 +255,10 @@ export function ProjectDashboardPage({ projectId }: ProjectDashboardPageProps) {
   });
   // `/v1/costs` returns `{items, has_more}` — fold into the flat shape the
   // dashboard stat cards expect (issue #158).
-  const costs = summariseCostItems(costsList?.items ?? []);
+  // #425: unwrapList handles a future bare-array flip.
+  const costs = summariseCostItems(
+    unwrapList<import("../lib/types").SessionCostRecord>(costsList),
+  );
 
   const { data: recentEvents } = useQuery({
     queryKey: ["proj-events"],

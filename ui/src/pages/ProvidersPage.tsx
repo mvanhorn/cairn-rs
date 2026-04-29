@@ -9,7 +9,7 @@ import { clsx } from "clsx";
 import { StatCard } from "../components/StatCard";
 import { Badge } from "../components/Badge";
 import { Drawer } from "../components/Drawer";
-import { defaultApi, ApiError } from "../lib/api";
+import { defaultApi, ApiError, unwrapList } from "../lib/api";
 import { useToast } from "../components/Toast";
 import { sectionLabel } from "../lib/design-system";
 import { useScope } from "../hooks/useScope";
@@ -924,7 +924,8 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
           if (e instanceof ApiError && e.status === 409) {
             try {
               const creds = await defaultApi.getCredentials(scope.tenant_id, { limit: 200 });
-              const match = creds.items.find(
+              // #425: shared list-shape normalizer (was `creds.items.find(...)`)
+              const match = unwrapList<import("../lib/types").CredentialSummary>(creds).find(
                 c => c.provider_id === connectionId.trim() && c.active,
               );
               if (match) {
@@ -1351,7 +1352,8 @@ function ConnectionsSection({
     refetchInterval: 20_000,
   });
 
-  const entries: ProviderConnectionRecord[] = data?.items ?? [];
+  // #425: shape-flip-safe normalizer.
+  const entries: ProviderConnectionRecord[] = unwrapList<ProviderConnectionRecord>(data);
   const healthMap = new Map<string, ProviderHealthEntry>(
     (Array.isArray(healthData) ? healthData : []).map(h => [h.connection_id, h])
   );

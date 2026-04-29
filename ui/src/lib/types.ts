@@ -975,20 +975,20 @@ export interface CreateSourceRequest {
   description?: string;
 }
 
-/** PUT /v1/sources/:id — update source request body.
+/** PATCH /v1/sources/:id — partial-update source request body (#426).
  *
- * Backend (`crates/cairn-app/src/handlers/memory.rs::UpdateSourceRequest`)
- * uses `Option<String>`, so the wire accepts either an explicit string, an
- * explicit `null` (to clear the field), or omission. `defaultApi.updateSource`
- * always serialises `null` when the caller passes `undefined`, so the TS
- * type must allow `string | null`.
+ * Backend (`crates/cairn-app/src/handlers/memory.rs::PatchSourceRequest`)
+ * uses `Option<String>`, so the wire accepts either an explicit string or
+ * omission. Absent fields preserve the existing value — PATCH semantics.
+ * The verb was changed from PUT to PATCH in #426 because partial update
+ * violates PUT's full-replacement contract per RFC 7231 §4.3.4.
  */
-export interface UpdateSourceRequest {
+export interface PatchSourceRequest {
   tenant_id: string;
   workspace_id: string;
   project_id: string;
-  name?: string | null;
-  description?: string | null;
+  name?: string;
+  description?: string;
 }
 
 /** POST /v1/memory/ingest — response body. */

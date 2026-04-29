@@ -5,7 +5,7 @@ import { ErrorFallback } from "../components/ErrorFallback";
 import { clsx } from "clsx";
 import { MiniChart } from "../components/MiniChart";
 import { BarChart } from "../components/BarChart";
-import { defaultApi, summariseCostItems } from "../lib/api";
+import { defaultApi, summariseCostItems, unwrapList } from "../lib/api";
 import { useScope } from "../hooks/useScope";
 import { PageHeader } from "../components/PageHeader";
 import { StatCard } from "../components/StatCard";
@@ -102,8 +102,13 @@ export function CostsPage() {
 
   // `/v1/costs` returns `{items, has_more}` — collapse into the stat-card
   // shape client-side so the existing layout keeps working.
+  // #425: route through `unwrapList` so a future flip to `SessionCostRecord[]`
+  // doesn't crash the summariser.
   const costs = useMemo(
-    () => summariseCostItems(costsList?.items ?? []),
+    () =>
+      summariseCostItems(
+        unwrapList<import("../lib/types").SessionCostRecord>(costsList),
+      ),
     [costsList],
   );
 

@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 import { clsx } from "clsx";
 import { ErrorFallback } from "../components/ErrorFallback";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import type { AuditOutcome } from "../lib/types";
 import { ds } from "../lib/design-system";
 import { EntityExplainer } from "../components/EntityExplainer";
@@ -157,8 +157,12 @@ export function AuditLogPage() {
     refetchInterval: cursorStack.length === 0 ? 30_000 : false,
   });
 
-  const entries = data?.items ?? [];
-  const hasMore = Boolean(data?.hasMore);
+  // #425: `unwrapList` normalizes `{items, hasMore}` into a plain array
+  // AND handles a future flip to a bare `T[]` response shape without
+  // crashing. `hasMore` is only present on the envelope shape, so we
+  // read it separately (defensive `?.`).
+  const entries = unwrapList<import("../lib/types").AuditRecord>(data);
+  const hasMore = Boolean(data && typeof data === "object" && "hasMore" in data && (data as { hasMore: unknown }).hasMore);
   const atNewest = cursorStack.length === 0;
 
   // Reset paging when filters that change the result set flip.

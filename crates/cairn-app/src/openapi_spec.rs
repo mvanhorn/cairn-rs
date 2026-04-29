@@ -103,6 +103,54 @@ pub const OPENAPI_JSON: &str = r##"{
           "breaker_overrides":   { "$ref": "#/components/schemas/BreakerOverrides", "nullable": true }
         }
       },
+      "ApprovePlanRequest": {
+        "type": "object",
+        "description": "Request body for POST /v1/runs/{id}/approve (RFC 018 plan review). Typed + `deny_unknown_fields` per #427 — unknown keys (e.g. `reviewerComments` camelCase) return 422.",
+        "additionalProperties": false,
+        "properties": {
+          "reviewer_comments": { "type": "string", "nullable": true, "description": "Optional operator note attached to the approval audit event." }
+        }
+      },
+      "RejectPlanRequest": {
+        "type": "object",
+        "description": "Request body for POST /v1/runs/{id}/reject (RFC 018 plan review). Typed + `deny_unknown_fields` per #427.",
+        "additionalProperties": false,
+        "properties": {
+          "reason": { "type": "string", "nullable": true, "description": "Optional operator-provided reason. Defaults to \"rejected by operator\" when omitted or empty." }
+        }
+      },
+      "RevisePlanRequest": {
+        "type": "object",
+        "description": "Request body for POST /v1/runs/{id}/revise (RFC 018 plan review). Typed + `deny_unknown_fields` per #427.",
+        "additionalProperties": false,
+        "properties": {
+          "reviewer_comments": { "type": "string", "description": "Required. An empty string returns 400." }
+        },
+        "required": ["reviewer_comments"]
+      },
+      "RunCostAlertResponse": {
+        "type": "object",
+        "description": "Response body for POST /v1/runs/{id}/cost-alert — #431. Returns the created alert so the UI does not need a follow-up GET to learn the value it just set.",
+        "properties": {
+          "run_id":           { "type": "string" },
+          "tenant_id":        { "type": "string" },
+          "threshold_micros": { "type": "integer", "format": "int64", "minimum": 0 }
+        },
+        "required": ["run_id", "tenant_id", "threshold_micros"]
+      },
+      "PatchSourceRequest": {
+        "type": "object",
+        "description": "Partial-update request body for PATCH /v1/sources/{id} (#426). `name` and `description` are optional; absent fields preserve the current value. `deny_unknown_fields` — any unknown key returns 422. PR #555 review (Copilot): explicit `null` is NOT a way to clear a field — omit the key instead. The handler collapses `null` to the same as missing via `#[serde(default)] Option<String>`.",
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id":    { "type": "string" },
+          "workspace_id": { "type": "string" },
+          "project_id":   { "type": "string" },
+          "name":         { "type": "string" },
+          "description":  { "type": "string" }
+        },
+        "required": ["tenant_id", "workspace_id", "project_id"]
+      },
       "OrchestrateTerminationBreakerTripped": {
         "type": "object",
         "description": "F65 PR-3: response body shape for `termination = \"breaker_tripped\"`. HTTP 200 — the run was cleanly terminated by a circuit-breaker trip; the run's `state` is flipped to the terminal `Failed` state with `FailureClass::ExecutionError` before the response returns.",
@@ -737,13 +785,21 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Runs", "Events"],
         "summary": "Event stream for a run",
+        "description": "Returns an `EventsPage { events, next_cursor, has_more }` wrapper ALWAYS — #429 removed the dual-shape behaviour where passing `from=N` returned a bare array. `from` is still accepted as a legacy alias for `cursor`, but the response wrapper is unconditional now.",
         "operationId": "listRunEvents",
         "parameters": [
           { "name": "id",     "in": "path",  "required": true, "schema": { "type": "string" } },
-          { "name": "cursor", "in": "query", "schema": { "type": "integer" } },
-          { "name": "limit",  "in": "query", "schema": { "type": "integer" } }
+          { "name": "cursor", "in": "query", "schema": { "type": "integer" }, "description": "Exclusive lower-bound position; next page starts after this event." },
+          { "name": "from",   "in": "query", "schema": { "type": "integer" }, "description": "Legacy alias for `cursor`. Same semantics; only the response shape was unified (#429)." },
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 500 } }
         ],
-        "responses": { "200": { "description": "Events page" } }
+        "responses": {
+          "200": {
+            "description": "Events page (`{ events, next_cursor, has_more }` — always wrapped per #429).",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "events": { "type": "array", "items": { "type": "object" } }, "next_cursor": { "type": "integer", "nullable": true }, "has_more": { "type": "boolean" } }, "required": ["events", "has_more"] } } }
+          },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/runs/{id}/telemetry": {
@@ -1474,8 +1530,48 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Admin"],
         "summary": "JSON request metrics",
+        "description": "**Scope (#428):** process-level (not tenant-scoped) — aggregate latency percentiles, request counts, and error rate across the whole deployment. Not gated with `AdminRoleGuard` because existing Prometheus scrapers depend on unauthenticated-but-token-gated access; adding a workspace-role requirement would break monitoring rigs. Treat as admin-equivalent at the network / token layer.",
         "operationId": "getMetrics",
         "responses": { "200": { "description": "Rolling latency percentiles, request counts, error rate" } }
+      }
+    },
+    "/v1/stats": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Lightweight aggregate counts for the deployment (admin-only)",
+        "description": "**Scope (#428):** cross-tenant — event counts, active-run counts, active-task counts, and session counts are aggregated across every tenant. Gated with `AdminRoleGuard`; non-admin callers get 403. Per-tenant counts are available via `/v1/tenants/:id/stats` or `/v1/fleet`.",
+        "operationId": "getStats",
+        "responses": {
+          "200": { "description": "Deployment-wide aggregate counts" },
+          "403": { "description": "Caller lacks the admin role", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/events/recent": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Recent events across every tenant (admin-only)",
+        "description": "**Scope (#428):** cross-tenant — streams the last N entries from the global event log with no tenant filter. Gated with `AdminRoleGuard`; per-tenant callers should use `GET /v1/stream` (SSE, tenant-scoped) or `GET /v1/runs/:id/events` (run-scoped).",
+        "operationId": "getRecentEvents",
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 500 } }
+        ],
+        "responses": {
+          "200": { "description": "Recent events across all tenants" },
+          "403": { "description": "Caller lacks the admin role", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/providers/registry": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Cross-tenant snapshot of every provider connection (admin-only)",
+        "description": "**Scope (#428):** cross-tenant — returns `connection_id`, `backend`, and `model` for every provider binding cached in this process, plus the fallback chain and static catalog. Gated with `AdminRoleGuard`; non-admin callers would otherwise learn which providers other tenants have configured.",
+        "operationId": "getProviderRegistry",
+        "responses": {
+          "200": { "description": "All provider connections + fallbacks + catalog" },
+          "403": { "description": "Caller lacks the admin role", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/metrics/prometheus": {
@@ -1785,7 +1881,7 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Health"],
         "summary": "High-level operator overview",
-        "description": "Combines status and dashboard: store backend, deployment mode, uptime, active counts, cost summary, feature flags.",
+        "description": "Combines status and dashboard: store backend, deployment mode, uptime, active counts, cost summary, feature flags.\n\n**Scope (#428):** cross-deployment (not tenant-scoped) — the response body carries only process-level health and component statuses, no per-tenant data, so it intentionally stays ungated. If a future field is added that carries tenant-specific counts, the handler must adopt `AdminRoleGuard`.",
         "operationId": "getOverview",
         "responses": { "200": { "description": "Overview data" } }
       }
@@ -1939,27 +2035,46 @@ pub const OPENAPI_JSON: &str = r##"{
       "post": {
         "tags": ["Plan Review"],
         "summary": "Approve a plan artifact (RFC 018)",
+        "description": "Records an operator approval for a Plan-mode run. Audit event attributed to the authenticated principal (T6a-H7). Request body is validated against `ApprovePlanRequest` with `deny_unknown_fields` — typos such as `reviewerComments` (camelCase) return 422 (#427).",
         "operationId": "approvePlan",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Approved, next_step: create_execute_run" } }
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApprovePlanRequest" } } } },
+        "responses": {
+          "200": { "description": "Approved, next_step: create_execute_run" },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "422": { "description": "Invalid request body (e.g. unknown field, wrong type)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/runs/{id}/reject": {
       "post": {
         "tags": ["Plan Review"],
         "summary": "Reject a plan artifact",
+        "description": "Records an operator rejection. Request body validated against `RejectPlanRequest` with `deny_unknown_fields` (#427).",
         "operationId": "rejectPlan",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Rejected" } }
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RejectPlanRequest" } } } },
+        "responses": {
+          "200": { "description": "Rejected" },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "422": { "description": "Invalid request body", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/runs/{id}/revise": {
       "post": {
         "tags": ["Plan Review"],
         "summary": "Request plan revision, creates new Plan-mode run",
+        "description": "Creates a new Plan-mode run seeded from the original. `reviewer_comments` is required — a revise without comments is a client error (400). Body validated against `RevisePlanRequest` with `deny_unknown_fields` (#427).",
         "operationId": "revisePlan",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "201": { "description": "New plan run created" } }
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RevisePlanRequest" } } } },
+        "responses": {
+          "201": { "description": "New plan run created" },
+          "400": { "description": "reviewer_comments missing or empty", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "422": { "description": "Invalid request body", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/sqeq/initialize": {
@@ -2084,14 +2199,24 @@ pub const OPENAPI_JSON: &str = r##"{
       "post": {
         "tags": ["Runs"],
         "summary": "Kick off orchestration for a run (F65)",
-        "description": "Starts the orchestration loop. The request body is an `OrchestrateRequest` (see schema). Returns 202 when the loop has been enqueued.",
+        "description": "Starts the orchestration loop. The request body is an `OrchestrateRequest` (see schema). Returns 202 when the loop has been enqueued.\n\n**Idempotency (#433).** This endpoint honors the optional `Idempotency-Key` request header. When present, the first response is cached per (tenant, endpoint, key) for 5 minutes; retries with the same key + same body replay the first response verbatim (with an `idempotent-replayed: true` response header). Retries with the same key but a DIFFERENT body return 409 `idempotency_key_reuse`. Concurrent retries with the same key while the first is still in flight return 409 `idempotency_in_progress`. Clients should generate a fresh Idempotency-Key per logical submission (UUID v4 works well) and re-use it only on transport retries.",
         "operationId": "orchestrateRun",
-        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "Client-supplied key that makes a retry of this request safe. Same key + same body replays the prior response; same key + different body 409s. 1..=255 ASCII chars.",
+            "schema": { "type": "string", "minLength": 1, "maxLength": 255 }
+          }
+        ],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrchestrateRequest" } } } },
         "responses": {
           "202": { "description": "Orchestration enqueued" },
-          "400": { "description": "Invalid request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
-          "404": { "description": "Run not found" }
+          "400": { "description": "Invalid request (includes malformed `Idempotency-Key` header)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "409": { "description": "Idempotency-Key conflict — either reused with a different body (`idempotency_key_reuse`) or a request with the same key is still in flight (`idempotency_in_progress`).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
@@ -2107,10 +2232,22 @@ pub const OPENAPI_JSON: &str = r##"{
     "/v1/runs/{id}/recover": {
       "post": {
         "tags": ["Runs"],
-        "summary": "Force run recovery — no-op legacy (scheduled background scanners handle recovery now)",
+        "summary": "Force run recovery — no-op legacy",
+        "description": "**Deprecated.** Manual recovery used to drive cairn-side `RecoveryServiceImpl::recover_interrupted_runs`; recovery now runs unconditionally inside FlowFabric's background scanners (14 total). This endpoint is a 202 stub preserved so dashboards that hit it don't break. Scheduled for removal at v2.\n\nDeprecation is signalled via RFC 8594 response headers: `Deprecation` (the day the endpoint was retired), `Sunset` (the planned removal date), and `Link; rel=\"deprecation\"` (docs URL). Pre-#430 this endpoint returned `\"deprecated\": true` in the body; body markers are invisible to SDK generators and API gateways, so the signal moved into headers per spec.",
+        "deprecated": true,
         "operationId": "recoverRun",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "202": { "description": "Recovery request accepted (no-op)" } }
+        "responses": {
+          "202": {
+            "description": "Recovery request accepted (no-op). Inspect `Deprecation` + `Sunset` response headers per RFC 8594.",
+            "headers": {
+              "Deprecation": { "description": "HTTP-date at which this endpoint was deprecated (RFC 8594).", "schema": { "type": "string" } },
+              "Sunset":      { "description": "HTTP-date at which this endpoint will be removed (RFC 8594).",      "schema": { "type": "string" } },
+              "Link":        { "description": "Link header with `rel=\"deprecation\"` pointing at human-readable docs.", "schema": { "type": "string" } }
+            }
+          },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/runs/{id}/spawn": {
@@ -2194,10 +2331,14 @@ pub const OPENAPI_JSON: &str = r##"{
       "post": {
         "tags": ["Runs"],
         "summary": "Set a cost alert threshold for a run (RFC 010)",
+        "description": "Configures a cost alert that fires when total run cost crosses `threshold_micros`. Returns the created alert record per #431 so the UI can render the configured threshold without a follow-up GET.",
         "operationId": "setRunCostAlert",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
-        "responses": { "201": { "description": "Alert configured" }, "404": { "description": "Run not found" } }
+        "responses": {
+          "201": { "description": "Alert configured — returns the created alert record.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunCostAlertResponse" } } } },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/runs/{id}/audit": {
@@ -3176,8 +3317,12 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Admin"],
         "summary": "Fleet overview (hosts, roles, deployment mode)",
+        "description": "**Scope (#428):** tenant-scoped — the `TenantScope` extractor injects the caller's tenant; non-admin callers only see fleet members bound to their own tenant. Admin principals see every tenant. The path stays outside `/v1/admin/` because it's already correctly scoped.",
         "operationId": "getFleet",
-        "responses": { "200": { "description": "Fleet overview" } }
+        "responses": {
+          "200": { "description": "Fleet overview" },
+          "401": { "description": "Missing or invalid bearer token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/graph/trace": {
@@ -3473,6 +3618,46 @@ pub const OPENAPI_JSON: &str = r##"{
         "operationId": "createSource",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
         "responses": { "201": { "description": "Source created" } }
+      }
+    },
+    "/v1/sources/{id}": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "Fetch a source detail record",
+        "operationId": "getSource",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "project_id", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Source detail" },
+          "404": { "description": "Source not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "patch": {
+        "tags": ["Memory"],
+        "summary": "Partially update a knowledge source (#426)",
+        "description": "Updates an existing source's name and/or description. Absent fields preserve the current value — PATCH semantics per RFC 7231 §4.3.4. The verb was changed from PUT to PATCH in #426 because the handler has never had full-replacement semantics.",
+        "operationId": "patchSource",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PatchSourceRequest" } } } },
+        "responses": {
+          "200": { "description": "Source updated" },
+          "404": { "description": "Source not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "422": { "description": "Unknown or malformed field", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "delete": {
+        "tags": ["Memory"],
+        "summary": "Deactivate a knowledge source",
+        "operationId": "deleteSource",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Source deactivated" },
+          "404": { "description": "Source not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/sources/process-refresh": {

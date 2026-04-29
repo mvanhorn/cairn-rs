@@ -102,16 +102,28 @@ impl MemoryIngestRequest {
     }
 }
 
+/// PATCH /v1/sources/:id — partial-update request.
+///
+/// Renamed from `UpdateSourceRequest` + PUT to `PatchSourceRequest` +
+/// PATCH per #426. The handler uses `.and_modify()` semantics: absent
+/// fields keep their existing values. PUT would imply full replacement
+/// per RFC 7231 §4.3.4, so PATCH is the correct verb for this shape.
 #[derive(Clone, Debug, serde::Deserialize)]
-pub(crate) struct UpdateSourceRequest {
+#[serde(deny_unknown_fields)]
+pub(crate) struct PatchSourceRequest {
     tenant_id: String,
     workspace_id: String,
     project_id: String,
+    /// When `Some`, overwrites the existing name. When `None`, the
+    /// existing name is preserved.
+    #[serde(default)]
     name: Option<String>,
+    /// Same partial-update semantics as `name`.
+    #[serde(default)]
     description: Option<String>,
 }
 
-impl UpdateSourceRequest {
+impl PatchSourceRequest {
     fn project(&self) -> ProjectKey {
         ProjectKey::new(
             self.tenant_id.as_str(),
@@ -602,31 +614,81 @@ pub(crate) async fn get_source_handler(
     }
 }
 
-pub(crate) async fn update_source_handler(
+/// PATCH /v1/sources/:id — partial update.
+///
+/// Renamed + remethoded from PUT per #426. PUT RFC 7231 §4.3.4 semantics
+/// demand full replacement; this handler preserves existing fields
+/// when the caller omits them, so PATCH is the correct verb.
+pub(crate) async fn patch_source_handler(
     State(state): State<Arc<AppState>>,
+    // PR #555 review (Copilot, memory.rs:635): tenant-scope gate. A
+    // body-supplied `tenant_id` that does not match the authenticated
+    // tenant MUST be refused before the mutation, otherwise any
+    // authenticated caller can PATCH another tenant's source by
+    // spelling a foreign `tenant_id` in the JSON body (same class of
+    // bug as #337/#537). We intentionally return 404 rather than 403
+    // on mismatch so cross-tenant probing cannot distinguish "source
+    // exists in other tenant" from "source does not exist" — the
+    // convention established for tools.rs in #537.
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
-    Json(body): Json<UpdateSourceRequest>,
+    // PR #555 review (Copilot): route `deny_unknown_fields` rejections
+    // through the canonical `Error` envelope via `json_rejection_response`
+    // instead of axum's default (which skips `status_code` /
+    // `request_id`). Without this, OpenAPI's 422 `Error` schema lies.
+    body: Result<Json<PatchSourceRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(err) => return crate::errors::json_rejection_response(err),
+    };
     let project = body.project();
     let source_id = SourceId::new(id);
+
+    // Tenant-scope gate: body's tenant MUST match the authenticated
+    // tenant for non-admin callers. 404 on mismatch (existence-leak
+    // safe; #337/#537 convention).
+    if !tenant_scope.is_admin && project.tenant_id != *tenant_scope.tenant_id() {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "source not found")
+            .into_response();
+    }
+
     if source_detail_for(&state, &project, &source_id).is_none() {
         return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "source not found")
             .into_response();
     }
 
-    state
+    // #426: partial-update semantics. Only overwrite fields the caller
+    // actually sent; absent optional fields keep their existing value.
+    //
+    // PR #555 review (Copilot, memory.rs:655): zero extra clones.
+    // The prior version cloned both fields inside `.and_modify` AND
+    // moved the originals into `.or_insert`, paying 2 allocations per
+    // PATCH when a single `match` on the `Entry` moves each
+    // `Option<String>` exactly once — into whichever arm runs.
+    use std::collections::hash_map::Entry;
+    match state
         .source_metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(source_id.as_str().to_owned())
-        .and_modify(|entry| {
-            entry.name = body.name.clone();
-            entry.description = body.description.clone();
-        })
-        .or_insert(AppSourceMetadata {
-            name: body.name,
-            description: body.description,
-        });
+    {
+        Entry::Occupied(mut slot) => {
+            let entry = slot.get_mut();
+            if let Some(name) = body.name {
+                entry.name = Some(name);
+            }
+            if let Some(desc) = body.description {
+                entry.description = Some(desc);
+            }
+        }
+        Entry::Vacant(slot) => {
+            slot.insert(AppSourceMetadata {
+                name: body.name,
+                description: body.description,
+            });
+        }
+    }
 
     match source_detail_for(&state, &project, &source_id) {
         Some(detail) => (StatusCode::OK, Json(detail)).into_response(),

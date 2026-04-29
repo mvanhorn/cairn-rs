@@ -784,8 +784,11 @@ impl AppBootstrap {
                     (HttpMethod::Get, "/v1/sources/:id") => {
                         router.route(&path, get(get_source_handler))
                     }
-                    (HttpMethod::Put, "/v1/sources/:id") => {
-                        router.route(&path, put(update_source_handler))
+                    // #426: PATCH replaces PUT. Pre-release, no deprecation
+                    // alias — partial-update semantics are correct, and PUT
+                    // would imply full replacement per RFC 7231 §4.3.4.
+                    (HttpMethod::Patch, "/v1/sources/:id") => {
+                        router.route(&path, patch(patch_source_handler))
                     }
                     (HttpMethod::Delete, "/v1/sources/:id") => {
                         router.route(&path, delete(delete_source_handler))
@@ -1511,10 +1514,14 @@ impl AppBootstrap {
                 get(get_eval_asset_export_handler),
             )
             // ── Sources / Ingest ──────────────────────────────────────────────────────
+            // #426: `/v1/sources/:id` — PATCH replaces PUT. The handler
+            // has partial-update semantics (absent fields keep their
+            // existing value), so PUT was a verb-contract violation per
+            // RFC 7231 §4.3.4. Pre-release; no compatibility alias.
             .route(
                 "/v1/sources/:id",
                 get(get_source_handler)
-                    .put(update_source_handler)
+                    .patch(patch_source_handler)
                     .delete(delete_source_handler),
             )
             .route("/v1/sources/:id/chunks", get(list_source_chunks_handler))

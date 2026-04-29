@@ -25,7 +25,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { clsx } from "clsx";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import { ErrorFallback } from "../components/ErrorFallback";
 import { useClipboard } from "../hooks/useClipboard";
 import type { ModelCatalogEntry } from "../lib/types";
@@ -257,10 +257,14 @@ export function CostCalculatorPage() {
     retry: 1,
   });
 
-  const MODELS: ModelRow[] = useMemo(() => {
-    if (!catalog?.items) return [];
-    return catalogToRows(catalog.items, configuredIds);
-  }, [catalog, configuredIds]);
+  // #425: `unwrapList` normalizes both the current envelope shape
+  // (`{items, has_more}`) and any future flat-array shape. Previously
+  // this short-circuited on absent `.items`, which also short-circuited
+  // the empty-envelope case — same outward result.
+  const MODELS: ModelRow[] = useMemo(
+    () => catalogToRows(unwrapList<ModelCatalogEntry>(catalog), configuredIds),
+    [catalog, configuredIds],
+  );
 
   const PROVIDERS = useMemo(
     () => [...new Set(MODELS.map(m => m.provider))].sort(),

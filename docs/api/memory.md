@@ -32,7 +32,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `POST` | `/v1/sources` | Preserve |  |
 | `DELETE` | `/v1/sources/:id` | Preserve |  |
 | `GET` | `/v1/sources/:id` | Preserve |  |
-| `PUT` | `/v1/sources/:id` | Preserve |  |
+| `PATCH` | `/v1/sources/:id` | Preserve | partial update; absent fields keep existing value (#426) |
 | `GET` | `/v1/sources/:id/chunks` | Preserve |  |
 | `GET` | `/v1/sources/:id/quality` | Preserve |  |
 | `GET` | `/v1/sources/:id/refresh-schedule` | Preserve |  |

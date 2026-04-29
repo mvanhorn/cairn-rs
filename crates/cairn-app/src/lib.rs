@@ -12,6 +12,7 @@ pub mod extractors;
 pub mod fabric_adapter;
 pub mod handlers;
 pub mod helpers;
+pub mod idempotency;
 pub mod marketplace_routes;
 pub mod metrics;
 #[cfg(feature = "metrics-otel")]

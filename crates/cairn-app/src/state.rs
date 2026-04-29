@@ -382,6 +382,15 @@ pub struct AppState {
     /// buffer stays in the binary (preserving the crate boundary) while
     /// the lib-level SSE publish loop can still push into it.
     pub notification_sink: Arc<NotificationSink>,
+    /// #433: per-tenant per-endpoint Idempotency-Key cache for the
+    /// orchestrate handler (the only endpoint wired in this PR — see
+    /// `idempotency.rs` module doc for the rationale and follow-up
+    /// wiring plan for create-run / create-tool-invocation). Entries
+    /// expire after 5 min; cap is 5_000 entries with amortized
+    /// eviction. In-process only — multi-node team mode still lets a
+    /// retry hit a different node; that gap closes with a future
+    /// FF-backed shared cache.
+    pub idempotency_cache: Arc<crate::idempotency::IdempotencyCache>,
 }
 
 /// F50: dynamic-dispatch wrapper so the lib crate can push
@@ -1218,6 +1227,7 @@ impl AppState {
             provider_fallback_cooldown: Arc::new(ScopedProviderFallbackCooldown::new()),
             orchestrate_kick_tx: Arc::new(OrchestrateKickSender::new()),
             notification_sink: Arc::new(NotificationSink::new()),
+            idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new()),
         };
         state.runtime.store.reset_usage_counters();
 

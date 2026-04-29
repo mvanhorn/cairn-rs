@@ -138,10 +138,10 @@ async fn sources_crud_and_memory_ingest_roundtrip() {
         .unwrap_or_default();
     assert!(!chunks.is_empty(), "expected ingested chunks, got {body}");
 
-    // 5. Update source metadata.
+    // 5. Update source metadata via PATCH (partial update, #426).
     let res = h
         .client()
-        .put(format!("{base}/v1/sources/{}", encoded_source_id))
+        .patch(format!("{base}/v1/sources/{}", encoded_source_id))
         .bearer_auth(&h.admin_token)
         .json(&json!({
             "tenant_id":    h.tenant,

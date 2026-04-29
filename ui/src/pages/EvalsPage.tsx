@@ -19,7 +19,7 @@ import { StatCard } from "../components/StatCard";
 import { useToast } from "../components/Toast";
 import { MiniChart } from "../components/MiniChart";
 import { BarChart } from "../components/BarChart";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { useScope } from "../hooks/useScope";
 import type { EvalRunRecord, EvalRunStatus } from "../lib/types";
@@ -409,7 +409,8 @@ export function EvalsPage() {
     onError: (e) => toast.error(errorMessage(e, "Failed to create eval run.")),
   });
 
-  const runs = data?.items ?? [];
+  // #425: shared normalizer.
+  const runs = unwrapList<EvalRunRecord>(data);
   const annotated = useMemo(
     () => runs.map((r) => ({ ...r, _status: deriveStatus(r) })),
     [runs],
@@ -536,7 +537,7 @@ export function EvalsPage() {
                       className="mt-1 w-full rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-950 text-gray-700 dark:text-zinc-300 text-[12px] px-2 py-1.5 focus:outline-none focus:border-indigo-500"
                     >
                       <option value="">— none —</option>
-                      {(releasesQ.data?.items ?? []).map(r => (
+                      {unwrapList<import("../lib/types").PromptReleaseRecord>(releasesQ.data).map(r => (
                         <option key={r.prompt_release_id} value={r.prompt_release_id}>
                           {r.prompt_release_id}
                         </option>

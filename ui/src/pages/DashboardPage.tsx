@@ -28,7 +28,7 @@ import { sectionLabel, skeleton } from "../lib/design-system";
 import { EventLog } from "../components/EventLog";
 import { MiniChart } from "../components/MiniChart";
 import { BarChart } from "../components/BarChart";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import { useAutoRefresh, REFRESH_OPTIONS } from "../hooks/useAutoRefresh";
 import { useScope } from "../hooks/useScope";
 import type { StatCardVariant } from "../components/StatCard";
@@ -344,17 +344,20 @@ function TokenBar({ inputTokens, outputTokens }: { inputTokens: number; outputTo
   );
 }
 
-/** Aggregate the list-shaped /v1/costs response into a CostSummary. */
+/** Aggregate the list-shaped /v1/costs response into a CostSummary.
+ *
+ * #425: the inline `.items` extraction was replaced with the shared
+ * `unwrapList` helper from api.ts so a future flip to a bare-array
+ * response shape doesn't crash this widget.
+ */
 function aggregateCosts(raw: unknown): CostSummary {
   // If the API already returns CostSummary shape, use it directly.
   if (raw && typeof raw === 'object' && 'total_cost_micros' in raw) {
     return raw as CostSummary;
   }
-  // Otherwise, aggregate from the list response {items: [...], hasMore}.
-  const items: Array<Record<string, number>> =
-    (raw && typeof raw === 'object' && 'items' in raw && Array.isArray((raw as { items: unknown }).items))
-      ? (raw as { items: Array<Record<string, number>> }).items
-      : [];
+  // Otherwise, aggregate from the list response — unwrapList handles
+  // both bare-array and {items, has_more} shapes.
+  const items = unwrapList<Record<string, number>>(raw);
   return items.reduce<CostSummary>(
     (acc, item) => ({
       total_provider_calls: acc.total_provider_calls + (item.provider_calls ?? item.total_provider_calls ?? 0),

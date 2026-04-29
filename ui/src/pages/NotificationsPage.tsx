@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { StatCard } from '../components/StatCard';
-import { defaultApi } from '../lib/api';
+import { defaultApi, unwrapList } from '../lib/api';
 import { sectionLabel } from '../lib/design-system';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { ErrorFallback } from '../components/ErrorFallback';
@@ -638,7 +638,8 @@ export function NotificationsPage() {
 
   const channels    = prefsQuery.data?.channels   ?? [];
   const eventTypes  = prefsQuery.data?.event_types ?? [];
-  const deliveries  = failedQuery.data?.items      ?? [];
+  // #425: shared list-shape normalizer.
+  const deliveries  = unwrapList<import("../lib/types").NotificationRecord>(failedQuery.data);
 
   // Compute per-channel status from failure records
   function channelStatus(ch: NotificationChannel): ChannelStatus {

@@ -3,7 +3,8 @@ import { Activity, BookOpen, Loader2, Wrench } from "lucide-react";
 import { ErrorFallback } from "../components/ErrorFallback";
 import { StatCard } from "../components/StatCard";
 import { FeatureEmptyState } from "../components/FeatureEmptyState";
-import { defaultApi, ApiError } from "../lib/api";
+import { defaultApi, ApiError, unwrapList } from "../lib/api";
+import type { SkillRecord } from "../lib/types";
 import { Card } from "../components/Card";
 import { EntityExplainer } from "../components/EntityExplainer";
 import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
@@ -45,7 +46,9 @@ export function SkillsPage() {
     return <ErrorFallback error={error} resource="skills" onRetry={() => void refetch()} />;
   }
 
-  const items = data?.items ?? [];
+  // #425: use the shared list-shape normalizer so a future flip from
+  // `{items, ...}` to a bare array doesn't crash the page.
+  const items = unwrapList<SkillRecord>(data);
   const summary = data?.summary ?? { total: 0, enabled: 0, disabled: 0 };
   const active = data?.currently_active ?? [];
 

@@ -538,8 +538,17 @@ pub(crate) async fn list_provider_connections_handler(
     }
 }
 
+/// `GET /v1/providers/registry` — admin-only cross-tenant snapshot of
+/// every provider connection cached in this process.
+///
+/// **#428:** response includes `connection_id`, `backend`, and `model`
+/// for every tenant's provider bindings — leaking those to a
+/// per-tenant operator would disclose which providers another tenant
+/// has configured. Gated with `AdminRoleGuard` (admin principal or
+/// workspace-admin role).
 pub(crate) async fn provider_registry_handler(
     State(state): State<Arc<AppState>>,
+    _admin: crate::extractors::AdminRoleGuard,
 ) -> impl IntoResponse {
     let snapshot = state.runtime.provider_registry.snapshot();
     let catalog = static_provider_registry_catalog();

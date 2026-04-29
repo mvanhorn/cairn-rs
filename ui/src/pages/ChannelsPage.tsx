@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { StatCard } from '../components/StatCard';
-import { defaultApi } from '../lib/api';
+import { defaultApi, unwrapList } from '../lib/api';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { ErrorFallback } from '../components/ErrorFallback';
 import { useToast } from '../components/Toast';
@@ -411,7 +411,9 @@ export function ChannelsPage() {
     );
   }
 
-  const channels = listQuery.data?.items ?? [];
+  // #425: shared list-shape normalizer — robust against a future
+  // `{items, ...}` → `T[]` flip on the backend.
+  const channels = unwrapList<import("../lib/types").Channel>(listQuery.data);
 
   return (
     <div className="flex flex-col h-full bg-gray-50 dark:bg-zinc-900">

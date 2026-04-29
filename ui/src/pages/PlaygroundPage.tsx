@@ -9,7 +9,7 @@ import {
   Plus, X, Copy, Check, PanelLeftClose, PanelLeft, GitCompare, Download,
 } from "lucide-react";
 import { clsx } from "clsx";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import { useToast } from "../components/Toast";
 import { FeatureEmptyState } from "../components/FeatureEmptyState";
 
@@ -1001,7 +1001,10 @@ export function PlaygroundPage() {
       return p.default_model ? [p.default_model] : [];
     });
 
-  const connectionModels: string[] = (connectionsData?.items ?? []).flatMap(c => c.supported_models ?? []);
+  // #425: shared list-shape normalizer.
+  const connectionModels: string[] = unwrapList<import("../lib/types").ProviderConnectionRecord>(
+    connectionsData,
+  ).flatMap(c => c.supported_models ?? []);
 
   // Merge: configured models first, then registry, then connections.
   const allModels = [

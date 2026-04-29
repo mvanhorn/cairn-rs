@@ -197,6 +197,23 @@ pub fn close_nonstandard_fds(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{close_nonstandard_fds, enumerate_nonstandard_fds};
+    use std::sync::{Mutex, OnceLock};
+
+    /// Every test in this module inspects `/proc/self/fd/` of the
+    /// shared cargo-test process. Concurrent tests (which cargo runs
+    /// by default) open short-lived readdir handles on the same
+    /// `/proc/<OUR_PID>/fd` path, which shows up in each other's
+    /// `enumerate_nonstandard_fds` output and trips the resolved-form
+    /// assertion in `enumerate_never_returns_own_readdir_fd`. Serialise
+    /// the three tests here via a module-private mutex — the tests are
+    /// cheap so serialisation is fine, and it's strictly safer than
+    /// weakening the assertions.
+    fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     /// #458: each call to `enumerate_nonstandard_fds` opens its own
     /// readdir fd and must exclude it from the returned candidate set.
@@ -211,6 +228,7 @@ mod tests {
     /// assumptions needed.
     #[test]
     fn enumerate_never_returns_own_readdir_fd() {
+        let _serial = serial_guard();
         let own_fd_dir = format!("/proc/{}/fd", std::process::id());
         let candidates = enumerate_nonstandard_fds(None).expect("enumerate");
 
@@ -260,6 +278,7 @@ mod tests {
     /// sandboxed-agent tool-bridge path.
     #[test]
     fn enumerate_excludes_keep_fd() {
+        let _serial = serial_guard();
         // Open a scratch fd so we know there IS at least one candidate
         // that would be returned without keep_fd; then assert it's
         // filtered when passed as keep_fd.
@@ -288,6 +307,7 @@ mod tests {
     /// proc-walk. Preserves the pre-existing error contract.
     #[test]
     fn close_rejects_keep_fd_below_three() {
+        let _serial = serial_guard();
         let err = close_nonstandard_fds(Some(2)).expect_err("keep_fd=2 must be rejected");
         let msg = err.to_string();
         assert!(

@@ -580,3 +580,80 @@ async fn tenant_b_operator_cannot_restore_tenant_a_checkpoint() {
         "tenant-B operator must get 404 restoring A's checkpoint"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Source — cross-tenant PATCH must be 404 (PR #555, Copilot memory.rs:635)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Regression test for the tenant-scope gap Copilot flagged on
+/// `PATCH /v1/sources/:id`. Before the fix, a non-admin operator for
+/// tenant B could overwrite tenant A's source metadata just by
+/// spelling A's `tenant_id`/`workspace_id`/`project_id` in the JSON
+/// body — the handler trusted the body scope verbatim. The handler
+/// now extracts `TenantScope` and rejects with 404 when
+/// `body.tenant_id` disagrees with the authenticated tenant (404 not
+/// 403 per the #337/#537 existence-leak-safe convention).
+#[tokio::test]
+async fn tenant_b_operator_cannot_patch_tenant_a_source() {
+    let h = LiveHarness::setup().await;
+    let source_id = format!("src_{}", &h.project);
+
+    // Seed a source under tenant A's scope.
+    let r = h
+        .client()
+        .post(format!("{}/v1/sources", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id":    h.tenant,
+            "workspace_id": h.workspace,
+            "project_id":   h.project,
+            "source_id":    source_id,
+            "name":         "Original Name",
+            "description":  "owned by tenant A",
+        }))
+        .send()
+        .await
+        .expect("A seed source");
+    assert_eq!(r.status().as_u16(), 201);
+
+    let (b_token, _b_tenant) = foreign_tenant_operator_token(&h).await;
+
+    // B attempts PATCH spelling A's scope in the body.
+    let status = status_only(
+        &h,
+        reqwest::Method::PATCH,
+        &format!("{}/v1/sources/{}", h.base_url, source_id),
+        &b_token,
+        Some(json!({
+            "tenant_id":    h.tenant,
+            "workspace_id": h.workspace,
+            "project_id":   h.project,
+            "name":         "Hijacked by B",
+            "description":  "should never land",
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "tenant-B operator must get 404 patching A's source id={source_id}"
+    );
+
+    // Verify A's source was not side-effected — name is still "Original Name".
+    let r = h
+        .client()
+        .get(format!(
+            "{}/v1/sources/{}?tenant_id={}&workspace_id={}&project_id={}",
+            h.base_url, source_id, h.tenant, h.workspace, h.project,
+        ))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("A source reread");
+    assert_eq!(r.status().as_u16(), 200);
+    let body: Value = r.json().await.expect("source detail json");
+    assert_eq!(
+        body.get("name").and_then(|v| v.as_str()),
+        Some("Original Name"),
+        "tenant B's PATCH must not have mutated tenant A's source name",
+    );
+}

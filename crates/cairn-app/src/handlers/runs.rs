@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -391,6 +391,52 @@ pub(crate) struct SetRunCostAlertRequest {
     #[serde(default, rename = "tenant_id")]
     pub(crate) _tenant_id_deprecated: Option<String>,
     pub(crate) threshold_micros: u64,
+}
+
+/// Response returned on POST /v1/runs/:id/cost-alert so callers can
+/// render the configured threshold without a follow-up GET. Closes #431
+/// (also noted: the sister save-checkpoint endpoint already returns the
+/// created record).
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct RunCostAlertResponse {
+    pub(crate) run_id: String,
+    pub(crate) tenant_id: String,
+    pub(crate) threshold_micros: u64,
+}
+
+// ── Plan review request DTOs (RFC 018) — #427 ────────────────────────────────
+//
+// Before #427 these three endpoints accepted `serde_json::Value` and
+// plucked fields by name. Consequences logged in the audit: unknown
+// fields silently accepted (typos in UI code went through audit as
+// "plan approved with no comment"), wrong types silently ignored,
+// OpenAPI could not describe the shape, no input size cap.
+//
+// Typed structs with `deny_unknown_fields` turn typos into 422s and
+// let utoipa derive a ToSchema so the OpenAPI spec is accurate.
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApprovePlanRequest {
+    #[serde(default)]
+    pub(crate) reviewer_comments: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RejectPlanRequest {
+    /// Optional operator-provided reason. When absent the handler
+    /// substitutes "rejected by operator" (pre-#427 behaviour).
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RevisePlanRequest {
+    /// Required — a revise without reviewer_comments is a no-op from
+    /// the plan-author's perspective.
+    pub(crate) reviewer_comments: String,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -1163,8 +1209,12 @@ pub(crate) async fn list_run_events_handler(
     };
 
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
-    // `from` is a legacy param: treat it as a minimum position filter and return a plain array.
-    let use_legacy_array = query.from.is_some() && query.cursor.is_none();
+    // #429: response shape is ALWAYS `EventsPage { events, next_cursor,
+    // has_more }`. The earlier dual-shape branch (plain array when
+    // `from=N` was passed) violated the 'pick one' rule — OpenAPI
+    // could only describe one shape and SDK generators choked. The
+    // legacy `from=N` query param is still honoured as an alias for
+    // `cursor=N`, but the response wrapper is unconditional.
     let cursor = query.cursor.or(query.from).map(EventPosition);
 
     // Fetch one extra to detect whether more pages exist
@@ -1195,11 +1245,6 @@ pub(crate) async fn list_run_events_handler(
             description: event_message(&e.envelope.payload),
         })
         .collect();
-
-    if use_legacy_array {
-        // Legacy `from=N` callers expect a plain JSON array of event summaries.
-        return (StatusCode::OK, Json(events)).into_response();
-    }
 
     (
         StatusCode::OK,
@@ -1800,10 +1845,26 @@ pub(crate) async fn set_run_cost_alert_handler(
     match state
         .runtime
         .run_cost_alerts
-        .set_alert(run_id, run.project.tenant_id.clone(), body.threshold_micros)
+        .set_alert(
+            run_id.clone(),
+            run.project.tenant_id.clone(),
+            body.threshold_micros,
+        )
         .await
     {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response(),
+        // #431: return the created alert record instead of `{ok: true}`.
+        // The UI was forced to re-list alerts to discover the value it
+        // just set. Callers that only care about success can still
+        // check the HTTP 201 status.
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(RunCostAlertResponse {
+                run_id: run_id.as_str().to_owned(),
+                tenant_id: run.project.tenant_id.as_str().to_owned(),
+                threshold_micros: body.threshold_micros,
+            }),
+        )
+            .into_response(),
         Err(err) => runtime_error_response(err),
     }
 }
@@ -2274,12 +2335,136 @@ async fn finalize_run_failure(
 // ── Orchestrator entry point ──────────────────────────────────────────────
 
 /// POST /v1/runs/:id/orchestrate -- trigger the GATHER -> DECIDE -> EXECUTE loop.
+///
+/// #433: this is the single most expensive POST in the API (LLM tokens,
+/// provider cost, breaker-state writes). A double-submit after a 502
+/// gateway timeout used to burn real budget. This wrapper honors the
+/// `Idempotency-Key` HTTP header: a retry with the same key + same body
+/// replays the first response; a retry with the same key + different
+/// body returns 409. See `crate::idempotency` for the full contract.
 pub(crate) async fn orchestrate_run_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
     Path(run_id_str): Path<String>,
+    headers: axum::http::HeaderMap,
+    // #433 review — Gemini high-severity: use `Json<Value>` as a thin
+    // gate so axum's default 2MB body cap applies. Going through
+    // `serde_json::Value` instead of `OrchestrateRequest` directly
+    // keeps the raw wire bytes available for the idempotency
+    // body-hash (`serde_json::to_vec(&v)` is stable for
+    // round-tripped Value). Pre-fix we used `Bytes` which has no cap.
+    Json(body_value): Json<serde_json::Value>,
+) -> axum::response::Response {
+    use crate::idempotency::{claim, IdempotencyEndpoint};
+
+    // Serialize back to bytes for the idempotency body-hash. `Value`
+    // round-trips deterministically under serde_json's canonical form
+    // (object-key order preserved via IndexMap when the
+    // `preserve_order` feature is on, otherwise alphabetic). Both
+    // orderings are stable WITHIN a given crates.io build, which is
+    // all the hash needs — retries from the same client serialise
+    // the same way.
+    let body_bytes = match serde_json::to_vec(&body_value) {
+        Ok(b) => b,
+        Err(err) => {
+            return AppApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_request",
+                format!("failed to re-serialize body for idempotency hash: {err}"),
+            )
+            .into_response();
+        }
+    };
+
+    // Typed re-parse. Keeps the same 422 semantics the project-wide
+    // `json_rejection_response` maps to — the prior `Bytes` path was
+    // returning 400 on malformed bodies, drifting from the rest of
+    // the API. Copilot review flagged the status-code regression.
+    let body: OrchestrateRequest = match serde_json::from_value(body_value) {
+        Ok(v) => v,
+        Err(err) => {
+            return AppApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_error",
+                format!("invalid orchestrate request: {err}"),
+            )
+            .into_response();
+        }
+    };
+
+    // Claim the idempotency slot. Three outcomes:
+    //   - no header               => guard = None, proceed as normal.
+    //   - claimed                 => guard = Some, run + publish.
+    //   - replay / conflict / 400 => short-circuit with that Response.
+    //
+    // The cache handle is cloned so the borrow doesn't overlap with
+    // the `State(state)` move into the inner handler. `Arc::clone` is
+    // ~2 instructions; fine for a once-per-request path.
+    let cache = state.idempotency_cache.clone();
+    let tenant_id_str = tenant_scope.tenant_id().as_str().to_owned();
+    let guard = match claim(
+        &cache,
+        &headers,
+        &body_bytes,
+        &tenant_id_str,
+        IdempotencyEndpoint::Orchestrate,
+    ) {
+        Ok(g) => g,
+        Err(response) => return response,
+    };
+
+    let response =
+        orchestrate_run_handler_inner(State(state), tenant_scope, Path(run_id_str), Json(body))
+            .await;
+
+    // Cache the response bytes so retries replay verbatim. Axum
+    // responses are streaming by nature; we buffer here to capture the
+    // body. Gemini/Copilot review flagged `to_bytes(..., usize::MAX)`
+    // as an unbounded-buffer DoS vector. Cap at 1MB — far larger than
+    // every observed orchestrate response (tens of KB) but well
+    // below the `DefaultBodyLimit::max(10 * 1024 * 1024)` the router
+    // already enforces on requests. If a future response ever
+    // legitimately exceeds this, we'll see the 500 below and can
+    // revisit.
+    const MAX_RESPONSE_BUFFER_BYTES: usize = 1024 * 1024;
+    if let Some(guard) = guard {
+        let (parts, stream_body) = response.into_parts();
+        let status = parts.status;
+        let collected = match axum::body::to_bytes(stream_body, MAX_RESPONSE_BUFFER_BYTES).await {
+            Ok(b) => b,
+            Err(err) => {
+                // Either the body stream errored or it exceeded the
+                // 1MB cap. Release the claim by dropping the guard
+                // (happens automatically) and return 500 so the
+                // client retries without replaying a broken response.
+                drop(guard);
+                tracing::warn!(
+                    error = %err,
+                    cap_bytes = MAX_RESPONSE_BUFFER_BYTES,
+                    "idempotency: failed to buffer response body (likely exceeded cap)"
+                );
+                return AppApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "idempotency_buffer_failed",
+                    "failed to buffer response body for idempotent replay \
+                     (cap 1MB — increase MAX_RESPONSE_BUFFER_BYTES if legitimate)",
+                )
+                .into_response();
+            }
+        };
+        guard.publish(status, collected.clone());
+        return axum::response::Response::from_parts(parts, axum::body::Body::from(collected));
+    }
+
+    response
+}
+
+async fn orchestrate_run_handler_inner(
+    State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
+    Path(run_id_str): Path<String>,
     Json(body): Json<OrchestrateRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     use cairn_domain::RunId;
     use cairn_harness_tools::{
         HarnessBash, HarnessBashKill, HarnessBashOutput, HarnessBuiltin, HarnessEdit, HarnessGlob,
@@ -3859,6 +4044,13 @@ async fn submit_all_providers_exhausted_proposal(
 ///
 /// Kept as a 202 stub so operator dashboards hitting `/v1/runs/:id/recover`
 /// don't break. Scheduled for removal in v2.
+///
+/// #430: deprecation is signalled via RFC 8594 HTTP response headers
+/// (`Deprecation` + `Sunset` + `Link`) rather than a `deprecated: true`
+/// field in the response body. Header-based markers are what SDK
+/// generators, API gateways, and proxies inspect for lifecycle
+/// management; body markers leak into UI renders and are invisible to
+/// tooling.
 pub(crate) async fn recover_run_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
@@ -3874,16 +4066,43 @@ pub(crate) async fn recover_run_handler(
         Err(response) => return response,
     }
 
+    // RFC 8594 headers. `Deprecation: <http-date>` points to the date
+    // the endpoint was deprecated — PAST tense (RFC 020 milestone
+    // 2026-04-21 when the 14 FF background scanners took over
+    // recovery; see project_rfc020_milestone_tracks_1_4_shipped.md).
+    // `Sunset` points to the planned removal date (v1.0 cut, approx
+    // 2027-04-28). `Link: rel="deprecation"` points SDK consumers at
+    // human docs. Cursor review caught the prior future-dated
+    // `Deprecation` header — RFC 8594 semantics require past-tense.
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "deprecation",
+        HeaderValue::from_static("Tue, 21 Apr 2026 00:00:00 GMT"),
+    );
+    headers.insert(
+        "sunset",
+        HeaderValue::from_static("Wed, 28 Apr 2027 00:00:00 GMT"),
+    );
+    headers.insert(
+        "link",
+        HeaderValue::from_static(
+            "<https://github.com/avifenesh/cairn-rs/blob/main/docs/design/rfcs/\
+             recovery-retirement.md>; rel=\"deprecation\"; type=\"text/html\"",
+        ),
+    );
+
     (
         StatusCode::ACCEPTED,
+        headers,
         Json(serde_json::json!({
             "status": "accepted",
             "note": "recovery is handled by FlowFabric background scanners \
                      (lease_expiry, attempt_timeout, execution_deadline, \
                      suspension_timeout, dependency_reconciler, unblock_scanner, \
                      and 8 others); this endpoint is a no-op kept for \
-                     backwards-compatibility and will be removed in v2",
-            "deprecated": true,
+                     backwards-compatibility and will be removed in v2. \
+                     Inspect the `Deprecation` and `Sunset` response headers \
+                     for the authoritative lifecycle signal (RFC 8594).",
         })),
     )
         .into_response()
@@ -3927,11 +4146,18 @@ pub(crate) async fn approve_plan_handler(
     tenant_scope: TenantScope,
     Extension(principal): Extension<AuthPrincipal>,
     Path(plan_run_id): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    // PR #555 review (Copilot): surface `deny_unknown_fields` / wrong-
+    // type rejections through the canonical `Error` envelope rather
+    // than axum's default body. Matches the OpenAPI 422 contract.
+    body: Result<Json<ApprovePlanRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     use cairn_domain::events::PlanApproved;
     use cairn_runtime::make_envelope;
 
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(err) => return crate::errors::json_rejection_response(err),
+    };
     let run_id = RunId::new(&plan_run_id);
 
     // T6a-C2: tenant scope check.
@@ -3944,10 +4170,16 @@ pub(crate) async fn approve_plan_handler(
         Err(response) => return response,
     };
 
-    let reviewer_comments = body
-        .get("reviewer_comments")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
+    // #427: reviewer_comments is now a typed Option<String>. Normalise
+    // empty strings to None so audit rows carry `null` rather than `""`.
+    //
+    // Copilot review: this IS a semantic change from the pre-typing
+    // behaviour (not a preservation). The old `Value::as_str()` would
+    // have returned `Some("")` for `""`, and `.map(str::to_owned)`
+    // produced `Some("".to_owned())`. We intentionally collapse empty
+    // to None now because an empty `reviewer_comments` audit row is
+    // operator noise, not a signal worth preserving.
+    let reviewer_comments = body.reviewer_comments.filter(|s| !s.is_empty());
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3993,11 +4225,16 @@ pub(crate) async fn reject_plan_handler(
     tenant_scope: TenantScope,
     Extension(principal): Extension<AuthPrincipal>,
     Path(plan_run_id): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    // PR #555 review (Copilot): canonical Error envelope on rejections.
+    body: Result<Json<RejectPlanRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     use cairn_domain::events::PlanRejected;
     use cairn_runtime::make_envelope;
 
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(err) => return crate::errors::json_rejection_response(err),
+    };
     let run_id = RunId::new(&plan_run_id);
 
     // T6a-C2: tenant scope check.
@@ -4010,11 +4247,19 @@ pub(crate) async fn reject_plan_handler(
         Err(response) => return response,
     };
 
+    // #427: reason is now an Option<String>; default to "rejected by
+    // operator" when the caller omits it OR sends an empty string.
+    //
+    // Copilot review: this IS a semantic change from the pre-typing
+    // path. The old `.as_str().unwrap_or("rejected by operator")`
+    // returned the literal `""` when the client sent an empty
+    // string — it only defaulted when the field was absent. We
+    // intentionally collapse empty-to-default here because an empty
+    // `reason` audit row is operator noise, not a meaningful signal.
     let reason = body
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("rejected by operator")
-        .to_owned();
+        .reason
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "rejected by operator".to_owned());
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -4055,11 +4300,16 @@ pub(crate) async fn revise_plan_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
     Path(plan_run_id): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    // PR #555 review (Copilot): canonical Error envelope on rejections.
+    body: Result<Json<RevisePlanRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     use cairn_domain::events::PlanRevisionRequested;
     use cairn_runtime::make_envelope;
 
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(err) => return crate::errors::json_rejection_response(err),
+    };
     let original_run_id = RunId::new(&plan_run_id);
 
     // T6a-C2: tenant scope check.
@@ -4073,11 +4323,10 @@ pub(crate) async fn revise_plan_handler(
             Err(response) => return response,
         };
 
-    let reviewer_comments = body
-        .get("reviewer_comments")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_owned();
+    // #427: reviewer_comments is now a typed String. An empty string
+    // is still a client error (a revise without comments is the same
+    // as not reviewing).
+    let reviewer_comments = body.reviewer_comments;
     if reviewer_comments.is_empty() {
         return bad_request_response("reviewer_comments is required for revise");
     }

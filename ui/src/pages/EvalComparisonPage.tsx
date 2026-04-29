@@ -21,7 +21,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { clsx } from "clsx";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import type { EvalRunRecord, EvalRunStatus } from "../lib/types";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -326,7 +326,9 @@ export function EvalComparisonPage({ leftId, rightId }: EvalComparisonPageProps)
     retry:    false,
   });
 
-  const runs = data?.items ?? [];
+  // #425: normalize through the shared helper so a future shape flip
+  // (`T[]` instead of `{items, ...}`) doesn't crash this widget.
+  const runs = unwrapList<import("../lib/types").EvalRunRecord>(data);
   const left  = runs.find((r) => r.eval_run_id === leftId);
   const right = runs.find((r) => r.eval_run_id === rightId);
 

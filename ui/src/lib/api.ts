@@ -123,8 +123,16 @@ async function apiFetch<T>(
 /**
  * The server may return list endpoints as either a plain `T[]` array or wrapped
  * in `{ items: T[] }`.  This helper normalises both shapes into a plain array.
+ *
+ * **#425:** exported for pages that already hold a list payload (e.g. a
+ * TanStack-Query cached object with `items` AND `has_more`) and just need to
+ * unwrap safely. Pages that DON'T need the `has_more` flag should instead
+ * reach for `client.<method>()` that internally routes through `getList()` —
+ * that's the canonical path. This helper exists as a narrow
+ * escape-hatch/migration aid so sites re-implementing it inline can drop the
+ * copy (DecisionsPage:51-52, DashboardPage:355-356 pre-#425).
  */
-function unwrapList<T>(data: unknown): T[] {
+export function unwrapList<T>(data: unknown): T[] {
   if (Array.isArray(data)) return data as T[];
   if (data && typeof data === 'object' && 'items' in data && Array.isArray((data as { items: unknown }).items)) {
     return (data as { items: T[] }).items;
@@ -401,6 +409,12 @@ export function createApiClient(config: ApiClientConfig) {
   const put  = <T>(path: string, body?: unknown) =>
     apiFetch<T>(config, path, {
       method: "PUT",
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  // PATCH is used for partial-update endpoints (#426: /v1/sources/:id).
+  const patch = <T>(path: string, body?: unknown) =>
+    apiFetch<T>(config, path, {
+      method: "PATCH",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   const del  = <T>(path: string) => apiFetch<T>(config, path, { method: "DELETE" });
@@ -789,6 +803,13 @@ export function createApiClient(config: ApiClientConfig) {
      * Cairn picks the model from the tenant's configured provider bindings;
      * the caller describes the task. Any `model_id` field sent by older
      * callers is ignored by the server.
+     *
+     * #433: sends an `Idempotency-Key` HTTP header so a retry after a
+     * 502 gateway timeout replays the first response instead of firing
+     * a second orchestration loop. The key is a fresh `crypto.randomUUID()`
+     * per call; callers that want to retry a specific submission should
+     * capture the returned key from network logs and resend it manually,
+     * or pass `idempotencyKey` explicitly.
      */
     orchestrateRun: (
       runId: string,
@@ -799,8 +820,23 @@ export function createApiClient(config: ApiClientConfig) {
         approval_timeout_ms?: number;
         mode?: RunModeRequest;
       },
+      idempotencyKey?: string,
     ): Promise<import("./types").OrchestrateResult> =>
-      post(`/v1/runs/${encodeURIComponent(runId)}/orchestrate`, body ?? {}),
+      apiFetch<import("./types").OrchestrateResult>(
+        config,
+        `/v1/runs/${encodeURIComponent(runId)}/orchestrate`,
+        {
+          method: "POST",
+          body: JSON.stringify(body ?? {}),
+          headers: {
+            "Idempotency-Key":
+              idempotencyKey ??
+              (typeof crypto !== "undefined" && "randomUUID" in crypto
+                ? crypto.randomUUID()
+                : `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+          },
+        },
+      ),
 
     /** POST /v1/runs/:id/diagnose — return a diagnosis report for a stuck run. */
     diagnoseRun: (runId: string): Promise<import("./types").DiagnoseResult> =>
@@ -1657,26 +1693,30 @@ export function createApiClient(config: ApiClientConfig) {
       return get(`/v1/sources/${encodeURIComponent(sourceId)}?${qs}`);
     },
 
-    /** PUT /v1/sources/:id — update source metadata (name/description). */
+    /** PATCH /v1/sources/:id — partial-update source metadata (#426).
+     *
+     * Switched from PUT to PATCH because absent fields preserve the
+     * existing value — PUT would imply full replacement per RFC 7231.
+     * Fields the caller doesn't pass are omitted from the body (no
+     * more `null`-to-clear; use an explicit empty string if that is
+     * the intent).
+     */
     updateSource: (sourceId: string, body: {
-      // Widened to `string | null` to match the wire contract — the backend
-      // accepts null to clear these fields, and this client actively sends
-      // null when the caller passes undefined. Matches UpdateSourceRequest
-      // in types.ts.
-      name?: string | null;
-      description?: string | null;
+      name?: string;
+      description?: string;
       tenant_id?: string;
       workspace_id?: string;
       project_id?: string;
     }): Promise<import("./types").SourceDetailResponse> => {
       const merged = withScope(body);
-      return put(`/v1/sources/${encodeURIComponent(sourceId)}`, {
+      const payload: Record<string, unknown> = {
         tenant_id:    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id,
         workspace_id: merged.workspace_id ?? DEFAULT_SCOPE.workspace_id,
         project_id:   merged.project_id   ?? DEFAULT_SCOPE.project_id,
-        name:         body.name        ?? null,
-        description:  body.description ?? null,
-      });
+      };
+      if (body.name !== undefined) payload.name = body.name;
+      if (body.description !== undefined) payload.description = body.description;
+      return patch(`/v1/sources/${encodeURIComponent(sourceId)}`, payload);
     },
 
     /** DELETE /v1/sources/:id — deactivate a source. */
@@ -1832,12 +1872,27 @@ export function createApiClient(config: ApiClientConfig) {
 
     // ── Plan Review (RFC 018) ──────────────────────────────────────────────────
 
-    /** POST /v1/runs/:id/approve — approve a plan-mode run. */
-    approvePlan: (runId: string, body: { approved_by: string; comments?: string }): Promise<unknown> =>
-      post(`/v1/runs/${encodeURIComponent(runId)}/approve`, body),
+    /** POST /v1/runs/:id/approve — approve a plan-mode run.
+     *
+     * #427 / PR #555 review (Cursor bugbot): backend now validates
+     * against `ApprovePlanRequest { reviewer_comments?: string }` with
+     * `deny_unknown_fields`. The old UI shape
+     * `{ approved_by, comments }` would 422 — `approved_by` is
+     * client-side UI chrome that never reached the typed audit row
+     * anyway (the backend stamps the reviewer from the auth
+     * principal, T6a-H7).
+     */
+    approvePlan: (runId: string, body?: { reviewer_comments?: string }): Promise<unknown> =>
+      post(`/v1/runs/${encodeURIComponent(runId)}/approve`, body ?? {}),
 
-    /** POST /v1/runs/:id/reject — reject a plan-mode run. */
-    rejectPlan: (runId: string, body: { rejected_by: string; reason: string }): Promise<unknown> =>
+    /** POST /v1/runs/:id/reject — reject a plan-mode run.
+     *
+     * #427 / PR #555 review (Cursor bugbot): backend now validates
+     * against `RejectPlanRequest { reason?: string }` with
+     * `deny_unknown_fields`. The old `rejected_by` field is dropped
+     * for the same reason as `approved_by` on approve.
+     */
+    rejectPlan: (runId: string, body: { reason: string }): Promise<unknown> =>
       post(`/v1/runs/${encodeURIComponent(runId)}/reject`, body),
 
     /** POST /v1/runs/:id/revise — request revision of a plan-mode run. */

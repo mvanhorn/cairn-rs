@@ -8,7 +8,7 @@ import {
 import { ErrorFallback } from '../components/ErrorFallback';
 import { StatCard } from '../components/StatCard';
 import { useToast } from '../components/Toast';
-import { defaultApi } from '../lib/api';
+import { defaultApi, unwrapList } from '../lib/api';
 import { sectionLabel } from '../lib/design-system';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { useScope } from '../hooks/useScope';
@@ -648,7 +648,8 @@ export function PluginsPage() {
     },
   });
 
-  const plugins = data?.items ?? [];
+  // #425: unwrapList guards against a future shape flip.
+  const plugins = unwrapList<import("../lib/types").PluginManifest>(data);
   const catalogEntries = catalogData?.plugins ?? [];
 
   if (isError) return <ErrorFallback error={error} resource="plugins" onRetry={() => void refetch()} />;

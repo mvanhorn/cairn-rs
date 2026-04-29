@@ -386,7 +386,10 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
   };
 
   const approveMut = useMutation({
-    mutationFn: () => defaultApi.approvePlan(runId, { approved_by: "operator" }),
+    // #427 / PR #555 review: drop the `approved_by` field — backend
+    // attributes the approval from the auth principal. No comments
+    // from the operator UI today; omit the body entirely.
+    mutationFn: () => defaultApi.approvePlan(runId),
     onSuccess: () => {
       toast.success("Plan approved.");
     },
@@ -396,7 +399,9 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
   });
 
   const rejectMut = useMutation({
-    mutationFn: () => defaultApi.rejectPlan(runId, { rejected_by: "operator", reason: rejectReason }),
+    // #427 / PR #555 review: drop the `rejected_by` field — backend
+    // attributes the rejection from the auth principal.
+    mutationFn: () => defaultApi.rejectPlan(runId, { reason: rejectReason }),
     onSuccess: () => {
       toast.success("Plan rejected.");
       setShowReject(false);

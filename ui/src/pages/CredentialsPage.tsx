@@ -19,7 +19,7 @@ import {
   KeyRound, Lock, Eye, EyeOff, AlertTriangle,
 } from 'lucide-react';
 import { clsx } from 'clsx';
-import { defaultApi } from '../lib/api';
+import { defaultApi, unwrapList } from '../lib/api';
 import { useScope } from '../hooks/useScope';
 import { DEFAULT_SCOPE } from '../lib/scope';
 import { useFocusTrap } from '../hooks/useFocusTrap';
@@ -517,7 +517,8 @@ export function CredentialsPage() {
     },
   });
 
-  const creds      = data?.items ?? [];
+  // #425: shared normalizer — absent items or bare-array shape safe.
+  const creds      = unwrapList<import("../lib/types").CredentialSummary>(data);
   const active     = creds.filter(c => c.active);
   const encrypted  = active.filter(c => !!c.encrypted_at_ms);
   const typeSet    = new Set(active.map(c => c.credential_type));

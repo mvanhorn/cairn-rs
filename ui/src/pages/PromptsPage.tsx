@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { clsx } from "clsx";
 import { Card } from "../components/Card";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { sectionLabel } from "../lib/design-system";
 import { useToast } from "../components/Toast";
@@ -546,7 +546,8 @@ function AssetItem({
     staleTime: 60_000,
   });
 
-  const versions = (versionsData?.items ?? []).sort(
+  // #425: shared list-shape normalizer.
+  const versions = unwrapList<PromptVersionRecord>(versionsData).sort(
     (a, b) => (b.version_number ?? 0) - (a.version_number ?? 0),
   );
 
@@ -824,8 +825,9 @@ export function PromptsPage() {
     retry: false,
   });
 
-  const assets   = assetsData?.items   ?? [];
-  const releases = releasesData?.items ?? [];
+  // #425: shared list-shape normalizer on both payloads.
+  const assets   = unwrapList<PromptAssetRecord>(assetsData);
+  const releases = unwrapList<PromptReleaseRecord>(releasesData);
 
   // Derive latest release state per asset for filtering
   const latestState = (assetId: string): PromptReleaseState | null => {

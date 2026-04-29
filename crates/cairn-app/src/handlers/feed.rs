@@ -21,7 +21,7 @@ use cairn_store::EventLog;
 use crate::errors::{
     bad_request_response, now_ms, runtime_error_response, store_error_response, AppApiError,
 };
-use crate::extractors::OptionalProjectScopedQuery;
+use crate::extractors::{AdminRoleGuard, OptionalProjectScopedQuery};
 use crate::helpers::{event_message, event_type_name, mailbox_message_view, run_id_for_event};
 use crate::state::{AppMailboxMessage, AppState, MailboxMessageView};
 
@@ -356,8 +356,19 @@ pub(crate) async fn mark_mailbox_delivered_handler(
 ///
 /// No SSE connection needed — suitable for initial page load.
 /// Returns at most `limit` events (default 50, capped at 500).
+/// `GET /v1/events/recent` — cross-tenant event log peek.
+///
+/// **Admin-only (#428).** The handler reads `store.read_stream(None, ...)`
+/// without any tenant filter, so its output leaks event rows from every
+/// tenant on the deployment. The audit suggested either moving the path
+/// under `/v1/admin/` or gating it with `AdminRoleGuard`. Keeping the
+/// legacy path (pre-release; no users to break) and gating via guard
+/// is the least-invasive fix — callers that need per-tenant event
+/// streams should use `GET /v1/stream` (SSE, tenant-scoped) or
+/// `GET /v1/runs/:id/events` (run-scoped).
 pub(crate) async fn recent_events_handler(
     State(state): State<Arc<AppState>>,
+    _admin: AdminRoleGuard,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     let limit: usize = query.limit().min(500);
@@ -394,7 +405,15 @@ pub(crate) async fn recent_events_handler(
 }
 
 /// `GET /v1/stats` — lightweight aggregate counts for the deployment.
-pub(crate) async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+///
+/// **Admin-only (#428).** Same reasoning as `recent_events_handler`:
+/// event counts, active-run counts, and session counts are aggregated
+/// across every tenant and MUST NOT be visible to a per-tenant operator
+/// token (would leak sizing information about tenant B to tenant A).
+pub(crate) async fn stats_handler(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminRoleGuard,
+) -> impl IntoResponse {
     let store = state.runtime.store.as_ref();
 
     let total_events: u64 = store
