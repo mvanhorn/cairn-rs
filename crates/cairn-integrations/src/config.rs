@@ -214,11 +214,18 @@ impl IntegrationRegistry {
     }
 
     /// Remove a registered integration (runtime API).
+    ///
+    /// Removal is a single atomic write on the slot map — both the
+    /// trait-object view (consumed by `get` / `list`) and the typed
+    /// view (consumed by `get_typed`) are dropped in the same
+    /// removal, so no reader can ever observe a partially-
+    /// unregistered state.
     pub async fn unregister(&self, id: &str) -> Result<(), IntegrationError> {
         let mut integrations = self.integrations.write().await;
         if integrations.remove(id).is_none() {
             return Err(IntegrationError::NotConfigured(id.into()));
         }
+        drop(integrations);
         self.configs.write().await.remove(id);
         self.clear_overrides(id).await;
         Ok(())

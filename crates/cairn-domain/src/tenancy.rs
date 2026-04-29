@@ -100,6 +100,24 @@ impl ProjectKey {
             workspace_id: self.workspace_id.clone(),
         }
     }
+
+    /// Parse a canonical `tenant/workspace/project` triple string.
+    ///
+    /// Returns `None` when the string is malformed — wrong arity
+    /// (must be exactly three `/`-separated segments) or any segment
+    /// is empty / whitespace-only. Segments are trimmed.
+    ///
+    /// Centralised here so every integration that ingests a triple
+    /// from config, env, or the operator API shares one parser and
+    /// one set of rejection rules. Keeps pure-string parsing testable
+    /// without touching process env.
+    pub fn parse_triple(raw: &str) -> Option<Self> {
+        let parts: Vec<&str> = raw.split('/').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.trim().is_empty()) {
+            return None;
+        }
+        Some(Self::new(parts[0].trim(), parts[1].trim(), parts[2].trim()))
+    }
 }
 
 impl Default for ProjectKey {
@@ -254,6 +272,29 @@ mod tests {
         assert_eq!(tenant.scope(), Scope::Tenant);
         assert_eq!(workspace.scope(), Scope::Workspace);
         assert_eq!(project.scope(), Scope::Project);
+    }
+
+    #[test]
+    fn parse_triple_rejects_malformed() {
+        // Two-part strings → None.
+        assert!(ProjectKey::parse_triple("only/two").is_none());
+        // Four-part strings → None.
+        assert!(ProjectKey::parse_triple("a/b/c/d").is_none());
+        // Empty segment → None.
+        assert!(ProjectKey::parse_triple("tenant//project").is_none());
+        // Whitespace-only segment → None.
+        assert!(ProjectKey::parse_triple("tenant/ /project").is_none());
+        // Empty string → None.
+        assert!(ProjectKey::parse_triple("").is_none());
+    }
+
+    #[test]
+    fn parse_triple_happy_path_trims_whitespace() {
+        let key =
+            ProjectKey::parse_triple("  tenant / workspace / project ").expect("triple must parse");
+        assert_eq!(key.tenant_id.as_str(), "tenant");
+        assert_eq!(key.workspace_id.as_str(), "workspace");
+        assert_eq!(key.project_id.as_str(), "project");
     }
 }
 

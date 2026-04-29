@@ -1,13 +1,15 @@
-//! Application state, GitHub integration, and startup replay.
+//! Application state and startup replay.
+//!
+//! The GitHub-specific plugin state moved to
+//! `cairn_integrations::github::GitHubPlugin` as part of #557; cairn-app
+//! handlers recover the concrete plugin via
+//! `state.integrations.get_typed::<GitHubPlugin>("github")`.
 
 use async_trait::async_trait;
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, AtomicU32},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use tokio::sync::broadcast;
@@ -307,24 +309,6 @@ pub struct AppState {
     /// Ring buffer of the last 2,000 structured request log entries, populated
     /// by the observability middleware.  Consumed by `GET /v1/admin/logs`.
     pub request_log: Arc<std::sync::RwLock<RequestLogBuffer>>,
-    /// GitHub App integration -- set by main.rs when GITHUB_APP_ID + private key are configured.
-    ///
-    /// DEPRECATED: the canonical registration lives in `self.integrations` (the
-    /// `IntegrationRegistry`).  This field is kept ONLY because the legacy webhook,
-    /// queue, scan, and installation handlers below access `GitHubIntegration`
-    /// fields directly (credentials, installations, issue_queue, etc.) and the
-    /// `Integration` trait does not yet expose them.
-    ///
-    /// TODO(#557, integration-migration): add `as_any()` to the
-    /// `Integration` trait (or surface the needed fields through trait
-    /// methods), migrate the handlers to look up GitHub via
-    /// `state.integrations.get("github")`, then delete this field and
-    /// the `GitHubIntegration` struct. Tracking issue lists the three
-    /// candidate migration strategies; pick one and land it end-to-end
-    /// (the duplicated registration in `main.rs` disappears with this
-    /// field). This is the **canonical** location of the TODO — the two
-    /// references in `main.rs` cite this one.
-    pub github: Option<Arc<GitHubIntegration>>,
     /// Integration plugin registry -- holds all configured integrations (GitHub, Linear, etc.).
     pub integrations: Arc<cairn_integrations::IntegrationRegistry>,
     /// Model catalog — per-model metadata including cost rates and capabilities.
@@ -576,164 +560,6 @@ impl ScopedProviderFallbackCooldown {
         guard.retain(|_, cooldown| !cooldown.is_empty());
         guard.len()
     }
-}
-
-// ── GitHubIntegration ────────────────────────────────────────────────────────
-
-/// Parse a `tenant/workspace/project` env value into a `ProjectKey`.
-/// Returns `None` when unset or malformed (missing parts, empty segments).
-fn parse_triple_env(env_var: &str) -> Option<cairn_domain::ProjectKey> {
-    let raw = std::env::var(env_var).ok()?;
-    let parts: Vec<&str> = raw.split('/').collect();
-    if parts.len() != 3 || parts.iter().any(|p| p.trim().is_empty()) {
-        return None;
-    }
-    Some(cairn_domain::ProjectKey::new(
-        parts[0].trim(),
-        parts[1].trim(),
-        parts[2].trim(),
-    ))
-}
-
-/// T6a-C5: fallback project for unmapped GitHub installations, read from
-/// `CAIRN_GITHUB_DEFAULT_PROJECT` in `tenant/workspace/project` form.
-/// Returns `None` when unset — callers MUST reject the webhook in that
-/// case rather than fall through to the old `default_tenant` triple.
-pub(crate) fn default_github_project_from_env() -> Option<cairn_domain::ProjectKey> {
-    parse_triple_env("CAIRN_GITHUB_DEFAULT_PROJECT")
-}
-
-/// GitHub App integration state.
-pub struct GitHubIntegration {
-    pub credentials: cairn_github::AppCredentials,
-    pub webhook_secret: String,
-    /// Map of installation_id -> InstallationToken (auto-refreshing).
-    pub installations:
-        tokio::sync::RwLock<std::collections::HashMap<u64, cairn_github::InstallationToken>>,
-    /// Operator-configured event->action mappings.
-    pub event_actions: tokio::sync::RwLock<Vec<GitHubEventAction>>,
-    /// Issue processing queue.
-    pub issue_queue: tokio::sync::RwLock<VecDeque<IssueQueueEntry>>,
-    /// Whether the queue dispatcher is paused.
-    pub queue_paused: AtomicBool,
-    /// Whether the queue dispatcher loop is running.
-    pub queue_running: AtomicBool,
-    /// Max concurrent orchestration runs (operator-configurable).
-    pub max_concurrent: AtomicU32,
-    /// Semaphore controlling concurrent run slots.
-    pub run_semaphore: Arc<tokio::sync::Semaphore>,
-    pub http: reqwest::Client,
-}
-
-impl std::fmt::Debug for GitHubIntegration {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GitHubIntegration")
-            .field("app_id", &self.credentials.app_id)
-            .finish()
-    }
-}
-
-impl GitHubIntegration {
-    /// T6a-C5: resolve the ProjectKey for a GitHub App installation.
-    ///
-    /// Today this reads the per-installation env var
-    /// `CAIRN_GITHUB_INSTALLATION_<id>_PROJECT` in the canonical
-    /// `tenant/workspace/project` form. When no env exists, callers fall
-    /// back to `default_github_project_from_env()` (or reject entirely).
-    ///
-    /// A future iteration will move this mapping into the event log via
-    /// a dedicated `GitHubInstallationMapping` projection; this env
-    /// shim is a placeholder so webhooks stop commingling tenants.
-    pub async fn project_for_installation(
-        &self,
-        installation_id: u64,
-    ) -> Option<cairn_domain::ProjectKey> {
-        let key = format!("CAIRN_GITHUB_INSTALLATION_{installation_id}_PROJECT");
-        parse_triple_env(&key)
-    }
-
-    /// Get or create an InstallationToken for the given installation ID.
-    pub async fn token_for_installation(
-        &self,
-        installation_id: u64,
-    ) -> cairn_github::InstallationToken {
-        {
-            let cache = self.installations.read().await;
-            if let Some(token) = cache.get(&installation_id) {
-                return token.clone();
-            }
-        }
-        let token = cairn_github::InstallationToken::new(
-            self.credentials.clone(),
-            installation_id,
-            self.http.clone(),
-        );
-        let mut cache = self.installations.write().await;
-        cache.insert(installation_id, token.clone());
-        token
-    }
-
-    /// Get a GitHubClient for the given installation.
-    pub async fn client_for_installation(
-        &self,
-        installation_id: u64,
-    ) -> cairn_github::GitHubClient {
-        let token = self.token_for_installation(installation_id).await;
-        cairn_github::GitHubClient::with_http(token, self.http.clone())
-    }
-}
-
-// ── GitHubEventAction / WebhookAction ────────────────────────────────────────
-
-/// Configurable event->action mapping for GitHub webhooks.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct GitHubEventAction {
-    /// Event key pattern to match (e.g., "issues.opened", "issues.labeled", "push").
-    /// Supports "*" as wildcard (e.g., "issues.*" matches all issue events).
-    pub event_pattern: String,
-    /// Optional label filter -- only trigger if the issue/PR has this label.
-    #[serde(default)]
-    pub label_filter: Option<String>,
-    /// Optional repo filter -- only trigger for this repo (owner/repo).
-    #[serde(default)]
-    pub repo_filter: Option<String>,
-    /// What to do when the event matches.
-    pub action: WebhookAction,
-}
-
-/// What to do when a webhook event matches a configured pattern.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WebhookAction {
-    /// Create a session + run and trigger orchestration.
-    /// The goal is derived from the issue/PR title + body.
-    CreateAndOrchestrate,
-    /// Post a comment acknowledging the event.
-    Acknowledge,
-    /// Ignore the event (useful for explicit deny rules).
-    Ignore,
-}
-
-// ── IssueQueueEntry / IssueQueueStatus ───────────────────────────────────────
-
-#[derive(Clone, Debug)]
-pub struct IssueQueueEntry {
-    pub repo: String,
-    pub installation_id: u64,
-    pub issue_number: u64,
-    pub title: String,
-    pub session_id: String,
-    pub run_id: String,
-    pub status: IssueQueueStatus,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum IssueQueueStatus {
-    Pending,
-    Processing,
-    WaitingApproval,
-    Completed,
-    Failed(String),
 }
 
 // ── AppState impl ────────────────────────────────────────────────────────────
@@ -1106,7 +932,6 @@ impl AppState {
             bedrock_provider: None,
             tool_registry: None,
             request_log: Arc::new(std::sync::RwLock::new(RequestLogBuffer::new())),
-            github: None,
             integrations: Arc::new(cairn_integrations::IntegrationRegistry::new()),
             model_registry: ModelRegistry::with_bundled()
                 .unwrap_or_else(|_| ModelRegistry::empty()),

@@ -1040,14 +1040,9 @@ async fn real_main() {
     }
 
     // ── Wire GitHub App integration into lib_state ────────────────────────────
-    // The integration registry (`IntegrationRegistry`) is the canonical home for
-    // all integrations. We register a `GitHubPlugin` there.
-    //
-    // The legacy `state.github` (`GitHubIntegration`) is ALSO set here because
-    // the webhook/queue/scan handlers in lib.rs still access its concrete
-    // fields directly. Canonical TODO(#557, integration-migration) lives on
-    // `AppState.github` in state.rs — once that lands, this duplicate
-    // registration block disappears.
+    // The integration registry (`IntegrationRegistry`) is the single source of
+    // truth for all integrations. Handlers recover the concrete `GitHubPlugin`
+    // via `registry.get_typed::<GitHubPlugin>("github")`.
     {
         let github_app_id = std::env::var("GITHUB_APP_ID").ok();
         let github_key_file = std::env::var("GITHUB_PRIVATE_KEY_FILE").ok();
@@ -1060,34 +1055,15 @@ async fn real_main() {
                 Ok(app_id) => match std::fs::read(&key_file) {
                     Ok(pem_bytes) => match cairn_github::AppCredentials::new(app_id, &pem_bytes) {
                         Ok(credentials) => {
-                            // Legacy shim — kept until handlers are migrated to
-                            // the registry. See TODO(#557,
-                            // integration-migration) in state.rs for the
-                            // canonical tracking comment.
-                            let github = cairn_app::GitHubIntegration {
-                                credentials: credentials.clone(),
-                                webhook_secret: webhook_secret.clone(),
-                                installations: tokio::sync::RwLock::new(
-                                    std::collections::HashMap::new(),
-                                ),
-                                event_actions: tokio::sync::RwLock::new(vec![]),
-                                issue_queue: tokio::sync::RwLock::new(
-                                    std::collections::VecDeque::new(),
-                                ),
-                                queue_paused: std::sync::atomic::AtomicBool::new(false),
-                                queue_running: std::sync::atomic::AtomicBool::new(false),
-                                max_concurrent: std::sync::atomic::AtomicU32::new(3),
-                                run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(3)),
-                                http: reqwest::Client::new(),
-                            };
-                            // Canonical registration — the integration registry is the
-                            // single source of truth for all integrations.
                             let github_plugin = cairn_integrations::github::GitHubPlugin::new(
                                 credentials,
                                 webhook_secret,
                                 3,
                             );
-                            // T6b-C4: same fail-loud pattern as above.
+                            // T6b-C4: fail-loud — every prior wire-in step
+                            // (brain provider, bedrock provider) uses the
+                            // same Arc::get_mut pattern with an eprintln +
+                            // exit on clone-before-write. Keep the shape.
                             let lib_mut = match Arc::get_mut(&mut lib_state) {
                                 Some(m) => m,
                                 None => {
@@ -1097,7 +1073,6 @@ async fn real_main() {
                                     std::process::exit(1);
                                 }
                             };
-                            lib_mut.github = Some(Arc::new(github));
                             let registry = match Arc::get_mut(&mut lib_mut.integrations) {
                                 Some(r) => r,
                                 None => {

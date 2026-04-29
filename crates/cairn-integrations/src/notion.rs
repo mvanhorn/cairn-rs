@@ -174,6 +174,10 @@ and open a pull request. For research tasks, compile findings with sources.";
 
 #[async_trait]
 impl Integration for NotionPlugin {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &str {
         "notion"
     }

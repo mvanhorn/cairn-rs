@@ -14,13 +14,38 @@ use axum::{
 };
 
 use cairn_api::sse::SseFrame;
+use cairn_integrations::github::{
+    default_github_project_from_env, GitHubEventAction, GitHubPlugin, IssueQueueEntry,
+    IssueQueueStatus, WebhookAction,
+};
 use cairn_store::EventLog;
 
 use crate::errors::AppApiError;
-use crate::state::{
-    default_github_project_from_env, AppState, GitHubEventAction, GitHubIntegration,
-    IssueQueueEntry, IssueQueueStatus, WebhookAction,
-};
+use crate::state::AppState;
+
+/// Resolve the `GitHubPlugin` from the integration registry.
+///
+/// Returns `None` when the operator has not configured the GitHub
+/// integration (no `GITHUB_APP_ID`/key/webhook-secret at boot and no
+/// `POST /v1/integrations` with `"type": "github"`). Handlers surface
+/// this as `503 github_not_configured`, preserving the pre-migration
+/// contract.
+///
+/// # Cost model
+///
+/// One call is one `RwLock::read().await` + one `HashMap::get` +
+/// `Arc::clone` + `Arc::downcast`. Each handler in this file calls
+/// `github_plugin(&state).await` **exactly once** at entry and binds
+/// the returned `Arc<GitHubPlugin>` to a local (`let github = …`) for
+/// the rest of the request — so repeated registry lookups inside a
+/// single handler never happen. That per-request single-lookup
+/// pattern is deliberate and the reason this file doesn't need an
+/// axum extractor or an `AppState` cache field: the registry already
+/// *is* the cache (`GitHubPlugin` is registered once and the same
+/// `Arc` is handed out for every lookup).
+async fn github_plugin(state: &AppState) -> Option<Arc<GitHubPlugin>> {
+    state.integrations.get_typed::<GitHubPlugin>("github").await
+}
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
@@ -99,7 +124,7 @@ pub(crate) fn event_pattern_matches(pattern: &str, event_key: &str) -> bool {
 }
 
 pub(crate) async fn acknowledge_event(
-    github: &GitHubIntegration,
+    github: &GitHubPlugin,
     installation_id: u64,
     event: &cairn_github::WebhookEvent,
 ) -> Result<(), cairn_github::GitHubError> {
@@ -128,7 +153,7 @@ pub(crate) async fn acknowledge_event(
 
 pub(crate) async fn process_webhook_orchestrate(
     state: &AppState,
-    github: &GitHubIntegration,
+    github: &GitHubPlugin,
     event: &cairn_github::WebhookEvent,
 ) -> Result<(), String> {
     use cairn_domain::{RunId, SessionId};
@@ -600,8 +625,8 @@ pub(crate) async fn github_webhook_handler(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let github = match &state.github {
-        Some(gh) => gh.clone(),
+    let github = match github_plugin(&state).await {
+        Some(gh) => gh,
         None => {
             return AppApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -740,7 +765,7 @@ pub(crate) async fn github_webhook_handler(
 pub(crate) async fn list_webhook_actions_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return Json(serde_json::json!({"actions": [], "github_configured": false}))
@@ -755,7 +780,7 @@ pub(crate) async fn set_webhook_actions_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SetWebhookActionsRequest>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return AppApiError::new(
@@ -777,8 +802,8 @@ pub(crate) async fn github_scan_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ScanRequest>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
-        Some(gh) => gh.clone(),
+    let github = match github_plugin(&state).await {
+        Some(gh) => gh,
         None => {
             return AppApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -953,7 +978,7 @@ pub(crate) async fn github_scan_handler(
     Json(serde_json::json!({"status": "queued", "repo": body.repo, "total_issues": issue_count, "queued": queued_count, "issues": queued})).into_response()
 }
 
-pub(crate) async fn process_issue_queue(state: Arc<AppState>, github: Arc<GitHubIntegration>) {
+pub(crate) async fn process_issue_queue(state: Arc<AppState>, github: Arc<GitHubPlugin>) {
     if github
         .queue_running
         .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -1042,7 +1067,7 @@ pub(crate) async fn process_issue_queue(state: Arc<AppState>, github: Arc<GitHub
 
 pub(crate) async fn orchestrate_single_issue(
     state: &AppState,
-    github: &GitHubIntegration,
+    github: &GitHubPlugin,
     entry: &IssueQueueEntry,
 ) -> Result<IssueQueueStatus, String> {
     let (owner, repo_name) = entry.repo.split_once('/').unwrap_or(("", &entry.repo));
@@ -1126,7 +1151,7 @@ pub(crate) async fn orchestrate_single_issue(
 }
 
 pub(crate) async fn update_queue_status(
-    github: &GitHubIntegration,
+    github: &GitHubPlugin,
     issue_number: u64,
     status: IssueQueueStatus,
 ) {
@@ -1139,7 +1164,7 @@ pub(crate) async fn update_queue_status(
 pub(crate) async fn github_queue_pause_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if let Some(ref gh) = state.github {
+    if let Some(gh) = github_plugin(&state).await {
         gh.queue_paused
             .store(true, std::sync::atomic::Ordering::SeqCst);
         emit_github_progress(&state, serde_json::json!({"action": "queue_paused"}));
@@ -1153,8 +1178,8 @@ pub(crate) async fn github_queue_pause_handler(
 pub(crate) async fn github_queue_resume_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
-        Some(gh) => gh.clone(),
+    let github = match github_plugin(&state).await {
+        Some(gh) => gh,
         None => {
             return AppApiError::new(StatusCode::SERVICE_UNAVAILABLE, "github_not_configured", "")
                 .into_response();
@@ -1198,7 +1223,7 @@ pub(crate) async fn github_queue_skip_handler(
     State(state): State<Arc<AppState>>,
     Path(issue_str): Path<String>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return AppApiError::new(StatusCode::SERVICE_UNAVAILABLE, "github_not_configured", "")
@@ -1229,8 +1254,8 @@ pub(crate) async fn github_queue_retry_handler(
     State(state): State<Arc<AppState>>,
     Path(issue_str): Path<String>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
-        Some(gh) => gh.clone(),
+    let github = match github_plugin(&state).await {
+        Some(gh) => gh,
         None => {
             return AppApiError::new(StatusCode::SERVICE_UNAVAILABLE, "github_not_configured", "")
                 .into_response();
@@ -1272,7 +1297,7 @@ pub(crate) async fn github_queue_retry_handler(
 pub(crate) async fn github_installations_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return Json(serde_json::json!({"installations": [], "configured": false}))
@@ -1297,7 +1322,7 @@ pub(crate) async fn set_queue_concurrency_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return AppApiError::new(StatusCode::SERVICE_UNAVAILABLE, "github_not_configured", "")
@@ -1317,7 +1342,7 @@ pub(crate) async fn set_queue_concurrency_handler(
 
 /// GET /v1/webhooks/github/queue
 pub(crate) async fn github_queue_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return Json(serde_json::json!({

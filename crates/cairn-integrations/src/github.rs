@@ -3,6 +3,11 @@
 //! Implements the `Integration` trait using `cairn_github` for auth, webhooks,
 //! and API operations. The agent prompt, tools, and event→action mappings are
 //! all defaults that the operator can override.
+//!
+//! Also owns the plugin-specific DTOs (`GitHubEventAction`, `WebhookAction`,
+//! `IssueQueueEntry`, `IssueQueueStatus`) that the cairn-app HTTP handlers
+//! consume — these live with the plugin, not on `AppState`, so cairn-app
+//! stays integration-agnostic.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -13,21 +18,55 @@ use tokio::sync::{RwLock, Semaphore};
 
 use crate::{
     EventAction, EventActionMapping, Integration, IntegrationError, IntegrationEvent, QueueStats,
-    WorkItem, WorkItemStatus,
+    WorkItem,
 };
+
+/// Env-var-backed triple lookup that delegates to
+/// [`cairn_domain::ProjectKey::parse_triple`]. Kept as a thin wrapper
+/// so pure-string parsing (and its rejection rules) live with the
+/// domain type and stay testable without env manipulation.
+fn parse_triple_env(env_var: &str) -> Option<cairn_domain::ProjectKey> {
+    let raw = std::env::var(env_var).ok()?;
+    cairn_domain::ProjectKey::parse_triple(&raw)
+}
+
+/// Fallback project for unmapped GitHub installations, read from
+/// `CAIRN_GITHUB_DEFAULT_PROJECT` in `tenant/workspace/project` form.
+/// Returns `None` when unset — callers MUST reject the webhook in that
+/// case rather than fall through to a legacy `default_tenant` triple.
+pub fn default_github_project_from_env() -> Option<cairn_domain::ProjectKey> {
+    parse_triple_env("CAIRN_GITHUB_DEFAULT_PROJECT")
+}
 
 /// GitHub App integration plugin.
 ///
-/// Holds credentials, installation token cache, work queue, and
-/// concurrency controls. Created at startup when GITHUB_APP_ID +
-/// GITHUB_PRIVATE_KEY_FILE + GITHUB_WEBHOOK_SECRET env vars are set.
+/// Holds credentials, installation token cache, webhook event/action
+/// mappings, the issue-processing queue, and concurrency controls.
+/// Created at startup when GITHUB_APP_ID + GITHUB_PRIVATE_KEY_FILE +
+/// GITHUB_WEBHOOK_SECRET env vars are set, or via
+/// `IntegrationRegistry::register_from_config` at runtime.
+///
+/// The cairn-app HTTP handlers recover this concrete type from the
+/// registry via `registry.get_typed::<GitHubPlugin>("github").await`
+/// and reach into `webhook_secret`, `installations`, `event_actions`,
+/// and `issue_queue` directly — the `Integration` trait intentionally
+/// does not surface these plugin-specific concerns.
 pub struct GitHubPlugin {
     pub credentials: cairn_github::AppCredentials,
     pub webhook_secret: String,
     /// Map of installation_id → InstallationToken (auto-refreshing).
     pub installations: RwLock<HashMap<u64, cairn_github::InstallationToken>>,
-    /// Work item queue for processing GitHub issues/PRs.
-    pub queue: RwLock<VecDeque<WorkItem>>,
+    /// Operator-configured event→action mappings.
+    ///
+    /// `default_event_actions()` seeds the trait-level defaults;
+    /// operators mutate this list via the `/v1/integrations/...` HTTP
+    /// surface. Distinct from `EventActionMapping` on the generic
+    /// trait because GitHub's mapping carries a label filter with
+    /// semantics the generic trait does not need to know about.
+    pub event_actions: RwLock<Vec<GitHubEventAction>>,
+    /// Issue processing queue — ingested by `/v1/webhooks/github/scan`
+    /// and drained by `process_issue_queue`.
+    pub issue_queue: RwLock<VecDeque<IssueQueueEntry>>,
     /// Whether the queue dispatcher is paused by the operator.
     pub queue_paused: AtomicBool,
     /// Whether the queue dispatcher loop is currently running.
@@ -58,13 +97,33 @@ impl GitHubPlugin {
             credentials,
             webhook_secret,
             installations: RwLock::new(HashMap::new()),
-            queue: RwLock::new(VecDeque::new()),
+            event_actions: RwLock::new(Vec::new()),
+            issue_queue: RwLock::new(VecDeque::new()),
             queue_paused: AtomicBool::new(false),
             queue_running: AtomicBool::new(false),
             max_concurrent: AtomicU32::new(max_concurrent),
             run_semaphore: Arc::new(Semaphore::new(max_concurrent as usize)),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Resolve the `ProjectKey` for a GitHub App installation.
+    ///
+    /// Today this reads the per-installation env var
+    /// `CAIRN_GITHUB_INSTALLATION_<id>_PROJECT` in the canonical
+    /// `tenant/workspace/project` form. When no env exists, callers
+    /// fall back to `default_github_project_from_env()` (or reject
+    /// entirely).
+    ///
+    /// A future iteration will move this mapping into the event log
+    /// via a dedicated `GitHubInstallationMapping` projection; this
+    /// env shim is a placeholder so webhooks stop commingling tenants.
+    pub async fn project_for_installation(
+        &self,
+        installation_id: u64,
+    ) -> Option<cairn_domain::ProjectKey> {
+        let key = format!("CAIRN_GITHUB_INSTALLATION_{installation_id}_PROJECT");
+        parse_triple_env(&key)
     }
 
     /// Create a GitHubPlugin from a config payload (runtime API).
@@ -150,6 +209,10 @@ Do not call complete_run until you have opened a pull request.";
 
 #[async_trait]
 impl Integration for GitHubPlugin {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &str {
         "github"
     }
@@ -345,20 +408,82 @@ impl Integration for GitHubPlugin {
     }
 
     async fn queue_stats(&self) -> QueueStats {
-        let queue = self.queue.read().await;
+        let queue = self.issue_queue.read().await;
         let mut stats = QueueStats::default();
-        for item in queue.iter() {
-            match &item.status {
-                WorkItemStatus::Pending => stats.pending += 1,
-                WorkItemStatus::Processing => stats.processing += 1,
-                WorkItemStatus::WaitingApproval => stats.waiting_approval += 1,
-                WorkItemStatus::Completed => stats.completed += 1,
-                WorkItemStatus::Failed(_) => stats.failed += 1,
-                WorkItemStatus::Skipped => {}
+        for entry in queue.iter() {
+            match &entry.status {
+                IssueQueueStatus::Pending => stats.pending += 1,
+                IssueQueueStatus::Processing => stats.processing += 1,
+                IssueQueueStatus::WaitingApproval => stats.waiting_approval += 1,
+                IssueQueueStatus::Completed => stats.completed += 1,
+                IssueQueueStatus::Failed(_) => stats.failed += 1,
             }
         }
         stats
     }
+}
+
+// ── GitHubEventAction / WebhookAction ───────────────────────────────────────
+//
+// The operator-configurable event→action mapping the cairn-app webhook
+// handler consumes. Distinct from the crate-level `EventActionMapping`
+// because GitHub's mapping carries a label filter and the `WebhookAction`
+// enum is GitHub-flavoured (comment-based Acknowledge etc.).
+
+/// Configurable event->action mapping for GitHub webhooks.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GitHubEventAction {
+    /// Event key pattern to match (e.g. "issues.opened", "issues.labeled",
+    /// "push"). Supports "*" as wildcard (e.g. "issues.*" matches all
+    /// issue events).
+    pub event_pattern: String,
+    /// Optional label filter — only trigger if the issue/PR has this
+    /// label.
+    #[serde(default)]
+    pub label_filter: Option<String>,
+    /// Optional repo filter — only trigger for this repo (owner/repo).
+    #[serde(default)]
+    pub repo_filter: Option<String>,
+    /// What to do when the event matches.
+    pub action: WebhookAction,
+}
+
+/// What to do when a webhook event matches a configured pattern.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookAction {
+    /// Create a session + run and trigger orchestration. The goal is
+    /// derived from the issue/PR title + body.
+    CreateAndOrchestrate,
+    /// Post a comment acknowledging the event.
+    Acknowledge,
+    /// Ignore the event (useful for explicit deny rules).
+    Ignore,
+}
+
+// ── IssueQueueEntry / IssueQueueStatus ──────────────────────────────────────
+
+/// A single issue queued for orchestration. Produced by the scan
+/// handler, drained by `process_issue_queue`.
+#[derive(Clone, Debug)]
+pub struct IssueQueueEntry {
+    pub repo: String,
+    pub installation_id: u64,
+    pub issue_number: u64,
+    pub title: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub status: IssueQueueStatus,
+}
+
+/// Processing state of a queued GitHub issue.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IssueQueueStatus {
+    Pending,
+    Processing,
+    WaitingApproval,
+    Completed,
+    Failed(String),
 }
 
 #[cfg(test)]
@@ -422,11 +547,11 @@ mod tests {
     async fn queue_stats_counts_correctly() {
         let plugin = make_test_plugin();
         {
-            let mut queue = plugin.queue.write().await;
-            queue.push_back(make_work_item("1", WorkItemStatus::Pending));
-            queue.push_back(make_work_item("2", WorkItemStatus::Processing));
-            queue.push_back(make_work_item("3", WorkItemStatus::Completed));
-            queue.push_back(make_work_item("4", WorkItemStatus::Failed("err".into())));
+            let mut queue = plugin.issue_queue.write().await;
+            queue.push_back(make_queue_entry(1, IssueQueueStatus::Pending));
+            queue.push_back(make_queue_entry(2, IssueQueueStatus::Processing));
+            queue.push_back(make_queue_entry(3, IssueQueueStatus::Completed));
+            queue.push_back(make_queue_entry(4, IssueQueueStatus::Failed("err".into())));
         }
         let stats = plugin.queue_stats().await;
         assert_eq!(stats.pending, 1);
@@ -434,6 +559,11 @@ mod tests {
         assert_eq!(stats.completed, 1);
         assert_eq!(stats.failed, 1);
     }
+
+    // `parse_triple` itself now lives on `cairn_domain::ProjectKey` and is
+    // exercised by the tenancy unit tests. The wrapper here only adds the
+    // `std::env::var` lookup; covering that in a unit test would require
+    // mutating process env (flaky under cargo-test's shared process).
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -445,7 +575,8 @@ mod tests {
             credentials: unsafe_test_credentials(),
             webhook_secret: "test-secret".into(),
             installations: RwLock::new(HashMap::new()),
-            queue: RwLock::new(VecDeque::new()),
+            event_actions: RwLock::new(Vec::new()),
+            issue_queue: RwLock::new(VecDeque::new()),
             queue_paused: AtomicBool::new(false),
             queue_running: AtomicBool::new(false),
             max_concurrent: AtomicU32::new(3),
@@ -454,16 +585,14 @@ mod tests {
         }
     }
 
-    fn make_work_item(id: &str, status: WorkItemStatus) -> WorkItem {
-        WorkItem {
-            integration_id: "github".into(),
-            source_id: "123".into(),
-            external_id: id.into(),
+    fn make_queue_entry(issue_number: u64, status: IssueQueueStatus) -> IssueQueueEntry {
+        IssueQueueEntry {
             repo: "owner/repo".into(),
-            title: format!("Issue {id}"),
-            body: String::new(),
-            run_id: format!("run_{id}"),
-            session_id: format!("sess_{id}"),
+            installation_id: 123,
+            issue_number,
+            title: format!("Issue {issue_number}"),
+            session_id: format!("sess_{issue_number}"),
+            run_id: format!("run_{issue_number}"),
             status,
         }
     }
