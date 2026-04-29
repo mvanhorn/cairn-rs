@@ -1509,21 +1509,33 @@ async fn real_main() {
         }
     }
 
-    // ── Startup replays ────────────────────────────────────────────────────────
-    // Replay all store events into in-memory projections so pre-existing data
-    // (seeded above or loaded from a snapshot) is immediately visible without
-    // requiring an SSE connection first.
+    // ── Startup replays (trigger service only) ───────────────────────────────
+    // Walks the event log at boot to rebuild the in-memory
+    // `TriggerService` cache so pre-existing trigger + template data
+    // (seeded above or loaded from a persistent backend) is immediately
+    // visible to the orchestrator without waiting for an SSE client.
     //
-    // RFC-025 Phase 1 (milestone 6) deleted `replay_evals` — the eval_runs
-    // projection is now the canonical read model (pg V034 + sqlite schema).
-    // `state.evals` is still populated lazily via handler writes on the hot
-    // path; a process restart drops the in-memory cache but all durable eval
-    // state (runs, scores, rubric verdicts, archived-at timestamps) reads
-    // back from the projection tables.
+    // Historical context — two sibling walkers previously ran here and
+    // have been migrated to sync projections / declared Ephemeral:
     //
-    // replay_graph + replay_triggers continue to run here; they migrate to
-    // sync projections in Phases 1.5b + 1.5a respectively.
-    lib_state.replay_graph().await;
+    //   * RFC-025 Phase 1 (milestone 6) deleted `replay_evals` — the
+    //     `eval_runs` read model is now the canonical source (pg V034
+    //     + sqlite schema). `state.evals` is still populated lazily
+    //     via handler writes on the hot path; a process restart drops
+    //     the in-memory cache but all durable eval state (runs,
+    //     scores, rubric verdicts, archived-at timestamps) reads back
+    //     from the projection tables.
+    //
+    //   * RFC-025 Phase 1.5b (2026-04-28) deleted `replay_graph`. The
+    //     graph read-model is declared Ephemeral;
+    //     `publish_runtime_frames_since` populates it on the live
+    //     write path. Pre-restart node IDs return empty subgraphs on
+    //     persistent backends until those entities participate in new
+    //     events (Ephemeral contract). See state.rs for the in-code
+    //     rationale and RFC-025 for the full decision history.
+    //
+    // `replay_triggers` will migrate to a sync projection in RFC-025
+    // Phase 1.5a; once it lands, this whole block goes away.
     lib_state.replay_triggers().await;
 
     // ── META #461: legacy credential-format scan ─────────────────────────────

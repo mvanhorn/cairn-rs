@@ -31,7 +31,6 @@ use cairn_evals::{
     ModelComparisonServiceImpl, PluginDimensionScore, PluginRubricScorer,
 };
 
-use cairn_graph::event_projector::EventProjector as RuntimeGraphProjector;
 use cairn_graph::in_memory::InMemoryGraphStore;
 
 use cairn_memory::api_impl::MemoryApiImpl;
@@ -721,25 +720,31 @@ pub enum IssueQueueStatus {
 // ── AppState impl ────────────────────────────────────────────────────────────
 
 impl AppState {
-    /// Replay all events from the store into the graph projector.
-    ///
-    /// Call this after any external seeding (e.g. demo data) that writes
-    /// to the runtime store outside of the normal API write path.  The
-    /// graph is otherwise populated lazily -- only when API handlers call
-    /// `publish_runtime_frames_since` -- so startup seeding leaves it empty
-    /// until this is called.
-    pub async fn replay_graph(&self) {
-        use cairn_store::event_log::EventLog;
-        match self.runtime.store.read_stream(None, usize::MAX).await {
-            Ok(events) => {
-                let projector = RuntimeGraphProjector::new(self.graph.clone());
-                if let Err(e) = projector.project_events(&events).await {
-                    tracing::warn!("graph replay: projection error: {e:?}");
-                }
-            }
-            Err(e) => tracing::warn!("graph replay: failed to read events: {e}"),
-        }
-    }
+    // RFC-025 Phase 1.5b (2026-04-28): `replay_graph` removed.
+    //
+    // The graph read-model is declared Ephemeral. `AppState.graph` is
+    // `Arc<InMemoryGraphStore>` -- a process-scoped derived index over
+    // the event log. Every event-log append routed through
+    // `publish_runtime_frames_since` (`crates/cairn-app/src/handlers/sse.rs`)
+    // already projects the event into the graph on the write path, so
+    // the boot walker was duplicating that logic O(N) times per restart.
+    //
+    // Post-removal semantics: on persistent backends (pg/sqlite), graph
+    // queries against pre-restart node IDs return empty subgraphs until
+    // those entities participate in new events. This matches the
+    // Ephemeral contract already applied to TaskDependencyAdded /
+    // TaskDependencyResolved in `crates/cairn-store/src/projection_registry.rs`
+    // ("graph projection owns the read model, not cairn-store").
+    //
+    // If provenance traversal across restarts becomes a product
+    // requirement, a later RFC-025 phase wires `PgGraphStore`
+    // (`crates/cairn-graph/src/pg/store.rs`) + a matching SQLite store
+    // behind `GraphProjection` on `AppState.graph`. That migration
+    // drops any boot walker too (the store survives restart under its
+    // own backend) -- it does not reintroduce the replay path.
+    //
+    // See docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md
+    // §"Phase 1.5b" for the full rationale.
 
     // RFC-025 Phase 1 (milestone 6): `replay_evals` removed.
     //

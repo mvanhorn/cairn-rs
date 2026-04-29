@@ -2,8 +2,10 @@
 
 ## Status
 
-Phase 0 IMPLEMENTED — 2026-04-28. Phases 1, 1.5a, 1.5b, 2a, 2b, 3, 4 draft
-(seven phases total; Phase 0 is the infrastructure prerequisite).
+Phase 0 IMPLEMENTED — 2026-04-28. Phase 1 IMPLEMENTED — 2026-04-28.
+Phase 1.5b IMPLEMENTED — 2026-04-28 (graph read-model declared Ephemeral;
+`replay_graph` removed). Phases 1.5a, 2a, 2b, 3, 4 draft (seven phases
+total; Phase 0 is the infrastructure prerequisite).
 
 Authored via iterated proposer/challenger debate (3 rounds). Final verdict:
 **ACCEPTED**. Open questions resolved 2026-04-28:
@@ -298,6 +300,19 @@ SQLite only, nightly CI adds pg.
 **Dependencies.** Phase 0.
 
 **Risk + mitigation.** Graph is the largest read-model; migration table size could be significant. Mitigation: measure on a representative dogfood dataset before deciding Projected vs Ephemeral.
+
+**Decision (landed, 2026-04-28).** The graph read-model is declared **Ephemeral**. `AppState::replay_graph()` and its call site in `main.rs` are removed. Rationale:
+
+- `AppState.graph` is hard-coded as `Arc<InMemoryGraphStore>` — a process-scoped in-memory derived index over the event log. Every node and edge is reconstructable from events; the graph holds no authoritative state.
+- Every event-log append routed through `publish_runtime_frames_since` (`crates/cairn-app/src/handlers/sse.rs`) already projects the event into the graph on the write path. This is the async-derived pattern: graph updates happen after the event is durable in the store but before the SSE frame fans out.
+- The boot walker (`replay_graph`) existed to re-seed the in-memory graph against pre-existing events on Postgres / SQLite backends. It duplicated the write-path projection logic and ran O(N) over the event log on every restart.
+- Keeping the walker blocked the graph from being honestly classified — it pretended the graph was durable when the underlying `Arc<InMemoryGraphStore>` was explicitly not.
+
+**Post-Phase-1.5b semantics.** The graph is empty immediately after boot regardless of backend. It is populated lazily as new events flow through `publish_runtime_frames_since`. Pre-restart node IDs return empty subgraphs on persistent backends until those entities participate in new events. This is the defining property of an Ephemeral read-model and matches the contract already applied to `TaskDependencyAdded` / `TaskDependencyResolved` in the projection registry (marked Ephemeral with the reason "graph projection owns the read model, not cairn-store").
+
+**Future work (out of scope for Phase 1.5b).** If provenance traversal across restarts becomes a product requirement, a later phase can wire `PgGraphStore` (already implemented at `crates/cairn-graph/src/pg/store.rs`) and a matching SQLite store into `AppState.graph` behind a `GraphProjection` trait object, moving the graph from Ephemeral to Projected. That migration would drop the boot walker too — not reintroduce it — because a persistent graph store would survive restart under its own backend. Phase 1.5b chose the simpler Ephemeral path because the migration table for a full graph is "significant" (per the risk note above) and the cost of a wasted boot walker today is real, while the cost of deferring Projected-graph is the documented Ephemeral semantics.
+
+**Registry impact.** None. Graph-relevant event variants (`SessionCreated`, `RunCreated`, `TaskCreated`, `ApprovalRequested`, `TriggerCreated`, `TriggerFired`, `CheckpointRecorded`, `MailboxMessageAppended`, `ToolInvocationStarted`, `SignalIngested`, `IngestJobStarted`, `SubagentSpawned`, `CheckpointRestored`, `EvalRunStarted`, `EvalRunCompleted`) all continue to carry their existing cairn-store projection classification (most Projected with their own read-model tables). The graph is a second derived index — not something the cairn-store registry tracks — so no registry row moves as part of Phase 1.5b.
 
 ### Phase 2a — Fill projection stubs for services with existing events (~2000 LOC)
 
