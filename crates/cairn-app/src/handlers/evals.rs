@@ -61,9 +61,9 @@ use cairn_api::http::ListResponse;
 use crate::extractors::TenantScope;
 use crate::helpers::load_eval_run_visible_to_tenant;
 use crate::{
-    bad_request_response, parse_eval_subject_kind, require_feature, runtime_error_response,
-    store_error_response, AppApiError, AppState, OptionalProjectScopedQuery, ProjectScopedQuery,
-    DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID,
+    parse_eval_subject_kind, require_feature, runtime_error_response, store_error_response,
+    validation_error_response, AppApiError, AppState, OptionalProjectScopedQuery,
+    ProjectScopedQuery, DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID,
 };
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
@@ -737,7 +737,7 @@ pub(crate) async fn create_eval_dataset_handler(
 ) -> impl IntoResponse {
     let subject_kind = match parse_eval_subject_kind(&body.subject_kind) {
         Ok(subject_kind) => subject_kind,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
     let dataset =
         state
@@ -869,7 +869,7 @@ pub(crate) async fn create_eval_run_handler(
 ) -> impl IntoResponse {
     let domain_subject_kind = match parse_eval_subject_kind(&body.subject_kind) {
         Ok(subject_kind) => subject_kind,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
     // Convert cairn_domain::EvalSubjectKind to cairn_evals::EvalSubjectKind via serde.
     let subject_kind: EvalSubjectKind =
@@ -1671,7 +1671,7 @@ pub(crate) async fn compare_eval_runs_handler(
 ) -> impl IntoResponse {
     let run_ids = query.run_ids();
     if run_ids.is_empty() {
-        return bad_request_response("run_ids is required");
+        return validation_error_response("run_ids is required");
     }
 
     let mut runs = Vec::new();

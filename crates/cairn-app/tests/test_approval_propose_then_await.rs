@@ -176,6 +176,7 @@ fn build_phase(
         .tool_call_approval_service(svc)
         .approval_timeout_default(Duration::from_secs(60))
         .build()
+        .expect("test fixture supplies all required services")
 }
 
 fn build_service(

@@ -39,8 +39,8 @@ use cairn_store::projections::{
 use cairn_store::EventLog;
 
 use crate::errors::{
-    bad_request_response, now_ms, operator_event_envelope, run_not_found_response,
-    runtime_error_response, store_error_response, validation_error_response, AppApiError,
+    now_ms, operator_event_envelope, run_not_found_response, runtime_error_response,
+    store_error_response, validation_error_response, AppApiError,
 };
 use crate::extractors::TenantScope;
 use crate::helpers::{build_run_replay_result, checkpoint_recorded_position};
@@ -304,7 +304,7 @@ pub(crate) async fn list_tool_invocations_handler(
     let parsed_state = match query.state.as_deref() {
         Some(s) => match parse_tool_invocation_state(s) {
             Ok(parsed) => Some(parsed),
-            Err(message) => return bad_request_response(message),
+            Err(message) => return validation_error_response(message),
         },
         None => None,
     };

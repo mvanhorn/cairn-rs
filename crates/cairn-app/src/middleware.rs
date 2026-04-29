@@ -24,8 +24,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::errors::{
-    bad_request_response, forbidden_api_error, now_ms, runtime_error_response,
-    store_error_response, AppApiError,
+    forbidden_api_error, now_ms, runtime_error_response, store_error_response, AppApiError,
 };
 use crate::state::{AppState, RateLimitBucket};
 use crate::tokens::RequestLogEntry;
@@ -573,6 +572,40 @@ pub(crate) async fn lookup_workspace_role(
         .map_err(store_error_response)
 }
 
+/// Classify a failure returned by `axum::body::to_bytes` into the
+/// matching HTTP error envelope.
+///
+/// - 413 `payload_too_large` when the failure is the length-limit
+///   path (`http_body_util::LengthLimitError` surfaces as the wrapped
+///   source). Keeps the error parallel to what the axum extractors
+///   return for `JsonRejection::BytesRejection`.
+/// - 400 `bad_request` for every other path (io failure, transport
+///   disconnect, framing error).
+///
+/// `axum::Error` is opaque — it wraps the inner `http_body_util`
+/// error as a source but we don't depend on `http-body-util`
+/// directly. We classify via a stable substring on the `Debug` /
+/// `Display` output of the wrapped chain; the 400 fallback means a
+/// future wording change silently degrades to 400 rather than
+/// mis-classifying. Test: `classify_body_read_error_*` below.
+fn classify_body_read_error(err: &axum::Error) -> AppApiError {
+    let is_length_limit = format!("{err:?}").contains("LengthLimitError")
+        || err.to_string().contains("length limit exceeded");
+    if is_length_limit {
+        AppApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "request body exceeds the 10 MiB limit",
+        )
+    } else {
+        AppApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "invalid request body",
+        )
+    }
+}
+
 pub(crate) async fn infer_workspace_role_for_request(
     state: &AppState,
     principal: &AuthPrincipal,
@@ -584,9 +617,15 @@ pub(crate) async fn infer_workspace_role_for_request(
     if method == axum::http::Method::POST && path == "/v1/runs" {
         let owned_request = std::mem::replace(request, Request::new(Body::empty()));
         let (parts, body) = owned_request.into_parts();
+        // Honour the underlying rejection's native status — a body
+        // that trips the 10 MiB length cap returns 413 Payload Too
+        // Large, while a transport/io failure surfaces as 400 Bad
+        // Request. Mapping everything to 422 previously masked "you
+        // exceeded the cap" with "your body is unparseable". Copilot
+        // review on #564.
         let bytes = to_bytes(body, 10 * 1024 * 1024)
             .await
-            .map_err(|_| bad_request_response("invalid request body"))?;
+            .map_err(|err| classify_body_read_error(&err).into_response())?;
         *request = Request::from_parts(parts, Body::from(bytes.clone()));
 
         let Ok(payload) = serde_json::from_slice::<CreateRunRequest>(&bytes) else {
@@ -1144,5 +1183,47 @@ mod tests {
             hash_rate_limit_token(""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         );
+    }
+
+    // ── classify_body_read_error (audit #483 follow-up, #564 review) ───────
+
+    /// A 10 MiB cap exceeded by an oversized body must map to 413
+    /// Payload Too Large with the `payload_too_large` code — matches
+    /// the status the axum `JsonRejection::BytesRejection` path
+    /// surfaces in `json_rejection_response`, so callers reading the
+    /// response envelope see a stable code across both entry paths.
+    #[tokio::test]
+    async fn classify_body_read_error_length_limit_is_413() {
+        // Build a body that exceeds the 1-byte cap so `to_bytes`
+        // returns `axum::Error` wrapping `LengthLimitError`. Using
+        // the real `to_bytes` rather than a synthetic `axum::Error`
+        // keeps the test honest about the actual wrapped shape.
+        let body = Body::from("aa");
+        let err = to_bytes(body, 1)
+            .await
+            .expect_err("to_bytes over the cap should fail");
+        let envelope = classify_body_read_error(&err);
+        assert_eq!(envelope.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(envelope.error.status_code, 413);
+        assert_eq!(envelope.error.code, "payload_too_large");
+    }
+
+    /// A failure that does NOT match the length-limit substring falls
+    /// back to 400 `bad_request`. The fallback branch is exercised
+    /// directly through the `err.to_string()` / `Debug` substring
+    /// check — if a future `http-body-util` wording change breaks
+    /// detection, we degrade to 400 (wrong but recoverable) rather
+    /// than mis-classifying as 413.
+    #[test]
+    fn classify_body_read_error_unknown_shape_is_400() {
+        // Fake a non-length-limit `axum::Error` by wrapping a
+        // custom `std::io::Error` that has no "LengthLimitError" or
+        // "length limit exceeded" in its formatted output.
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "peer reset");
+        let err = axum::Error::new(io);
+        let envelope = classify_body_read_error(&err);
+        assert_eq!(envelope.status, StatusCode::BAD_REQUEST);
+        assert_eq!(envelope.error.status_code, 400);
+        assert_eq!(envelope.error.code, "bad_request");
     }
 }

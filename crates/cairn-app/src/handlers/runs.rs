@@ -29,7 +29,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::errors::{
-    api_error_with_details, bad_request_response, now_ms, operator_event_envelope, parse_run_state,
+    api_error_with_details, now_ms, operator_event_envelope, parse_run_state,
     run_not_found_response, runtime_error_response, store_error_response,
     validation_error_response, AppApiError,
 };
@@ -539,7 +539,7 @@ pub(crate) async fn list_runs_handler(
     let query = project_scope.into_inner();
     let status_filter = match query.status.as_deref().map(parse_run_state).transpose() {
         Ok(status_filter) => status_filter,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
     let session_id = query.session_id.as_deref().map(SessionId::new);
     let limit = query.limit();
@@ -3455,7 +3455,11 @@ async fn orchestrate_run_handler_inner(
         ))
         .checkpoint_every_n_tool_calls(cfg.checkpoint_every_n_tool_calls)
         .tool_result_cache(state.tool_result_cache.clone())
-        .build();
+        .build()
+        // All six required services are supplied above — any missing
+        // setter here is a compile-time regression, not a runtime
+        // configuration gap, so `.expect` is the right shape.
+        .expect("RuntimeExecutePhase builder misconfigured");
 
     let sse_emitter = std::sync::Arc::new(crate::sse_hooks::SseOrchestratorEmitter::new(
         state.runtime_sse_tx.clone(),
@@ -4331,7 +4335,7 @@ pub(crate) async fn revise_plan_handler(
     // as not reviewing).
     let reviewer_comments = body.reviewer_comments;
     if reviewer_comments.is_empty() {
-        return bad_request_response("reviewer_comments is required for revise");
+        return validation_error_response("reviewer_comments is required for revise");
     }
 
     let now_ms = std::time::SystemTime::now()

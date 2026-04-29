@@ -219,18 +219,36 @@ impl RuntimeExecutePhaseBuilder {
         self.approval_timeout_default = Some(d);
         self
     }
-    pub fn build(self) -> RuntimeExecutePhase {
-        RuntimeExecutePhase {
-            run_service: self.run_service.expect("run_service required"),
-            task_service: self.task_service.expect("task_service required"),
-            approval_service: self.approval_service.expect("approval_service required"),
+    /// Finalise the builder into a [`RuntimeExecutePhase`].
+    ///
+    /// Returns [`BuilderError::Missing`] when any of the six required
+    /// services were never supplied, naming the first one that is
+    /// missing so the caller can add the corresponding setter. Callers
+    /// that have already supplied every service (production startup in
+    /// `handlers::runs`/`handlers::github`, test fixtures) can
+    /// `.expect("builder misconfigured")` at the call site — but the
+    /// error variant makes the diagnosis local and actionable rather
+    /// than a stringly-typed panic inside the library. Audit #476.
+    pub fn build(self) -> Result<RuntimeExecutePhase, BuilderError> {
+        Ok(RuntimeExecutePhase {
+            run_service: self
+                .run_service
+                .ok_or(BuilderError::Missing("run_service"))?,
+            task_service: self
+                .task_service
+                .ok_or(BuilderError::Missing("task_service"))?,
+            approval_service: self
+                .approval_service
+                .ok_or(BuilderError::Missing("approval_service"))?,
             checkpoint_service: self
                 .checkpoint_service
-                .expect("checkpoint_service required"),
-            mailbox_service: self.mailbox_service.expect("mailbox_service required"),
+                .ok_or(BuilderError::Missing("checkpoint_service"))?,
+            mailbox_service: self
+                .mailbox_service
+                .ok_or(BuilderError::Missing("mailbox_service"))?,
             tool_invocation_service: self
                 .tool_invocation_service
-                .expect("tool_invocation_service required"),
+                .ok_or(BuilderError::Missing("tool_invocation_service"))?,
             tool_registry: self.tool_registry,
             decision_service: self.decision_service,
             checkpoint_every_n_tool_calls: self.checkpoint_every_n_tool_calls.max(1),
@@ -241,9 +259,40 @@ impl RuntimeExecutePhaseBuilder {
             approval_timeout_default: self
                 .approval_timeout_default
                 .unwrap_or_else(|| Duration::from_secs(24 * 60 * 60)),
+        })
+    }
+}
+
+/// Errors returned by [`RuntimeExecutePhaseBuilder::build`].
+///
+/// Named `Missing(field: &'static str)` so the caller gets a concrete
+/// field name (`"run_service"`, `"task_service"`, …) and not just a
+/// stringly-typed panic. Construction is a startup-only path, so this
+/// stays a hand-written error type rather than taking on a
+/// `thiserror` dependency for a single variant. Implements
+/// `std::error::Error` + `Display` so callers that want to propagate
+/// (via `?`, `anyhow`, or a startup-log formatter) can, while leaving
+/// production call sites free to `.expect("builder misconfigured")`
+/// when every setter is supplied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuilderError {
+    /// A required service was never supplied via its setter. The
+    /// embedded `&'static str` is the missing field name so operators
+    /// can point at the exact call site.
+    Missing(&'static str),
+}
+
+impl std::fmt::Display for BuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuilderError::Missing(field) => {
+                write!(f, "RuntimeExecutePhaseBuilder: missing {field}")
+            }
         }
     }
 }
+
+impl std::error::Error for BuilderError {}
 
 // ── ExecutePhase impl ─────────────────────────────────────────────────────────
 

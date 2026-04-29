@@ -61,7 +61,7 @@ pub mod gather_impl;
 pub use gather_impl::StandardGatherPhase;
 
 pub mod execute_impl;
-pub use execute_impl::RuntimeExecutePhase;
+pub use execute_impl::{BuilderError as RuntimeExecutePhaseBuilderError, RuntimeExecutePhase};
 
 /// Test-only helpers exposed for cross-crate regression tests.
 ///

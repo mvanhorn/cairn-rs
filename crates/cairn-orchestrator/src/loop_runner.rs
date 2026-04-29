@@ -310,20 +310,13 @@ pub const MIN_DECIDE_BUDGET_MS: u64 = 5_000;
 /// One operator-rejected tool call surfaced by the F46 rejection
 /// drain.
 ///
-/// Packaging the `tool_name` and truncated `preview` alongside the
-/// built `StepSummary` lets the loop emit SSE (or do nothing, as the
-/// current policy requires) without parsing the tool name back out of
-/// the summary text — that's brittle to formatting changes and forces
-/// the summary string to serve two purposes at once.
+/// Thin wrapper around the `StepSummary` that the next DECIDE sees;
+/// earlier drafts also carried `tool_name` + `preview` for prospective
+/// SSE/metrics plumbing, but those fields were never read and
+/// "reserved for later" accumulated churn on every refactor. When an
+/// SSE or metrics consumer materialises we will reinstate the fields
+/// alongside the emission site in the same PR — audit #474.
 struct DrainedRejection {
-    /// Tool whose proposal was rejected. Kept so callers who want to
-    /// emit SSE or metrics don't have to re-derive it from the summary.
-    #[allow(dead_code)] // Reserved for future SSE/metrics plumbing; see run_inner.
-    tool_name: String,
-    /// Operator-supplied reason, already passed through
-    /// `truncate_for_summary` for memory-bounding.
-    #[allow(dead_code)] // Reserved for future SSE/metrics plumbing; see run_inner.
-    preview: String,
     /// Step summary that will be pushed into `step_history` so the
     /// next DECIDE's user message sees the rejection verbatim.
     summary: StepSummary,
@@ -590,11 +583,7 @@ where
                 // rejection semantics.
                 succeeded: true,
             };
-            out.push(DrainedRejection {
-                tool_name,
-                preview,
-                summary,
-            });
+            out.push(DrainedRejection { summary });
         }
         Ok(out)
     }
@@ -854,12 +843,7 @@ where
             let rejections = self
                 .drain_rejected_pending(ctx, &mut drained_call_ids)
                 .await?;
-            for DrainedRejection {
-                tool_name: _,
-                preview: _,
-                summary,
-            } in rejections
-            {
+            for DrainedRejection { summary } in rejections {
                 // Rejections are NOT tool executions — the tool was
                 // never invoked. Emitting a `tool_result` SSE frame
                 // (succeeded=false) would mislead UI consumers and skew

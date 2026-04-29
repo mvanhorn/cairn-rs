@@ -41,11 +41,27 @@ macro_rules! define_id {
             }
         }
 
-        impl Default for $name {
-            fn default() -> Self {
-                Self(String::new())
-            }
-        }
+        // Intentionally no `impl Default`: an empty-string ID has no
+        // meaningful referent and would silently match nothing in a
+        // query (the hazard the audit called out — a test fixture
+        // using `..Default::default()` on a struct with an ID field
+        // flows an empty ID into store queries that then return
+        // empty results, masking the test bug).
+        //
+        // Call sites that genuinely need a placeholder must spell it
+        // — `$name::new("")` (e.g. `TenantId::new("")`) for
+        // schema-migration of an older event shape (the payload
+        // predates the field), or a named sentinel such as
+        // `$name::new("unknown")` for operational fallbacks.
+        //
+        // Separately, serde back-compat for missing ID fields is
+        // handled per-field via
+        // `#[serde(default = "crate::ids::empty_<kind>_id")]`. That
+        // attribute only affects deserialisation of older payloads
+        // where the field was absent; it does not reinstate Rust's
+        // `Default` trait on the ID type itself, so
+        // `..Default::default()` on a struct carrying an ID still
+        // fails to compile. Audit: #473.
     };
 }
 
@@ -93,6 +109,43 @@ define_id!(WorkerId);
 define_id!(WorkspaceId);
 // F65: workspace-filesystem snapshots used by the orchestrator session redesign.
 define_id!(WorkspaceSnapshotId);
+
+// ── Serde migration helpers ───────────────────────────────────────────────
+//
+// Per audit #473, the ID newtypes no longer implement `Default`.
+// A small set of event payloads embed bare-typed IDs with
+// `#[serde(default)]` so that older event-log entries (written
+// before the field existed) still deserialise. For each such field
+// we expose a named helper here so the declaration site can opt in
+// via `#[serde(default = "empty_<kind>_id")]` — the empty-string
+// value is still the payload shape, but the call site reads as a
+// deliberate schema-migration choice rather than a silent Default.
+//
+// When an older event-log entry rehydrates with one of these empty
+// IDs, projections treat it as "attribute was absent at write time";
+// the surrounding payload carries the canonical identity via
+// `ProjectKey` (tenant/workspace/project) so no cross-tenant leak
+// is introduced.
+
+pub(crate) fn empty_task_id() -> TaskId {
+    TaskId::new("")
+}
+
+pub(crate) fn empty_tenant_id() -> TenantId {
+    TenantId::new("")
+}
+
+pub(crate) fn empty_workspace_id() -> WorkspaceId {
+    WorkspaceId::new("")
+}
+
+pub(crate) fn empty_credential_id() -> CredentialId {
+    CredentialId::new("")
+}
+
+pub(crate) fn empty_provider_connection_id() -> ProviderConnectionId {
+    ProviderConnectionId::new("")
+}
 
 #[cfg(test)]
 mod tests {

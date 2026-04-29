@@ -154,6 +154,7 @@ fn build_execute_phase(
         .checkpoint_every_n_tool_calls(1000)
         .tool_result_cache(cache)
         .build()
+        .expect("test fixture supplies all required services")
 }
 
 fn decide_with(proposal: ActionProposal) -> DecideOutput {

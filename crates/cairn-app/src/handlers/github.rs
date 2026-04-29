@@ -391,7 +391,11 @@ pub(crate) async fn webhook_trigger_orchestration(
         .tool_invocation_service(Arc::new(ToolInvocationServiceImpl::new(store)))
         .checkpoint_every_n_tool_calls(config.checkpoint_every_n_tool_calls)
         .tool_result_cache(state.tool_result_cache.clone())
-        .build();
+        .build()
+        // All six required services are supplied above — any missing
+        // setter here is a compile-time regression, not a runtime
+        // configuration gap, so `.expect` is the right shape.
+        .expect("RuntimeExecutePhase builder misconfigured");
 
     let emitter = build_orchestrator_emitter(state);
 

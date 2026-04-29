@@ -17,7 +17,8 @@ use cairn_domain::{ProjectKey, RunId, SessionId, TaskId};
 use cairn_store::EventLog;
 
 use crate::errors::{
-    bad_request_response, now_ms, runtime_error_response, tenant_scope_mismatch_error, AppApiError,
+    now_ms, runtime_error_response, tenant_scope_mismatch_error, validation_error_response,
+    AppApiError,
 };
 use crate::extractors::TenantScope;
 use crate::state::{A2aTaskBinding, AppState, SqEqSessionBinding};
@@ -70,7 +71,7 @@ pub(crate) async fn sqeq_initialize_handler(
     let negotiated = if body.protocol_versions.iter().any(|v| v == "1.0") {
         "1.0".to_owned()
     } else {
-        return bad_request_response("unsupported protocol version");
+        return validation_error_response("unsupported protocol version");
     };
 
     // Generate transport session ID.
@@ -329,7 +330,7 @@ pub(crate) async fn sqeq_events_handler(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let Some(session_id) = params.get("sqeq_session_id") else {
-        return bad_request_response("sqeq_session_id is required");
+        return validation_error_response("sqeq_session_id is required");
     };
 
     let Some(binding) = state

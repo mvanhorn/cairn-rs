@@ -19,7 +19,7 @@ use cairn_store::{EntityRef, EventLog, EventPosition, StoredEvent};
 use utoipa::ToSchema;
 
 use crate::errors::{
-    bad_request_response, parse_session_state, runtime_error_response, store_error_response,
+    parse_session_state, runtime_error_response, store_error_response, validation_error_response,
     AppApiError,
 };
 use crate::extractors::{AdminRoleGuard, HasProjectScope, ProjectJson, ProjectScope, TenantScope};
@@ -147,7 +147,7 @@ pub(crate) async fn list_sessions_handler(
     let query = project_scope.into_inner();
     let status_filter = match query.status.as_deref().map(parse_session_state).transpose() {
         Ok(status_filter) => status_filter,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
     let limit = query.limit();
 
@@ -579,10 +579,10 @@ pub(crate) async fn create_session_handler(
     // any downstream lookup.
     let trimmed = body.session_id.trim().to_owned();
     if trimmed.is_empty() {
-        return bad_request_response("session_id must not be empty");
+        return validation_error_response("session_id must not be empty");
     }
     if trimmed.len() > SESSION_ID_MAX_LEN {
-        return bad_request_response(format!(
+        return validation_error_response(format!(
             "session_id exceeds max length {SESSION_ID_MAX_LEN}"
         ));
     }
@@ -637,10 +637,10 @@ pub(crate) async fn delete_session_snapshots_handler(
 ) -> impl IntoResponse {
     let trimmed = session_id.trim().to_owned();
     if trimmed.is_empty() {
-        return bad_request_response("session_id must not be empty");
+        return validation_error_response("session_id must not be empty");
     }
     if trimmed.len() > SESSION_ID_MAX_LEN {
-        return bad_request_response(format!(
+        return validation_error_response(format!(
             "session_id exceeds max length {SESSION_ID_MAX_LEN}"
         ));
     }
@@ -753,10 +753,10 @@ pub(crate) async fn delete_session_admin_handler(
     // runtime with a 10k-char lookup key.
     let trimmed = session_id.trim().to_owned();
     if trimmed.is_empty() {
-        return bad_request_response("session_id must not be empty");
+        return validation_error_response("session_id must not be empty");
     }
     if trimmed.len() > SESSION_ID_MAX_LEN {
-        return bad_request_response(format!(
+        return validation_error_response(format!(
             "session_id exceeds max length {SESSION_ID_MAX_LEN}"
         ));
     }

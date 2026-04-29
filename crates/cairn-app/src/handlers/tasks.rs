@@ -22,8 +22,8 @@ use cairn_store::EventLog;
 use utoipa::ToSchema;
 
 use crate::errors::{
-    bad_request_response, parse_task_state, runtime_error_response, store_error_response,
-    validation_error_response, AppApiError,
+    parse_task_state, runtime_error_response, store_error_response, validation_error_response,
+    AppApiError,
 };
 use crate::extractors::{HasProjectScope, ProjectJson, ProjectScope, TenantScope};
 use crate::helpers::resolve_session_for_task_record;
@@ -244,7 +244,7 @@ pub(crate) async fn list_tasks_handler(
     let query = project_scope.into_inner();
     let state_filter = match query.state.as_deref().map(parse_task_state).transpose() {
         Ok(state_filter) => state_filter,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
     let run_id = query.run_id.as_deref().map(RunId::new);
     let limit = query.limit();
@@ -291,7 +291,7 @@ pub(crate) async fn create_task_handler(
     let body = project_scope.into_inner();
     // SEC-002: validate ids before they reach FF key builders.
     if let Err(msg) = body.validate() {
-        return bad_request_response(msg);
+        return validation_error_response(msg);
     }
     let project = CreateTaskRequest::project(&body);
     let mut session_id: Option<cairn_domain::SessionId> = None;

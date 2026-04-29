@@ -14,7 +14,7 @@ use axum::{
 
 use cairn_api::auth::AuthPrincipal;
 
-use crate::errors::{bad_request_response, AppApiError};
+use crate::errors::{validation_error_response, AppApiError};
 use crate::extractors::is_admin_principal;
 use crate::state::AppState;
 use crate::tokens::OperatorTokenRecord;
@@ -60,10 +60,10 @@ pub(crate) async fn create_auth_token_handler(
         .into_response();
     }
     if body.operator_id.trim().is_empty() {
-        return bad_request_response("operator_id must not be empty");
+        return validation_error_response("operator_id must not be empty");
     }
     if body.name.trim().is_empty() {
-        return bad_request_response("name must not be empty");
+        return validation_error_response("name must not be empty");
     }
 
     let token_id = format!("tok_{}", uuid::Uuid::new_v4().simple());

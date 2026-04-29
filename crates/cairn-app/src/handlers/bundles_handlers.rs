@@ -17,7 +17,7 @@ use cairn_memory::bundles::{
     BundleEnvelope, ConflictResolutionStrategy, DocumentExportFilters, ImportService,
 };
 
-use crate::errors::{bad_request_response, AppApiError};
+use crate::errors::{validation_error_response, AppApiError};
 use crate::helpers::{parse_csv_values, parse_project_scope};
 use crate::state::AppState;
 
@@ -231,7 +231,7 @@ pub(crate) async fn export_bundle_handler(
 ) -> impl IntoResponse {
     let project = match query.project() {
         Ok(project) => project,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
     let filters = DocumentExportFilters {
         bundle_source_id: None,
@@ -262,7 +262,7 @@ pub(crate) async fn export_filtered_bundle_handler(
 ) -> impl IntoResponse {
     let project = match body.project() {
         Ok(project) => project,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
     let bundle_name = body.bundle_name().to_owned();
     let filters = DocumentExportFilters {

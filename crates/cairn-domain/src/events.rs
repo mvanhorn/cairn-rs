@@ -1676,7 +1676,7 @@ pub struct PromptAssetCreated {
     /// RFC 006: workspace scope — prompt assets belong to a workspace, not a project.
     /// Extracted from `project.workspace_id` at creation time so downstream projections
     /// can scope queries at workspace level without re-deriving from the full project key.
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_workspace_id")]
     pub workspace_id: WorkspaceId,
 }
 
@@ -1690,7 +1690,7 @@ pub struct PromptVersionCreated {
     /// RFC 006: workspace scope — prompt versions inherit workspace from the
     /// owning asset. Extracted from `project.workspace_id` at creation time
     /// so projections can scope at workspace level without re-deriving.
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_workspace_id")]
     pub workspace_id: WorkspaceId,
 }
 
@@ -2188,7 +2188,7 @@ pub struct EvalRubricCreated {
 pub struct EventLogCompacted {
     pub up_to_position: u64,
     pub compacted_at_ms: u64,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: TenantId,
     #[serde(default)]
     pub events_before: u64,
@@ -2221,7 +2221,7 @@ pub struct OperatorIntervention {
     pub action: String,
     #[serde(default)]
     pub run_id: Option<RunId>,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: TenantId,
     #[serde(default)]
     pub reason: String,
@@ -2404,7 +2404,7 @@ pub struct RecoveryEscalated {
 pub struct ResourceShareRevoked {
     pub share_id: String,
     pub revoked_at_ms: u64,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: TenantId,
 }
 
@@ -2415,11 +2415,11 @@ pub struct ResourceShared {
     #[serde(default)]
     pub grantee: String,
     pub shared_at_ms: u64,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: TenantId,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_workspace_id")]
     pub source_workspace_id: WorkspaceId,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_workspace_id")]
     pub target_workspace_id: WorkspaceId,
     #[serde(default)]
     pub resource_id: String,
@@ -2645,7 +2645,7 @@ pub struct RunTemplateDeleted {
 pub struct SnapshotCreated {
     pub snapshot_id: String,
     pub created_at_ms: u64,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: TenantId,
     #[serde(default)]
     pub event_position: u64,
@@ -2657,10 +2657,10 @@ pub struct TaskDependencyAdded {
     pub depends_on: crate::ids::TaskId,
     pub added_at_ms: u64,
     /// Alias for task_id (the dependent task).
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_task_id")]
     pub dependent_task_id: crate::ids::TaskId,
     /// Alias for depends_on (the prerequisite task).
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_task_id")]
     pub depends_on_task_id: crate::ids::TaskId,
     /// Edge kind forwarded to FF. Default `SuccessOnly` so pre-0.2
     /// event-log entries deserialise.
@@ -2678,9 +2678,9 @@ pub struct TaskDependencyResolved {
     pub task_id: crate::ids::TaskId,
     pub prerequisite_id: crate::ids::TaskId,
     pub resolved_at_ms: u64,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_task_id")]
     pub dependent_task_id: crate::ids::TaskId,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_task_id")]
     pub depends_on_task_id: crate::ids::TaskId,
 }
 

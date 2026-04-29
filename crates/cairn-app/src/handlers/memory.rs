@@ -33,7 +33,7 @@ use cairn_api::memory_api::{CreateMemoryRequest, MemoryEndpoints, MemoryItem, Me
 use cairn_api::http::ListResponse;
 
 use crate::{
-    bad_request_response, graph_trace_snapshot, json_rejection_response, memory_api_error_response,
+    graph_trace_snapshot, json_rejection_response, memory_api_error_response,
     runtime_error_response, tenant_scope_mismatch_error, validation_error_response, AppApiError,
     AppSourceMetadata, AppState, OptionalProjectScopedQuery, PendingIngestJobPayload,
     PreservedMemoryListQuery, PreservedMemorySearchParams, ProjectScope, ProjectScopedQuery,
@@ -1032,10 +1032,10 @@ pub(crate) async fn memory_ingest_handler(
     // a structured source_type was accepted and only failed later at
     // retrieval time.
     if body.source_id.trim().is_empty() {
-        return bad_request_response("source_id must not be empty");
+        return validation_error_response("source_id must not be empty");
     }
     if body.document_id.trim().is_empty() {
-        return bad_request_response("document_id must not be empty");
+        return validation_error_response("document_id must not be empty");
     }
     // Structured-JSON source types must carry a parseable JSON payload.
     // Covers both `structured_json` and `json_structured` aliases;
@@ -1046,7 +1046,7 @@ pub(crate) async fn memory_ingest_handler(
         Some(SourceType::StructuredJson) | Some(SourceType::JsonStructured)
     ) {
         if let Err(err) = serde_json::from_str::<serde_json::Value>(&body.content) {
-            return bad_request_response(format!(
+            return validation_error_response(format!(
                 "content is not valid JSON for structured source_type: {err}"
             ));
         }
@@ -1611,7 +1611,7 @@ pub(crate) async fn search_memories_preserved_handler(
 ) -> impl IntoResponse {
     let query = project_scope.into_inner();
     if query.q.trim().is_empty() {
-        return bad_request_response("query parameter q is required");
+        return validation_error_response("query parameter q is required");
     }
 
     match state

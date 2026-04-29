@@ -1323,7 +1323,10 @@ pub struct RunCostAlert {
     pub run_id: crate::ids::RunId,
     pub threshold_micros: u64,
     pub triggered_at_ms: u64,
-    #[serde(default)]
+    // Older event-log entries (pre-tenant-scoping) wrote this
+    // struct without `tenant_id`; deserialise those as empty and
+    // let projections back-fill from the enclosing envelope.
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: crate::ids::TenantId,
     #[serde(default)]
     pub actual_cost_micros: u64,
@@ -1335,15 +1338,26 @@ pub struct ProviderHealthSchedule {
     pub binding_id: crate::ids::ProviderBindingId,
     pub interval_ms: u64,
     pub enabled: bool,
-    #[serde(default)]
+    // Pre-tenant-aware schedules omitted `connection_id` +
+    // `tenant_id`; deserialise those as empty IDs so the projection
+    // layer can resolve them from the linked binding record rather
+    // than failing to load.
+    #[serde(default = "crate::ids::empty_provider_connection_id")]
     pub connection_id: crate::ids::ProviderConnectionId,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: crate::ids::TenantId,
     #[serde(default)]
     pub last_run_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+// Deliberately no `#[derive(Default)]` (audit #473): every caller
+// constructs this with an explicit `model_id: ProviderModelId::new(...)`
+// so a blanket `Default` that would have produced an empty-string ID
+// bought nothing and masked the zero-value hazard. Deserialisation
+// still tolerates missing optional fields via `#[serde(default)]`,
+// but `model_id` is always present in the payload (the canonical
+// primary key) so it stays without a default.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderModelCapability {
     pub model_id: crate::ids::ProviderModelId,
     #[serde(default)]
@@ -1371,7 +1385,9 @@ pub struct ProviderConnectionPool {
     pub max_connections: u32,
     #[serde(default)]
     pub active_connections: u32,
-    #[serde(default)]
+    // Pre-tenant-aware pool snapshots omitted `tenant_id`;
+    // projections back-fill from the owning binding when absent.
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: crate::ids::TenantId,
 }
 

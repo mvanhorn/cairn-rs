@@ -82,6 +82,16 @@ pub(crate) fn forbidden_api_error(message: impl Into<String>) -> AppApiError {
     AppApiError::new(StatusCode::FORBIDDEN, "forbidden", message)
 }
 
+/// 422 Unprocessable Entity with the canonical `validation_error` code.
+///
+/// Use for requests that parse (syntactically valid JSON) but fail
+/// business-rule validation — missing required fields, unknown enum
+/// variants, values outside allowed ranges. Audit #483 removed the
+/// `bad_request_response` alias which returned the same 422 + name,
+/// naming-drift that misled callers into expecting 400. For genuinely
+/// malformed requests that should surface as 400 Bad Request, use the
+/// rejection-path helper `json_rejection_response` which honours the
+/// axum extractor's native status.
 pub(crate) fn validation_error_response(message: impl Into<String>) -> Response {
     AppApiError::new(
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -89,10 +99,6 @@ pub(crate) fn validation_error_response(message: impl Into<String>) -> Response 
         message,
     )
     .into_response()
-}
-
-pub(crate) fn bad_request_response(message: impl Into<String>) -> axum::response::Response {
-    validation_error_response(message)
 }
 
 /// #486: canonical 404 `run not found` envelope, extracted from 18+
@@ -109,7 +115,7 @@ pub(crate) fn memory_api_error_response(err: String) -> Response {
     }
 
     if err.starts_with("invalid memory status:") {
-        return bad_request_response(err);
+        return validation_error_response(err);
     }
 
     AppApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", err).into_response()

@@ -33,8 +33,8 @@ use cairn_store::{EventLog, StoredEvent};
 use cairn_tools::{PluginHost, PluginRegistry};
 
 use crate::errors::{
-    bad_request_response, deployment_mode_label, now_ms, runtime_error_response,
-    storage_backend_label, store_error_response, AppApiError,
+    deployment_mode_label, now_ms, runtime_error_response, storage_backend_label,
+    store_error_response, validation_error_response, AppApiError,
 };
 use crate::helpers::{parse_project_scope, parse_scope_name};
 use crate::middleware::refresh_activity_metrics;
@@ -996,9 +996,9 @@ async fn validate_setting_value(
     if let Some((_, min, max)) = NUMERIC_KEYS.iter().find(|(k, _, _)| *k == key) {
         let n = value
             .as_f64()
-            .ok_or_else(|| bad_request_response(format!("{key} must be a number")))?;
+            .ok_or_else(|| validation_error_response(format!("{key} must be a number")))?;
         if !n.is_finite() || n < *min || n > *max {
-            return Err(bad_request_response(format!(
+            return Err(validation_error_response(format!(
                 "{key} must be within [{min}, {max}]"
             )));
         }
@@ -1006,7 +1006,7 @@ async fn validate_setting_value(
         // silently drop a fractional value, which then falls back to the
         // hard-coded default and misleads the operator. Reject at PUT.
         if INTEGER_ONLY_KEYS.contains(&key) && n.fract() != 0.0 {
-            return Err(bad_request_response(format!(
+            return Err(validation_error_response(format!(
                 "{key} must be a whole number"
             )));
         }
@@ -1018,12 +1018,14 @@ async fn validate_setting_value(
     if MODEL_ID_KEYS.contains(&key) {
         let model_id = value
             .as_str()
-            .ok_or_else(|| bad_request_response(format!("{key} must be a string")))?;
+            .ok_or_else(|| validation_error_response(format!("{key} must be a string")))?;
         if model_id.is_empty() {
-            return Err(bad_request_response(format!("{key} must not be empty")));
+            return Err(validation_error_response(format!(
+                "{key} must not be empty"
+            )));
         }
         if model_id.len() > MODEL_ID_MAX_LEN {
-            return Err(bad_request_response(format!(
+            return Err(validation_error_response(format!(
                 "{key} exceeds max length {MODEL_ID_MAX_LEN}"
             )));
         }
@@ -1161,7 +1163,7 @@ async fn validate_setting_value(
     // Generic string-length cap for everything else.
     if let Some(s) = value.as_str() {
         if s.len() > PROMPT_LIKE_MAX_LEN {
-            return Err(bad_request_response(format!(
+            return Err(validation_error_response(format!(
                 "{key} exceeds max length {PROMPT_LIKE_MAX_LEN}"
             )));
         }
@@ -1175,7 +1177,7 @@ pub(crate) async fn set_default_setting_handler(
     Json(body): Json<SetDefaultSettingRequest>,
 ) -> impl IntoResponse {
     let Some(scope) = parse_scope_name(&scope) else {
-        return bad_request_response("invalid scope");
+        return validation_error_response("invalid scope");
     };
 
     // Per-key validation (closes #228). Unknown/empty/oversized values
@@ -1211,7 +1213,7 @@ pub(crate) async fn get_default_setting_handler(
     use cairn_store::projections::DefaultsReadModel;
 
     let Some(scope_enum) = parse_scope_name(&scope) else {
-        return bad_request_response("invalid scope");
+        return validation_error_response("invalid scope");
     };
 
     match DefaultsReadModel::get(state.runtime.store.as_ref(), scope_enum, &scope_id, &key).await {
@@ -1241,7 +1243,7 @@ pub(crate) async fn clear_default_setting_handler(
     Path((scope, scope_id, key)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
     let Some(scope) = parse_scope_name(&scope) else {
-        return bad_request_response("invalid scope");
+        return validation_error_response("invalid scope");
     };
 
     match state.runtime.defaults.clear(scope, scope_id, key).await {
@@ -1338,7 +1340,7 @@ pub(crate) async fn resolve_default_setting_handler(
     Query(query): Query<ResolveDefaultQuery>,
 ) -> impl IntoResponse {
     let Some((tenant_id, workspace_id, project_id)) = parse_project_scope(&query.project) else {
-        return bad_request_response("project must use tenant/workspace/project");
+        return validation_error_response("project must use tenant/workspace/project");
     };
     let project = ProjectKey::new(tenant_id, workspace_id, project_id);
 

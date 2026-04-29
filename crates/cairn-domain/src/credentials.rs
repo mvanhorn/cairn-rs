@@ -34,7 +34,10 @@ fn default_true() -> bool {
 pub struct CredentialRotationRecord {
     pub rotation_id: String,
     pub tenant_id: TenantId,
-    #[serde(default)]
+    // Early rotation events (pre-id-tracking) wrote only
+    // `rotation_id`; back-compat deserialise with an empty
+    // placeholder so the projection keeps reading older log pages.
+    #[serde(default = "crate::ids::empty_credential_id")]
     pub credential_id: CredentialId,
     #[serde(default)]
     pub rotated_at: u64,

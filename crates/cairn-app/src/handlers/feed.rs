@@ -19,7 +19,7 @@ use cairn_runtime::MailboxService;
 use cairn_store::EventLog;
 
 use crate::errors::{
-    bad_request_response, now_ms, runtime_error_response, store_error_response, AppApiError,
+    now_ms, runtime_error_response, store_error_response, validation_error_response, AppApiError,
 };
 use crate::extractors::{AdminRoleGuard, OptionalProjectScopedQuery};
 use crate::helpers::{event_message, event_type_name, mailbox_message_view, run_id_for_event};
@@ -260,7 +260,7 @@ pub(crate) async fn list_mailbox_handler(
         let more = cap_exceeded || offset.saturating_add(slice.len()) < total;
         (slice, more)
     } else {
-        return bad_request_response("run_id or session_id is required");
+        return validation_error_response("run_id or session_id is required");
     };
 
     let items: Vec<MailboxMessageView> = raw_records

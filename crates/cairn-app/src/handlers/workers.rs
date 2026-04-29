@@ -18,7 +18,7 @@ use cairn_domain::{ProjectKey, RunId, TaskId, WorkerId};
 use cairn_runtime::ExternalWorkerService;
 
 use crate::errors::{
-    bad_request_response, now_ms, runtime_error_response, tenant_scope_mismatch_error,
+    now_ms, runtime_error_response, tenant_scope_mismatch_error, validation_error_response,
 };
 use crate::extractors::TenantScope;
 use crate::helpers::{build_external_worker_report, scoped_worker};
@@ -276,7 +276,7 @@ pub(crate) async fn worker_report_handler(
         body.outcome.as_deref(),
     ) {
         Ok(report) => report,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
 
     match state.runtime.external_workers.report(report).await {
