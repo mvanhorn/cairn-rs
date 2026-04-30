@@ -18,9 +18,23 @@ impl PgSyncProjection {
     /// (not a full `StoredEvent`) so the hot append path does not need to
     /// clone the potentially-large payload (CheckpointCreated snapshots can
     /// be hundreds of KB per event) — see #497.
+    ///
+    /// `event_time_ms` is the wall-clock millisecond at which the event was
+    /// durably logged. On the live append path this is identical to the
+    /// current wall clock; on `ProjectionRebuilder::rebuild_*` it is the
+    /// `StoredEvent.stored_at` of the event being replayed. Projection arms
+    /// whose row data is semantically tied to the event's time (e.g.
+    /// `pause_schedules.resume_at_ms = event_time_ms + resume_after_ms`)
+    /// MUST use this parameter rather than fabricating `now` at apply time,
+    /// otherwise rebuilds silently shift scheduled timestamps forward to
+    /// the rebuild wall clock. Audit columns (`updated_at`, `created_at`
+    /// on current-state tables) are intentionally left on apply-time `now`
+    /// because they describe "when the projection row was last touched",
+    /// which is correctly the rebuild time on replay.
     pub async fn apply_async(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         envelope: &EventEnvelope<RuntimeEvent>,
+        event_time_ms: u64,
     ) -> Result<(), StoreError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -86,6 +100,67 @@ impl PgSyncProjection {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+                // Issue #592: pause_schedules projection — evict-on-resume.
+                // Transition → Paused with a non-None `resume_after_ms`
+                // INSERTs a scheduled-resume row; any transition away
+                // from Paused DELETEs the row (any reason — operator
+                // resume, timer fire, completion, failure, cancel).
+                //
+                // `resume_at_ms` / `created_at_ms` are derived from
+                // `event_time_ms` (the wall-clock at which the event
+                // was durably logged), NOT the projection-apply wall
+                // clock. On live append these are the same; on
+                // `ProjectionRebuilder::rebuild_*` `event_time_ms` is
+                // the stored event's `stored_at`, so replayed pause
+                // rows land at the original schedule instead of
+                // `rebuild_time + resume_after_ms`. Copilot #595.
+                match e.transition.to {
+                    cairn_domain::RunState::Paused => {
+                        if let Some(reason) = &e.pause_reason {
+                            if let Some(resume_after_ms) = reason.resume_after_ms {
+                                // Copilot #595: saturating_add guards
+                                // pathologically large
+                                // `resume_after_ms`; i64::try_from
+                                // falls back to i64::MAX so we always
+                                // bind a legal BIGINT rather than
+                                // wrap-to-negative.
+                                let resume_at_ms_u64 =
+                                    event_time_ms.saturating_add(resume_after_ms);
+                                let resume_at_ms_i64 =
+                                    i64::try_from(resume_at_ms_u64).unwrap_or(i64::MAX);
+                                let event_time_i64 =
+                                    i64::try_from(event_time_ms).unwrap_or(i64::MAX);
+                                sqlx::query(
+                                    "INSERT INTO pause_schedules (
+                                        run_id, tenant_id, workspace_id, project_id,
+                                        resume_at_ms, created_at_ms
+                                    )
+                                     VALUES ($1, $2, $3, $4, $5, $6)
+                                     ON CONFLICT (run_id) DO UPDATE SET
+                                        resume_at_ms = EXCLUDED.resume_at_ms,
+                                        created_at_ms = EXCLUDED.created_at_ms",
+                                )
+                                .bind(e.run_id.as_str())
+                                .bind(e.project.tenant_id.as_str())
+                                .bind(e.project.workspace_id.as_str())
+                                .bind(e.project.project_id.as_str())
+                                .bind(resume_at_ms_i64)
+                                .bind(event_time_i64)
+                                .execute(&mut **tx)
+                                .await
+                                .map_err(|e| StoreError::Internal(e.to_string()))?;
+                            }
+                        }
+                    }
+                    _ => {
+                        sqlx::query("DELETE FROM pause_schedules WHERE run_id = $1")
+                            .bind(e.run_id.as_str())
+                            .execute(&mut **tx)
+                            .await
+                            .map_err(|e| StoreError::Internal(e.to_string()))?;
+                    }
+                }
             }
 
             RuntimeEvent::TaskCreated(e) => {
@@ -1766,7 +1841,15 @@ impl PgSyncProjection {
             RuntimeEvent::OperatorIntervention(_) => log_stub("OperatorIntervention"),
             RuntimeEvent::OperatorProfileCreated(_) => log_stub("OperatorProfileCreated"),
             RuntimeEvent::OperatorProfileUpdated(_) => log_stub("OperatorProfileUpdated"),
-            RuntimeEvent::PauseScheduled(_) => log_stub("PauseScheduled"),
+            // Issue #592: `PauseScheduled` is declared Projected with
+            // backing table `pause_schedules`, but the current service
+            // layer emits pause-schedule rows via the `RunStateChanged`
+            // → `pause_schedules` projection arm above (driven by
+            // `PauseReason.resume_after_ms`). No code path constructs
+            // this variant today; the no-op arm is intentional — a
+            // dead-letter safety if someone lands a handwritten
+            // `PauseScheduled` event without a parallel table write.
+            RuntimeEvent::PauseScheduled(_) => {}
             RuntimeEvent::PermissionDecisionRecorded(_) => {
                 log_stub("PermissionDecisionRecorded")
             }

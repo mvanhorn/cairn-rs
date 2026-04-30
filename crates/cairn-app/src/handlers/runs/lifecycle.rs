@@ -652,31 +652,47 @@ pub(crate) async fn list_due_run_resumes_handler(
     // no longer iterates across every tenant's paused runs to discard
     // cross-tenant rows.
     //
-    // `PauseScheduleReadModel::list_due` is derived from the event
-    // log and does NOT evict records when a run resumes (Copilot
-    // review on #589): so the raw projection set may include records
-    // whose runs are no longer Paused. The handler filters those
-    // post-fetch via `runs.get`, which means a page-by-page fetch
-    // with `limit + 1` could under-report `has_more` — an entire
-    // page of stale pause records would return 0 still-paused runs
-    // but has_more=false.
+    // #592: `PauseScheduleReadModel::list_due` is now an indexed
+    // range scan against the `pause_schedules` projection table
+    // (populated by `RunStateChanged` with evict-on-resume). The
+    // pre-#592 comment warned that the walker could return stale
+    // rows whose runs had already resumed, forcing a post-fetch
+    // `runs.get` filter + a safety-cap scan. The evict-on-resume
+    // projection makes stale rows impossible on the happy path —
+    // we still call `runs.get` defensively to cover the narrow
+    // window between projection read and the caller's subsequent
+    // `runs.resume` (the row can legitimately exist while the run
+    // has just transitioned to a non-Paused terminal state on a
+    // different request).
     //
-    // Correct behaviour: fetch up to a safety cap that bounds the
-    // per-tenant scan, filter in memory, then paginate the
-    // still-paused set. The `DUE_BATCH_LIMIT` below matches the
-    // cap used by the post-processor at
-    // `process_scheduled_run_resumes_handler` so operator read
-    // and writer drain agree on the working-set size. Once the
-    // event-log `list_due` walker is replaced with an evict-on-
-    // resume projection this cap can drop back to `limit + 1`.
-    const DUE_SCAN_CAP: usize = 1_000;
+    // Copilot #595: `PaginationQuery::limit()` clamps to
+    // `MAX_LIMIT=1_000` but `offset()` is unbounded. Copilot round-2
+    // also flagged that capping `fetch_size` without capping `offset`
+    // still breaks deep pagination — a caller with `offset=10_000`
+    // would slice past the end of the (capped) fetch set and return
+    // the wrong page.
+    //
+    // Fix both at once: reject `offset > MAX_DEEP_OFFSET` with a 422
+    // (the scheduled-resume queue is operationally small — thousands
+    // of due rows is already pathological — so deep cursors are not
+    // a real use case we need to support). Within the allowed range,
+    // the fetch size stays tight via `limit + offset + 1`.
+    const MAX_DEEP_OFFSET: usize = 10_000;
     let limit = query.limit();
     let offset = query.offset();
+    if offset > MAX_DEEP_OFFSET {
+        return validation_error_response(format!(
+            "offset must be <= {MAX_DEEP_OFFSET} (deep pagination on the \
+             scheduled-resume queue is not supported; filter the upstream \
+             caller or raise the cap in runs/lifecycle.rs)"
+        ));
+    }
+    let fetch_size = limit.saturating_add(offset).saturating_add(1);
     match PauseScheduleReadModel::list_due(
         state.runtime.store.as_ref(),
         tenant_scope.tenant_id(),
         now_ms(),
-        DUE_SCAN_CAP,
+        fetch_size,
     )
     .await
     {
@@ -689,10 +705,11 @@ pub(crate) async fn list_due_run_resumes_handler(
                     Err(err) => return runtime_error_response(err),
                 }
             }
-            // Paginate the filtered set. `has_more` is honest against
-            // the filtered total — an all-stale page no longer
-            // mis-reports has_more=false on the back of a truncated
-            // projection scan.
+            // Paginate the filtered set. `has_more` remains honest
+            // against the post-filter total: the projection is
+            // already evict-on-resume, so the filter is usually a
+            // no-op, but a race with an in-flight resume can still
+            // shave one row.
             let total = still_paused.len();
             let tail_start = offset.min(total);
             let page: Vec<_> = still_paused
@@ -719,20 +736,14 @@ pub(crate) async fn process_scheduled_run_resumes_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
 ) -> impl IntoResponse {
-    // #570: tenant filter moved into the projection. The limit
-    // parameter here is `usize::MAX` — effectively unbounded —
-    // which preserves the pre-#570 semantic of "process every
-    // due record in one call" and sidesteps a Copilot-flagged
-    // starvation risk:
+    // #570: tenant filter moved into the projection.
     //
-    // > the batch may be dominated by non-resumable rows, which
-    // > starves genuinely-due paused runs that sort after them
-    //
-    // …because the current `list_due` walker reads the full event
-    // log regardless of the returned set size (it does not evict
-    // rows when a run resumes), so an unbounded return doesn't
-    // change the scan cost. Once a dedicated evict-on-resume
-    // projection lands we can drop this to a small batch cap.
+    // #592: the projection is now evict-on-resume, so the row set
+    // returned here is tight (only runs actually due). `usize::MAX`
+    // preserves the "drain everything due on this tick" semantic —
+    // the operator poll cadence is the batch size, not a hard-coded
+    // cap — and no longer risks the starvation/cost issues the
+    // pre-#592 walker had.
     let due = match PauseScheduleReadModel::list_due(
         state.runtime.store.as_ref(),
         tenant_scope.tenant_id(),

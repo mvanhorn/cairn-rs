@@ -99,7 +99,7 @@ fn migration_count_matches_expected() {
         "must have at least 17 migrations (V001–V017); got {count}"
     );
     assert!(
-        count <= 60,
+        count <= 80,
         "unexpected large migration count {count} — a migration may have been added without updating this test"
     );
 }

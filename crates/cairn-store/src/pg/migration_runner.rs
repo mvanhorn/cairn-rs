@@ -318,6 +318,86 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "add_workspace_archived_at",
         include_str!("migrations/V050__add_workspace_archived_at.sql"),
     ),
+    // RFC-025 Phase 2b.2b (PR #593) and 2b.3 (PR #594) together
+    // landed eleven migration SQL files on disk — V051..V061 — but
+    // failed to register them here, so fresh Postgres installs would
+    // hit `relation "resource_shares" does not exist` (etc.) on the
+    // first projection write. The `sequential no gaps` contract test
+    // only hard-checks V001..V017, so the omission slipped through
+    // review on both PRs. Re-wiring them here alongside #592's V062
+    // as a mandatory accompanying fix — the projection arms are live
+    // callers of these tables.
+    (
+        51,
+        "create_resource_shares",
+        include_str!("migrations/V051__create_resource_shares.sql"),
+    ),
+    (
+        52,
+        "create_signal_ingestions",
+        include_str!("migrations/V052__create_signal_ingestions.sql"),
+    ),
+    (
+        53,
+        "create_subagent_spawns",
+        include_str!("migrations/V053__create_subagent_spawns.sql"),
+    ),
+    (
+        54,
+        "create_user_messages",
+        include_str!("migrations/V054__create_user_messages.sql"),
+    ),
+    (
+        55,
+        "create_soul_patches",
+        include_str!("migrations/V055__create_soul_patches.sql"),
+    ),
+    (
+        56,
+        "create_tool_recovery_pauses",
+        include_str!("migrations/V056__create_tool_recovery_pauses.sql"),
+    ),
+    // RFC-025 Phase 2b.3 (PR #594) landed V057..V061 on disk with
+    // the same "not registered here" gap that affected V051..V056.
+    // Wire them in alongside #592's V062 so pg never hits `relation
+    // "ingest_jobs" does not exist` (etc.) on first write.
+    (
+        57,
+        "create_ingest_jobs",
+        include_str!("migrations/V057__create_ingest_jobs.sql"),
+    ),
+    (
+        58,
+        "create_default_settings",
+        include_str!("migrations/V058__create_default_settings.sql"),
+    ),
+    (
+        59,
+        "create_channels",
+        include_str!("migrations/V059__create_channels.sql"),
+    ),
+    (
+        60,
+        "create_notifications",
+        include_str!("migrations/V060__create_notifications.sql"),
+    ),
+    (
+        61,
+        "create_checkpoint_strategies",
+        include_str!("migrations/V061__create_checkpoint_strategies.sql"),
+    ),
+    // Issue #592: pause_schedules projection. Replaces the
+    // event-log walker in `PauseScheduleReadModel::list_due` with
+    // an evict-on-resume table — `RunStateChanged(→Paused)` with a
+    // `resume_after_ms` INSERTs a row, and any transition away from
+    // Paused DELETEs it. The handler no longer scans the full event
+    // log on every poll of `/v1/runs/paused-due`. Renumbered
+    // V057 → V062 after main published Phase 2b.3 (V057-V061).
+    (
+        62,
+        "create_pause_schedules",
+        include_str!("migrations/V062__create_pause_schedules.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

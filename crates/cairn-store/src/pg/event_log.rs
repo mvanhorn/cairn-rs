@@ -202,8 +202,14 @@ impl EventLog for PgEventLog {
         // takes `&EventEnvelope` so no clone of the potentially large
         // payload (e.g. CheckpointCreated snapshots) is needed on the
         // hot append path.
+        //
+        // `event_time_ms` is the same `now` we bound to the `stored_at`
+        // column above — projection arms that key row data off event
+        // time (e.g. `pause_schedules.resume_at_ms`) must agree with
+        // the event-log column to be rebuild-safe. Copilot #595.
+        let event_time_ms = u64::try_from(now).unwrap_or(0);
         for event in events {
-            PgSyncProjection::apply_async(&mut tx, event).await?;
+            PgSyncProjection::apply_async(&mut tx, event, event_time_ms).await?;
         }
 
         tx.commit()

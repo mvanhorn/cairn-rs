@@ -42,9 +42,18 @@ impl SqliteSyncProjection {
     /// Takes the envelope by reference (not a full `StoredEvent`) so the
     /// hot append path does not need to clone the potentially-large
     /// payload on every event — see #498.
+    ///
+    /// `event_time_ms` mirrors the pg applier contract: it is the
+    /// wall-clock millisecond at which the event was durably logged
+    /// (live append = `now_millis()`, rebuild = `StoredEvent.stored_at`).
+    /// Projection arms whose row data is semantically tied to the event
+    /// time (e.g. `pause_schedules.resume_at_ms`) MUST use it rather
+    /// than fabricating `now` at apply time — otherwise a rebuild
+    /// silently shifts scheduled resumes forward. Copilot #595.
     pub async fn apply_async(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         envelope: &EventEnvelope<RuntimeEvent>,
+        event_time_ms: u64,
     ) -> Result<(), StoreError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -118,6 +127,59 @@ impl SqliteSyncProjection {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+                // Issue #592: pause_schedules projection — evict-on-resume.
+                // Mirror pg (same SQL shape, `?` placeholders).
+                // `resume_at_ms` + `created_at_ms` are derived from
+                // `event_time_ms` so a rebuild replays scheduled
+                // resumes at their original time rather than shifting
+                // them forward to the rebuild wall clock. Copilot #595.
+                match e.transition.to {
+                    cairn_domain::RunState::Paused => {
+                        if let Some(reason) = &e.pause_reason {
+                            if let Some(resume_after_ms) = reason.resume_after_ms {
+                                // Copilot #595: saturating_add guards
+                                // pathologically large
+                                // `resume_after_ms`; i64::try_from
+                                // falls back to i64::MAX so we always
+                                // bind a legal INTEGER rather than
+                                // wrap-to-negative.
+                                let resume_at_ms_u64 =
+                                    event_time_ms.saturating_add(resume_after_ms);
+                                let resume_at_ms_i64 =
+                                    i64::try_from(resume_at_ms_u64).unwrap_or(i64::MAX);
+                                let event_time_i64 =
+                                    i64::try_from(event_time_ms).unwrap_or(i64::MAX);
+                                sqlx::query(
+                                    "INSERT INTO pause_schedules (
+                                        run_id, tenant_id, workspace_id, project_id,
+                                        resume_at_ms, created_at_ms
+                                    )
+                                     VALUES (?, ?, ?, ?, ?, ?)
+                                     ON CONFLICT(run_id) DO UPDATE SET
+                                        resume_at_ms = excluded.resume_at_ms,
+                                        created_at_ms = excluded.created_at_ms",
+                                )
+                                .bind(e.run_id.as_str())
+                                .bind(e.project.tenant_id.as_str())
+                                .bind(e.project.workspace_id.as_str())
+                                .bind(e.project.project_id.as_str())
+                                .bind(resume_at_ms_i64)
+                                .bind(event_time_i64)
+                                .execute(&mut **tx)
+                                .await
+                                .map_err(|e| StoreError::Internal(e.to_string()))?;
+                            }
+                        }
+                    }
+                    _ => {
+                        sqlx::query("DELETE FROM pause_schedules WHERE run_id = ?")
+                            .bind(e.run_id.as_str())
+                            .execute(&mut **tx)
+                            .await
+                            .map_err(|e| StoreError::Internal(e.to_string()))?;
+                    }
+                }
             }
 
             RuntimeEvent::TaskCreated(e) => {
@@ -1983,7 +2045,12 @@ impl SqliteSyncProjection {
             RuntimeEvent::OperatorIntervention(_) => log_stub("OperatorIntervention"),
             RuntimeEvent::OperatorProfileCreated(_) => log_stub("OperatorProfileCreated"),
             RuntimeEvent::OperatorProfileUpdated(_) => log_stub("OperatorProfileUpdated"),
-            RuntimeEvent::PauseScheduled(_) => log_stub("PauseScheduled"),
+            // Issue #592: mirror pg — `PauseScheduled` is Projected
+            // via the `RunStateChanged` → `pause_schedules` arm above.
+            // Explicit no-op here (not log_stub) so the projection-
+            // stub-guard CI job stays green on a variant that has no
+            // dedicated emission path today.
+            RuntimeEvent::PauseScheduled(_) => {}
             RuntimeEvent::PermissionDecisionRecorded(_) => log_stub("PermissionDecisionRecorded"),
             // RFC-025 Phase 3: provider_bindings projection (sqlite
             // parity with pg). Keep the ON CONFLICT semantics symmetric

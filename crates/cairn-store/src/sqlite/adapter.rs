@@ -5481,3 +5481,78 @@ impl crate::projections::IngestJobReadModel for SqliteAdapter {
             .collect()
     }
 }
+
+// ── Issue #592: pause_schedules read model ─────────────────────────
+//
+// Mirrors pg/adapter.rs: SELECT from the `pause_schedules` projection
+// table with backend-stable ordering. The projection arm in
+// sqlite/projections.rs INSERTs on RunStateChanged(→Paused,
+// resume_after_ms=Some) and DELETEs on any transition away from
+// Paused, so `list_due` is a single indexed range scan.
+
+#[derive(sqlx::FromRow)]
+struct SqlitePauseScheduleRow {
+    run_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    resume_at_ms: i64,
+    created_at_ms: i64,
+}
+
+impl SqlitePauseScheduleRow {
+    fn into_record(self) -> crate::projections::PauseScheduledRecord {
+        // Copilot #595: mirror pg — clamp corrupt negative rows to 0
+        // rather than silently reinterpreting as huge u64. See
+        // `PauseScheduleRow::into_record` in pg/adapter.rs for the
+        // rationale.
+        let resume_at_ms = u64::try_from(self.resume_at_ms).unwrap_or(0);
+        let created_at_ms = u64::try_from(self.created_at_ms).unwrap_or(0);
+        crate::projections::PauseScheduledRecord {
+            run_id: RunId::new(self.run_id),
+            project: ProjectKey::new(
+                self.tenant_id.as_str(),
+                self.workspace_id.as_str(),
+                self.project_id.as_str(),
+            ),
+            resume_at_ms,
+            created_at_ms,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::projections::PauseScheduleReadModel for SqliteAdapter {
+    async fn list_due(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::PauseScheduledRecord>, StoreError> {
+        // Copilot #595: `limit as i64` on `usize::MAX` wraps to -1,
+        // which SQLite interprets as "no limit" — the opposite of
+        // what you want for a bounded read. Clamp to i64::MAX so
+        // legitimate unbounded-drain callers get a huge-but-finite
+        // LIMIT and hostile inputs can't accidentally flood the
+        // handler's post-filter loop.
+        let before_ms_i64 = i64::try_from(before_ms).unwrap_or(i64::MAX);
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = "SELECT run_id, tenant_id, workspace_id, project_id,
+                          resume_at_ms, created_at_ms
+                   FROM pause_schedules
+                   WHERE tenant_id = ? AND resume_at_ms <= ?
+                   ORDER BY resume_at_ms ASC, run_id ASC
+                   LIMIT ?";
+        let rows: Vec<SqlitePauseScheduleRow> = sqlx::query_as(sql)
+            .bind(tenant_id.as_str())
+            .bind(before_ms_i64)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(SqlitePauseScheduleRow::into_record)
+            .collect())
+    }
+}

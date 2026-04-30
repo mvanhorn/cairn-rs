@@ -869,8 +869,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "PauseScheduled",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (pause schedules)",
+        status: ProjectionStatus::Projected {
+            table: Some("pause_schedules"),
         },
     },
     ProjectionEntry {
@@ -1429,17 +1429,27 @@ mod tests {
         //     Stubbed → Projected with backing table
         //     `checkpoint_strategies` (pg V061 + sqlite schema.rs).
         //     Net: +1 Projected, -1 Stubbed → 113 / 20 / 25.
+        //   * Issue #592 flips `PauseScheduled` Stubbed → Projected
+        //     with backing table `pause_schedules` (pg V062 + sqlite
+        //     schema.rs). Renumbered V057 → V062 after main published
+        //     Phase 2b.3 (V057-V061). The pause_schedules table is
+        //     populated by the `RunStateChanged` projection arm
+        //     (INSERT on Paused with `resume_after_ms=Some`, DELETE
+        //     on any transition away). Replaces the event-log walker
+        //     in `PauseScheduleReadModel::list_due` with an indexed
+        //     range scan. Net: +1 Projected, -1 Stubbed
+        //     → 114 / 20 / 24.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 113,
+            projected, 114,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
             ephemeral, 20,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 25, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 24, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 

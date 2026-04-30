@@ -4835,3 +4835,87 @@ impl crate::projections::IngestJobReadModel for PgAdapter {
         rows.into_iter().map(IngestJobRow::into_record).collect()
     }
 }
+
+// ── Issue #592: pause_schedules read model ─────────────────────────
+//
+// Replaces the event-log walker in `InMemoryStore` with an indexed
+// range scan against `pause_schedules` (populated by the projection
+// arm on RunStateChanged). Parity with the in-memory impl: same
+// tenant filter, same `resume_at_ms <= before_ms` gate, same
+// `ORDER BY resume_at_ms ASC, run_id ASC` tie-breaker, same limit
+// semantics.
+
+#[derive(sqlx::FromRow)]
+struct PauseScheduleRow {
+    run_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    resume_at_ms: i64,
+    created_at_ms: i64,
+}
+
+impl PauseScheduleRow {
+    fn into_record(self) -> crate::projections::PauseScheduledRecord {
+        // Copilot #595: i64 → u64 via `as` silently reinterpreted
+        // negative DB values as huge u64 timestamps. Clamp corrupt
+        // negative rows to 0 instead (immediately due + resolve on
+        // next sweep) — masking them as u64::MAX would hide them from
+        // `list_due` forever, which is the worse failure mode.
+        let resume_at_ms = u64::try_from(self.resume_at_ms).unwrap_or(0);
+        let created_at_ms = u64::try_from(self.created_at_ms).unwrap_or(0);
+        crate::projections::PauseScheduledRecord {
+            run_id: RunId::new(self.run_id),
+            project: ProjectKey::new(
+                self.tenant_id.as_str(),
+                self.workspace_id.as_str(),
+                self.project_id.as_str(),
+            ),
+            resume_at_ms,
+            created_at_ms,
+        }
+    }
+}
+
+#[async_trait]
+impl crate::projections::PauseScheduleReadModel for PgAdapter {
+    async fn list_due(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::PauseScheduledRecord>, StoreError> {
+        // Copilot #595: `as i64` on out-of-range u64/usize silently
+        // wrapped to negative, which Postgres interprets as "LIMIT -N"
+        // (error) and `resume_at_ms <= -N` (filter matches nothing).
+        // Clamp to i64::MAX so a caller passing `usize::MAX` becomes
+        // "effectively unbounded" — which is the legitimate operator
+        // drain pattern in `process_scheduled_run_resumes_handler` —
+        // and a pathologically large `before_ms` becomes "all rows"
+        // rather than "no rows".
+        let before_ms_i64 = i64::try_from(before_ms).unwrap_or(i64::MAX);
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        // Backend-stable ordering so the parity harness compares the
+        // same rows in the same order against in-memory and sqlite.
+        // Membership/eviction semantics are asserted byte-equal;
+        // `resume_at_ms` is compared with sub-second tolerance
+        // because append wall-clock can differ slightly per backend.
+        let sql = "SELECT run_id, tenant_id, workspace_id, project_id,
+                          resume_at_ms, created_at_ms
+                   FROM pause_schedules
+                   WHERE tenant_id = $1 AND resume_at_ms <= $2
+                   ORDER BY resume_at_ms ASC, run_id ASC
+                   LIMIT $3";
+        let rows: Vec<PauseScheduleRow> = sqlx::query_as(sql)
+            .bind(tenant_id.as_str())
+            .bind(before_ms_i64)
+            .bind(limit_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(PauseScheduleRow::into_record)
+            .collect())
+    }
+}

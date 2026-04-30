@@ -1365,4 +1365,30 @@ CREATE TABLE IF NOT EXISTS checkpoint_strategies (
     trigger_on_task_complete  INTEGER NOT NULL,
     set_at_ms                 INTEGER NOT NULL
 );
+
+-- Issue #592: pause_schedules parity table (pg V062, renumbered from
+-- V057 after main published Phase 2b.3 V057-V061). Evict-on-resume
+-- projection that replaces `PauseScheduleReadModel::list_due`'s
+-- event-log walker. `RunStateChanged(→Paused)` with a non-None
+-- `resume_after_ms` INSERTs; any transition away from Paused DELETEs
+-- by run_id. Composite index matches pg's idx_pause_schedules_due so
+-- the `ORDER BY resume_at_ms ASC, run_id ASC` tie-breaker is
+-- backend-stable and the parity harness asserts consistent ordering +
+-- membership/eviction semantics across backends. `resume_at_ms` is
+-- derived from the event's durable timestamp (`event_time_ms` /
+-- `stored_at`), so rebuilds do not shift schedules; any millisecond
+-- drift seen in the parity test comes from different append times
+-- between backends, and the test uses a sub-second tolerance there
+-- rather than strict byte-equality.
+CREATE TABLE IF NOT EXISTS pause_schedules (
+    run_id         TEXT    PRIMARY KEY,
+    tenant_id      TEXT    NOT NULL,
+    workspace_id   TEXT    NOT NULL,
+    project_id     TEXT    NOT NULL,
+    resume_at_ms   INTEGER NOT NULL,
+    created_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pause_schedules_due
+    ON pause_schedules (tenant_id, resume_at_ms, run_id);
 "#;

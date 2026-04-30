@@ -630,3 +630,106 @@ async fn task_pause_and_resume_emit_state_changed() {
 
     h.teardown().await;
 }
+
+/// Regression guard for issue #591: `BridgeEvent::ExecutionSuspended`
+/// must thread `pause_reason` (including `resume_after_ms`) through to
+/// the `RunStateChanged` event log entry, and `ExecutionResumed` must
+/// thread `resume_trigger`.
+///
+/// Pre-fix: the bridge converter hard-coded `pause_reason: None` and
+/// `resume_trigger: None` for both variants, so the service path could
+/// not populate the `pause_schedules` projection — timer-fired resumes
+/// were invisible to `list_due` (#592).
+///
+/// Post-fix: a `runs.pause` with a non-None `resume_after_ms` lands in
+/// the event log carrying the same value, and the matching
+/// `runs.resume` records the trigger classification.
+#[tokio::test]
+async fn run_pause_and_resume_thread_pause_reason_and_resume_trigger() {
+    use cairn_domain::lifecycle::RunState;
+
+    let h = TestHarness::setup().await;
+    let session_id = h.unique_session_id();
+    let run_id = h.unique_run_id();
+
+    h.fabric
+        .runs
+        .start(&h.project, &session_id, run_id.clone(), None)
+        .await
+        .expect("start failed");
+
+    // FF requires `lifecycle_phase=active` before ff_suspend_execution.
+    h.fabric
+        .runs
+        .claim(&h.project, &session_id, &run_id)
+        .await
+        .expect("runs.claim failed");
+
+    // Pause with a structured reason carrying `resume_after_ms`. The
+    // bridge must forward the entire PauseReason into
+    // RunStateChanged.pause_reason — not drop it on the floor.
+    let operator = "integration-test-591";
+    let detail = "scheduled-handoff";
+    let resume_after_ms: u64 = 60_000;
+    let pause_reason = PauseReason {
+        kind: PauseReasonKind::OperatorPause,
+        detail: Some(detail.to_owned()),
+        resume_after_ms: Some(resume_after_ms),
+        actor: Some(operator.to_owned()),
+    };
+    h.fabric
+        .runs
+        .pause(&h.project, &session_id, &run_id, pause_reason.clone())
+        .await
+        .expect("runs.pause failed");
+
+    // Assert the RunStateChanged(→Paused) event carries the exact
+    // PauseReason we passed in. `wait_for_event` returns on the first
+    // match, but bridge emission is async so we wait up to 2s.
+    let expected_run = run_id.clone();
+    let expected_reason = pause_reason.clone();
+    wait_for_event(&h, Duration::from_secs(2), move |event| {
+        matches!(event, RuntimeEvent::RunStateChanged(e)
+            if e.run_id == expected_run
+                && e.transition.to == RunState::Paused
+                && e.pause_reason.as_ref() == Some(&expected_reason))
+    })
+    .await
+    .expect(
+        "RunStateChanged(Paused) with pause_reason not observed — #591 regressed. \
+         bridge_event_to_runtime_event must forward BridgeEvent::ExecutionSuspended.pause_reason \
+         into RunStateChanged.pause_reason. A `None` value here means resume_after_ms is dropped, \
+         which breaks the pause_schedules projection / list_due path.",
+    );
+
+    // Resume with OperatorResume — must surface on the
+    // RunStateChanged.resume_trigger column.
+    h.fabric
+        .runs
+        .resume(
+            &h.project,
+            &session_id,
+            &run_id,
+            ResumeTrigger::OperatorResume,
+            cairn_domain::lifecycle::RunResumeTarget::Running,
+        )
+        .await
+        .expect("runs.resume failed");
+
+    let expected_run = run_id.clone();
+    wait_for_event(&h, Duration::from_secs(2), move |event| {
+        matches!(event, RuntimeEvent::RunStateChanged(e)
+            if e.run_id == expected_run
+                && e.transition.to == RunState::Running
+                && e.resume_trigger == Some(ResumeTrigger::OperatorResume))
+    })
+    .await
+    .expect(
+        "RunStateChanged(Running) with resume_trigger not observed — #591 regressed. \
+         bridge_event_to_runtime_event must forward BridgeEvent::ExecutionResumed.resume_trigger \
+         into RunStateChanged.resume_trigger. A `None` here means audit / operator UI cannot \
+         distinguish timer-fired resumes from operator-initiated ones.",
+    );
+
+    h.teardown().await;
+}

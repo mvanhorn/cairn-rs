@@ -778,6 +778,11 @@ impl FabricRunService {
                 project: project_for_emit,
                 prev_state: Some(prev_state),
                 to: to_state,
+                // Issue #591: thread the caller's `PauseReason` (carries
+                // `resume_after_ms` for timer-fired resumes) through to
+                // the event log. Previously the bridge hard-coded
+                // `None`, which broke the scheduled-resume path.
+                pause_reason: Some(reason),
             })
             .await;
         record_result
@@ -788,7 +793,7 @@ impl FabricRunService {
         project: &ProjectKey,
         session_id: &SessionId,
         run_id: &RunId,
-        _trigger: ResumeTrigger,
+        trigger: ResumeTrigger,
         _target: RunResumeTarget,
     ) -> Result<RunRecord, FabricError> {
         let eid = self.execution_id(project, session_id, run_id);
@@ -822,6 +827,10 @@ impl FabricRunService {
                 run_id: run_id.clone(),
                 project: record.project.clone(),
                 prev_state: Some(prev_state),
+                // Issue #591 symmetry: forward the caller-supplied
+                // trigger so the projection row records why the run
+                // unpaused (operator vs timer vs runtime signal).
+                resume_trigger: Some(trigger),
             })
             .await;
         Ok(record)
@@ -883,6 +892,18 @@ impl FabricRunService {
                 project: project_for_emit,
                 prev_state: Some(prev_state),
                 to: to_state,
+                // Approval suspensions have no scheduled `resume_after_ms`
+                // — they unblock on an approval-granted/rejected signal
+                // only — so the pause_reason is purely informational.
+                // Using `PolicyHold` mirrors the FF blocking_reason
+                // (`waiting_approval`) semantically: a policy gate held
+                // the run.
+                pause_reason: Some(cairn_domain::lifecycle::PauseReason {
+                    kind: cairn_domain::lifecycle::PauseReasonKind::PolicyHold,
+                    detail: Some(format!("approval:{}", run_id.as_str())),
+                    resume_after_ms: None,
+                    actor: None,
+                }),
             })
             .await;
         record_result
@@ -954,6 +975,10 @@ impl FabricRunService {
                         run_id: run_id.clone(),
                         project: record.project.clone(),
                         prev_state: Some(RunState::WaitingApproval),
+                        // Approval-granted is an operator-driven resume
+                        // (a human made the decision). `OperatorResume`
+                        // is the correct trigger classification.
+                        resume_trigger: Some(ResumeTrigger::OperatorResume),
                     })
                     .await;
                 Ok(record)

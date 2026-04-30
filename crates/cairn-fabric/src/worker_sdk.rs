@@ -398,6 +398,16 @@ impl CairnTask {
                         project: proj,
                         prev_state: Some(RunState::Running),
                         to: RunState::WaitingApproval,
+                        // Worker-initiated approval suspension: no
+                        // scheduled resume, so `resume_after_ms=None`.
+                        // `PolicyHold` with the approval detail mirrors
+                        // the service-side `enter_waiting_approval`.
+                        pause_reason: Some(cairn_domain::lifecycle::PauseReason {
+                            kind: cairn_domain::lifecycle::PauseReasonKind::PolicyHold,
+                            detail: Some(format!("approval:{approval_id}")),
+                            resume_after_ms: None,
+                            actor: None,
+                        }),
                     })
                     .await;
             }
@@ -435,6 +445,19 @@ impl CairnTask {
                         // `waiting_for_children`; the corresponding cairn
                         // domain state is WaitingDependency.
                         to: RunState::WaitingDependency,
+                        // Subagent suspension: no scheduled resume
+                        // (worker-sdk deadline is signalled via FF
+                        // timeout_behaviour, not via the cairn
+                        // projection). Emit `RuntimeSuspension` with the
+                        // child-task detail so the pause_schedules
+                        // projection correctly filters it out
+                        // (resume_after_ms is None).
+                        pause_reason: Some(cairn_domain::lifecycle::PauseReason {
+                            kind: cairn_domain::lifecycle::PauseReasonKind::RuntimeSuspension,
+                            detail: Some(format!("subagent:{child_task_id}")),
+                            resume_after_ms: None,
+                            actor: None,
+                        }),
                     })
                     .await;
             }
@@ -472,6 +495,19 @@ impl CairnTask {
                         // dedicated state for that today; it collapses to
                         // Paused. See T4-M7 for the tracked follow-up.
                         to: RunState::Paused,
+                        // Worker-initiated tool-result wait: forward
+                        // `timeout_ms` as `resume_after_ms` so the
+                        // projection can still schedule a resume if the
+                        // tool result doesn't arrive. Kind is
+                        // `ToolRequestedSuspension` with the invocation
+                        // id in `detail` (matches the
+                        // `RunService::pause` path).
+                        pause_reason: Some(cairn_domain::lifecycle::PauseReason {
+                            kind: cairn_domain::lifecycle::PauseReasonKind::ToolRequestedSuspension,
+                            detail: Some(invocation_id.to_owned()),
+                            resume_after_ms: timeout_ms,
+                            actor: None,
+                        }),
                     })
                     .await;
             }

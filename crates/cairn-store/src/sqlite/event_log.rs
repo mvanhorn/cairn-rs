@@ -201,8 +201,13 @@ impl EventLog for SqliteEventLog {
         // projection table stayed empty in production — retained as a
         // regression-origin pointer to .claude/audit-state/review-queue.md
         // §T2-C1 per project convention.)
+        //
+        // `event_time_ms` matches the `stored_at` column bound above so
+        // rebuild replays produce the same `pause_schedules` row as
+        // the original live append. Copilot #595.
+        let event_time_ms = u64::try_from(now).unwrap_or(0);
         for event in events {
-            SqliteSyncProjection::apply_async(&mut tx, event).await?;
+            SqliteSyncProjection::apply_async(&mut tx, event, event_time_ms).await?;
         }
 
         tx.commit()

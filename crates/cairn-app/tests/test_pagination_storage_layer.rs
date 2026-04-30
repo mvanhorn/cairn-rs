@@ -241,18 +241,15 @@ async fn sla_breached_pagination_is_storage_layer() {
 // ── /v1/runs/resume-due ──────────────────────────────────────────────
 
 /// `/v1/runs/resume-due` paginates through PauseScheduleReadModel.
-/// End-to-end seeding of PAUSED runs with `resume_after_ms` requires
-/// `BridgeEvent::ExecutionSuspended` to propagate `pause_reason`
-/// through to the projection's RunStateChanged — which it currently
-/// does NOT (the bridge converter hard-codes `pause_reason: None` at
-/// `crates/cairn-fabric/src/event_bridge.rs::bridge_event_to_runtime_event`).
-/// That's a separate latent bug, out-of-scope for this PR.
-///
-/// We still lock in the new paginated WIRE CONTRACT: the handler
-/// must accept `limit` + `offset`, return `{items, hasMore}`, and
-/// emit `hasMore=false` when the projection is empty. A future PR
-/// that fixes the bridge converter can extend this test to assert
-/// the full populated-page contract without reworking the shape.
+/// Pre-#591 the bridge converter hard-coded `pause_reason: None`
+/// which prevented any end-to-end seeding test from populating the
+/// projection. #591 fixed that; #592 replaced the event-log walker
+/// with an evict-on-resume projection table. Populated-page
+/// coverage lives in
+/// `crates/cairn-store/tests/pause_schedule_projection.rs` against
+/// the projection directly; this test still locks in the HTTP
+/// wire contract (handler accepts `limit` + `offset`, returns
+/// `{items, hasMore}`, emits `hasMore=false` on empty).
 #[tokio::test]
 async fn resume_due_pagination_shape_is_honest_on_empty() {
     let h = LiveHarness::setup().await;

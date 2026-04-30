@@ -7,7 +7,9 @@ use cairn_domain::events::{
     StateTransition, TaskCreated, TaskLeaseClaimed, TaskStateChanged,
 };
 use cairn_domain::ids::{EventId, RunId, SessionId, TaskId};
-use cairn_domain::lifecycle::{FailureClass, RunState, SessionState, TaskState};
+use cairn_domain::lifecycle::{
+    FailureClass, PauseReason, ResumeTrigger, RunState, SessionState, TaskState,
+};
 use cairn_domain::tenancy::ProjectKey;
 use cairn_store::event_log::EventLog;
 use tokio::sync::{mpsc, oneshot};
@@ -57,11 +59,33 @@ pub enum BridgeEvent {
         /// Approval-gated suspensions become `WaitingApproval`; plain
         /// operator pauses stay `Paused`.
         to: RunState,
+        /// Why the run suspended. Threads through to the
+        /// `RunStateChanged.pause_reason` column on the event log so
+        /// the `pause_schedules` projection can INSERT a row with the
+        /// correct `resume_after_ms` (issue #591). Populate this
+        /// whenever the emitter has a structured reason — including
+        /// worker-SDK subagent suspensions, which now emit
+        /// `PauseReasonKind::RuntimeSuspension` with a
+        /// `subagent:<child_task_id>` detail. Use `None` only for
+        /// callers that genuinely have no structured pause
+        /// classification available at the emission site.
+        #[allow(clippy::struct_field_names)]
+        pause_reason: Option<PauseReason>,
     },
     ExecutionResumed {
         run_id: RunId,
         project: ProjectKey,
         prev_state: Option<RunState>,
+        /// Resume source. Mirrors the pause-side `pause_reason` for
+        /// symmetry: callers that can classify the resume trigger
+        /// (operator vs timer-fired vs runtime signal) thread it
+        /// through so the projection row records who unpaused the run.
+        /// Approval-granted resumes are operator-driven and emit
+        /// `Some(ResumeTrigger::OperatorResume)`. `None` is reserved
+        /// for call sites where the trigger is genuinely indeterminate
+        /// at emission time.
+        #[allow(clippy::struct_field_names)]
+        resume_trigger: Option<ResumeTrigger>,
     },
     TaskCreated {
         task_id: TaskId,
@@ -445,6 +469,7 @@ fn bridge_event_to_runtime_event(event: &BridgeEvent) -> RuntimeEvent {
             project,
             prev_state,
             to,
+            pause_reason,
         } => RuntimeEvent::RunStateChanged(RunStateChanged {
             project: project.clone(),
             run_id: run_id.clone(),
@@ -453,13 +478,19 @@ fn bridge_event_to_runtime_event(event: &BridgeEvent) -> RuntimeEvent {
                 to: *to,
             },
             failure_class: None,
-            pause_reason: None,
+            // Issue #591: `pause_reason` (carrying `resume_after_ms`) now
+            // threads through to the event log so downstream projections
+            // can observe scheduled resumes. Previously hard-coded to
+            // `None`, which made timer-fired resumes invisible to the
+            // service-layer path.
+            pause_reason: pause_reason.clone(),
             resume_trigger: None,
         }),
         BridgeEvent::ExecutionResumed {
             run_id,
             project,
             prev_state,
+            resume_trigger,
         } => RuntimeEvent::RunStateChanged(RunStateChanged {
             project: project.clone(),
             run_id: run_id.clone(),
@@ -469,7 +500,10 @@ fn bridge_event_to_runtime_event(event: &BridgeEvent) -> RuntimeEvent {
             },
             failure_class: None,
             pause_reason: None,
-            resume_trigger: None,
+            // Issue #591 symmetry: the matching resume event carries the
+            // trigger classification so audit / operator UI can tell
+            // a timer-fired resume apart from an operator-initiated one.
+            resume_trigger: *resume_trigger,
         }),
         BridgeEvent::TaskCreated {
             task_id,
@@ -728,12 +762,14 @@ mod tests {
             project: ProjectKey::new("t", "w", "p"),
             prev_state: Some(RunState::Running),
             to: RunState::Paused,
+            pause_reason: None,
         };
         let runtime = bridge_event_to_runtime_event(&event);
         match runtime {
             RuntimeEvent::RunStateChanged(rsc) => {
                 assert_eq!(rsc.transition.from, Some(RunState::Running));
                 assert_eq!(rsc.transition.to, RunState::Paused);
+                assert!(rsc.pause_reason.is_none());
             }
             _ => panic!("expected RunStateChanged"),
         }
@@ -748,6 +784,7 @@ mod tests {
             project: ProjectKey::new("t", "w", "p"),
             prev_state: Some(RunState::Running),
             to: RunState::WaitingApproval,
+            pause_reason: None,
         };
         let runtime = bridge_event_to_runtime_event(&event);
         match runtime {
@@ -759,18 +796,70 @@ mod tests {
         }
     }
 
+    // Issue #591 regression: `pause_reason` (including `resume_after_ms`)
+    // must survive the bridge→RunStateChanged conversion so the
+    // `pause_schedules` projection lands a row. Previously hard-coded to
+    // `None`, which silently dropped scheduled resumes emitted via the
+    // service path.
+    #[test]
+    fn bridge_event_to_runtime_suspended_threads_pause_reason() {
+        use cairn_domain::lifecycle::{PauseReason, PauseReasonKind};
+
+        let reason = PauseReason {
+            kind: PauseReasonKind::OperatorPause,
+            detail: Some("on-call handoff".to_owned()),
+            resume_after_ms: Some(60_000),
+            actor: Some("alice".to_owned()),
+        };
+        let event = BridgeEvent::ExecutionSuspended {
+            run_id: RunId::new("run_1"),
+            project: ProjectKey::new("t", "w", "p"),
+            prev_state: Some(RunState::Running),
+            to: RunState::Paused,
+            pause_reason: Some(reason.clone()),
+        };
+        match bridge_event_to_runtime_event(&event) {
+            RuntimeEvent::RunStateChanged(rsc) => {
+                let got = rsc.pause_reason.expect("pause_reason must survive");
+                assert_eq!(got, reason);
+            }
+            _ => panic!("expected RunStateChanged"),
+        }
+    }
+
     #[test]
     fn bridge_event_to_runtime_resumed() {
         let event = BridgeEvent::ExecutionResumed {
             run_id: RunId::new("run_1"),
             project: ProjectKey::new("t", "w", "p"),
             prev_state: Some(RunState::Paused),
+            resume_trigger: None,
         };
         let runtime = bridge_event_to_runtime_event(&event);
         match runtime {
             RuntimeEvent::RunStateChanged(rsc) => {
                 assert_eq!(rsc.transition.from, Some(RunState::Paused));
                 assert_eq!(rsc.transition.to, RunState::Running);
+                assert!(rsc.resume_trigger.is_none());
+            }
+            _ => panic!("expected RunStateChanged"),
+        }
+    }
+
+    // Issue #591 symmetry: `resume_trigger` threads through the same
+    // conversion so the audit trail can distinguish timer-fired from
+    // operator-initiated resumes.
+    #[test]
+    fn bridge_event_to_runtime_resumed_threads_resume_trigger() {
+        let event = BridgeEvent::ExecutionResumed {
+            run_id: RunId::new("run_1"),
+            project: ProjectKey::new("t", "w", "p"),
+            prev_state: Some(RunState::Paused),
+            resume_trigger: Some(ResumeTrigger::ResumeAfterTimer),
+        };
+        match bridge_event_to_runtime_event(&event) {
+            RuntimeEvent::RunStateChanged(rsc) => {
+                assert_eq!(rsc.resume_trigger, Some(ResumeTrigger::ResumeAfterTimer));
             }
             _ => panic!("expected RunStateChanged"),
         }

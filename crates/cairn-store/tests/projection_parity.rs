@@ -4275,6 +4275,135 @@ mod in_memory_vs_sqlite {
         assert_eq!(b.max_checkpoints, 10, "0 rehydrates to default 10");
         assert!(!b.trigger_on_task_complete);
     }
+
+    /// Issue #592: `pause_schedules` projection parity. Pause two
+    /// runs, resume one, then pause a third. Assert in-memory and
+    /// sqlite return the same `list_due` membership with the same
+    /// ordering, the same evict-on-resume semantics, and the same
+    /// `resume_after_ms=None` exclusion. The in-memory shadow reads
+    /// from `state.pause_schedules` (post-#592 — no event-log
+    /// walker), so matching sqlite on membership and ordering keeps
+    /// both projection arms in lockstep even if `resume_at_ms`
+    /// timestamps drift within the parity test's tolerance.
+    #[tokio::test]
+    async fn pause_schedule_projection_matches_across_backends() {
+        use cairn_domain::lifecycle::{PauseReason, PauseReasonKind, ResumeTrigger};
+        use cairn_store::projections::PauseScheduleReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_ps", "w_ps", "p_ps");
+        let tenant = cairn_domain::TenantId::new("t_ps");
+
+        // run_a and run_b both paused with resume_after_ms; run_b
+        // gets resumed immediately so it must evict from both
+        // projections. run_c paused without resume_after_ms so it
+        // must NOT appear.
+        let events = vec![
+            env(RuntimeEvent::RunStateChanged(RunStateChanged {
+                run_id: RunId::new("run_a"),
+                project: scope.clone(),
+                transition: StateTransition {
+                    from: Some(RunState::Running),
+                    to: RunState::Paused,
+                },
+                failure_class: None,
+                pause_reason: Some(PauseReason {
+                    kind: PauseReasonKind::OperatorPause,
+                    detail: None,
+                    resume_after_ms: Some(0),
+                    actor: None,
+                }),
+                resume_trigger: None,
+            })),
+            env(RuntimeEvent::RunStateChanged(RunStateChanged {
+                run_id: RunId::new("run_b"),
+                project: scope.clone(),
+                transition: StateTransition {
+                    from: Some(RunState::Running),
+                    to: RunState::Paused,
+                },
+                failure_class: None,
+                pause_reason: Some(PauseReason {
+                    kind: PauseReasonKind::OperatorPause,
+                    detail: None,
+                    resume_after_ms: Some(0),
+                    actor: None,
+                }),
+                resume_trigger: None,
+            })),
+            env(RuntimeEvent::RunStateChanged(RunStateChanged {
+                run_id: RunId::new("run_b"),
+                project: scope.clone(),
+                transition: StateTransition {
+                    from: Some(RunState::Paused),
+                    to: RunState::Running,
+                },
+                failure_class: None,
+                pause_reason: None,
+                resume_trigger: Some(ResumeTrigger::ResumeAfterTimer),
+            })),
+            env(RuntimeEvent::RunStateChanged(RunStateChanged {
+                run_id: RunId::new("run_c"),
+                project: scope.clone(),
+                transition: StateTransition {
+                    from: Some(RunState::Running),
+                    to: RunState::Paused,
+                },
+                failure_class: None,
+                pause_reason: Some(PauseReason {
+                    kind: PauseReasonKind::PolicyHold,
+                    detail: Some("approval".into()),
+                    resume_after_ms: None, // ← excluded from schedule
+                    actor: None,
+                }),
+                resume_trigger: None,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_due = PauseScheduleReadModel::list_due(&mem, &tenant, u64::MAX / 2, 100)
+            .await
+            .unwrap();
+        let sqlite_due = PauseScheduleReadModel::list_due(&adapter, &tenant, u64::MAX / 2, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mem_due.len(),
+            sqlite_due.len(),
+            "list_due length must match: in-memory={mem_due:?} sqlite={sqlite_due:?}"
+        );
+        for (m, s) in mem_due.iter().zip(sqlite_due.iter()) {
+            assert_eq!(m.run_id, s.run_id);
+            assert_eq!(m.project, s.project);
+            // `resume_at_ms` and `created_at_ms` are computed inside
+            // each backend's projection arm against its own
+            // `now_millis()` at apply-time, so across `append_both`
+            // calls they can differ by a few ms. Use a generous
+            // tolerance — the parity that matters is "same run_id +
+            // same tenant appears in the same order", not sub-ms
+            // clock agreement.
+            let dt = m.resume_at_ms.abs_diff(s.resume_at_ms);
+            assert!(
+                dt < 1_000,
+                "resume_at_ms drift too large: in-memory={}, sqlite={}, diff={}ms",
+                m.resume_at_ms,
+                s.resume_at_ms,
+                dt
+            );
+        }
+
+        let run_ids: Vec<_> = mem_due.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(
+            run_ids,
+            vec!["run_a"],
+            "only run_a should be due: run_b was resumed (evict), run_c has \
+             resume_after_ms=None (not scheduled). Got: {run_ids:?}"
+        );
+    }
 }
 
 // ── Postgres parity (nightly / labelled PRs) ───────────────────────────

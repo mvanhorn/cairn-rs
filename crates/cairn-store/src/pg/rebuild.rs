@@ -15,11 +15,19 @@ pub struct ProjectionRebuilder {
 }
 
 /// Tables that hold synchronous projection state.
+///
+/// Ordered reverse-FK-safe: children first, parents last. New
+/// projection tables MUST be added here so `rebuild_all` clears
+/// stale rows before the replay repopulates them — otherwise a
+/// rebuild silently keeps rows no longer backed by the event log
+/// (or rows for runs whose events were compacted), corrupting
+/// read models such as `PauseScheduleReadModel::list_due`.
 const PROJECTION_TABLES: &[&str] = &[
     "tool_invocations",
     "mailbox_messages",
     "checkpoints",
     "approvals",
+    "pause_schedules",
     "tasks",
     "runs",
     "sessions",
@@ -79,7 +87,13 @@ impl ProjectionRebuilder {
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
 
             for event in &events {
-                match PgSyncProjection::apply_async(&mut tx, &event.envelope).await {
+                // Copilot #595: forward the event's durable
+                // `stored_at` as the projection's event-time so replay
+                // reproduces the original pause_schedules row instead
+                // of shifting `resume_at_ms` forward to the rebuild
+                // wall clock.
+                match PgSyncProjection::apply_async(&mut tx, &event.envelope, event.stored_at).await
+                {
                     Ok(()) => {}
                     Err(_e) => {
                         total_errors += 1;
@@ -132,7 +146,11 @@ impl ProjectionRebuilder {
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
 
             for event in &events {
-                match PgSyncProjection::apply_async(&mut tx, &event.envelope).await {
+                // Copilot #595: see `rebuild_all` — forward the
+                // stored event-time so replay is idempotent with the
+                // original live append.
+                match PgSyncProjection::apply_async(&mut tx, &event.envelope, event.stored_at).await
+                {
                     Ok(()) => {}
                     Err(_e) => {
                         total_errors += 1;
@@ -183,5 +201,27 @@ pub struct RebuildReport {
 impl RebuildReport {
     pub fn is_clean(&self) -> bool {
         self.errors == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PROJECTION_TABLES;
+
+    /// Regression guard for Copilot #595 round 4: when a new
+    /// projection table is added, `rebuild_all` must truncate it too,
+    /// otherwise rows not backed by the replayed event log survive
+    /// the rebuild and corrupt the read model. `pause_schedules` is
+    /// the most recent addition (issue #592) and the one Copilot
+    /// caught missing; asserting its membership locks the fix in.
+    #[test]
+    fn projection_tables_includes_pause_schedules() {
+        assert!(
+            PROJECTION_TABLES.contains(&"pause_schedules"),
+            "PROJECTION_TABLES must list `pause_schedules` so \
+             ProjectionRebuilder::rebuild_all clears stale rows \
+             before replay. Adding a new projection table without \
+             adding it here leaves stale rows after rebuild."
+        );
     }
 }

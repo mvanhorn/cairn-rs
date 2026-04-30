@@ -273,6 +273,14 @@ struct State {
     /// Track 3). Keyed by `tool_call_id`. Mirror of the
     /// `tool_recovery_pauses` pg/sqlite table.
     tool_recovery_pauses: HashMap<String, crate::projections::ToolRecoveryPauseRecord>,
+    /// Issue #592: evict-on-resume projection keyed by `run_id`.
+    /// Mirror of the `pause_schedules` pg/sqlite table (pg V062 +
+    /// sqlite `schema.rs`). `RunStateChanged(→Paused)` with a
+    /// non-None `resume_after_ms` inserts a row; any transition away
+    /// from Paused removes it. `PauseScheduleReadModel::list_due`
+    /// reads this map with an ordered range scan — no event-log
+    /// walker.
+    pause_schedules: HashMap<String, crate::projections::PauseScheduledRecord>,
 }
 
 pub struct InMemoryStore {
@@ -398,6 +406,7 @@ impl InMemoryStore {
                 user_messages: HashMap::new(),
                 soul_patches: HashMap::new(),
                 tool_recovery_pauses: HashMap::new(),
+                pause_schedules: HashMap::new(),
             }),
             usage_counters: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
@@ -570,6 +579,40 @@ impl InMemoryStore {
                     rec.resume_trigger = e.resume_trigger;
                     rec.version += 1;
                     rec.updated_at = now;
+                }
+
+                // Issue #592: pause_schedules projection — evict-on-resume.
+                // Mirrors pg/sqlite: INSERT on Paused with
+                // `resume_after_ms=Some`, DELETE on any transition
+                // away from Paused. Parity harness asserts stable
+                // ordering + consistent membership/eviction across
+                // backends. Post Copilot #595 fix, all three backends
+                // compute `resume_at_ms` = event-time + resume_after_ms
+                // (in_memory reads `event.stored_at` via the enclosing
+                // `apply_projection`, pg/sqlite take `event_time_ms`
+                // through `apply_async`), so a rebuild replays
+                // scheduled resumes at their original wall-clock
+                // instead of shifting them to the rebuild wall-clock.
+                match e.transition.to {
+                    cairn_domain::RunState::Paused => {
+                        if let Some(reason) = &e.pause_reason {
+                            if let Some(resume_after_ms) = reason.resume_after_ms {
+                                let resume_at_ms = now.saturating_add(resume_after_ms);
+                                state.pause_schedules.insert(
+                                    e.run_id.as_str().to_owned(),
+                                    crate::projections::PauseScheduledRecord {
+                                        run_id: e.run_id.clone(),
+                                        project: e.project.clone(),
+                                        resume_at_ms,
+                                        created_at_ms: now,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        state.pause_schedules.remove(e.run_id.as_str());
+                    }
                 }
             }
             RuntimeEvent::TaskCreated(e) => {
@@ -5984,56 +6027,26 @@ impl crate::projections::PauseScheduleReadModel for InMemoryStore {
         before_ms: u64,
         limit: usize,
     ) -> Result<Vec<crate::projections::PauseScheduledRecord>, StoreError> {
-        // Issue #570: tenant filter + `limit` now live on the trait so
-        // handlers no longer iterate over every tenant's paused runs to
-        // then discard the ones that don't belong.
+        // Issue #592: evict-on-resume projection — read from
+        // `state.pause_schedules` (populated by the RunStateChanged
+        // projection arm) instead of walking the full event log.
+        //
+        // Contract parity with pg/sqlite/sqlite adapter's `list_due`:
+        //   - tenant gate (`tenant_id == caller`).
+        //   - `resume_at_ms <= before_ms` filter.
+        //   - ORDER BY `resume_at_ms ASC, run_id ASC` — stable
+        //     ordering so backends agree on membership/eviction
+        //     semantics even when `resume_at_ms` is compared with
+        //     sub-second tolerance.
+        //   - LIMIT applied AFTER the ordering, not via a random
+        //     partial iterator.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        // Find all RunStateChanged(to=Paused) events with resume_after_ms set.
-        // Use a map to keep only the latest pause event per run.
-        let mut paused: std::collections::HashMap<
-            String,
-            crate::projections::PauseScheduledRecord,
-        > = std::collections::HashMap::new();
-        for stored in &state.events {
-            if let RuntimeEvent::RunStateChanged(e) = &stored.envelope.payload {
-                // Tenant gate: events outside the caller's tenant never
-                // contribute to the paused set, so resumes on a
-                // different tenant can't evict a still-paused row
-                // belonging to ours either.
-                if e.project.tenant_id != *tenant_id {
-                    continue;
-                }
-                if e.transition.to == cairn_domain::RunState::Paused {
-                    if let Some(reason) = &e.pause_reason {
-                        if let Some(resume_after_ms) = reason.resume_after_ms {
-                            let resume_at_ms = stored.stored_at + resume_after_ms;
-                            paused.insert(
-                                e.run_id.as_str().to_owned(),
-                                crate::projections::PauseScheduledRecord {
-                                    run_id: e.run_id.clone(),
-                                    project: e.project.clone(),
-                                    resume_at_ms,
-                                    created_at_ms: stored.stored_at,
-                                },
-                            );
-                        }
-                    }
-                } else if matches!(
-                    e.transition.to,
-                    cairn_domain::RunState::Running
-                        | cairn_domain::RunState::Completed
-                        | cairn_domain::RunState::Failed
-                ) {
-                    // Run resumed/completed — remove from paused map.
-                    paused.remove(e.run_id.as_str());
-                }
-            }
-        }
-        let mut due: Vec<_> = paused
-            .into_values()
-            .filter(|r| r.resume_at_ms <= before_ms)
+        let mut due: Vec<_> = state
+            .pause_schedules
+            .values()
+            .filter(|r| r.project.tenant_id == *tenant_id && r.resume_at_ms <= before_ms)
+            .cloned()
             .collect();
-        // Deterministic order so page-by-page iteration is stable.
         due.sort_by(|a, b| {
             a.resume_at_ms
                 .cmp(&b.resume_at_ms)
@@ -6918,6 +6931,13 @@ impl InMemoryStore {
         state.retention_policies.clear();
         state.route_policies.clear();
         state.resource_shares.clear();
+        // Issue #592: pause_schedules is an evict-on-resume projection
+        // that must be part of compaction's clear-then-rebuild pass.
+        // Otherwise a compact-while-paused run's schedule row would
+        // duplicate into the rebuilt map or, worse, survive a
+        // retention-window prune of its originating RunStateChanged
+        // event and leak a stale resume entry into `list_due`.
+        state.pause_schedules.clear();
         state.snapshots.clear();
         state.command_id_index.clear();
         // RFC-025 Phase 1.5a: trigger / run_template / trigger_fires
