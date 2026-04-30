@@ -587,8 +587,56 @@ impl SqliteSyncProjection {
                 )
                 .await?;
             }
-            RuntimeEvent::RunCostUpdated(_) => log_stub("RunCostUpdated"),
-            RuntimeEvent::SpendAlertTriggered(_) => log_stub("SpendAlertTriggered"),
+            // RFC-025 Phase 2b.4 m4: run_costs projection (sqlite parity
+            // with pg V065). Counter-semantic accumulate. See pg applier.
+            RuntimeEvent::RunCostUpdated(e) => {
+                let delta_cost = i64::try_from(e.delta_cost_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostUpdated.delta_cost_micros {} exceeds i64::MAX",
+                        e.delta_cost_micros
+                    ))
+                })?;
+                let delta_in = i64::try_from(e.delta_tokens_in).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostUpdated.delta_tokens_in {} exceeds i64::MAX",
+                        e.delta_tokens_in
+                    ))
+                })?;
+                let delta_out = i64::try_from(e.delta_tokens_out).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostUpdated.delta_tokens_out {} exceeds i64::MAX",
+                        e.delta_tokens_out
+                    ))
+                })?;
+                let updated_at = i64::try_from(e.updated_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostUpdated.updated_at_ms {} exceeds i64::MAX",
+                        e.updated_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO run_costs (
+                        run_id, total_cost_micros, total_tokens_in,
+                        total_tokens_out, provider_calls, updated_at_ms
+                     ) VALUES (?, ?, ?, ?, 1, ?)
+                     ON CONFLICT (run_id) DO UPDATE SET
+                        total_cost_micros = run_costs.total_cost_micros + excluded.total_cost_micros,
+                        total_tokens_in   = run_costs.total_tokens_in + excluded.total_tokens_in,
+                        total_tokens_out  = run_costs.total_tokens_out + excluded.total_tokens_out,
+                        provider_calls    = run_costs.provider_calls + 1,
+                        updated_at_ms     = excluded.updated_at_ms",
+                )
+                .bind(e.run_id.as_str())
+                .bind(delta_cost)
+                .bind(delta_in)
+                .bind(delta_out)
+                .bind(updated_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC-025 Phase 2b.4 m4: Ephemeral — see pg applier + registry.
+            RuntimeEvent::SpendAlertTriggered(_) => {}
             // RFC-025 Phase 2b.2b m3: subagent_spawns projection (pg V053).
             // Parity with pg + in-memory: also UPDATEs the child
             // task's parent linkage on `tasks` (Gemini PR #593 review).
@@ -1634,11 +1682,12 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderPoolCreated(_) => log_stub("ProviderPoolCreated"),
-            RuntimeEvent::ProviderPoolConnectionAdded(_) => log_stub("ProviderPoolConnectionAdded"),
-            RuntimeEvent::ProviderPoolConnectionRemoved(_) => {
-                log_stub("ProviderPoolConnectionRemoved")
-            }
+            // RFC-025 Phase 2b.4: provider pools are Ephemeral — live
+            // HTTP-client state rebuilt from provider_bindings at boot.
+            // See `crate::projection_registry` for the rationale.
+            RuntimeEvent::ProviderPoolCreated(_)
+            | RuntimeEvent::ProviderPoolConnectionAdded(_)
+            | RuntimeEvent::ProviderPoolConnectionRemoved(_) => {}
             // RFC-025 Phase 2a.1 milestone 2: tenant quotas projection
             // (sqlite parity with pg).
             RuntimeEvent::TenantQuotaSet(e) => {
@@ -1748,8 +1797,68 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::RunCostAlertSet(_) => log_stub("RunCostAlertSet"),
-            RuntimeEvent::RunCostAlertTriggered(_) => log_stub("RunCostAlertTriggered"),
+            // RFC-025 Phase 2b.4 m4: run_cost_alerts projection (sqlite
+            // parity with pg V065). See pg applier for rearm-on-set +
+            // update-in-place-on-trigger semantics.
+            RuntimeEvent::RunCostAlertSet(e) => {
+                let threshold = i64::try_from(e.threshold_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostAlertSet.threshold_micros {} exceeds i64::MAX",
+                        e.threshold_micros
+                    ))
+                })?;
+                let set_at = i64::try_from(e.set_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostAlertSet.set_at_ms {} exceeds i64::MAX",
+                        e.set_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO run_cost_alerts (
+                        run_id, tenant_id, threshold_micros,
+                        triggered_at_ms, actual_cost_micros, set_at_ms
+                     ) VALUES (?, ?, ?, 0, 0, ?)
+                     ON CONFLICT (run_id) DO UPDATE SET
+                        tenant_id           = excluded.tenant_id,
+                        threshold_micros    = excluded.threshold_micros,
+                        triggered_at_ms     = 0,
+                        actual_cost_micros  = 0,
+                        set_at_ms           = excluded.set_at_ms",
+                )
+                .bind(e.run_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(threshold)
+                .bind(set_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::RunCostAlertTriggered(e) => {
+                let actual = i64::try_from(e.actual_cost_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostAlertTriggered.actual_cost_micros {} exceeds i64::MAX",
+                        e.actual_cost_micros
+                    ))
+                })?;
+                let triggered_at = i64::try_from(e.triggered_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostAlertTriggered.triggered_at_ms {} exceeds i64::MAX",
+                        e.triggered_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE run_cost_alerts SET
+                        triggered_at_ms    = ?2,
+                        actual_cost_micros = ?3
+                     WHERE run_id = ?1",
+                )
+                .bind(e.run_id.as_str())
+                .bind(triggered_at)
+                .bind(actual)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::WorkspaceMemberAdded(e) => {
                 let role = enum_to_str(&e.role)?;
                 sqlx::query(
@@ -1967,11 +2076,103 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::EvalBaselineLocked(_) => log_stub("EvalBaselineLocked"),
-            RuntimeEvent::EvalBaselineSet(_) => log_stub("EvalBaselineSet"),
-            RuntimeEvent::EvalDatasetCreated(_) => log_stub("EvalDatasetCreated"),
-            RuntimeEvent::EvalDatasetEntryAdded(_) => log_stub("EvalDatasetEntryAdded"),
-            RuntimeEvent::EvalRubricCreated(_) => log_stub("EvalRubricCreated"),
+            // RFC-025 Phase 2b.4 m2: eval catalog projections (sqlite
+            // parity with pg V063). See pg applier for the full
+            // rationale + replay-semantics breakdown.
+            RuntimeEvent::EvalDatasetCreated(e) => {
+                let created_at = i64::try_from(e.created_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EvalDatasetCreated.created_at_ms {} exceeds i64::MAX",
+                        e.created_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO eval_datasets (
+                        dataset_id, tenant_id, name, subject_kind, created_at_ms
+                     ) VALUES (?, '', ?, 'prompt_release', ?)
+                     ON CONFLICT (dataset_id) DO NOTHING",
+                )
+                .bind(&e.dataset_id)
+                .bind(&e.name)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalDatasetEntryAdded(e) => {
+                let added_at = i64::try_from(e.added_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EvalDatasetEntryAdded.added_at_ms {} exceeds i64::MAX",
+                        e.added_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO eval_dataset_entries (
+                        dataset_id, entry_id, added_at_ms
+                     ) VALUES (?, ?, ?)
+                     ON CONFLICT (dataset_id, entry_id) DO NOTHING",
+                )
+                .bind(&e.dataset_id)
+                .bind(&e.entry_id)
+                .bind(added_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRubricCreated(e) => {
+                let created_at = i64::try_from(e.created_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EvalRubricCreated.created_at_ms {} exceeds i64::MAX",
+                        e.created_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO eval_rubrics (
+                        rubric_id, tenant_id, name, dimensions_json, created_at_ms
+                     ) VALUES (?, '', ?, '[]', ?)
+                     ON CONFLICT (rubric_id) DO NOTHING",
+                )
+                .bind(&e.rubric_id)
+                .bind(&e.name)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalBaselineSet(e) => {
+                let set_at = i64::try_from(e.set_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EvalBaselineSet.set_at_ms {} exceeds i64::MAX",
+                        e.set_at_ms
+                    ))
+                })?;
+                let display_name = format!("{}[{}={}]", e.baseline_id, e.metric, e.value);
+                sqlx::query(
+                    "INSERT INTO eval_baselines (
+                        baseline_id, tenant_id, name, prompt_asset_id,
+                        metrics_json, created_at_ms, locked
+                     ) VALUES (?, '', ?, '', '{}', ?, 0)
+                     ON CONFLICT (baseline_id) DO UPDATE SET
+                        name = excluded.name
+                     WHERE eval_baselines.locked = 0",
+                )
+                .bind(&e.baseline_id)
+                .bind(&display_name)
+                .bind(set_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalBaselineLocked(e) => {
+                sqlx::query(
+                    "UPDATE eval_baselines SET locked = 1
+                     WHERE baseline_id = ?",
+                )
+                .bind(&e.baseline_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 2b.2b m6: Ephemeral — see pg applier + registry.
             RuntimeEvent::EventLogCompacted(_) => {}
             // RFC-025 Phase 2a.2 milestone 2: guardrail_policies projection.
@@ -2042,14 +2243,55 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::OperatorIntervention(_) => log_stub("OperatorIntervention"),
-            RuntimeEvent::OperatorProfileCreated(_) => log_stub("OperatorProfileCreated"),
-            RuntimeEvent::OperatorProfileUpdated(_) => log_stub("OperatorProfileUpdated"),
-            // Issue #592: mirror pg — `PauseScheduled` is Projected
-            // via the `RunStateChanged` → `pause_schedules` arm above.
-            // Explicit no-op here (not log_stub) so the projection-
-            // stub-guard CI job stays green on a variant that has no
-            // dedicated emission path today.
+            // RFC-025 Phase 2b.4 m3: Ephemeral — see pg applier + registry.
+            RuntimeEvent::OperatorIntervention(_) => {}
+            // RFC-025 Phase 2b.4 m3: operator_profiles projection
+            // (sqlite parity with pg V064). See pg applier for the
+            // per-event rationale; ? placeholders + EXCLUDED replaced
+            // by `excluded` in the ON CONFLICT UPDATE clause.
+            RuntimeEvent::OperatorProfileCreated(e) => {
+                // Propagate serialization errors — see pg applier.
+                // Copilot PR #596 review.
+                let role = enum_to_str(&e.role)?;
+                sqlx::query(
+                    "INSERT INTO operator_profiles (
+                        operator_id, tenant_id, display_name, email, role,
+                        created_at_ms
+                     ) VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (operator_id) DO UPDATE SET
+                        tenant_id     = excluded.tenant_id,
+                        display_name  = excluded.display_name,
+                        email         = excluded.email,
+                        role          = excluded.role,
+                        created_at_ms = excluded.created_at_ms",
+                )
+                .bind(e.profile_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(&e.display_name)
+                .bind(&e.email)
+                .bind(&role)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::OperatorProfileUpdated(e) => {
+                sqlx::query(
+                    "UPDATE operator_profiles SET
+                        display_name = COALESCE(?2, display_name),
+                        email        = COALESCE(?3, email)
+                     WHERE operator_id = ?1",
+                )
+                .bind(e.profile_id.as_str())
+                .bind(e.display_name.as_deref())
+                .bind(e.email.as_deref())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // PR #595 (issue #592): `PauseScheduled` is Projected via the
+            // `RunStateChanged` → `pause_schedules` arm above; explicit
+            // no-op keeps the projection-stub-guard CI job green.
             RuntimeEvent::PauseScheduled(_) => {}
             RuntimeEvent::PermissionDecisionRecorded(_) => log_stub("PermissionDecisionRecorded"),
             // RFC-025 Phase 3: provider_bindings projection (sqlite
@@ -2204,15 +2446,16 @@ impl SqliteSyncProjection {
                     .await
                     .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderHealthChecked(_) => log_stub("ProviderHealthChecked"),
-            RuntimeEvent::ProviderHealthScheduleSet(_) => log_stub("ProviderHealthScheduleSet"),
-            RuntimeEvent::ProviderHealthScheduleTriggered(_) => {
-                log_stub("ProviderHealthScheduleTriggered")
-            }
-            RuntimeEvent::ProviderMarkedDegraded(_) => log_stub("ProviderMarkedDegraded"),
-            RuntimeEvent::ProviderModelRegistered(_) => log_stub("ProviderModelRegistered"),
-            RuntimeEvent::ProviderRecovered(_) => log_stub("ProviderRecovered"),
-            RuntimeEvent::ProviderRetryPolicySet(_) => log_stub("ProviderRetryPolicySet"),
+            // RFC-025 Phase 2b.4: provider health / model / retry events
+            // are Ephemeral (sqlite parity with pg). See
+            // `crate::projection_registry` for per-variant rationale.
+            RuntimeEvent::ProviderHealthChecked(_)
+            | RuntimeEvent::ProviderHealthScheduleSet(_)
+            | RuntimeEvent::ProviderHealthScheduleTriggered(_)
+            | RuntimeEvent::ProviderMarkedDegraded(_)
+            | RuntimeEvent::ProviderModelRegistered(_)
+            | RuntimeEvent::ProviderRecovered(_)
+            | RuntimeEvent::ProviderRetryPolicySet(_) => {}
             // RFC-025 Phase 2b.2b m6: Ephemeral — see pg applier + registry.
             RuntimeEvent::RecoveryEscalated(_) => {}
             // RFC-025 Phase 2b.2b m1: resource_shares projection (pg V051).
@@ -2283,10 +2526,26 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            // PG's projection does not consume RoutePolicyUpdated — the event
-            // is kept for audit, and the rules set is advanced by the next
-            // RoutePolicyCreated upsert. SQLite mirrors that shape.
-            RuntimeEvent::RoutePolicyUpdated(_) => log_stub("RoutePolicyUpdated"),
+            // RFC-025 Phase 2b.4 m4: route_policies.updated_at bump.
+            // Matches pg applier + in-memory `if let Some(p)` guard:
+            // missing row is silently ignored.
+            RuntimeEvent::RoutePolicyUpdated(e) => {
+                let updated_at = i64::try_from(e.updated_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RoutePolicyUpdated.updated_at_ms {} exceeds i64::MAX",
+                        e.updated_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE route_policies SET updated_at = ?2
+                     WHERE policy_id = ?1",
+                )
+                .bind(&e.policy_id)
+                .bind(updated_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::RunSlaBreached(_) => log_stub("RunSlaBreached"),
             RuntimeEvent::RunSlaSet(_) => log_stub("RunSlaSet"),
             RuntimeEvent::SignalRouted(_) => log_stub("SignalRouted"),

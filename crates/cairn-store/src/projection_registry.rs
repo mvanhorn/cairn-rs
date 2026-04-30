@@ -743,32 +743,32 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "EvalBaselineLocked",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (eval baselines)",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_baselines"),
         },
     },
     ProjectionEntry {
         variant: "EvalBaselineSet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (eval baselines)",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_baselines"),
         },
     },
     ProjectionEntry {
         variant: "EvalDatasetCreated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (eval datasets)",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_datasets"),
         },
     },
     ProjectionEntry {
         variant: "EvalDatasetEntryAdded",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (eval datasets)",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_dataset_entries"),
         },
     },
     ProjectionEntry {
         variant: "EvalRubricCreated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (eval rubrics)",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_rubrics"),
         },
     },
     ProjectionEntry {
@@ -845,20 +845,20 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "OperatorIntervention",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (operator interventions)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "`OperatorInterventionReadModel::list_by_run` walks the event log directly on every backend (pg/sqlite reads replay into `InMemoryStore` at boot; the read impl iterates `state.events` and filters by `run_id`). A dedicated projection table would duplicate the event-log contents without a new read path — the event log itself is the audit trail, which is the Ephemeral contract. Gated by `load_run_visible_to_tenant` for cross-tenant isolation.",
         },
     },
     ProjectionEntry {
         variant: "OperatorProfileCreated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (operator profiles)",
+        status: ProjectionStatus::Projected {
+            table: Some("operator_profiles"),
         },
     },
     ProjectionEntry {
         variant: "OperatorProfileUpdated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (operator profiles)",
+        status: ProjectionStatus::Projected {
+            table: Some("operator_profiles"),
         },
     },
     ProjectionEntry {
@@ -876,7 +876,7 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     ProjectionEntry {
         variant: "PermissionDecisionRecorded",
         status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (permission decisions)",
+            tracking: "RFC-025 Phase 2b.5 (permission decisions — Ephemeral reclassification deferred; the in-memory applier is already a no-op and no reader exists anywhere in cairn-runtime / cairn-app, so the pg/sqlite log_stub is purely a tracking signal until the parallel pause-lifecycle work lands and the stub-guard diff window clears)",
         },
     },
     ProjectionEntry {
@@ -910,21 +910,25 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     // research underpinning this classification:
     //   * Bindings + connections are PROJECTED (persistent config) —
     //     this is what Phase 3 ships.
-    //   * Pools (ProviderPool*) stay STUBBED for now; they are intended
-    //     to become EPHEMERAL in Phase 3b (live HTTP-client state is
-    //     not persistable and is rebuilt from bindings + connections
-    //     at boot — but flipping the registry status to Ephemeral
-    //     without the accompanying pool read-model would drop the
-    //     stub-guard alert that tracks Phase 3b scope).
+    //   * Pools (ProviderPool*) are EPHEMERAL (see below): live HTTP-
+    //     client state is not persistable; the pool is rebuilt from
+    //     bindings + connections on boot.
     //   * Health probes (ProviderHealthChecked, ProviderMarkedDegraded,
-    //     ProviderRecovered, ProviderHealthSchedule*) stay STUBBED for
-    //     now; they are intended to become EPHEMERAL in Phase 3b (next
-    //     probe cycle rebuilds state; no operator-visible read after
-    //     restart).
-    // Flipping the pool / health variants to Ephemeral is deferred to
-    // Phase 3b so the stub-guard CI job continues to track the Phase 3b
-    // scope explicitly rather than silently absorbing it into the
-    // Ephemeral bucket.
+    //     ProviderRecovered, ProviderHealthSchedule*) are EPHEMERAL:
+    //     the next probe cycle supersedes any persisted status; there
+    //     is no operator-visible read-after-restart contract.
+    //   * Model capability announcements and retry policies (Provider
+    //     ModelRegistered, ProviderRetryPolicySet) are EPHEMERAL: the
+    //     in-memory applier is already a no-op today and the runtime
+    //     layer has no reader; operator re-announces on restart. See
+    //     the comments on each entry below.
+    // RFC-025 Phase 2b.4 (2026-04-28): the 10 variants immediately
+    // below moved from Stubbed → Ephemeral once the research above
+    // was cross-checked against the in-memory applier + service-layer
+    // read paths. The stub-guard CI job still catches any *new* stub
+    // site, so this reclassification does not weaken the Phase 3b
+    // scope signal — Phase 3b is now limited to the work needed to
+    // surface ephemeral provider state to operators via SSE/metrics.
     ProjectionEntry {
         variant: "ProviderBindingCreated",
         status: ProjectionStatus::Projected {
@@ -967,64 +971,74 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             table: Some("provider_connections"),
         },
     },
+    // RFC-025 Phase 2b.4: health probes are ephemeral. `ProviderHealth
+    // Checked` updates an in-memory `ProviderHealthRecord` that callers
+    // read via `ProviderHealthService::run_due_health_checks` — a
+    // live-probe endpoint, not a read-after-restart surface. The next
+    // probe cycle overwrites the in-memory row regardless of whether
+    // the previous check survived restart. Persisting probe history
+    // would require a dedicated bounded audit table (bounded-ring, not
+    // append-forever) — that is a separate follow-up, not the core F40
+    // durability contract. Today the event log itself is the audit
+    // trail; operators observe live status via SSE + metrics.
     ProjectionEntry {
         variant: "ProviderHealthChecked",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider health — ephemeral vs projected pending research)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Health probe status is rebuilt on the next probe cycle. The in-memory `ProviderHealthRecord` exists only for the live `run_due_health_checks` endpoint; operators observe status via SSE + metrics. Persisting every probe hit would grow without bound with no read-after-restart contract. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderHealthScheduleSet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider health)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Health-check schedules are derived configuration rebuilt from provider_bindings at boot (the canonical config). The `ProviderHealthSchedule` in-memory record only drives the in-process scheduler loop; operators view + edit schedules via the binding CRUD path, not a schedule-specific projection. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderHealthScheduleTriggered",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider health)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Schedule-tick `last_run_ms` is purely an in-process scheduler marker — restart resets the tick cadence and the next scheduler pass re-triggers probes. No operator read-after-restart surface. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderMarkedDegraded",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider health)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "The degraded bit lives on the in-memory `ProviderHealthRecord` and is superseded by the next `ProviderHealthChecked` / `ProviderRecovered` event in-process. Persisting it would suggest a read-after-restart contract cairn does not expose — operators see degradation via SSE + metrics. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderModelRegistered",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider models)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Capability announcements are informational — the in-memory applier is already a no-op and the runtime layer exposes no `ProviderModelReadModel` consumer today (only the in-memory `InMemoryStore` impl exists, used by a handful of tests). Operator re-announces on restart; the event log keeps the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderPoolConnectionAdded",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider pools — ephemeral vs projected pending research)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Pool membership tracks live HTTP-client state; it is rebuilt from provider_bindings + provider_connections on boot. Persisting the mutation would diverge from the live pool the moment reqwest reconnects. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderPoolConnectionRemoved",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider pools — ephemeral vs projected pending research)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Counterpart to `ProviderPoolConnectionAdded` — pool membership is live-HTTP-client state rebuilt from bindings + connections at boot. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderPoolCreated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider pools — ephemeral vs projected pending research)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Pools are live HTTP-client state (active_connections, reqwest::Client references). Rebuilt from provider_bindings + provider_connections on boot; persistence would diverge from reality. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderRecovered",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider health)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Recovery flip complements `ProviderMarkedDegraded` — the next probe cycle is authoritative, the in-memory status survives only until the next `ProviderHealthChecked`. No operator read-after-restart surface. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
         variant: "ProviderRetryPolicySet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 3 (provider retry policies)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Retry policy today has no reader in cairn-runtime — the HTTP handler only appends the event (see `set_provider_retry_policy_handler` in cairn-app/src/handlers/providers.rs). Operator re-sets on restart; persisting would suggest a read-after-restart contract cairn does not implement. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
@@ -1053,26 +1067,26 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "RoutePolicyUpdated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (route policies — Created is projected, Updated is not)",
+        status: ProjectionStatus::Projected {
+            table: Some("route_policies"),
         },
     },
     ProjectionEntry {
         variant: "RunCostAlertSet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (run cost alerts)",
+        status: ProjectionStatus::Projected {
+            table: Some("run_cost_alerts"),
         },
     },
     ProjectionEntry {
         variant: "RunCostAlertTriggered",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (run cost alerts)",
+        status: ProjectionStatus::Projected {
+            table: Some("run_cost_alerts"),
         },
     },
     ProjectionEntry {
         variant: "RunCostUpdated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (run cost updates — parity with SessionCostUpdated)",
+        status: ProjectionStatus::Projected {
+            table: Some("run_costs"),
         },
     },
     ProjectionEntry {
@@ -1101,8 +1115,8 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "SpendAlertTriggered",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (spend alerts)",
+        status: ProjectionStatus::Ephemeral {
+            reason: "No reader in cairn-runtime or cairn-app — the event is appended as an audit record and operators consume it via SSE (see `cairn-app/src/helpers.rs` event-type classification). The in-memory applier is already a no-op; pg/sqlite match. Event log is the audit trail.",
         },
     },
     ProjectionEntry {
@@ -1243,18 +1257,63 @@ mod tests {
             !stubbed.is_empty(),
             "Phase 1 should surface at least one stubbed variant (Phase 2a/2b backlog)"
         );
-        // Spot-check variants still in the Stubbed bucket post-Phase-2b.3.
-        // Ingest-jobs + defaults + channels migrated in 2b.3 m1/m2/m3;
-        // the skills + plugins surface is deliberately deferred to a
-        // follow-up PR (needs net-new `RuntimeEvent` variants — see
-        // issue #574 "needs new events before projection can land").
-        // Provider-health / route-policy-Updated / eval baselines stay
-        // in the Stubbed bucket pending later milestones of 2b.3 or a
-        // follow-up phase.
-        for required in ["EvalBaselineSet", "ProviderHealthChecked"] {
+        // Spot-check variants still in the Stubbed bucket post-Phase-2b.4 m1.
+        // Provider health / pools / model / retry variants moved to
+        // Ephemeral in Phase 2b.4 m1 (bindings + connections were the
+        // only persistent provider-state required by the F40 durability
+        // contract). Eval baselines / datasets / rubrics, operator
+        // interventions / profiles, permissions, route-policy-Updated,
+        // run-cost / spend-alert, and `PauseScheduled` are the 15
+        // variants that remain Stubbed pending Phase 2b.4 m2-m4 and
+        // the parallel pause-lifecycle work.
+        // Post-Phase-2b.4 m4 the Stubbed bucket holds only
+        // `PermissionDecisionRecorded` (Phase 2b.5 follow-up — the
+        // Ephemeral reclassification is correct but was deferred).
+        // PR #595 took PauseScheduled Projected.
+        assert!(
+            stubbed.contains(&"PermissionDecisionRecorded"),
+            "PermissionDecisionRecorded should still be Stubbed post-Phase-2b.4 m4"
+        );
+        // Confirm every Phase 2b.4 migration left the Stubbed bucket.
+        for migrated in [
+            "EvalBaselineLocked",
+            "EvalBaselineSet",
+            "EvalDatasetCreated",
+            "EvalDatasetEntryAdded",
+            "EvalRubricCreated",
+            "OperatorProfileCreated",
+            "OperatorProfileUpdated",
+            "OperatorIntervention",
+            "PauseScheduled",
+            "RoutePolicyUpdated",
+            "RunCostAlertSet",
+            "RunCostAlertTriggered",
+            "RunCostUpdated",
+            "SpendAlertTriggered",
+        ] {
             assert!(
-                stubbed.contains(&required),
-                "{required} should still be Stubbed post-Phase-2b.3 m3 (later phase follow-up)"
+                !stubbed.contains(&migrated),
+                "{migrated} should be Projected/Ephemeral after Phase 2b.4"
+            );
+        }
+        // Confirm Phase 2b.4 m1 ephemeral reclassification left the
+        // Stubbed bucket for every provider health / pool / model /
+        // retry variant.
+        for migrated in [
+            "ProviderHealthChecked",
+            "ProviderHealthScheduleSet",
+            "ProviderHealthScheduleTriggered",
+            "ProviderMarkedDegraded",
+            "ProviderModelRegistered",
+            "ProviderPoolCreated",
+            "ProviderPoolConnectionAdded",
+            "ProviderPoolConnectionRemoved",
+            "ProviderRecovered",
+            "ProviderRetryPolicySet",
+        ] {
+            assert!(
+                !stubbed.contains(&migrated),
+                "{migrated} should be Ephemeral after Phase 2b.4 milestone 1"
             );
         }
         // Confirm Phase-1 eval migrations stayed out of Stubbed.
@@ -1429,27 +1488,66 @@ mod tests {
         //     Stubbed → Projected with backing table
         //     `checkpoint_strategies` (pg V061 + sqlite schema.rs).
         //     Net: +1 Projected, -1 Stubbed → 113 / 20 / 25.
-        //   * Issue #592 flips `PauseScheduled` Stubbed → Projected
-        //     with backing table `pause_schedules` (pg V062 + sqlite
-        //     schema.rs). Renumbered V057 → V062 after main published
-        //     Phase 2b.3 (V057-V061). The pause_schedules table is
-        //     populated by the `RunStateChanged` projection arm
-        //     (INSERT on Paused with `resume_after_ms=Some`, DELETE
-        //     on any transition away). Replaces the event-log walker
-        //     in `PauseScheduleReadModel::list_due` with an indexed
-        //     range scan. Net: +1 Projected, -1 Stubbed
-        //     → 114 / 20 / 24.
+        //   * PR #595 (issue #592, parallel pause-lifecycle agent):
+        //     flips `PauseScheduled` Stubbed → Projected with backing
+        //     table `pause_schedules` (pg V062 from that PR + sqlite
+        //     schema.rs). Net: +1 Projected, -1 Stubbed → 114 / 20 / 24.
+        //   * Phase 2b.4 milestone 1 flips the 10 provider-state
+        //     variants that Phase 3 deferred (`ProviderHealthChecked`,
+        //     `ProviderHealthScheduleSet`, `ProviderHealthSchedule
+        //     Triggered`, `ProviderMarkedDegraded`, `ProviderModel
+        //     Registered`, `ProviderPoolCreated`, `ProviderPool
+        //     ConnectionAdded`, `ProviderPoolConnectionRemoved`,
+        //     `ProviderRecovered`, `ProviderRetryPolicySet`) Stubbed →
+        //     Ephemeral. Pools + health probes are live-HTTP-client
+        //     state rebuilt from bindings on boot; retry + model events
+        //     have no reader in cairn-runtime. See each registry entry
+        //     for the per-variant rationale.
+        //     Net: +10 Ephemeral, -10 Stubbed → 114 / 30 / 14.
+        //   * Phase 2b.4 milestone 2 flips the five eval-catalog
+        //     variants (`EvalBaselineLocked`, `EvalBaselineSet`,
+        //     `EvalDatasetCreated`, `EvalDatasetEntryAdded`,
+        //     `EvalRubricCreated`) Stubbed → Projected with backing
+        //     tables `eval_datasets` + `eval_dataset_entries` +
+        //     `eval_rubrics` + `eval_baselines` (pg V063 + sqlite
+        //     schema.rs; renumbered from V062 after PR #595 took V062
+        //     for `pause_schedules`). Net: +5 Projected, -5 Stubbed
+        //     → 119 / 30 / 9.
+        //   * Phase 2b.4 milestone 3 flips `OperatorProfileCreated` +
+        //     `OperatorProfileUpdated` Stubbed → Projected with backing
+        //     table `operator_profiles` (pg V064 + sqlite schema.rs),
+        //     and flips `OperatorIntervention` Stubbed → Ephemeral
+        //     (intervention is read via an event-log walk so the log
+        //     itself is the projection). `PermissionDecisionRecorded`
+        //     is deferred to Phase 2b.5 — the Ephemeral reclassification
+        //     is correct (no reader, audit-only).
+        //     Net: +2 Projected, +1 Ephemeral, -2 Stubbed
+        //     → 121 / 31 / 7.
+        //   * Phase 2b.4 milestone 4 flips `RunCostUpdated` +
+        //     `RunCostAlertSet` + `RunCostAlertTriggered` +
+        //     `RoutePolicyUpdated` Stubbed → Projected with backing
+        //     tables `run_costs` + `run_cost_alerts` (pg V065 + sqlite
+        //     schema.rs; renumbered from V064) and a delta-update on
+        //     the existing `route_policies` row, and flips
+        //     `SpendAlertTriggered` Stubbed → Ephemeral (audit-only;
+        //     no reader in cairn).
+        //     Net: +4 Projected, +1 Ephemeral, -5 Stubbed
+        //     → 125 / 32 / 1.
+        //     The lone remaining Stubbed variant is
+        //     `PermissionDecisionRecorded` (Phase 2b.5 Ephemeral
+        //     reclassification). PR #595 took `PauseScheduled`
+        //     Projected ahead of 2b.4 landing.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 114,
+            projected, 125,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
-            ephemeral, 20,
+            ephemeral, 32,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 24, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 1, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 
@@ -1464,7 +1562,7 @@ mod tests {
         // bucket in Phases 2b.1/2b.2/2b.2b. Ingest-jobs + defaults +
         // channels left in Phase 2b.3 m1/m2/m3. Pick a later-phase
         // variant that still lives in the Stubbed bucket.
-        assert!(msg.contains("EvalBaselineSet"));
+        assert!(msg.contains("PermissionDecisionRecorded"));
         assert!(msg.contains("Postgres") || msg.contains("postgres"));
     }
 }

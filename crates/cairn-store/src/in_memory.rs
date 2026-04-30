@@ -4281,7 +4281,14 @@ impl crate::projections::EvalDatasetReadModel for InMemoryStore {
             .filter(|d| d.tenant_id == *tenant_id || tenant_id.as_str().is_empty())
             .cloned()
             .collect();
-        results.sort_by_key(|d| d.created_at_ms);
+        // RFC-025 Phase 2b.4 m2: dataset_id tiebreaker so cross-backend
+        // parity holds when two datasets share a `created_at_ms` (matches
+        // the pg/sqlite `ORDER BY created_at_ms ASC, dataset_id ASC` query).
+        results.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.dataset_id.cmp(&b.dataset_id))
+        });
         Ok(results.into_iter().skip(offset).take(limit).collect())
     }
 }

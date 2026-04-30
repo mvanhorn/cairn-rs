@@ -594,8 +594,67 @@ impl PgSyncProjection {
                 )
                 .await?;
             }
-            RuntimeEvent::RunCostUpdated(_) => log_stub("RunCostUpdated"),
-            RuntimeEvent::SpendAlertTriggered(_) => log_stub("SpendAlertTriggered"),
+            // RFC-025 Phase 2b.4 m4: run_costs projection (pg V065).
+            // Counter-semantic upsert — every `RunCostUpdated` carries
+            // the per-call *delta*, so the UPDATE path accumulates
+            // onto `run_costs.total_*` rather than replacing. A new
+            // run_id seeds a zeroed row then immediately adds the
+            // first delta; subsequent events accumulate. Matches the
+            // in-memory applier's `saturating_add` per field. The
+            // derived `RunCostAlertTriggered` the in-memory applier
+            // emits when the threshold is crossed arrives through the
+            // normal append path (InMemoryStore emits it into the
+            // event log, which then writes through to pg/sqlite); the
+            // `RunCostAlertTriggered` arm below handles that delivery.
+            RuntimeEvent::RunCostUpdated(e) => {
+                let delta_cost = i64::try_from(e.delta_cost_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostUpdated.delta_cost_micros {} exceeds i64::MAX",
+                        e.delta_cost_micros
+                    ))
+                })?;
+                let delta_in = i64::try_from(e.delta_tokens_in).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostUpdated.delta_tokens_in {} exceeds i64::MAX",
+                        e.delta_tokens_in
+                    ))
+                })?;
+                let delta_out = i64::try_from(e.delta_tokens_out).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostUpdated.delta_tokens_out {} exceeds i64::MAX",
+                        e.delta_tokens_out
+                    ))
+                })?;
+                let updated_at = i64::try_from(e.updated_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostUpdated.updated_at_ms {} exceeds i64::MAX",
+                        e.updated_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO run_costs (
+                        run_id, total_cost_micros, total_tokens_in,
+                        total_tokens_out, provider_calls, updated_at_ms
+                     ) VALUES ($1, $2, $3, $4, 1, $5)
+                     ON CONFLICT (run_id) DO UPDATE SET
+                        total_cost_micros = run_costs.total_cost_micros + EXCLUDED.total_cost_micros,
+                        total_tokens_in   = run_costs.total_tokens_in + EXCLUDED.total_tokens_in,
+                        total_tokens_out  = run_costs.total_tokens_out + EXCLUDED.total_tokens_out,
+                        provider_calls    = run_costs.provider_calls + 1,
+                        updated_at_ms     = EXCLUDED.updated_at_ms",
+                )
+                .bind(e.run_id.as_str())
+                .bind(delta_cost)
+                .bind(delta_in)
+                .bind(delta_out)
+                .bind(updated_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC-025 Phase 2b.4 m4: Ephemeral — no reader in cairn;
+            // audit-only, surfaces to operators via SSE.
+            RuntimeEvent::SpendAlertTriggered(_) => {}
             // RFC-025 Phase 2b.2b m3: subagent_spawns projection (RFC 014).
             // Keyed on child_task_id (every spawn creates a distinct
             // child task). Replay is idempotent via ON CONFLICT DO
@@ -1433,13 +1492,15 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderPoolCreated(_) => log_stub("ProviderPoolCreated"),
-            RuntimeEvent::ProviderPoolConnectionAdded(_) => {
-                log_stub("ProviderPoolConnectionAdded")
-            }
-            RuntimeEvent::ProviderPoolConnectionRemoved(_) => {
-                log_stub("ProviderPoolConnectionRemoved")
-            }
+            // RFC-025 Phase 2b.4: provider pools are Ephemeral. Live
+            // HTTP-client state (active_connections, reqwest::Client
+            // references) is rebuilt from provider_bindings +
+            // provider_connections at boot — persisting it would
+            // diverge from reality the moment the HTTP layer
+            // reconnects. See `crate::projection_registry` rationale.
+            RuntimeEvent::ProviderPoolCreated(_)
+            | RuntimeEvent::ProviderPoolConnectionAdded(_)
+            | RuntimeEvent::ProviderPoolConnectionRemoved(_) => {}
             // RFC-025 Phase 2a.1: tenant quotas projection.
             //
             // `TenantQuotaSet` upserts the operator-configured baseline.
@@ -1551,8 +1612,75 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::RunCostAlertSet(_) => log_stub("RunCostAlertSet"),
-            RuntimeEvent::RunCostAlertTriggered(_) => log_stub("RunCostAlertTriggered"),
+            // RFC-025 Phase 2b.4 m4: run_cost_alerts projection (pg V065).
+            // `Set` seeds or resets the alert row: the in-memory applier
+            // writes `triggered_at_ms = 0, actual_cost_micros = 0` on
+            // re-set, effectively rearming the alert. `ON CONFLICT
+            // DO UPDATE SET triggered_at_ms = 0, actual_cost_micros = 0`
+            // mirrors that rearm semantic exactly.
+            RuntimeEvent::RunCostAlertSet(e) => {
+                let threshold = i64::try_from(e.threshold_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostAlertSet.threshold_micros {} exceeds i64::MAX",
+                        e.threshold_micros
+                    ))
+                })?;
+                let set_at = i64::try_from(e.set_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostAlertSet.set_at_ms {} exceeds i64::MAX",
+                        e.set_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO run_cost_alerts (
+                        run_id, tenant_id, threshold_micros,
+                        triggered_at_ms, actual_cost_micros, set_at_ms
+                     ) VALUES ($1, $2, $3, 0, 0, $4)
+                     ON CONFLICT (run_id) DO UPDATE SET
+                        tenant_id           = EXCLUDED.tenant_id,
+                        threshold_micros    = EXCLUDED.threshold_micros,
+                        triggered_at_ms     = 0,
+                        actual_cost_micros  = 0,
+                        set_at_ms           = EXCLUDED.set_at_ms",
+                )
+                .bind(e.run_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(threshold)
+                .bind(set_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // `Triggered` updates the existing row in place. Missing row
+            // is silently ignored — the in-memory applier uses
+            // `if let Some(a) = state.run_cost_alerts.get_mut(...)` and
+            // does not create a phantom alert from a trigger-without-set.
+            RuntimeEvent::RunCostAlertTriggered(e) => {
+                let actual = i64::try_from(e.actual_cost_micros).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostAlertTriggered.actual_cost_micros {} exceeds i64::MAX",
+                        e.actual_cost_micros
+                    ))
+                })?;
+                let triggered_at = i64::try_from(e.triggered_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RunCostAlertTriggered.triggered_at_ms {} exceeds i64::MAX",
+                        e.triggered_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE run_cost_alerts SET
+                        triggered_at_ms    = $2,
+                        actual_cost_micros = $3
+                     WHERE run_id = $1",
+                )
+                .bind(e.run_id.as_str())
+                .bind(triggered_at)
+                .bind(actual)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 2a.2 milestone 1: approval_delegations audit
             // projection. One row per delegation event; replay is
             // idempotent via the composite primary key (approval_id,
@@ -1762,11 +1890,145 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::EvalBaselineLocked(_) => log_stub("EvalBaselineLocked"),
-            RuntimeEvent::EvalBaselineSet(_) => log_stub("EvalBaselineSet"),
-            RuntimeEvent::EvalDatasetCreated(_) => log_stub("EvalDatasetCreated"),
-            RuntimeEvent::EvalDatasetEntryAdded(_) => log_stub("EvalDatasetEntryAdded"),
-            RuntimeEvent::EvalRubricCreated(_) => log_stub("EvalRubricCreated"),
+            // RFC-025 Phase 2b.4 m2: eval catalog projections (pg V063).
+            //
+            // The five Eval* config events populate three read-model
+            // tables: `eval_datasets` + `eval_dataset_entries` for
+            // dataset CRUD, `eval_rubrics` for rubric registration, and
+            // `eval_baselines` for the locked/unlocked baseline ledger.
+            //
+            // Tenant scoping: events currently carry no tenant_id, so
+            // the projection writes the sentinel empty string to match
+            // the in-memory applier. A Phase 2b.5 follow-up will bump
+            // the events to carry tenant_id and tighten the
+            // `list_by_tenant` filter.
+            //
+            // Replay semantics mirror the in-memory applier:
+            //   * DatasetCreated  — INSERT ON CONFLICT DO NOTHING
+            //     (first-write-wins; entries_json stays empty, entries
+            //     come via `EvalDatasetEntryAdded`).
+            //   * DatasetEntryAdded — INSERT ON CONFLICT DO NOTHING on
+            //     (dataset_id, entry_id) — matches the `already_exists`
+            //     dedup in-memory.
+            //   * RubricCreated   — INSERT ON CONFLICT DO NOTHING.
+            //   * BaselineSet     — INSERT ON CONFLICT DO UPDATE SET
+            //     name WHERE locked = 0. `metrics_json` is inserted as
+            //     `'{}'` on first write and NEVER updated — the
+            //     in-memory applier likewise only tags the `name` field
+            //     with `{baseline_id}[{metric}={value}]` and does not
+            //     write the single metric key/value into
+            //     `EvalMetrics` (the ten optional float fields). A
+            //     Phase 2b.5 follow-up will evolve the event to carry
+            //     a typed `EvalMetrics` delta so both the in-memory
+            //     applier and the projection can merge on top. The
+            //     "locked is immutable" guard mirrors the in-memory
+            //     `if !entry.locked` gate.
+            //   * BaselineLocked  — UPDATE SET locked = 1. Idempotent;
+            //     missing row is silently ignored (cannot lock a
+            //     baseline that does not exist in the projection).
+            RuntimeEvent::EvalDatasetCreated(e) => {
+                let created_at = i64::try_from(e.created_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EvalDatasetCreated.created_at_ms {} exceeds i64::MAX",
+                        e.created_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO eval_datasets (
+                        dataset_id, tenant_id, name, subject_kind, created_at_ms
+                     ) VALUES ($1, '', $2, 'prompt_release', $3)
+                     ON CONFLICT (dataset_id) DO NOTHING",
+                )
+                .bind(&e.dataset_id)
+                .bind(&e.name)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalDatasetEntryAdded(e) => {
+                let added_at = i64::try_from(e.added_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EvalDatasetEntryAdded.added_at_ms {} exceeds i64::MAX",
+                        e.added_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO eval_dataset_entries (
+                        dataset_id, entry_id, added_at_ms
+                     ) VALUES ($1, $2, $3)
+                     ON CONFLICT (dataset_id, entry_id) DO NOTHING",
+                )
+                .bind(&e.dataset_id)
+                .bind(&e.entry_id)
+                .bind(added_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalRubricCreated(e) => {
+                let created_at = i64::try_from(e.created_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EvalRubricCreated.created_at_ms {} exceeds i64::MAX",
+                        e.created_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO eval_rubrics (
+                        rubric_id, tenant_id, name, dimensions_json, created_at_ms
+                     ) VALUES ($1, '', $2, '[]', $3)
+                     ON CONFLICT (rubric_id) DO NOTHING",
+                )
+                .bind(&e.rubric_id)
+                .bind(&e.name)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalBaselineSet(e) => {
+                let set_at = i64::try_from(e.set_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "EvalBaselineSet.set_at_ms {} exceeds i64::MAX",
+                        e.set_at_ms
+                    ))
+                })?;
+                // Synthesize the "metric[metric=value]" name shape the
+                // in-memory applier uses so rehydrated rows compare
+                // byte-equal across backends. Empty metrics_json is an
+                // empty `EvalMetrics` default (all Option fields = None);
+                // the one metric key arrives tagged inside `name`.
+                let display_name = format!("{}[{}={}]", e.baseline_id, e.metric, e.value);
+                sqlx::query(
+                    "INSERT INTO eval_baselines (
+                        baseline_id, tenant_id, name, prompt_asset_id,
+                        metrics_json, created_at_ms, locked
+                     ) VALUES ($1, '', $2, '', '{}', $3, 0)
+                     ON CONFLICT (baseline_id) DO UPDATE SET
+                        name = EXCLUDED.name
+                     WHERE eval_baselines.locked = 0",
+                )
+                .bind(&e.baseline_id)
+                .bind(&display_name)
+                .bind(set_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::EvalBaselineLocked(e) => {
+                // `locked_at_ms` is audit-only — the row flips to
+                // locked=1 and stays there; later BaselineSet events
+                // are WHERE-gated on `locked = 0` so they become no-ops.
+                let _locked_at = e.locked_at_ms;
+                sqlx::query(
+                    "UPDATE eval_baselines SET locked = 1
+                     WHERE baseline_id = $1",
+                )
+                .bind(&e.baseline_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 2b.2b m6: Ephemeral — the compaction
             // boundary is recoverable from `event_log`'s first
             // remaining position; no read-model table is needed. See
@@ -1838,17 +2100,78 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::OperatorIntervention(_) => log_stub("OperatorIntervention"),
-            RuntimeEvent::OperatorProfileCreated(_) => log_stub("OperatorProfileCreated"),
-            RuntimeEvent::OperatorProfileUpdated(_) => log_stub("OperatorProfileUpdated"),
-            // Issue #592: `PauseScheduled` is declared Projected with
-            // backing table `pause_schedules`, but the current service
-            // layer emits pause-schedule rows via the `RunStateChanged`
-            // → `pause_schedules` projection arm above (driven by
-            // `PauseReason.resume_after_ms`). No code path constructs
-            // this variant today; the no-op arm is intentional — a
-            // dead-letter safety if someone lands a handwritten
-            // `PauseScheduled` event without a parallel table write.
+            // RFC-025 Phase 2b.4 m3: Ephemeral — `OperatorIntervention
+            // ReadModel::list_by_run` walks the event log directly; no
+            // dedicated read-model row is needed. See registry for full
+            // rationale.
+            RuntimeEvent::OperatorIntervention(_) => {}
+            // RFC-025 Phase 2b.4 m3: operator_profiles projection (pg
+            // V064). Upsert keyed on `profile_id`. `Created` seeds the
+            // row with display_name / email / role; `Updated` patches
+            // only the `Option<>` fields that are `Some` (the in-memory
+            // applier uses the `if let Some(...)` pattern on both
+            // display_name and email). Role is immutable via `Updated`
+            // — matches the in-memory applier's behaviour (it does not
+            // touch `role`).
+            RuntimeEvent::OperatorProfileCreated(e) => {
+                // Propagate serialization errors through the tx so a
+                // malformed role (should be unreachable since
+                // `WorkspaceRole` is an enum with `#[serde(rename_all =
+                // "snake_case")]`) fails the append rather than
+                // silently writing an empty string. Copilot PR #596
+                // review.
+                let role = enum_to_str(&e.role)?;
+                sqlx::query(
+                    "INSERT INTO operator_profiles (
+                        operator_id, tenant_id, display_name, email, role,
+                        created_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT (operator_id) DO UPDATE SET
+                        tenant_id     = EXCLUDED.tenant_id,
+                        display_name  = EXCLUDED.display_name,
+                        email         = EXCLUDED.email,
+                        role          = EXCLUDED.role,
+                        created_at_ms = EXCLUDED.created_at_ms",
+                )
+                .bind(e.profile_id.as_str())
+                .bind(e.tenant_id.as_str())
+                .bind(&e.display_name)
+                .bind(&e.email)
+                .bind(&role)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::OperatorProfileUpdated(e) => {
+                // Patch-shape update: each Option<> field is only
+                // applied if Some. The COALESCE trick lets a single
+                // query handle every subset of patches without the
+                // projection inserting NULLs for fields the event
+                // did not touch. Matches the in-memory applier's
+                // `if let Some(dn)` / `if let Some(email)` gating.
+                sqlx::query(
+                    "UPDATE operator_profiles SET
+                        display_name = COALESCE($2, display_name),
+                        email        = COALESCE($3, email)
+                     WHERE operator_id = $1",
+                )
+                .bind(e.profile_id.as_str())
+                .bind(e.display_name.as_deref())
+                .bind(e.email.as_deref())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // PR #595 (issue #592): `PauseScheduled` is declared
+            // Projected with backing table `pause_schedules`, but the
+            // current service layer emits pause-schedule rows via the
+            // `RunStateChanged` → `pause_schedules` projection arm
+            // above (driven by `PauseReason.resume_after_ms`). No
+            // code path constructs this variant today; the no-op arm
+            // is intentional — a dead-letter safety if someone lands
+            // a handwritten `PauseScheduled` event without a parallel
+            // table write.
             RuntimeEvent::PauseScheduled(_) => {}
             RuntimeEvent::PermissionDecisionRecorded(_) => {
                 log_stub("PermissionDecisionRecorded")
@@ -2033,15 +2356,19 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ProviderHealthChecked(_) => log_stub("ProviderHealthChecked"),
-            RuntimeEvent::ProviderHealthScheduleSet(_) => log_stub("ProviderHealthScheduleSet"),
-            RuntimeEvent::ProviderHealthScheduleTriggered(_) => {
-                log_stub("ProviderHealthScheduleTriggered")
-            }
-            RuntimeEvent::ProviderMarkedDegraded(_) => log_stub("ProviderMarkedDegraded"),
-            RuntimeEvent::ProviderModelRegistered(_) => log_stub("ProviderModelRegistered"),
-            RuntimeEvent::ProviderRecovered(_) => log_stub("ProviderRecovered"),
-            RuntimeEvent::ProviderRetryPolicySet(_) => log_stub("ProviderRetryPolicySet"),
+            // RFC-025 Phase 2b.4: provider health / model / retry events
+            // are Ephemeral. The next probe cycle supersedes any persisted
+            // health state; schedules are rebuilt from provider_bindings
+            // at boot; model capabilities + retry policies have no reader
+            // in cairn-runtime today. Event log is the audit trail. See
+            // `crate::projection_registry` for the per-variant rationale.
+            RuntimeEvent::ProviderHealthChecked(_)
+            | RuntimeEvent::ProviderHealthScheduleSet(_)
+            | RuntimeEvent::ProviderHealthScheduleTriggered(_)
+            | RuntimeEvent::ProviderMarkedDegraded(_)
+            | RuntimeEvent::ProviderModelRegistered(_)
+            | RuntimeEvent::ProviderRecovered(_)
+            | RuntimeEvent::ProviderRetryPolicySet(_) => {}
             // RFC-025 Phase 2b.2b m6: Ephemeral — the event carries
             // no tenant_id so a tenant-scoped read-model cannot be
             // built without a domain-layer event version bump.
@@ -2101,7 +2428,29 @@ impl PgSyncProjection {
                     .await
                     .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::RoutePolicyUpdated(_) => log_stub("RoutePolicyUpdated"),
+            // RFC-025 Phase 2b.4 m4: route_policies.updated_at bump.
+            // Matches the in-memory applier (`if let Some(p) =
+            // state.route_policies.get_mut(...) { p.updated_at_ms = ... }`)
+            // — missing row is silently ignored. The row body
+            // (`rules`, `name`, `enabled`) is owned by `RoutePolicy
+            // Created`; `Updated` carries only the timestamp bump.
+            RuntimeEvent::RoutePolicyUpdated(e) => {
+                let updated_at = i64::try_from(e.updated_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "RoutePolicyUpdated.updated_at_ms {} exceeds i64::MAX",
+                        e.updated_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE route_policies SET updated_at = $2
+                     WHERE policy_id = $1",
+                )
+                .bind(&e.policy_id)
+                .bind(updated_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // Projection contract: one row per `ToolInvocationCacheHit`
             // keyed by `invocation_id`. Operators query cache activity
             // via the REST surface (`tool_invocation_cache_hits` table)

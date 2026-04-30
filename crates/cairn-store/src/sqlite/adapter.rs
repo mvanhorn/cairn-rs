@@ -5482,7 +5482,197 @@ impl crate::projections::IngestJobReadModel for SqliteAdapter {
     }
 }
 
-// ── Issue #592: pause_schedules read model ─────────────────────────
+// ── RFC-025 Phase 2b.4 m2: eval catalog read models (pg V063) ────────
+//
+// Backed by `eval_datasets` / `eval_dataset_entries` / `eval_rubrics` /
+// `eval_baselines`. The domain records re-inflated here mirror the
+// in-memory applier exactly so the parity harness can byte-compare:
+// * datasets carry `TenantId::new("")` + `EvalSubjectKind::PromptRelease`
+//   (both are sentinels since the event lacks those fields);
+// * dataset entries are rebuilt with `entry_id` stored as the single
+//   tag + `input = {"entry_id": …}` — the same shape the in-memory
+//   applier uses;
+// * rubrics carry empty `dimensions` (the event only has the rubric id
+//   + name + created_at_ms);
+// * baselines land with `EvalMetrics::default()` and the synthesized
+//   `{baseline_id}[{metric}={value}]` display name the in-memory applier
+//   writes.
+
+/// Max parameters per chunked `IN (?, ?, …)` clause on SQLite. Legacy
+/// SQLite builds cap host parameters at 999; modern builds (≥ 3.32.0)
+/// raise it to 32766. Using 900 stays safely under both and mirrors the
+/// defensive pattern in `sqlite::event_log::BATCH_INSERT_CHUNK`. Large
+/// `list_by_tenant` result sets are reloaded in chunked IN-clauses so a
+/// caller passing `limit > 999` cannot blow up the variable cap.
+const SQLITE_IN_CHUNK: usize = 900;
+
+#[async_trait]
+impl crate::projections::EvalDatasetReadModel for SqliteAdapter {
+    async fn get_dataset(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Option<cairn_domain::EvalDataset>, StoreError> {
+        let row: Option<(String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT dataset_id, tenant_id, name, subject_kind, created_at_ms
+             FROM eval_datasets WHERE dataset_id = ?",
+        )
+        .bind(dataset_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let Some((dataset_id, tenant_id, name, _subject_kind, created_at_ms)) = row else {
+            return Ok(None);
+        };
+        let entries = self.load_eval_dataset_entries(&dataset_id).await?;
+        Ok(Some(cairn_domain::EvalDataset {
+            dataset_id,
+            tenant_id: cairn_domain::TenantId::new(tenant_id),
+            name,
+            subject_kind: cairn_domain::EvalSubjectKind::PromptRelease,
+            entries,
+            created_at_ms: created_at_ms.max(0) as u64,
+        }))
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::EvalDataset>, StoreError> {
+        // Mirrors the in-memory filter: when the requested tenant is
+        // the sentinel empty string, return every dataset (matches the
+        // in-memory `|| tenant_id.as_str().is_empty()` branch so cross-
+        // backend parity holds).
+        let sql = if tenant_id.as_str().is_empty() {
+            "SELECT dataset_id, tenant_id, name, subject_kind, created_at_ms
+             FROM eval_datasets
+             ORDER BY created_at_ms ASC, dataset_id ASC
+             LIMIT ?1 OFFSET ?2"
+        } else {
+            "SELECT dataset_id, tenant_id, name, subject_kind, created_at_ms
+             FROM eval_datasets
+             WHERE tenant_id = ?1
+             ORDER BY created_at_ms ASC, dataset_id ASC
+             LIMIT ?2 OFFSET ?3"
+        };
+        let rows: Vec<(String, String, String, String, i64)> = if tenant_id.as_str().is_empty() {
+            sqlx::query_as(sql)
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await
+        } else {
+            sqlx::query_as(sql)
+                .bind(tenant_id.as_str())
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await
+        }
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Bulk-load every dataset's entries in chunked IN-clause
+        // queries to avoid the N+1 pattern. Copilot PR #596 review.
+        // Chunk size ≤ `SQLITE_IN_CHUNK` (900) keeps the host-parameter
+        // count below the legacy SQLite 999 cap (modern builds are at
+        // 32766 but we port across every build cairn-rs might run on —
+        // same rationale as `BATCH_INSERT_CHUNK` in sqlite::event_log).
+        // Dataset ids are caller-provided strings bound as parameters —
+        // never interpolated into the SQL body — so there is no
+        // injection surface. Results from every chunk are merged into a
+        // single `entries_by_dataset` map before assembly.
+        let dataset_ids: Vec<&String> = rows.iter().map(|r| &r.0).collect();
+        let mut entries_by_dataset: std::collections::HashMap<
+            String,
+            Vec<cairn_domain::EvalDatasetEntry>,
+        > = std::collections::HashMap::new();
+        for chunk in dataset_ids.chunks(SQLITE_IN_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let entries_sql = format!(
+                "SELECT dataset_id, entry_id FROM eval_dataset_entries
+                 WHERE dataset_id IN ({placeholders})
+                 ORDER BY dataset_id ASC, added_at_ms ASC, entry_id ASC"
+            );
+            let mut entries_query = sqlx::query_as::<_, (String, String)>(&entries_sql);
+            for dataset_id in chunk {
+                entries_query = entries_query.bind(*dataset_id);
+            }
+            let entry_rows: Vec<(String, String)> = entries_query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            // Group by dataset_id so each dataset gets its own slice.
+            for (dataset_id, entry_id) in entry_rows {
+                entries_by_dataset.entry(dataset_id).or_default().push(
+                    cairn_domain::EvalDatasetEntry {
+                        input: serde_json::json!({ "entry_id": entry_id.clone() }),
+                        expected_output: None,
+                        tags: vec![entry_id],
+                    },
+                );
+            }
+        }
+        let mut datasets = Vec::with_capacity(rows.len());
+        for (dataset_id, tenant_id, name, _subject_kind, created_at_ms) in rows {
+            let entries = entries_by_dataset.remove(&dataset_id).unwrap_or_default();
+            datasets.push(cairn_domain::EvalDataset {
+                dataset_id,
+                tenant_id: cairn_domain::TenantId::new(tenant_id),
+                name,
+                subject_kind: cairn_domain::EvalSubjectKind::PromptRelease,
+                entries,
+                created_at_ms: created_at_ms.max(0) as u64,
+            });
+        }
+        Ok(datasets)
+    }
+}
+
+impl SqliteAdapter {
+    /// Reload a dataset's entries ordered by `(added_at_ms ASC,
+    /// entry_id ASC)` — event-log order for distinct timestamps with
+    /// `entry_id` as the deterministic tiebreaker on same-ms
+    /// deliveries. The in-memory applier keeps its
+    /// `Vec<EvalDatasetEntry>` in event-log arrival order, which for
+    /// distinct timestamps is identical to `added_at_ms ASC`. Same-ms
+    /// arrival is a pre-existing cross-backend divergence (in-memory
+    /// preserves arrival order; pg/sqlite tie-break on `entry_id`);
+    /// acceptable because the event carries a monotonic `added_at_ms`
+    /// that in practice collides only under test conditions.
+    async fn load_eval_dataset_entries(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Vec<cairn_domain::EvalDatasetEntry>, StoreError> {
+        let entries: Vec<(String,)> = sqlx::query_as(
+            "SELECT entry_id FROM eval_dataset_entries
+             WHERE dataset_id = ?1
+             ORDER BY added_at_ms ASC, entry_id ASC",
+        )
+        .bind(dataset_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(entries
+            .into_iter()
+            .map(|(entry_id,)| cairn_domain::EvalDatasetEntry {
+                // Clone for the `input` body so `entry_id` stays
+                // available for `tags`. The `serde_json::json!` macro
+                // expands to `Value::from(&entry_id)` so it does not
+                // move the String — but the explicit clone makes the
+                // shape unambiguous for future readers + defensive
+                // against serde_json internals shifting.
+                input: serde_json::json!({ "entry_id": entry_id.clone() }),
+                expected_output: None,
+                tags: vec![entry_id],
+            })
+            .collect())
+    }
+}
+
+// ── PR #595 (issue #592): pause_schedules read model ───────────────
 //
 // Mirrors pg/adapter.rs: SELECT from the `pause_schedules` projection
 // table with backend-stable ordering. The projection arm in
@@ -5503,9 +5693,7 @@ struct SqlitePauseScheduleRow {
 impl SqlitePauseScheduleRow {
     fn into_record(self) -> crate::projections::PauseScheduledRecord {
         // Copilot #595: mirror pg — clamp corrupt negative rows to 0
-        // rather than silently reinterpreting as huge u64. See
-        // `PauseScheduleRow::into_record` in pg/adapter.rs for the
-        // rationale.
+        // rather than silently reinterpreting as huge u64.
         let resume_at_ms = u64::try_from(self.resume_at_ms).unwrap_or(0);
         let created_at_ms = u64::try_from(self.created_at_ms).unwrap_or(0);
         crate::projections::PauseScheduledRecord {
@@ -5518,6 +5706,442 @@ impl SqlitePauseScheduleRow {
             resume_at_ms,
             created_at_ms,
         }
+    }
+}
+
+#[async_trait]
+impl crate::projections::EvalRubricReadModel for SqliteAdapter {
+    async fn get_rubric(
+        &self,
+        rubric_id: &str,
+    ) -> Result<Option<cairn_domain::EvalRubric>, StoreError> {
+        let row: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT rubric_id, tenant_id, name, created_at_ms
+             FROM eval_rubrics WHERE rubric_id = ?",
+        )
+        .bind(rubric_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(
+            |(rubric_id, tenant_id, name, created_at_ms)| cairn_domain::EvalRubric {
+                rubric_id,
+                tenant_id: cairn_domain::TenantId::new(tenant_id),
+                name,
+                dimensions: vec![],
+                created_at_ms: created_at_ms.max(0) as u64,
+            },
+        ))
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::EvalRubric>, StoreError> {
+        let rows: Vec<(String, String, String, i64)> = if tenant_id.as_str().is_empty() {
+            sqlx::query_as(
+                "SELECT rubric_id, tenant_id, name, created_at_ms
+                 FROM eval_rubrics
+                 ORDER BY rubric_id ASC
+                 LIMIT ?1 OFFSET ?2",
+            )
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as(
+                "SELECT rubric_id, tenant_id, name, created_at_ms
+                 FROM eval_rubrics
+                 WHERE tenant_id = ?1
+                 ORDER BY rubric_id ASC
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .bind(tenant_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(rubric_id, tenant_id, name, created_at_ms)| cairn_domain::EvalRubric {
+                    rubric_id,
+                    tenant_id: cairn_domain::TenantId::new(tenant_id),
+                    name,
+                    dimensions: vec![],
+                    created_at_ms: created_at_ms.max(0) as u64,
+                },
+            )
+            .collect())
+    }
+}
+
+#[async_trait]
+impl crate::projections::RoutePolicyReadModel for SqliteAdapter {
+    async fn get(
+        &self,
+        policy_id: &str,
+    ) -> Result<Option<cairn_domain::providers::RoutePolicy>, StoreError> {
+        let row: Option<(String, String, String, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT policy_id, tenant_id, name, rules, enabled, created_at, updated_at
+             FROM route_policies WHERE policy_id = ?",
+        )
+        .bind(policy_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(route_policy_row_into_record).transpose()
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::providers::RoutePolicy>, StoreError> {
+        // Mirrors the in-memory filter: enabled-only, tenant-scoped,
+        // sorted on policy_id ASC for deterministic cross-backend order.
+        let rows: Vec<(String, String, String, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT policy_id, tenant_id, name, rules, enabled, created_at, updated_at
+             FROM route_policies
+             WHERE tenant_id = ?1 AND enabled = 1
+             ORDER BY policy_id ASC
+             LIMIT ?2 OFFSET ?3",
+        )
+        .bind(tenant_id.as_str())
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(route_policy_row_into_record).collect()
+    }
+}
+
+fn route_policy_row_into_record(
+    (policy_id, tenant_id, name, rules_json, enabled, _created_at, updated_at): (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+    ),
+) -> Result<cairn_domain::providers::RoutePolicy, StoreError> {
+    let rules: Vec<cairn_domain::providers::RoutePolicyRule> = serde_json::from_str(&rules_json)
+        .map_err(|e| {
+            StoreError::Serialization(format!(
+                "route_policies.rules decode for policy_id={policy_id}: {e}"
+            ))
+        })?;
+    Ok(cairn_domain::providers::RoutePolicy {
+        policy_id,
+        name,
+        enabled: enabled != 0,
+        tenant_id,
+        rules,
+        updated_at_ms: updated_at.max(0) as u64,
+    })
+}
+
+#[async_trait]
+impl crate::projections::RunCostReadModel for SqliteAdapter {
+    async fn get_run_cost(
+        &self,
+        run_id: &cairn_domain::RunId,
+    ) -> Result<Option<cairn_domain::providers::RunCostRecord>, StoreError> {
+        let row: Option<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT run_id, total_cost_micros, total_tokens_in, total_tokens_out,
+                    provider_calls, updated_at_ms
+             FROM run_costs WHERE run_id = ?",
+        )
+        .bind(run_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(run_cost_row_into_record))
+    }
+
+    async fn list_by_session(
+        &self,
+        _session_id: &cairn_domain::SessionId,
+    ) -> Result<Vec<cairn_domain::providers::RunCostRecord>, StoreError> {
+        // The `run_costs` row does not carry `session_id` — the event
+        // body does (`RunCostUpdated.session_id` as an Option) but the
+        // projection does not index on it (one run-id is always scoped
+        // to a single session). Matches the in-memory applier, which
+        // returns every run_cost row (it does not index by
+        // session_id either — see `run_cost_impl.rs`'s
+        // `list_by_session` at
+        // `state.run_costs.values().cloned().collect()`), and the new
+        // PgAdapter impl which mirrors this shape. Callers that need a
+        // session filter apply it client-side. Copilot PR #596 review:
+        // the earlier empty-list return diverged from the in-memory
+        // contract and would have silently hidden session-cost
+        // breakdowns if a caller ever dispatched through SqliteAdapter
+        // directly.
+        let rows: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT run_id, total_cost_micros, total_tokens_in, total_tokens_out,
+                    provider_calls, updated_at_ms
+             FROM run_costs
+             ORDER BY updated_at_ms DESC, run_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(run_cost_row_into_record).collect())
+    }
+}
+
+fn run_cost_row_into_record(
+    (run_id, total_cost_micros, total_tokens_in, total_tokens_out, provider_calls, _updated_at_ms): (
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ),
+) -> cairn_domain::providers::RunCostRecord {
+    let total_cost_micros = total_cost_micros.max(0) as u64;
+    let total_tokens_in = total_tokens_in.max(0) as u64;
+    let total_tokens_out = total_tokens_out.max(0) as u64;
+    let provider_calls = provider_calls.max(0) as u64;
+    cairn_domain::providers::RunCostRecord {
+        run_id: cairn_domain::RunId::new(run_id),
+        total_cost_micros,
+        total_tokens_in,
+        total_tokens_out,
+        provider_calls,
+        token_in: total_tokens_in,
+        token_out: total_tokens_out,
+    }
+}
+
+#[async_trait]
+impl crate::projections::RunCostAlertReadModel for SqliteAdapter {
+    async fn get_alert(
+        &self,
+        run_id: &cairn_domain::RunId,
+    ) -> Result<Option<cairn_domain::providers::RunCostAlert>, StoreError> {
+        let row: Option<(String, String, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT run_id, tenant_id, threshold_micros, triggered_at_ms,
+                    actual_cost_micros, set_at_ms
+             FROM run_cost_alerts WHERE run_id = ?",
+        )
+        .bind(run_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(run_cost_alert_row_into_record))
+    }
+
+    async fn list_triggered_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::providers::RunCostAlert>, StoreError> {
+        // Matches the in-memory impl: only return rows whose alert has
+        // actually triggered (`triggered_at_ms != 0`), newest-first
+        // (`triggered_at_ms DESC`), scoped to the tenant.
+        let rows: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT run_id, tenant_id, threshold_micros, triggered_at_ms,
+                    actual_cost_micros, set_at_ms
+             FROM run_cost_alerts
+             WHERE tenant_id = ?1 AND triggered_at_ms > 0
+             ORDER BY triggered_at_ms DESC, run_id ASC
+             LIMIT ?2 OFFSET ?3",
+        )
+        .bind(tenant_id.as_str())
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(run_cost_alert_row_into_record)
+            .collect())
+    }
+}
+
+fn run_cost_alert_row_into_record(
+    (run_id, tenant_id, threshold_micros, triggered_at_ms, actual_cost_micros, _set_at_ms): (
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+    ),
+) -> cairn_domain::providers::RunCostAlert {
+    cairn_domain::providers::RunCostAlert {
+        run_id: cairn_domain::RunId::new(run_id),
+        tenant_id: cairn_domain::TenantId::new(tenant_id),
+        threshold_micros: threshold_micros.max(0) as u64,
+        triggered_at_ms: triggered_at_ms.max(0) as u64,
+        actual_cost_micros: actual_cost_micros.max(0) as u64,
+    }
+}
+
+#[async_trait]
+impl crate::projections::OperatorProfileReadModel for SqliteAdapter {
+    async fn get(
+        &self,
+        operator_id: &cairn_domain::OperatorId,
+    ) -> Result<Option<crate::projections::OperatorProfileRecord>, StoreError> {
+        let row: Option<(String, String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT operator_id, tenant_id, display_name, email, role, created_at_ms
+             FROM operator_profiles WHERE operator_id = ?",
+        )
+        .bind(operator_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(
+            |(operator_id, tenant_id, display_name, email, role, created_at)| {
+                crate::projections::OperatorProfileRecord {
+                    operator_id: cairn_domain::OperatorId::new(operator_id),
+                    tenant_id: cairn_domain::TenantId::new(tenant_id),
+                    display_name,
+                    // `OperatorProfileRecord.email` is Option<String>
+                    // but `OperatorProfileCreated.email` is a required
+                    // String on the event and the projection column is
+                    // NOT NULL. `Some(_)` unconditionally mirrors the
+                    // in-memory applier's `Some(e.email.clone())`
+                    // (see `in_memory.rs` OperatorProfileCreated arm);
+                    // `None` is reserved for a future event version
+                    // that makes email optional.
+                    email: Some(email),
+                    role,
+                    created_at: created_at.max(0) as u64,
+                }
+            },
+        ))
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::OperatorProfileRecord>, StoreError> {
+        let rows: Vec<(String, String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT operator_id, tenant_id, display_name, email, role, created_at_ms
+             FROM operator_profiles
+             WHERE tenant_id = ?1
+             ORDER BY operator_id ASC
+             LIMIT ?2 OFFSET ?3",
+        )
+        .bind(tenant_id.as_str())
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(operator_id, tenant_id, display_name, email, role, created_at)| {
+                    crate::projections::OperatorProfileRecord {
+                        operator_id: cairn_domain::OperatorId::new(operator_id),
+                        tenant_id: cairn_domain::TenantId::new(tenant_id),
+                        display_name,
+                        email: Some(email),
+                        role,
+                        created_at: created_at.max(0) as u64,
+                    }
+                },
+            )
+            .collect())
+    }
+}
+
+#[async_trait]
+impl crate::projections::EvalBaselineReadModel for SqliteAdapter {
+    async fn get_baseline(
+        &self,
+        baseline_id: &str,
+    ) -> Result<Option<cairn_domain::EvalBaseline>, StoreError> {
+        let row: Option<(String, String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT baseline_id, tenant_id, name, prompt_asset_id, created_at_ms, locked
+             FROM eval_baselines WHERE baseline_id = ?",
+        )
+        .bind(baseline_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(
+            |(baseline_id, tenant_id, name, prompt_asset_id, created_at_ms, locked)| {
+                cairn_domain::EvalBaseline {
+                    baseline_id,
+                    tenant_id: cairn_domain::TenantId::new(tenant_id),
+                    name,
+                    prompt_asset_id: cairn_domain::PromptAssetId::new(prompt_asset_id),
+                    metrics: cairn_domain::EvalMetrics::default(),
+                    created_at_ms: created_at_ms.max(0) as u64,
+                    locked: locked != 0,
+                }
+            },
+        ))
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::EvalBaseline>, StoreError> {
+        let rows: Vec<(String, String, String, String, i64, i64)> =
+            if tenant_id.as_str().is_empty() {
+                sqlx::query_as(
+                    "SELECT baseline_id, tenant_id, name, prompt_asset_id, created_at_ms, locked
+                 FROM eval_baselines
+                 ORDER BY baseline_id ASC
+                 LIMIT ?1 OFFSET ?2",
+                )
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await
+            } else {
+                sqlx::query_as(
+                    "SELECT baseline_id, tenant_id, name, prompt_asset_id, created_at_ms, locked
+                 FROM eval_baselines
+                 WHERE tenant_id = ?1
+                 ORDER BY baseline_id ASC
+                 LIMIT ?2 OFFSET ?3",
+                )
+                .bind(tenant_id.as_str())
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await
+            }
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(baseline_id, tenant_id, name, prompt_asset_id, created_at_ms, locked)| {
+                    cairn_domain::EvalBaseline {
+                        baseline_id,
+                        tenant_id: cairn_domain::TenantId::new(tenant_id),
+                        name,
+                        prompt_asset_id: cairn_domain::PromptAssetId::new(prompt_asset_id),
+                        metrics: cairn_domain::EvalMetrics::default(),
+                        created_at_ms: created_at_ms.max(0) as u64,
+                        locked: locked != 0,
+                    }
+                },
+            )
+            .collect())
     }
 }
 

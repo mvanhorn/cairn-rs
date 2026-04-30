@@ -17,22 +17,27 @@ nine service-migration phases build on it):
 | 2a.2   | 2026-04-29      | #571  | Remaining governance — delegations + guardrails + retention + entitlements + license overrides |
 | 2b.1   | 2026-04-29      | #573  | Add events + projections for audits + scheduled_tasks + outcomes + plan_reviews                  |
 | 2b.2a  | 2026-04-29      | #580  | external_workers projection + restart durability                                                 |
+| 2b.2b  | 2026-04-29      | #593  | resource_sharing + signal_ingest + subagents + soul_patches + user_messages + tool_recovery      |
+| 2b.3   | 2026-04-28      | #594  | ingest_jobs + defaults + channels + notifications + checkpoint_strategies                        |
+| 2b.4   | 2026-04-28      | (this PR) | eval catalog + operator profiles + run costs + route policy updates + 10 provider-state variants Ephemeral reclassification |
 | 3      | 2026-04-29      | #572  | Provider bindings + connections → Projected; pools + health stay Ephemeral                      |
-| 4      | 2026-04-29      | #585  | Rename `InMemoryServices` → `RuntimeServices` + doc cleanup (this PR)                           |
+| 4      | 2026-04-29      | #585  | Rename `InMemoryServices` → `RuntimeServices` + doc cleanup                                     |
 
-**Final projection registry counts** (as of Phase 4 landing, tracked in `crates/cairn-store/src/projection_registry.rs`):
+**Final projection registry counts** (as of Phase 2b.4 landing, tracked in `crates/cairn-store/src/projection_registry.rs`):
 
-- **95 Projected** — every lifecycle-carrying variant writes to a named
+- **125 Projected** — every lifecycle-carrying variant writes to a named
   read-model table inside the event-append transaction (pg / sqlite /
   in-memory byte-equal per the parity harness).
-- **18 Ephemeral** — observability-only, policy-scoped, or owned by a
-  downstream projection (graph, signal routing, FF lease history).
+- **32 Ephemeral** — observability-only, policy-scoped, or owned by a
+  downstream projection (graph, signal routing, FF lease history,
+  provider pools + health probes, audit-only events with no reader).
   Documented in-registry with a `reason` string.
-- **45 Stubbed** — tracked for future phases outside RFC-025's scope.
-  The remaining set is Phase 2b.2b (channels + route policy Updated +
-  checkpoint strategy + subagent spawning + misc operator events), covered
-  by a separate follow-up issue (#574) and held off this RFC because the
-  parity story for each group requires dedicated design. The boot guard
+- **1 Stubbed** — `PermissionDecisionRecorded`, whose Ephemeral
+  reclassification is deferred to Phase 2b.5 (the in-memory applier
+  is already a no-op and no reader exists anywhere in cairn-runtime
+  or cairn-app, so this is a cosmetic bucket move — held for 2b.5
+  rather than bundled into 2b.4). PR #595 took `PauseScheduled`
+  Projected with backing table `pause_schedules`. The boot guard
   surfaces the list at WARN on pg/sqlite so no operator is silently
   reading empty projection tables.
 
@@ -113,7 +118,7 @@ Authored via iterated proposer/challenger debate (3 rounds). Final verdict:
 **Phase 0 shipped (PR #549):**
 - Projection registry at `crates/cairn-store/src/projection_registry.rs`
   with all `RuntimeEvent` variants classified (see "Final projection
-  registry counts" above for current 95 / 18 / 45).
+  registry counts" above — 125 / 32 / 1 as of Phase 2b.4 close).
 - Compile-time exhaustiveness via `crates/cairn-store/build.rs`
   (parses `cairn-domain/src/events.rs` and rejects the build when any
   variant drifts in or out of the registry).
@@ -143,7 +148,7 @@ Authored via iterated proposer/challenger debate (3 rounds). Final verdict:
   is untouched; that name is correct.
 - Operator-facing + developer-guide docs refreshed to use the new
   name and to describe the post-RFC-025 storage contract honestly:
-  95 Projected event variants now write to durable pg/sqlite
+  125 Projected event variants now write to durable pg/sqlite
   read-model tables, the three hand-rolled walkers are gone, and
   the startup in-memory-warm-up replay is explicitly flagged as
   remaining (targeted by a follow-up refactor).
@@ -163,12 +168,16 @@ events, causing silent data loss on restart (#435, #337 class).
 
 This RFC moved the affected services off the three hand-rolled
 boot walkers onto durable `SyncProjection` read-models, phased the
-work across 10 PRs (delivered against an original 7-phase plan, with
-Phase 2a + Phase 2b subdivided after audit), and preserved
+work across 14 PRs (delivered against an original 7-phase plan, with
+Phase 2a + Phase 2b subdivided after audit and Phase 2b.4 landing as
+the final projection-fill milestone), and preserved
 `--db memory` as a first-class runtime mode. Every `Projected` event
 variant now writes to a named pg/sqlite read-model table inside the
-event-append transaction (95 Projected / 18 Ephemeral / 45 Stubbed in
-the registry as of Phase 4 close). The three hand-rolled walkers
+event-append transaction (125 Projected / 32 Ephemeral / 1 Stubbed in
+the registry as of Phase 2b.4 close — the lone Stubbed variant is
+`PermissionDecisionRecorded`, a Phase 2b.5 cosmetic reclassification).
+PR #595 took `PauseScheduled` Projected ahead of 2b.4 landing. The
+three hand-rolled walkers
 (`replay_evals`, `replay_graph`, `replay_triggers`) are deleted and
 the aggregate is renamed `RuntimeServices` to match.
 

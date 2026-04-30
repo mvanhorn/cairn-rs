@@ -1366,20 +1366,11 @@ CREATE TABLE IF NOT EXISTS checkpoint_strategies (
     set_at_ms                 INTEGER NOT NULL
 );
 
--- Issue #592: pause_schedules parity table (pg V062, renumbered from
--- V057 after main published Phase 2b.3 V057-V061). Evict-on-resume
--- projection that replaces `PauseScheduleReadModel::list_due`'s
--- event-log walker. `RunStateChanged(→Paused)` with a non-None
--- `resume_after_ms` INSERTs; any transition away from Paused DELETEs
--- by run_id. Composite index matches pg's idx_pause_schedules_due so
--- the `ORDER BY resume_at_ms ASC, run_id ASC` tie-breaker is
--- backend-stable and the parity harness asserts consistent ordering +
--- membership/eviction semantics across backends. `resume_at_ms` is
--- derived from the event's durable timestamp (`event_time_ms` /
--- `stored_at`), so rebuilds do not shift schedules; any millisecond
--- drift seen in the parity test comes from different append times
--- between backends, and the test uses a sub-second tolerance there
--- rather than strict byte-equality.
+-- PR #595 (issue #592): pause_schedules parity table (pg V062).
+-- Evict-on-resume projection that replaces
+-- `PauseScheduleReadModel::list_due`'s event-log walker.
+-- `RunStateChanged(→Paused)` with a non-None `resume_after_ms`
+-- INSERTs; any transition away from Paused DELETEs by run_id.
 CREATE TABLE IF NOT EXISTS pause_schedules (
     run_id         TEXT    PRIMARY KEY,
     tenant_id      TEXT    NOT NULL,
@@ -1391,4 +1382,90 @@ CREATE TABLE IF NOT EXISTS pause_schedules (
 
 CREATE INDEX IF NOT EXISTS idx_pause_schedules_due
     ON pause_schedules (tenant_id, resume_at_ms, run_id);
+
+-- RFC-025 Phase 2b.4 milestone 2: eval datasets + rubrics + baselines
+-- parity tables (pg V063, renumbered from V062 after PR #595 took
+-- V062 for pause_schedules). RFC 004 eval catalog. tenant_id is
+-- carried as a sentinel empty string because the five Eval* events
+-- do not (yet) carry tenant_id; matches the in-memory applier that
+-- writes `TenantId::new("")`. See V063 for the detailed rationale.
+CREATE TABLE IF NOT EXISTS eval_datasets (
+    dataset_id     TEXT    PRIMARY KEY,
+    tenant_id      TEXT    NOT NULL,
+    name           TEXT    NOT NULL,
+    subject_kind   TEXT    NOT NULL,
+    created_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_datasets_tenant
+    ON eval_datasets (tenant_id, created_at_ms, dataset_id);
+
+CREATE TABLE IF NOT EXISTS eval_dataset_entries (
+    dataset_id    TEXT NOT NULL,
+    entry_id      TEXT NOT NULL,
+    added_at_ms   INTEGER NOT NULL,
+    PRIMARY KEY (dataset_id, entry_id)
+);
+
+CREATE TABLE IF NOT EXISTS eval_rubrics (
+    rubric_id       TEXT    PRIMARY KEY,
+    tenant_id       TEXT    NOT NULL,
+    name            TEXT    NOT NULL,
+    dimensions_json TEXT    NOT NULL,
+    created_at_ms   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_rubrics_tenant
+    ON eval_rubrics (tenant_id, rubric_id);
+
+CREATE TABLE IF NOT EXISTS eval_baselines (
+    baseline_id     TEXT    PRIMARY KEY,
+    tenant_id       TEXT    NOT NULL,
+    name            TEXT    NOT NULL,
+    prompt_asset_id TEXT    NOT NULL,
+    metrics_json    TEXT    NOT NULL,
+    created_at_ms   INTEGER NOT NULL,
+    locked          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_eval_baselines_tenant
+    ON eval_baselines (tenant_id, baseline_id);
+
+-- RFC-025 Phase 2b.4 milestone 3: operator_profiles parity table
+-- (pg V064, renumbered from V063). RFC 008 operator directory.
+CREATE TABLE IF NOT EXISTS operator_profiles (
+    operator_id    TEXT    PRIMARY KEY,
+    tenant_id      TEXT    NOT NULL,
+    display_name   TEXT    NOT NULL,
+    email          TEXT    NOT NULL,
+    role           TEXT    NOT NULL,
+    created_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_profiles_tenant
+    ON operator_profiles (tenant_id, operator_id);
+
+-- RFC-025 Phase 2b.4 milestone 4: run_costs + run_cost_alerts parity
+-- tables (pg V065, renumbered from V064). Per-run cost rollup + alert
+-- ledger.
+CREATE TABLE IF NOT EXISTS run_costs (
+    run_id             TEXT    PRIMARY KEY,
+    total_cost_micros  INTEGER NOT NULL DEFAULT 0,
+    total_tokens_in    INTEGER NOT NULL DEFAULT 0,
+    total_tokens_out   INTEGER NOT NULL DEFAULT 0,
+    provider_calls     INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_cost_alerts (
+    run_id              TEXT    PRIMARY KEY,
+    tenant_id           TEXT    NOT NULL,
+    threshold_micros    INTEGER NOT NULL,
+    triggered_at_ms     INTEGER NOT NULL DEFAULT 0,
+    actual_cost_micros  INTEGER NOT NULL DEFAULT 0,
+    set_at_ms           INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_cost_alerts_tenant_triggered
+    ON run_cost_alerts (tenant_id, triggered_at_ms DESC, run_id);
 "#;

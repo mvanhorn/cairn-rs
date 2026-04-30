@@ -324,9 +324,9 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     // hit `relation "resource_shares" does not exist` (etc.) on the
     // first projection write. The `sequential no gaps` contract test
     // only hard-checks V001..V017, so the omission slipped through
-    // review on both PRs. Re-wiring them here alongside #592's V062
-    // as a mandatory accompanying fix — the projection arms are live
-    // callers of these tables.
+    // review on both PRs. Wiring them in here (introduced by PR #595
+    // alongside V062 = pause_schedules and extended by this PR's
+    // V063..V065).
     (
         51,
         "create_resource_shares",
@@ -357,10 +357,6 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_tool_recovery_pauses",
         include_str!("migrations/V056__create_tool_recovery_pauses.sql"),
     ),
-    // RFC-025 Phase 2b.3 (PR #594) landed V057..V061 on disk with
-    // the same "not registered here" gap that affected V051..V056.
-    // Wire them in alongside #592's V062 so pg never hits `relation
-    // "ingest_jobs" does not exist` (etc.) on first write.
     (
         57,
         "create_ingest_jobs",
@@ -386,17 +382,36 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_checkpoint_strategies",
         include_str!("migrations/V061__create_checkpoint_strategies.sql"),
     ),
-    // Issue #592: pause_schedules projection. Replaces the
+    // PR #595 (issue #592): pause_schedules projection. Replaces the
     // event-log walker in `PauseScheduleReadModel::list_due` with
     // an evict-on-resume table — `RunStateChanged(→Paused)` with a
     // `resume_after_ms` INSERTs a row, and any transition away from
-    // Paused DELETEs it. The handler no longer scans the full event
-    // log on every poll of `/v1/runs/paused-due`. Renumbered
-    // V057 → V062 after main published Phase 2b.3 (V057-V061).
+    // Paused DELETEs it.
     (
         62,
         "create_pause_schedules",
         include_str!("migrations/V062__create_pause_schedules.sql"),
+    ),
+    // RFC-025 Phase 2b.4 milestone 2: eval datasets + rubrics +
+    // baselines. Renumbered V062 → V063 after PR #595 took V062.
+    (
+        63,
+        "create_eval_projections",
+        include_str!("migrations/V063__create_eval_projections.sql"),
+    ),
+    // RFC-025 Phase 2b.4 milestone 3: operator_profiles projection.
+    // Renumbered V063 → V064.
+    (
+        64,
+        "create_operator_profiles",
+        include_str!("migrations/V064__create_operator_profiles.sql"),
+    ),
+    // RFC-025 Phase 2b.4 milestone 4: run_costs + run_cost_alerts.
+    // Renumbered V064 → V065.
+    (
+        65,
+        "create_run_cost_projections",
+        include_str!("migrations/V065__create_run_cost_projections.sql"),
     ),
 ];
 
