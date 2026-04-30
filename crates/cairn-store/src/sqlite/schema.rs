@@ -1258,4 +1258,111 @@ CREATE INDEX IF NOT EXISTS idx_tool_recovery_pauses_run
 
 CREATE INDEX IF NOT EXISTS idx_tool_recovery_pauses_project
     ON tool_recovery_pauses (tenant_id, workspace_id, project_id, paused_at_ms, tool_call_id);
+
+-- RFC-025 Phase 2b.3 milestone 1: ingest_jobs parity table (pg V057).
+-- RFC 003 memory ingest pipeline. Started → state="processing"; Completed
+-- flips state to "completed" or "failed" and attaches error_message.
+CREATE TABLE IF NOT EXISTS ingest_jobs (
+    job_id           TEXT    PRIMARY KEY,
+    tenant_id        TEXT    NOT NULL,
+    workspace_id     TEXT    NOT NULL,
+    project_id       TEXT    NOT NULL,
+    source_id        TEXT,
+    document_count   INTEGER NOT NULL,
+    state            TEXT    NOT NULL,
+    error_message    TEXT,
+    created_at_ms    INTEGER NOT NULL,
+    updated_at_ms    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_jobs_project
+    ON ingest_jobs (tenant_id, workspace_id, project_id, created_at_ms, job_id);
+
+-- RFC-025 Phase 2b.3 milestone 2: default_settings parity table (pg V058).
+-- Layered defaults keyed on (scope, scope_id, key) — upsert on Set,
+-- hard-delete on Cleared. `value_json` stores `serde_json::Value` as
+-- TEXT so pg and sqlite agree byte-for-byte.
+CREATE TABLE IF NOT EXISTS default_settings (
+    scope         TEXT NOT NULL,
+    scope_id      TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    value_json    TEXT NOT NULL,
+    PRIMARY KEY (scope, scope_id, key)
+);
+
+-- RFC-025 Phase 2b.3 milestone 3: channels + channel_messages parity
+-- tables (pg V059). Two projections for one service: channel lifecycle
+-- + message ledger with consume-tracking.
+CREATE TABLE IF NOT EXISTS channels (
+    channel_id     TEXT    PRIMARY KEY,
+    tenant_id      TEXT    NOT NULL,
+    workspace_id   TEXT    NOT NULL,
+    project_id     TEXT    NOT NULL,
+    name           TEXT    NOT NULL,
+    capacity       INTEGER NOT NULL,
+    created_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_channels_project
+    ON channels (tenant_id, workspace_id, project_id, created_at_ms, channel_id);
+
+CREATE TABLE IF NOT EXISTS channel_messages (
+    channel_id       TEXT    NOT NULL,
+    message_id       TEXT    NOT NULL,
+    sender_id        TEXT    NOT NULL,
+    body             TEXT    NOT NULL,
+    sent_at_ms       INTEGER NOT NULL,
+    consumed_by      TEXT,
+    consumed_at_ms   INTEGER,
+    PRIMARY KEY (channel_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_messages_channel
+    ON channel_messages (channel_id, sent_at_ms, message_id);
+
+-- RFC-025 Phase 2b.3 milestone 4: notification_preferences + notifications
+-- parity tables (pg V060). RFC 008 operator notification matrix +
+-- delivery audit ledger.
+CREATE TABLE IF NOT EXISTS notification_preferences (
+    tenant_id        TEXT NOT NULL,
+    operator_id      TEXT NOT NULL,
+    pref_id          TEXT NOT NULL,
+    event_types_json TEXT NOT NULL,
+    channels_json    TEXT NOT NULL,
+    set_at_ms        INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, operator_id)
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    record_id       TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL,
+    operator_id     TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    channel_kind    TEXT NOT NULL,
+    channel_target  TEXT NOT NULL,
+    payload_json    TEXT NOT NULL,
+    sent_at_ms      INTEGER NOT NULL,
+    delivered       INTEGER NOT NULL,
+    delivery_error  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_tenant
+    ON notifications (tenant_id, sent_at_ms, record_id);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_tenant_delivered
+    ON notifications (tenant_id, delivered, sent_at_ms, record_id);
+
+-- RFC-025 Phase 2b.3 milestone 5: checkpoint_strategies parity table
+-- (pg V061). RFC 002 checkpoint cadence policy: one row per run_id,
+-- upsert on set. Events with `run_id = None` are skipped (matches the
+-- in-memory `if let Some(run_id)` guard).
+CREATE TABLE IF NOT EXISTS checkpoint_strategies (
+    run_id                    TEXT    PRIMARY KEY,
+    strategy_id               TEXT    NOT NULL,
+    interval_ms               INTEGER NOT NULL,
+    max_checkpoints           INTEGER NOT NULL,
+    trigger_on_task_complete  INTEGER NOT NULL,
+    set_at_ms                 INTEGER NOT NULL
+);
 "#;

@@ -135,11 +135,21 @@ struct State {
     credentials: HashMap<String, cairn_domain::credentials::CredentialRecord>,
     channels: HashMap<String, cairn_domain::ChannelRecord>,
     channel_messages: HashMap<String, Vec<cairn_domain::ChannelMessage>>,
+    /// Sidecar dedupe index for `channel_messages` — keeps the
+    /// first-write-wins guard O(1) per event apply instead of a linear
+    /// scan of the message Vec. Mirrors the `guardrail_evaluation_keys`
+    /// pattern. Kept in lockstep with `channel_messages` by the applier
+    /// and the clear paths. Copilot PR #594 perf fix.
+    channel_message_keys: std::collections::HashSet<(String, String)>,
     credential_rotations: Vec<cairn_domain::credentials::CredentialRotationRecord>,
     licenses: HashMap<String, cairn_domain::LicenseRecord>,
     entitlement_overrides: HashMap<String, cairn_domain::EntitlementOverrideRecord>,
     notification_prefs: HashMap<String, cairn_domain::notification_prefs::NotificationPreference>,
     notification_records: Vec<cairn_domain::notification_prefs::NotificationRecord>,
+    /// Sidecar dedupe index for `notification_records` — first-write-wins
+    /// guard on `record_id` in O(1). Same reasoning as
+    /// `channel_message_keys` above. Copilot PR #594 perf fix.
+    notification_record_ids: std::collections::HashSet<String>,
     guardrail_policies: HashMap<String, cairn_domain::policy::GuardrailPolicy>,
     /// RFC-025 Phase 2a.2 milestone 2: tenant association for guardrail
     /// policies so `list_policies(tenant_id, ..)` scopes correctly. The
@@ -345,11 +355,13 @@ impl InMemoryStore {
                 credentials: HashMap::new(),
                 channels: HashMap::new(),
                 channel_messages: HashMap::new(),
+                channel_message_keys: std::collections::HashSet::new(),
                 credential_rotations: Vec::new(),
                 licenses: HashMap::new(),
                 entitlement_overrides: HashMap::new(),
                 notification_prefs: HashMap::new(),
                 notification_records: Vec::new(),
+                notification_record_ids: std::collections::HashSet::new(),
                 guardrail_policies: HashMap::new(),
                 guardrail_policy_tenants: HashMap::new(),
                 guardrail_evaluations: Vec::new(),
@@ -933,19 +945,29 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::ChannelMessageSent(e) => {
-                state
-                    .channel_messages
-                    .entry(e.channel_id.as_str().to_owned())
-                    .or_default()
-                    .push(cairn_domain::ChannelMessage {
-                        channel_id: e.channel_id.clone(),
-                        message_id: e.message_id.clone(),
-                        sender_id: e.sender_id.clone(),
-                        body: e.body.clone(),
-                        sent_at_ms: e.sent_at_ms,
-                        consumed_by: None,
-                        consumed_at_ms: None,
-                    });
+                // RFC-025 Phase 2b.3 m3: first-write-wins on
+                // `(channel_id, message_id)` so replayed events are
+                // a no-op — matches the pg/sqlite ON CONFLICT DO NOTHING
+                // on the composite PK. Uses the `channel_message_keys`
+                // sidecar HashSet for O(1) dedupe (vs. O(n) Vec scan
+                // that would make ingesting N messages O(N^2) —
+                // Copilot PR #594 perf fix).
+                let key = (e.channel_id.as_str().to_owned(), e.message_id.clone());
+                if state.channel_message_keys.insert(key) {
+                    state
+                        .channel_messages
+                        .entry(e.channel_id.as_str().to_owned())
+                        .or_default()
+                        .push(cairn_domain::ChannelMessage {
+                            channel_id: e.channel_id.clone(),
+                            message_id: e.message_id.clone(),
+                            sender_id: e.sender_id.clone(),
+                            body: e.body.clone(),
+                            sent_at_ms: e.sent_at_ms,
+                            consumed_by: None,
+                            consumed_at_ms: None,
+                        });
+                }
             }
             RuntimeEvent::ChannelMessageConsumed(e) => {
                 if let Some(messages) = state.channel_messages.get_mut(e.channel_id.as_str()) {
@@ -956,7 +978,17 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::DefaultSettingSet(e) => {
-                let composite_key = format!("{:?}:{}:{}", e.scope, e.scope_id, e.key);
+                // RFC-025 Phase 2b.3 m2: composite key uses the shared
+                // snake_case scope encoding (matches pg/sqlite
+                // `default_settings.scope` column) so doc-comment parity
+                // claims in `projections/defaults.rs` are literally
+                // true. Copilot PR #594 review.
+                let composite_key = format!(
+                    "{}:{}:{}",
+                    crate::projections::defaults_scope_str(e.scope),
+                    e.scope_id,
+                    e.key
+                );
                 state.default_settings.insert(
                     composite_key,
                     cairn_domain::DefaultSetting {
@@ -967,7 +999,12 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::DefaultSettingCleared(e) => {
-                let composite_key = format!("{:?}:{}:{}", e.scope, e.scope_id, e.key);
+                let composite_key = format!(
+                    "{}:{}:{}",
+                    crate::projections::defaults_scope_str(e.scope),
+                    e.scope_id,
+                    e.key
+                );
                 state.default_settings.remove(&composite_key);
             }
             RuntimeEvent::LicenseActivated(e) => {
@@ -1014,20 +1051,30 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::NotificationSent(e) => {
-                state.notification_records.push(
-                    cairn_domain::notification_prefs::NotificationRecord {
-                        record_id: e.record_id.clone(),
-                        tenant_id: e.tenant_id.clone(),
-                        operator_id: e.operator_id.clone(),
-                        event_type: e.event_type.clone(),
-                        channel_kind: e.channel_kind.clone(),
-                        channel_target: e.channel_target.clone(),
-                        payload: e.payload.clone(),
-                        sent_at_ms: e.sent_at_ms,
-                        delivered: e.delivered,
-                        delivery_error: e.delivery_error.clone(),
-                    },
-                );
+                // RFC-025 Phase 2b.3 m4: first-write-wins on `record_id`
+                // so replayed events are a no-op — matches pg/sqlite
+                // ON CONFLICT (record_id) DO NOTHING. Uses the
+                // `notification_record_ids` sidecar HashSet for O(1)
+                // dedupe (vs. O(n) Vec scan). Copilot PR #594 perf fix.
+                if state
+                    .notification_record_ids
+                    .insert(e.record_id.clone())
+                {
+                    state.notification_records.push(
+                        cairn_domain::notification_prefs::NotificationRecord {
+                            record_id: e.record_id.clone(),
+                            tenant_id: e.tenant_id.clone(),
+                            operator_id: e.operator_id.clone(),
+                            event_type: e.event_type.clone(),
+                            channel_kind: e.channel_kind.clone(),
+                            channel_target: e.channel_target.clone(),
+                            payload: e.payload.clone(),
+                            sent_at_ms: e.sent_at_ms,
+                            delivered: e.delivered,
+                            delivery_error: e.delivery_error.clone(),
+                        },
+                    );
+                }
             }
             RuntimeEvent::ProviderPoolCreated(e) => {
                 state.provider_pools.insert(
@@ -2772,17 +2819,13 @@ impl InMemoryStore {
                         run_id.as_str().to_owned(),
                         cairn_domain::CheckpointStrategy {
                             strategy_id: e.strategy_id.clone(),
-                            project: cairn_domain::ProjectKey::new(
-                                "_strategy",
-                                "_strategy",
-                                "_strategy",
-                            ),
+                            project: crate::projections::checkpoint_strategy_sentinel_project(),
                             run_id: run_id.clone(),
                             interval_ms: e.interval_ms,
                             max_checkpoints: if e.max_checkpoints > 0 {
                                 e.max_checkpoints
                             } else {
-                                10
+                                crate::projections::CHECKPOINT_STRATEGY_DEFAULT_MAX_CHECKPOINTS
                             },
                             trigger_on_task_complete: e.trigger_on_task_complete,
                         },
@@ -4019,7 +4062,16 @@ impl IngestJobReadModel for InMemoryStore {
             .filter(|j| j.project == *project)
             .cloned()
             .collect();
-        results.sort_by_key(|j| j.created_at);
+        // RFC-025 Phase 2b.3 m1: tiebreak on `id` so two jobs created in
+        // the same millisecond land in a deterministic order that pg/sqlite
+        // also produce (they `ORDER BY created_at_ms ASC, job_id ASC` on the
+        // composite project index). Without this, byte-equality parity with
+        // the SQL backends fails.
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
         let results = results.into_iter().skip(offset).take(limit).collect();
         Ok(results)
     }
@@ -5139,14 +5191,21 @@ impl crate::projections::ChannelReadModel for InMemoryStore {
         offset: usize,
     ) -> Result<Vec<cairn_domain::ChannelRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m3: sort by (created_at ASC, channel_id ASC)
+        // to match pg/sqlite ORDER BY. HashMap::values is otherwise
+        // unordered and breaks byte-equal parity.
+        let mut rows: Vec<cairn_domain::ChannelRecord> = state
             .channels
             .values()
             .filter(|c| &c.project == project)
-            .skip(offset)
-            .take(limit)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.channel_id.as_str().cmp(b.channel_id.as_str()))
+        });
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
     async fn list_messages(
         &self,
@@ -5154,14 +5213,22 @@ impl crate::projections::ChannelReadModel for InMemoryStore {
         limit: usize,
     ) -> Result<Vec<cairn_domain::ChannelMessage>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m3: sort by (sent_at_ms ASC, message_id ASC)
+        // — the in-memory store appends to a Vec in arrival order which
+        // happens to match sent_at_ms ordering when events are appended
+        // in chronological order, but an out-of-order replay would drift
+        // from the SQL `ORDER BY` otherwise.
+        let mut msgs = state
             .channel_messages
             .get(channel_id.as_str())
             .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .take(limit)
-            .collect())
+            .unwrap_or_default();
+        msgs.sort_by(|a, b| {
+            a.sent_at_ms
+                .cmp(&b.sent_at_ms)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        Ok(msgs.into_iter().take(limit).collect())
     }
 }
 
@@ -5277,7 +5344,12 @@ impl crate::projections::DefaultsReadModel for InMemoryStore {
         scope_id: &str,
         key: &str,
     ) -> Result<Option<cairn_domain::DefaultSetting>, StoreError> {
-        let k = format!("{scope:?}:{scope_id}:{key}");
+        let k = format!(
+            "{}:{}:{}",
+            crate::projections::defaults_scope_str(scope),
+            scope_id,
+            key
+        );
         Ok(self
             .state
             .lock()
@@ -5291,14 +5363,23 @@ impl crate::projections::DefaultsReadModel for InMemoryStore {
         scope: cairn_domain::Scope,
         scope_id: &str,
     ) -> Result<Vec<cairn_domain::DefaultSetting>, StoreError> {
-        let prefix = format!("{scope:?}:{scope_id}:");
+        let prefix = format!(
+            "{}:{}:",
+            crate::projections::defaults_scope_str(scope),
+            scope_id
+        );
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m2: sort by `key` to match pg/sqlite
+        // `ORDER BY key ASC`. HashMap iteration is otherwise unordered
+        // and breaks byte-equal parity with the SQL backends.
+        let mut rows: Vec<cairn_domain::DefaultSetting> = state
             .default_settings
             .iter()
             .filter(|(k, _)| k.starts_with(&prefix))
             .map(|(_, v)| v.clone())
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(rows)
     }
 }
 
@@ -5454,12 +5535,16 @@ impl crate::projections::NotificationReadModel for InMemoryStore {
         tenant_id: &cairn_domain::TenantId,
     ) -> Result<Vec<cairn_domain::notification_prefs::NotificationPreference>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m4: sort by `operator_id ASC` to match
+        // pg/sqlite `ORDER BY operator_id ASC`.
+        let mut rows: Vec<cairn_domain::notification_prefs::NotificationPreference> = state
             .notification_prefs
             .values()
             .filter(|p| &p.tenant_id == tenant_id)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| a.operator_id.cmp(&b.operator_id));
+        Ok(rows)
     }
     async fn list_sent_notifications(
         &self,
@@ -5467,24 +5552,38 @@ impl crate::projections::NotificationReadModel for InMemoryStore {
         since_ms: u64,
     ) -> Result<Vec<cairn_domain::notification_prefs::NotificationRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m4: sort (sent_at_ms ASC, record_id ASC) to
+        // match pg/sqlite ORDER BY.
+        let mut rows: Vec<cairn_domain::notification_prefs::NotificationRecord> = state
             .notification_records
             .iter()
             .filter(|r| &r.tenant_id == tenant_id && r.sent_at_ms >= since_ms)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| {
+            a.sent_at_ms
+                .cmp(&b.sent_at_ms)
+                .then_with(|| a.record_id.cmp(&b.record_id))
+        });
+        Ok(rows)
     }
     async fn list_failed_notifications(
         &self,
         tenant_id: &cairn_domain::TenantId,
     ) -> Result<Vec<cairn_domain::notification_prefs::NotificationRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        let mut rows: Vec<cairn_domain::notification_prefs::NotificationRecord> = state
             .notification_records
             .iter()
             .filter(|r| &r.tenant_id == tenant_id && !r.delivered)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| {
+            a.sent_at_ms
+                .cmp(&b.sent_at_ms)
+                .then_with(|| a.record_id.cmp(&b.record_id))
+        });
+        Ok(rows)
     }
 }
 
@@ -6797,11 +6896,13 @@ impl InMemoryStore {
         state.credentials.clear();
         state.channels.clear();
         state.channel_messages.clear();
+        state.channel_message_keys.clear();
         state.credential_rotations.clear();
         state.licenses.clear();
         state.entitlement_overrides.clear();
         state.notification_prefs.clear();
         state.notification_records.clear();
+        state.notification_record_ids.clear();
         state.guardrail_policies.clear();
         state.guardrail_policy_tenants.clear();
         state.guardrail_evaluations.clear();
@@ -6962,11 +7063,13 @@ impl InMemoryStore {
             state.credentials.clear();
             state.channels.clear();
             state.channel_messages.clear();
+            state.channel_message_keys.clear();
             state.credential_rotations.clear();
             state.licenses.clear();
             state.entitlement_overrides.clear();
             state.notification_prefs.clear();
             state.notification_records.clear();
+            state.notification_record_ids.clear();
             state.guardrail_policies.clear();
             state.guardrail_policy_tenants.clear();
             state.guardrail_evaluations.clear();
@@ -7286,11 +7389,13 @@ impl InMemoryStore {
         state.credentials.clear();
         state.channels.clear();
         state.channel_messages.clear();
+        state.channel_message_keys.clear();
         state.credential_rotations.clear();
         state.licenses.clear();
         state.entitlement_overrides.clear();
         state.notification_prefs.clear();
         state.notification_records.clear();
+        state.notification_record_ids.clear();
         state.guardrail_policies.clear();
         state.guardrail_policy_tenants.clear();
         state.guardrail_evaluations.clear();

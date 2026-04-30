@@ -683,8 +683,73 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::IngestJobStarted(_) => log_stub("IngestJobStarted"),
-            RuntimeEvent::IngestJobCompleted(_) => log_stub("IngestJobCompleted"),
+            // RFC-025 Phase 2b.3 m1: ingest_jobs parity with pg V057.
+            // Started inserts the initial row; Completed updates the
+            // existing row with terminal state + error_message. Both
+            // keyed on `job_id`.
+            RuntimeEvent::IngestJobStarted(e) => {
+                let document_count = i32::try_from(e.document_count).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "IngestJobStarted.document_count {} exceeds i32::MAX",
+                        e.document_count
+                    ))
+                })?;
+                let started_at = i64::try_from(e.started_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "IngestJobStarted.started_at {} exceeds i64::MAX",
+                        e.started_at
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO ingest_jobs (
+                        job_id, tenant_id, workspace_id, project_id,
+                        source_id, document_count, state, error_message,
+                        created_at_ms, updated_at_ms
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                     ON CONFLICT(job_id) DO NOTHING",
+                )
+                .bind(e.job_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.source_id.as_ref().map(|s| s.as_str()))
+                .bind(document_count)
+                .bind(crate::projections::ingest_job_state_str(
+                    cairn_domain::IngestJobState::Processing,
+                ))
+                .bind(started_at)
+                .bind(started_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::IngestJobCompleted(e) => {
+                let completed_at = i64::try_from(e.completed_at).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "IngestJobCompleted.completed_at {} exceeds i64::MAX",
+                        e.completed_at
+                    ))
+                })?;
+                let new_state = crate::projections::ingest_job_state_str(if e.success {
+                    cairn_domain::IngestJobState::Completed
+                } else {
+                    cairn_domain::IngestJobState::Failed
+                });
+                sqlx::query(
+                    "UPDATE ingest_jobs
+                     SET state         = ?2,
+                         error_message = ?3,
+                         updated_at_ms = ?4
+                     WHERE job_id = ?1",
+                )
+                .bind(e.job_id.as_str())
+                .bind(new_state)
+                .bind(e.error_message.as_deref())
+                .bind(completed_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 1 (milestone 4): `eval_runs` projection —
             // sqlite parity with the pg applier in
             // `crates/cairn-store/src/pg/projections.rs`. Same
@@ -1256,11 +1321,114 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::ChannelCreated(_) => log_stub("ChannelCreated"),
-            RuntimeEvent::ChannelMessageSent(_) => log_stub("ChannelMessageSent"),
-            RuntimeEvent::ChannelMessageConsumed(_) => log_stub("ChannelMessageConsumed"),
-            RuntimeEvent::DefaultSettingSet(_) => log_stub("DefaultSettingSet"),
-            RuntimeEvent::DefaultSettingCleared(_) => log_stub("DefaultSettingCleared"),
+            // RFC-025 Phase 2b.3 m3: channels + channel_messages parity
+            // with pg V059.
+            RuntimeEvent::ChannelCreated(e) => {
+                let capacity = i32::try_from(e.capacity).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ChannelCreated.capacity {} exceeds i32::MAX",
+                        e.capacity
+                    ))
+                })?;
+                let created_at = i64::try_from(e.created_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ChannelCreated.created_at_ms {} exceeds i64::MAX",
+                        e.created_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO channels (
+                        channel_id, tenant_id, workspace_id, project_id,
+                        name, capacity, created_at_ms, updated_at_ms
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(channel_id) DO NOTHING",
+                )
+                .bind(e.channel_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(&e.name)
+                .bind(capacity)
+                .bind(created_at)
+                .bind(created_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ChannelMessageSent(e) => {
+                let sent_at = i64::try_from(e.sent_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ChannelMessageSent.sent_at_ms {} exceeds i64::MAX",
+                        e.sent_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO channel_messages (
+                        channel_id, message_id, sender_id, body, sent_at_ms,
+                        consumed_by, consumed_at_ms
+                     ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
+                     ON CONFLICT(channel_id, message_id) DO NOTHING",
+                )
+                .bind(e.channel_id.as_str())
+                .bind(&e.message_id)
+                .bind(&e.sender_id)
+                .bind(&e.body)
+                .bind(sent_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::ChannelMessageConsumed(e) => {
+                let consumed_at = i64::try_from(e.consumed_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "ChannelMessageConsumed.consumed_at_ms {} exceeds i64::MAX",
+                        e.consumed_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE channel_messages
+                     SET consumed_by    = ?3,
+                         consumed_at_ms = ?4
+                     WHERE channel_id = ?1 AND message_id = ?2",
+                )
+                .bind(e.channel_id.as_str())
+                .bind(&e.message_id)
+                .bind(&e.consumed_by)
+                .bind(consumed_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC-025 Phase 2b.3 m2: default_settings parity with pg V058.
+            RuntimeEvent::DefaultSettingSet(e) => {
+                let value_json = serde_json::to_string(&e.value)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO default_settings (scope, scope_id, key, value_json)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(scope, scope_id, key) DO UPDATE SET
+                         value_json = excluded.value_json",
+                )
+                .bind(crate::projections::defaults_scope_str(e.scope))
+                .bind(&e.scope_id)
+                .bind(&e.key)
+                .bind(value_json)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::DefaultSettingCleared(e) => {
+                sqlx::query(
+                    "DELETE FROM default_settings
+                     WHERE scope = ?1 AND scope_id = ?2 AND key = ?3",
+                )
+                .bind(crate::projections::defaults_scope_str(e.scope))
+                .bind(&e.scope_id)
+                .bind(&e.key)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 2a.1 milestone 4: licenses projection
             // (sqlite parity with pg).
             RuntimeEvent::LicenseActivated(e) => {
@@ -1338,8 +1506,72 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::NotificationPreferenceSet(_) => log_stub("NotificationPreferenceSet"),
-            RuntimeEvent::NotificationSent(_) => log_stub("NotificationSent"),
+            // RFC-025 Phase 2b.3 m4: notification_preferences +
+            // notifications parity with pg V060.
+            RuntimeEvent::NotificationPreferenceSet(e) => {
+                let event_types_json = serde_json::to_string(&e.event_types)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let channels_json = serde_json::to_string(&e.channels)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let set_at = i64::try_from(e.set_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "NotificationPreferenceSet.set_at_ms {} exceeds i64::MAX",
+                        e.set_at_ms
+                    ))
+                })?;
+                let pref_id = format!("{}:{}", e.tenant_id.as_str(), e.operator_id);
+                sqlx::query(
+                    "INSERT INTO notification_preferences (
+                        tenant_id, operator_id, pref_id,
+                        event_types_json, channels_json, set_at_ms
+                     ) VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(tenant_id, operator_id) DO UPDATE SET
+                         pref_id          = excluded.pref_id,
+                         event_types_json = excluded.event_types_json,
+                         channels_json    = excluded.channels_json,
+                         set_at_ms        = excluded.set_at_ms",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(&e.operator_id)
+                .bind(&pref_id)
+                .bind(event_types_json)
+                .bind(channels_json)
+                .bind(set_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::NotificationSent(e) => {
+                let payload_json = serde_json::to_string(&e.payload)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let sent_at = i64::try_from(e.sent_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "NotificationSent.sent_at_ms {} exceeds i64::MAX",
+                        e.sent_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO notifications (
+                        record_id, tenant_id, operator_id, event_type,
+                        channel_kind, channel_target, payload_json, sent_at_ms,
+                        delivered, delivery_error
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(record_id) DO NOTHING",
+                )
+                .bind(&e.record_id)
+                .bind(e.tenant_id.as_str())
+                .bind(&e.operator_id)
+                .bind(&e.event_type)
+                .bind(&e.channel_kind)
+                .bind(&e.channel_target)
+                .bind(payload_json)
+                .bind(sent_at)
+                .bind(if e.delivered { 1_i64 } else { 0_i64 })
+                .bind(e.delivery_error.as_deref())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::ProviderPoolCreated(_) => log_stub("ProviderPoolCreated"),
             RuntimeEvent::ProviderPoolConnectionAdded(_) => log_stub("ProviderPoolConnectionAdded"),
             RuntimeEvent::ProviderPoolConnectionRemoved(_) => {
@@ -1537,7 +1769,60 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
-            RuntimeEvent::CheckpointStrategySet(_) => log_stub("CheckpointStrategySet"),
+            // RFC-025 Phase 2b.3 m5: checkpoint_strategies parity with
+            // pg V061.
+            RuntimeEvent::CheckpointStrategySet(e) => {
+                let Some(run_id) = e.run_id.as_ref() else {
+                    return Ok(());
+                };
+                let max_checkpoints = if e.max_checkpoints > 0 {
+                    e.max_checkpoints
+                } else {
+                    crate::projections::CHECKPOINT_STRATEGY_DEFAULT_MAX_CHECKPOINTS
+                };
+                let max_checkpoints = i32::try_from(max_checkpoints).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "CheckpointStrategySet.max_checkpoints {max_checkpoints} exceeds i32::MAX"
+                    ))
+                })?;
+                let interval_ms = i64::try_from(e.interval_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "CheckpointStrategySet.interval_ms {} exceeds i64::MAX",
+                        e.interval_ms
+                    ))
+                })?;
+                let set_at = i64::try_from(e.set_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "CheckpointStrategySet.set_at_ms {} exceeds i64::MAX",
+                        e.set_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO checkpoint_strategies (
+                        run_id, strategy_id, interval_ms, max_checkpoints,
+                        trigger_on_task_complete, set_at_ms
+                     ) VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(run_id) DO UPDATE SET
+                         strategy_id              = excluded.strategy_id,
+                         interval_ms              = excluded.interval_ms,
+                         max_checkpoints          = excluded.max_checkpoints,
+                         trigger_on_task_complete = excluded.trigger_on_task_complete,
+                         set_at_ms                = excluded.set_at_ms",
+                )
+                .bind(run_id.as_str())
+                .bind(&e.strategy_id)
+                .bind(interval_ms)
+                .bind(max_checkpoints)
+                .bind(if e.trigger_on_task_complete {
+                    1_i64
+                } else {
+                    0_i64
+                })
+                .bind(set_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // RFC-025 Phase 2a.1: credentials projection — sqlite parity
             // with pg. Keep `ON CONFLICT DO UPDATE` semantics identical
             // so the parity harness can byte-compare both backends for

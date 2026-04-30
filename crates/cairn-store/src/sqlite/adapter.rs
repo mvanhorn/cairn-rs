@@ -749,10 +749,36 @@ impl CheckpointStrategyReadModel for SqliteAdapter {
         &self,
         run_id: &RunId,
     ) -> Result<Option<cairn_domain::CheckpointStrategy>, StoreError> {
-        // Checkpoint strategies are stored as events; query the strategies table if it exists,
-        // otherwise return None (strategy not configured).
-        let _ = run_id;
-        Ok(None)
+        // RFC-025 Phase 2b.3 m5: replaces the pre-Phase-2b.3 `Ok(None)`
+        // stub. Parity with pg/adapter.rs: the row is keyed on
+        // `run_id` and carries no project scope on the write side, so
+        // we return the shared sentinel `ProjectKey` here.
+        let row: Option<(String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT strategy_id, interval_ms, max_checkpoints, trigger_on_task_complete
+             FROM checkpoint_strategies
+             WHERE run_id = ?1",
+        )
+        .bind(run_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        let Some((strategy_id, interval_ms, max_checkpoints, trigger_on_task_complete)) = row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(cairn_domain::CheckpointStrategy {
+            strategy_id,
+            project: crate::projections::checkpoint_strategy_sentinel_project(),
+            run_id: run_id.clone(),
+            interval_ms: interval_ms.max(0) as u64,
+            max_checkpoints: u32::try_from(max_checkpoints.max(0)).map_err(|_| {
+                StoreError::Internal(format!(
+                    "checkpoint_strategies.max_checkpoints {max_checkpoints} exceeds u32::MAX"
+                ))
+            })?,
+            trigger_on_task_complete: trigger_on_task_complete != 0,
+        }))
     }
 }
 
@@ -5016,5 +5042,442 @@ impl crate::projections::ToolRecoveryPauseReadModel for SqliteAdapter {
             .into_iter()
             .map(SqliteToolRecoveryPauseRow::into_record)
             .collect())
+    }
+}
+
+// ── RFC-025 Phase 2b.3 m1: ingest_jobs read model (RFC 003) ──
+
+#[derive(sqlx::FromRow)]
+struct SqliteIngestJobRow {
+    job_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    source_id: Option<String>,
+    document_count: i64,
+    state: String,
+    error_message: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl SqliteIngestJobRow {
+    fn into_record(self) -> Result<cairn_domain::IngestJobRecord, StoreError> {
+        Ok(cairn_domain::IngestJobRecord {
+            id: cairn_domain::IngestJobId::new(self.job_id),
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            source_id: self.source_id.map(cairn_domain::ids::SourceId::new),
+            document_count: u32::try_from(self.document_count.max(0)).map_err(|_| {
+                StoreError::Internal(format!(
+                    "ingest_jobs.document_count {} exceeds u32::MAX",
+                    self.document_count
+                ))
+            })?,
+            state: crate::projections::rehydrate_ingest_job_state(&self.state)?,
+            error_message: self.error_message,
+            created_at: self.created_at_ms.max(0) as u64,
+            updated_at: self.updated_at_ms.max(0) as u64,
+        })
+    }
+}
+
+const INGEST_JOB_SELECT_COLS_SQLITE: &str =
+    "job_id, tenant_id, workspace_id, project_id, source_id, document_count, \
+     state, error_message, created_at_ms, updated_at_ms";
+
+// ── RFC-025 Phase 2b.3 m3: channels + channel_messages read models ──
+
+#[derive(sqlx::FromRow)]
+struct SqliteChannelRow {
+    channel_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    name: String,
+    capacity: i64,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl SqliteChannelRow {
+    fn into_record(self) -> Result<cairn_domain::ChannelRecord, StoreError> {
+        Ok(cairn_domain::ChannelRecord {
+            channel_id: cairn_domain::ChannelId::new(self.channel_id),
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            name: self.name,
+            capacity: u32::try_from(self.capacity.max(0)).map_err(|_| {
+                StoreError::Internal(format!(
+                    "channels.capacity {} exceeds u32::MAX",
+                    self.capacity
+                ))
+            })?,
+            created_at: self.created_at_ms.max(0) as u64,
+            updated_at: self.updated_at_ms.max(0) as u64,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct SqliteChannelMessageRow {
+    channel_id: String,
+    message_id: String,
+    sender_id: String,
+    body: String,
+    sent_at_ms: i64,
+    consumed_by: Option<String>,
+    consumed_at_ms: Option<i64>,
+}
+
+impl SqliteChannelMessageRow {
+    fn into_record(self) -> cairn_domain::ChannelMessage {
+        cairn_domain::ChannelMessage {
+            channel_id: cairn_domain::ChannelId::new(self.channel_id),
+            message_id: self.message_id,
+            sender_id: self.sender_id,
+            body: self.body,
+            sent_at_ms: self.sent_at_ms.max(0) as u64,
+            consumed_by: self.consumed_by,
+            consumed_at_ms: self.consumed_at_ms.map(|v| v.max(0) as u64),
+        }
+    }
+}
+
+const CHANNEL_SELECT_COLS_SQLITE: &str =
+    "channel_id, tenant_id, workspace_id, project_id, name, capacity, \
+     created_at_ms, updated_at_ms";
+
+const CHANNEL_MESSAGE_SELECT_COLS_SQLITE: &str =
+    "channel_id, message_id, sender_id, body, sent_at_ms, consumed_by, consumed_at_ms";
+
+#[async_trait]
+impl crate::projections::ChannelReadModel for SqliteAdapter {
+    async fn get_channel(
+        &self,
+        channel_id: &cairn_domain::ChannelId,
+    ) -> Result<Option<cairn_domain::ChannelRecord>, StoreError> {
+        let sql = format!("SELECT {CHANNEL_SELECT_COLS_SQLITE} FROM channels WHERE channel_id = ?");
+        let row: Option<SqliteChannelRow> = sqlx::query_as(&sql)
+            .bind(channel_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(SqliteChannelRow::into_record).transpose()
+    }
+
+    async fn list_channels(
+        &self,
+        project: &cairn_domain::tenancy::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::ChannelRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {CHANNEL_SELECT_COLS_SQLITE} FROM channels
+             WHERE tenant_id = ?1 AND workspace_id = ?2 AND project_id = ?3
+             ORDER BY created_at_ms ASC, channel_id ASC
+             LIMIT ?4 OFFSET ?5"
+        );
+        let rows: Vec<SqliteChannelRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(SqliteChannelRow::into_record)
+            .collect()
+    }
+
+    async fn list_messages(
+        &self,
+        channel_id: &cairn_domain::ChannelId,
+        limit: usize,
+    ) -> Result<Vec<cairn_domain::ChannelMessage>, StoreError> {
+        let sql = format!(
+            "SELECT {CHANNEL_MESSAGE_SELECT_COLS_SQLITE} FROM channel_messages
+             WHERE channel_id = ?1
+             ORDER BY sent_at_ms ASC, message_id ASC
+             LIMIT ?2"
+        );
+        let rows: Vec<SqliteChannelMessageRow> = sqlx::query_as(&sql)
+            .bind(channel_id.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(SqliteChannelMessageRow::into_record)
+            .collect())
+    }
+}
+
+// ── RFC-025 Phase 2b.3 m4: notification_preferences + notifications ──
+
+#[derive(sqlx::FromRow)]
+struct SqliteNotificationPrefRow {
+    tenant_id: String,
+    operator_id: String,
+    pref_id: String,
+    event_types_json: String,
+    channels_json: String,
+}
+
+impl SqliteNotificationPrefRow {
+    fn into_record(
+        self,
+    ) -> Result<cairn_domain::notification_prefs::NotificationPreference, StoreError> {
+        let event_types: Vec<String> = serde_json::from_str(&self.event_types_json)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let channels: Vec<cairn_domain::notification_prefs::NotificationChannel> =
+            serde_json::from_str(&self.channels_json)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok(cairn_domain::notification_prefs::NotificationPreference {
+            pref_id: self.pref_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            operator_id: self.operator_id,
+            event_types,
+            channels,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct SqliteNotificationRecordRow {
+    record_id: String,
+    tenant_id: String,
+    operator_id: String,
+    event_type: String,
+    channel_kind: String,
+    channel_target: String,
+    payload_json: String,
+    sent_at_ms: i64,
+    delivered: i64,
+    delivery_error: Option<String>,
+}
+
+impl SqliteNotificationRecordRow {
+    fn into_record(
+        self,
+    ) -> Result<cairn_domain::notification_prefs::NotificationRecord, StoreError> {
+        let payload: serde_json::Value = serde_json::from_str(&self.payload_json)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok(cairn_domain::notification_prefs::NotificationRecord {
+            record_id: self.record_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            operator_id: self.operator_id,
+            event_type: self.event_type,
+            channel_kind: self.channel_kind,
+            channel_target: self.channel_target,
+            payload,
+            sent_at_ms: self.sent_at_ms.max(0) as u64,
+            delivered: self.delivered != 0,
+            delivery_error: self.delivery_error,
+        })
+    }
+}
+
+const NOTIFICATION_PREF_COLS_SQLITE: &str =
+    "tenant_id, operator_id, pref_id, event_types_json, channels_json";
+
+const NOTIFICATION_RECORD_COLS_SQLITE: &str =
+    "record_id, tenant_id, operator_id, event_type, channel_kind, channel_target, \
+     payload_json, sent_at_ms, delivered, delivery_error";
+
+#[async_trait]
+impl crate::projections::NotificationReadModel for SqliteAdapter {
+    async fn get_preferences(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        operator_id: &str,
+    ) -> Result<Option<cairn_domain::notification_prefs::NotificationPreference>, StoreError> {
+        let sql = format!(
+            "SELECT {NOTIFICATION_PREF_COLS_SQLITE} FROM notification_preferences
+             WHERE tenant_id = ?1 AND operator_id = ?2"
+        );
+        let row: Option<SqliteNotificationPrefRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(operator_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(SqliteNotificationPrefRow::into_record).transpose()
+    }
+
+    async fn list_preferences_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Vec<cairn_domain::notification_prefs::NotificationPreference>, StoreError> {
+        let sql = format!(
+            "SELECT {NOTIFICATION_PREF_COLS_SQLITE} FROM notification_preferences
+             WHERE tenant_id = ?1
+             ORDER BY operator_id ASC"
+        );
+        let rows: Vec<SqliteNotificationPrefRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(SqliteNotificationPrefRow::into_record)
+            .collect()
+    }
+
+    async fn list_sent_notifications(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        since_ms: u64,
+    ) -> Result<Vec<cairn_domain::notification_prefs::NotificationRecord>, StoreError> {
+        let since = i64::try_from(since_ms)
+            .map_err(|_| StoreError::Internal(format!("since_ms {since_ms} exceeds i64::MAX")))?;
+        let sql = format!(
+            "SELECT {NOTIFICATION_RECORD_COLS_SQLITE} FROM notifications
+             WHERE tenant_id = ?1 AND sent_at_ms >= ?2
+             ORDER BY sent_at_ms ASC, record_id ASC"
+        );
+        let rows: Vec<SqliteNotificationRecordRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(SqliteNotificationRecordRow::into_record)
+            .collect()
+    }
+
+    async fn list_failed_notifications(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Vec<cairn_domain::notification_prefs::NotificationRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {NOTIFICATION_RECORD_COLS_SQLITE} FROM notifications
+             WHERE tenant_id = ?1 AND delivered = 0
+             ORDER BY sent_at_ms ASC, record_id ASC"
+        );
+        let rows: Vec<SqliteNotificationRecordRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(SqliteNotificationRecordRow::into_record)
+            .collect()
+    }
+}
+
+// ── RFC-025 Phase 2b.3 m2: default_settings read model ──
+
+#[derive(sqlx::FromRow)]
+struct SqliteDefaultSettingRow {
+    scope: String,
+    key: String,
+    value_json: String,
+}
+
+impl SqliteDefaultSettingRow {
+    fn into_record(self) -> Result<cairn_domain::DefaultSetting, StoreError> {
+        let value: serde_json::Value = serde_json::from_str(&self.value_json)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok(cairn_domain::DefaultSetting {
+            key: self.key,
+            value,
+            scope: crate::projections::rehydrate_defaults_scope(&self.scope)?,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::projections::DefaultsReadModel for SqliteAdapter {
+    async fn get(
+        &self,
+        scope: cairn_domain::Scope,
+        scope_id: &str,
+        key: &str,
+    ) -> Result<Option<cairn_domain::DefaultSetting>, StoreError> {
+        let row: Option<SqliteDefaultSettingRow> = sqlx::query_as(
+            "SELECT scope, key, value_json FROM default_settings
+             WHERE scope = ?1 AND scope_id = ?2 AND key = ?3",
+        )
+        .bind(crate::projections::defaults_scope_str(scope))
+        .bind(scope_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(SqliteDefaultSettingRow::into_record).transpose()
+    }
+
+    async fn list_by_scope(
+        &self,
+        scope: cairn_domain::Scope,
+        scope_id: &str,
+    ) -> Result<Vec<cairn_domain::DefaultSetting>, StoreError> {
+        let rows: Vec<SqliteDefaultSettingRow> = sqlx::query_as(
+            "SELECT scope, key, value_json FROM default_settings
+             WHERE scope = ?1 AND scope_id = ?2
+             ORDER BY key ASC",
+        )
+        .bind(crate::projections::defaults_scope_str(scope))
+        .bind(scope_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(SqliteDefaultSettingRow::into_record)
+            .collect()
+    }
+}
+
+#[async_trait]
+impl crate::projections::IngestJobReadModel for SqliteAdapter {
+    async fn get(
+        &self,
+        job_id: &cairn_domain::IngestJobId,
+    ) -> Result<Option<cairn_domain::IngestJobRecord>, StoreError> {
+        let sql =
+            format!("SELECT {INGEST_JOB_SELECT_COLS_SQLITE} FROM ingest_jobs WHERE job_id = ?");
+        let row: Option<SqliteIngestJobRow> = sqlx::query_as(&sql)
+            .bind(job_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(SqliteIngestJobRow::into_record).transpose()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::tenancy::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::IngestJobRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {INGEST_JOB_SELECT_COLS_SQLITE} FROM ingest_jobs
+             WHERE tenant_id = ?1 AND workspace_id = ?2 AND project_id = ?3
+             ORDER BY created_at_ms ASC, job_id ASC
+             LIMIT ?4 OFFSET ?5"
+        );
+        let rows: Vec<SqliteIngestJobRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(SqliteIngestJobRow::into_record)
+            .collect()
     }
 }

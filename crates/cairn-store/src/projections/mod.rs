@@ -68,10 +68,13 @@ pub use approval_policy::*;
 pub use audit::*;
 pub use channel::*;
 pub use checkpoint::*;
-pub use checkpoint_strategy::*;
+pub use checkpoint_strategy::{
+    checkpoint_strategy_sentinel_project, CheckpointStrategyReadModel,
+    CHECKPOINT_STRATEGY_DEFAULT_MAX_CHECKPOINTS,
+};
 pub use commercial::*;
 pub use credential::*;
-pub use defaults::*;
+pub use defaults::{defaults_scope_str, rehydrate_defaults_scope, DefaultsReadModel};
 pub use eval_baseline::*;
 pub use eval_dataset::*;
 pub use eval_rubric::*;
@@ -79,7 +82,7 @@ pub use eval_run::*;
 pub use external_worker::*;
 pub use ff_lease_history_cursor::{FfLeaseHistoryCursor, FfLeaseHistoryCursorStore};
 pub use guardrail::*;
-pub use ingest_job::*;
+pub use ingest_job::{ingest_job_state_str, rehydrate_ingest_job_state, IngestJobReadModel};
 pub use llm_traces::LlmCallTraceReadModel;
 pub use mailbox::*;
 pub use model_comparison::*;

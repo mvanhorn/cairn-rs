@@ -531,8 +531,34 @@ impl CheckpointStrategyReadModel for PgAdapter {
         &self,
         run_id: &RunId,
     ) -> Result<Option<cairn_domain::CheckpointStrategy>, StoreError> {
-        let _ = run_id;
-        Ok(None)
+        // RFC-025 Phase 2b.3 m5: replaces the pre-Phase-2b.3 `Ok(None)`
+        // stub. The row is keyed on `run_id` and carries no project
+        // scope on the write side (the `CheckpointStrategySet` event
+        // has no project field); we return the shared sentinel
+        // `ProjectKey` on read so pg/sqlite/in-memory agree
+        // byte-for-byte.
+        let row: Option<(String, i64, i32, i32)> = sqlx::query_as(
+            "SELECT strategy_id, interval_ms, max_checkpoints, trigger_on_task_complete
+             FROM checkpoint_strategies
+             WHERE run_id = $1",
+        )
+        .bind(run_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        Ok(row.map(
+            |(strategy_id, interval_ms, max_checkpoints, trigger_on_task_complete)| {
+                cairn_domain::CheckpointStrategy {
+                    strategy_id,
+                    project: crate::projections::checkpoint_strategy_sentinel_project(),
+                    run_id: run_id.clone(),
+                    interval_ms: interval_ms.max(0) as u64,
+                    max_checkpoints: max_checkpoints.max(0) as u32,
+                    trigger_on_task_complete: trigger_on_task_complete != 0,
+                }
+            },
+        ))
     }
 }
 
@@ -4377,5 +4403,435 @@ impl crate::projections::ToolRecoveryPauseReadModel for PgAdapter {
             .into_iter()
             .map(ToolRecoveryPauseRow::into_record)
             .collect())
+    }
+}
+
+// ── RFC-025 Phase 2b.3 m1: ingest_jobs read model (RFC 003) ──
+
+#[derive(sqlx::FromRow)]
+struct IngestJobRow {
+    job_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    source_id: Option<String>,
+    document_count: i32,
+    state: String,
+    error_message: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl IngestJobRow {
+    fn into_record(self) -> Result<cairn_domain::IngestJobRecord, StoreError> {
+        // i32 → u32 via .max(0) is safe: `document_count` is sourced from
+        // a u32 on the write side (see `IngestJobStarted.document_count`
+        // → `i32_from_u32`) so negative values indicate projection
+        // corruption we cannot recover from anyway.
+        Ok(cairn_domain::IngestJobRecord {
+            id: cairn_domain::IngestJobId::new(self.job_id),
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            source_id: self.source_id.map(cairn_domain::ids::SourceId::new),
+            document_count: self.document_count.max(0) as u32,
+            state: crate::projections::rehydrate_ingest_job_state(&self.state)?,
+            error_message: self.error_message,
+            created_at: self.created_at_ms.max(0) as u64,
+            updated_at: self.updated_at_ms.max(0) as u64,
+        })
+    }
+}
+
+const INGEST_JOB_SELECT_COLS: &str =
+    "job_id, tenant_id, workspace_id, project_id, source_id, document_count, \
+     state, error_message, created_at_ms, updated_at_ms";
+
+// ── RFC-025 Phase 2b.3 m3: channels + channel_messages read models ──
+
+#[derive(sqlx::FromRow)]
+struct ChannelRow {
+    channel_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    name: String,
+    capacity: i32,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+impl ChannelRow {
+    fn into_record(self) -> cairn_domain::ChannelRecord {
+        cairn_domain::ChannelRecord {
+            channel_id: cairn_domain::ChannelId::new(self.channel_id),
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            name: self.name,
+            capacity: self.capacity.max(0) as u32,
+            created_at: self.created_at_ms.max(0) as u64,
+            updated_at: self.updated_at_ms.max(0) as u64,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ChannelMessageRow {
+    channel_id: String,
+    message_id: String,
+    sender_id: String,
+    body: String,
+    sent_at_ms: i64,
+    consumed_by: Option<String>,
+    consumed_at_ms: Option<i64>,
+}
+
+impl ChannelMessageRow {
+    fn into_record(self) -> cairn_domain::ChannelMessage {
+        cairn_domain::ChannelMessage {
+            channel_id: cairn_domain::ChannelId::new(self.channel_id),
+            message_id: self.message_id,
+            sender_id: self.sender_id,
+            body: self.body,
+            sent_at_ms: self.sent_at_ms.max(0) as u64,
+            consumed_by: self.consumed_by,
+            consumed_at_ms: self.consumed_at_ms.map(|v| v.max(0) as u64),
+        }
+    }
+}
+
+const CHANNEL_SELECT_COLS: &str =
+    "channel_id, tenant_id, workspace_id, project_id, name, capacity, \
+     created_at_ms, updated_at_ms";
+
+const CHANNEL_MESSAGE_SELECT_COLS: &str =
+    "channel_id, message_id, sender_id, body, sent_at_ms, consumed_by, consumed_at_ms";
+
+#[async_trait]
+impl crate::projections::ChannelReadModel for PgAdapter {
+    async fn get_channel(
+        &self,
+        channel_id: &cairn_domain::ChannelId,
+    ) -> Result<Option<cairn_domain::ChannelRecord>, StoreError> {
+        let sql = format!("SELECT {CHANNEL_SELECT_COLS} FROM channels WHERE channel_id = $1");
+        let row: Option<ChannelRow> = sqlx::query_as(&sql)
+            .bind(channel_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(ChannelRow::into_record))
+    }
+
+    async fn list_channels(
+        &self,
+        project: &cairn_domain::tenancy::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::ChannelRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {CHANNEL_SELECT_COLS} FROM channels
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+             ORDER BY created_at_ms ASC, channel_id ASC
+             LIMIT $4 OFFSET $5"
+        );
+        let rows: Vec<ChannelRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows.into_iter().map(ChannelRow::into_record).collect())
+    }
+
+    async fn list_messages(
+        &self,
+        channel_id: &cairn_domain::ChannelId,
+        limit: usize,
+    ) -> Result<Vec<cairn_domain::ChannelMessage>, StoreError> {
+        let sql = format!(
+            "SELECT {CHANNEL_MESSAGE_SELECT_COLS} FROM channel_messages
+             WHERE channel_id = $1
+             ORDER BY sent_at_ms ASC, message_id ASC
+             LIMIT $2"
+        );
+        let rows: Vec<ChannelMessageRow> = sqlx::query_as(&sql)
+            .bind(channel_id.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(ChannelMessageRow::into_record)
+            .collect())
+    }
+}
+
+// ── RFC-025 Phase 2b.3 m4: notification_preferences + notifications ──
+
+#[derive(sqlx::FromRow)]
+struct NotificationPrefRow {
+    tenant_id: String,
+    operator_id: String,
+    pref_id: String,
+    event_types_json: String,
+    channels_json: String,
+}
+
+impl NotificationPrefRow {
+    fn into_record(
+        self,
+    ) -> Result<cairn_domain::notification_prefs::NotificationPreference, StoreError> {
+        let event_types: Vec<String> = serde_json::from_str(&self.event_types_json)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let channels: Vec<cairn_domain::notification_prefs::NotificationChannel> =
+            serde_json::from_str(&self.channels_json)
+                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok(cairn_domain::notification_prefs::NotificationPreference {
+            pref_id: self.pref_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            operator_id: self.operator_id,
+            event_types,
+            channels,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct NotificationRecordRow {
+    record_id: String,
+    tenant_id: String,
+    operator_id: String,
+    event_type: String,
+    channel_kind: String,
+    channel_target: String,
+    payload_json: String,
+    sent_at_ms: i64,
+    /// Stored as INTEGER 0/1 for byte-equal parity with the sqlite
+    /// schema (Copilot PR #594 review).
+    delivered: i32,
+    delivery_error: Option<String>,
+}
+
+impl NotificationRecordRow {
+    fn into_record(
+        self,
+    ) -> Result<cairn_domain::notification_prefs::NotificationRecord, StoreError> {
+        let payload: serde_json::Value = serde_json::from_str(&self.payload_json)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok(cairn_domain::notification_prefs::NotificationRecord {
+            record_id: self.record_id,
+            tenant_id: cairn_domain::TenantId::new(self.tenant_id),
+            operator_id: self.operator_id,
+            event_type: self.event_type,
+            channel_kind: self.channel_kind,
+            channel_target: self.channel_target,
+            payload,
+            sent_at_ms: self.sent_at_ms.max(0) as u64,
+            delivered: self.delivered != 0,
+            delivery_error: self.delivery_error,
+        })
+    }
+}
+
+const NOTIFICATION_PREF_COLS: &str =
+    "tenant_id, operator_id, pref_id, event_types_json, channels_json";
+
+const NOTIFICATION_RECORD_COLS: &str =
+    "record_id, tenant_id, operator_id, event_type, channel_kind, channel_target, \
+     payload_json, sent_at_ms, delivered, delivery_error";
+
+#[async_trait]
+impl crate::projections::NotificationReadModel for PgAdapter {
+    async fn get_preferences(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        operator_id: &str,
+    ) -> Result<Option<cairn_domain::notification_prefs::NotificationPreference>, StoreError> {
+        let sql = format!(
+            "SELECT {NOTIFICATION_PREF_COLS} FROM notification_preferences
+             WHERE tenant_id = $1 AND operator_id = $2"
+        );
+        let row: Option<NotificationPrefRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(operator_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(NotificationPrefRow::into_record).transpose()
+    }
+
+    async fn list_preferences_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Vec<cairn_domain::notification_prefs::NotificationPreference>, StoreError> {
+        let sql = format!(
+            "SELECT {NOTIFICATION_PREF_COLS} FROM notification_preferences
+             WHERE tenant_id = $1
+             ORDER BY operator_id ASC"
+        );
+        let rows: Vec<NotificationPrefRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(NotificationPrefRow::into_record)
+            .collect()
+    }
+
+    async fn list_sent_notifications(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        since_ms: u64,
+    ) -> Result<Vec<cairn_domain::notification_prefs::NotificationRecord>, StoreError> {
+        let since = i64::try_from(since_ms)
+            .map_err(|_| StoreError::Internal(format!("since_ms {since_ms} exceeds i64::MAX")))?;
+        let sql = format!(
+            "SELECT {NOTIFICATION_RECORD_COLS} FROM notifications
+             WHERE tenant_id = $1 AND sent_at_ms >= $2
+             ORDER BY sent_at_ms ASC, record_id ASC"
+        );
+        let rows: Vec<NotificationRecordRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .bind(since)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(NotificationRecordRow::into_record)
+            .collect()
+    }
+
+    async fn list_failed_notifications(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+    ) -> Result<Vec<cairn_domain::notification_prefs::NotificationRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {NOTIFICATION_RECORD_COLS} FROM notifications
+             WHERE tenant_id = $1 AND delivered = 0
+             ORDER BY sent_at_ms ASC, record_id ASC"
+        );
+        let rows: Vec<NotificationRecordRow> = sqlx::query_as(&sql)
+            .bind(tenant_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(NotificationRecordRow::into_record)
+            .collect()
+    }
+}
+
+// ── RFC-025 Phase 2b.3 m2: default_settings read model ──
+
+#[derive(sqlx::FromRow)]
+struct DefaultSettingRow {
+    scope: String,
+    key: String,
+    value_json: String,
+}
+
+impl DefaultSettingRow {
+    fn into_record(self) -> Result<cairn_domain::DefaultSetting, StoreError> {
+        let value: serde_json::Value = serde_json::from_str(&self.value_json)
+            .map_err(|e| StoreError::Serialization(e.to_string()))?;
+        Ok(cairn_domain::DefaultSetting {
+            key: self.key,
+            value,
+            scope: crate::projections::rehydrate_defaults_scope(&self.scope)?,
+        })
+    }
+}
+
+#[async_trait]
+impl crate::projections::DefaultsReadModel for PgAdapter {
+    async fn get(
+        &self,
+        scope: cairn_domain::Scope,
+        scope_id: &str,
+        key: &str,
+    ) -> Result<Option<cairn_domain::DefaultSetting>, StoreError> {
+        let row: Option<DefaultSettingRow> = sqlx::query_as(
+            "SELECT scope, key, value_json FROM default_settings
+             WHERE scope = $1 AND scope_id = $2 AND key = $3",
+        )
+        .bind(crate::projections::defaults_scope_str(scope))
+        .bind(scope_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(DefaultSettingRow::into_record).transpose()
+    }
+
+    async fn list_by_scope(
+        &self,
+        scope: cairn_domain::Scope,
+        scope_id: &str,
+    ) -> Result<Vec<cairn_domain::DefaultSetting>, StoreError> {
+        // ORDER BY key ASC for deterministic iteration — the in-memory
+        // projection is sorted by the same key to keep byte-equal parity.
+        let rows: Vec<DefaultSettingRow> = sqlx::query_as(
+            "SELECT scope, key, value_json FROM default_settings
+             WHERE scope = $1 AND scope_id = $2
+             ORDER BY key ASC",
+        )
+        .bind(crate::projections::defaults_scope_str(scope))
+        .bind(scope_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(DefaultSettingRow::into_record)
+            .collect()
+    }
+}
+
+#[async_trait]
+impl crate::projections::IngestJobReadModel for PgAdapter {
+    async fn get(
+        &self,
+        job_id: &cairn_domain::IngestJobId,
+    ) -> Result<Option<cairn_domain::IngestJobRecord>, StoreError> {
+        let sql = format!("SELECT {INGEST_JOB_SELECT_COLS} FROM ingest_jobs WHERE job_id = $1");
+        let row: Option<IngestJobRow> = sqlx::query_as(&sql)
+            .bind(job_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(IngestJobRow::into_record).transpose()
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::tenancy::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<cairn_domain::IngestJobRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {INGEST_JOB_SELECT_COLS} FROM ingest_jobs
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
+             ORDER BY created_at_ms ASC, job_id ASC
+             LIMIT $4 OFFSET $5"
+        );
+        let rows: Vec<IngestJobRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(IngestJobRow::into_record).collect()
     }
 }

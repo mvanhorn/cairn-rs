@@ -683,26 +683,26 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "ChannelCreated",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (channels)",
+        status: ProjectionStatus::Projected {
+            table: Some("channels"),
         },
     },
     ProjectionEntry {
         variant: "ChannelMessageConsumed",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (channels)",
+        status: ProjectionStatus::Projected {
+            table: Some("channel_messages"),
         },
     },
     ProjectionEntry {
         variant: "ChannelMessageSent",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (channels)",
+        status: ProjectionStatus::Projected {
+            table: Some("channel_messages"),
         },
     },
     ProjectionEntry {
         variant: "CheckpointStrategySet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (checkpoint strategies)",
+        status: ProjectionStatus::Projected {
+            table: Some("checkpoint_strategies"),
         },
     },
     ProjectionEntry {
@@ -725,14 +725,14 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "DefaultSettingCleared",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (defaults)",
+        status: ProjectionStatus::Projected {
+            table: Some("default_settings"),
         },
     },
     ProjectionEntry {
         variant: "DefaultSettingSet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (defaults)",
+        status: ProjectionStatus::Projected {
+            table: Some("default_settings"),
         },
     },
     ProjectionEntry {
@@ -815,14 +815,14 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "IngestJobCompleted",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (ingest jobs)",
+        status: ProjectionStatus::Projected {
+            table: Some("ingest_jobs"),
         },
     },
     ProjectionEntry {
         variant: "IngestJobStarted",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (ingest jobs)",
+        status: ProjectionStatus::Projected {
+            table: Some("ingest_jobs"),
         },
     },
     ProjectionEntry {
@@ -833,14 +833,14 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "NotificationPreferenceSet",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (notifications)",
+        status: ProjectionStatus::Projected {
+            table: Some("notification_preferences"),
         },
     },
     ProjectionEntry {
         variant: "NotificationSent",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2a (notifications)",
+        status: ProjectionStatus::Projected {
+            table: Some("notifications"),
         },
     },
     ProjectionEntry {
@@ -1243,17 +1243,18 @@ mod tests {
             !stubbed.is_empty(),
             "Phase 1 should surface at least one stubbed variant (Phase 2a/2b backlog)"
         );
-        // Spot-check variants still in the Stubbed bucket post-Phase-2b.2b.
-        // Resource-sharing + signal-ingest migrated in 2b.2b m1/m2; the
-        // skills + plugins surface is deliberately deferred to a
+        // Spot-check variants still in the Stubbed bucket post-Phase-2b.3.
+        // Ingest-jobs + defaults + channels migrated in 2b.3 m1/m2/m3;
+        // the skills + plugins surface is deliberately deferred to a
         // follow-up PR (needs net-new `RuntimeEvent` variants — see
         // issue #574 "needs new events before projection can land").
-        // Defaults / channels / provider-health / route-policy-Updated
-        // stay in the Stubbed bucket until later phases.
-        for required in ["DefaultSettingSet", "ChannelCreated"] {
+        // Provider-health / route-policy-Updated / eval baselines stay
+        // in the Stubbed bucket pending later milestones of 2b.3 or a
+        // follow-up phase.
+        for required in ["EvalBaselineSet", "ProviderHealthChecked"] {
             assert!(
                 stubbed.contains(&required),
-                "{required} should still be Stubbed post-Phase-2b.2b (later phase follow-up)"
+                "{required} should still be Stubbed post-Phase-2b.3 m3 (later phase follow-up)"
             );
         }
         // Confirm Phase-1 eval migrations stayed out of Stubbed.
@@ -1406,17 +1407,39 @@ mod tests {
         //     domain changes).
         //     Net: +1 Projected, +2 Ephemeral, -3 Stubbed
         //     → 103 / 20 / 35.
+        //   * Phase 2b.3 milestone 1 flips `IngestJobStarted` +
+        //     `IngestJobCompleted` Stubbed → Projected with backing
+        //     table `ingest_jobs` (pg V057 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 105 / 20 / 33.
+        //   * Phase 2b.3 milestone 2 flips `DefaultSettingSet` +
+        //     `DefaultSettingCleared` Stubbed → Projected with backing
+        //     table `default_settings` (pg V058 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 107 / 20 / 31.
+        //   * Phase 2b.3 milestone 3 flips `ChannelCreated` +
+        //     `ChannelMessageSent` + `ChannelMessageConsumed` Stubbed →
+        //     Projected with backing tables `channels` + `channel_messages`
+        //     (pg V059 + sqlite schema.rs).
+        //     Net: +3 Projected, -3 Stubbed → 110 / 20 / 28.
+        //   * Phase 2b.3 milestone 4 flips `NotificationPreferenceSet` +
+        //     `NotificationSent` Stubbed → Projected with backing tables
+        //     `notification_preferences` + `notifications`
+        //     (pg V060 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 112 / 20 / 26.
+        //   * Phase 2b.3 milestone 5 flips `CheckpointStrategySet`
+        //     Stubbed → Projected with backing table
+        //     `checkpoint_strategies` (pg V061 + sqlite schema.rs).
+        //     Net: +1 Projected, -1 Stubbed → 113 / 20 / 25.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
         assert_eq!(
-            projected, 103,
+            projected, 113,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
             ephemeral, 20,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 35, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 25, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 
@@ -1428,9 +1451,10 @@ mod tests {
         // workers + resource-sharing + signal-ingest + subagents +
         // soul-patches + user-messages + tool-recovery-paused +
         // recovery-escalated + event-log-compacted all left the Stubbed
-        // bucket in Phases 2b.1/2b.2/2b.2b. Pick a later-phase variant
-        // that still lives there.
-        assert!(msg.contains("DefaultSettingSet"));
+        // bucket in Phases 2b.1/2b.2/2b.2b. Ingest-jobs + defaults +
+        // channels left in Phase 2b.3 m1/m2/m3. Pick a later-phase
+        // variant that still lives in the Stubbed bucket.
+        assert!(msg.contains("EvalBaselineSet"));
         assert!(msg.contains("Postgres") || msg.contains("postgres"));
     }
 }

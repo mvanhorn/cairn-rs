@@ -3691,6 +3691,590 @@ mod in_memory_vs_sqlite {
         assert_eq!(mem_list[0].tool_call_id, "tc_1");
         assert_eq!(mem_list[1].tool_call_id, "tc_2");
     }
+
+    // ── RFC-025 Phase 2b.3 m1: ingest_jobs parity ─────────────────────
+
+    #[tokio::test]
+    async fn ingest_job_projection_matches_across_backends() {
+        use cairn_domain::{IngestJobCompleted, IngestJobId, IngestJobStarted, SourceId};
+        use cairn_store::projections::IngestJobReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_ij", "w_ij", "p_ij");
+        let j1 = IngestJobId::new("job_ij_1");
+        let j2 = IngestJobId::new("job_ij_2");
+
+        let events = vec![
+            env(RuntimeEvent::IngestJobStarted(IngestJobStarted {
+                project: scope.clone(),
+                job_id: j1.clone(),
+                source_id: Some(SourceId::new("src_parity")),
+                document_count: 3,
+                started_at: 1_700_200_000_000,
+            })),
+            env(RuntimeEvent::IngestJobStarted(IngestJobStarted {
+                project: scope.clone(),
+                job_id: j2.clone(),
+                source_id: None,
+                document_count: 5,
+                started_at: 1_700_200_001_000,
+            })),
+            env(RuntimeEvent::IngestJobCompleted(IngestJobCompleted {
+                project: scope.clone(),
+                job_id: j1.clone(),
+                success: true,
+                error_message: None,
+                completed_at: 1_700_200_100_000,
+            })),
+            env(RuntimeEvent::IngestJobCompleted(IngestJobCompleted {
+                project: scope.clone(),
+                job_id: j2.clone(),
+                success: false,
+                error_message: Some("embedder 503".to_owned()),
+                completed_at: 1_700_200_101_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get() parity for both terminal shapes.
+        let mem_j1 = IngestJobReadModel::get(&mem, &j1).await.unwrap().unwrap();
+        let sqlite_j1 = IngestJobReadModel::get(&adapter, &j1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_j1, sqlite_j1);
+
+        let mem_j2 = IngestJobReadModel::get(&mem, &j2).await.unwrap().unwrap();
+        let sqlite_j2 = IngestJobReadModel::get(&adapter, &j2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_j2, sqlite_j2);
+
+        // list_by_project parity: ordered by (created_at_ms ASC, job_id ASC).
+        let mem_list = IngestJobReadModel::list_by_project(&mem, &scope, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = IngestJobReadModel::list_by_project(&adapter, &scope, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list, sqlite_list);
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(mem_list[0].id, j1);
+        assert_eq!(mem_list[1].id, j2);
+    }
+
+    /// Same-millisecond-collision tiebreak: two jobs created at the same
+    /// `started_at`, which the SQL backends disambiguate via the secondary
+    /// `job_id ASC` sort key. In-memory must agree byte-for-byte.
+    #[tokio::test]
+    async fn ingest_job_same_ms_collision_tiebreak_matches_across_backends() {
+        use cairn_domain::{IngestJobId, IngestJobStarted};
+        use cairn_store::projections::IngestJobReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_tie", "w_tie", "p_tie");
+        let same_ts = 1_700_300_000_000;
+
+        // IDs chosen so a naive filesystem-iteration order would differ
+        // from the sorted (`job_beta` < `job_zeta`) order; the secondary
+        // sort key must win.
+        let events = vec![
+            env(RuntimeEvent::IngestJobStarted(IngestJobStarted {
+                project: scope.clone(),
+                job_id: IngestJobId::new("job_zeta"),
+                source_id: None,
+                document_count: 1,
+                started_at: same_ts,
+            })),
+            env(RuntimeEvent::IngestJobStarted(IngestJobStarted {
+                project: scope.clone(),
+                job_id: IngestJobId::new("job_beta"),
+                source_id: None,
+                document_count: 1,
+                started_at: same_ts,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = IngestJobReadModel::list_by_project(&mem, &scope, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = IngestJobReadModel::list_by_project(&adapter, &scope, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list, sqlite_list, "same-ms tiebreak must be byte-equal");
+        assert_eq!(mem_list[0].id.as_str(), "job_beta");
+        assert_eq!(mem_list[1].id.as_str(), "job_zeta");
+    }
+
+    // ── RFC-025 Phase 2b.3 m2: default_settings parity ─────────────────
+
+    /// DefaultSetting events carry no `project` — they are
+    /// `OwnershipKey::System` — so the parity helper needs a raw envelope.
+    fn sys_env(event: RuntimeEvent) -> EventEnvelope<RuntimeEvent> {
+        EventEnvelope {
+            event_id: next_event_id(),
+            source: EventSource::Runtime,
+            ownership: cairn_domain::OwnershipKey::System,
+            causation_id: None,
+            correlation_id: None,
+            payload: event,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_settings_projection_matches_across_backends() {
+        use cairn_domain::{DefaultSettingCleared, DefaultSettingSet, Scope};
+        use cairn_store::projections::DefaultsReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope_id = "tenant_parity";
+        let events = vec![
+            sys_env(RuntimeEvent::DefaultSettingSet(DefaultSettingSet {
+                scope: Scope::Tenant,
+                scope_id: scope_id.to_owned(),
+                key: "zeta_key".to_owned(),
+                value: serde_json::json!({"nested": {"v": 1}}),
+            })),
+            sys_env(RuntimeEvent::DefaultSettingSet(DefaultSettingSet {
+                scope: Scope::Tenant,
+                scope_id: scope_id.to_owned(),
+                key: "alpha_key".to_owned(),
+                value: serde_json::json!("string_value"),
+            })),
+            sys_env(RuntimeEvent::DefaultSettingSet(DefaultSettingSet {
+                scope: Scope::Tenant,
+                scope_id: scope_id.to_owned(),
+                key: "middle_key".to_owned(),
+                value: serde_json::json!(42),
+            })),
+            // Clear the middle key.
+            sys_env(RuntimeEvent::DefaultSettingCleared(DefaultSettingCleared {
+                scope: Scope::Tenant,
+                scope_id: scope_id.to_owned(),
+                key: "middle_key".to_owned(),
+            })),
+            // Upsert alpha_key — last write wins.
+            sys_env(RuntimeEvent::DefaultSettingSet(DefaultSettingSet {
+                scope: Scope::Tenant,
+                scope_id: scope_id.to_owned(),
+                key: "alpha_key".to_owned(),
+                value: serde_json::json!("updated"),
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get() parity for each surviving key.
+        for key in ["alpha_key", "zeta_key"] {
+            let mem_r = DefaultsReadModel::get(&mem, Scope::Tenant, scope_id, key)
+                .await
+                .unwrap()
+                .unwrap();
+            let sqlite_r = DefaultsReadModel::get(&adapter, Scope::Tenant, scope_id, key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(mem_r, sqlite_r, "get({key}) must match across backends");
+        }
+
+        // Cleared key: both return None.
+        let mem_mid = DefaultsReadModel::get(&mem, Scope::Tenant, scope_id, "middle_key")
+            .await
+            .unwrap();
+        let sqlite_mid = DefaultsReadModel::get(&adapter, Scope::Tenant, scope_id, "middle_key")
+            .await
+            .unwrap();
+        assert!(mem_mid.is_none());
+        assert!(sqlite_mid.is_none());
+
+        // list_by_scope parity: key ASC ordering.
+        let mem_list = DefaultsReadModel::list_by_scope(&mem, Scope::Tenant, scope_id)
+            .await
+            .unwrap();
+        let sqlite_list = DefaultsReadModel::list_by_scope(&adapter, Scope::Tenant, scope_id)
+            .await
+            .unwrap();
+        assert_eq!(mem_list, sqlite_list);
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(mem_list[0].key, "alpha_key");
+        assert_eq!(mem_list[0].value, serde_json::json!("updated"));
+        assert_eq!(mem_list[1].key, "zeta_key");
+    }
+
+    // ── RFC-025 Phase 2b.3 m3: channels + channel_messages parity ────
+
+    #[tokio::test]
+    async fn channel_projection_matches_across_backends() {
+        use cairn_domain::{ChannelCreated, ChannelId, ChannelMessageConsumed, ChannelMessageSent};
+        use cairn_store::projections::ChannelReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let scope = ProjectKey::new("t_chp", "w_chp", "p_chp");
+        let c1 = ChannelId::new("chan_parity_1");
+        let c2 = ChannelId::new("chan_parity_2");
+
+        let events = vec![
+            env(RuntimeEvent::ChannelCreated(ChannelCreated {
+                channel_id: c1.clone(),
+                project: scope.clone(),
+                name: "alpha".to_owned(),
+                capacity: 16,
+                created_at_ms: 1_700_600_000_000,
+            })),
+            // Same-ms collision on channel create: tiebreak on channel_id.
+            env(RuntimeEvent::ChannelCreated(ChannelCreated {
+                channel_id: c2.clone(),
+                project: scope.clone(),
+                name: "beta".to_owned(),
+                capacity: 32,
+                created_at_ms: 1_700_600_000_000,
+            })),
+            env(RuntimeEvent::ChannelMessageSent(ChannelMessageSent {
+                channel_id: c1.clone(),
+                project: scope.clone(),
+                message_id: "m_z".to_owned(),
+                sender_id: "alice".to_owned(),
+                body: "hello".to_owned(),
+                sent_at_ms: 1_700_600_010_000,
+            })),
+            env(RuntimeEvent::ChannelMessageSent(ChannelMessageSent {
+                channel_id: c1.clone(),
+                project: scope.clone(),
+                message_id: "m_a".to_owned(),
+                sender_id: "bob".to_owned(),
+                body: "world".to_owned(),
+                sent_at_ms: 1_700_600_010_000,
+            })),
+            env(RuntimeEvent::ChannelMessageConsumed(
+                ChannelMessageConsumed {
+                    channel_id: c1.clone(),
+                    project: scope.clone(),
+                    message_id: "m_a".to_owned(),
+                    consumed_by: "worker_1".to_owned(),
+                    consumed_at_ms: 1_700_600_020_000,
+                },
+            )),
+            // Replayed Sent for m_a — first-write-wins.
+            env(RuntimeEvent::ChannelMessageSent(ChannelMessageSent {
+                channel_id: c1.clone(),
+                project: scope.clone(),
+                message_id: "m_a".to_owned(),
+                sender_id: "IMPOSTOR".to_owned(),
+                body: "DIFFERENT".to_owned(),
+                sent_at_ms: 1_700_600_030_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // get_channel parity.
+        let mem_c1 = ChannelReadModel::get_channel(&mem, &c1)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_c1 = ChannelReadModel::get_channel(&adapter, &c1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_c1, sqlite_c1);
+
+        // list_channels parity: sorted by (created_at ASC, channel_id ASC).
+        let mem_list = ChannelReadModel::list_channels(&mem, &scope, 10, 0)
+            .await
+            .unwrap();
+        let sqlite_list = ChannelReadModel::list_channels(&adapter, &scope, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_list, sqlite_list);
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(mem_list[0].channel_id, c1); // chan_parity_1 < chan_parity_2
+        assert_eq!(mem_list[1].channel_id, c2);
+
+        // list_messages parity: ordered (sent_at_ms ASC, message_id ASC).
+        // m_a < m_z at the same timestamp, so m_a comes first.
+        let mem_msgs = ChannelReadModel::list_messages(&mem, &c1, 10)
+            .await
+            .unwrap();
+        let sqlite_msgs = ChannelReadModel::list_messages(&adapter, &c1, 10)
+            .await
+            .unwrap();
+        assert_eq!(mem_msgs, sqlite_msgs);
+        assert_eq!(mem_msgs.len(), 2);
+        assert_eq!(mem_msgs[0].message_id, "m_a");
+        assert_eq!(
+            mem_msgs[0].sender_id, "bob",
+            "first Sent write wins; replayed Sent for m_a must not clobber"
+        );
+        assert_eq!(mem_msgs[0].body, "world");
+        assert_eq!(mem_msgs[0].consumed_by.as_deref(), Some("worker_1"));
+        assert_eq!(mem_msgs[1].message_id, "m_z");
+        assert_eq!(mem_msgs[1].consumed_by, None);
+    }
+
+    // ── RFC-025 Phase 2b.3 m4: notifications parity ────────────────────
+
+    #[tokio::test]
+    async fn notification_preferences_projection_matches_across_backends() {
+        use cairn_domain::notification_prefs::NotificationChannel;
+        use cairn_domain::NotificationPreferenceSet;
+        use cairn_store::projections::NotificationReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = cairn_domain::TenantId::new("t_np_parity");
+
+        let events = vec![
+            sys_env(RuntimeEvent::NotificationPreferenceSet(
+                NotificationPreferenceSet {
+                    tenant_id: tenant.clone(),
+                    operator_id: "zeta".to_owned(),
+                    event_types: vec!["a".to_owned(), "b".to_owned()],
+                    channels: vec![NotificationChannel {
+                        kind: "email".to_owned(),
+                        target: "z@x".to_owned(),
+                    }],
+                    set_at_ms: 100,
+                },
+            )),
+            sys_env(RuntimeEvent::NotificationPreferenceSet(
+                NotificationPreferenceSet {
+                    tenant_id: tenant.clone(),
+                    operator_id: "alpha".to_owned(),
+                    event_types: vec!["c".to_owned()],
+                    channels: vec![],
+                    set_at_ms: 200,
+                },
+            )),
+            // Upsert alpha
+            sys_env(RuntimeEvent::NotificationPreferenceSet(
+                NotificationPreferenceSet {
+                    tenant_id: tenant.clone(),
+                    operator_id: "alpha".to_owned(),
+                    event_types: vec!["updated".to_owned()],
+                    channels: vec![NotificationChannel {
+                        kind: "slack".to_owned(),
+                        target: "#a".to_owned(),
+                    }],
+                    set_at_ms: 300,
+                },
+            )),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        for op in ["alpha", "zeta"] {
+            let m = NotificationReadModel::get_preferences(&mem, &tenant, op)
+                .await
+                .unwrap()
+                .unwrap();
+            let s = NotificationReadModel::get_preferences(&adapter, &tenant, op)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(m, s, "pref({op}) must match across backends");
+        }
+
+        let mem_list = NotificationReadModel::list_preferences_by_tenant(&mem, &tenant)
+            .await
+            .unwrap();
+        let sqlite_list = NotificationReadModel::list_preferences_by_tenant(&adapter, &tenant)
+            .await
+            .unwrap();
+        assert_eq!(mem_list, sqlite_list);
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(mem_list[0].operator_id, "alpha");
+        assert_eq!(mem_list[0].event_types, vec!["updated".to_owned()]);
+        assert_eq!(mem_list[1].operator_id, "zeta");
+    }
+
+    #[tokio::test]
+    async fn notification_sent_projection_matches_across_backends() {
+        use cairn_domain::NotificationSent;
+        use cairn_store::projections::NotificationReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant = cairn_domain::TenantId::new("t_ns_parity");
+
+        let events = vec![
+            sys_env(RuntimeEvent::NotificationSent(NotificationSent {
+                record_id: "rec_z".to_owned(),
+                tenant_id: tenant.clone(),
+                operator_id: "alice".to_owned(),
+                event_type: "e1".to_owned(),
+                channel_kind: "email".to_owned(),
+                channel_target: "a@x".to_owned(),
+                payload: serde_json::json!({"n": 1}),
+                sent_at_ms: 1_000,
+                delivered: true,
+                delivery_error: None,
+            })),
+            // Same ts as rec_z — tiebreak on record_id ASC.
+            sys_env(RuntimeEvent::NotificationSent(NotificationSent {
+                record_id: "rec_a".to_owned(),
+                tenant_id: tenant.clone(),
+                operator_id: "bob".to_owned(),
+                event_type: "e2".to_owned(),
+                channel_kind: "webhook".to_owned(),
+                channel_target: "https://x".to_owned(),
+                payload: serde_json::json!({"n": 2}),
+                sent_at_ms: 1_000,
+                delivered: false,
+                delivery_error: Some("oops".to_owned()),
+            })),
+            sys_env(RuntimeEvent::NotificationSent(NotificationSent {
+                record_id: "rec_m".to_owned(),
+                tenant_id: tenant.clone(),
+                operator_id: "alice".to_owned(),
+                event_type: "e3".to_owned(),
+                channel_kind: "email".to_owned(),
+                channel_target: "a@x".to_owned(),
+                payload: serde_json::json!({}),
+                sent_at_ms: 2_000,
+                delivered: true,
+                delivery_error: None,
+            })),
+            // Replayed rec_a — first-write-wins.
+            sys_env(RuntimeEvent::NotificationSent(NotificationSent {
+                record_id: "rec_a".to_owned(),
+                tenant_id: tenant.clone(),
+                operator_id: "IMPOSTOR".to_owned(),
+                event_type: "IMPOSTOR".to_owned(),
+                channel_kind: "email".to_owned(),
+                channel_target: "x".to_owned(),
+                payload: serde_json::json!({}),
+                sent_at_ms: 9_999,
+                delivered: true,
+                delivery_error: None,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_all = NotificationReadModel::list_sent_notifications(&mem, &tenant, 0)
+            .await
+            .unwrap();
+        let sqlite_all = NotificationReadModel::list_sent_notifications(&adapter, &tenant, 0)
+            .await
+            .unwrap();
+        assert_eq!(mem_all, sqlite_all);
+        assert_eq!(mem_all.len(), 3);
+        assert_eq!(mem_all[0].record_id, "rec_a");
+        assert_eq!(
+            mem_all[0].operator_id, "bob",
+            "first-write-wins: replayed rec_a must not clobber operator_id"
+        );
+        assert_eq!(mem_all[1].record_id, "rec_z");
+        assert_eq!(mem_all[2].record_id, "rec_m");
+
+        let mem_failed = NotificationReadModel::list_failed_notifications(&mem, &tenant)
+            .await
+            .unwrap();
+        let sqlite_failed = NotificationReadModel::list_failed_notifications(&adapter, &tenant)
+            .await
+            .unwrap();
+        assert_eq!(mem_failed, sqlite_failed);
+        assert_eq!(mem_failed.len(), 1);
+        assert_eq!(mem_failed[0].record_id, "rec_a");
+    }
+
+    // ── RFC-025 Phase 2b.3 m5: checkpoint_strategies parity ────────────
+
+    #[tokio::test]
+    async fn checkpoint_strategy_projection_matches_across_backends() {
+        use cairn_domain::CheckpointStrategySet;
+        use cairn_store::projections::CheckpointStrategyReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let run_a = cairn_domain::RunId::new("run_cs_a");
+        let run_b = cairn_domain::RunId::new("run_cs_b");
+
+        let events = vec![
+            sys_env(RuntimeEvent::CheckpointStrategySet(CheckpointStrategySet {
+                strategy_id: "s_a1".to_owned(),
+                description: "".to_owned(),
+                set_at_ms: 10,
+                run_id: Some(run_a.clone()),
+                interval_ms: 1000,
+                max_checkpoints: 3,
+                trigger_on_task_complete: true,
+            })),
+            sys_env(RuntimeEvent::CheckpointStrategySet(CheckpointStrategySet {
+                strategy_id: "s_b".to_owned(),
+                description: "".to_owned(),
+                set_at_ms: 20,
+                run_id: Some(run_b.clone()),
+                interval_ms: 5_000,
+                max_checkpoints: 0, // default-10 rehydration path
+                trigger_on_task_complete: false,
+            })),
+            // Upsert run_a — last write wins.
+            sys_env(RuntimeEvent::CheckpointStrategySet(CheckpointStrategySet {
+                strategy_id: "s_a2".to_owned(),
+                description: "".to_owned(),
+                set_at_ms: 30,
+                run_id: Some(run_a.clone()),
+                interval_ms: 2000,
+                max_checkpoints: 9,
+                trigger_on_task_complete: false,
+            })),
+            // run_id = None — skipped on both appliers.
+            sys_env(RuntimeEvent::CheckpointStrategySet(CheckpointStrategySet {
+                strategy_id: "s_orphan".to_owned(),
+                description: "".to_owned(),
+                set_at_ms: 40,
+                run_id: None,
+                interval_ms: 0,
+                max_checkpoints: 0,
+                trigger_on_task_complete: false,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        for run in [&run_a, &run_b] {
+            let m = CheckpointStrategyReadModel::get_by_run(&mem, run)
+                .await
+                .unwrap()
+                .unwrap();
+            let s = CheckpointStrategyReadModel::get_by_run(&adapter, run)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(m, s, "get_by_run({}) byte-equal", run.as_str());
+        }
+
+        let a = CheckpointStrategyReadModel::get_by_run(&adapter, &run_a)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.strategy_id, "s_a2", "last write wins");
+        assert_eq!(a.interval_ms, 2000);
+        assert_eq!(a.max_checkpoints, 9);
+
+        let b = CheckpointStrategyReadModel::get_by_run(&adapter, &run_b)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.max_checkpoints, 10, "0 rehydrates to default 10");
+        assert!(!b.trigger_on_task_complete);
+    }
 }
 
 // ── Postgres parity (nightly / labelled PRs) ───────────────────────────
