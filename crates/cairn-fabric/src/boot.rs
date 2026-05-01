@@ -239,20 +239,26 @@ impl FabricRuntime {
         // later renders — cloning the Arc is how FF's own crates share
         // the registry across threads (see ff-observability 0.3.2
         // `real.rs`: every instrument handle is itself `Arc`-backed).
+        //
+        // FF 0.13 (cairn #436, PR-7b): the engine now accepts
+        // `Arc<dyn EngineBackend>` instead of `ferriskey::Client`. The
+        // Valkey scanner spawn path inside ff-engine still extracts
+        // the embedded `ferriskey::Client` via `as_any().downcast_ref::
+        // <ValkeyBackend>`, so behaviour is unchanged — the engine
+        // just no longer panics on non-Valkey backends. Coerce our
+        // `Arc<ValkeyBackend>` to the trait object before the call so
+        // the same handle powers both the engine and the post-boot
+        // `restore_frames` / lease-history subscriber surface.
+        let backend: Arc<dyn EngineBackend> = backend;
+
         let ff_metrics = std::sync::Arc::new(ff_observability::Metrics::new());
         let engine = Engine::start_with_completions(
             engine_config,
-            client.clone(),
+            backend.clone(),
             std::sync::Arc::clone(&ff_metrics),
             completion_stream,
         );
         tracing::info!("fabric runtime started");
-
-        // `ValkeyBackend::from_client_partitions_and_connection` returns
-        // an `Arc<ValkeyBackend>`; coerce to the trait object so the
-        // post-boot surface (`restore_frames`, future trait-consumers
-        // from CG-b) holds a stable dyn-compatible handle.
-        let backend: Arc<dyn EngineBackend> = backend;
 
         Ok(Self {
             client,

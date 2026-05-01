@@ -49,8 +49,18 @@ impl CairnWorker {
         // backend connection shape (host/port/tls/cluster for Valkey,
         // URL+pool for Postgres). Hand it to `WorkerConfig` as-is —
         // cairn no longer maintains a parallel derivation here.
+        //
+        // FF 0.12 made `WorkerConfig::backend` `Option<BackendConfig>`
+        // (the backend-agnostic `connect_with` path ignores the field;
+        // only the URL-dialling `connect` path consumes it). Cairn
+        // takes the `connect` path below, so `Some(...)` is required
+        // — a `None` here would surface `SdkError::Config` at runtime.
+        // FF 0.12 also added `partition_config: Option<PartitionConfig>`
+        // as a `connect_with`-only override; `connect` reads
+        // `ff:config:partitions` from Valkey and ignores this field,
+        // so `None` preserves pre-bump behaviour.
         let worker_config = WorkerConfig {
-            backend: config.backend.clone(),
+            backend: Some(config.backend.clone()),
             worker_id: config.worker_id.clone(),
             worker_instance_id: config.worker_instance_id.clone(),
             namespace: config.namespace.clone(),
@@ -59,6 +69,7 @@ impl CairnWorker {
             lease_ttl_ms: config.lease_ttl_ms,
             claim_poll_interval_ms: 1_000,
             max_concurrent_tasks: config.max_concurrent_tasks,
+            partition_config: None,
         };
 
         let inner = FlowFabricWorker::connect(worker_config)

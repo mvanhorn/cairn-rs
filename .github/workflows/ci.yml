@@ -256,9 +256,23 @@ jobs:
       # binary is still mid-execution (test_rfc020_readiness on the
       # 2026-04-28 main run). Tests themselves are healthy — it's raw
       # compile + serial run time that spills past the cap.
+      #
+      # `RUSTFLAGS: "-C debuginfo=0"` matches the three sibling
+      # integration-test steps above in the `test` job. Without it,
+      # the ~16 cairn-app test binaries carry full debuginfo and
+      # push `target/` past the ~14 GB of runner free space that
+      # remains after this job's cached FF artifacts land — observed
+      # on the FF 0.11 → 0.13 bump (PR #598) where invalidating the
+      # lockfile-hashed cache forces a full FF recompile that leaves
+      # too little room for debuginfo-laden cairn-app test binaries
+      # to link. Matches the same hygiene the `test` job applies to
+      # its larger integration-test steps.
       - name: cargo test -p cairn-app --tests --features debug-endpoints
         run: cargo test -p cairn-app --tests --features debug-endpoints --
         timeout-minutes: 18
+        env:
+          CARGO_BUILD_JOBS: "2"
+          RUSTFLAGS: "-C debuginfo=0"
 
   # ── 6. UI Build + Type Check + Component Tests ──────────────────────────────
   ui:
