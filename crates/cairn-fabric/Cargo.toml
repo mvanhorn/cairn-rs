@@ -50,7 +50,14 @@ fabric-postgres = [
     "flowfabric/engine",
 ]
 
-test-harness = ["fabric-valkey", "dep:testcontainers"]
+# `test-harness` activates the Valkey testcontainers harness unconditionally
+# (cairn-app's HTTP integration suite and every in-tree Valkey integration
+# test boot one), and — when `fabric-postgres` is also active — pulls in the
+# Postgres harness for the PR-C4a live integration binary under
+# `tests/postgres_control_plane_live.rs`. `testcontainers-modules` carries
+# its own `postgres` module feature; gating its pull through cairn's
+# `test-harness` keeps the dep out of production builds.
+test-harness = ["fabric-valkey", "dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
 # FlowFabric umbrella crate. The `valkey` / `engine` /
@@ -119,6 +126,13 @@ thiserror = "2"
 async-trait = "0.1"
 # Gated behind `test-support` — pulled in only when the harness is needed.
 testcontainers = { version = "0.23", optional = true }
+# PR-C4a: Postgres testcontainer image for the live `PostgresControlPlane`
+# integration suite (`tests/postgres_control_plane_live.rs`). Gated behind
+# `test-harness` so production binaries never link it; the harness itself
+# is further gated on `fabric-postgres` at the test-binary level so
+# `cargo test -p cairn-fabric --features test-harness` on a Valkey-only
+# build does not try to spin up a Postgres image.
+testcontainers-modules = { version = "0.11", features = ["postgres"], optional = true }
 # `url` is unconditional: `FabricConfig::from_env` parses `CAIRN_FABRIC_URL`
 # on every boot, so the parser is library-code. Default features only —
 # cairn does NOT opt into `url`'s `serde` feature (verified via
@@ -155,6 +169,12 @@ futures = "0.3"
 # decode compat path still accepts it. The `test-fixtures` feature is
 # dev-only on ff-core — production binaries never link it.
 ff-core = { version = "0.13", features = ["test-fixtures"] }
+# PR-C4a: `postgres_control_plane_live.rs` needs a direct sqlx pool to
+# run FF migrations (`apply_migrations(&pool)`) on the testcontainer
+# before constructing the `PostgresBackend` handle. Dev-only; production
+# cairn-fabric consumes sqlx transitively via `ff-backend-postgres` and
+# never instantiates a standalone pool.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 
 # ── Integration test targets ────────────────────────────────────────
 #
@@ -187,18 +207,17 @@ required-features = ["test-harness"]
 name = "backend_agnostic"
 path = "tests/backend_agnostic.rs"
 
-# `postgres_control_plane_compiles.rs` is the PR-C3 compile-sentinel: it
-# imports `cairn_fabric::engine::PostgresControlPlane` and instantiates
-# a `TypeId` against it, so the test binary fails to compile if the
-# stub type is ever renamed, removed, or moved behind a different feature
-# gate. `required-features = ["fabric-postgres"]` keeps it skipped on
-# default (fabric-valkey) builds — the symbol only exists when the
-# postgres feature is on. PR-C4 replaces this file with real integration
-# assertions against a live Postgres testcontainer.
+# `postgres_control_plane_live.rs` is the PR-C4a live-integration suite:
+# drives every bucket-A + bucket-B method on `PostgresControlPlane`
+# against a real Postgres container (testcontainers-modules postgres).
+# Requires BOTH `fabric-postgres` (so `PostgresControlPlane` + the FF
+# backend constructor are linked) and `test-harness` (so
+# `testcontainers-modules` is linked). Replaces PR-C3's compile-only
+# sentinel (`postgres_control_plane_compiles.rs`).
 [[test]]
-name = "postgres_control_plane_compiles"
-path = "tests/postgres_control_plane_compiles.rs"
-required-features = ["fabric-postgres"]
+name = "postgres_control_plane_live"
+path = "tests/postgres_control_plane_live.rs"
+required-features = ["fabric-postgres", "test-harness"]
 
 # `pr_c2_migrations.rs` is the PR-C2 regression suite: asserts the six
 # FF 0.13 `EngineBackend` trait methods cairn routes through

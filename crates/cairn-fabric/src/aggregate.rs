@@ -93,13 +93,33 @@ impl FabricServices {
         match config.backend_kind {
             BackendKind::Valkey => Self::start_valkey(config, event_log, cursor_store).await,
             BackendKind::Postgres => {
-                unimplemented!(
-                    "PR-C4: FabricServices::start on BackendKind::Postgres. \
-                     The aggregate path currently only wires the Valkey runtime; \
-                     PR-C4 replaces this arm with PostgresFabricRuntime::start \
-                     + PostgresControlPlane wiring. Do NOT fall through to the \
-                     Valkey arm — PR-C3's self-contained structure is load-bearing."
-                );
+                // PR-C4a shipped the PG control-plane surface
+                // (`PostgresFabricRuntime::start` +
+                // `PostgresControlPlane`) but the full `FabricServices`
+                // aggregate still takes `Arc<FabricRuntime>`
+                // concretely on every service constructor
+                // (`run_service.rs`, `task_service.rs`,
+                // `session_service.rs`, `scheduler_service.rs`,
+                // `quota_service.rs`). Lifting those to a backend-
+                // agnostic runtime handle is PR-C4b's scope — it
+                // touches every service constructor + the boot path
+                // in cairn-app. Today the Postgres arm surfaces a
+                // loud, cross-referenced failure so a misconfigured
+                // `CAIRN_FABRIC_BACKEND=postgres` launch fails
+                // informatively rather than silently falling into
+                // the Valkey path.
+                let _ = event_log;
+                let _ = cursor_store;
+                Err(FabricError::Config(
+                    "CAIRN_FABRIC_BACKEND=postgres cannot boot the full FabricServices \
+                     aggregate yet. PR-C4a landed PostgresFabricRuntime::start + the \
+                     control-plane surface, but services (run/task/session/scheduler/\
+                     quota) still hold a concrete Arc<FabricRuntime> (Valkey runtime). \
+                     PR-C4b lifts those constructors onto a backend-agnostic runtime \
+                     trait. Until then use CAIRN_FABRIC_BACKEND=valkey or construct \
+                     PostgresFabricRuntime::start directly for control-plane read paths."
+                        .into(),
+                ))
             }
         }
     }
