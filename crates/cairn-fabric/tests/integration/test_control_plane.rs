@@ -80,10 +80,12 @@ async fn control_plane_budget_create_spend_release_roundtrip() {
         .expect("get_budget_status");
     assert_eq!(*status.usage.get("tokens").unwrap_or(&0), 50);
 
-    // Release resets usage.
+    // Per-execution release (FF 0.13 / cairn #454) — reverses this
+    // execution's attribution so the aggregate usage drops back to 0
+    // for the single applied spend.
     h.fabric
         .budgets
-        .release_budget(&budget_id)
+        .release_budget(&budget_id, &eid)
         .await
         .expect("release_budget");
     let post_status = h

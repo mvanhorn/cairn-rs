@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use flowfabric::core::engine_backend::EngineBackend;
 use flowfabric::core::keys::ExecKeyContext;
+use flowfabric::core::partition::execution_partition;
 use flowfabric::core::types::{
     ExecutionId, LaneId, SignalId, TimestampMs, WaitpointId, WaitpointToken,
 };
@@ -22,11 +24,10 @@ use crate::helpers::sanitize_signal_component;
 /// executions can't grow the map unbounded.
 const LANE_ID_CACHE_MAX: usize = 1024;
 
-/// Read the HMAC waitpoint token from FF's waitpoint hash.
-///
-/// FF mints the token during `ff_suspend_execution` and writes it to the
-/// `waitpoint_token` field of the waitpoint hash (see lua/suspension.lua
-/// line 185). It is the ONLY source of truth — cairn never caches it.
+/// Read the HMAC waitpoint token for `waitpoint_id` via FF 0.13's
+/// `EngineBackend::read_waitpoint_token` trait method
+/// (`ff-core-0.13.0/src/engine_backend.rs:306`). Cairn never caches the
+/// token — FF owns it from mint (`ff_suspend_execution`) to reveal.
 ///
 /// Returns `Err(Validation)` ONLY when the field is missing or empty — i.e.
 /// the waitpoint hash has never been written, or was deleted. FF does NOT
@@ -36,16 +37,23 @@ const LANE_ID_CACHE_MAX: usize = 1024;
 /// state boundary where it belongs. That separation matters — mixing
 /// "waitpoint never existed" with "waitpoint is closed" at the auth layer
 /// would re-create the exact oracle FF's Lua took pains to eliminate.
+///
+/// Pre-PR-C2 this was a direct `ferriskey::Client::hget` against
+/// `{exec}:waitpoint:<wp>`; PR-C2 routes it through the backend trait
+/// so pg/sqlite backends answer the same shape without wire-layer
+/// Valkey coupling.
 pub(crate) async fn read_waitpoint_token(
-    client: &ferriskey::Client,
-    ctx: &ExecKeyContext,
+    backend: &dyn EngineBackend,
+    partition_config: &flowfabric::core::partition::PartitionConfig,
+    execution_id: &ExecutionId,
     waitpoint_id: &WaitpointId,
 ) -> Result<WaitpointToken, FabricError> {
-    let token_str: Option<String> = client
-        .hget(&ctx.waitpoint(waitpoint_id), "waitpoint_token")
+    let partition = execution_partition(execution_id, partition_config);
+    let token_opt = backend
+        .read_waitpoint_token(partition.into(), waitpoint_id)
         .await
-        .map_err(|e| FabricError::Valkey(format!("HGET waitpoint_token: {e}")))?;
-    match token_str {
+        .map_err(|e| FabricError::Engine(Box::new(e)))?;
+    match token_opt {
         Some(s) if !s.is_empty() => Ok(WaitpointToken::new(s)),
         _ => Err(FabricError::Validation {
             reason: format!("waitpoint {waitpoint_id} is not active (missing token)"),
@@ -229,13 +237,13 @@ impl SignalBridge {
             .into_bytes()
         });
 
-        let partition = flowfabric::core::partition::execution_partition(
-            execution_id,
+        let waitpoint_token = read_waitpoint_token(
+            self.runtime.backend().as_ref(),
             &self.runtime.partition_config,
-        );
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let waitpoint_token =
-            read_waitpoint_token(&self.runtime.client, &ctx, waitpoint_id).await?;
+            execution_id,
+            waitpoint_id,
+        )
+        .await?;
 
         let signal = Signal {
             signal_name,
@@ -266,13 +274,13 @@ impl SignalBridge {
         .into_bytes();
 
         let safe_id = sanitize_signal_component(child_task_id);
-        let partition = flowfabric::core::partition::execution_partition(
-            parent_execution_id,
+        let waitpoint_token = read_waitpoint_token(
+            self.runtime.backend().as_ref(),
             &self.runtime.partition_config,
-        );
-        let ctx = ExecKeyContext::new(&partition, parent_execution_id);
-        let waitpoint_token =
-            read_waitpoint_token(&self.runtime.client, &ctx, parent_waitpoint_id).await?;
+            parent_execution_id,
+            parent_waitpoint_id,
+        )
+        .await?;
 
         let signal = Signal {
             signal_name: format!("child_completed:{safe_id}"),
@@ -296,13 +304,13 @@ impl SignalBridge {
         result_payload: Option<Vec<u8>>,
     ) -> Result<SignalOutcome, FabricError> {
         let safe_id = sanitize_signal_component(invocation_id);
-        let partition = flowfabric::core::partition::execution_partition(
-            execution_id,
+        let waitpoint_token = read_waitpoint_token(
+            self.runtime.backend().as_ref(),
             &self.runtime.partition_config,
-        );
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let waitpoint_token =
-            read_waitpoint_token(&self.runtime.client, &ctx, waitpoint_id).await?;
+            execution_id,
+            waitpoint_id,
+        )
+        .await?;
 
         let signal = Signal {
             signal_name: format!("tool_result:{safe_id}"),
@@ -328,7 +336,7 @@ impl SignalBridge {
             execution_id,
             &self.runtime.partition_config,
         );
-        let ctx = flowfabric::core::keys::ExecKeyContext::new(&partition, execution_id);
+        let ctx = ExecKeyContext::new(&partition, execution_id);
         let idx = flowfabric::core::keys::IndexKeys::new(&partition);
 
         let signal_id = SignalId::new();

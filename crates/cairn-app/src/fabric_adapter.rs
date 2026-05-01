@@ -259,6 +259,15 @@ fn fabric_err_to_runtime(err: FabricError) -> RuntimeError {
                 id: code,
             }
         }
+        // PR-C2 (#599): FF 0.13 typed `EngineError` now surfaces through
+        // `FabricError::Engine` for the migrated trait-routed methods
+        // (`record_spend`, `release_budget`, `deliver_approval_signal`,
+        // `issue_grant_and_claim`, `read_waitpoint_token`). Before this
+        // arm, those errors collapsed into the catchall 500. Dispatch
+        // on the typed variants so they surface as 409/422 at the HTTP
+        // boundary — preserves the F37 invariant (no 5xx leak on
+        // expected state conflicts / caller-retriable races).
+        FabricError::Engine(boxed) => fabric_engine_err_to_runtime(*boxed),
         // SEC-007: Valkey / script / bridge / config / internal variants
         // carry FCALL names, key names, and occasionally secret-hash
         // references — none of which should reach the 500 response body.
@@ -266,6 +275,169 @@ fn fabric_err_to_runtime(err: FabricError) -> RuntimeError {
         // an opaque message to the caller.
         other => {
             tracing::error!(fabric_err = %other, "fabric layer error");
+            RuntimeError::Internal("fabric layer error".into())
+        }
+    }
+}
+
+/// Map FF 0.13's typed [`EngineError`] variants onto cairn's
+/// [`RuntimeError`] so the HTTP handler stack keeps its pre-PR-C2
+/// 4xx / 5xx contract (F37).
+///
+/// Classification axes follow the engine_error docstrings
+/// (`ff-core-0.13.0/src/engine_error.rs:40`-`:485`):
+/// - `NotFound` → 404 via `RuntimeError::NotFound`
+/// - `Validation` → 422 via `RuntimeError::Validation`
+///   (cairn renders validation errors as HTTP 422 in
+///   `validation_error_response`)
+/// - `Contention(_)` → 409 via `RuntimeError::Conflict` (retryable race)
+/// - `Conflict(_)` → 409 via `RuntimeError::Conflict` (permanent)
+/// - `State(_)` → 409 via either `RuntimeError::Conflict` (signal /
+///   waitpoint variants — not on a lifecycle-transition path) or
+///   `RuntimeError::InvalidTransition` (lifecycle variants — carrying
+///   a kebab-case `from` label clients can branch on)
+/// - `Unavailable` / `Transport` / `Bug` / `ResourceExhausted` / `Timeout`
+///   → 500 (opaque, audit via tracing — these really are fabric faults)
+fn fabric_engine_err_to_runtime(err: cairn_fabric::engine_error::EngineError) -> RuntimeError {
+    use cairn_fabric::engine_error::{ConflictKind, ContentionKind, EngineError, StateKind};
+
+    match err {
+        EngineError::NotFound { entity } => RuntimeError::NotFound {
+            entity,
+            id: String::new(),
+        },
+        EngineError::Validation { kind, detail } => RuntimeError::Validation {
+            reason: format!("{kind:?}: {detail}"),
+        },
+        EngineError::Contention(kind) => {
+            let code = match kind {
+                ContentionKind::ExecutionNotActive { .. } => "execution_not_active",
+                ContentionKind::ExecutionNotEligible => "execution_not_eligible",
+                ContentionKind::ExecutionNotLeaseable => "execution_not_leaseable",
+                ContentionKind::ExecutionNotReclaimable => "execution_not_reclaimable",
+                ContentionKind::ExecutionNotInEligibleSet => "execution_not_in_eligible_set",
+                ContentionKind::LeaseConflict => "lease_conflict",
+                ContentionKind::InvalidClaimGrant => "invalid_claim_grant",
+                ContentionKind::ClaimGrantExpired => "claim_grant_expired",
+                ContentionKind::NoEligibleExecution => "no_eligible_execution",
+                ContentionKind::NoActiveLease => "no_active_lease",
+                ContentionKind::WaitpointNotFound => "waitpoint_not_found",
+                ContentionKind::WaitpointPendingUseBufferScript => {
+                    "waitpoint_pending_use_buffer_script"
+                }
+                ContentionKind::StaleGraphRevision => "stale_graph_revision",
+                ContentionKind::UseClaimResumedExecution => "use_claim_resumed_execution",
+                ContentionKind::NotAResumedExecution => "not_a_resumed_execution",
+                ContentionKind::RateLimitExceeded => "rate_limit_exceeded",
+                ContentionKind::ConcurrencyLimitExceeded => "concurrency_limit_exceeded",
+                ContentionKind::RetryExhausted => "retry_exhausted",
+                _ => "contention",
+            };
+            tracing::debug!(fabric_err = ?kind, code = %code, "fabric engine contention (409 to caller)");
+            RuntimeError::Conflict {
+                entity: "execution",
+                id: code.to_owned(),
+            }
+        }
+        EngineError::State(kind) => {
+            // Two-axis mapping (Copilot #599 review):
+            // 1. Signal / waitpoint variants do NOT represent a
+            //    lifecycle transition — the caller was delivering or
+            //    reading a signal, not driving the run to a terminal
+            //    state. Return `RuntimeError::Conflict { entity: "signal" }`
+            //    so the 409 body doesn't falsely advertise a
+            //    "from: X / to: completed" lifecycle transition.
+            // 2. Everything else IS a lifecycle transition attempt
+            //    (complete / fail / cancel / resume / claim). Return
+            //    `RuntimeError::InvalidTransition` with the kebab-case
+            //    "from" label so clients can branch without re-parsing
+            //    a message.
+            let code = match kind {
+                StateKind::StaleLease => "stale_lease",
+                StateKind::LeaseExpired => "lease_expired",
+                StateKind::LeaseRevoked => "lease_revoked",
+                StateKind::ExecutionNotSuspended => "execution_not_suspended",
+                StateKind::AlreadySuspended => "already_suspended",
+                StateKind::WaitpointClosed => "waitpoint_closed",
+                StateKind::TargetNotSignalable => "target_not_signalable",
+                StateKind::DuplicateSignal => "duplicate_signal",
+                StateKind::ResumeConditionNotMet => "resume_condition_not_met",
+                StateKind::WaitpointNotPending => "waitpoint_not_pending",
+                StateKind::PendingWaitpointExpired => "pending_waitpoint_expired",
+                StateKind::WaitpointNotOpen => "waitpoint_not_open",
+                StateKind::ExecutionNotTerminal => "execution_not_terminal",
+                StateKind::FlowAlreadyTerminal => "flow_already_terminal",
+                StateKind::DepsNotSatisfied => "deps_not_satisfied",
+                StateKind::NotBlockedByDeps => "not_blocked_by_deps",
+                StateKind::NotRunnable => "not_runnable",
+                StateKind::Terminal => "terminal",
+                StateKind::BudgetExceeded => "budget_exceeded",
+                StateKind::BudgetSoftExceeded => "budget_soft_exceeded",
+                StateKind::OkAlreadyApplied => "ok_already_applied",
+                _ => "invalid_state",
+            };
+
+            // Signal/waitpoint-bucket: NOT a lifecycle transition. Avoid
+            // the misleading `InvalidTransition { to: "completed" }` body.
+            let is_signal_bucket = matches!(
+                kind,
+                StateKind::WaitpointClosed
+                    | StateKind::TargetNotSignalable
+                    | StateKind::DuplicateSignal
+                    | StateKind::ResumeConditionNotMet
+                    | StateKind::WaitpointNotPending
+                    | StateKind::PendingWaitpointExpired
+                    | StateKind::WaitpointNotOpen
+            );
+
+            if is_signal_bucket {
+                tracing::debug!(fabric_err = ?kind, code = %code, "fabric engine signal-path state conflict (409 to caller)");
+                RuntimeError::Conflict {
+                    entity: "signal",
+                    id: code.to_owned(),
+                }
+            } else {
+                tracing::debug!(fabric_err = ?kind, from = %code, "fabric engine lifecycle state conflict (409 to caller)");
+                RuntimeError::InvalidTransition {
+                    entity: "run",
+                    from: code.to_owned(),
+                    to: "completed".to_owned(),
+                }
+            }
+        }
+        EngineError::Conflict(kind) => {
+            // Copilot #599 review: return a stable kebab-case code
+            // rather than `format!("{kind:?}")` — the upstream debug
+            // repr may include struct fields (e.g.
+            // `DependencyAlreadyExists { existing }`) that leak internal
+            // shape and can change across FF versions. Fixed
+            // kebab-case tokens give HTTP clients a stable id to branch
+            // on and keep SEC-007 in force.
+            let code = match kind {
+                ConflictKind::DependencyAlreadyExists { .. } => "dependency_already_exists",
+                ConflictKind::CycleDetected => "cycle_detected",
+                ConflictKind::SelfReferencingEdge => "self_referencing_edge",
+                ConflictKind::ExecutionAlreadyInFlow => "execution_already_in_flow",
+                ConflictKind::WaitpointAlreadyExists => "waitpoint_already_exists",
+                ConflictKind::BudgetAttachConflict => "budget_attach_conflict",
+                ConflictKind::QuotaAttachConflict => "quota_attach_conflict",
+                ConflictKind::RotationConflict(_) => "rotation_conflict",
+                ConflictKind::ActiveAttemptExists => "active_attempt_exists",
+                _ => "conflict",
+            };
+            tracing::debug!(fabric_err = ?kind, code = %code, "fabric engine conflict (409 to caller)");
+            RuntimeError::Conflict {
+                entity: "execution",
+                id: code.to_owned(),
+            }
+        }
+        // Everything else (Unavailable / Transport / Bug /
+        // ResourceExhausted / Timeout / StreamDisconnected / StreamLag)
+        // is a genuine fabric fault — log for operators, opaque 500 to
+        // caller. Preserves SEC-007 (no FCALL names / key names in the
+        // response body).
+        other => {
+            tracing::error!(fabric_err = %other, "fabric engine layer error");
             RuntimeError::Internal("fabric layer error".into())
         }
     }

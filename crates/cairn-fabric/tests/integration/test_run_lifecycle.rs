@@ -196,9 +196,17 @@ async fn test_claim_rejects_reclaim_on_active() {
          not silently succeed — see trait docstring contract on RunService::claim",
     );
     let msg = format!("{err}");
+    // Post-PR-C2 (M4): `issue_grant_and_claim` routes through FF 0.13's
+    // typed `EngineBackend::issue_grant_and_claim`, which surfaces the
+    // grant-gate rejection as the typed `EngineError::Contention` /
+    // `ExecutionNotEligible` rather than the raw Lua-code string.
+    // Pre-PR-C2 this read `"execution_not_eligible"` from the FCALL
+    // Internal string. Either lower- or CamelCase form is accepted so
+    // the test tracks the typed-error migration without flipping on
+    // each upstream display-impl tweak.
     assert!(
-        msg.contains("execution_not_eligible"),
-        "expected FF grant-gate rejection with `execution_not_eligible` code \
+        msg.contains("execution_not_eligible") || msg.contains("ExecutionNotEligible"),
+        "expected FF grant-gate rejection (execution_not_eligible / ExecutionNotEligible) \
          from ff_issue_claim_grant (lua/scheduling.lua:109-112); got: {msg}",
     );
 

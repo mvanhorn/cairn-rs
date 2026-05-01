@@ -17,23 +17,20 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use flowfabric::core::contracts::ReportUsageResult;
 use flowfabric::core::keys::{
-    budget_policies_index, budget_resets_key, quota_policies_index, usage_dedup_key,
-    BudgetKeyContext, ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys, QuotaKeyContext,
+    budget_policies_index, budget_resets_key, quota_policies_index, BudgetKeyContext,
+    ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys, QuotaKeyContext,
 };
 use flowfabric::core::partition::{
     budget_partition, execution_partition, flow_partition, quota_partition, Partition,
     PartitionFamily,
 };
-use flowfabric::core::types::{
-    AttemptId, AttemptIndex, BudgetId, ExecutionId, LeaseId, QuotaPolicyId, SignalId, TimestampMs,
-};
-use flowfabric::sdk::task::parse_report_usage_result;
+use flowfabric::core::types::{BudgetId, ExecutionId, QuotaPolicyId, TimestampMs};
 
 use crate::error::FabricError;
 use crate::fcall;
 use crate::helpers::{
-    check_fcall_success, fcall_error_code, fcall_error_code_ref, is_duplicate_result,
-    parse_eligibility_result, parse_fail_outcome, parse_stage_result_revision, FailOutcome,
+    check_fcall_success, fcall_error_code, is_duplicate_result, parse_eligibility_result,
+    parse_fail_outcome, parse_stage_result_revision, FailOutcome,
 };
 
 use super::control_plane::ControlPlaneBackend;
@@ -122,45 +119,65 @@ impl ControlPlaneBackend for ValkeyEngine {
                 reason: "record_spend: at least one dimension_delta is required".to_owned(),
             });
         }
-        let _ = execution_id; // part of the idempotency_key caller-side; kept for
-                              // future backends that want to log per-execution.
 
-        let partition = budget_partition(budget_id, &self.runtime().partition_config);
-        let ctx = BudgetKeyContext::new(&partition, budget_id);
-        let now = TimestampMs::now();
-
-        // Prefix with the budget's `{b:N}` hash tag so FF's SET lands
-        // on the same slot as the budget itself.
-        let dedup_key = usage_dedup_key(ctx.hash_tag(), idempotency_key);
-
-        let (keys, argv) =
-            fcall::budget::build_report_usage(&ctx, dimension_deltas, now, &dedup_key);
-
-        let raw: ferriskey::Value = self
+        // Route through FF 0.13's typed `EngineBackend::record_spend`
+        // (cairn #454 Phase 3a, `ff-core-0.13.0/src/engine_backend.rs:1714`).
+        // The backend owns partition/key derivation, dedup-slot keying,
+        // and per-execution attribution — cairn supplies the typed
+        // args and branches on the same `ReportUsageResult` variants.
+        //
+        // Copilot #599 review: `BTreeMap::collect()` silently
+        // last-writer-wins on duplicate keys; the old FCALL ARGV path
+        // passed duplicates through as-is (which FF's Lua summed). Reject
+        // them explicitly here so spend attribution never depends on
+        // iteration order. Callers building the slice can dedup upstream
+        // if they want additive semantics.
+        let mut deltas: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for (dim, delta) in dimension_deltas {
+            if deltas.insert((*dim).to_owned(), *delta).is_some() {
+                return Err(FabricError::Validation {
+                    reason: format!(
+                        "record_spend: duplicate dimension `{dim}` in dimension_deltas — \
+                         caller must dedup upstream (additive semantics not implied)"
+                    ),
+                });
+            }
+        }
+        let args = flowfabric::core::contracts::RecordSpendArgs::new(
+            budget_id.clone(),
+            execution_id.clone(),
+            deltas,
+            idempotency_key,
+        );
+        let outcome = self
             .runtime()
-            .fcall(fcall::names::FF_REPORT_USAGE_AND_CHECK, &keys, &argv)
-            .await?;
-
-        let ff_outcome: ReportUsageResult =
-            parse_report_usage_result(&raw).map_err(|e| FabricError::Internal(e.to_string()))?;
-        Ok(map_report_usage_result(ff_outcome))
+            .backend()
+            .record_spend(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        Ok(map_report_usage_result(outcome))
     }
 
-    async fn release_budget(&self, budget_id: &BudgetId) -> Result<(), FabricError> {
-        let partition = budget_partition(budget_id, &self.runtime().partition_config);
-        let ctx = BudgetKeyContext::new(&partition, budget_id);
-        let resets_zset = budget_resets_key(&partition.hash_tag());
-        let now = TimestampMs::now();
-
-        let keys: Vec<String> = vec![ctx.definition(), ctx.usage(), resets_zset];
-        let argv: Vec<String> = vec![budget_id.to_string(), now.to_string()];
-
-        let raw: ferriskey::Value = self
-            .runtime()
-            .fcall(fcall::names::FF_RESET_BUDGET, &keys, &argv)
-            .await?;
-        check_fcall_success(&raw, fcall::names::FF_RESET_BUDGET)?;
-
+    async fn release_budget(
+        &self,
+        budget_id: &BudgetId,
+        execution_id: &ExecutionId,
+    ) -> Result<(), FabricError> {
+        // Route through FF 0.13's typed
+        // `EngineBackend::release_budget(ReleaseBudgetArgs)` method
+        // (cairn #454 Phase 3b, `ff-core-0.13.0/src/engine_backend.rs:1732`).
+        // Per-execution attribution release — reverses this
+        // execution's contribution on the aggregate usage counter
+        // without touching other executions' attribution.
+        let args = flowfabric::core::contracts::ReleaseBudgetArgs::new(
+            budget_id.clone(),
+            execution_id.clone(),
+        );
+        self.runtime()
+            .backend()
+            .release_budget(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
         Ok(())
     }
 
@@ -616,55 +633,28 @@ impl ControlPlaneBackend for ValkeyEngine {
         &self,
         input: DeliverApprovalSignalInput,
     ) -> Result<(), FabricError> {
-        let partition = execution_partition(&input.execution_id, &self.runtime().partition_config);
-        let ctx = ExecKeyContext::new(&partition, &input.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        let signal_id = SignalId::new();
-        let now = TimestampMs::now();
-
-        let idem_str = input.idempotency_suffix.clone();
-        let idem_key = ctx.signal_dedup(&input.waitpoint_id, &idem_str);
-
-        // HMAC waitpoint token — FF owns it, cairn never caches. Missing
-        // token surfaces as `Validation` up the stack.
-        let waitpoint_token = crate::signal_bridge::read_waitpoint_token(
-            &self.runtime().client,
-            &ctx,
-            &input.waitpoint_id,
-        )
-        .await?;
-
-        let signal_maxlen = input.maxlen.to_string();
-        let max_signals = input.max_signals_per_execution.to_string();
-
-        let (keys, args) = fcall::suspension::build_deliver_signal(
-            &ctx,
-            &idx,
-            &input.lane_id,
-            &signal_id,
-            &input.waitpoint_id,
-            idem_key,
-            &input.execution_id,
+        // Route through FF 0.13's typed
+        // `EngineBackend::deliver_approval_signal(DeliverApprovalSignalArgs)`
+        // method (`ff-core-0.13.0/src/engine_backend.rs:1754`). The backend
+        // reads the HMAC waitpoint token from `ff_waitpoint_pending`
+        // server-side, HMAC-verifies, and dispatches — cairn never
+        // handles the token bytes. This drops the pre-call HGET on
+        // `signal_bridge::read_waitpoint_token` the old path required.
+        let args = flowfabric::core::contracts::DeliverApprovalSignalArgs::new(
+            input.execution_id,
+            input.lane_id,
+            input.waitpoint_id,
             input.signal_name,
-            "approval".to_owned(),
-            crate::constants::SOURCE_TYPE_APPROVAL_OPERATOR.to_owned(),
-            crate::constants::SOURCE_IDENTITY.to_owned(),
-            String::new(),
-            idem_str,
-            now,
+            input.idempotency_suffix,
             input.signal_dedup_ttl_ms,
-            &signal_maxlen,
-            &max_signals,
-            waitpoint_token.as_str(),
+            Some(input.maxlen),
+            Some(input.max_signals_per_execution),
         );
-
-        let raw: ferriskey::Value = self
-            .runtime()
-            .fcall(fcall::names::FF_DELIVER_SIGNAL, &keys, &args)
+        self.runtime()
+            .backend()
+            .deliver_approval_signal(args)
             .await
-            .map_err(|e| FabricError::Internal(format!("ff_deliver_signal: {e}")))?;
-        check_fcall_success(&raw, fcall::names::FF_DELIVER_SIGNAL)?;
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
         Ok(())
     }
 
@@ -738,117 +728,32 @@ impl ControlPlaneBackend for ValkeyEngine {
         &self,
         input: IssueGrantAndClaimInput,
     ) -> Result<ClaimGrantOutcome, FabricError> {
-        let partition = execution_partition(&input.execution_id, &self.runtime().partition_config);
-        let ctx = ExecKeyContext::new(&partition, &input.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        // ── Step 1: issue claim grant ─────────────────────────────────────
-        let grant_ttl = self.runtime().config.grant_ttl_ms;
-        let grant_keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.claim_grant(),
-            idx.lane_eligible(&input.lane_id),
-        ];
-        let grant_args: Vec<String> = vec![
-            input.execution_id.to_string(),
-            self.runtime().config.worker_id.to_string(),
-            self.runtime().config.worker_instance_id.to_string(),
-            input.lane_id.to_string(),
-            String::new(),
-            grant_ttl.to_string(),
-            String::new(),
-            String::new(),
-        ];
-
-        let raw_grant: ferriskey::Value = self
+        // Route through FF 0.13's typed
+        // `EngineBackend::issue_grant_and_claim(IssueGrantAndClaimArgs)`
+        // method (`ff-core-0.13.0/src/engine_backend.rs:1775`, cairn #454 Q4).
+        // Backend-atomic composition of `issue_claim_grant` +
+        // `claim_execution`: fuses the pair so a `claim_execution`
+        // failure after a successful `issue_claim_grant` cannot leak
+        // the grant (what the old caller-chained path risked). The
+        // backend also transparently dispatches into
+        // `claim_resumed_execution` when the target execution is in
+        // `attempt_interrupted` — we don't need a cairn-side
+        // `USE_CLAIM_RESUMED_EXECUTION` sentinel check anymore.
+        let args = flowfabric::core::contracts::IssueGrantAndClaimArgs::new(
+            input.execution_id,
+            input.lane_id,
+            input.lease_duration_ms,
+        );
+        let outcome = self
             .runtime()
-            .fcall(fcall::names::FF_ISSUE_CLAIM_GRANT, &grant_keys, &grant_args)
+            .backend()
+            .issue_grant_and_claim(args)
             .await
-            .map_err(|e| FabricError::Internal(format!("ff_issue_claim_grant: {e}")))?;
-        check_fcall_success(&raw_grant, fcall::names::FF_ISSUE_CLAIM_GRANT)?;
-
-        // ── Step 2: claim execution ───────────────────────────────────────
-        let total_str: Option<String> = self
-            .runtime()
-            .client
-            .hget(&ctx.core(), "total_attempt_count")
-            .await
-            .unwrap_or(None);
-        let next_idx = total_str
-            .as_deref()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        let att_idx = AttemptIndex::new(next_idx);
-
-        let lease_id = LeaseId::new();
-        let attempt_id = AttemptId::new();
-        let renew_before_ms = input.lease_duration_ms / 3;
-
-        let claim_keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.claim_grant(),
-            idx.lane_eligible(&input.lane_id),
-            idx.lease_expiry(),
-            idx.worker_leases(&self.runtime().config.worker_instance_id),
-            ctx.attempt_hash(att_idx),
-            ctx.attempt_usage(att_idx),
-            ctx.attempt_policy(att_idx),
-            ctx.attempts(),
-            ctx.lease_current(),
-            ctx.lease_history(),
-            idx.lane_active(&input.lane_id),
-            idx.attempt_timeout(),
-            idx.execution_deadline(),
-        ];
-        let claim_args: Vec<String> = vec![
-            input.execution_id.to_string(),
-            self.runtime().config.worker_id.to_string(),
-            self.runtime().config.worker_instance_id.to_string(),
-            input.lane_id.to_string(),
-            String::new(),
-            lease_id.to_string(),
-            input.lease_duration_ms.to_string(),
-            renew_before_ms.to_string(),
-            attempt_id.to_string(),
-            "{}".to_owned(),
-            String::new(),
-            String::new(),
-        ];
-
-        let raw_claim: ferriskey::Value = self
-            .runtime()
-            .fcall(fcall::names::FF_CLAIM_EXECUTION, &claim_keys, &claim_args)
-            .await
-            .map_err(|e| FabricError::Internal(format!("ff_claim_execution: {e}")))?;
-
-        // Dispatch: if FF returns `use_claim_resumed_execution` the
-        // execution is in `attempt_interrupted` (resumed from suspension)
-        // and must go through `ff_claim_resumed_execution` — which
-        // resumes the SAME attempt instead of allocating a new one. The
-        // grant is still live: FF's dispatch guard runs BEFORE grant
-        // consumption, so we do NOT re-issue it.
-        // Use the zero-alloc variant: the typed-code dispatch only needs a
-        // borrowed `&str` comparison against the static sentinel. The owned
-        // `String` round-trip via `fcall_error_code` was pure waste here.
-        if fcall_error_code_ref(&raw_claim).as_deref() == Some(USE_CLAIM_RESUMED_EXECUTION) {
-            return self
-                .claim_resumed_execution(
-                    &ctx,
-                    &idx,
-                    &input.execution_id,
-                    &input.lane_id,
-                    input.lease_duration_ms,
-                )
-                .await;
-        }
-
-        check_fcall_success(&raw_claim, fcall::names::FF_CLAIM_EXECUTION)?;
-        let lease_epoch = parse_claim_lease_epoch(&raw_claim)?;
-
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
         Ok(ClaimGrantOutcome {
-            lease_id,
-            lease_epoch,
-            attempt_index: att_idx,
+            lease_id: outcome.lease_id,
+            lease_epoch: outcome.lease_epoch,
+            attempt_index: outcome.attempt_index,
         })
     }
 
@@ -1110,101 +1015,22 @@ impl ControlPlaneBackend for ValkeyEngine {
     }
 }
 
-// ── Claim-resumed (Phase D PR 2a) ───────────────────────────────────────
-
-/// FF's typed dispatch error: the execution's `attempt_state` is
-/// `attempt_interrupted` (resume-from-suspension claim), so the caller
-/// must use `ff_claim_resumed_execution`. See `lua/execution.lua`.
-const USE_CLAIM_RESUMED_EXECUTION: &str = "use_claim_resumed_execution";
-
-impl ValkeyEngine {
-    async fn claim_resumed_execution(
-        &self,
-        ctx: &ExecKeyContext,
-        idx: &IndexKeys,
-        eid: &ExecutionId,
-        lane_id: &flowfabric::core::types::LaneId,
-        lease_duration_ms: u64,
-    ) -> Result<ClaimGrantOutcome, FabricError> {
-        // FF requires the existing attempt_hash as KEYS[6]; re-read the
-        // attempt index from exec_core so the key points at the live
-        // attempt.
-        let att_idx_str: Option<String> = self
-            .runtime()
-            .client
-            .hget(&ctx.core(), "current_attempt_index")
-            .await
-            .unwrap_or(None);
-        let att_idx = AttemptIndex::new(
-            att_idx_str
-                .as_deref()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0),
-        );
-
-        let lease_id = LeaseId::new();
-
-        let keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.claim_grant(),
-            idx.lane_eligible(lane_id),
-            idx.lease_expiry(),
-            idx.worker_leases(&self.runtime().config.worker_instance_id),
-            ctx.attempt_hash(att_idx),
-            ctx.lease_current(),
-            ctx.lease_history(),
-            idx.lane_active(lane_id),
-            idx.attempt_timeout(),
-            idx.execution_deadline(),
-        ];
-        let args: Vec<String> = vec![
-            eid.to_string(),
-            self.runtime().config.worker_id.to_string(),
-            self.runtime().config.worker_instance_id.to_string(),
-            lane_id.to_string(),
-            String::new(),
-            lease_id.to_string(),
-            lease_duration_ms.to_string(),
-            String::new(),
-        ];
-
-        let raw: ferriskey::Value = self
-            .runtime()
-            .fcall(fcall::names::FF_CLAIM_RESUMED_EXECUTION, &keys, &args)
-            .await
-            .map_err(|e| FabricError::Internal(format!("ff_claim_resumed_execution: {e}")))?;
-        check_fcall_success(&raw, fcall::names::FF_CLAIM_RESUMED_EXECUTION)?;
-
-        let lease_epoch = parse_claim_lease_epoch(&raw)?;
-        Ok(ClaimGrantOutcome {
-            lease_id,
-            lease_epoch,
-            attempt_index: att_idx,
-        })
-    }
-}
-
-/// Parse the `lease_epoch` slot of `ff_claim_execution`'s reply:
-/// `{1, "OK", <lease_id>, <lease_epoch>}`. Previously lived inside
-/// `services::claim_common`; lifted here with the rest of the claim
-/// machinery.
-fn parse_claim_lease_epoch(
-    raw: &ferriskey::Value,
-) -> Result<flowfabric::core::types::LeaseEpoch, FabricError> {
-    if let ferriskey::Value::Array(arr) = raw {
-        if let Some(Ok(ferriskey::Value::BulkString(b))) = arr.get(3) {
-            if let Ok(n) = String::from_utf8_lossy(b).parse::<u64>() {
-                return Ok(flowfabric::core::types::LeaseEpoch::new(n));
-            }
-        }
-        if let Some(Ok(ferriskey::Value::Int(n))) = arr.get(3) {
-            return Ok(flowfabric::core::types::LeaseEpoch::new(*n as u64));
-        }
-    }
-    Err(FabricError::Internal(
-        "ff_claim_execution: missing lease_epoch in response".to_owned(),
-    ))
-}
+// ── Claim-resumed (Phase D PR 2a → PR-C2 M6) ────────────────────────────
+//
+// The private `ValkeyEngine::claim_resumed_execution` helper (HGET
+// `current_attempt_index` + `FCALL FF_CLAIM_RESUMED_EXECUTION`) was
+// the cairn-side dispatch branch for `use_claim_resumed_execution`
+// replies from `ff_claim_execution`. PR-C2 M4 routed the outer
+// `issue_grant_and_claim` through FF 0.13's atomic trait method, which
+// internally composes `read_current_attempt_index` (trait) +
+// `claim_resumed_execution` (trait) when the target execution is in
+// `attempt_interrupted`. The private helper therefore became dead
+// code; deleting it removes the orphaned `HGET` + `FCALL` path and
+// the `parse_claim_lease_epoch` helper, plus the
+// `USE_CLAIM_RESUMED_EXECUTION` sentinel constant. See
+// `ff-core-0.13.0/src/engine_backend.rs:474` (read_current_attempt_index)
+// and `ff-core-0.13.0/src/engine_backend.rs:1043`
+// (claim_resumed_execution).
 
 // ── Helpers (free functions, kept file-local) ──────────────────────────
 

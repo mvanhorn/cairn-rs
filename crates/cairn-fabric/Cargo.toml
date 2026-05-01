@@ -199,3 +199,15 @@ path = "tests/backend_agnostic.rs"
 name = "postgres_control_plane_compiles"
 path = "tests/postgres_control_plane_compiles.rs"
 required-features = ["fabric-postgres"]
+
+# `pr_c2_migrations.rs` is the PR-C2 regression suite: asserts the six
+# FF 0.13 `EngineBackend` trait methods cairn routes through
+# (`record_spend`, `release_budget`, `deliver_approval_signal`,
+# `issue_grant_and_claim`, `read_waitpoint_token`,
+# `read_current_attempt_index`) preserve their behavioral contract
+# before AND after the in-tree migration. Requires `test-harness` to
+# drive a live Valkey testcontainer.
+[[test]]
+name = "pr_c2_migrations"
+path = "tests/pr_c2_migrations.rs"
+required-features = ["test-harness"]

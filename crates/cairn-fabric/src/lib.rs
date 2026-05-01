@@ -141,3 +141,14 @@ pub use config::FabricConfig;
 pub use error::FabricError;
 #[cfg(feature = "fabric-valkey")]
 pub use worker_sdk::{CairnTask, CairnWorker};
+
+/// Re-export FF 0.13's typed engine-error surface so cairn-app can
+/// classify `FabricError::Engine(_)` without taking a direct dep on
+/// the `flowfabric` umbrella crate. Added for PR-C2 after the
+/// trait-routed backend methods started flowing typed errors through
+/// the app's fabric-adapter mapper.
+pub mod engine_error {
+    pub use flowfabric::core::engine_error::{
+        ConflictKind, ContentionKind, EngineError, StateKind, ValidationKind,
+    };
+}

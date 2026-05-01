@@ -92,8 +92,18 @@ pub trait ControlPlaneBackend: Send + Sync {
         idempotency_key: &str,
     ) -> Result<BudgetSpendOutcome, FabricError>;
 
-    /// Release (reset) a budget's usage counters.
-    async fn release_budget(&self, budget_id: &BudgetId) -> Result<(), FabricError>;
+    /// Release this execution's attribution against a budget.
+    ///
+    /// Per FF 0.13 / cairn #454 clarification, this is **per-execution**
+    /// (not a whole-budget flush). The backend reads the per-execution
+    /// `by_exec` ledger written during [`Self::record_spend`] and
+    /// negates each dimension on the aggregate `usage` counter. The
+    /// budget itself persists across executions.
+    async fn release_budget(
+        &self,
+        budget_id: &BudgetId,
+        execution_id: &ExecutionId,
+    ) -> Result<(), FabricError>;
 
     /// Read a budget's current definition + usage. Returns `Ok(None)`
     /// when the budget does not exist in FF.

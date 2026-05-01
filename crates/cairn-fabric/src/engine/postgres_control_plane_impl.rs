@@ -205,7 +205,11 @@ impl ControlPlaneBackend for PostgresControlPlane {
         unimplemented!("PR-C4: PostgresControlPlane::record_spend")
     }
 
-    async fn release_budget(&self, _budget_id: &BudgetId) -> Result<(), FabricError> {
+    async fn release_budget(
+        &self,
+        _budget_id: &BudgetId,
+        _execution_id: &ExecutionId,
+    ) -> Result<(), FabricError> {
         unimplemented!("PR-C4: PostgresControlPlane::release_budget")
     }
 
