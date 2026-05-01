@@ -274,6 +274,61 @@ jobs:
           CARGO_BUILD_JOBS: "2"
           RUSTFLAGS: "-C debuginfo=0"
 
+  # ── 5b. Fabric integration — Postgres backend (testcontainers) ─────────────
+  # Parallel to `fabric-integration` above. Drives
+  # `crates/cairn-fabric/tests/postgres_control_plane_live.rs`: a live
+  # Postgres 16 testcontainer (spun up by `testcontainers-modules` inside
+  # the test binary — not a GitHub Actions service container, matching
+  # the Valkey pattern) exercises every bucket-A, bucket-B, and bucket-C
+  # method on `PostgresControlPlane`. Closes cairn-rs #346 + #347.
+  #
+  # Why a separate job:
+  # - Different feature flag (`fabric-postgres` vs. implicit Valkey)
+  #   produces a different cargo compilation unit graph; running it in
+  #   the same job as the Valkey suite would double the compile-time
+  #   ceiling on a single runner.
+  # - Separate cache key so feature-specific artifacts don't invalidate
+  #   the Valkey cache when only one side changes.
+  # - Scoped timeout matches the Valkey job's `timeout-minutes: 40`
+  #   overall cap + 15-minute per-step cap for the test binary itself.
+  fabric-integration-postgres:
+    name: fabric-integration-postgres
+    runs-on: ubuntu-latest
+    # Matches the Valkey sibling's cap; PG compile graph + testcontainer
+    # spin-up is similar in order of magnitude.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # Distinct cache key from the Valkey job — feature-gated deps
+          # (ff-backend-postgres, sqlx, testcontainers-modules/postgres)
+          # aren't in the Valkey compile unit, so sharing the `fabric`
+          # cache would serve stale artifacts on lockfile changes that
+          # only touch PG deps.
+          key: ${{ runner.os }}-cargo-fabric-pg-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fabric-pg-
+            ${{ runner.os }}-cargo-fabric-
+            ${{ runner.os }}-cargo-
+      - name: cargo test --test postgres_control_plane_live
+        # `--features fabric-postgres,test-harness` required:
+        # - `fabric-postgres` gates `PostgresControlPlane` +
+        #   `ff_backend_postgres::PostgresBackend::connect`.
+        # - `test-harness` gates `testcontainers-modules::postgres`
+        #   (never linked in production builds).
+        # Both are required-features on the `[[test]]` target, so a
+        # missing flag would skip the binary entirely — an explicit
+        # invocation keeps CI green/red semantics legible.
+        run: cargo test --tests -p cairn-fabric --features fabric-postgres,test-harness
+        timeout-minutes: 15
+
   # ── 6. UI Build + Type Check + Component Tests ──────────────────────────────
   ui:
     name: ui

@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flowfabric::core::engine_backend::EngineBackend;
+use flowfabric::core::engine_error::EngineError;
 use flowfabric::core::types::{
     BudgetId, EdgeId, ExecutionId, FlowId, LaneId, QuotaPolicyId, TimestampMs, WorkerId,
     WorkerInstanceId,
@@ -144,14 +145,17 @@ impl Engine for PostgresControlPlane {
         &self,
         _execution_id: &ExecutionId,
     ) -> Result<Vec<EdgeSnapshot>, FabricError> {
-        // Bucket C — deferred to PR-C4b. FF's `list_edges` takes
-        // `(flow_id, EdgeDirection::Incoming{to_node})`; cairn's
-        // trait only supplies `execution_id`, so we need to compose
-        // `resolve_execution_flow_id` + `list_edges`. PR-C4b also
-        // decides whether this stays an `Unavailable` gap (since
-        // scheduler-internal callers already own the flow id) or
-        // gets a real two-step body.
-        unimplemented!("PR-C4: PostgresControlPlane::list_incoming_edges")
+        // Bucket C — FF 0.13's `EngineBackend` trait has no
+        // point-query primitive for "incoming edges of an execution".
+        // FF's SDK-facing `list_incoming_edges` composes on top of
+        // per-flow edge state that isn't exposed as a trait primitive
+        // on PG yet (tracked in `docs/design/postgres-parity-gaps.md`).
+        // Return the typed `Unavailable` variant so callers that
+        // land on the PG backend see a classified failure instead of
+        // a panic.
+        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
+            op: "list_incoming_edges",
+        })))
     }
 
     async fn get_execution_tag(
@@ -241,20 +245,27 @@ impl Engine for PostgresControlPlane {
         _instance_id: &WorkerInstanceId,
         _capabilities: &[String],
     ) -> Result<WorkerRegistration, FabricError> {
-        // Bucket C — FF has no worker-registry trait primitive
-        // today. Tracked upstream at FF#473. PR-C4b returns
-        // `EngineError::Unavailable { op: "register_worker" }`.
-        unimplemented!("PR-C4: PostgresControlPlane::register_worker")
+        // Bucket C — FF 0.13 has no worker-registry trait primitive.
+        // Tracked upstream at FF#473; cairn-app's worker paths are
+        // Valkey-gated so this surface is exercised from operator
+        // dashboards only. See `docs/design/postgres-parity-gaps.md`.
+        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
+            op: "register_worker",
+        })))
     }
 
     async fn heartbeat_worker(&self, _instance_id: &WorkerInstanceId) -> Result<(), FabricError> {
         // Bucket C — see `register_worker` above. FF#473.
-        unimplemented!("PR-C4: PostgresControlPlane::heartbeat_worker")
+        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
+            op: "heartbeat_worker",
+        })))
     }
 
     async fn mark_worker_dead(&self, _instance_id: &WorkerInstanceId) -> Result<(), FabricError> {
         // Bucket C — see `register_worker` above. FF#473.
-        unimplemented!("PR-C4: PostgresControlPlane::mark_worker_dead")
+        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
+            op: "mark_worker_dead",
+        })))
     }
 
     async fn list_expired_leases(
@@ -265,10 +276,12 @@ impl Engine for PostgresControlPlane {
         // Bucket C — FF has no operator-facing expired-leases read
         // on the trait (lease expiry is handled server-side by each
         // backend's scanner). Cairn surfaces this for operator
-        // dashboards only; PR-C4b returns `Unavailable` so the read
-        // model degrades gracefully on PG until we either expose a
-        // trait primitive upstream or add a PG-native table scan.
-        unimplemented!("PR-C4: PostgresControlPlane::list_expired_leases")
+        // dashboards only; the read model degrades gracefully on PG
+        // with a typed `Unavailable` until we either expose a trait
+        // primitive upstream or add a PG-native table scan.
+        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
+            op: "list_expired_leases",
+        })))
     }
 }
 

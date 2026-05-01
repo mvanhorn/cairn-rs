@@ -93,31 +93,39 @@ impl FabricServices {
         match config.backend_kind {
             BackendKind::Valkey => Self::start_valkey(config, event_log, cursor_store).await,
             BackendKind::Postgres => {
-                // PR-C4a shipped the PG control-plane surface
+                // PR-C4a + PR-C4b shipped the PG control-plane surface
                 // (`PostgresFabricRuntime::start` +
-                // `PostgresControlPlane`) but the full `FabricServices`
-                // aggregate still takes `Arc<FabricRuntime>`
-                // concretely on every service constructor
-                // (`run_service.rs`, `task_service.rs`,
+                // `PostgresControlPlane`: 27 bucket-B trait methods
+                // wired, 3 bucket-A methods as direct delegates, 5
+                // bucket-C methods returning typed
+                // `EngineError::Unavailable`). The full
+                // `FabricServices` aggregate still takes
+                // `Arc<FabricRuntime>` concretely on every service
+                // constructor (`run_service.rs`, `task_service.rs`,
                 // `session_service.rs`, `scheduler_service.rs`,
-                // `quota_service.rs`). Lifting those to a backend-
-                // agnostic runtime handle is PR-C4b's scope — it
-                // touches every service constructor + the boot path
-                // in cairn-app. Today the Postgres arm surfaces a
-                // loud, cross-referenced failure so a misconfigured
+                // `quota_service.rs`, …). Lifting those to a
+                // backend-agnostic runtime handle is PR-C4c's scope
+                // (cairn-rs #602) — it touches ~30 service
+                // constructors + the boot path in cairn-app. Today
+                // the Postgres arm surfaces a loud, cross-referenced
+                // failure so a misconfigured
                 // `CAIRN_FABRIC_BACKEND=postgres` launch fails
-                // informatively rather than silently falling into
-                // the Valkey path.
+                // informatively rather than silently falling into the
+                // Valkey path.
                 let _ = event_log;
                 let _ = cursor_store;
                 Err(FabricError::Config(
-                    "CAIRN_FABRIC_BACKEND=postgres cannot boot the full FabricServices \
-                     aggregate yet. PR-C4a landed PostgresFabricRuntime::start + the \
-                     control-plane surface, but services (run/task/session/scheduler/\
-                     quota) still hold a concrete Arc<FabricRuntime> (Valkey runtime). \
-                     PR-C4b lifts those constructors onto a backend-agnostic runtime \
-                     trait. Until then use CAIRN_FABRIC_BACKEND=valkey or construct \
-                     PostgresFabricRuntime::start directly for control-plane read paths."
+                    "CAIRN_FABRIC_BACKEND=postgres supports control-plane methods via \
+                     PostgresControlPlane (PR-C4a + PR-C4b shipped 27 bucket-B + 3 bucket-A \
+                     trait methods live-tested on a PG container; 5 bucket-C methods return \
+                     typed EngineError::Unavailable — see docs/design/postgres-parity-gaps.md) \
+                     but cannot boot the full cairn service aggregate yet — service \
+                     constructors (run/task/session/scheduler/quota) still hold a concrete \
+                     Arc<FabricRuntime> (Valkey runtime). Tracked at cairn-rs #602 (PR-C4c). \
+                     Current options: (a) use CAIRN_FABRIC_BACKEND=valkey for full app mode, \
+                     or (b) instantiate PostgresControlPlane directly for control-plane-only \
+                     integrations (see docs/design/postgres-parity-gaps.md §'What works today \
+                     on fabric-postgres')."
                         .into(),
                 ))
             }

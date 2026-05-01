@@ -54,10 +54,11 @@ use cairn_fabric::engine::{ControlPlaneBackend, Engine, PostgresControlPlane};
 use cairn_fabric::FabricError;
 use ff_backend_postgres::{apply_migrations, PgPool, PostgresBackend};
 use flowfabric::core::engine_backend::EngineBackend;
+use flowfabric::core::engine_error::EngineError;
 use flowfabric::core::partition::PartitionConfig;
 use flowfabric::core::types::{
     AttemptId, AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId,
-    Namespace, QuotaPolicyId, WaitpointId, WorkerInstanceId,
+    Namespace, QuotaPolicyId, WaitpointId, WorkerId, WorkerInstanceId,
 };
 use sqlx::postgres::PgPoolOptions;
 use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
@@ -1425,4 +1426,87 @@ async fn pg_set_flow_tag_persists() {
         Some("true"),
         "get_flow_tag must read back the value set_flow_tag wrote",
     );
+}
+
+// ── Bucket C — typed `Unavailable` responses (PR-C4b) ────────────────
+//
+// These 5 methods have no FF 0.13 `EngineBackend` trait primitive
+// today. PR-C4b's contract: surface `EngineError::Unavailable { op }`
+// so operators see a typed, actionable failure instead of a panic.
+// Gap rationale + upstream tracking lives in
+// `docs/design/postgres-parity-gaps.md`.
+//
+// The assertion shape is the same per test: call the method on PG,
+// peel the `FabricError::Engine(Box<EngineError>)` and confirm the
+// inner variant is `Unavailable { op: "<method>" }` with the `op`
+// literal matching the method name. A panic (or any other variant)
+// fails the test — that's the whole contract.
+
+/// Shared assertion helper: `result` must be
+/// `Err(FabricError::Engine(Box::new(EngineError::Unavailable { op: expected_op })))`.
+/// Any other shape — `Ok`, a different `FabricError` arm, a different
+/// `EngineError` variant, or a different `op` literal — fails the test
+/// with the observed value formatted for triage.
+#[track_caller]
+fn assert_unavailable<T: std::fmt::Debug>(
+    result: Result<T, FabricError>,
+    expected_op: &'static str,
+) {
+    match result {
+        Err(FabricError::Engine(engine_err)) => match *engine_err {
+            EngineError::Unavailable { op } => assert_eq!(
+                op, expected_op,
+                "Unavailable.op mismatch: expected {expected_op:?}, got {op:?}",
+            ),
+            other => panic!(
+                "expected EngineError::Unavailable {{ op: {expected_op:?} }}, got {other:?}",
+            ),
+        },
+        other => panic!(
+            "expected Err(FabricError::Engine(Unavailable {{ op: {expected_op:?} }})), got {other:?}",
+        ),
+    }
+}
+
+#[tokio::test]
+async fn pg_list_incoming_edges_returns_unavailable() {
+    let cp = control_plane().await;
+    let eid = test_eid("bucket_c_list_incoming_edges");
+    let result = cp.list_incoming_edges(&eid).await;
+    assert_unavailable(result, "list_incoming_edges");
+}
+
+#[tokio::test]
+async fn pg_register_worker_returns_unavailable() {
+    let cp = control_plane().await;
+    let worker_id = WorkerId::new("cairn-worker");
+    let instance_id = WorkerInstanceId::new("cairn-worker-i1");
+    let capabilities = vec!["gpu=true".to_owned()];
+    let result = cp
+        .register_worker(&worker_id, &instance_id, &capabilities)
+        .await;
+    assert_unavailable(result, "register_worker");
+}
+
+#[tokio::test]
+async fn pg_heartbeat_worker_returns_unavailable() {
+    let cp = control_plane().await;
+    let instance_id = WorkerInstanceId::new("cairn-worker-heartbeat");
+    let result = cp.heartbeat_worker(&instance_id).await;
+    assert_unavailable(result, "heartbeat_worker");
+}
+
+#[tokio::test]
+async fn pg_mark_worker_dead_returns_unavailable() {
+    let cp = control_plane().await;
+    let instance_id = WorkerInstanceId::new("cairn-worker-dead");
+    let result = cp.mark_worker_dead(&instance_id).await;
+    assert_unavailable(result, "mark_worker_dead");
+}
+
+#[tokio::test]
+async fn pg_list_expired_leases_returns_unavailable() {
+    let cp = control_plane().await;
+    let result = cp.list_expired_leases(0, 16).await;
+    assert_unavailable(result, "list_expired_leases");
 }
