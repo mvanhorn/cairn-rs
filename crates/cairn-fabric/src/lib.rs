@@ -109,6 +109,14 @@ pub mod version_check;
 #[cfg(feature = "fabric-valkey")]
 pub mod worker_sdk;
 
+// PR-C3: PostgreSQL-backed runtime stub. Gated on `fabric-postgres` so
+// default (Valkey-only) builds neither compile nor link the module. The
+// `start` body is `unimplemented!("PR-C4")` today; PR-C4 wires
+// `ff_backend_postgres::PostgresBackend::connect` and installs the
+// background subsystems equivalent to `FabricRuntime::start`.
+#[cfg(feature = "fabric-postgres")]
+pub mod postgres_boot;
+
 /// Valkey testcontainers harness for integration tests. Gated on the
 /// `test-harness` cargo feature (which in turn implies `fabric-valkey`)
 /// so production binaries don't link `testcontainers`.

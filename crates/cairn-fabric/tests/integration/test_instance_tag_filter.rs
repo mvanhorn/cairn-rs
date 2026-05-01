@@ -74,6 +74,7 @@ async fn spawn_instance(instance_suffix: &str) -> TestInstance {
             "00000000000000000000000000000000000000000000000000000000000000aa".into(),
         ),
         waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+        backend_kind: cairn_fabric::config::BackendKind::Valkey,
     };
 
     let event_log = Arc::new(InMemoryStore::default());

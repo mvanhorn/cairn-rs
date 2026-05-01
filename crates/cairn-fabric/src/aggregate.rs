@@ -5,7 +5,7 @@ use cairn_store::projections::FfLeaseHistoryCursorStore;
 use tokio::task::JoinHandle;
 
 use crate::boot::FabricRuntime;
-use crate::config::FabricConfig;
+use crate::config::{BackendKind, FabricConfig};
 use crate::engine::{ControlPlaneBackend, Engine, ValkeyEngine};
 use crate::error::FabricError;
 use crate::event_bridge::EventBridge;
@@ -64,6 +64,53 @@ impl FabricServices {
     }
 
     async fn start_inner(
+        config: FabricConfig,
+        event_log: Arc<dyn EventLog + Send + Sync>,
+        cursor_store: Option<Arc<dyn FfLeaseHistoryCursorStore>>,
+    ) -> Result<Self, FabricError> {
+        // Defensive: re-run validation. `FabricConfig::from_env` already
+        // calls it, but callers that build a config via struct-literal
+        // (several tests do) may skip it. Surfacing
+        // `FabricError::Config` here is strictly better than panicking
+        // deeper in startup on a mismatched backend_kind / feature
+        // combination. (Copilot review, PR #600.)
+        config.validate()?;
+
+        // PR-C3: runtime dispatch on the always-compiled `backend_kind`
+        // selector. Each arm is **self-contained** — it owns the full
+        // construction path for its backend and returns `Self` directly.
+        // No fall-through: this is the contract PR-C4 relies on when it
+        // replaces the `unimplemented!` in the Postgres arm with a real
+        // `PostgresFabricRuntime::start` body. A restructuring back to
+        // "match then shared valkey tail" would re-introduce the bug
+        // the Gemini review on PR #600 flagged — the Postgres arm would
+        // silently fall into Valkey init.
+        //
+        // `FabricConfig::validate` has already rejected the
+        // "backend_kind requested but feature disabled" combination by
+        // the time we reach this match, so the Postgres arm only fires
+        // on a binary that genuinely linked the PG stack.
+        match config.backend_kind {
+            BackendKind::Valkey => Self::start_valkey(config, event_log, cursor_store).await,
+            BackendKind::Postgres => {
+                unimplemented!(
+                    "PR-C4: FabricServices::start on BackendKind::Postgres. \
+                     The aggregate path currently only wires the Valkey runtime; \
+                     PR-C4 replaces this arm with PostgresFabricRuntime::start \
+                     + PostgresControlPlane wiring. Do NOT fall through to the \
+                     Valkey arm — PR-C3's self-contained structure is load-bearing."
+                );
+            }
+        }
+    }
+
+    /// Valkey-backend construction path. Owns the full startup sequence
+    /// — runtime handshake, bridge wiring, engine construction,
+    /// lease-history subscriber, service aggregate — and returns
+    /// `Self`. Extracted out of `start_inner` so the backend-kind match
+    /// arm can stay a one-liner and the Postgres arm in PR-C4 can
+    /// similarly own its full startup sequence without any shared tail.
+    async fn start_valkey(
         config: FabricConfig,
         event_log: Arc<dyn EventLog + Send + Sync>,
         cursor_store: Option<Arc<dyn FfLeaseHistoryCursorStore>>,

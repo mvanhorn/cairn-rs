@@ -63,6 +63,13 @@ pub mod valkey_control_plane_impl;
 #[cfg(feature = "fabric-valkey")]
 pub mod valkey_impl;
 
+// PR-C3: compile-only PostgreSQL stub. Gated on `fabric-postgres` so the
+// default Valkey build neither compiles nor links it. PR-C4 replaces
+// every `unimplemented!("PR-C4: …")` body with real delegations / PG
+// bodies and adds a live-Postgres integration test suite.
+#[cfg(feature = "fabric-postgres")]
+pub mod postgres_control_plane_impl;
+
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
@@ -80,6 +87,8 @@ pub use control_plane_types::{
     RotationOutcome, StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
     WorkerRegistration,
 };
+#[cfg(feature = "fabric-postgres")]
+pub use postgres_control_plane_impl::PostgresControlPlane;
 pub use snapshots::{
     AttemptSummary, EdgeSnapshot, EdgeState, ExecutionSnapshot, FlowSnapshot, LeaseSummary,
 };

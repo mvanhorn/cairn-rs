@@ -33,6 +33,23 @@ fabric-valkey = [
     "flowfabric/engine",
     "flowfabric/scheduler-internals",
 ]
+
+# PR-C3: PostgreSQL backend wiring. Compile-only today — the
+# `PostgresControlPlane` impl added under this feature currently stubs
+# every method with `unimplemented!("PR-C4: <name>")`. PR-C4 adds
+# delegation to FF 0.13 `EngineBackend` trait methods where they exist,
+# fills in the remaining Postgres-native bodies, and adds a
+# live-Postgres integration test suite. The explicit
+# `dep:ff-backend-postgres` entry is kept alongside `flowfabric/postgres`
+# so the `ff_backend_postgres::PostgresBackend::connect` constructor is
+# directly importable in `postgres_boot.rs` without routing through the
+# `flowfabric` umbrella re-export.
+fabric-postgres = [
+    "dep:ff-backend-postgres",
+    "flowfabric/postgres",
+    "flowfabric/engine",
+]
+
 test-harness = ["fabric-valkey", "dep:testcontainers"]
 
 [dependencies]
@@ -68,6 +85,15 @@ ff-observability = { version = "0.13", features = ["enabled"], optional = true }
 # Do not add new direct ferriskey usage; route through the engine
 # traits instead.
 ferriskey = { version = "0.13", optional = true }
+# PR-C3: direct handle to the PostgreSQL backend crate. Gated behind
+# `fabric-postgres` so a default (Valkey-only) build neither compiles
+# nor links the PG driver. `flowfabric/postgres` pulls this crate in
+# transitively via the umbrella, but we also list it explicitly here so
+# `postgres_boot.rs` can import `ff_backend_postgres::PostgresBackend`
+# without the `flowfabric::backend::postgres` re-export detour. PR-C4
+# will exercise `PostgresBackend::connect` inside
+# `PostgresFabricRuntime::start`.
+ff-backend-postgres = { version = "0.13", optional = true }
 
 # Cairn crates
 cairn-domain = { path = "../cairn-domain" }
@@ -160,3 +186,16 @@ required-features = ["test-harness"]
 [[test]]
 name = "backend_agnostic"
 path = "tests/backend_agnostic.rs"
+
+# `postgres_control_plane_compiles.rs` is the PR-C3 compile-sentinel: it
+# imports `cairn_fabric::engine::PostgresControlPlane` and instantiates
+# a `TypeId` against it, so the test binary fails to compile if the
+# stub type is ever renamed, removed, or moved behind a different feature
+# gate. `required-features = ["fabric-postgres"]` keeps it skipped on
+# default (fabric-valkey) builds — the symbol only exists when the
+# postgres feature is on. PR-C4 replaces this file with real integration
+# assertions against a live Postgres testcontainer.
+[[test]]
+name = "postgres_control_plane_compiles"
+path = "tests/postgres_control_plane_compiles.rs"
+required-features = ["fabric-postgres"]

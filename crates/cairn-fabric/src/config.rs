@@ -92,6 +92,62 @@ pub struct FabricConfig {
     /// when `waitpoint_hmac_secret` is `Some`. Arbitrary operator-chosen
     /// string; FF uses it only as a lookup key in its secrets hash.
     pub waitpoint_hmac_kid: Option<String>,
+    /// Which storage backend the FabricServices aggregate should bring
+    /// up. Parsed from the `CAIRN_FABRIC_BACKEND` env var by
+    /// [`Self::from_env`] (default: [`BackendKind::Valkey`]).
+    ///
+    /// Always-compiled (not behind any Cargo feature) so the field is
+    /// visible to operators regardless of which backend features the
+    /// binary was built with. A mismatch between the requested kind
+    /// and the enabled Cargo features is caught in
+    /// [`Self::validate`] with an actionable error message.
+    ///
+    /// PR-C3 lands the field + parser; the runtime dispatch arm that
+    /// consumes it (`FabricServices::start` matching on `backend_kind`)
+    /// stubs the Postgres branch until PR-C4 wires
+    /// `PostgresFabricRuntime::start`.
+    pub backend_kind: BackendKind,
+}
+
+/// Which storage backend cairn-fabric should bring up.
+///
+/// Orthogonal to the [`BackendConnection`] carried by
+/// [`FabricConfig::backend`]: `BackendConnection` describes the *wire*
+/// (Valkey host/port, Postgres URL) while `BackendKind` selects which
+/// cairn-fabric runtime (valkey / postgres) dispatches the services
+/// on top. Today they agree 1:1 (Valkey wire → Valkey runtime), but
+/// the separate enum lets PR-C4 wire a Postgres runtime without
+/// refactoring the wire-config enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Valkey,
+    Postgres,
+}
+
+impl BackendKind {
+    /// Human-readable token used in env-var parsing and error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valkey => "valkey",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+impl std::str::FromStr for BackendKind {
+    type Err = FabricError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Accept lowercase ASCII only. The env-var parser in
+        // `FabricConfig::from_env` trims + lowercases before calling us.
+        match s {
+            "valkey" => Ok(Self::Valkey),
+            "postgres" => Ok(Self::Postgres),
+            other => Err(FabricError::Config(format!(
+                "CAIRN_FABRIC_BACKEND must be one of [valkey, postgres], got '{other}'"
+            ))),
+        }
+    }
 }
 
 impl FabricConfig {
@@ -162,6 +218,21 @@ impl FabricConfig {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // `CAIRN_FABRIC_BACKEND` (optional). Default to Valkey for
+        // backwards compat with every deployment predating PR-C3.
+        // Whitespace trimmed, ASCII-lowercased, then parsed.
+        let backend_kind = match std::env::var("CAIRN_FABRIC_BACKEND") {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    BackendKind::Valkey
+                } else {
+                    trimmed.to_ascii_lowercase().parse::<BackendKind>()?
+                }
+            }
+            Err(_) => BackendKind::Valkey,
+        };
+
         let config = Self {
             backend,
             lane_id,
@@ -176,6 +247,7 @@ impl FabricConfig {
             worker_capabilities,
             waitpoint_hmac_secret,
             waitpoint_hmac_kid,
+            backend_kind,
         };
         config.validate()?;
         Ok(config)
@@ -213,6 +285,67 @@ impl FabricConfig {
     }
 
     pub fn validate(&self) -> Result<(), FabricError> {
+        // Cross-check the backend-kind selector against the wire-config
+        // variant. An operator who sets `CAIRN_FABRIC_BACKEND=postgres`
+        // but leaves `CAIRN_FABRIC_URL=valkey://...` (or vice versa) is
+        // in an impossible state — the runtime-dispatch arm selects a
+        // runtime that can't consume the configured connection. Fail
+        // loud here with an actionable message pointing at both env vars.
+        // (Copilot review, PR #600.)
+        //
+        // `BackendConnection` is `#[non_exhaustive]` upstream — we
+        // deliberately list every known variant so a future FF addition
+        // fails the build rather than silently defaulting.
+        match (self.backend_kind, &self.backend.connection) {
+            (BackendKind::Valkey, BackendConnection::Valkey(_)) => {}
+            (BackendKind::Postgres, BackendConnection::Postgres(_)) => {}
+            (kind, conn) => {
+                return Err(FabricError::Config(format!(
+                    "CAIRN_FABRIC_BACKEND={} does not match CAIRN_FABRIC_URL scheme \
+                     (resolved to {}). Align the two env vars: either set \
+                     CAIRN_FABRIC_BACKEND={} to match the URL, or reset \
+                     CAIRN_FABRIC_URL to a {} scheme \
+                     (e.g. `valkey://localhost:6379` or `postgres://user:pw@host/db`).",
+                    kind.as_str(),
+                    backend_kind(conn),
+                    backend_kind(conn),
+                    kind.as_str(),
+                )));
+            }
+        }
+
+        // Cross-check the backend-kind selector against the compiled
+        // Cargo features. Fails loud at boot with an actionable message
+        // when an operator sets `CAIRN_FABRIC_BACKEND=postgres` on a
+        // binary built without the `fabric-postgres` feature (or the
+        // symmetric case). The runtime dispatch arm in
+        // `FabricServices::start` depends on this check to rule out the
+        // "feature disabled" case before matching.
+        match self.backend_kind {
+            BackendKind::Valkey => {
+                #[cfg(not(feature = "fabric-valkey"))]
+                {
+                    return Err(FabricError::Config(
+                        "CAIRN_FABRIC_BACKEND=valkey requires the `fabric-valkey` Cargo feature \
+                         (enabled by default); this binary was built with \
+                         `--no-default-features` and without `--features fabric-valkey`."
+                            .into(),
+                    ));
+                }
+            }
+            BackendKind::Postgres => {
+                #[cfg(not(feature = "fabric-postgres"))]
+                {
+                    return Err(FabricError::Config(
+                        "CAIRN_FABRIC_BACKEND=postgres requires the `fabric-postgres` Cargo \
+                         feature; this binary was built without it. Rebuild with \
+                         `--features fabric-postgres` (or rely on the default `fabric-valkey` \
+                         backend)."
+                            .into(),
+                    ));
+                }
+            }
+        }
         // `BackendConnection` is `#[non_exhaustive]` upstream — keep a
         // catch-all arm so a future FF variant cairn doesn't know about
         // fails loud at boot instead of silently defaulting.
@@ -545,6 +678,7 @@ mod tests {
             "CAIRN_FABRIC_LEASE_TTL_MS",
             "CAIRN_FABRIC_MAX_TASKS",
             "CAIRN_FABRIC_GRANT_TTL_MS",
+            "CAIRN_FABRIC_BACKEND",
         ] {
             std::env::remove_var(key);
         }
@@ -596,6 +730,119 @@ mod tests {
         assert_valkey(&config, "localhost", 6379, false, false);
 
         std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    // ── CAIRN_FABRIC_BACKEND parser unit tests (PR-C3) ──────────────────
+
+    #[test]
+    fn backend_kind_defaults_to_valkey_when_env_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(config.backend_kind, BackendKind::Valkey);
+    }
+
+    #[test]
+    fn backend_kind_empty_string_falls_back_to_valkey() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_BACKEND", "");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(config.backend_kind, BackendKind::Valkey);
+
+        std::env::remove_var("CAIRN_FABRIC_BACKEND");
+    }
+
+    #[test]
+    fn backend_kind_accepts_valkey_explicit() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_BACKEND", "valkey");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(config.backend_kind, BackendKind::Valkey);
+
+        std::env::remove_var("CAIRN_FABRIC_BACKEND");
+    }
+
+    // Note on the "postgres" case: when the `fabric-postgres` Cargo
+    // feature is off (default-features-only test run) `validate()`
+    // rejects `backend_kind = Postgres` with an actionable error.
+    // Built via struct-literal because `parse_fabric_url` today only
+    // accepts `valkey` / `rediss` schemes, so the env path cannot
+    // produce this state (PR-C4 extends the URL parser). The
+    // `base_config()` helper already wires a matching `Postgres`
+    // BackendConnection via `BackendConfig::postgres(...)` so the
+    // wire-mismatch guard passes and the feature-gate arm is reached.
+    #[cfg(not(feature = "fabric-postgres"))]
+    #[test]
+    fn backend_kind_postgres_without_feature_fails_validate() {
+        let mut cfg = base_config();
+        cfg.backend = BackendConfig::postgres("postgres://u:p@h/db");
+        cfg.backend_kind = BackendKind::Postgres;
+
+        let err = cfg.validate().expect_err("validate must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fabric-postgres") && msg.contains("CAIRN_FABRIC_BACKEND=postgres"),
+            "expected feature-gate error pointing at fabric-postgres, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn backend_kind_rejects_unknown_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_BACKEND", "sqlite");
+
+        let err = FabricConfig::from_env().expect_err("unknown token must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CAIRN_FABRIC_BACKEND") && msg.contains("sqlite"),
+            "expected actionable error naming the env var + offending token, got: {msg}"
+        );
+
+        std::env::remove_var("CAIRN_FABRIC_BACKEND");
+    }
+
+    #[test]
+    fn backend_kind_trims_whitespace_and_lowercases() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_BACKEND", "  VALKEY  ");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(config.backend_kind, BackendKind::Valkey);
+
+        std::env::remove_var("CAIRN_FABRIC_BACKEND");
+    }
+
+    #[test]
+    fn backend_kind_mismatch_with_wire_config_is_rejected() {
+        // Covers the validate() cross-check: `backend_kind = Valkey`
+        // paired with a Postgres-variant `BackendConnection` must fail
+        // loud rather than dispatching to the Valkey runtime against
+        // a PG connection.
+        //
+        // Built via struct-literal rather than `from_env` because
+        // today's `parse_fabric_url` only accepts `valkey` / `rediss`
+        // schemes — so an operator cannot actually produce
+        // `BackendConnection::Postgres` through the env path. That
+        // extension lands in PR-C4 when the URL parser grows a
+        // `postgres://` arm; until then the struct-literal path (tests
+        // + any caller that builds `FabricConfig` by hand) is where
+        // this invariant matters.
+        let mut cfg = base_config();
+        cfg.backend = BackendConfig::postgres("postgres://u:p@h/db");
+        // Leave backend_kind as Valkey (from base_config) — this is
+        // the wire-mismatch we're asserting against.
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_BACKEND") && err.contains("CAIRN_FABRIC_URL"),
+            "expected actionable error naming both env vars, got: {err}"
+        );
     }
 
     // ── URL parser unit tests ────────────────────────────────────────────
@@ -906,6 +1153,7 @@ mod tests {
             worker_capabilities: BTreeSet::new(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
+            backend_kind: BackendKind::Valkey,
         }
     }
 
@@ -985,6 +1233,7 @@ mod tests {
             worker_capabilities: BTreeSet::new(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
+            backend_kind: BackendKind::Valkey,
         };
         config.validate()?;
         Ok(config)
@@ -1014,13 +1263,23 @@ mod tests {
             .contains("max_concurrent_tasks"));
     }
 
+    // Gated on `fabric-postgres` because reaching the "postgres url
+    // must not be empty" arm requires `backend_kind = Postgres` (to
+    // satisfy the PR-C3 wire-mismatch cross-check) which itself
+    // requires the feature (to satisfy the feature-gate cross-check
+    // that runs even earlier). Without the feature flag, the test
+    // terminates on the feature-gate arm before the empty-URL arm
+    // ever fires — not useful signal.
+    #[cfg(feature = "fabric-postgres")]
     #[test]
     fn rejects_empty_postgres_url_in_validate() {
-        // Smoke-test the Postgres validation arm — the URL parser
-        // rejects `postgres://` today, but validate() still needs to
-        // guard the non-Valkey branch for the PR-C roll-forward path.
+        // Smoke-test the Postgres validation arm. Built via struct
+        // literal; `parse_fabric_url` today only accepts valkey/rediss
+        // schemes, so env-driven construction cannot produce this
+        // state (PR-C4 extends the URL parser).
         let mut cfg = base_config();
         cfg.backend = BackendConfig::postgres("");
+        cfg.backend_kind = BackendKind::Postgres;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("postgres url must not be empty"),

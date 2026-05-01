@@ -130,6 +130,7 @@ impl TestHarness {
                 "00000000000000000000000000000000000000000000000000000000000000aa".into(),
             ),
             waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+            backend_kind: cairn_fabric::config::BackendKind::Valkey,
         };
 
         let event_log = Arc::new(InMemoryStore::default());

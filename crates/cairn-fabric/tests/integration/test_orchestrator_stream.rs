@@ -351,6 +351,7 @@ fn worker_config_from(h: &TestHarness) -> FabricConfig {
         worker_capabilities: BTreeSet::new(),
         waitpoint_hmac_secret: h.fabric.runtime.config.waitpoint_hmac_secret.clone(),
         waitpoint_hmac_kid: h.fabric.runtime.config.waitpoint_hmac_kid.clone(),
+        backend_kind: h.fabric.runtime.config.backend_kind,
     }
 }
 

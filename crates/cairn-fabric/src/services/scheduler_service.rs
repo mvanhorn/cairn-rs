@@ -271,6 +271,7 @@ mod tests {
             worker_capabilities: caps.clone(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
+            backend_kind: crate::config::BackendKind::Valkey,
         };
 
         // The config carries the set unchanged. FabricSchedulerService::new
