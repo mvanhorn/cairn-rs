@@ -859,6 +859,25 @@ export function createApiClient(config: ApiClientConfig) {
         `/v1/admin/operators/${encodeURIComponent(operatorId)}/tenant-roles/${encodeURIComponent(tenantId)}`,
       ),
 
+    /**
+     * GET /v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles
+     * — list every tenant-role grant the operator holds (active + soft-
+     * revoked). Tenant-scoped so `TenantAdminGuard` authorizes on
+     * `:tenant_id`; cross-tenant operator ids return 404. RFC-026 PR-A4.
+     *
+     * Note: the response cross-cuts tenants (an operator on home tenant
+     * T can be surfaced as also holding roles on T' / T'' in the list)
+     * — revoke still requires admin on each target tenant, so the
+     * broader read surface does not enable escalation.
+     */
+    listOperatorTenantRoles: (
+      tenantId: string,
+      operatorId: string,
+    ): Promise<import("./types").ListResponse<import("./types").TenantRoleGrant>> =>
+      get(
+        `/v1/admin/tenants/${encodeURIComponent(tenantId)}/operators/${encodeURIComponent(operatorId)}/tenant-roles`,
+      ),
+
     // ── Admin: snapshots + event-log compaction (RFC-026 PR-A1) ──────────────
 
     /** POST /v1/admin/tenants/:id/snapshot — create a point-in-time snapshot. */

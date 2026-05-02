@@ -52,6 +52,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `GET` | `/v1/admin/tenants/:tenant_id/operator-profiles` | Preserve |  |
 | `POST` | `/v1/admin/tenants/:tenant_id/operator-profiles` | Preserve |  |
 | `PATCH` | `/v1/admin/tenants/:tenant_id/operator-profiles/:id` | Preserve | RFC-026 PR-A2 operator profile edit. |
+| `GET` | `/v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles` | Preserve | RFC-026 PR-A4: list tenant-role grants for an operator (includes revoked rows with audit fields). |
 | `GET` | `/v1/admin/tenants/:tenant_id/quota` | Preserve |  |
 | `POST` | `/v1/admin/tenants/:tenant_id/quota` | Preserve |  |
 | `GET` | `/v1/admin/tenants/:tenant_id/retention-policy` | Preserve |  |

@@ -1208,6 +1208,18 @@ impl AppBootstrap {
                 "/v1/admin/tenants/:tenant_id/operator-profiles",
                 get(list_operator_profiles_handler),
             )
+            // RFC 026 PR-A4: list an operator's tenant-role grants.
+            // Tenant-scoped under `:tenant_id` so `TenantAdminGuard`
+            // authorizes on the URL's tenant; cross-tenant operator ids
+            // return 404 so presence of foreign-tenant operators is
+            // never revealed. Body lists grants on *all* tenants the
+            // operator holds a record for — revokes still require admin
+            // on each target tenant, so read-surface breadth does not
+            // enable escalation.
+            .route(
+                "/v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles",
+                get(list_operator_tenant_roles_handler),
+            )
             .route(
                 "/v1/admin/tenants/:tenant_id/workspaces",
                 get(list_workspaces_handler),

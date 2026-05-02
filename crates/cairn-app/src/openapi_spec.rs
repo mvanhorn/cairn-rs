@@ -3188,6 +3188,23 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "200": { "description": "Failed notification list" } }
       }
     },
+    "/v1/admin/tenants/{tenant_id}/operators/{operator_id}/tenant-roles": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List an operator's tenant-role grants (RFC 026 PR-A4)",
+        "description": "Returns every `(tenant_id, operator_id)` grant ever recorded for the operator — active and revoked — so the OperatorsPage can surface the full grant set per-row. Tenant-scoped under `:tenant_id`; `TenantAdminGuard` authorizes on that tenant. Cross-tenant operator ids return 404 so presence is never revealed. Body items echo the `OperatorTenantRoleRecord` projection shape.",
+        "operationId": "listOperatorTenantRoles",
+        "parameters": [
+          { "name": "tenant_id",   "in": "path", "required": true, "schema": { "type": "string" }, "description": "Tenant the caller is admin on." },
+          { "name": "operator_id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Operator whose grants to list." }
+        ],
+        "responses": {
+          "200": { "description": "Grant list (active + revoked)." },
+          "403": { "description": "Structured `tenant_role_missing` for non-admin callers." },
+          "404": { "description": "Operator profile not found for this tenant." }
+        }
+      }
+    },
     "/v1/admin/operators/{id}/tenant-roles/{tenant}/promote": {
       "post": {
         "tags": ["Admin"],

@@ -1684,6 +1684,63 @@ pub(crate) async fn promote_tenant_role_handler(
     }
 }
 
+/// `GET /v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles`
+/// — list every tenant-role grant currently held (or revoked) by an
+/// operator.
+///
+/// Guard: `TenantAdminGuard` — tenant-scoped under `:tenant_id` so the
+/// caller must hold `TenantRole::Admin` on that tenant (or god-token).
+/// We intentionally return the operator's grants across *all* tenants,
+/// not just the URL tenant, so the OperatorsPage can surface the full
+/// grant set per-row without a second round-trip. Cross-tenant
+/// isolation is preserved at revoke-time (each revoke requires admin
+/// on the target tenant), so surfacing a read-only view on this path
+/// does not enable escalation.
+///
+/// The handler also enforces the same cross-tenant 404 policy as
+/// `patch_operator_profile_handler`: the URL's `:tenant_id` must be
+/// the operator's home tenant or the response is 404 — a tenant-admin
+/// on T cannot enumerate operators belonging to T'.
+pub(crate) async fn list_operator_tenant_roles_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Path((tenant_id, operator_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let tenant_id = TenantId::new(tenant_id);
+    let operator_id = OperatorId::new(operator_id);
+
+    // Cross-tenant isolation: the operator's home tenant must match the
+    // URL tenant. Both the "doesn't exist" and "exists in another tenant"
+    // branches return the SAME 404 body — differing messages would leak
+    // existence across tenants (SEC-007). Returns 404 (not 403) so the
+    // tenant boundary itself isn't probed.
+    match state.runtime.operator_profiles.get(&operator_id).await {
+        Ok(Some(existing)) if existing.tenant_id == tenant_id => {}
+        Ok(_) => {
+            return AppApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "operator profile not found",
+            )
+            .into_response();
+        }
+        Err(err) => return runtime_error_response(err),
+    }
+
+    match state
+        .runtime
+        .tenant_roles
+        .list_by_operator(&operator_id)
+        .await
+    {
+        Ok(items) => {
+            let has_more = false;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
+        Err(err) => runtime_error_response(err),
+    }
+}
+
 /// `DELETE /v1/admin/operators/:id/tenant-roles/:tenant` — revoke the
 /// active `(tenant, operator)` role.
 ///

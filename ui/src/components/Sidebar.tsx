@@ -27,6 +27,7 @@ import {
   Terminal,
   TestTube,
   User,
+  Users,
   BarChart2,
   Waves,
   Scale,
@@ -47,6 +48,7 @@ export type NavPage =
   | 'dashboard'
   | 'workspaces'
   | 'tenants'
+  | 'operators'
   | 'sessions'
   | 'runs'
   | 'tasks'
@@ -162,7 +164,8 @@ const NAV_GROUPS: NavGroup[] = [
     label: 'Admin',
     adminOnly: true,
     items: [
-      { id: 'tenants', label: 'Tenants', icon: Building2 },
+      { id: 'tenants',   label: 'Tenants',   icon: Building2 },
+      { id: 'operators', label: 'Operators', icon: Users     },
     ],
   },
 ];

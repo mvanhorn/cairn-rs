@@ -52,6 +52,7 @@ GET	/v1/admin/tenants/:id/overview	preserve	-	-
 GET	/v1/admin/tenants/:id/snapshots	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/credentials	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/operator-profiles	preserve	-	-
+GET	/v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/quota	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/retention-policy	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/workspaces	preserve	-	-
