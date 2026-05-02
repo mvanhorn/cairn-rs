@@ -161,6 +161,8 @@ pub enum RuntimeEvent {
     /// RFC 001: gradual traffic rollout started.
     PromptRolloutStarted(PromptRolloutStarted),
     TenantCreated(TenantCreated),
+    /// RFC 026 PR-A2: tenant PATCH edit (rename).
+    TenantUpdated(TenantUpdated),
     WorkspaceCreated(WorkspaceCreated),
     WorkspaceArchived(WorkspaceArchived),
     ProjectCreated(ProjectCreated),
@@ -385,6 +387,7 @@ impl RuntimeEvent {
             RuntimeEvent::PromptReleaseTransitioned(event) => &event.project,
             RuntimeEvent::PromptRolloutStarted(event) => &event.project,
             RuntimeEvent::TenantCreated(event) => &event.project,
+            RuntimeEvent::TenantUpdated(event) => &event.project,
             RuntimeEvent::WorkspaceCreated(event) => &event.project,
             RuntimeEvent::WorkspaceArchived(event) => &event.project,
             RuntimeEvent::ProjectCreated(event) => &event.project,
@@ -673,6 +676,7 @@ impl RuntimeEvent {
                 prompt_release_id: event.prompt_release_id.clone(),
             }),
             RuntimeEvent::TenantCreated(_) => None,
+            RuntimeEvent::TenantUpdated(_) => None,
             RuntimeEvent::WorkspaceCreated(_) => None,
             RuntimeEvent::WorkspaceArchived(_) => None,
             RuntimeEvent::ProjectCreated(_) => None,
@@ -1767,6 +1771,25 @@ pub struct TenantCreated {
     pub created_at: u64,
 }
 
+/// RFC 026 PR-A2: tenant-level PATCH edit. Only `name` is mutable
+/// today — the `tenants` projection table carries `name`, `created_at`,
+/// `updated_at` and nothing else (`crates/cairn-store/migrations/V017`).
+///
+/// `Option<String>` uses PATCH semantics: `None` leaves the field
+/// alone, `Some(value)` overwrites. Every backend's applier COALESCEs
+/// or `if let Some` so a future `metadata: Option<...>` field can be
+/// added without breaking replay of events emitted before the column
+/// existed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantUpdated {
+    pub project: ProjectKey,
+    pub tenant_id: TenantId,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub updated_by: String,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceCreated {
     pub project: ProjectKey,
@@ -2270,6 +2293,13 @@ pub struct OperatorProfileUpdated {
     pub profile_id: crate::ids::OperatorId,
     pub display_name: Option<String>,
     pub email: Option<String>,
+    /// RFC 026 PR-A2: operator `WorkspaceRole` is mutable from the
+    /// admin PATCH. `None` leaves the stored role alone; `Some(role)`
+    /// replaces it. `#[serde(default)]` keeps pre-A2 events (which
+    /// omitted the field) replayable — they deserialize as `None` and
+    /// therefore no-op on the role column.
+    #[serde(default)]
+    pub role: Option<crate::tenancy::WorkspaceRole>,
 }
 
 /// RFC 026 PR-A0: tenant-admin role granted to an operator.

@@ -38,6 +38,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `GET` | `/v1/admin/tenants` | Preserve | { items } |
 | `POST` | `/v1/admin/tenants` | Preserve |  |
 | `GET` | `/v1/admin/tenants/:id` | Preserve |  |
+| `PATCH` | `/v1/admin/tenants/:id` | Preserve | RFC-026 PR-A2 tenant edit. |
 | `POST` | `/v1/admin/tenants/:id/compact-event-log` | Preserve |  |
 | `GET` | `/v1/admin/tenants/:id/overview` | Preserve |  |
 | `POST` | `/v1/admin/tenants/:id/restore` | Preserve |  |
@@ -50,6 +51,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `POST` | `/v1/admin/tenants/:tenant_id/credentials/rotate-key` | Preserve |  |
 | `GET` | `/v1/admin/tenants/:tenant_id/operator-profiles` | Preserve |  |
 | `POST` | `/v1/admin/tenants/:tenant_id/operator-profiles` | Preserve |  |
+| `PATCH` | `/v1/admin/tenants/:tenant_id/operator-profiles/:id` | Preserve | RFC-026 PR-A2 operator profile edit. |
 | `GET` | `/v1/admin/tenants/:tenant_id/quota` | Preserve |  |
 | `POST` | `/v1/admin/tenants/:tenant_id/quota` | Preserve |  |
 | `GET` | `/v1/admin/tenants/:tenant_id/retention-policy` | Preserve |  |

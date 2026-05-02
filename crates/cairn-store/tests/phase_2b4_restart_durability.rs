@@ -492,6 +492,7 @@ async fn operator_profile_updated_is_patch_shape() {
                 profile_id: profile_id.clone(),
                 display_name: Some("RADM Grace Hopper".to_owned()),
                 email: None,
+                role: None,
             }),
         ),
     ])
@@ -531,6 +532,7 @@ async fn operator_profile_update_on_missing_is_noop() {
             profile_id: profile_id.clone(),
             display_name: Some("Phantom".to_owned()),
             email: Some("phantom@example.com".to_owned()),
+            role: None,
         }),
     )])
     .await

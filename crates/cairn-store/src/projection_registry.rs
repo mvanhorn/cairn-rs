@@ -363,6 +363,14 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             table: Some("tenants"),
         },
     },
+    // RFC 026 PR-A2: tenant PATCH edit (rename). Writes into the same
+    // `tenants` table the `TenantCreated` applier maintains.
+    ProjectionEntry {
+        variant: "TenantUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("tenants"),
+        },
+    },
     ProjectionEntry {
         variant: "TerminalRecoveryAttempted",
         status: ProjectionStatus::Projected {
@@ -1486,8 +1494,12 @@ mod tests {
         //     (pg V066 + sqlite schema.rs). The admin-UI series depends on
         //     a tenant-scope admin role model that `AdminRoleGuard` was
         //     asked to enforce but never had. Net: +2 Projected → 127 / 33 / 0.
+        //   * RFC 026 PR-A2: `TenantUpdated` added as Projected with
+        //     backing table `tenants` (same table `TenantCreated` maintains;
+        //     PATCH appliers `UPDATE` only the supplied fields). Unblocks
+        //     the admin-UI tenant rename flow. Net: +1 Projected → 128 / 33 / 0.
         assert_eq!(
-            projected, 127,
+            projected, 128,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
@@ -1495,7 +1507,7 @@ mod tests {
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 160);
+        assert_eq!(projected + ephemeral + stubbed, 161);
     }
 
     #[test]

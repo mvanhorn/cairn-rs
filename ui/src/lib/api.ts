@@ -656,6 +656,40 @@ export function createApiClient(config: ApiClientConfig) {
     getTenantOverview: (tenantId: string): Promise<import("./types").TenantOverview> =>
       get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/overview`),
 
+    /**
+     * PATCH /v1/admin/tenants/:id — edit tenant metadata (RFC-026 PR-A2).
+     * Every field is optional; omit fields you don't want to change. An
+     * all-`undefined` body is rejected server-side with 422 `empty_patch`.
+     * Guard: caller must hold `TenantRole::Admin` on the target tenant,
+     * or use the deployment `CAIRN_ADMIN_TOKEN` (god-token).
+     */
+    updateTenant: (
+      tenantId: string,
+      body: { name?: string },
+    ): Promise<import("./types").TenantRecord> =>
+      patch(`/v1/admin/tenants/${encodeURIComponent(tenantId)}`, body),
+
+    /**
+     * PATCH /v1/admin/tenants/:tenant_id/operator-profiles/:id — edit an
+     * operator profile's display_name, email, or WorkspaceRole (RFC-026
+     * PR-A2). Omitted fields are preserved. A non-admin operator targeting
+     * another tenant's operator gets 404, not 403, to avoid leaking the
+     * existence of cross-tenant ids.
+     */
+    updateOperatorProfile: (
+      tenantId: string,
+      operatorId: string,
+      body: {
+        display_name?: string;
+        email?: string;
+        role?: "owner" | "admin" | "member" | "viewer";
+      },
+    ): Promise<import("./types").OperatorProfile> =>
+      patch(
+        `/v1/admin/tenants/${encodeURIComponent(tenantId)}/operator-profiles/${encodeURIComponent(operatorId)}`,
+        body,
+      ),
+
     // ── Admin: quotas (RFC-026 PR-A1) ────────────────────────────────────────
 
     /** GET /v1/admin/tenants/:tenant_id/quota — current concurrent/session/task limits + live usage. */

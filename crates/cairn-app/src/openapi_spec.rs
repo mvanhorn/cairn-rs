@@ -1440,6 +1440,65 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "201": { "description": "Created tenant" } }
       }
     },
+    "/v1/admin/tenants/{id}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Fetch a single tenant record",
+        "operationId": "getTenant",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Tenant record" },
+          "404": { "description": "Tenant not found" }
+        }
+      },
+      "patch": {
+        "tags": ["Admin"],
+        "summary": "Edit a tenant (RFC 026 PR-A2)",
+        "description": "PATCH semantics — every field is optional; omitted fields preserve the stored value. An all-`null` body returns 422 `empty_patch`. Guarded by `TenantAdminGuard`: god-token (`CAIRN_ADMIN_TOKEN`) bypasses for cross-tenant bootstrap; real operators require `TenantRole::Admin` on the target tenant (otherwise 403 with the structured `tenant_role_missing` envelope). Emits `TenantUpdated` and an `AuditLogEntryRecorded` entry.",
+        "operationId": "updateTenant",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string", "nullable": true } } } } }
+        },
+        "responses": {
+          "200": { "description": "Updated tenant record" },
+          "403": { "description": "Structured `tenant_role_missing` body when the caller is a non-admin operator without `TenantRole::Admin` on the target." },
+          "404": { "description": "Tenant not found" },
+          "422": { "description": "Empty patch body" }
+        }
+      }
+    },
+    "/v1/admin/tenants/{tenant_id}/operator-profiles/{id}": {
+      "patch": {
+        "tags": ["Admin"],
+        "summary": "Edit an operator profile (RFC 026 PR-A2)",
+        "description": "PATCH semantics — any subset of `display_name`, `email`, or `role` may be supplied; omitted fields stay as-is. An all-`null` body returns 422 `empty_patch`. Guarded by `TenantAdminGuard`; cross-tenant ids return 404 rather than 403 so operator presence is not revealed to a non-tenant-admin. Emits `OperatorProfileUpdated` plus an `AuditLogEntryRecorded` entry. `role` here is the `WorkspaceRole` carried on the operator profile (default role for workspace assignments); the tenant-scope `TenantRole` has its own endpoint (PR-A0).",
+        "operationId": "updateOperatorProfile",
+        "parameters": [
+          { "name": "tenant_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id",        "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "properties": {
+            "display_name": { "type": "string", "nullable": true },
+            "email":        { "type": "string", "nullable": true },
+            "role":         { "type": "string", "nullable": true, "enum": ["owner", "admin", "member", "viewer"] }
+          } } } }
+        },
+        "responses": {
+          "200": { "description": "Updated operator profile" },
+          "403": { "description": "Structured `tenant_role_missing` body when the caller lacks `TenantRole::Admin` on `:tenant_id`." },
+          "404": { "description": "Operator profile not found for this tenant" },
+          "422": { "description": "Empty patch body or invalid email" }
+        }
+      }
+    },
     "/v1/settings": {
       "get": {
         "tags": ["Admin"],

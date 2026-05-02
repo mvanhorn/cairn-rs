@@ -1068,6 +1068,30 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
+            // RFC 026 PR-A2: tenant PATCH edit. Same shape as pg applier
+            // above — `COALESCE(?2, name)` leaves the column untouched
+            // when the event's `name` is `None`. `updated_at` always
+            // advances so the admin UI can show a fresh mtime.
+            RuntimeEvent::TenantUpdated(e) => {
+                let updated_at = i64::try_from(e.updated_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "TenantUpdated.updated_at_ms {} exceeds i64::MAX",
+                        e.updated_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE tenants SET
+                        name       = COALESCE(?2, name),
+                        updated_at = ?3
+                     WHERE tenant_id = ?1",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.name.as_deref())
+                .bind(updated_at)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             RuntimeEvent::WorkspaceCreated(e) => {
                 sqlx::query(
                     "INSERT INTO workspaces (workspace_id, tenant_id, name, created_at, updated_at)
@@ -2276,15 +2300,26 @@ impl SqliteSyncProjection {
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
             RuntimeEvent::OperatorProfileUpdated(e) => {
+                // RFC 026 PR-A2: role edit. Same COALESCE pattern as
+                // the pg applier above — pre-A2 events deserialize
+                // with `role=None` so the column is untouched.
+                let role_str = e.role.as_ref().map(|r| {
+                    serde_json::to_string(r)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_owned()
+                });
                 sqlx::query(
                     "UPDATE operator_profiles SET
                         display_name = COALESCE(?2, display_name),
-                        email        = COALESCE(?3, email)
+                        email        = COALESCE(?3, email),
+                        role         = COALESCE(?4, role)
                      WHERE operator_id = ?1",
                 )
                 .bind(e.profile_id.as_str())
                 .bind(e.display_name.as_deref())
                 .bind(e.email.as_deref())
+                .bind(role_str.as_deref())
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;

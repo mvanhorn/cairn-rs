@@ -132,7 +132,7 @@ pub use soul_guard::SoulGuard;
 pub use tasks::TaskService;
 pub use tenant_role_backfill::{run_tenant_role_backfill, TenantRoleBackfillReport};
 pub use tenant_roles::TenantRoleService;
-pub use tenants::TenantService;
+pub use tenants::{TenantService, TenantUpdatePatch};
 pub use tool_call_approvals::{
     AllowRule, ApprovalDecision as ToolCallApprovalDecision, ApprovedProposal, OperatorDecision,
     StoredProposal, StoredProposalState, ToolCallApprovalReader, ToolCallApprovalService,
@@ -148,7 +148,7 @@ pub use defaults::DefaultsService;
 pub use guardrails::GuardrailService;
 pub use licenses::LicenseService;
 pub use notification_prefs::NotificationService;
-pub use operator_profiles::OperatorProfileService;
+pub use operator_profiles::{OperatorProfilePatch, OperatorProfileService};
 pub use provider_bindings::ProviderBindingService;
 pub use provider_connections::{ProviderConnectionConfig, ProviderConnectionService};
 pub use provider_health::ProviderHealthService;

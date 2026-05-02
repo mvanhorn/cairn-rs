@@ -1012,6 +1012,7 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::PromptReleaseCreated(_) => "prompt_release_created",
         RuntimeEvent::PromptReleaseTransitioned(_) => "prompt_release_transitioned",
         RuntimeEvent::TenantCreated(_) => "tenant_created",
+        RuntimeEvent::TenantUpdated(_) => "tenant_updated",
         RuntimeEvent::TenantQuotaSet(_) => "tenant_quota_set",
         RuntimeEvent::TenantQuotaViolated(_) => "tenant_quota_violated",
         RuntimeEvent::WorkspaceCreated(_) => "workspace_created",
@@ -1430,6 +1431,9 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         }
         RuntimeEvent::TenantCreated(tenant) => {
             format!("Tenant {} created", tenant.tenant_id)
+        }
+        RuntimeEvent::TenantUpdated(tenant) => {
+            format!("Tenant {} updated", tenant.tenant_id)
         }
         RuntimeEvent::TenantQuotaSet(quota) => {
             format!("Tenant quota set for {}", quota.tenant_id)

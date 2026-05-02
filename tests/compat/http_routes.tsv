@@ -262,6 +262,8 @@ GET	/v1/workers/:id	preserve	-	-
 GET	/v1/workspaces/:tenant/:workspace/costs	preserve	-	{ total_cost_micros, total_tokens_in, total_tokens_out, provider_calls }
 GET	/v1/ws	preserve	-	-
 GET	/version	preserve	-	-
+PATCH	/v1/admin/tenants/:id	preserve	-	-
+PATCH	/v1/admin/tenants/:tenant_id/operator-profiles/:id	preserve	-	-
 PATCH	/v1/approvals/:id/amend	preserve	-	-
 PATCH	/v1/sources/:id	preserve	-	-
 PATCH	/v1/tool-call-approvals/:call_id/amend	preserve	-	-

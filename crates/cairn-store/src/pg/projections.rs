@@ -2150,15 +2150,28 @@ impl PgSyncProjection {
                 // projection inserting NULLs for fields the event
                 // did not touch. Matches the in-memory applier's
                 // `if let Some(dn)` / `if let Some(email)` gating.
+                //
+                // RFC 026 PR-A2 adds `role` — pre-A2 events deserialize
+                // with `role=None` so the COALESCE no-ops. Fresh PATCH
+                // events carry `Some(role)` and the projection's role
+                // column advances.
+                let role_str = e.role.as_ref().map(|r| {
+                    serde_json::to_string(r)
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_owned()
+                });
                 sqlx::query(
                     "UPDATE operator_profiles SET
                         display_name = COALESCE($2, display_name),
-                        email        = COALESCE($3, email)
+                        email        = COALESCE($3, email),
+                        role         = COALESCE($4, role)
                      WHERE operator_id = $1",
                 )
                 .bind(e.profile_id.as_str())
                 .bind(e.display_name.as_deref())
                 .bind(e.email.as_deref())
+                .bind(role_str.as_deref())
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
@@ -2812,6 +2825,31 @@ impl PgSyncProjection {
                 .bind(e.tenant_id.as_str())
                 .bind(&e.name)
                 .bind(e.created_at as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+
+            // RFC 026 PR-A2: tenant PATCH edit. Only the fields carried
+            // by the event are applied; `COALESCE($n, column)` leaves
+            // the existing value when the patch carried `None`. Touches
+            // `updated_at` regardless so callers get a fresh mtime.
+            RuntimeEvent::TenantUpdated(e) => {
+                let updated_at = i64::try_from(e.updated_at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "TenantUpdated.updated_at_ms {} exceeds i64::MAX",
+                        e.updated_at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE tenants SET
+                        name       = COALESCE($2, name),
+                        updated_at = $3
+                     WHERE tenant_id = $1",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.name.as_deref())
+                .bind(updated_at)
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;

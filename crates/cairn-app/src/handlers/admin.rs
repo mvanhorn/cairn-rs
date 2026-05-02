@@ -402,6 +402,77 @@ pub(crate) async fn get_tenant_handler(
     }
 }
 
+/// `PATCH /v1/admin/tenants/:id` — edit tenant name. RFC 026 PR-A2.
+///
+/// PATCH semantics: every field is optional; omitted fields are
+/// preserved. The handler rejects an all-`None` body with 422
+/// (`empty_patch`) at the service layer so UI callers get a clear
+/// signal rather than a silent success.
+///
+/// Guard: `TenantAdminGuard` — god-token bypasses for cross-tenant
+/// bootstrap; real operators need `TenantRole::Admin` for the target
+/// tenant (attached by `attach_tenant_role` middleware). A tenant-
+/// admin on `T` issuing PATCH against `T'` receives the structured
+/// `tenant_role_missing` 403 body from the guard.
+#[derive(Clone, Debug, serde::Deserialize, ToSchema)]
+pub(crate) struct PatchTenantRequest {
+    /// New display name. Optional — omit to leave the stored name
+    /// unchanged.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+pub(crate) async fn patch_tenant_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(id): Path<String>,
+    body: Result<Json<PatchTenantRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(err) => return json_rejection_response(err),
+    };
+    let tenant_id = TenantId::new(id);
+    let updated_by = audit_actor_id(&principal);
+
+    let patch = cairn_runtime::TenantUpdatePatch {
+        name: body.name.clone(),
+    };
+
+    match state
+        .runtime
+        .tenants
+        .update(tenant_id.clone(), patch, updated_by.clone())
+        .await
+    {
+        Ok(record) => {
+            // Audit every successful PATCH so operators can trace
+            // rename history. Failures also emit an audit entry in
+            // the service-layer path via `audits.record` pattern; we
+            // mirror the `create_tenant_handler` shape here.
+            match state
+                .runtime
+                .audits
+                .record(
+                    record.tenant_id.clone(),
+                    updated_by,
+                    "update_tenant".to_owned(),
+                    "tenant".to_owned(),
+                    record.tenant_id.to_string(),
+                    AuditOutcome::Success,
+                    serde_json::json!({ "name": record.name }),
+                )
+                .await
+            {
+                Ok(_) => (StatusCode::OK, Json(record)).into_response(),
+                Err(err) => runtime_error_response(err),
+            }
+        }
+        Err(err) => runtime_error_response(err),
+    }
+}
+
 pub(crate) async fn get_tenant_overview_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1438,6 +1509,136 @@ pub(crate) async fn list_operator_profiles_handler(
             items.truncate(limit);
             (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
+        Err(err) => runtime_error_response(err),
+    }
+}
+
+/// `PATCH /v1/admin/tenants/:tenant_id/operator-profiles/:id` —
+/// edit an operator profile's display_name, email, or role. RFC 026
+/// PR-A2.
+///
+/// PATCH semantics (same shape as `PatchTenantRequest`): each field
+/// is optional; `None` preserves the stored value. An all-`None` body
+/// returns 422 `empty_patch`. 404 when the operator id has no row.
+/// The route is tenant-scoped so `TenantAdminGuard` authorizes on
+/// `:tenant_id` without having to look up the operator's tenant first
+/// — matches the existing `/operator-profiles` create/list routes.
+///
+/// Note: `role` here is the `WorkspaceRole` carried on the operator's
+/// profile record (the *default* role when they join a new workspace).
+/// The tenant-scope `TenantRole` lives in a separate grant table and
+/// is edited via `/v1/admin/operators/:id/tenant-roles/:tenant`
+/// (PR-A0).
+#[derive(Clone, Debug, serde::Deserialize, ToSchema)]
+pub(crate) struct PatchOperatorProfileRequest {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub role: Option<WorkspaceRole>,
+}
+
+/// Minimal email validator shared by admin PATCH paths. Rejects
+/// blank strings and anything missing the `<local>@<domain>` split.
+/// Matches the handler's original create-time validation surface so
+/// PATCH doesn't introduce a softer contract.
+fn validate_admin_email(email: &str) -> Result<(), String> {
+    let trimmed = email.trim();
+    if trimmed.is_empty() {
+        return Err("email must not be empty".to_owned());
+    }
+    let (local, domain) = trimmed
+        .split_once('@')
+        .ok_or_else(|| "email must be of the form <local>@<domain>".to_owned())?;
+    if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+        return Err("email must be of the form <local>@<domain>".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) async fn patch_operator_profile_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path((tenant_id, operator_id)): Path<(String, String)>,
+    body: Result<Json<PatchOperatorProfileRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(err) => return json_rejection_response(err),
+    };
+    // Validate email up-front so typos round-trip as a 422 rather than
+    // landing in the event log.
+    if let Some(email) = body.email.as_deref() {
+        if let Err(msg) = validate_admin_email(email) {
+            return validation_error_response(msg);
+        }
+    }
+    // Resolve the operator first so we can enforce cross-tenant
+    // isolation: a tenant-admin on `T` must not edit an operator that
+    // belongs to `T'`. `TenantAdminGuard` already proves the caller
+    // has Admin on `:tenant_id`; we just need the operator's tenant
+    // to match.
+    let tenant_id = TenantId::new(tenant_id);
+    let operator_id = OperatorId::new(operator_id);
+
+    match state.runtime.operator_profiles.get(&operator_id).await {
+        Ok(Some(existing)) if existing.tenant_id != tenant_id => {
+            return AppApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "operator profile not found for this tenant",
+            )
+            .into_response();
+        }
+        Ok(None) => {
+            return AppApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "operator profile not found",
+            )
+            .into_response();
+        }
+        Ok(Some(_)) => {}
+        Err(err) => return runtime_error_response(err),
+    }
+
+    let updated_by = audit_actor_id(&principal);
+    let patch = cairn_runtime::OperatorProfilePatch {
+        display_name: body.display_name,
+        email: body.email,
+        role: body.role,
+    };
+
+    match state
+        .runtime
+        .operator_profiles
+        .patch_profile(&operator_id, patch)
+        .await
+    {
+        Ok(profile) => match state
+            .runtime
+            .audits
+            .record(
+                profile.tenant_id.clone(),
+                updated_by,
+                "update_operator_profile".to_owned(),
+                "operator_profile".to_owned(),
+                profile.operator_id.to_string(),
+                AuditOutcome::Success,
+                serde_json::json!({
+                    "display_name": profile.display_name,
+                    "email": profile.email,
+                    "role": profile.role,
+                }),
+            )
+            .await
+        {
+            Ok(_) => (StatusCode::OK, Json(profile)).into_response(),
+            Err(err) => runtime_error_response(err),
+        },
         Err(err) => runtime_error_response(err),
     }
 }

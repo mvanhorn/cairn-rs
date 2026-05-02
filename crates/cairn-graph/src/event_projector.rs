@@ -372,6 +372,7 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::PromptReleaseTransitioned(_)
             | RuntimeEvent::PromptRolloutStarted(_)
             | RuntimeEvent::TenantCreated(_)
+            | RuntimeEvent::TenantUpdated(_)
             | RuntimeEvent::WorkspaceCreated(_)
             | RuntimeEvent::WorkspaceArchived(_)
             | RuntimeEvent::EvalRunArchived(_)

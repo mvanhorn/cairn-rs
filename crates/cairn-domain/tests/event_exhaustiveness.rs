@@ -274,6 +274,9 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::TenantCreated(_) => {
             assert!(eref.is_none());
         }
+        RuntimeEvent::TenantUpdated(_) => {
+            assert!(eref.is_none());
+        }
         RuntimeEvent::WorkspaceCreated(_) => {
             assert!(eref.is_none());
         }
@@ -1088,6 +1091,13 @@ fn all_variants() -> Vec<RuntimeEvent> {
             name: "T".to_owned(),
             created_at: ts,
         }),
+        RuntimeEvent::TenantUpdated(cairn_domain::TenantUpdated {
+            project: p(),
+            tenant_id: tid(),
+            name: Some("T (updated)".to_owned()),
+            updated_by: "op_admin".to_owned(),
+            updated_at_ms: ts,
+        }),
         RuntimeEvent::WorkspaceCreated(WorkspaceCreated {
             project: p(),
             workspace_id: WorkspaceId::new("w_exh"),
@@ -1433,6 +1443,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             profile_id: OperatorId::new("op1"),
             display_name: None,
             email: None,
+            role: None,
         }),
         RuntimeEvent::TenantRoleGranted(cairn_domain::TenantRoleGranted {
             tenant_id: tid(),
@@ -1968,12 +1979,13 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 160 variants in the RuntimeEvent enum (158 baseline + RFC 026 PR-A0
-    // TenantRoleGranted + TenantRoleRevoked).
+    // 161 variants in the RuntimeEvent enum (158 baseline + RFC 026 PR-A0
+    // TenantRoleGranted + TenantRoleRevoked + RFC 026 PR-A2
+    // TenantUpdated).
     assert_eq!(
         variants.len(),
-        160,
-        "all_variants() must construct exactly 160 RuntimeEvent instances"
+        161,
+        "all_variants() must construct exactly 161 RuntimeEvent instances"
     );
 }
 

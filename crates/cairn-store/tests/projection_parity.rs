@@ -103,6 +103,10 @@ mod in_memory_vs_sqlite {
         TaskStateChanged, TenantCreated, TenantId, ToolRecoveryPaused, UserMessageAppended,
         WorkerId, WorkspaceCreated, WorkspaceId,
     };
+    // RFC 026 PR-A2: TenantUpdated is tested in a dedicated fixture
+    // below alongside the other tenant lifecycle variants; import on
+    // the test block rather than the module to keep the original
+    // TenantCreated-era import list stable.
     use cairn_store::event_log::EventLog;
     use cairn_store::in_memory::InMemoryStore;
     use cairn_store::projections::{
@@ -465,6 +469,8 @@ mod in_memory_vs_sqlite {
             // RFC 026 PR-A0: tenant-admin role fixtures below.
             "TenantRoleGranted",
             "TenantRoleRevoked",
+            // RFC 026 PR-A2: tenant PATCH edit fixture below.
+            "TenantUpdated",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -4623,6 +4629,101 @@ mod in_memory_vs_sqlite {
         assert_eq!(sqlite_list[0].role, TenantRole::Member);
         assert_eq!(mem_list[1].role, TenantRole::Admin);
         assert_eq!(sqlite_list[1].role, TenantRole::Admin);
+    }
+
+    // ── RFC 026 PR-A2: tenant PATCH edit projection parity. ──────────
+    //
+    // `TenantCreated` seeds the row, then `TenantUpdated` with a new
+    // `name` must land identically on both backends. A second
+    // `TenantUpdated` with `name = None` must be a no-op on `name` but
+    // still advance `updated_at`. Cross-backend parity on tenant mtime
+    // is what the admin UI reads to render "last modified" badges.
+    //
+    // `TenantReadModel` is not implemented on `SqliteAdapter` (tenants
+    // are queried via cairn-app org routes in the in-memory path, with
+    // the sqlite row read through a raw sqlx query). Match the pattern
+    // established by `org_hierarchy_projection_matches_across_backends`
+    // above and assert event-stream equality + in-memory row shape, then
+    // cross-check the sqlite row via a raw query so both backends are
+    // observed to converge on `(name="After", updated_at=3_000)`.
+    #[tokio::test]
+    async fn tenant_updated_projection_matches_across_backends() {
+        use cairn_domain::TenantUpdated;
+        use cairn_store::projections::TenantReadModel;
+        use sqlx::Row;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_patch_parity");
+        let project = ProjectKey::new(tenant_id.as_str(), "__system__", "__system__");
+        let events = vec![
+            env(RuntimeEvent::TenantCreated(TenantCreated {
+                project: project.clone(),
+                tenant_id: tenant_id.clone(),
+                name: "Before".into(),
+                created_at: 1_000,
+            })),
+            // Patch applies a new name and advances `updated_at`.
+            env(RuntimeEvent::TenantUpdated(TenantUpdated {
+                project: project.clone(),
+                tenant_id: tenant_id.clone(),
+                name: Some("After".into()),
+                updated_by: "op_admin".into(),
+                updated_at_ms: 2_000,
+            })),
+            // Empty-patch replay: `name=None` preserves the existing
+            // name but still bumps `updated_at` on both backends.
+            env(RuntimeEvent::TenantUpdated(TenantUpdated {
+                project: project.clone(),
+                tenant_id: tenant_id.clone(),
+                name: None,
+                updated_by: "op_admin".into(),
+                updated_at_ms: 3_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        // 1. In-memory row — exercises the `if let Some(name)` /
+        //    `updated_at = e.updated_at_ms` applier branches.
+        let mem_rec = TenantReadModel::get(&mem, &tenant_id)
+            .await
+            .unwrap()
+            .expect("in-memory tenant row after patch");
+        assert_eq!(mem_rec.name, "After", "patch replaced name in-memory");
+        assert_eq!(
+            mem_rec.created_at, 1_000,
+            "create timestamp preserved in-memory"
+        );
+        assert_eq!(
+            mem_rec.updated_at, 3_000,
+            "second (empty) patch still advanced updated_at in-memory"
+        );
+
+        // 2. Sqlite row via raw sqlx — exercises the COALESCE branch
+        //    of the pg/sqlite applier.
+        let sqlite_row =
+            sqlx::query("SELECT name, created_at, updated_at FROM tenants WHERE tenant_id = ?")
+                .bind(tenant_id.as_str())
+                .fetch_one(adapter.pool())
+                .await
+                .expect("sqlite tenants row after patch");
+        let sqlite_name: String = sqlite_row.get("name");
+        let sqlite_created_at: i64 = sqlite_row.get("created_at");
+        let sqlite_updated_at: i64 = sqlite_row.get("updated_at");
+        assert_eq!(
+            sqlite_name, mem_rec.name,
+            "name parity between in-memory and sqlite"
+        );
+        assert_eq!(
+            sqlite_created_at as u64, mem_rec.created_at,
+            "created_at parity between in-memory and sqlite"
+        );
+        assert_eq!(
+            sqlite_updated_at as u64, mem_rec.updated_at,
+            "updated_at parity between in-memory and sqlite"
+        );
     }
 }
 

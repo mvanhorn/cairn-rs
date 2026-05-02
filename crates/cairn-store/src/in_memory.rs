@@ -1335,6 +1335,16 @@ impl InMemoryStore {
                     if let Some(email) = &e.email {
                         rec.email = Some(email.clone());
                     }
+                    // RFC 026 PR-A2: role edit. Same serialization as
+                    // `OperatorProfileCreated` — serde_json::to_string
+                    // yields a quoted variant name; strip the quotes so
+                    // the stored value matches `role TEXT NOT NULL`.
+                    if let Some(role) = &e.role {
+                        rec.role = serde_json::to_string(role)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                            .to_owned();
+                    }
                 }
                 if let Some(profile) = state.full_operator_profiles.get_mut(e.profile_id.as_str()) {
                     if let Some(dn) = &e.display_name {
@@ -1342,6 +1352,9 @@ impl InMemoryStore {
                     }
                     if let Some(email) = &e.email {
                         profile.email = email.clone();
+                    }
+                    if let Some(role) = &e.role {
+                        profile.role = *role;
                     }
                 }
             }
@@ -2622,6 +2635,18 @@ impl InMemoryStore {
                         updated_at: e.created_at,
                     },
                 );
+            }
+            // RFC 026 PR-A2: tenant PATCH edit. Leave fields untouched
+            // when the event carries `None` (matches pg/sqlite
+            // COALESCE). `updated_at` always advances to the event's
+            // `updated_at_ms` so admin-UI mtimes stay in sync.
+            RuntimeEvent::TenantUpdated(e) => {
+                if let Some(rec) = state.tenants.get_mut(e.tenant_id.as_str()) {
+                    if let Some(name) = &e.name {
+                        rec.name = name.clone();
+                    }
+                    rec.updated_at = e.updated_at_ms;
+                }
             }
             RuntimeEvent::WorkspaceCreated(e) => {
                 state.workspaces.insert(

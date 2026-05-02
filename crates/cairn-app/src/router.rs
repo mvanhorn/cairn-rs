@@ -1184,7 +1184,14 @@ impl AppBootstrap {
                 "/v1/admin/audit-log/:resource_type/:resource_id",
                 get(list_audit_log_for_resource_handler),
             )
-            .route("/v1/admin/tenants/:id", get(get_tenant_handler))
+            // RFC 026 PR-A2: tenant PATCH edit. `TenantAdminGuard` on
+            // the PATCH handler scopes the write to the target tenant
+            // even when the god-token bypasses the guard for cross-
+            // tenant bootstrap.
+            .route(
+                "/v1/admin/tenants/:id",
+                get(get_tenant_handler).patch(patch_tenant_handler),
+            )
             .route(
                 "/v1/admin/tenants/:id/overview",
                 get(get_tenant_overview_handler),
@@ -1249,6 +1256,15 @@ impl AppBootstrap {
             .route(
                 "/v1/admin/tenants/:tenant_id/operator-profiles",
                 post(create_operator_profile_handler),
+            )
+            // RFC 026 PR-A2: operator-profile PATCH edit. Tenant-scoped
+            // so `TenantAdminGuard` authorizes on the URL's tenant_id
+            // without a pre-lookup; the handler rejects cross-tenant
+            // ids with 404 so a tenant-admin on T cannot reach an
+            // operator that belongs to T'.
+            .route(
+                "/v1/admin/tenants/:tenant_id/operator-profiles/:id",
+                patch(patch_operator_profile_handler),
             )
             .route(
                 "/v1/admin/tenants/:tenant_id/credentials",
