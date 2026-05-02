@@ -9,10 +9,10 @@ use flowfabric::core::types::{
 };
 use flowfabric::sdk::task::{Signal, SignalOutcome};
 
-use crate::boot::FabricRuntime;
 use crate::engine::Engine;
 use crate::error::FabricError;
 use crate::helpers::sanitize_signal_component;
+use crate::runtime_handle::FabricRuntimeHandle;
 
 /// Bounded cap for the per-execution `lane_id` cache (#506).
 ///
@@ -167,7 +167,17 @@ impl LaneIdCache {
 }
 
 pub struct SignalBridge {
-    runtime: Arc<FabricRuntime>,
+    // PR-C4c: backend-agnostic runtime handle. Accesses
+    // `partition_config()`, `signal_dedup_ttl_ms()`, `backend()`,
+    // and the Valkey-only `fcall()` escape hatch. On the Postgres
+    // runtime `fcall()` returns `EngineError::Unavailable` — every
+    // signal delivery surfaces that as a typed FabricError::Engine
+    // at the service boundary. Cairn-app's signal-delivery surfaces
+    // (approval resolution, tool-result, child-completed) are
+    // currently Valkey-only at the app layer; the PG
+    // full-aggregate-boot path this refactor enables doesn't
+    // exercise them.
+    runtime: Arc<dyn FabricRuntimeHandle>,
     /// Cairn-side read abstraction over FF state. Used to fetch
     /// `lane_id` on the signal-delivery hot path through a narrow
     /// trait method ([`Engine::get_execution_lane_id`]) instead of
@@ -195,9 +205,9 @@ pub struct SignalBridge {
 }
 
 impl SignalBridge {
-    pub fn new(runtime: &Arc<FabricRuntime>, engine: Arc<dyn Engine>) -> Self {
+    pub fn new(runtime: Arc<dyn FabricRuntimeHandle>, engine: Arc<dyn Engine>) -> Self {
         Self {
-            runtime: runtime.clone(),
+            runtime,
             engine,
             lane_id_cache: LaneIdCache::new(),
         }
@@ -239,7 +249,7 @@ impl SignalBridge {
 
         let waitpoint_token = read_waitpoint_token(
             self.runtime.backend().as_ref(),
-            &self.runtime.partition_config,
+            self.runtime.partition_config(),
             execution_id,
             waitpoint_id,
         )
@@ -276,7 +286,7 @@ impl SignalBridge {
         let safe_id = sanitize_signal_component(child_task_id);
         let waitpoint_token = read_waitpoint_token(
             self.runtime.backend().as_ref(),
-            &self.runtime.partition_config,
+            self.runtime.partition_config(),
             parent_execution_id,
             parent_waitpoint_id,
         )
@@ -306,7 +316,7 @@ impl SignalBridge {
         let safe_id = sanitize_signal_component(invocation_id);
         let waitpoint_token = read_waitpoint_token(
             self.runtime.backend().as_ref(),
-            &self.runtime.partition_config,
+            self.runtime.partition_config(),
             execution_id,
             waitpoint_id,
         )
@@ -334,7 +344,7 @@ impl SignalBridge {
     ) -> Result<SignalOutcome, FabricError> {
         let partition = flowfabric::core::partition::execution_partition(
             execution_id,
-            &self.runtime.partition_config,
+            self.runtime.partition_config(),
         );
         let ctx = ExecKeyContext::new(&partition, execution_id);
         let idx = flowfabric::core::keys::IndexKeys::new(&partition);
@@ -380,7 +390,7 @@ impl SignalBridge {
             payload_str,
             effective_idem,
             now,
-            self.runtime.config.signal_dedup_ttl_ms,
+            self.runtime.signal_dedup_ttl_ms(),
             crate::constants::DEFAULT_SIGNAL_MAXLEN,
             crate::constants::DEFAULT_MAX_SIGNALS_PER_EXECUTION,
             signal.waitpoint_token.as_str(),

@@ -7,20 +7,24 @@ use cairn_domain::SessionId;
 use cairn_store::projections::SessionRecord;
 use flowfabric::core::types::{FlowId, Namespace, TimestampMs};
 
-use crate::boot::FabricRuntime;
 use crate::engine::ControlPlaneBackend;
 use crate::error::FabricError;
 use crate::event_bridge::{BridgeEvent, EventBridge};
 use crate::helpers::try_parse_project_key;
 use crate::id_map;
+use crate::runtime_handle::FabricRuntimeHandle;
 
 pub struct FabricSessionService {
     /// Retained for API parity with the other fabric services. Not
     /// read directly from this service anymore — all FF-state reads
     /// go through `engine` and all FCALL-dispatch goes through
     /// `control_plane`.
+    ///
+    /// PR-C4c: lifted from `Arc<FabricRuntime>` to
+    /// `Arc<dyn FabricRuntimeHandle>` so the Postgres runtime can
+    /// satisfy the constructor.
     #[allow(dead_code)]
-    runtime: Arc<FabricRuntime>,
+    runtime: Arc<dyn FabricRuntimeHandle>,
     bridge: Arc<EventBridge>,
     engine: Arc<dyn crate::engine::Engine>,
     control_plane: Arc<dyn ControlPlaneBackend>,
@@ -28,7 +32,7 @@ pub struct FabricSessionService {
 
 impl FabricSessionService {
     pub fn new(
-        runtime: Arc<FabricRuntime>,
+        runtime: Arc<dyn FabricRuntimeHandle>,
         bridge: Arc<EventBridge>,
         engine: Arc<dyn crate::engine::Engine>,
         control_plane: Arc<dyn ControlPlaneBackend>,

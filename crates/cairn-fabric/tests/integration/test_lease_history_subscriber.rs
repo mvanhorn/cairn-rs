@@ -43,7 +43,9 @@ async fn subscriber_emits_retryable_failed_on_lease_expiry() {
         harness.event_log.clone();
     let cursor_store: Arc<dyn FfLeaseHistoryCursorStore> = harness.event_log.clone();
 
-    let mut config: cairn_fabric::FabricConfig = (*harness.fabric.runtime.config).clone();
+    // PR-C4c: pull the FabricConfig from the concrete Valkey runtime.
+    // `TestHarness` is Valkey-only (see `valkey_runtime` helper docstring).
+    let mut config: cairn_fabric::FabricConfig = (*harness.valkey_runtime().config).clone();
     // Per-test-unique namespace prevents collision if multiple tests
     // spin up their own FabricServices against the same container.
     config.namespace = flowfabric::core::types::Namespace::new(format!(
@@ -99,19 +101,29 @@ async fn subscriber_emits_retryable_failed_on_lease_expiry() {
 
     // Derive the exec_id from the same mint cairn-fabric used for
     // this task.
-    let partition_config = subscriber_fabric.runtime.partition_config;
+    let partition_config = *subscriber_fabric.runtime.partition_config();
     let eid =
         id_map::session_task_to_execution_id(&project, &session_id, &task_id, &partition_config);
     let partition = execution_partition(&eid, &partition_config);
     let ctx = ExecKeyContext::new(&partition, &eid);
 
+    // PR-C4c: pull the raw `ferriskey::Client` from the concrete
+    // Valkey runtime slot — the `runtime` field is now the trait
+    // object `Arc<dyn FabricRuntimeHandle>` and doesn't expose
+    // `client` directly. `subscriber_fabric` is Valkey-only
+    // (built via `start_with_lease_history`), so the slot is
+    // always `Some`.
+    let subscriber_client = &subscriber_fabric
+        .valkey_runtime
+        .as_ref()
+        .expect("subscriber_fabric is Valkey-only")
+        .client;
+
     // Backdate the lease so ff_mark_lease_expired_if_due's "actually
     // expired" guard passes. Cairn's projection still reads lease
     // state from exec_core — backdating keeps the per-exec state
     // consistent with what the subscriber will observe.
-    let _: ferriskey::Value = subscriber_fabric
-        .runtime
-        .client
+    let _: ferriskey::Value = subscriber_client
         .cmd("HSET")
         .arg(ctx.core())
         .arg("lease_expires_at")
@@ -124,9 +136,7 @@ async fn subscriber_emits_retryable_failed_on_lease_expiry() {
     // the expiry (for the subsequent `resolve_context` HGETALL inside
     // the subscriber).
     let index = flowfabric::core::keys::IndexKeys::new(&partition);
-    let _: ferriskey::Value = subscriber_fabric
-        .runtime
-        .client
+    let _: ferriskey::Value = subscriber_client
         .fcall(
             "ff_mark_lease_expired_if_due",
             &[
@@ -158,9 +168,7 @@ async fn subscriber_emits_retryable_failed_on_lease_expiry() {
         index: 0,
     };
     let partition_stream_key = format!("ff:part:{}:lease_history", flow_partition_0.hash_tag());
-    let _: ferriskey::Value = subscriber_fabric
-        .runtime
-        .client
+    let _: ferriskey::Value = subscriber_client
         .cmd("XADD")
         .arg(partition_stream_key.as_str())
         .arg("*")

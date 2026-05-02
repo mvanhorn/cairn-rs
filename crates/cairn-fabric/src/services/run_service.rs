@@ -7,7 +7,6 @@ use cairn_store::projections::RunRecord;
 use crate::error::FabricError;
 use flowfabric::core::types::{ExecutionId, LaneId, Namespace};
 
-use crate::boot::FabricRuntime;
 use crate::engine::{
     CancelRunInput, CompleteRunInput, ControlPlaneBackend, CreateRunExecutionInput,
     DeliverApprovalSignalInput, Engine, ExecutionLeaseContext, ExecutionSnapshot,
@@ -16,10 +15,15 @@ use crate::engine::{
 use crate::event_bridge::{BridgeEvent, EventBridge};
 use crate::helpers::{now_ms, try_parse_project_key};
 use crate::id_map;
+use crate::runtime_handle::FabricRuntimeHandle;
 use crate::state_map;
 
 pub struct FabricRunService {
-    runtime: Arc<FabricRuntime>,
+    // PR-C4c: backend-agnostic runtime handle. Reads only
+    // `partition_config`, `worker_instance_id`, `lease_ttl_ms`,
+    // `signal_dedup_ttl_ms`, `backend()` — all satisfied by the
+    // Postgres runtime too.
+    runtime: Arc<dyn FabricRuntimeHandle>,
     bridge: Arc<EventBridge>,
     engine: Arc<dyn Engine>,
     control_plane: Arc<dyn ControlPlaneBackend>,
@@ -27,7 +31,7 @@ pub struct FabricRunService {
 
 impl FabricRunService {
     pub fn new(
-        runtime: Arc<FabricRuntime>,
+        runtime: Arc<dyn FabricRuntimeHandle>,
         bridge: Arc<EventBridge>,
         engine: Arc<dyn Engine>,
         control_plane: Arc<dyn ControlPlaneBackend>,
@@ -57,7 +61,7 @@ impl FabricRunService {
             project,
             session_id,
             run_id,
-            &self.runtime.partition_config,
+            self.runtime.partition_config(),
         )
     }
 
@@ -189,7 +193,7 @@ impl FabricRunService {
         // this tag is mandatory on every execution cairn creates.
         tags.insert(
             "cairn.instance_id".to_owned(),
-            self.runtime.config.worker_instance_id.to_string(),
+            self.runtime.worker_instance_id().to_string(),
         );
         if let Some(parent) = parent_run_id.as_ref() {
             tags.insert("cairn.parent_run_id".to_owned(), parent.as_str().to_owned());
@@ -315,7 +319,7 @@ impl FabricRunService {
             .issue_grant_and_claim(crate::engine::IssueGrantAndClaimInput {
                 execution_id: eid,
                 lane_id,
-                lease_duration_ms: self.runtime.config.lease_ttl_ms,
+                lease_duration_ms: self.runtime.lease_ttl_ms(),
             })
             .await?;
 
@@ -392,7 +396,7 @@ impl FabricRunService {
             .issue_grant_and_claim(crate::engine::IssueGrantAndClaimInput {
                 execution_id: eid,
                 lane_id,
-                lease_duration_ms: self.runtime.config.lease_ttl_ms,
+                lease_duration_ms: self.runtime.lease_ttl_ms(),
             })
             .await?;
 
@@ -528,7 +532,7 @@ impl FabricRunService {
             .renew_task_lease(crate::engine::RenewLeaseInput {
                 execution_id: eid.clone(),
                 lease: lease_ctx,
-                lease_extension_ms: self.runtime.config.lease_ttl_ms,
+                lease_extension_ms: self.runtime.lease_ttl_ms(),
             })
             .await;
 
@@ -961,7 +965,7 @@ impl FabricRunService {
                 waitpoint_id,
                 signal_name,
                 idempotency_suffix: idem_suffix,
-                signal_dedup_ttl_ms: self.runtime.config.signal_dedup_ttl_ms,
+                signal_dedup_ttl_ms: self.runtime.signal_dedup_ttl_ms(),
                 maxlen: crate::constants::DEFAULT_SIGNAL_MAXLEN_U64,
                 max_signals_per_execution: crate::constants::DEFAULT_MAX_SIGNALS_PER_EXECUTION_U64,
             })

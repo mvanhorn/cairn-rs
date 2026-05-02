@@ -266,13 +266,17 @@ async fn engine_config_scanner_filter_is_wired() {
     // worker_instance_id landed there. If it didn't, the upstream
     // filter would silently treat every frame as foreign — the exact
     // regression this test catches.
-    let partition_config = fabric.runtime.partition_config;
+    // PR-C4c: route through trait + `valkey_runtime` slot since
+    // `fabric.runtime` is now `Arc<dyn FabricRuntimeHandle>`.
+    let partition_config = *fabric.runtime.partition_config();
     let eid =
         id_map::session_task_to_execution_id(&project, &session_id, &task_id, &partition_config);
     let partition = execution_partition(&eid, &partition_config);
     let ctx = ExecKeyContext::new(&partition, &eid);
     let stamped: Option<String> = fabric
-        .runtime
+        .valkey_runtime
+        .as_ref()
+        .expect("test is Valkey-only")
         .client
         .hget(&ctx.tags(), "cairn.instance_id")
         .await

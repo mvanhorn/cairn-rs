@@ -77,7 +77,9 @@ pub(crate) async fn debug_partition_handler(
         )
         .into_response();
     };
-    let partition_config = fabric.runtime.partition_config;
+    // PR-C4c: partition_config is exposed through the trait accessor
+    // now — works on both Valkey and Postgres runtimes.
+    let partition_config = *fabric.runtime.partition_config();
     let store = &state.runtime.store;
 
     match query.kind.as_str() {

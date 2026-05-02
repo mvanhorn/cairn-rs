@@ -37,6 +37,25 @@ struct TestInstance {
     config: FabricConfig,
 }
 
+impl TestInstance {
+    /// Convenience accessor for the Valkey-concrete runtime. This
+    /// test file spawns Valkey-only fabrics, so the
+    /// `valkey_runtime` slot is always `Some(_)`. Introduced in
+    /// PR-C4c when `FabricServices::runtime` became the trait
+    /// object `Arc<dyn FabricRuntimeHandle>`.
+    fn valkey_runtime(&self) -> &Arc<cairn_fabric::FabricRuntime> {
+        self.fabric
+            .valkey_runtime
+            .as_ref()
+            .expect("TestInstance is Valkey-only; valkey_runtime must be Some")
+    }
+
+    /// Borrow the trait-object partition config — backend-agnostic.
+    fn partition_config(&self) -> &flowfabric::core::partition::PartitionConfig {
+        self.fabric.runtime.partition_config()
+    }
+}
+
 async fn spawn_instance(instance_suffix: &str) -> TestInstance {
     let (host, port) = valkey_endpoint().await;
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -142,7 +161,7 @@ async fn create_and_expire_task_lease(inst: &TestInstance) -> (SessionId, TaskId
         .await
         .expect("claim_from_grant");
 
-    let partition_config = inst.fabric.runtime.partition_config;
+    let partition_config = *inst.partition_config();
     let eid = id_map::session_task_to_execution_id(
         &inst.project,
         &session_id,
@@ -154,8 +173,7 @@ async fn create_and_expire_task_lease(inst: &TestInstance) -> (SessionId, TaskId
     let idx = IndexKeys::new(&partition);
 
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .cmd("HSET")
         .arg(ctx.core())
@@ -166,8 +184,7 @@ async fn create_and_expire_task_lease(inst: &TestInstance) -> (SessionId, TaskId
         .expect("HSET lease_expires_at");
 
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .fcall(
             "ff_mark_lease_expired_if_due",
@@ -194,8 +211,7 @@ async fn create_and_expire_task_lease(inst: &TestInstance) -> (SessionId, TaskId
     };
     let partition_stream_key = format!("ff:part:{}:lease_history", flow_partition_0.hash_tag());
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .cmd("XADD")
         .arg(partition_stream_key.as_str())
@@ -355,7 +371,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
         .await
         .expect("submit task");
 
-    let partition_config = inst.fabric.runtime.partition_config;
+    let partition_config = *inst.partition_config();
     let eid = id_map::session_task_to_execution_id(
         &inst.project,
         &session_id,
@@ -369,8 +385,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
     // Strip the tag — simulates a pre-filter execution surviving into
     // the new binary.
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .cmd("HDEL")
         .arg(ctx.tags())
@@ -381,7 +396,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
 
     // Run the backfill — it should re-stamp the tag.
     let outcome = cairn_fabric::instance_tag_backfill::backfill_instance_tag(
-        &inst.fabric.runtime.client,
+        &inst.valkey_runtime().client,
         inst.config.worker_instance_id.as_str(),
     )
     .await
@@ -393,8 +408,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
 
     // Confirm the tag is now present on the exec.
     let tag: Option<String> = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .hget(&ctx.tags(), "cairn.instance_id")
         .await
@@ -433,8 +447,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
         .expect("claim_from_grant");
 
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .cmd("HSET")
         .arg(ctx.core())
@@ -444,8 +457,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
         .await
         .expect("HSET lease_expires_at");
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .fcall(
             "ff_mark_lease_expired_if_due",
@@ -468,8 +480,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
     };
     let partition_stream_key = format!("ff:part:{}:lease_history", flow_partition_0.hash_tag());
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .cmd("XADD")
         .arg(partition_stream_key.as_str())
@@ -517,7 +528,7 @@ async fn run_lease_expiry_honours_instance_tag_filter() {
         .await
         .expect("run start");
 
-    let partition_config = inst_a.fabric.runtime.partition_config;
+    let partition_config = *inst_a.partition_config();
     let eid = id_map::session_run_to_execution_id(
         &inst_a.project,
         &session_id,
@@ -528,9 +539,9 @@ async fn run_lease_expiry_honours_instance_tag_filter() {
     let ctx = ExecKeyContext::new(&partition, &eid);
 
     // Confirm the instance_id tag was written on run create.
+    // PR-C4c: route through `valkey_runtime()` helper.
     let tag: Option<String> = inst_a
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .hget(&ctx.tags(), "cairn.instance_id")
         .await

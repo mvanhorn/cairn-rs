@@ -324,3 +324,52 @@ impl FabricRuntime {
 // (~45 LOC of per-partition HSET loops) was deleted in favour of
 // `EngineBackend::seed_waitpoint_hmac_secret`. Call site lives in
 // `FabricRuntime::start` above.
+
+// PR-C4c: impl the backend-agnostic `FabricRuntimeHandle` trait so
+// services can hold `Arc<dyn FabricRuntimeHandle>` instead of the
+// concrete Valkey-typed `Arc<FabricRuntime>`. All accessors
+// delegate to the existing fields; `valkey_client` returns `Some`
+// (this IS the Valkey runtime) and `fcall` delegates to
+// [`FabricRuntime::fcall`].
+#[async_trait::async_trait]
+impl crate::runtime_handle::FabricRuntimeHandle for FabricRuntime {
+    fn partition_config(&self) -> &PartitionConfig {
+        &self.partition_config
+    }
+
+    fn worker_instance_id(&self) -> &flowfabric::core::types::WorkerInstanceId {
+        &self.config.worker_instance_id
+    }
+
+    fn lease_ttl_ms(&self) -> u64 {
+        self.config.lease_ttl_ms
+    }
+
+    fn signal_dedup_ttl_ms(&self) -> u64 {
+        self.config.signal_dedup_ttl_ms
+    }
+
+    fn worker_capabilities(&self) -> &std::collections::BTreeSet<String> {
+        &self.config.worker_capabilities
+    }
+
+    fn backend(&self) -> &Arc<dyn EngineBackend> {
+        &self.backend
+    }
+
+    fn valkey_client(&self) -> Option<&ferriskey::Client> {
+        Some(&self.client)
+    }
+
+    async fn fcall(
+        &self,
+        function: &str,
+        keys: &[String],
+        args: &[String],
+    ) -> Result<ferriskey::Value, crate::error::FabricError> {
+        // Delegate to the existing inherent method so debug-mode
+        // arg verification + the `fcall_timeout_ms` timeout both
+        // fire exactly once.
+        FabricRuntime::fcall(self, function, keys, args).await
+    }
+}

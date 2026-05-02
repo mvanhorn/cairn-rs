@@ -150,7 +150,7 @@ React 19 + TypeScript + Tailwind v4 + TanStack Query. 30 operator pages. Embedde
 - **List responses** are inconsistent: some endpoints return `T[]`, others `{items: T[], hasMore}`. The UI `getList()` helper in `api.ts` normalizes both. Always use `getList()` for list endpoints.
 - **Health endpoints**: `/health` returns `{status: "healthy", store_ok, ...}`. `/v1/status` returns `{status: "ok", components: [...]}`. Use `isRuntimeHealthy()` / `isStoreHealthy()` from `ui/src/lib/types.ts` — never access `runtime_ok` or `store_ok` directly.
 - **Store backends**: Feature-gated via Cargo features (`postgres`, `sqlite`). Default is Postgres when `DATABASE_URL` is set. Use `--db memory` for explicit in-memory (ephemeral, with startup warning).
-- **Fabric backends**: FlowFabric control-plane runs on Valkey (default, complete) or Postgres (`fabric-postgres` feature, control-plane-only). See [`docs/design/postgres-parity-gaps.md`](docs/design/postgres-parity-gaps.md) for the per-method parity table + operator guide.
+- **Fabric backends**: FlowFabric control-plane runs on Valkey (default, complete) or Postgres (`fabric-postgres` feature). PR-C4c (cairn-rs #602) landed full service-aggregate boot on both backends; run / task / session / quota surfaces route through the same trait objects. Worker-claim and signal-delivery paths are still Valkey-only at the service layer until FF surfaces the equivalents on `EngineBackend`. See [`docs/design/postgres-parity-gaps.md`](docs/design/postgres-parity-gaps.md) for the per-method parity table + operator guide.
 - **`unsafe_code = "forbid"`** at workspace level. No exceptions.
 - **RFCs**: Behavior is specified by RFCs in `docs/design/rfcs/`. Each RFC has integration tests as compliance proof.
 

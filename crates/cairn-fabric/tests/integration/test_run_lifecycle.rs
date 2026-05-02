@@ -49,9 +49,10 @@ async fn test_start_with_correlation_tags_exec_core() {
     );
     let partition = flowfabric::core::partition::execution_partition(&eid, h.partition_config());
     let ctx = flowfabric::core::keys::ExecKeyContext::new(&partition, &eid);
+    // PR-C4c: `runtime.client` is no longer a field on the trait
+    // object. Pull through the Valkey-concrete runtime handle.
     let tags: HashMap<String, String> = h
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .hgetall(&ctx.tags())
         .await

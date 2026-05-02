@@ -17,11 +17,11 @@ use std::sync::Arc;
 
 use flowfabric::core::types::{ExecutionId, QuotaPolicyId};
 
-use crate::boot::FabricRuntime;
 use crate::engine::control_plane::ControlPlaneBackend;
 use crate::engine::control_plane_types::QuotaAdmission;
 use crate::error::FabricError;
 use crate::id_map;
+use crate::runtime_handle::FabricRuntimeHandle;
 
 /// Re-export of the mirror type under the historical service-level
 /// name. Existing callers that imported
@@ -30,11 +30,19 @@ pub type AdmissionResult = QuotaAdmission;
 
 pub struct FabricQuotaService {
     backend: Arc<dyn ControlPlaneBackend>,
-    runtime: Arc<FabricRuntime>,
+    // PR-C4c: backend-agnostic runtime handle. Reads
+    // `partition_config` only (for `check_admission_for_run`'s
+    // ExecutionId minting). Holding the trait object instead of
+    // `Arc<FabricRuntime>` lets the PG runtime satisfy this
+    // constructor without faking a Valkey-typed client.
+    runtime: Arc<dyn FabricRuntimeHandle>,
 }
 
 impl FabricQuotaService {
-    pub fn new(backend: Arc<dyn ControlPlaneBackend>, runtime: Arc<FabricRuntime>) -> Self {
+    pub fn new(
+        backend: Arc<dyn ControlPlaneBackend>,
+        runtime: Arc<dyn FabricRuntimeHandle>,
+    ) -> Self {
         Self { backend, runtime }
     }
 
@@ -145,7 +153,7 @@ impl FabricQuotaService {
             project,
             session_id,
             run_id,
-            &self.runtime.partition_config,
+            self.runtime.partition_config(),
         );
         self.check_admission(
             quota_policy_id,

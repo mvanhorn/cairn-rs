@@ -201,8 +201,7 @@ async fn test_heartbeat_with_stale_epoch_is_rejected() {
     // epoch check, and we wouldn't be proving what we claim to be proving.
     let attempt_id: String = {
         let v: Option<String> = h
-            .fabric
-            .runtime
+            .valkey_runtime()
             .client
             .hget(&ctx.core(), "current_attempt_id")
             .await
@@ -211,8 +210,7 @@ async fn test_heartbeat_with_stale_epoch_is_rejected() {
     };
     let lease_id: String = {
         let v: Option<String> = h
-            .fabric
-            .runtime
+            .valkey_runtime()
             .client
             .hget(&ctx.core(), "current_lease_id")
             .await

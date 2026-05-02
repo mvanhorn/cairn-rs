@@ -79,8 +79,7 @@ async fn read_exec_core_for_run(
     let partition = execution_partition(&eid, h.partition_config());
     let ctx = ExecKeyContext::new(&partition, &eid);
     let fields: HashMap<String, String> = h
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .hgetall(&ctx.core())
         .await

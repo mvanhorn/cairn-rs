@@ -95,11 +95,28 @@ impl PrC2Harness {
     }
 
     fn partition_config(&self) -> &flowfabric::core::partition::PartitionConfig {
-        &self.fabric.runtime.partition_config
+        // PR-C4c: route through the trait accessor; `runtime` is
+        // `Arc<dyn FabricRuntimeHandle>` post-refactor.
+        self.fabric.runtime.partition_config()
     }
 
     fn backend(&self) -> &Arc<dyn EngineBackend> {
-        &self.fabric.runtime.backend
+        // PR-C4c: trait method.
+        self.fabric.runtime.backend()
+    }
+
+    /// Borrow the raw `ferriskey::Client` for direct HSET / HGETALL
+    /// assertions in test bodies. This harness only spins Valkey
+    /// backends (the whole file is gated on `test-harness` which
+    /// implies `fabric-valkey`), so the `valkey_runtime` slot is
+    /// always `Some` post-PR-C4c.
+    fn client(&self) -> &ferriskey::Client {
+        &self
+            .fabric
+            .valkey_runtime
+            .as_ref()
+            .expect("pr_c2_migrations harness is Valkey-only")
+            .client
     }
 
     fn unique_run_id(&self) -> cairn_domain::RunId {
@@ -283,9 +300,7 @@ async fn test_deliver_approval_signal_routes_via_engine_backend() {
     let partition = execution_partition(&eid, h.partition_config());
     let ctx = ExecKeyContext::new(&partition, &eid);
     let fields: std::collections::HashMap<String, String> = h
-        .fabric
-        .runtime
-        .client
+        .client()
         .hgetall(&ctx.core())
         .await
         .expect("HGETALL exec_core failed");
@@ -340,9 +355,7 @@ async fn test_deliver_approval_signal_routes_via_engine_backend() {
     // happened *without* the cairn caller reading the waitpoint token
     // is the contract PR-C2 migration preserves.
     let post: std::collections::HashMap<String, String> = h
-        .fabric
-        .runtime
-        .client
+        .client()
         .hgetall(&ctx.core())
         .await
         .expect("HGETALL exec_core (post) failed");
@@ -412,9 +425,7 @@ async fn test_issue_grant_and_claim_atomic() {
     let partition = execution_partition(&eid, h.partition_config());
     let ctx = ExecKeyContext::new(&partition, &eid);
     let fields: std::collections::HashMap<String, String> = h
-        .fabric
-        .runtime
-        .client
+        .client()
         .hgetall(&ctx.core())
         .await
         .expect("HGETALL exec_core failed");
@@ -449,9 +460,7 @@ async fn test_issue_grant_and_claim_atomic() {
     // Post-condition: FF's exec_core carries the same lease_id →
     // the atomic claim actually committed.
     let post: std::collections::HashMap<String, String> = h
-        .fabric
-        .runtime
-        .client
+        .client()
         .hgetall(&ctx.core())
         .await
         .expect("HGETALL exec_core (post) failed");
@@ -502,9 +511,7 @@ async fn test_read_waitpoint_token_via_engine_backend() {
     let partition = execution_partition(&eid, h.partition_config());
     let ctx = ExecKeyContext::new(&partition, &eid);
     let fields: std::collections::HashMap<String, String> = h
-        .fabric
-        .runtime
-        .client
+        .client()
         .hgetall(&ctx.core())
         .await
         .expect("HGETALL exec_core failed");
@@ -617,9 +624,7 @@ async fn test_claim_resumed_uses_read_current_attempt_index() {
     let partition = execution_partition(&eid, h.partition_config());
     let ctx = ExecKeyContext::new(&partition, &eid);
     let fields_pre: std::collections::HashMap<String, String> = h
-        .fabric
-        .runtime
-        .client
+        .client()
         .hgetall(&ctx.core())
         .await
         .expect("HGETALL exec_core (pre) failed");
@@ -659,9 +664,7 @@ async fn test_claim_resumed_uses_read_current_attempt_index() {
 
     // Sanity: the pointer must match what exec_core recorded.
     let fields_mid: std::collections::HashMap<String, String> = h
-        .fabric
-        .runtime
-        .client
+        .client()
         .hgetall(&ctx.core())
         .await
         .expect("HGETALL exec_core (mid) failed");

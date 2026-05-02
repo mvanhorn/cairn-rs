@@ -154,7 +154,25 @@ impl TestHarness {
     /// partition scheme the runtime enforces (see id_map.rs's
     /// partition-count stability contract).
     pub fn partition_config(&self) -> &flowfabric::core::partition::PartitionConfig {
-        &self.fabric.runtime.partition_config
+        // PR-C4c: `FabricServices::runtime` is now the trait object
+        // `Arc<dyn FabricRuntimeHandle>`; expose the partition
+        // config via the trait accessor. Works on both Valkey and
+        // Postgres backends.
+        self.fabric.runtime.partition_config()
+    }
+
+    /// Borrow the concrete Valkey runtime. Convenience accessor for
+    /// tests that need Valkey-specific primitives (`ferriskey::Client`,
+    /// `FabricConfig` struct fields). Panics if the fabric is on a
+    /// non-Valkey backend — `TestHarness` is Valkey-only by
+    /// construction, so this is a load-bearing invariant rather than a
+    /// surprise. PR-C4c introduced the accessor when the aggregate
+    /// stopped carrying `Arc<FabricRuntime>` directly.
+    pub fn valkey_runtime(&self) -> &std::sync::Arc<cairn_fabric::FabricRuntime> {
+        self.fabric
+            .valkey_runtime
+            .as_ref()
+            .expect("TestHarness is Valkey-only; valkey_runtime must be Some")
     }
 
     pub fn unique_run_id(&self) -> RunId {

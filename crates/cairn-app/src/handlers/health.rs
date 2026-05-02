@@ -388,13 +388,21 @@ pub(crate) async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl 
     // `mod name`) so there is no collision with cairn's namespace. When
     // `state.fabric` is `None` (e.g. in-memory dev mode, unit tests),
     // there is no FF runtime and nothing to render.
+    //
+    // PR-C4c: `ff_metrics` only exists on the Valkey runtime (the
+    // `ff_observability::Metrics` registry is constructed inside
+    // `FabricRuntime::start` and shared with FF's ff-engine). The
+    // Postgres runtime has no equivalent registry today — skip the
+    // render on the PG boot path.
     if let Some(fabric) = state.fabric.as_ref() {
-        let ff_text = fabric.runtime.ff_metrics.render();
-        if !ff_text.is_empty() {
-            if !body.ends_with('\n') {
-                body.push('\n');
+        if let Some(valkey_runtime) = fabric.valkey_runtime.as_ref() {
+            let ff_text = valkey_runtime.ff_metrics.render();
+            if !ff_text.is_empty() {
+                if !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str(&ff_text);
             }
-            body.push_str(&ff_text);
         }
     }
 

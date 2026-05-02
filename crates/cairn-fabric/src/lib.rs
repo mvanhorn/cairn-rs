@@ -98,6 +98,16 @@ pub mod event_bridge;
 pub mod instance_tag_backfill;
 #[cfg(feature = "fabric-valkey")]
 pub mod lease_history_subscriber;
+// PR-C4c: backend-agnostic runtime handle trait. Gated on
+// `fabric-valkey` because every service that holds one is itself
+// behind the same gate (`services`, `signal_bridge`). A Postgres-
+// only build (just `fabric-postgres` active) doesn't compile the
+// services or the aggregate, so it has no consumer of this trait.
+// When both `fabric-valkey` and `fabric-postgres` are active the
+// trait is impl'd by both the Valkey [`FabricRuntime`] (here) and
+// [`PostgresFabricRuntime`] (`postgres_boot.rs`).
+#[cfg(feature = "fabric-valkey")]
+pub mod runtime_handle;
 #[cfg(feature = "fabric-valkey")]
 pub mod services;
 #[cfg(feature = "fabric-valkey")]
@@ -139,6 +149,8 @@ pub use aggregate::FabricServices;
 pub use boot::FabricRuntime;
 pub use config::FabricConfig;
 pub use error::FabricError;
+#[cfg(feature = "fabric-valkey")]
+pub use runtime_handle::FabricRuntimeHandle;
 #[cfg(feature = "fabric-valkey")]
 pub use worker_sdk::{CairnTask, CairnWorker};
 

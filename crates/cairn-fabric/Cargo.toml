@@ -230,3 +230,14 @@ required-features = ["fabric-postgres", "test-harness"]
 name = "pr_c2_migrations"
 path = "tests/pr_c2_migrations.rs"
 required-features = ["test-harness"]
+
+# `postgres_full_aggregate_boot.rs` is the PR-C4c regression guard:
+# asserts the full `FabricServices` aggregate (run/task/session/
+# scheduler/quota + bridges + rotation) constructs on a Postgres
+# backend, no longer returning `FabricError::Config` at boot. Requires
+# BOTH `fabric-postgres` (for `PostgresFabricRuntime`) and
+# `test-harness` (for the `testcontainers-modules` Postgres image).
+[[test]]
+name = "postgres_full_aggregate_boot"
+path = "tests/postgres_full_aggregate_boot.rs"
+required-features = ["fabric-postgres", "test-harness"]

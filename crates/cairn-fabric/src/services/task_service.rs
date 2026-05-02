@@ -15,12 +15,15 @@ use crate::event_bridge::{BridgeEvent, EventBridge};
 use crate::helpers::{parse_public_state, try_parse_project_key};
 use flowfabric::core::types::{ExecutionId, LaneId};
 
-use crate::boot::FabricRuntime;
 use crate::id_map;
+use crate::runtime_handle::FabricRuntimeHandle;
 use crate::state_map;
 
 pub struct FabricTaskService {
-    runtime: Arc<FabricRuntime>,
+    // PR-C4c: backend-agnostic runtime handle. See
+    // `run_service.rs` for the audit of runtime-level accesses
+    // services actually perform.
+    runtime: Arc<dyn FabricRuntimeHandle>,
     bridge: Arc<EventBridge>,
     engine: Arc<dyn Engine>,
     control_plane: Arc<dyn ControlPlaneBackend>,
@@ -28,7 +31,7 @@ pub struct FabricTaskService {
 
 impl FabricTaskService {
     pub fn new(
-        runtime: Arc<FabricRuntime>,
+        runtime: Arc<dyn FabricRuntimeHandle>,
         bridge: Arc<EventBridge>,
         engine: Arc<dyn Engine>,
         control_plane: Arc<dyn ControlPlaneBackend>,
@@ -63,9 +66,9 @@ impl FabricTaskService {
                 project,
                 sid,
                 task_id,
-                &self.runtime.partition_config,
+                self.runtime.partition_config(),
             ),
-            None => id_map::task_to_execution_id(project, task_id, &self.runtime.partition_config),
+            None => id_map::task_to_execution_id(project, task_id, self.runtime.partition_config()),
         }
     }
 
@@ -251,7 +254,7 @@ impl FabricTaskService {
         // invisible to its owner's subscriber after a lease expiry.
         tags.insert(
             "cairn.instance_id".to_owned(),
-            self.runtime.config.worker_instance_id.to_string(),
+            self.runtime.worker_instance_id().to_string(),
         );
         if let Some(sid) = session_id {
             tags.insert("cairn.session_id".to_owned(), sid.as_str().to_owned());
@@ -675,7 +678,7 @@ impl FabricTaskService {
             .emit(BridgeEvent::TaskLeaseClaimed {
                 task_id: task_id.clone(),
                 project: record.project.clone(),
-                lease_owner: self.runtime.config.worker_instance_id.to_string(),
+                lease_owner: self.runtime.worker_instance_id().to_string(),
                 lease_epoch: record.version,
                 lease_expires_at_ms: record.lease_expires_at.unwrap_or(0),
             })

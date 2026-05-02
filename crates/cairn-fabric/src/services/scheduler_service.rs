@@ -25,15 +25,23 @@
 //! # API surface (#507)
 //!
 //! The only public constructor is [`FabricSchedulerService::new`],
-//! which takes `&Arc<FabricRuntime>` — a cairn-owned type that hides
-//! the FF client, partition config, and capabilities behind its own
-//! boundary. The previously-public `from_parts(ferriskey::Client, _)`
-//! constructor has been deleted because it leaked `ferriskey::Client`
-//! into cairn's public API (an FF-side concrete type) with zero
-//! in-tree callers. The test-only
+//! which takes `&Arc<dyn FabricRuntimeHandle>` — a cairn-owned trait
+//! that hides the FF client, partition config, and capabilities
+//! behind its own boundary. The previously-public
+//! `from_parts(ferriskey::Client, _)` constructor has been deleted
+//! because it leaked `ferriskey::Client` into cairn's public API
+//! (an FF-side concrete type) with zero in-tree callers. The test-only
 //! [`FabricSchedulerService::from_parts_with_capabilities`] remains
 //! behind `#[cfg(test)]` — it is unreachable from dependent crates
 //! and therefore does not widen the public surface.
+//!
+//! PR-C4c (cairn-rs #602): constructor accepts the trait-object
+//! runtime handle so the Postgres runtime can drive the same
+//! signature. On PG, `valkey_client()` returns `None` and the
+//! inner `ff_scheduler::Scheduler` is skipped; `claim_for_worker`
+//! surfaces `EngineError::Unavailable` on that branch (cairn-app's
+//! worker loop is Valkey-gated at the app layer, so the PG
+//! full-aggregate-boot path doesn't exercise it).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -41,11 +49,19 @@ use std::sync::Arc;
 use flowfabric::core::types::{LaneId, WorkerId, WorkerInstanceId};
 use flowfabric::scheduler::claim::{ClaimGrant, Scheduler};
 
-use crate::boot::FabricRuntime;
 use crate::error::FabricError;
+use crate::runtime_handle::FabricRuntimeHandle;
 
 pub struct FabricSchedulerService {
-    scheduler: Scheduler,
+    /// The wrapped ff-scheduler `Scheduler`. `None` when the runtime
+    /// has no Valkey client (i.e. the Postgres runtime — FF's
+    /// scheduler is `ferriskey::Client`-bound today, see FF 0.13
+    /// `ff-scheduler/src/claim.rs:278`). `claim_for_worker` returns
+    /// a typed `EngineError::Unavailable` on the `None` branch; the
+    /// cairn-app worker loop is gated at the app layer on a Valkey
+    /// backend so this unavailable path is unreachable in the
+    /// full-app-mode-on-PG scenario that motivated PR-C4c.
+    scheduler: Option<Scheduler>,
     /// Capabilities advertised to FF at claim time. Passed into
     /// `Scheduler::claim_for_worker` as `&BTreeSet<String>`; FF builds a
     /// deterministic sorted CSV from this set and matches against each
@@ -56,11 +72,19 @@ pub struct FabricSchedulerService {
 }
 
 impl FabricSchedulerService {
-    pub fn new(runtime: &Arc<FabricRuntime>) -> Self {
-        let scheduler = Scheduler::new(runtime.client.clone(), runtime.partition_config);
+    /// PR-C4c: accept `Arc<dyn FabricRuntimeHandle>` so both the
+    /// Valkey and Postgres runtimes can drive service construction
+    /// via the same signature. Only Valkey provides the
+    /// `ferriskey::Client` the underlying `ff_scheduler::Scheduler`
+    /// needs; on Postgres `valkey_client()` is `None` and the
+    /// inner scheduler is skipped.
+    pub fn new(runtime: &Arc<dyn FabricRuntimeHandle>) -> Self {
+        let scheduler = runtime
+            .valkey_client()
+            .map(|client| Scheduler::new(client.clone(), *runtime.partition_config()));
         Self {
             scheduler,
-            worker_capabilities: runtime.config.worker_capabilities.clone(),
+            worker_capabilities: runtime.worker_capabilities().clone(),
         }
     }
 
@@ -76,7 +100,7 @@ impl FabricSchedulerService {
     ) -> Self {
         let scheduler = Scheduler::new(client, partition_config);
         Self {
-            scheduler,
+            scheduler: Some(scheduler),
             worker_capabilities,
         }
     }
@@ -108,7 +132,23 @@ impl FabricSchedulerService {
         instance_id: &WorkerInstanceId,
         grant_ttl_ms: u64,
     ) -> Result<Option<ClaimGrant>, FabricError> {
-        self.scheduler
+        // PR-C4c: the scheduler is `None` on a Postgres-backed
+        // runtime because ff-scheduler's `Scheduler` is
+        // `ferriskey::Client`-constructed (see FF 0.13
+        // `ff-scheduler/src/claim.rs:278`). Surface a typed
+        // `Unavailable` so callers classify at parity with PG's
+        // bucket-C `EngineBackend` primitives. Cairn-app's worker
+        // loop is Valkey-gated at the app layer (cairn-rs #602
+        // parity table), so this branch is unreachable in the
+        // full-app-mode-on-PG boot scenario PR-C4c enables.
+        let Some(scheduler) = self.scheduler.as_ref() else {
+            return Err(FabricError::Engine(Box::new(
+                flowfabric::core::engine_error::EngineError::Unavailable {
+                    op: "scheduler_claim_for_worker (Postgres backend has no ff-scheduler)",
+                },
+            )));
+        };
+        scheduler
             .claim_for_worker(
                 lane_id,
                 worker_id,

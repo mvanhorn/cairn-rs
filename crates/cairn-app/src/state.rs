@@ -1199,39 +1199,54 @@ async fn build_runtime_with_optional_fabric(
     // the `cairn.instance_id` tag filter. Idempotent — running twice
     // is a no-op on the second pass because the HSET only fires on
     // hashes that lack the tag. Logs once at completion.
+    //
+    // PR-C4c: the backfill utility walks `ff:exec:*:tags` via
+    // `ferriskey::Client::scan` + `HSET` — Valkey-only. Skip
+    // automatically on the PG boot path (where
+    // `fabric.valkey_runtime` is `None`). An operator who sets
+    // the env var on a PG deploy gets a one-line warning instead
+    // of a boot-halting panic.
     if std::env::var("CAIRN_BACKFILL_INSTANCE_TAG").as_deref() == Ok("1") {
-        match cairn_fabric::instance_tag_backfill::backfill_instance_tag(
-            &fabric.runtime.client,
-            fabric.runtime.config.worker_instance_id.as_str(),
-        )
-        .await
-        {
-            Ok(outcome) => {
-                tracing::info!(
-                    scanned = outcome.scanned,
-                    tagged = outcome.tagged,
-                    skipped_tagged = outcome.skipped_tagged,
-                    skipped_foreign = outcome.skipped_foreign,
-                    "backfilled cairn.instance_id on {} executions",
-                    outcome.tagged,
-                );
-                eprintln!(
-                    "backfilled cairn.instance_id on {} executions (scanned={} skipped_tagged={} skipped_foreign={})",
-                    outcome.tagged,
-                    outcome.scanned,
-                    outcome.skipped_tagged,
-                    outcome.skipped_foreign,
-                );
+        if let Some(valkey_runtime) = fabric.valkey_runtime.as_ref() {
+            match cairn_fabric::instance_tag_backfill::backfill_instance_tag(
+                &valkey_runtime.client,
+                valkey_runtime.config.worker_instance_id.as_str(),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    tracing::info!(
+                        scanned = outcome.scanned,
+                        tagged = outcome.tagged,
+                        skipped_tagged = outcome.skipped_tagged,
+                        skipped_foreign = outcome.skipped_foreign,
+                        "backfilled cairn.instance_id on {} executions",
+                        outcome.tagged,
+                    );
+                    eprintln!(
+                        "backfilled cairn.instance_id on {} executions (scanned={} skipped_tagged={} skipped_foreign={})",
+                        outcome.tagged,
+                        outcome.scanned,
+                        outcome.skipped_tagged,
+                        outcome.skipped_foreign,
+                    );
+                }
+                Err(e) => {
+                    // Do not halt startup: the backfill is advisory. A
+                    // failed pass leaves existing foreign behavior intact
+                    // (lease expiries on untagged execs are dropped). An
+                    // operator can re-run by restarting with the env var
+                    // still set.
+                    tracing::error!(error = %e, "cairn.instance_id backfill failed");
+                    eprintln!("warning: cairn.instance_id backfill failed: {e}");
+                }
             }
-            Err(e) => {
-                // Do not halt startup: the backfill is advisory. A
-                // failed pass leaves existing foreign behavior intact
-                // (lease expiries on untagged execs are dropped). An
-                // operator can re-run by restarting with the env var
-                // still set.
-                tracing::error!(error = %e, "cairn.instance_id backfill failed");
-                eprintln!("warning: cairn.instance_id backfill failed: {e}");
-            }
+        } else {
+            tracing::warn!(
+                "CAIRN_BACKFILL_INSTANCE_TAG=1 set but the fabric is running on a \
+                 non-Valkey backend (Postgres) — the backfill walks ff:exec:*:tags \
+                 on Valkey only. Ignoring the env var."
+            );
         }
     }
 
