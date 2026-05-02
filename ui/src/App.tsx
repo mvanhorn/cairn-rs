@@ -22,6 +22,7 @@ const PlaygroundPage     = lazy(() => import('./pages/PlaygroundPage').then(m =>
 const WorkspacesPage = lazy(() => import('./pages/WorkspacesPage').then(m => ({ default: m.WorkspacesPage })));
 const TenantsPage        = lazy(() => import('./pages/TenantsPage').then(m => ({ default: m.TenantsPage })));
 const OperatorsPage      = lazy(() => import('./pages/OperatorsPage').then(m => ({ default: m.OperatorsPage })));
+const QuotasPage         = lazy(() => import('./pages/QuotasPage').then(m => ({ default: m.QuotasPage })));
 const WorkersPage        = lazy(() => import('./pages/WorkersPage').then(m => ({ default: m.WorkersPage })));
 const TestHarnessPage    = lazy(() => import('./pages/TestHarnessPage').then(m => ({ default: m.TestHarnessPage })));
 const MetricsPage        = lazy(() => import('./pages/MetricsPage').then(m => ({ default: m.MetricsPage })));
@@ -150,6 +151,7 @@ function renderRoute(route: Route): React.ReactNode {
     switch (page) {
       case 'tenants':         return <AdminGate><TenantsPage /></AdminGate>;
       case 'operators':       return <AdminGate><OperatorsPage /></AdminGate>;
+      case 'quotas':          return <AdminGate><QuotasPage /></AdminGate>;
       case 'workers':         return <WorkersPage />;
       case 'orchestration': return <OrchestrationPage />;
       case 'deployment':  return <DeploymentPage />;

@@ -3,6 +3,7 @@ import {
   Building2,
   Cable,
   Cpu,
+  Gauge,
   GitBranch,
   Calculator,
   Coins,
@@ -49,6 +50,7 @@ export type NavPage =
   | 'workspaces'
   | 'tenants'
   | 'operators'
+  | 'quotas'
   | 'sessions'
   | 'runs'
   | 'tasks'
@@ -166,6 +168,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { id: 'tenants',   label: 'Tenants',   icon: Building2 },
       { id: 'operators', label: 'Operators', icon: Users     },
+      { id: 'quotas',    label: 'Quotas',    icon: Gauge     },
     ],
   },
 ];
