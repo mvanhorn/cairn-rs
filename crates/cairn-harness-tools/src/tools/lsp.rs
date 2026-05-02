@@ -4,25 +4,29 @@
 //! workspaceSymbol, implementation) with 1-indexed positions and
 //! `server_starting` retry hints.
 //!
-//! # Session cache
+//! # Run cache
 //!
 //! LSP servers are expensive to spawn (rust-analyzer can take 30s+ to index).
-//! We cache one `SpawnLspClient` per cairn session keyed by
-//! `(tenant, workspace, project, session_id)`. The client owns the spawned
-//! server processes and their stdio pumps; a second call in the same session
-//! reuses the already-warm server. Different sessions (e.g. separate runs in
-//! different projects) get isolated clients so tenant boundaries stay firm.
+//! We cache one `SpawnLspClient` per cairn run keyed by
+//! `(tenant, workspace, project, session_id, run_id)`. The client owns the
+//! spawned server processes and their stdio pumps; a second call in the same
+//! run reuses the already-warm server. Different runs — even under the same
+//! session — get isolated clients.
 //!
-//! The cache grows unbounded over the cairn-app process lifetime. Eviction on
-//! run-finalize is a follow-up, same pattern as the write-ledger cache. For
-//! typical single-run lifetimes this is not urgent; for long-lived servers it
-//! is worth wiring to the `SessionEnded` event.
+//! Eviction is explicit: the orchestrator calls `crate::evict_run` on every
+//! terminal `RunStateChanged`, bounding cache size to the number of live
+//! runs. A run-scoped cache pays a rust-analyzer re-spawn (~30 s) per new
+//! run; the previous session-scoped design theoretically amortized that cost
+//! across sibling runs but in practice grew unbounded over the cairn-app
+//! process lifetime because session-end has no single observable moment
+//! (`SessionState` is derived from constituent run states — see
+//! `cairn-domain/src/lifecycle.rs::derive_session_state`).
 //!
-//! Calls made without a `session_id` (typically unit-test harness paths that
-//! construct `ToolContext::default()` and hit the `execute()` entrypoint)
-//! bypass the cache and get a fresh `SpawnLspClient` every time — this
-//! prevents unrelated default-ctx calls from silently sharing a cached
-//! language server across completely unrelated invocations.
+//! Calls made without both a `session_id` and a `run_id` (typically unit-test
+//! harness paths that construct `ToolContext::default()` and hit the
+//! `execute()` entrypoint) bypass the cache and get a fresh `SpawnLspClient`
+//! every time — this prevents unrelated default-ctx calls from silently
+//! sharing a cached language server across completely unrelated invocations.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -44,36 +48,61 @@ use crate::adapter::HarnessTool;
 use crate::error::map_harness;
 use crate::sensitive::default_sensitive_patterns;
 
-/// Structured cache key: `(tenant_id, workspace_id, project_id, session_id)`.
+/// Structured cache key:
+/// `(tenant_id, workspace_id, project_id, session_id, run_id)`.
 ///
 /// Using a tuple instead of a delimiter-joined string removes the risk of
 /// key collisions when ids contain `/` or other reserved characters.
-type ClientKey = (String, String, String, String);
+type ClientKey = (String, String, String, String, String);
 
-/// Per-session LSP client cache.
+/// Per-run LSP client cache.
 ///
-/// Keyed by `(tenant_id, workspace_id, project_id, session_id)` so
-/// cross-tenant + cross-session language-server processes are never shared.
-/// The inner `Arc<SpawnLspClient>` owns the spawned `rust-analyzer` /
-/// `gopls` / `typescript-language-server` / etc. child processes for the
-/// lifetime of that session.
+/// Keyed by `(tenant_id, workspace_id, project_id, session_id, run_id)` so
+/// cross-tenant, cross-session, and cross-run language-server processes
+/// are never shared. The inner `Arc<SpawnLspClient>` owns the spawned
+/// `rust-analyzer` / `gopls` / `typescript-language-server` / etc. child
+/// processes for the lifetime of that run.
 static CLIENTS: Lazy<Mutex<HashMap<ClientKey, Arc<SpawnLspClient>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn client_key(ctx: &ToolContext, project: &ProjectKey) -> Option<ClientKey> {
-    // Only cache when we have a concrete session_id. Without it, every
-    // caller (including unrelated `ToolHandler::execute()` entry-points
-    // using `ToolContext::default()`) would otherwise collapse onto the
-    // same cached client — risking stale-server reuse across unrelated
+    // Only cache when we have BOTH a concrete session_id and run_id.
+    // Without either, every caller (including unrelated
+    // `ToolHandler::execute()` entry-points using
+    // `ToolContext::default()`) would otherwise collapse onto the same
+    // cached client — risking stale-server reuse across unrelated
     // invocations. Returning `None` signals "build a fresh client, do
     // not insert".
     let session_id = ctx.session_id.as_ref()?.to_owned();
+    let run_id = ctx.run_id.as_ref()?.to_owned();
     Some((
         project.tenant_id.to_string(),
         project.workspace_id.to_string(),
         project.project_id.to_string(),
         session_id,
+        run_id,
     ))
+}
+
+/// Drop the LSP client cached for this `(project, session, run)` tuple, if
+/// any. Idempotent — calling twice on the same context is a no-op after
+/// the first call. Invoked by `crate::evict_run` when the orchestrator
+/// observes a terminal `RunStateChanged`.
+///
+/// Dropping the `Arc` causes `SpawnLspClient::close_session` to run when
+/// the last reference is released, so spawned `rust-analyzer` / `gopls` /
+/// etc. child processes terminate rather than lingering for the lifetime
+/// of the cairn-app.
+///
+/// Contexts missing either `session_id` or `run_id` never produced a
+/// cache entry (`client_key` returns `None` in that case), so this
+/// function is a safe no-op on them.
+pub(crate) fn evict_run_client(ctx: &ToolContext, project: &ProjectKey) {
+    let Some(key) = client_key(ctx, project) else {
+        return;
+    };
+    let mut guard = CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.remove(&key);
 }
 
 /// Look up or spawn the cached `SpawnLspClient` for this session.

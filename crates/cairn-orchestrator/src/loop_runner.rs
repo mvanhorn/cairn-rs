@@ -440,14 +440,26 @@ where
         // propagate the underlying OrchestratorError's Display string so
         // dashboards see the real cause (e.g. "decide: model 404",
         // "memory: kb unavailable") rather than "infrastructure error".
-        match &result {
-            Ok(t) => self.emitter.on_finished(&ctx, t).await,
+        let run_terminal = match &result {
+            Ok(t) => {
+                self.emitter.on_finished(&ctx, t).await;
+                t.drives_run_to_terminal()
+            }
             Err(e) => {
                 let term = LoopTermination::Failed {
                     reason: e.to_string(),
                 };
                 self.emitter.on_finished(&ctx, &term).await;
+                // Infrastructure errors still end the run for good —
+                // there is no resume path for an Err branch.
+                true
             }
+        };
+        if run_terminal {
+            // #606: evict harness-tools caches (write ledger + LSP
+            // clients) so rust-analyzer child processes terminate
+            // and the maps stay bounded to live runs.
+            cairn_harness_tools::evict_run(&ctx.tool_context(), &ctx.project);
         }
         result
     }

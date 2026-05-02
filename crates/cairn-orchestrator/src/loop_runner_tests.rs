@@ -1950,3 +1950,180 @@ async fn drain_tool_failure_continues_to_decide() {
         "failing drain entry must still have been dispatched"
     );
 }
+
+// ── #606: harness-tools cache eviction on run terminal ──────────────────────
+
+#[test]
+fn drives_run_to_terminal_distinguishes_suspension_from_finalization() {
+    use cairn_domain::session_orchestration::{BreakerKind, CircuitBreakerTrip};
+
+    // Terminal outcomes — eviction fires.
+    assert!(LoopTermination::Completed {
+        summary: "ok".into(),
+        verification: Default::default(),
+    }
+    .drives_run_to_terminal());
+    assert!(LoopTermination::Failed { reason: "x".into() }.drives_run_to_terminal());
+    assert!(LoopTermination::MaxIterationsReached.drives_run_to_terminal());
+    assert!(LoopTermination::TimedOut.drives_run_to_terminal());
+    assert!(LoopTermination::PlanProposed {
+        plan_markdown: "".into()
+    }
+    .drives_run_to_terminal());
+    assert!(LoopTermination::BreakerTripped {
+        trip: CircuitBreakerTrip {
+            which: BreakerKind::Round,
+            measured: 100,
+            limit: 100,
+            at_iteration: 5,
+        },
+    }
+    .drives_run_to_terminal());
+
+    // Suspension points — eviction must NOT fire.
+    assert!(!LoopTermination::WaitingApproval {
+        approval_id: ApprovalId::new("ap"),
+    }
+    .drives_run_to_terminal());
+    assert!(!LoopTermination::WaitingSubagent {
+        child_task_id: TaskId::new("ct"),
+    }
+    .drives_run_to_terminal());
+}
+
+#[tokio::test]
+async fn run_completion_evicts_harness_tools_caches() {
+    // After `run()` returns a terminal LoopTermination, the orchestrator
+    // must call `cairn_harness_tools::evict_run` — verifiable by priming
+    // the write ledger for (project, session, run), running the loop to
+    // completion, and asserting the cached Arc is no longer the same.
+    //
+    // Test-isolation note: the LEDGERS cache is a process-global; using
+    // unique session/run ids per test avoids false-sharing when cargo
+    // runs `#[test]` functions in parallel.
+
+    use cairn_harness_tools::{__ledger_cache_contains_for_tests, HarnessBuiltin, HarnessRead};
+    use cairn_tools::builtins::ToolHandler;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut ctx_orig = ctx();
+    ctx_orig.session_id = SessionId::new("sess-evict-completion");
+    ctx_orig.run_id = RunId::new("run-evict-completion");
+    ctx_orig.working_dir = dir.path().to_path_buf();
+    let project = ctx_orig.project.clone();
+    let tool_ctx = ctx_orig.tool_context();
+
+    // Prime the ledger cache via a real read — `__ledger_cache_contains_for_tests`
+    // checks presence by key, it does not mint an entry.
+    let path = dir.path().join("a.txt");
+    std::fs::write(&path, "hello\n").unwrap();
+    let read = HarnessBuiltin::<HarnessRead>::new();
+    read.execute_with_context(
+        &project,
+        serde_json::json!({ "path": path.to_string_lossy() }),
+        &tool_ctx,
+    )
+    .await
+    .expect("read should populate the ledger cache");
+    assert!(
+        __ledger_cache_contains_for_tests(&tool_ctx, &project),
+        "prime: read should have populated the ledger cache",
+    );
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        ScriptedDecide::always(decide_done()),
+        ScriptedExecute {
+            signal: LoopSignal::Done,
+        },
+        LoopConfig {
+            breakers: permissive_breakers(),
+            ..Default::default()
+        },
+    );
+    let result = lp.run(ctx_orig).await.unwrap();
+    assert!(
+        matches!(result, LoopTermination::Completed { .. }),
+        "expected Completed, got {result:?}"
+    );
+
+    assert!(
+        !__ledger_cache_contains_for_tests(&tool_ctx, &project),
+        "run terminal must have evicted the write ledger cache (#606)",
+    );
+}
+
+#[tokio::test]
+async fn run_suspension_does_not_evict_harness_tools_caches() {
+    // WaitingApproval is a suspension point — the run will resume, so
+    // the cached ledger MUST survive. Regression guard against evicting
+    // on every termination indiscriminately.
+    //
+    // Test-isolation note: unique session/run ids keep the sibling
+    // `run_completion_evicts_...` test from racing this one on the
+    // process-global LEDGERS cache.
+
+    use cairn_harness_tools::{__ledger_cache_contains_for_tests, HarnessBuiltin, HarnessRead};
+    use cairn_tools::builtins::ToolHandler;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut ctx_orig = ctx();
+    ctx_orig.session_id = SessionId::new("sess-evict-suspend");
+    ctx_orig.run_id = RunId::new("run-evict-suspend");
+    ctx_orig.working_dir = dir.path().to_path_buf();
+    let project = ctx_orig.project.clone();
+    let tool_ctx = ctx_orig.tool_context();
+
+    // Prime the ledger cache via a real read call so the eviction path
+    // has something to check.
+    let path = dir.path().join("b.txt");
+    std::fs::write(&path, "world\n").unwrap();
+    let read = HarnessBuiltin::<HarnessRead>::new();
+    read.execute_with_context(
+        &project,
+        serde_json::json!({ "path": path.to_string_lossy() }),
+        &tool_ctx,
+    )
+    .await
+    .expect("read should populate the ledger cache");
+    assert!(
+        __ledger_cache_contains_for_tests(&tool_ctx, &project),
+        "prime: read should have populated the ledger cache",
+    );
+
+    // Scripted decide that requires approval → execute phase short-circuits.
+    let decide_with_approval = DecideOutput {
+        requires_approval: true,
+        proposals: vec![ActionProposal {
+            action_type: ActionType::InvokeTool,
+            description: "suspend".into(),
+            confidence: 0.9,
+            tool_name: Some("bash".into()),
+            tool_args: Some(serde_json::json!({"command": "true"})),
+            requires_approval: true,
+        }],
+        ..decide_done()
+    };
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        ScriptedDecide::always(decide_with_approval),
+        ScriptedExecute {
+            signal: LoopSignal::WaitApproval {
+                approval_id: ApprovalId::new("ap-1"),
+            },
+        },
+        LoopConfig::default(),
+    );
+    let result = lp.run(ctx_orig).await.unwrap();
+    assert!(
+        matches!(result, LoopTermination::WaitingApproval { .. }),
+        "expected WaitingApproval, got {result:?}"
+    );
+
+    assert!(
+        __ledger_cache_contains_for_tests(&tool_ctx, &project),
+        "suspension-point terminations must not evict the cache — \
+         the run will resume and needs the read-before-edit state",
+    );
+}

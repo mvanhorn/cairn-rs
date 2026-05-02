@@ -82,6 +82,27 @@ pub struct OrchestrationContext {
     pub approval_timeout: Option<std::time::Duration>,
 }
 
+impl OrchestrationContext {
+    /// Build a `ToolContext` from this orchestration context.
+    ///
+    /// Populates `session_id`, `run_id`, `working_dir`, and leaves the
+    /// remaining fields at their `Default` (tenant/workspace/project
+    /// stay as the orchestrator doesn't thread tenant IDs through —
+    /// the harness tools key their caches on `(session, run)` inside
+    /// the supplied `ProjectKey`, which is passed separately).
+    ///
+    /// Used by the loop runner's `#606` cache-eviction hook and by
+    /// tests that need a `ToolContext` matching an
+    /// `OrchestrationContext`.
+    pub fn tool_context(&self) -> cairn_tools::builtins::ToolContext {
+        let mut tool_ctx = cairn_tools::builtins::ToolContext::default();
+        tool_ctx.session_id = Some(self.session_id.to_string());
+        tool_ctx.run_id = Some(self.run_id.to_string());
+        tool_ctx.working_dir = self.working_dir.clone();
+        tool_ctx
+    }
+}
+
 // ── GatherOutput ─────────────────────────────────────────────────────────────
 
 /// Context snapshot produced by the GatherPhase.
@@ -317,6 +338,32 @@ pub enum LoopTermination {
     /// frame, and the `RuntimeEvent::CircuitBreakerTripped` event that the
     /// loop appends via the emitter before returning this termination.
     BreakerTripped { trip: CircuitBreakerTrip },
+}
+
+impl LoopTermination {
+    /// Whether this termination drives the run to a terminal
+    /// `RunState` (`Completed` / `Failed` / `Canceled`).
+    ///
+    /// `WaitingApproval` and `WaitingSubagent` are suspension points,
+    /// not terminals — the run persists across cairn-app restarts and
+    /// resumes via a second `run()` call. Every other variant ends the
+    /// run for good.
+    ///
+    /// Used by the loop runner to fire run-terminal side effects (e.g.
+    /// evicting harness-tools caches, see cairn-rs #606).
+    pub fn drives_run_to_terminal(&self) -> bool {
+        match self {
+            LoopTermination::WaitingApproval { .. } | LoopTermination::WaitingSubagent { .. } => {
+                false
+            }
+            LoopTermination::Completed { .. }
+            | LoopTermination::Failed { .. }
+            | LoopTermination::MaxIterationsReached
+            | LoopTermination::TimedOut
+            | LoopTermination::PlanProposed { .. }
+            | LoopTermination::BreakerTripped { .. } => true,
+        }
+    }
 }
 
 // ── LoopConfig ───────────────────────────────────────────────────────────────

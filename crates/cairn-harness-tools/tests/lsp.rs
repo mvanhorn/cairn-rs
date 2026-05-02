@@ -21,9 +21,18 @@ fn other_project() -> ProjectKey {
 }
 
 fn ctx_with_session(dir: &TempDir, session_id: &str) -> ToolContext {
+    // The LSP cache is run-scoped (see module docs); a session-only
+    // context produces no cached entry. Tests that want cache reuse
+    // must fix both `session_id` AND `run_id`. The default `run_id`
+    // keeps the common-case cache-reuse tests readable.
+    ctx_with_session_and_run(dir, session_id, "run-fixed")
+}
+
+fn ctx_with_session_and_run(dir: &TempDir, session_id: &str, run_id: &str) -> ToolContext {
     let mut c = ToolContext::default();
     c.working_dir = dir.path().to_path_buf();
     c.session_id = Some(session_id.to_owned());
+    c.run_id = Some(run_id.to_owned());
     c
 }
 

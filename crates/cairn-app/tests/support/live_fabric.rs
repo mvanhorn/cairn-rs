@@ -175,6 +175,50 @@ impl LiveHarness {
             .build()
             .expect("reqwest client builds");
 
+        // The listener binds before the boot-recovery pass (event-log
+        // replay + FF seed) completes. Until that finishes, state-
+        // mutating admin endpoints return 503 with
+        // `{"status":"recovering", "retry_after_seconds":N}`. Poll
+        // `/health/ready` until the app is out of recovery mode, then
+        // rotate. 30s ceiling is generous for CI; local boots under 5s.
+        //
+        // Per-request timeout is 2s so a hung socket can't stretch
+        // past the 30s overall deadline (the shared `client` has a
+        // 60s request timeout for real-LLM paths — using it directly
+        // here would let one hung probe consume the entire budget).
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let probe = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.get(format!("{base_url}/health/ready")).send(),
+            )
+            .await;
+            match probe {
+                Ok(Ok(ready)) if ready.status().is_success() => break,
+                Ok(Ok(ready)) => {
+                    if std::time::Instant::now() >= ready_deadline {
+                        panic!(
+                            "cairn-app never reached /health/ready within 30s: last status {}",
+                            ready.status()
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    if std::time::Instant::now() >= ready_deadline {
+                        panic!("cairn-app readiness probe kept erroring for 30s: {e}");
+                    }
+                }
+                Err(_elapsed) => {
+                    if std::time::Instant::now() >= ready_deadline {
+                        panic!(
+                            "cairn-app never reached /health/ready within 30s: last probe timed out"
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
         let rotate_res = client
             .post(format!("{base_url}/v1/admin/rotate-token"))
             .bearer_auth(&seed_admin)
