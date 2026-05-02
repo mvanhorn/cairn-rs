@@ -14,12 +14,16 @@ use axum::{
 };
 use cairn_api::auth::Authenticator;
 use cairn_api::auth::{AuthPrincipal, ServiceTokenAuthenticator};
-use cairn_domain::{ProjectKey, PromptReleaseId, WorkspaceId, WorkspaceKey, WorkspaceRole};
+use cairn_domain::{
+    OperatorId, ProjectKey, PromptReleaseId, TenantId, WorkspaceId, WorkspaceKey, WorkspaceRole,
+};
 use cairn_runtime::set_current_trace_id;
 #[cfg(feature = "metrics-core")]
 use cairn_runtime::TenantService;
 use cairn_runtime::WorkspaceService;
-use cairn_store::projections::{PromptReleaseReadModel, WorkspaceMembershipReadModel};
+use cairn_store::projections::{
+    OperatorTenantRoleReadModel, PromptReleaseReadModel, WorkspaceMembershipReadModel,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -55,6 +59,10 @@ pub(crate) async fn auth_middleware(
     }
 
     if let Err(response) = attach_workspace_role(&state, &principal, &mut request).await {
+        return response;
+    }
+
+    if let Err(response) = attach_tenant_role(&state, &principal, &mut request).await {
         return response;
     }
 
@@ -687,6 +695,110 @@ pub(crate) async fn attach_workspace_role(
         request.extensions_mut().insert(role);
     }
     Ok(())
+}
+
+/// RFC 026 PR-A0: attach the operator's `TenantRole` on the target
+/// tenant to `request.extensions` for any path the admin surface may
+/// authorize against.
+///
+/// The target tenant id is extracted from two path shapes:
+///
+///   * `/v1/admin/tenants/:tenant_id/...` — every tenant-scoped admin
+///     handler (workspaces, snapshots, credentials, operator-profiles,
+///     ...).
+///   * `/v1/admin/operators/:operator_id/tenant-roles/:tenant_id/...` —
+///     the promote + revoke endpoints introduced by PR-A0.
+///
+/// When both shapes fail to match, no extension is attached — the
+/// `TenantAdminGuard` extractor falls back to god-token / workspace-role
+/// evaluation, preserving behaviour on non-admin paths. System and
+/// admin-service-account principals never need a TenantRole extension
+/// because `is_admin_principal` short-circuits the guard before the
+/// lookup runs.
+pub(crate) async fn attach_tenant_role(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    request: &mut Request,
+) -> Result<(), Response> {
+    let Some(operator_id) = operator_id_for_tenant_role(principal) else {
+        return Ok(());
+    };
+    let Some(tenant) = extract_target_tenant_id(request.uri().path()) else {
+        return Ok(());
+    };
+
+    // Attach the request's TARGET tenant id under a dedicated newtype
+    // so `TenantAdminGuard` can echo it into the `tenant_role_missing`
+    // body without clobbering the authenticated-principal's home
+    // tenant (still at `TenantId` via auth_middleware). The UI
+    // `<AdminGate>` then renders "no role on tenant T'" where T' is
+    // the request's target, not the caller's home. Gemini PR #609.
+    request
+        .extensions_mut()
+        .insert(crate::extractors::TargetTenantId(tenant.clone()));
+
+    let record =
+        OperatorTenantRoleReadModel::get(state.runtime.store.as_ref(), &tenant, &operator_id)
+            .await
+            .map_err(store_error_response)?;
+
+    // An active grant (revoked_at_ms is None) is the only shape that
+    // should expose the role to `TenantAdminGuard`. Revoked rows stay
+    // in the table for audit but must not escalate.
+    if let Some(role_record) = record {
+        if role_record.is_active() {
+            request.extensions_mut().insert(role_record.role);
+        }
+    }
+    Ok(())
+}
+
+/// Return the operator id for principals that can hold tenant roles.
+/// Returns `None` for System + admin service-account: those bypass the
+/// tenant-role lookup via `is_admin_principal`, and the admin SA's
+/// `name = "admin"` is not a valid OperatorId.
+fn operator_id_for_tenant_role(principal: &AuthPrincipal) -> Option<OperatorId> {
+    match principal {
+        AuthPrincipal::Operator { operator_id, .. } => Some(operator_id.clone()),
+        AuthPrincipal::ServiceAccount { .. } | AuthPrincipal::System => None,
+    }
+}
+
+/// Parse the request path for a tenant id segment.
+///
+/// Shapes matched (in order):
+///
+///   * `/v1/admin/tenants/:tenant_id/...`
+///   * `/v1/admin/operators/:operator_id/tenant-roles/:tenant_id/...`
+///
+/// Returns `None` for paths that do not carry a target tenant.
+/// Cross-tenant admin routes that don't scope to a single tenant (e.g.
+/// `GET /v1/admin/tenants` to list every tenant) return `None`; those
+/// routes stay gated by `AdminRoleGuard` (god-token) until the admin-UI
+/// series migrates them individually.
+fn extract_target_tenant_id(path: &str) -> Option<TenantId> {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    // `/v1/admin/tenants/:tenant_id/...` — require at least 4 segments
+    // so `/v1/admin/tenants` (list) does not match.
+    if segments.len() >= 4
+        && segments[0] == "v1"
+        && segments[1] == "admin"
+        && segments[2] == "tenants"
+        && !segments[3].is_empty()
+    {
+        return Some(TenantId::new(segments[3]));
+    }
+    // `/v1/admin/operators/:operator_id/tenant-roles/:tenant_id[/...]`
+    if segments.len() >= 6
+        && segments[0] == "v1"
+        && segments[1] == "admin"
+        && segments[2] == "operators"
+        && segments[4] == "tenant-roles"
+        && !segments[5].is_empty()
+    {
+        return Some(TenantId::new(segments[5]));
+    }
+    None
 }
 
 pub(crate) async fn ensure_workspace_role_for_project(

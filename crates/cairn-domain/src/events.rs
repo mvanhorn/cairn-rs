@@ -212,6 +212,12 @@ pub enum RuntimeEvent {
     OperatorIntervention(OperatorIntervention),
     OperatorProfileCreated(OperatorProfileCreated),
     OperatorProfileUpdated(OperatorProfileUpdated),
+    /// RFC 026 PR-A0: tenant-admin role grant — upserts
+    /// `operator_tenant_roles` keyed on `(tenant_id, operator_id)`.
+    TenantRoleGranted(TenantRoleGranted),
+    /// RFC 026 PR-A0: tenant-admin role revocation — marks the row
+    /// revoked (not deleted; the audit trail survives).
+    TenantRoleRevoked(TenantRoleRevoked),
     PauseScheduled(PauseScheduled),
     PermissionDecisionRecorded(PermissionDecisionRecorded),
     ProviderBindingCreated(ProviderBindingCreated),
@@ -462,6 +468,8 @@ impl RuntimeEvent {
             | RuntimeEvent::OperatorIntervention(_)
             | RuntimeEvent::OperatorProfileCreated(_)
             | RuntimeEvent::OperatorProfileUpdated(_)
+            | RuntimeEvent::TenantRoleGranted(_)
+            | RuntimeEvent::TenantRoleRevoked(_)
             | RuntimeEvent::PauseScheduled(_)
             | RuntimeEvent::PermissionDecisionRecorded(_)
             | RuntimeEvent::ProviderBindingCreated(_)
@@ -712,6 +720,8 @@ impl RuntimeEvent {
             | RuntimeEvent::OperatorIntervention(_)
             | RuntimeEvent::OperatorProfileCreated(_)
             | RuntimeEvent::OperatorProfileUpdated(_)
+            | RuntimeEvent::TenantRoleGranted(_)
+            | RuntimeEvent::TenantRoleRevoked(_)
             | RuntimeEvent::PauseScheduled(_)
             | RuntimeEvent::PermissionDecisionRecorded(_)
             | RuntimeEvent::ProviderBindingCreated(_)
@@ -2260,6 +2270,46 @@ pub struct OperatorProfileUpdated {
     pub profile_id: crate::ids::OperatorId,
     pub display_name: Option<String>,
     pub email: Option<String>,
+}
+
+/// RFC 026 PR-A0: tenant-admin role granted to an operator.
+///
+/// Upserts one row in `operator_tenant_roles` keyed on
+/// `(tenant_id, operator_id)`. Replay of a later grant over an earlier one
+/// wins — the role string + `granted_by` + `granted_at_ms` update, and
+/// `revoked_at_ms` / `revoked_by` are cleared so a re-grant supersedes an
+/// earlier revocation.
+///
+/// `granted_by` is the authenticated principal id that approved the
+/// grant: operator id for a tenant-admin delegating, or the string
+/// `"system"` for a `CAIRN_ADMIN_TOKEN` promotion, or
+/// `"upgrade-backfill"` for events emitted by the V066 migration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantRoleGranted {
+    pub tenant_id: TenantId,
+    pub operator_id: crate::ids::OperatorId,
+    pub role: crate::tenancy::TenantRole,
+    pub granted_by: String,
+    pub at_ms: u64,
+}
+
+/// RFC 026 PR-A0: tenant-admin role revoked from an operator.
+///
+/// Updates the `operator_tenant_roles` row keyed on
+/// `(tenant_id, operator_id)` to record the revocation. The row is NOT
+/// deleted — `revoked_at_ms` + `revoked_by` are set so the audit trail
+/// survives, and a subsequent `TenantRoleGranted` re-grants by upserting
+/// a fresh role and clearing `revoked_at_ms`.
+///
+/// Applying `TenantRoleRevoked` against a non-existent row is a no-op
+/// (replay-safe — the projection keeps idempotency even if revocation is
+/// replayed before the grant).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantRoleRevoked {
+    pub tenant_id: TenantId,
+    pub operator_id: crate::ids::OperatorId,
+    pub revoked_by: String,
+    pub at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

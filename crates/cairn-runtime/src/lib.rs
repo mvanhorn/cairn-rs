@@ -68,6 +68,8 @@ pub mod soul_guard;
 pub mod startup;
 pub mod tasks;
 pub mod telemetry;
+pub mod tenant_role_backfill;
+pub mod tenant_roles;
 pub mod tenants;
 pub mod tool_call_approvals;
 pub mod voice;
@@ -128,6 +130,8 @@ pub use sessions::SessionService;
 pub use signals::SignalService;
 pub use soul_guard::SoulGuard;
 pub use tasks::TaskService;
+pub use tenant_role_backfill::{run_tenant_role_backfill, TenantRoleBackfillReport};
+pub use tenant_roles::TenantRoleService;
 pub use tenants::TenantService;
 pub use tool_call_approvals::{
     AllowRule, ApprovalDecision as ToolCallApprovalDecision, ApprovedProposal, OperatorDecision,

@@ -212,6 +212,58 @@ pub struct WorkspaceMembership {
     pub role: WorkspaceRole,
 }
 
+/// Tenant-scope role for admin-surface authorization (RFC 026 PR-A0).
+///
+/// Distinct from [`WorkspaceRole`]: a `WorkspaceRole` grants privileges
+/// within a single workspace, while `TenantRole` grants privileges across
+/// every workspace/project owned by a tenant. Admin-UI pages (tenants,
+/// operators, quotas, retention) gate on `TenantRole::Admin` for the
+/// target tenant rather than per-workspace membership.
+///
+/// Stored N-to-M in the `operator_tenant_roles` projection — one operator
+/// can hold distinct roles on multiple tenants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantRole {
+    /// Full tenant-scope admin: can administer tenants, operators,
+    /// quotas, retention, credentials, workspaces, and every other
+    /// handler currently guarded by `AdminRoleGuard`.
+    Admin,
+    /// Default tenant member: read + run-creation across the tenant's
+    /// workspaces, no admin-surface access.
+    Member,
+    /// Read-only observer: list/get across the tenant, no mutations.
+    ReadOnly,
+}
+
+impl TenantRole {
+    /// `true` when the role is `TenantRole::Admin`.
+    ///
+    /// RFC 026 PR-A0: the `TenantAdminGuard` extractor checks this to
+    /// decide whether a non-god-token operator can reach the admin
+    /// surface. Centralised here so future role-hierarchy tweaks (e.g. an
+    /// `Owner` variant above `Admin`) only need to update this helper.
+    pub fn is_admin(self) -> bool {
+        matches!(self, TenantRole::Admin)
+    }
+
+    /// `true` when the role grants read access to the tenant — every
+    /// currently-defined role (Admin/Member/ReadOnly) does.
+    pub fn can_read(self) -> bool {
+        matches!(
+            self,
+            TenantRole::Admin | TenantRole::Member | TenantRole::ReadOnly
+        )
+    }
+
+    /// `true` when the role may mutate non-admin tenant state (run
+    /// creation, task updates, etc.). Admin implies member; ReadOnly
+    /// does not.
+    pub fn can_write(self) -> bool {
+        matches!(self, TenantRole::Admin | TenantRole::Member)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{OwnershipKey, ProjectKey, Scope, TenantKey, WorkspaceKey};
@@ -369,5 +421,52 @@ mod rfc008_tests {
         // But a lower scope cannot override a higher scope
         assert!(!Scope::Project.includes(Scope::Tenant));
         assert!(!Scope::Workspace.includes(Scope::Tenant));
+    }
+}
+
+// ── RFC 026 TenantRole Tests ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod rfc026_tenant_role_tests {
+    use super::TenantRole;
+
+    #[test]
+    fn admin_is_the_only_is_admin_role() {
+        assert!(TenantRole::Admin.is_admin());
+        assert!(!TenantRole::Member.is_admin());
+        assert!(!TenantRole::ReadOnly.is_admin());
+    }
+
+    #[test]
+    fn every_role_can_read() {
+        // RFC 026: an operator with any TenantRole entry can observe the
+        // tenant — read-only is explicit, member/admin implicitly include
+        // read.
+        assert!(TenantRole::Admin.can_read());
+        assert!(TenantRole::Member.can_read());
+        assert!(TenantRole::ReadOnly.can_read());
+    }
+
+    #[test]
+    fn only_admin_and_member_can_write() {
+        assert!(TenantRole::Admin.can_write());
+        assert!(TenantRole::Member.can_write());
+        assert!(!TenantRole::ReadOnly.can_write());
+    }
+
+    #[test]
+    fn serde_uses_snake_case() {
+        // The projection + wire format stores the role as a snake_case
+        // string; changing this silently would corrupt every persisted
+        // `operator_tenant_roles.role` column.
+        let admin = serde_json::to_string(&TenantRole::Admin).unwrap();
+        let member = serde_json::to_string(&TenantRole::Member).unwrap();
+        let read_only = serde_json::to_string(&TenantRole::ReadOnly).unwrap();
+        assert_eq!(admin, "\"admin\"");
+        assert_eq!(member, "\"member\"");
+        assert_eq!(read_only, "\"read_only\"");
+
+        let round_trip: TenantRole = serde_json::from_str("\"read_only\"").unwrap();
+        assert_eq!(round_trip, TenantRole::ReadOnly);
     }
 }

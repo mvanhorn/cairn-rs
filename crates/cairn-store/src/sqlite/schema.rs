@@ -1468,4 +1468,22 @@ CREATE TABLE IF NOT EXISTS run_cost_alerts (
 
 CREATE INDEX IF NOT EXISTS idx_run_cost_alerts_tenant_triggered
     ON run_cost_alerts (tenant_id, triggered_at_ms DESC, run_id);
+
+-- RFC 026 PR-A0: operator_tenant_roles parity table (pg V066).
+-- N-to-M operator-to-tenant role mapping for the admin-surface UI series.
+-- Grants upsert; revocations set `revoked_at_ms` + `revoked_by` (row is
+-- retained so the audit trail survives).
+CREATE TABLE IF NOT EXISTS operator_tenant_roles (
+    tenant_id      TEXT    NOT NULL,
+    operator_id    TEXT    NOT NULL,
+    role           TEXT    NOT NULL,
+    granted_at_ms  INTEGER NOT NULL,
+    granted_by     TEXT    NOT NULL,
+    revoked_at_ms  INTEGER,
+    revoked_by     TEXT,
+    PRIMARY KEY (tenant_id, operator_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_tenant_roles_operator
+    ON operator_tenant_roles (operator_id);
 "#;

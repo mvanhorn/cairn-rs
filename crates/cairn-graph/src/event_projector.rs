@@ -432,6 +432,10 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::OperatorIntervention(_)
             | RuntimeEvent::OperatorProfileCreated(_)
             | RuntimeEvent::OperatorProfileUpdated(_)
+            // RFC 026 PR-A0: tenant-admin role events — projected into
+            // `operator_tenant_roles`, not into the graph.
+            | RuntimeEvent::TenantRoleGranted(_)
+            | RuntimeEvent::TenantRoleRevoked(_)
             | RuntimeEvent::PauseScheduled(_)
             | RuntimeEvent::PermissionDecisionRecorded(_)
             | RuntimeEvent::ProviderBindingCreated(_)

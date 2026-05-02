@@ -53,6 +53,7 @@ pub mod quota_impl;
 pub mod retention_impl;
 pub mod signal_impl;
 pub mod signal_router_impl;
+pub mod tenant_role_impl;
 pub mod tool_call_approval_impl;
 pub mod tool_call_approval_reader_adapter;
 pub mod voice_impl;
@@ -145,6 +146,7 @@ pub use route_policy_impl::RoutePolicyServiceImpl;
 pub use run_cost_alert_impl::RunCostAlertServiceImpl;
 pub use run_sla_impl::RunSlaServiceImpl;
 pub use signal_router_impl::SignalRouterServiceImpl;
+pub use tenant_role_impl::TenantRoleServiceImpl;
 pub use workspace_membership_impl::WorkspaceMembershipServiceImpl;
 
 // ── Tenancy & identity (extras) ──────────────────────────────────────────

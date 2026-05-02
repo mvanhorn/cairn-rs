@@ -1026,6 +1026,8 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ProjectCreated(_) => "project_created",
         RuntimeEvent::OperatorProfileCreated(_) => "operator_profile_created",
         RuntimeEvent::OperatorProfileUpdated(_) => "operator_profile_updated",
+        RuntimeEvent::TenantRoleGranted(_) => "tenant_role_granted",
+        RuntimeEvent::TenantRoleRevoked(_) => "tenant_role_revoked",
         RuntimeEvent::CredentialStored(_) => "credential_stored",
         RuntimeEvent::CredentialRevoked(_) => "credential_revoked",
         RuntimeEvent::CredentialKeyRotated(_) => "credential_key_rotated",
@@ -1479,6 +1481,18 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         }
         RuntimeEvent::OperatorProfileUpdated(profile) => {
             format!("Operator profile {} updated", profile.profile_id)
+        }
+        RuntimeEvent::TenantRoleGranted(e) => {
+            format!(
+                "Tenant role {:?} granted to operator {} on tenant {} by {}",
+                e.role, e.operator_id, e.tenant_id, e.granted_by
+            )
+        }
+        RuntimeEvent::TenantRoleRevoked(e) => {
+            format!(
+                "Tenant role revoked from operator {} on tenant {} by {}",
+                e.operator_id, e.tenant_id, e.revoked_by
+            )
         }
         RuntimeEvent::CredentialStored(credential) => {
             format!("Credential {} stored", credential.credential_id)

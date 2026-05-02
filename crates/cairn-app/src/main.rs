@@ -777,6 +777,70 @@ async fn real_main() {
         cairn_runtime::seed_event_counter(floor);
     }
 
+    // ── RFC 026 PR-A0 tenant-role upgrade backfill ───────────────────────────
+    //
+    // Pre-A0 deployments have `operator_profiles` + `workspace_members`
+    // rows but no `operator_tenant_roles` — every operator would lose
+    // admin-UI access on upgrade because `TenantAdminGuard` rejects
+    // non-god-token operators without a grant. The backfill walks the
+    // existing projections and emits real `TenantRoleGranted` events so
+    // the event log reconstructs the grants on future replay.
+    //
+    // Idempotent: pairs already present in `operator_tenant_roles` (re-
+    // boot, or greenfield deployments that never needed the backfill)
+    // are skipped.
+    //
+    // WARN log per RFC Open Q#4 so the operator sees exactly what the
+    // upgrade attached.
+    {
+        let store = lib_state.runtime.store.as_ref();
+        match cairn_runtime::run_tenant_role_backfill(store, &lib_state.runtime.tenant_roles, 500)
+            .await
+        {
+            Ok(report) => {
+                if report.total_emitted() > 0 {
+                    eprintln!(
+                        "WARN: tenant-role upgrade backfill granted {} pair(s) \
+                         (skipped {} already present)",
+                        report.total_emitted(),
+                        report.skipped_already_present,
+                    );
+                    // Cap the per-boot log at 20 pairs to bound noise
+                    // on large deployments while still giving operators
+                    // a recognizable sample. Full list lives in the
+                    // event log + `operator_tenant_roles` table.
+                    for (tenant, operator, role) in report.granted.iter().take(20) {
+                        eprintln!(
+                            "  tenant-role-backfill: tenant={tenant} operator={operator} \
+                             role={role:?}"
+                        );
+                    }
+                    if report.granted.len() > 20 {
+                        eprintln!(
+                            "  ... and {} more (see operator_tenant_roles + event log)",
+                            report.granted.len() - 20
+                        );
+                    }
+                } else if report.skipped_already_present > 0 {
+                    eprintln!(
+                        "tenant-role upgrade backfill: {} pair(s) already present \
+                         (no-op — replay-safe)",
+                        report.skipped_already_present
+                    );
+                }
+            }
+            Err(e) => {
+                // Do NOT fail boot — the backfill is a safety net, not
+                // a release gate. Log + continue; god-token access
+                // still works for the operator to diagnose.
+                eprintln!(
+                    "WARN: tenant-role upgrade backfill failed: {e} — admin-UI may \
+                     require god-token auth until corrected"
+                );
+            }
+        }
+    }
+
     // ── Ollama local LLM provider (optional) ─────────────────────────────────
     let ollama: Option<Arc<OllamaProvider>> = if let Some(provider) = OllamaProvider::from_env() {
         eprintln!("ollama: connecting to {}", provider.host());

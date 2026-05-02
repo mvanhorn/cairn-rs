@@ -1141,6 +1141,23 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             table: Some("tenant_quota_violations"),
         },
     },
+    // RFC 026 PR-A0: tenant-scope admin role. Upsert on Granted,
+    // mark revoked (not delete) on Revoked so the audit trail survives.
+    // Pg V066 + sqlite schema.rs both back this with `operator_tenant_roles`;
+    // in-memory mirrors the projection field-by-field. Projection-parity
+    // harness covers both variants.
+    ProjectionEntry {
+        variant: "TenantRoleGranted",
+        status: ProjectionStatus::Projected {
+            table: Some("operator_tenant_roles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TenantRoleRevoked",
+        status: ProjectionStatus::Projected {
+            table: Some("operator_tenant_roles"),
+        },
+    },
     ProjectionEntry {
         variant: "ToolRecoveryPaused",
         status: ProjectionStatus::Projected {
@@ -1464,8 +1481,13 @@ mod tests {
         //     the zero-Stubbed milestone; `assert_no_stubs_for_persistent_backend`
         //     now returns Ok on both persistent backends. Net: +1 Ephemeral,
         //     -1 Stubbed → 125 / 33 / 0.
+        //   * RFC-026 PR-A0: `TenantRoleGranted` + `TenantRoleRevoked`
+        //     added as Projected with backing table `operator_tenant_roles`
+        //     (pg V066 + sqlite schema.rs). The admin-UI series depends on
+        //     a tenant-scope admin role model that `AdminRoleGuard` was
+        //     asked to enforce but never had. Net: +2 Projected → 127 / 33 / 0.
         assert_eq!(
-            projected, 125,
+            projected, 127,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
@@ -1473,7 +1495,7 @@ mod tests {
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 158);
+        assert_eq!(projected + ephemeral + stubbed, 160);
     }
 
     #[test]

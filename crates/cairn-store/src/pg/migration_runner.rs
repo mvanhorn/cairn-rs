@@ -413,6 +413,13 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_run_cost_projections",
         include_str!("migrations/V065__create_run_cost_projections.sql"),
     ),
+    // RFC 026 PR-A0: operator_tenant_roles projection for the
+    // tenant-admin role model (blocker for admin-UI series A1..A6).
+    (
+        66,
+        "create_operator_tenant_roles",
+        include_str!("migrations/V066__create_operator_tenant_roles.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

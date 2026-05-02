@@ -19,13 +19,16 @@ use utoipa::ToSchema;
 use cairn_api::auth::AuthPrincipal;
 use cairn_api::http::{ApiError, ListResponse};
 use cairn_domain::credentials::CredentialRecord;
+use cairn_domain::tenancy::TenantRole;
+use cairn_domain::OperatorId;
 use cairn_domain::{
     AuditLogEntry, AuditOutcome, CredentialId, ProjectKey, TenantId, WorkspaceId, WorkspaceKey,
     WorkspaceRole, CREDENTIAL_MANAGEMENT,
 };
 use cairn_runtime::{
     AuditService, CredentialService, NotificationService, OperatorProfileService, ProjectService,
-    QuotaService, RetentionService, TenantService, WorkspaceMembershipService, WorkspaceService,
+    QuotaService, RetentionService, TenantRoleService, TenantService, WorkspaceMembershipService,
+    WorkspaceService,
 };
 use cairn_store::projections::{AuditLogReadModel, QuotaReadModel, RetentionPolicyReadModel};
 
@@ -33,7 +36,7 @@ use crate::errors::{
     api_error_with_details, json_rejection_response, require_feature, runtime_error_response,
     store_error_response, validation_error_response, AppApiError,
 };
-use crate::extractors::{AdminRoleGuard, TenantScope};
+use crate::extractors::{AdminRoleGuard, TenantAdminGuard, TenantScope};
 use crate::state::AppState;
 use crate::tokens::RequestLogEntry;
 use crate::webhook_validation::{validate_channels, WebhookValidationPolicy};
@@ -1435,6 +1438,82 @@ pub(crate) async fn list_operator_profiles_handler(
             items.truncate(limit);
             (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
+        Err(err) => runtime_error_response(err),
+    }
+}
+
+// ── Tenant-admin role grants (RFC 026 PR-A0) ────────────────────────────────
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct PromoteTenantRoleRequest {
+    /// Role to grant on the target tenant. Snake-case on the wire:
+    /// `"admin"`, `"member"`, or `"read_only"`.
+    pub role: TenantRole,
+}
+
+/// `POST /v1/admin/operators/:id/tenant-roles/:tenant/promote` — grant
+/// `role` on `tenant` to operator `:id`.
+///
+/// Guard: `TenantAdminGuard` — accepts the deployment admin service
+/// account (`CAIRN_ADMIN_TOKEN`) for bootstrapping AND tenant-admins on
+/// the target tenant (so one admin can delegate). `granted_by` on the
+/// emitted event is the authenticated principal id so the audit trail
+/// records who authorized the grant.
+pub(crate) async fn promote_tenant_role_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path((operator_id, tenant_id)): Path<(String, String)>,
+    Json(body): Json<PromoteTenantRoleRequest>,
+) -> impl IntoResponse {
+    let granted_by = audit_actor_id(&principal);
+    match state
+        .runtime
+        .tenant_roles
+        .grant(
+            TenantId::new(tenant_id),
+            OperatorId::new(operator_id),
+            body.role,
+            granted_by,
+        )
+        .await
+    {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Err(err) => runtime_error_response(err),
+    }
+}
+
+/// `DELETE /v1/admin/operators/:id/tenant-roles/:tenant` — revoke the
+/// active `(tenant, operator)` role.
+///
+/// Soft delete: the projection row is retained with `revoked_at_ms` +
+/// `revoked_by` set so the audit trail survives. Returns 404 when the
+/// pair has no row at all (distinct from "was revoked before" — the
+/// service returns `Some(revoked_row)` for that case).
+pub(crate) async fn revoke_tenant_role_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path((operator_id, tenant_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let revoked_by = audit_actor_id(&principal);
+    match state
+        .runtime
+        .tenant_roles
+        .revoke(
+            TenantId::new(tenant_id),
+            OperatorId::new(operator_id),
+            revoked_by,
+        )
+        .await
+    {
+        Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(None) => AppApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "tenant role grant not found",
+        )
+        .into_response(),
         Err(err) => runtime_error_response(err),
     }
 }

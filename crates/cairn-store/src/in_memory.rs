@@ -127,6 +127,11 @@ struct State {
     llm_traces: Vec<cairn_domain::LlmCallTrace>,
     operator_profiles: HashMap<String, crate::projections::OperatorProfileRecord>,
     full_operator_profiles: HashMap<String, cairn_domain::org::OperatorProfile>,
+    /// RFC 026 PR-A0: operator → tenant-role mapping keyed on
+    /// `(tenant_id, operator_id)`. Revoked rows are kept (the audit
+    /// trail survives); active-only queries filter on
+    /// `OperatorTenantRoleRecord::is_active`.
+    operator_tenant_roles: HashMap<(String, String), crate::projections::OperatorTenantRoleRecord>,
     workspace_members: Vec<crate::projections::WorkspaceMemberRecord>,
     signal_subscriptions: HashMap<String, crate::projections::SignalSubscriptionRecord>,
     provider_health_records: HashMap<String, cairn_domain::providers::ProviderHealthRecord>,
@@ -355,6 +360,7 @@ impl InMemoryStore {
                 llm_traces: Vec::new(),
                 operator_profiles: HashMap::new(),
                 full_operator_profiles: HashMap::new(),
+                operator_tenant_roles: HashMap::new(),
                 workspace_members: Vec::new(),
                 signal_subscriptions: HashMap::new(),
                 provider_health_records: HashMap::new(),
@@ -1337,6 +1343,42 @@ impl InMemoryStore {
                     if let Some(email) = &e.email {
                         profile.email = email.clone();
                     }
+                }
+            }
+            // RFC 026 PR-A0: operator_tenant_roles projection. Upsert on
+            // grant — a re-grant over a revoked row clears the revocation
+            // fields so the row reads as active again. The pg/sqlite
+            // appliers (V066) mirror this ON CONFLICT semantics.
+            RuntimeEvent::TenantRoleGranted(e) => {
+                let key = (
+                    e.tenant_id.as_str().to_owned(),
+                    e.operator_id.as_str().to_owned(),
+                );
+                state.operator_tenant_roles.insert(
+                    key,
+                    crate::projections::OperatorTenantRoleRecord {
+                        tenant_id: e.tenant_id.clone(),
+                        operator_id: e.operator_id.clone(),
+                        role: e.role,
+                        granted_at_ms: e.at_ms,
+                        granted_by: e.granted_by.clone(),
+                        revoked_at_ms: None,
+                        revoked_by: None,
+                    },
+                );
+            }
+            // RFC 026 PR-A0: soft-revoke. The row is NOT deleted — the
+            // audit trail survives, and a subsequent `TenantRoleGranted`
+            // upserts a fresh grant. Revoking a non-existent row is a
+            // no-op (replay-safe across reorders).
+            RuntimeEvent::TenantRoleRevoked(e) => {
+                let key = (
+                    e.tenant_id.as_str().to_owned(),
+                    e.operator_id.as_str().to_owned(),
+                );
+                if let Some(rec) = state.operator_tenant_roles.get_mut(&key) {
+                    rec.revoked_at_ms = Some(e.at_ms);
+                    rec.revoked_by = Some(e.revoked_by.clone());
                 }
             }
             RuntimeEvent::ProviderConnectionRegistered(e) => {
@@ -4910,6 +4952,57 @@ impl crate::projections::OperatorProfileReadModel for InMemoryStore {
     }
 }
 
+// -- OperatorTenantRoleReadModel (RFC 026 PR-A0) --
+
+#[async_trait]
+impl crate::projections::OperatorTenantRoleReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        tenant_id: &cairn_domain::ids::TenantId,
+        operator_id: &cairn_domain::ids::OperatorId,
+    ) -> Result<Option<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (
+            tenant_id.as_str().to_owned(),
+            operator_id.as_str().to_owned(),
+        );
+        Ok(state.operator_tenant_roles.get(&key).cloned())
+    }
+
+    async fn list_by_operator(
+        &self,
+        operator_id: &cairn_domain::ids::OperatorId,
+    ) -> Result<Vec<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::OperatorTenantRoleRecord> = state
+            .operator_tenant_roles
+            .values()
+            .filter(|r| &r.operator_id == operator_id)
+            .cloned()
+            .collect();
+        // Deterministic ordering across backends: tenant_id ASC.
+        results.sort_by(|a, b| a.tenant_id.as_str().cmp(b.tenant_id.as_str()));
+        Ok(results)
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::ids::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::OperatorTenantRoleRecord> = state
+            .operator_tenant_roles
+            .values()
+            .filter(|r| &r.tenant_id == tenant_id)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| a.operator_id.as_str().cmp(b.operator_id.as_str()));
+        Ok(results.into_iter().skip(offset).take(limit).collect())
+    }
+}
+
 // -- WorkspaceMembershipReadModel --
 
 #[async_trait]
@@ -6908,6 +7001,7 @@ impl InMemoryStore {
         state.llm_traces.clear();
         state.operator_profiles.clear();
         state.full_operator_profiles.clear();
+        state.operator_tenant_roles.clear();
         state.workspace_members.clear();
         state.signal_subscriptions.clear();
         state.provider_health_records.clear();
@@ -7082,6 +7176,7 @@ impl InMemoryStore {
             state.llm_traces.clear();
             state.operator_profiles.clear();
             state.full_operator_profiles.clear();
+            state.operator_tenant_roles.clear();
             state.workspace_members.clear();
             state.signal_subscriptions.clear();
             state.provider_health_records.clear();
@@ -7408,6 +7503,7 @@ impl InMemoryStore {
         state.llm_traces.clear();
         state.operator_profiles.clear();
         state.full_operator_profiles.clear();
+        state.operator_tenant_roles.clear();
         state.workspace_members.clear();
         state.signal_subscriptions.clear();
         state.provider_health_records.clear();

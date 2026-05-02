@@ -462,6 +462,9 @@ mod in_memory_vs_sqlite {
             "SoulPatchApplied",
             // RFC-025 Phase 2b.2b m6: tool-recovery-pause fixture below.
             "ToolRecoveryPaused",
+            // RFC 026 PR-A0: tenant-admin role fixtures below.
+            "TenantRoleGranted",
+            "TenantRoleRevoked",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -4403,6 +4406,223 @@ mod in_memory_vs_sqlite {
             "only run_a should be due: run_b was resumed (evict), run_c has \
              resume_after_ms=None (not scheduled). Got: {run_ids:?}"
         );
+    }
+
+    // ── RFC 026 PR-A0: operator_tenant_roles projection parity. ──────
+    //
+    // Grant-then-revoke then re-grant covers the upsert + soft-revoke +
+    // restore branches. Cross-backend parity on the read model protects
+    // the admin-UI TenantAdminGuard extractor: if pg and sqlite disagree
+    // on whether a role is active, the 403-vs-200 decision drifts.
+
+    #[tokio::test]
+    async fn tenant_role_granted_projection_matches_across_backends() {
+        use cairn_domain::tenancy::TenantRole;
+        use cairn_domain::TenantRoleGranted;
+        use cairn_store::projections::OperatorTenantRoleReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_role_parity");
+        let operator_id = OperatorId::new("op_role_parity");
+        let events = vec![env(RuntimeEvent::TenantRoleGranted(TenantRoleGranted {
+            tenant_id: tenant_id.clone(),
+            operator_id: operator_id.clone(),
+            role: TenantRole::Admin,
+            granted_by: "system".into(),
+            at_ms: 5_000_000,
+        }))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = OperatorTenantRoleReadModel::get(&mem, &tenant_id, &operator_id)
+            .await
+            .unwrap()
+            .expect("in-memory tenant-role row");
+        let sqlite_rec = OperatorTenantRoleReadModel::get(&adapter, &tenant_id, &operator_id)
+            .await
+            .unwrap()
+            .expect("sqlite tenant-role row");
+
+        assert_eq!(mem_rec.tenant_id, sqlite_rec.tenant_id);
+        assert_eq!(mem_rec.operator_id, sqlite_rec.operator_id);
+        assert_eq!(mem_rec.role, sqlite_rec.role);
+        assert_eq!(mem_rec.granted_at_ms, sqlite_rec.granted_at_ms);
+        assert_eq!(mem_rec.granted_by, sqlite_rec.granted_by);
+        assert_eq!(mem_rec.revoked_at_ms, sqlite_rec.revoked_at_ms);
+        assert_eq!(mem_rec.revoked_by, sqlite_rec.revoked_by);
+        assert_eq!(mem_rec.role, TenantRole::Admin);
+        assert!(mem_rec.is_active());
+        assert!(sqlite_rec.is_active());
+    }
+
+    #[tokio::test]
+    async fn tenant_role_revoke_then_regrant_matches_across_backends() {
+        use cairn_domain::tenancy::TenantRole;
+        use cairn_domain::{TenantRoleGranted, TenantRoleRevoked};
+        use cairn_store::projections::OperatorTenantRoleReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_role_restore");
+        let operator_id = OperatorId::new("op_role_restore");
+        let events = vec![
+            env(RuntimeEvent::TenantRoleGranted(TenantRoleGranted {
+                tenant_id: tenant_id.clone(),
+                operator_id: operator_id.clone(),
+                role: TenantRole::Admin,
+                granted_by: "op_admin_1".into(),
+                at_ms: 6_000_000,
+            })),
+            env(RuntimeEvent::TenantRoleRevoked(TenantRoleRevoked {
+                tenant_id: tenant_id.clone(),
+                operator_id: operator_id.clone(),
+                revoked_by: "op_admin_2".into(),
+                at_ms: 6_500_000,
+            })),
+            // Re-grant at a different role level: the row must now read
+            // as an active Member grant (role updated, revocation
+            // fields cleared). This is the core safety net for the
+            // admin-UI "promote then demote then re-promote" flow.
+            env(RuntimeEvent::TenantRoleGranted(TenantRoleGranted {
+                tenant_id: tenant_id.clone(),
+                operator_id: operator_id.clone(),
+                role: TenantRole::Member,
+                granted_by: "op_admin_3".into(),
+                at_ms: 7_000_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = OperatorTenantRoleReadModel::get(&mem, &tenant_id, &operator_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_rec = OperatorTenantRoleReadModel::get(&adapter, &tenant_id, &operator_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(mem_rec.role, TenantRole::Member);
+        assert_eq!(sqlite_rec.role, TenantRole::Member);
+        assert_eq!(mem_rec.granted_at_ms, 7_000_000);
+        assert_eq!(sqlite_rec.granted_at_ms, 7_000_000);
+        assert_eq!(mem_rec.granted_by, "op_admin_3");
+        assert_eq!(sqlite_rec.granted_by, "op_admin_3");
+        assert_eq!(mem_rec.revoked_at_ms, None);
+        assert_eq!(sqlite_rec.revoked_at_ms, None);
+        assert_eq!(mem_rec.revoked_by, None);
+        assert_eq!(sqlite_rec.revoked_by, None);
+        assert!(mem_rec.is_active());
+        assert!(sqlite_rec.is_active());
+    }
+
+    #[tokio::test]
+    async fn tenant_role_revoked_preserves_audit_trail_across_backends() {
+        // RFC 026 PR-A0: a revoke must NOT delete the row — the audit
+        // trail survives. Both backends must return `Some(..)` with
+        // `revoked_at_ms.is_some()`.
+        use cairn_domain::tenancy::TenantRole;
+        use cairn_domain::{TenantRoleGranted, TenantRoleRevoked};
+        use cairn_store::projections::OperatorTenantRoleReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let tenant_id = TenantId::new("t_role_audit");
+        let operator_id = OperatorId::new("op_role_audit");
+        let events = vec![
+            env(RuntimeEvent::TenantRoleGranted(TenantRoleGranted {
+                tenant_id: tenant_id.clone(),
+                operator_id: operator_id.clone(),
+                role: TenantRole::ReadOnly,
+                granted_by: "system".into(),
+                at_ms: 8_000_000,
+            })),
+            env(RuntimeEvent::TenantRoleRevoked(TenantRoleRevoked {
+                tenant_id: tenant_id.clone(),
+                operator_id: operator_id.clone(),
+                revoked_by: "op_admin".into(),
+                at_ms: 8_500_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_rec = OperatorTenantRoleReadModel::get(&mem, &tenant_id, &operator_id)
+            .await
+            .unwrap()
+            .expect("revoked row must still exist (audit trail)");
+        let sqlite_rec = OperatorTenantRoleReadModel::get(&adapter, &tenant_id, &operator_id)
+            .await
+            .unwrap()
+            .expect("revoked row must still exist (audit trail)");
+
+        assert_eq!(mem_rec.revoked_at_ms, Some(8_500_000));
+        assert_eq!(sqlite_rec.revoked_at_ms, Some(8_500_000));
+        assert_eq!(mem_rec.revoked_by.as_deref(), Some("op_admin"));
+        assert_eq!(sqlite_rec.revoked_by.as_deref(), Some("op_admin"));
+        assert!(!mem_rec.is_active());
+        assert!(!sqlite_rec.is_active());
+        // The original grant metadata is still readable — callers that
+        // need "who originally granted this role?" can reconstruct it.
+        assert_eq!(mem_rec.granted_by, "system");
+        assert_eq!(sqlite_rec.granted_by, "system");
+    }
+
+    #[tokio::test]
+    async fn tenant_role_list_by_operator_matches_across_backends() {
+        use cairn_domain::tenancy::TenantRole;
+        use cairn_domain::TenantRoleGranted;
+        use cairn_store::projections::OperatorTenantRoleReadModel;
+
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let operator_id = OperatorId::new("op_multi");
+        // Grants on two distinct tenants; the middleware uses
+        // list_by_operator to decide which tenant the incoming request's
+        // principal can administer.
+        let events = vec![
+            env(RuntimeEvent::TenantRoleGranted(TenantRoleGranted {
+                tenant_id: TenantId::new("t_b"),
+                operator_id: operator_id.clone(),
+                role: TenantRole::Admin,
+                granted_by: "system".into(),
+                at_ms: 9_000_000,
+            })),
+            env(RuntimeEvent::TenantRoleGranted(TenantRoleGranted {
+                tenant_id: TenantId::new("t_a"),
+                operator_id: operator_id.clone(),
+                role: TenantRole::Member,
+                granted_by: "system".into(),
+                at_ms: 9_500_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_list = OperatorTenantRoleReadModel::list_by_operator(&mem, &operator_id)
+            .await
+            .unwrap();
+        let sqlite_list = OperatorTenantRoleReadModel::list_by_operator(&adapter, &operator_id)
+            .await
+            .unwrap();
+
+        assert_eq!(mem_list.len(), 2);
+        assert_eq!(sqlite_list.len(), 2);
+        // Ordering must match across backends — tenant_id ASC.
+        assert_eq!(mem_list[0].tenant_id.as_str(), "t_a");
+        assert_eq!(sqlite_list[0].tenant_id.as_str(), "t_a");
+        assert_eq!(mem_list[1].tenant_id.as_str(), "t_b");
+        assert_eq!(sqlite_list[1].tenant_id.as_str(), "t_b");
+        assert_eq!(mem_list[0].role, TenantRole::Member);
+        assert_eq!(sqlite_list[0].role, TenantRole::Member);
+        assert_eq!(mem_list[1].role, TenantRole::Admin);
+        assert_eq!(sqlite_list[1].role, TenantRole::Admin);
     }
 }
 

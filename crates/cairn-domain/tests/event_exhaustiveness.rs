@@ -474,6 +474,12 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::OperatorProfileUpdated(_) => {
             assert!(eref.is_none());
         }
+        RuntimeEvent::TenantRoleGranted(_) => {
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::TenantRoleRevoked(_) => {
+            assert!(eref.is_none());
+        }
         RuntimeEvent::PauseScheduled(_) => {
             assert!(eref.is_none());
         }
@@ -1428,6 +1434,19 @@ fn all_variants() -> Vec<RuntimeEvent> {
             display_name: None,
             email: None,
         }),
+        RuntimeEvent::TenantRoleGranted(cairn_domain::TenantRoleGranted {
+            tenant_id: tid(),
+            operator_id: OperatorId::new("op1"),
+            role: cairn_domain::tenancy::TenantRole::Admin,
+            granted_by: "system".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::TenantRoleRevoked(cairn_domain::TenantRoleRevoked {
+            tenant_id: tid(),
+            operator_id: OperatorId::new("op1"),
+            revoked_by: "op_admin".to_owned(),
+            at_ms: ts,
+        }),
         RuntimeEvent::PauseScheduled(PauseScheduled {
             task_id: task(),
             resume_at_ms: ts + 60_000,
@@ -1949,18 +1968,12 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 158 variants in the RuntimeEvent enum (143 baseline + F65 PR-1
-    // orchestrator session redesign foundation: SessionAttemptStarted,
-    // SessionAttemptCompleted, CircuitBreakerTripped, BudgetThresholdCrossed,
-    // CheckpointPersisted, WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
-    // SessionOutcomeEmitted, OrchestratorDecisionMade, SummarizerFallback,
-    // WorkspaceBackendDegraded — 11 new variants, plus #244's EvalRunArchived,
-    // plus F65 PR-5's SandboxCrashRecovered (#359 umount sweep), plus RFC-025
-    // Phase 1's EvalRunScored + EvalRubricScored).
+    // 160 variants in the RuntimeEvent enum (158 baseline + RFC 026 PR-A0
+    // TenantRoleGranted + TenantRoleRevoked).
     assert_eq!(
         variants.len(),
-        158,
-        "all_variants() must construct exactly 158 RuntimeEvent instances"
+        160,
+        "all_variants() must construct exactly 160 RuntimeEvent instances"
     );
 }
 

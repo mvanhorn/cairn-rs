@@ -2289,6 +2289,60 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
+            // RFC 026 PR-A0: operator_tenant_roles projection (sqlite
+            // parity with pg V066). See pg applier for per-event
+            // rationale; the `excluded` pseudo-table replaces pg's
+            // `EXCLUDED` in the ON CONFLICT clause.
+            RuntimeEvent::TenantRoleGranted(e) => {
+                let role = enum_to_str(&e.role)?;
+                let granted_at = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "TenantRoleGranted.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO operator_tenant_roles (
+                        tenant_id, operator_id, role, granted_at_ms, granted_by,
+                        revoked_at_ms, revoked_by
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)
+                     ON CONFLICT (tenant_id, operator_id) DO UPDATE SET
+                        role          = excluded.role,
+                        granted_at_ms = excluded.granted_at_ms,
+                        granted_by    = excluded.granted_by,
+                        revoked_at_ms = NULL,
+                        revoked_by    = NULL",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.operator_id.as_str())
+                .bind(&role)
+                .bind(granted_at)
+                .bind(&e.granted_by)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::TenantRoleRevoked(e) => {
+                let revoked_at = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "TenantRoleRevoked.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE operator_tenant_roles SET
+                        revoked_at_ms = ?3,
+                        revoked_by    = ?4
+                     WHERE tenant_id = ?1 AND operator_id = ?2",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.operator_id.as_str())
+                .bind(revoked_at)
+                .bind(&e.revoked_by)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // PR #595 (issue #592): `PauseScheduled` is Projected via the
             // `RunStateChanged` → `pause_schedules` arm above; explicit
             // no-op keeps the projection-stub-guard CI job green.

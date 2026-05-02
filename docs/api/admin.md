@@ -28,6 +28,8 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `GET` | `/v1/admin/notifications/failed` | Preserve | failed notification records |
 | `GET` | `/v1/admin/operators/:id/notifications` | Preserve |  |
 | `POST` | `/v1/admin/operators/:id/notifications` | Preserve |  |
+| `DELETE` | `/v1/admin/operators/:id/tenant-roles/:tenant` | Preserve | RFC 026 PR-A0: soft-revoke tenant role grant (row retained with revocation fields). |
+| `POST` | `/v1/admin/operators/:id/tenant-roles/:tenant/promote` | Preserve | RFC 026 PR-A0: grant a tenant-scope role (Admin / Member / ReadOnly) to an operator. |
 | `POST` | `/v1/admin/rebuild-projections` | Preserve |  |
 | `POST` | `/v1/admin/restore` | Preserve |  |
 | `POST` | `/v1/admin/rotate-token` | Preserve |  |

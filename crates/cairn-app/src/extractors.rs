@@ -2,17 +2,19 @@
 
 use axum::extract::{FromRequest, FromRequestParts, Query, Request};
 use axum::http::request::Parts;
+use axum::response::IntoResponse;
 use axum::Json;
 use serde::de::DeserializeOwned;
 
 use cairn_api::auth::AuthPrincipal;
 use cairn_api::endpoints::ListQuery;
 use cairn_api::memory_api::MemorySearchQuery;
+use cairn_domain::tenancy::TenantRole;
 use cairn_domain::{ProjectKey, TenantId, WorkspaceRole};
 
 use crate::errors::{
-    forbidden_api_error, query_rejection_error, tenant_scope_mismatch_error,
-    unauthorized_api_error, AppApiError,
+    forbidden_api_error, query_rejection_error, tenant_role_missing_response,
+    tenant_scope_mismatch_error, unauthorized_api_error, AppApiError,
 };
 use crate::{DEFAULT_PROJECT_ID, DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID};
 
@@ -412,5 +414,95 @@ where
             return Err(forbidden_api_error("insufficient workspace role"));
         }
         Ok(Self)
+    }
+}
+
+// ── TenantAdminGuard (RFC 026 PR-A0) ───────────────────────────────────────
+
+/// The request's TARGET tenant id — parsed from the URL path by
+/// `crate::middleware::attach_tenant_role`. Distinct from the
+/// authenticated principal's home `TenantId` extension so the two
+/// don't clobber each other on admin-path requests.
+///
+/// Populated only for paths matching `/v1/admin/tenants/:tenant_id/*`
+/// or `/v1/admin/operators/:id/tenant-roles/:tenant/*`.
+#[derive(Clone, Debug)]
+pub struct TargetTenantId(pub TenantId);
+
+/// Extractor that admits god-token principals **or** operators holding
+/// `TenantRole::Admin` on the target tenant.
+///
+/// Attached earlier in the pipeline by
+/// [`crate::middleware::attach_tenant_role`], which parses the path's
+/// target tenant id and inserts the operator's active TenantRole into
+/// request extensions. System / admin-service-account principals
+/// short-circuit via [`is_admin_principal`] — they keep cross-tenant
+/// access for backward compatibility with existing `AdminRoleGuard`
+/// usage sites.
+///
+/// Rejection body on a real-operator 403 is intentionally non-canonical
+/// (see [`tenant_role_missing_response`]): the UI `<AdminGate>` wrapper
+/// parses `error_code == "tenant_role_missing"` to distinguish an
+/// upgrade-regression from a deliberate role gap.
+pub struct TenantAdminGuard;
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for TenantAdminGuard
+where
+    S: Send + Sync,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let principal = parts
+            .extensions
+            .get::<AuthPrincipal>()
+            .cloned()
+            .ok_or_else(|| unauthorized_api_error().into_response())?;
+
+        // God-token backward compat — deployment-global admin service
+        // account and System principals pass without a tenant-role
+        // check. This preserves every pre-PR-A0 admin workflow.
+        if is_admin_principal(&principal) {
+            return Ok(Self);
+        }
+
+        // Real operator: middleware attached a `TenantRole` extension
+        // only when the operator has an active grant on the target
+        // tenant. Absence of the extension means no grant; Admin is
+        // the only role that clears this guard.
+        match parts.extensions.get::<TenantRole>().copied() {
+            Some(role) if role.is_admin() => Ok(Self),
+            Some(_) | None => {
+                // Produce the structured `tenant_role_missing` body so
+                // operators upgrading from pre-A0 main get an actionable
+                // hint instead of a bare 403.
+                //
+                // Prefer the path's target tenant id (`TargetTenantId`,
+                // attached by `middleware::attach_tenant_role`) over
+                // the authenticated principal's home tenant — the body
+                // must reflect what the operator REQUESTED, not their
+                // home. Fall back to the principal's tenant when the
+                // path didn't carry a target (e.g. a non-admin path
+                // that somehow reached this guard).
+                let tenant_id = parts
+                    .extensions
+                    .get::<TargetTenantId>()
+                    .map(|t| t.0.as_str().to_owned())
+                    .or_else(|| {
+                        parts
+                            .extensions
+                            .get::<TenantId>()
+                            .map(|t| t.as_str().to_owned())
+                    })
+                    .unwrap_or_default();
+                let operator_id = match &principal {
+                    AuthPrincipal::Operator { operator_id, .. } => operator_id.as_str().to_owned(),
+                    AuthPrincipal::ServiceAccount { name, .. } => name.clone(),
+                    AuthPrincipal::System => String::new(),
+                };
+                Err(tenant_role_missing_response(&tenant_id, &operator_id))
+            }
+        }
     }
 }

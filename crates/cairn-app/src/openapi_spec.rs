@@ -3129,6 +3129,43 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "200": { "description": "Failed notification list" } }
       }
     },
+    "/v1/admin/operators/{id}/tenant-roles/{tenant}/promote": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Grant a tenant-scope role to an operator (RFC 026 PR-A0)",
+        "description": "Upserts the (tenant, operator) pair in `operator_tenant_roles`; re-granting an already-granted pair clears any prior revocation. Guarded by `TenantAdminGuard` — accepts god-token (`CAIRN_ADMIN_TOKEN`) for bootstrapping OR an existing `TenantRole::Admin` on the target tenant so tenant-admins can delegate.",
+        "operationId": "promoteTenantRole",
+        "parameters": [
+          { "name": "id",     "in": "path", "required": true, "schema": { "type": "string" }, "description": "Operator id." },
+          { "name": "tenant", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Target tenant id." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["role"], "properties": { "role": { "type": "string", "enum": ["admin", "member", "read_only"] } } } } }
+        },
+        "responses": {
+          "201": { "description": "Role granted — body echoes the projected row." },
+          "403": { "description": "Structured `tenant_role_missing` body when the caller is a non-admin operator without TenantRole::Admin on the target." }
+        }
+      }
+    },
+    "/v1/admin/operators/{id}/tenant-roles/{tenant}": {
+      "delete": {
+        "tags": ["Admin"],
+        "summary": "Revoke an operator's tenant-scope role (RFC 026 PR-A0)",
+        "description": "Soft delete — the projection row is retained with `revoked_at_ms` + `revoked_by` set so the audit trail survives. Returns 404 when no grant has ever existed for the (operator, tenant) pair.",
+        "operationId": "revokeTenantRole",
+        "parameters": [
+          { "name": "id",     "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenant", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Revoked — body echoes the updated row with revocation fields populated." },
+          "403": { "description": "Structured `tenant_role_missing` for non-admin callers." },
+          "404": { "description": "No grant exists for this (operator, tenant)." }
+        }
+      }
+    },
     "/v1/admin/workspaces": {
       "get": {
         "tags": ["Admin"],

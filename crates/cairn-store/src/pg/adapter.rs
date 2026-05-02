@@ -5311,6 +5311,132 @@ impl crate::projections::OperatorProfileReadModel for PgAdapter {
 }
 
 #[async_trait]
+impl crate::projections::OperatorTenantRoleReadModel for PgAdapter {
+    async fn get(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        operator_id: &cairn_domain::OperatorId,
+    ) -> Result<Option<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let row: Option<(
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT tenant_id, operator_id, role, granted_at_ms, granted_by,
+                    revoked_at_ms, revoked_by
+             FROM operator_tenant_roles
+             WHERE tenant_id = $1 AND operator_id = $2",
+        )
+        .bind(tenant_id.as_str())
+        .bind(operator_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(pg_row_to_operator_tenant_role))
+    }
+
+    async fn list_by_operator(
+        &self,
+        operator_id: &cairn_domain::OperatorId,
+    ) -> Result<Vec<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT tenant_id, operator_id, role, granted_at_ms, granted_by,
+                    revoked_at_ms, revoked_by
+             FROM operator_tenant_roles
+             WHERE operator_id = $1
+             ORDER BY tenant_id ASC",
+        )
+        .bind(operator_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(pg_row_to_operator_tenant_role)
+            .collect())
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT tenant_id, operator_id, role, granted_at_ms, granted_by,
+                    revoked_at_ms, revoked_by
+             FROM operator_tenant_roles
+             WHERE tenant_id = $1
+             ORDER BY operator_id ASC
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(tenant_id.as_str())
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(pg_row_to_operator_tenant_role)
+            .collect())
+    }
+}
+
+/// Row → record conversion shared by the three pg reads above. See the
+/// sqlite sibling in `sqlite/adapter.rs::row_to_operator_tenant_role` —
+/// kept per-backend to avoid leaking sqlx type-tuple signatures through
+/// a shared crate-level helper.
+fn pg_row_to_operator_tenant_role(
+    row: (
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<i64>,
+        Option<String>,
+    ),
+) -> crate::projections::OperatorTenantRoleRecord {
+    let (tenant_id, operator_id, role, granted_at_ms, granted_by, revoked_at_ms, revoked_by) = row;
+    let role: cairn_domain::tenancy::TenantRole = serde_json::from_str(&format!("\"{role}\""))
+        .unwrap_or(
+            // Defensive: default to ReadOnly (least-privilege) on a
+            // corrupt row. Mirrors sqlite.
+            cairn_domain::tenancy::TenantRole::ReadOnly,
+        );
+    crate::projections::OperatorTenantRoleRecord {
+        tenant_id: cairn_domain::TenantId::new(tenant_id),
+        operator_id: cairn_domain::OperatorId::new(operator_id),
+        role,
+        granted_at_ms: granted_at_ms.max(0) as u64,
+        granted_by,
+        revoked_at_ms: revoked_at_ms.map(|v| v.max(0) as u64),
+        revoked_by,
+    }
+}
+
+#[async_trait]
 impl crate::projections::RoutePolicyReadModel for PgAdapter {
     async fn get(
         &self,

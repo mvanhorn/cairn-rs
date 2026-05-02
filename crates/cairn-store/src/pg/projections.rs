@@ -2163,6 +2163,68 @@ impl PgSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
+            // RFC 026 PR-A0: operator_tenant_roles projection (pg V066).
+            // Upsert on grant — a re-grant over a revoked row clears
+            // `revoked_at_ms` / `revoked_by` so the row reads as an
+            // active grant again. Keeping the `(tenant_id, operator_id)`
+            // PK means each pair has exactly one row at a time; the
+            // lifetime audit lives in the event log itself.
+            RuntimeEvent::TenantRoleGranted(e) => {
+                let role = enum_to_str(&e.role)?;
+                let granted_at = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "TenantRoleGranted.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "INSERT INTO operator_tenant_roles (
+                        tenant_id, operator_id, role, granted_at_ms, granted_by,
+                        revoked_at_ms, revoked_by
+                     ) VALUES ($1, $2, $3, $4, $5, NULL, NULL)
+                     ON CONFLICT (tenant_id, operator_id) DO UPDATE SET
+                        role          = EXCLUDED.role,
+                        granted_at_ms = EXCLUDED.granted_at_ms,
+                        granted_by    = EXCLUDED.granted_by,
+                        revoked_at_ms = NULL,
+                        revoked_by    = NULL",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.operator_id.as_str())
+                .bind(&role)
+                .bind(granted_at)
+                .bind(&e.granted_by)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // RFC 026 PR-A0: soft revoke. Row retained so the audit
+            // trail survives. A revoke against an unknown pair is a
+            // no-op (replay-safe under event reordering). Only the
+            // revocation fields are written — the role/granted metadata
+            // stays intact so callers can read "what was revoked, and
+            // when did it first come in?"
+            RuntimeEvent::TenantRoleRevoked(e) => {
+                let revoked_at = i64::try_from(e.at_ms).map_err(|_| {
+                    StoreError::Internal(format!(
+                        "TenantRoleRevoked.at_ms {} exceeds i64::MAX",
+                        e.at_ms
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE operator_tenant_roles SET
+                        revoked_at_ms = $3,
+                        revoked_by    = $4
+                     WHERE tenant_id = $1 AND operator_id = $2",
+                )
+                .bind(e.tenant_id.as_str())
+                .bind(e.operator_id.as_str())
+                .bind(revoked_at)
+                .bind(&e.revoked_by)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
             // PR #595 (issue #592): `PauseScheduled` is declared
             // Projected with backing table `pause_schedules`, but the
             // current service layer emits pause-schedule rows via the

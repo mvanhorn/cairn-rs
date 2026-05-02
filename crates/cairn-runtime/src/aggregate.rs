@@ -22,8 +22,8 @@ use crate::services::{
     PromptReleaseServiceImpl, PromptVersionServiceImpl, ProviderBindingServiceImpl,
     ProviderConnectionPoolServiceImpl, ProviderConnectionServiceImpl, ProviderHealthServiceImpl,
     QuotaServiceImpl, RetentionServiceImpl, RoutePolicyServiceImpl, RunCostAlertServiceImpl,
-    RunSlaServiceImpl, SignalRouterServiceImpl, SignalServiceImpl, TenantServiceImpl,
-    WorkspaceMembershipServiceImpl, WorkspaceServiceImpl,
+    RunSlaServiceImpl, SignalRouterServiceImpl, SignalServiceImpl, TenantRoleServiceImpl,
+    TenantServiceImpl, WorkspaceMembershipServiceImpl, WorkspaceServiceImpl,
 };
 use crate::sessions::SessionService;
 use crate::tasks::TaskService;
@@ -125,6 +125,10 @@ pub struct RuntimeServices {
     // ── Notifications & operators ─────────────────────────────────────────
     pub notifications: NotificationServiceImpl<InMemoryStore>,
     pub operator_profiles: OperatorProfileServiceImpl<InMemoryStore>,
+    /// RFC 026 PR-A0: tenant-scope admin role service. Emits
+    /// `TenantRoleGranted` / `TenantRoleRevoked` and backs the
+    /// `TenantAdminGuard` extractor in cairn-app.
+    pub tenant_roles: TenantRoleServiceImpl<InMemoryStore>,
     pub workspace_memberships: WorkspaceMembershipServiceImpl<InMemoryStore>,
     pub audits: AuditServiceImpl<InMemoryStore>,
     pub tool_invocations: crate::services::ToolInvocationServiceImpl<InMemoryStore>,
@@ -242,6 +246,7 @@ impl RuntimeServices {
             budgets: BudgetServiceImpl::new(store.clone()),
             notifications: NotificationServiceImpl::new(store.clone()),
             operator_profiles: OperatorProfileServiceImpl::new(store.clone()),
+            tenant_roles: TenantRoleServiceImpl::new(store.clone()),
             workspace_memberships: WorkspaceMembershipServiceImpl::new(store.clone()),
             audits: AuditServiceImpl::new(store.clone()),
             tool_invocations: ToolInvocationServiceImpl::new(store.clone()),

@@ -82,6 +82,25 @@ pub(crate) fn forbidden_api_error(message: impl Into<String>) -> AppApiError {
     AppApiError::new(StatusCode::FORBIDDEN, "forbidden", message)
 }
 
+/// RFC 026 PR-A0: structured 403 body emitted when `TenantAdminGuard`
+/// rejects a real operator principal (not god-token) that has no
+/// `operator_tenant_roles` entry for the target tenant.
+///
+/// Carries the actionable hint so operators upgrading from pre-PR-A0
+/// main can see the remediation path instead of a bare `forbidden`.
+/// The body intentionally diverges from the canonical envelope — this
+/// is what the UI `<AdminGate>` wrapper parses to distinguish
+/// "regression upgrade, backfill missing" from "genuinely not admin."
+pub(crate) fn tenant_role_missing_response(tenant_id: &str, operator_id: &str) -> Response {
+    let body = serde_json::json!({
+        "error_code": "tenant_role_missing",
+        "tenant_id": tenant_id,
+        "operator_id": operator_id,
+        "hint": "Ask your deployment admin to run `cairn-app admin promote <op> --tenant <T> --role Admin` or set CAIRN_ADMIN_TOKEN and POST /v1/admin/operators/:id/tenant-roles/:tenant/promote",
+    });
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
 /// 422 Unprocessable Entity with the canonical `validation_error` code.
 ///
 /// Use for requests that parse (syntactically valid JSON) but fail

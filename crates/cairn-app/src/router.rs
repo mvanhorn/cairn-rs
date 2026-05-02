@@ -1282,6 +1282,15 @@ impl AppBootstrap {
                 "/v1/admin/operators/:id/notifications",
                 post(set_operator_notifications_handler),
             )
+            // RFC 026 PR-A0: tenant-admin role grants.
+            .route(
+                "/v1/admin/operators/:id/tenant-roles/:tenant/promote",
+                post(promote_tenant_role_handler),
+            )
+            .route(
+                "/v1/admin/operators/:id/tenant-roles/:tenant",
+                delete(revoke_tenant_role_handler),
+            )
             .route(
                 "/v1/admin/notifications/:id/retry",
                 post(retry_notification_handler),
