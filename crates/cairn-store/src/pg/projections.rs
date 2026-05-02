@@ -2173,9 +2173,10 @@ impl PgSyncProjection {
             // a handwritten `PauseScheduled` event without a parallel
             // table write.
             RuntimeEvent::PauseScheduled(_) => {}
-            RuntimeEvent::PermissionDecisionRecorded(_) => {
-                log_stub("PermissionDecisionRecorded")
-            }
+            // Durable audit event: the event log itself is the projection.
+            // Readers filter `list_events()` by variant — no derived table.
+            // See projection_registry.rs entry; reclassified Ephemeral in #574.
+            RuntimeEvent::PermissionDecisionRecorded(_) => {}
             // RFC-025 Phase 3: provider_bindings projection. Project-level
             // routing record linking (project, operation) → (connection,
             // model). `settings_json` carries the full
@@ -3949,18 +3950,6 @@ fn decision_outcome_kind(outcome: &cairn_domain::decisions::DecisionOutcome) -> 
         cairn_domain::decisions::DecisionOutcome::Allowed => "allowed",
         cairn_domain::decisions::DecisionOutcome::Denied { .. } => "denied",
     }
-}
-
-/// Log an event variant the PG applier does not project.
-///
-/// Matches the `log_stub` pattern used by `SqliteSyncProjection`. See
-/// `.claude/audit-state/review-queue.md` §T2-H3 for the coverage gap.
-fn log_stub(variant: &'static str) {
-    tracing::warn!(
-        event_variant = variant,
-        "pg projection stub: event committed to event_log but no projection table updated \
-         (see PgSyncProjection unprojected-stubs list for the coverage gap)"
-    );
 }
 
 /// RFC-025 Phase 2a.2 milestone 2: snake_case string for

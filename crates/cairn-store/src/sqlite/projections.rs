@@ -2293,7 +2293,10 @@ impl SqliteSyncProjection {
             // `RunStateChanged` → `pause_schedules` arm above; explicit
             // no-op keeps the projection-stub-guard CI job green.
             RuntimeEvent::PauseScheduled(_) => {}
-            RuntimeEvent::PermissionDecisionRecorded(_) => log_stub("PermissionDecisionRecorded"),
+            // Durable audit event: the event log itself is the projection.
+            // Readers filter `list_events()` by variant — no derived table.
+            // See projection_registry.rs entry; reclassified Ephemeral in #574.
+            RuntimeEvent::PermissionDecisionRecorded(_) => {}
             // RFC-025 Phase 3: provider_bindings projection (sqlite
             // parity with pg). Keep the ON CONFLICT semantics symmetric
             // with pg — replaying `ProviderBindingCreated` after a later

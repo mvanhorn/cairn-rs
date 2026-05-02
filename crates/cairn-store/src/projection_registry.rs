@@ -875,8 +875,12 @@ pub const REGISTRY: &[ProjectionEntry] = &[
     },
     ProjectionEntry {
         variant: "PermissionDecisionRecorded",
-        status: ProjectionStatus::Stubbed {
-            tracking: "RFC-025 Phase 2b.5 (permission decisions — Ephemeral reclassification deferred; the in-memory applier is already a no-op and no reader exists anywhere in cairn-runtime / cairn-app, so the pg/sqlite log_stub is purely a tracking signal until the parallel pause-lifecycle work lands and the stub-guard diff window clears)",
+        // Durable audit event with no read model. The event log itself
+        // is the projection — callers re-read via `list_events()` filters.
+        // All three backends intentionally no-op in their projection
+        // appliers: event persists, nothing else is derived. Closes #574.
+        status: ProjectionStatus::Ephemeral {
+            reason: "Durable audit event: the persisted event log is the projection (no derived read model). All three backends no-op in their appliers by design; readers filter the event log directly.",
         },
     },
     ProjectionEntry {
@@ -1245,110 +1249,25 @@ mod tests {
     }
 
     #[test]
-    fn assert_no_stubs_for_postgres_lists_every_stub() {
-        // Phase 0/1: this MUST fail until every Stubbed variant has a
-        // real projection; the error payload names each Stubbed entry
-        // so the operator sees a concrete action list in the boot log.
-        let err = assert_no_stubs_for_persistent_backend(Backend::Postgres)
-            .expect_err("Phase 1: registry still carries Stubbed variants pending Phase 2a/2b");
-        let RegistryError::StubbedVariantsPresent { backend, stubbed } = err;
-        assert_eq!(backend, Backend::Postgres);
-        assert!(
-            !stubbed.is_empty(),
-            "Phase 1 should surface at least one stubbed variant (Phase 2a/2b backlog)"
-        );
-        // Spot-check variants still in the Stubbed bucket post-Phase-2b.4 m1.
-        // Provider health / pools / model / retry variants moved to
-        // Ephemeral in Phase 2b.4 m1 (bindings + connections were the
-        // only persistent provider-state required by the F40 durability
-        // contract). Eval baselines / datasets / rubrics, operator
-        // interventions / profiles, permissions, route-policy-Updated,
-        // run-cost / spend-alert, and `PauseScheduled` are the 15
-        // variants that remain Stubbed pending Phase 2b.4 m2-m4 and
-        // the parallel pause-lifecycle work.
-        // Post-Phase-2b.4 m4 the Stubbed bucket holds only
-        // `PermissionDecisionRecorded` (Phase 2b.5 follow-up — the
-        // Ephemeral reclassification is correct but was deferred).
-        // PR #595 took PauseScheduled Projected.
-        assert!(
-            stubbed.contains(&"PermissionDecisionRecorded"),
-            "PermissionDecisionRecorded should still be Stubbed post-Phase-2b.4 m4"
-        );
-        // Confirm every Phase 2b.4 migration left the Stubbed bucket.
-        for migrated in [
-            "EvalBaselineLocked",
-            "EvalBaselineSet",
-            "EvalDatasetCreated",
-            "EvalDatasetEntryAdded",
-            "EvalRubricCreated",
-            "OperatorProfileCreated",
-            "OperatorProfileUpdated",
-            "OperatorIntervention",
-            "PauseScheduled",
-            "RoutePolicyUpdated",
-            "RunCostAlertSet",
-            "RunCostAlertTriggered",
-            "RunCostUpdated",
-            "SpendAlertTriggered",
-        ] {
-            assert!(
-                !stubbed.contains(&migrated),
-                "{migrated} should be Projected/Ephemeral after Phase 2b.4"
-            );
-        }
-        // Confirm Phase 2b.4 m1 ephemeral reclassification left the
-        // Stubbed bucket for every provider health / pool / model /
-        // retry variant.
-        for migrated in [
-            "ProviderHealthChecked",
-            "ProviderHealthScheduleSet",
-            "ProviderHealthScheduleTriggered",
-            "ProviderMarkedDegraded",
-            "ProviderModelRegistered",
-            "ProviderPoolCreated",
-            "ProviderPoolConnectionAdded",
-            "ProviderPoolConnectionRemoved",
-            "ProviderRecovered",
-            "ProviderRetryPolicySet",
-        ] {
-            assert!(
-                !stubbed.contains(&migrated),
-                "{migrated} should be Ephemeral after Phase 2b.4 milestone 1"
-            );
-        }
-        // Confirm Phase-1 eval migrations stayed out of Stubbed.
-        for migrated in [
-            "EvalRunStarted",
-            "EvalRunCompleted",
-            "EvalRunArchived",
-            "EvalRunScored",
-            "EvalRubricScored",
-        ] {
-            assert!(
-                !stubbed.contains(&migrated),
-                "{migrated} should be Projected after Phase 1 milestone 7"
-            );
-        }
-        // Confirm Phase-2a.1 milestone 1 credentials left the Stubbed
-        // bucket.
-        for migrated in [
-            "CredentialStored",
-            "CredentialRevoked",
-            "CredentialKeyRotated",
-        ] {
-            assert!(
-                !stubbed.contains(&migrated),
-                "{migrated} should be Projected after Phase 2a.1 milestone 1"
-            );
-        }
+    fn assert_no_stubs_for_postgres_passes() {
+        // Phase 2c milestone: after #574 reclassified the last Stubbed
+        // variant (`PermissionDecisionRecorded` → Ephemeral), the
+        // Postgres boot gate must return Ok. A future regression that
+        // adds a new Stubbed entry will fail both this test and the
+        // projection-stub-guard CI job.
+        //
+        // `expect(...)` over `is_ok()` so a regression prints the full
+        // `RegistryError::StubbedVariantsPresent { backend, stubbed }`
+        // payload — operators see the offending variant list directly
+        // in the test failure rather than having to rerun under a debugger.
+        assert_no_stubs_for_persistent_backend(Backend::Postgres)
+            .expect("Phase 2c invariant: no Stubbed variants remain on Postgres");
     }
 
     #[test]
-    fn assert_no_stubs_for_sqlite_lists_every_stub() {
-        let err = assert_no_stubs_for_persistent_backend(Backend::Sqlite)
-            .expect_err("Phase 0: registry still carries Stubbed variants");
-        let RegistryError::StubbedVariantsPresent { backend, .. } = err;
-        assert_eq!(backend, Backend::Sqlite);
+    fn assert_no_stubs_for_sqlite_passes() {
+        assert_no_stubs_for_persistent_backend(Backend::Sqlite)
+            .expect("Phase 2c invariant: no Stubbed variants remain on SQLite");
     }
 
     #[test]
@@ -1539,30 +1458,38 @@ mod tests {
         //     Projected ahead of 2b.4 landing.
         // If you're editing this test, confirm the registry edit
         // matches the milestone you're landing.
+        //   * #574 / Phase 2c: `PermissionDecisionRecorded` flips Stubbed
+        //     → Ephemeral — the durable event log is the projection (no
+        //     derived read model, no reader anywhere in cairn). This is
+        //     the zero-Stubbed milestone; `assert_no_stubs_for_persistent_backend`
+        //     now returns Ok on both persistent backends. Net: +1 Ephemeral,
+        //     -1 Stubbed → 125 / 33 / 0.
         assert_eq!(
             projected, 125,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
-            ephemeral, 32,
+            ephemeral, 33,
             "Ephemeral count drifted; update registry + RFC"
         );
-        assert_eq!(stubbed, 1, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
         assert_eq!(projected + ephemeral + stubbed, 158);
     }
 
     #[test]
-    fn error_display_includes_variant_list() {
-        let err = assert_no_stubs_for_persistent_backend(Backend::Postgres).unwrap_err();
+    fn error_display_shape_is_preserved() {
+        // The RegistryError::StubbedVariantsPresent Display path must
+        // stay well-formed even after Phase 2c flipped Stubbed to zero:
+        // if a future regression reintroduces a Stubbed entry, the error
+        // message operators see at boot must name the variant + backend.
+        // Construct the error directly since the registry no longer
+        // produces one.
+        let err = RegistryError::StubbedVariantsPresent {
+            backend: Backend::Postgres,
+            stubbed: vec!["SampleStubbedVariant"],
+        };
         let msg = err.to_string();
-        // Audits + scheduled tasks + outcomes + plan-reviews + external
-        // workers + resource-sharing + signal-ingest + subagents +
-        // soul-patches + user-messages + tool-recovery-paused +
-        // recovery-escalated + event-log-compacted all left the Stubbed
-        // bucket in Phases 2b.1/2b.2/2b.2b. Ingest-jobs + defaults +
-        // channels left in Phase 2b.3 m1/m2/m3. Pick a later-phase
-        // variant that still lives in the Stubbed bucket.
-        assert!(msg.contains("PermissionDecisionRecorded"));
+        assert!(msg.contains("SampleStubbedVariant"));
         assert!(msg.contains("Postgres") || msg.contains("postgres"));
     }
 }
