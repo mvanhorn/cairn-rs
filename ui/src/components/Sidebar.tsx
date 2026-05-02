@@ -1,4 +1,5 @@
 import {
+  Archive,
   Bell,
   Building2,
   Cable,
@@ -51,6 +52,7 @@ export type NavPage =
   | 'tenants'
   | 'operators'
   | 'quotas'
+  | 'retention'
   | 'sessions'
   | 'runs'
   | 'tasks'
@@ -169,6 +171,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'tenants',   label: 'Tenants',   icon: Building2 },
       { id: 'operators', label: 'Operators', icon: Users     },
       { id: 'quotas',    label: 'Quotas',    icon: Gauge     },
+      { id: 'retention', label: 'Retention', icon: Archive   },
     ],
   },
 ];
