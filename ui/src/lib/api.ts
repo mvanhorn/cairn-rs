@@ -642,6 +642,221 @@ export function createApiClient(config: ApiClientConfig) {
         `/v1/admin/tenants/${encodeURIComponent(tenantId)}/workspaces/${encodeURIComponent(workspaceId)}`,
       ),
 
+    // ── Admin: tenants (RFC-026 PR-A1) ───────────────────────────────────────
+
+    /** GET /v1/admin/tenants/:id — single tenant record. */
+    getTenant: (tenantId: string): Promise<import("./types").TenantRecord> =>
+      get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}`),
+
+    /**
+     * GET /v1/admin/tenants/:id/overview — per-workspace roll-up of members,
+     * projects, and active runs for the tenant. Used by the RFC-026 admin UI
+     * to populate the per-tenant summary without N+1 fetches.
+     */
+    getTenantOverview: (tenantId: string): Promise<import("./types").TenantOverview> =>
+      get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/overview`),
+
+    // ── Admin: quotas (RFC-026 PR-A1) ────────────────────────────────────────
+
+    /** GET /v1/admin/tenants/:tenant_id/quota — current concurrent/session/task limits + live usage. */
+    getTenantQuota: (tenantId: string): Promise<import("./types").TenantQuota> =>
+      get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/quota`),
+
+    /** POST /v1/admin/tenants/:tenant_id/quota — set tenant quota limits. */
+    setTenantQuota: (
+      tenantId: string,
+      body: import("./types").SetTenantQuotaRequest,
+    ): Promise<import("./types").TenantQuota> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/quota`, body),
+
+    // ── Admin: retention (RFC-026 PR-A1) ─────────────────────────────────────
+
+    /** GET /v1/admin/tenants/:tenant_id/retention-policy — fetch retention policy. */
+    getRetentionPolicy: (tenantId: string): Promise<import("./types").RetentionPolicy> =>
+      get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/retention-policy`),
+
+    /** POST /v1/admin/tenants/:tenant_id/retention-policy — set retention policy. */
+    setRetentionPolicy: (
+      tenantId: string,
+      body: import("./types").SetRetentionPolicyRequest,
+    ): Promise<import("./types").RetentionPolicy> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/retention-policy`, body),
+
+    /**
+     * POST /v1/admin/tenants/:tenant_id/apply-retention — trigger retention
+     * sweep now. Returns a count of events pruned and entities affected.
+     */
+    applyRetention: (tenantId: string): Promise<import("./types").RetentionResult> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/apply-retention`, {}),
+
+    // ── Admin: workspace members (RFC-026 PR-A1) ─────────────────────────────
+
+    /**
+     * POST /v1/admin/workspaces/:workspace_id/members — add an operator as a
+     * workspace member with a `WorkspaceRole`.
+     */
+    addWorkspaceMember: (
+      workspaceId: string,
+      body: import("./types").AddWorkspaceMemberRequest,
+    ): Promise<import("./types").WorkspaceMember> =>
+      post(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members`, body),
+
+    /**
+     * GET /v1/admin/workspaces/:workspace_id/members — list current members.
+     * Backend returns `{items, hasMore}` (camelCase via the `ListResponse<T>`
+     * contract); we keep the envelope so callers can surface "load more"
+     * controls.
+     */
+    listWorkspaceMembers: (
+      workspaceId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").WorkspaceMember>> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return get(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members${q}`);
+    },
+
+    /** DELETE /v1/admin/workspaces/:workspace_id/members/:member_id — remove a member. */
+    removeWorkspaceMember: (
+      workspaceId: string,
+      memberId: string,
+    ): Promise<{ ok: boolean }> =>
+      del(
+        `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(memberId)}`,
+      ),
+
+    // ── Admin: workspace shares (RFC-026 PR-A1) ──────────────────────────────
+
+    /** POST /v1/admin/workspaces/:workspace_id/shares — create a cross-workspace share. */
+    createWorkspaceShare: (
+      workspaceId: string,
+      body: import("./types").CreateWorkspaceShareRequest,
+    ): Promise<import("./types").WorkspaceShare> =>
+      post(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/shares`, body),
+
+    /** GET /v1/admin/workspaces/:workspace_id/shares — list shares originating from a workspace. */
+    listWorkspaceShares: (
+      workspaceId: string,
+      params: { tenant_id: string; limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").WorkspaceShare>> => {
+      const qs = new URLSearchParams();
+      qs.set("tenant_id", params.tenant_id);
+      if (params.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params.offset !== undefined) qs.set("offset", String(params.offset));
+      return get(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/shares?${qs}`);
+    },
+
+    /** DELETE /v1/admin/workspaces/:workspace_id/shares/:share_id — revoke a share. */
+    revokeWorkspaceShare: (
+      workspaceId: string,
+      shareId: string,
+    ): Promise<{ ok: boolean }> =>
+      del(
+        `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/shares/${encodeURIComponent(shareId)}`,
+      ),
+
+    // ── Admin: operator profiles (RFC-026 PR-A1) ─────────────────────────────
+
+    /**
+     * POST /v1/admin/tenants/:tenant_id/operator-profiles — create a new
+     * operator profile scoped to a tenant, with an initial workspace role.
+     */
+    createOperatorProfile: (
+      tenantId: string,
+      body: import("./types").CreateOperatorProfileRequest,
+    ): Promise<import("./types").OperatorProfile> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/operator-profiles`, body),
+
+    /**
+     * GET /v1/admin/tenants/:tenant_id/operator-profiles — list operator
+     * profiles within a tenant. Admin-only: operator rosters are sensitive
+     * metadata so even same-tenant non-admins receive 403.
+     */
+    listOperatorProfiles: (
+      tenantId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").OperatorProfile>> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/operator-profiles${q}`);
+    },
+
+    // ── Admin: tenant-role grants (RFC-026 PR-A0) ────────────────────────────
+    //
+    // PR-A0 added these endpoints; PR-A1 wires them into the client so the
+    // UI can promote/demote operators onto a tenant-admin role without
+    // shelling curl with the god token.
+
+    /**
+     * POST /v1/admin/operators/:id/tenant-roles/:tenant/promote — grant
+     * `role` on `tenant` to operator `:id`. Used by RFC-026 admin UI to
+     * delegate tenant administration from one tenant-admin to another
+     * operator.
+     */
+    promoteOperatorTenantRole: (
+      operatorId: string,
+      tenantId: string,
+      role: import("./types").TenantRole,
+    ): Promise<import("./types").TenantRoleGrant> =>
+      post(
+        `/v1/admin/operators/${encodeURIComponent(operatorId)}/tenant-roles/${encodeURIComponent(tenantId)}/promote`,
+        { role },
+      ),
+
+    /**
+     * DELETE /v1/admin/operators/:id/tenant-roles/:tenant — soft-revoke an
+     * operator's tenant-scope role. The projection row is retained with
+     * `revoked_at_ms` + `revoked_by` populated for audit.
+     */
+    revokeOperatorTenantRole: (
+      operatorId: string,
+      tenantId: string,
+    ): Promise<import("./types").TenantRoleGrant> =>
+      del(
+        `/v1/admin/operators/${encodeURIComponent(operatorId)}/tenant-roles/${encodeURIComponent(tenantId)}`,
+      ),
+
+    // ── Admin: snapshots + event-log compaction (RFC-026 PR-A1) ──────────────
+
+    /** POST /v1/admin/tenants/:id/snapshot — create a point-in-time snapshot. */
+    createSnapshot: (tenantId: string): Promise<import("./types").Snapshot> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/snapshot`, {}),
+
+    /** GET /v1/admin/tenants/:id/snapshots — list snapshots for a tenant. */
+    listSnapshots: (
+      tenantId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").Snapshot>> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/snapshots${q}`);
+    },
+
+    /**
+     * POST /v1/admin/tenants/:id/restore — restore the tenant's state from
+     * the latest snapshot. Returns an opaque report object whose shape
+     * varies per backend — consumers display the serialised JSON.
+     */
+    restoreSnapshot: (tenantId: string): Promise<import("./types").RestoreSnapshotReport> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/restore`, {}),
+
+    /**
+     * POST /v1/admin/tenants/:id/compact-event-log — compact the tenant's
+     * event log, retaining only the most recent `retain_last_n` events per
+     * entity. Response shape is backend-specific.
+     */
+    compactEventLog: (
+      tenantId: string,
+      body: import("./types").CompactEventLogRequest,
+    ): Promise<import("./types").CompactEventLogReport> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/compact-event-log`, body),
+
     /** GET /v1/runs/:id/events — event timeline for a run. */
     getRunEvents: async (runId: string, limit = 100): Promise<import("./types").RunEventSummary[]> => {
       let raw: unknown;
@@ -1526,6 +1741,27 @@ export function createApiClient(config: ApiClientConfig) {
       return get(`/v1/admin/audit-log?${qs}`);
     },
 
+    /**
+     * GET /v1/admin/audit-log/:resource_type/:resource_id — audit entries
+     * scoped to a single resource (e.g. one run, one tenant, one
+     * credential). Tenant-scoped: the caller only sees rows whose tenant
+     * matches the authenticated principal unless they are the admin
+     * service account.
+     */
+    listAuditLogForResource: (
+      resourceType: string,
+      resourceId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").AuditRecord>> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return get(
+        `/v1/admin/audit-log/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}${q}`,
+      );
+    },
+
     // ── Memory / Knowledge ───────────────────────────────────────────────────
 
     /** GET /v1/memory/search — lexical retrieval over the knowledge store. */
@@ -1936,6 +2172,17 @@ export function createApiClient(config: ApiClientConfig) {
       credentialId: string,
     ): Promise<import("./types").CredentialSummary> =>
       del(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/credentials/${encodeURIComponent(credentialId)}`),
+
+    /**
+     * POST /v1/admin/tenants/:tenantId/credentials/rotate-key
+     * Rotates every credential in the tenant from `old_key_id` to
+     * `new_key_id`. Returns the audit record for the rotation.
+     */
+    rotateCredentialKey: (
+      tenantId: string,
+      body: import("./types").RotateCredentialKeyRequest,
+    ): Promise<import("./types").CredentialRotationRecord> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/credentials/rotate-key`, body),
 
     // ── Runtime message channels (/v1/channels) ──────────────────────────────
 
@@ -2439,6 +2686,59 @@ export function createApiClient(config: ApiClientConfig) {
     /** GET /v1/models/catalog/providers — unique providers with counts. */
     listCatalogProviders: (): Promise<import("./types").ModelCatalogProvidersResponse> =>
       get("/v1/models/catalog/providers"),
+
+    // ── Admin: model registry CRUD (RFC-026 PR-A1) ──────────────────────────
+    //
+    // Mutations of the runtime ModelRegistry. Distinct from the read-only
+    // `/v1/models/catalog` above — these endpoints back the "bring-your-own
+    // model" admin UI where operators override costs, tiers, and
+    // capabilities for bespoke providers (private LLM endpoints, etc.).
+
+    /** GET /v1/admin/models — list every registered model entry. */
+    listModels: (): Promise<import("./types").ModelEntry[]> =>
+      get("/v1/admin/models"),
+
+    /** GET /v1/admin/models/:id — fetch one model entry by id. */
+    getModel: (id: string): Promise<import("./types").ModelEntry> =>
+      get(`/v1/admin/models/${encodeURIComponent(id)}`),
+
+    /**
+     * PUT /v1/admin/models/:id — create-or-update a model entry. The
+     * backend overwrites the body's `id` field with the path param, so
+     * callers do not need to set it on `entry`.
+     */
+    setModel: (
+      id: string,
+      entry: import("./types").ModelEntry,
+    ): Promise<import("./types").ModelEntry> =>
+      put(`/v1/admin/models/${encodeURIComponent(id)}`, entry),
+
+    /** DELETE /v1/admin/models/:id — remove a model entry from the registry. */
+    deleteModel: (id: string): Promise<import("./types").ModelEntry> =>
+      del(`/v1/admin/models/${encodeURIComponent(id)}`),
+
+    /**
+     * POST /v1/admin/models/import-litellm — bulk-import entries from a
+     * LiteLLM-shaped catalog object. Request body is the raw LiteLLM JSON
+     * (top-level object keyed by model id).
+     */
+    importLiteLLM: (
+      catalog: Record<string, unknown>,
+    ): Promise<import("./types").ImportLiteLLMResponse> =>
+      post("/v1/admin/models/import-litellm", catalog),
+
+    // ── Admin: waitpoint HMAC rotation (RFC-026 PR-A1) ──────────────────────
+
+    /**
+     * POST /v1/admin/rotate-waitpoint-hmac — rotate the waitpoint HMAC
+     * signing kid across every execution partition. Returns a
+     * per-partition outcome breakdown. Idempotent on the same
+     * (new_kid, new_secret_hex) pair.
+     */
+    rotateWaitpointHmac: (
+      body: import("./types").RotateWaitpointHmacRequest,
+    ): Promise<import("./types").RotateWaitpointHmacResponse> =>
+      post("/v1/admin/rotate-waitpoint-hmac", body),
 
     // ── F29 CE: Telemetry, stalled runs, settings-GET, cost rollups ─────────
 

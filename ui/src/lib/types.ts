@@ -1068,10 +1068,20 @@ export interface SystemStats {
 
 // ── Generic list response ─────────────────────────────────────────────────────
 
-/** Paginated list wrapper used by some endpoints */
+/**
+ * Paginated list wrapper used by preserved endpoints.
+ *
+ * The Rust-side struct (`cairn_api_contracts::http::ListResponse<T>`) is
+ * defined as `#[serde(rename_all = "camelCase")]`, so the wire field is
+ * `hasMore` even though the Rust field is named `has_more`. This TS
+ * interface mirrors the wire format. Callers reading `ListResponse.hasMore`
+ * get the correct flag; callers that reach for `has_more` get `undefined`.
+ * (This previously typed as `has_more` which silently hid the flag — fixed
+ * alongside RFC-026 PR-A1 admin surface coverage.)
+ */
 export interface ListResponse<T> {
   items: T[];
-  has_more: boolean;
+  hasMore: boolean;
 }
 
 // ── LLM Traces ────────────────────────────────────────────────────────────────
@@ -2141,4 +2151,261 @@ export interface DecisionCacheEntry {
   scope: DecisionCacheScope;
   expires_at: number;
   hit_count: number;
+}
+
+// ── RFC-026 admin surface types (PR-A1) ───────────────────────────────────────
+//
+// These mirror the backend shapes for the 29+ admin.rs handlers wired into
+// `ui/src/lib/api.ts` in PR-A1. Every field name is snake_case to match
+// `#[derive(Serialize)]` output; do not rename without also updating the
+// Rust struct.
+
+/**
+ * Workspace role for access control. Mirrors
+ * `cairn_domain::tenancy::WorkspaceRole` — order is ascending privilege.
+ */
+export type WorkspaceRole = "viewer" | "member" | "admin" | "owner";
+
+/**
+ * Tenant-scope role used by RFC-026 PR-A0 admin-surface gating. Mirrors
+ * `cairn_domain::tenancy::TenantRole`.
+ */
+export type TenantRole = "admin" | "member" | "read_only";
+
+/**
+ * GET /v1/admin/tenants/:tenant_id/quota — tenant concurrent-run /
+ * session-per-hour / task-per-run limits + live usage counters. Mirrors
+ * `cairn_domain::quotas::TenantQuota`.
+ */
+export interface TenantQuota {
+  tenant_id: string;
+  max_concurrent_runs: number;
+  max_sessions_per_hour: number;
+  max_tasks_per_run: number;
+  current_active_runs: number;
+  sessions_this_hour: number;
+}
+
+/** POST /v1/admin/tenants/:tenant_id/quota body. */
+export interface SetTenantQuotaRequest {
+  max_concurrent_runs: number;
+  max_sessions_per_hour: number;
+  max_tasks_per_run: number;
+}
+
+/**
+ * GET /v1/admin/tenants/:tenant_id/retention-policy. Mirrors
+ * `cairn_domain::quotas::RetentionPolicy`. Durations are whole-day
+ * integers; `max_events_per_entity` is per-entity event-log cap.
+ */
+export interface RetentionPolicy {
+  policy_id: string;
+  tenant_id: string;
+  full_history_days: number;
+  current_state_days: number;
+  max_events_per_entity: number;
+}
+
+/** POST /v1/admin/tenants/:tenant_id/retention-policy body. */
+export interface SetRetentionPolicyRequest {
+  full_history_days: number;
+  current_state_days: number;
+  max_events_per_entity: number;
+}
+
+/**
+ * POST /v1/admin/tenants/:tenant_id/apply-retention response. Mirrors
+ * `cairn_domain::quotas::RetentionResult`.
+ */
+export interface RetentionResult {
+  events_pruned: number;
+  entities_affected: number;
+}
+
+/**
+ * GET /v1/admin/tenants/:tenant_id/overview — per-workspace roll-up of
+ * membership / projects / active runs for RFC-008 tenant admin surface.
+ */
+export interface TenantOverviewWorkspace {
+  workspace_id: string;
+  name: string;
+  member_count: number;
+  project_count: number;
+  active_runs: number;
+}
+
+export interface TenantOverview {
+  tenant_id: string;
+  workspace_count: number;
+  total_members: number;
+  active_runs: number;
+  workspaces: TenantOverviewWorkspace[];
+}
+
+/**
+ * One entry from GET /v1/admin/workspaces/:workspace_id/members. Mirrors
+ * `cairn_domain::tenancy::WorkspaceMembership`.
+ */
+export interface WorkspaceMember {
+  workspace_id: string;
+  operator_id: string;
+  role: WorkspaceRole;
+}
+
+/** POST /v1/admin/workspaces/:workspace_id/members body. */
+export interface AddWorkspaceMemberRequest {
+  member_id: string;
+  role: WorkspaceRole;
+}
+
+/**
+ * One entry from GET /v1/admin/workspaces/:workspace_id/shares. Mirrors
+ * `cairn_domain::resource_sharing::SharedResource`.
+ */
+export interface WorkspaceShare {
+  share_id: string;
+  tenant_id: string;
+  source_workspace_id: string;
+  target_workspace_id: string;
+  /** One of "prompt_asset", "corpus", or "source". */
+  resource_type: string;
+  resource_id: string;
+  permissions: string[];
+  shared_at_ms: number;
+}
+
+/** POST /v1/admin/workspaces/:workspace_id/shares body. */
+export interface CreateWorkspaceShareRequest {
+  target_workspace_id: string;
+  resource_type: string;
+  resource_id: string;
+  permissions?: string[];
+  tenant_id?: string;
+}
+
+/**
+ * GET / POST /v1/admin/tenants/:tenant_id/operator-profiles. Mirrors
+ * `cairn_domain::org::OperatorProfile`.
+ */
+export interface OperatorProfile {
+  operator_id: string;
+  tenant_id: string;
+  display_name: string;
+  email: string;
+  role: WorkspaceRole;
+  /** Operator-defined preferences blob (JSON). */
+  preferences?: unknown;
+}
+
+/** POST /v1/admin/tenants/:tenant_id/operator-profiles body. */
+export interface CreateOperatorProfileRequest {
+  display_name: string;
+  email: string;
+  role: WorkspaceRole;
+}
+
+/**
+ * One row returned by POST /v1/admin/operators/:id/tenant-roles/:tenant/promote
+ * and DELETE .../:tenant. Mirrors
+ * `cairn_store::projections::OperatorTenantRoleRecord`.
+ */
+export interface TenantRoleGrant {
+  tenant_id: string;
+  operator_id: string;
+  role: TenantRole;
+  granted_at_ms: number;
+  granted_by: string;
+  revoked_at_ms?: number | null;
+  revoked_by?: string | null;
+}
+
+/** POST /v1/admin/operators/:id/tenant-roles/:tenant/promote body. */
+export interface PromoteTenantRoleRequest {
+  role: TenantRole;
+}
+
+/**
+ * One row from GET /v1/admin/tenants/:id/snapshots and the response shape
+ * of POST /v1/admin/tenants/:id/snapshot.
+ */
+export interface Snapshot {
+  snapshot_id: string;
+  tenant_id: string;
+  event_position: number;
+  state_hash: string;
+  created_at_ms: number;
+}
+
+/**
+ * POST /v1/admin/tenants/:id/compact-event-log response and
+ * POST /v1/admin/tenants/:id/restore response. Backend returns a
+ * free-form serde_json object; shape may vary by backend so we keep
+ * this loose. UI displays the entire object for operator inspection.
+ */
+export type CompactEventLogReport = Record<string, unknown>;
+export type RestoreSnapshotReport = Record<string, unknown>;
+
+/** POST /v1/admin/tenants/:id/compact-event-log body. */
+export interface CompactEventLogRequest {
+  retain_last_n: number;
+}
+
+/** POST /v1/admin/tenants/:tenant_id/credentials/rotate-key body. */
+export interface RotateCredentialKeyRequest {
+  old_key_id: string;
+  new_key_id: string;
+}
+
+/**
+ * POST /v1/admin/tenants/:tenant_id/credentials/rotate-key response.
+ * Audit record emitted for each rotation. Mirrors
+ * `cairn_domain::credentials::CredentialRotationRecord`.
+ */
+export interface CredentialRotationRecord {
+  rotation_id: string;
+  tenant_id: string;
+  credential_id: string;
+  rotated_at: number;
+  rotated_by: string | null;
+  started_at_ms: number;
+  completed_at_ms: number | null;
+  old_key_id: string;
+  new_key_id: string;
+  /** Count of credentials rotated in this operation. */
+  rotated_credentials: number;
+}
+
+/**
+ * GET /v1/admin/models entry. The admin-model endpoints return the same
+ * `ModelEntry` shape the public catalog exposes — we reuse
+ * `ModelCatalogEntry` here rather than duplicating fields. An alias so
+ * call sites read naturally.
+ */
+export type ModelEntry = ModelCatalogEntry;
+
+/** POST /v1/admin/models/import-litellm response. */
+export interface ImportLiteLLMResponse {
+  imported: number;
+}
+
+/** POST /v1/admin/rotate-waitpoint-hmac body. */
+export interface RotateWaitpointHmacRequest {
+  new_kid: string;
+  new_secret_hex: string;
+  grace_ms?: number;
+}
+
+/** One partition-level failure entry in the rotate-HMAC response. */
+export interface RotateWaitpointHmacFailure {
+  partition_index: number;
+  code: string | null;
+  detail: string;
+}
+
+/** POST /v1/admin/rotate-waitpoint-hmac response. */
+export interface RotateWaitpointHmacResponse {
+  rotated: number;
+  noop: number;
+  failed: RotateWaitpointHmacFailure[];
+  new_kid: string;
 }
