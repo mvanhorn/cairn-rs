@@ -889,7 +889,9 @@ test.describe("24. Real LLM Calls", () => {
     }
   });
 
-  test("orchestrate: real model completes a run", async ({ request }) => {
+  // Skipped in CI: requires a configured LLM provider (Bedrock/OpenRouter).
+  // Tracked at #618 for a PLAYWRIGHT_LIVE_LLM=1 nightly gate.
+  test.skip("orchestrate: real model completes a run", async ({ request }) => {
     const sid = `orch_sess_${id()}`, rid = `orch_run_${id()}`;
     await post(request, "/v1/sessions", { session_id: sid, ...scope });
     await post(request, "/v1/runs", { run_id: rid, session_id: sid, ...scope });
@@ -911,7 +913,9 @@ test.describe("24. Real LLM Calls", () => {
     }
   });
 
-  test("orchestrate with memory: model can search ingested knowledge", async ({ request }) => {
+  // Skipped in CI: requires a configured LLM provider + memory backend.
+  // Tracked at #618.
+  test.skip("orchestrate with memory: model can search ingested knowledge", async ({ request }) => {
     // Ingest a document
     await post(request, "/v1/memory/ingest", {
       document_id: `llm_doc_${id()}`,

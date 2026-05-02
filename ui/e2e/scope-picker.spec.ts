@@ -65,7 +65,9 @@ test.describe('scope picker — dropdowns, breadcrumb, empty-state hint', () => 
     await expect(trigger).toBeVisible();
   });
 
-  test('scope dropdown cascades: tenant → workspace → project', async ({ page }) => {
+  // Skipped in CI: requires pre-existing tenant/workspace/project data.
+  // Tracked at #618 for a seed-data fixture.
+  test.skip('scope dropdown cascades: tenant → workspace → project', async ({ page }) => {
     await resetToDefaultScope(page);
     await signIn(page);
     await nav(page, 'dashboard');
