@@ -98,14 +98,19 @@ async function apiFetch<T>(
     let message = `HTTP ${response.status}`;
     try {
       const err = await response.json();
-      code = err.code ?? code;
-      // Cairn handlers use two body shapes for errors:
-      //   1. `{ code, message }`    — used by most handlers.
-      //   2. `{ error: string }`    — used by repo_routes, credentials, and
+      // Cairn handlers use THREE body shapes for errors:
+      //   1. `{ code, message }`          — unified envelope (majority).
+      //   2. `{ error: string }`          — repo_routes, credentials, and
       //      a handful of older handlers that predate the unified envelope.
-      // Prefer `message` when present, fall back to `error` so UI toasts
-      // surface the real backend reason instead of a generic `HTTP 400`.
-      message = err.message ?? err.error ?? message;
+      //   3. `{ error_code, hint, ... }`  — RFC-026 PR-A0 structured 403
+      //      for `tenant_role_missing`. The body diverges from (1) on
+      //      purpose so the UI `<AdminGate>` wrapper can distinguish
+      //      "admin role not present, but operator exists" from a
+      //      generic 403. See `crates/cairn-app/src/errors.rs`.
+      // Resolution order for `code`:  code → error_code.
+      // Resolution order for `message`: message → hint → error.
+      code    = err.code  ?? err.error_code ?? code;
+      message = err.message ?? err.hint ?? err.error ?? message;
     } catch {
       // ignore JSON parse failure — use defaults above
     }

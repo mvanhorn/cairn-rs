@@ -1,5 +1,6 @@
 import {
   Bell,
+  Building2,
   Cable,
   Cpu,
   GitBranch,
@@ -39,11 +40,13 @@ import { clsx } from 'clsx';
 import { useQuery } from '@tanstack/react-query';
 import { clearStoredToken, defaultApi } from '../lib/api';
 import { usePresence, type PresenceEntry } from '../hooks/usePresence';
+import { useIsTenantAdmin } from './AdminGate';
 import type { ReactNode } from 'react';
 
 export type NavPage =
   | 'dashboard'
   | 'workspaces'
+  | 'tenants'
   | 'sessions'
   | 'runs'
   | 'tasks'
@@ -90,6 +93,10 @@ interface NavItem {
 interface NavGroup {
   label: string;
   items: NavItem[];
+  /** When true, the whole group is hidden unless the current operator
+   *  holds `TenantRole::Admin` on the active scope's tenant. Server-side
+   *  guards remain authoritative — this is purely nav-hiding UX. */
+  adminOnly?: boolean;
 }
 
 const NAV_GROUPS: NavGroup[] = [
@@ -146,6 +153,16 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'test-harness',  label: 'Test Harness',  icon: TestTube  },
       { id: 'api-docs',    label: 'API Docs',    icon: BookOpen },
       { id: 'settings',    label: 'Settings',    icon: Settings },
+    ],
+  },
+  {
+    // RFC-026 PR-A3+. Hidden unless the operator holds TenantRole::Admin
+    // on the active scope's tenant. Server-side `TenantAdminGuard` is the
+    // authoritative gate — this is UX only.
+    label: 'Admin',
+    adminOnly: true,
+    items: [
+      { id: 'tenants', label: 'Tenants', icon: Building2 },
     ],
   },
 ];
@@ -219,6 +236,17 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
     retry: false,
   });
 
+  // RFC-026 PR-A3 — probe whether the operator holds TenantRole::Admin
+  // on the active scope's tenant. While the probe is pending we hide
+  // admin groups by default; this avoids a flash of admin links for
+  // non-admins that disappear a tick later. The tradeoff is a one-tick
+  // delay for real admins — fine since admin pages are not the first
+  // surface an operator lands on.
+  const adminState = useIsTenantAdmin();
+  const showAdminGroups = adminState.isAdmin;
+
+  const visibleGroups = NAV_GROUPS.filter(g => !g.adminOnly || showAdminGroups);
+
   return (
     <>
       {/* Mobile backdrop */}
@@ -273,7 +301,7 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
 
         {/* Navigation — grouped */}
         <nav role="navigation" aria-label="Main navigation" className="flex-1 overflow-y-auto py-2 px-2 space-y-4">
-          {NAV_GROUPS.map((group) => (
+          {visibleGroups.map((group) => (
             <div key={group.label}>
               <p className="px-3 pb-1 text-[10px] font-medium text-gray-400 dark:text-zinc-500 uppercase tracking-wider">
                 {group.label}

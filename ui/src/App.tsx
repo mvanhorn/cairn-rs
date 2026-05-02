@@ -20,6 +20,7 @@ const EvalComparisonPage    = lazy(() => import('./pages/EvalComparisonPage').th
 const ProjectDashboardPage  = lazy(() => import('./pages/ProjectDashboardPage').then(m => ({ default: m.ProjectDashboardPage })));
 const PlaygroundPage     = lazy(() => import('./pages/PlaygroundPage').then(m => ({ default: m.PlaygroundPage })));
 const WorkspacesPage = lazy(() => import('./pages/WorkspacesPage').then(m => ({ default: m.WorkspacesPage })));
+const TenantsPage        = lazy(() => import('./pages/TenantsPage').then(m => ({ default: m.TenantsPage })));
 const WorkersPage        = lazy(() => import('./pages/WorkersPage').then(m => ({ default: m.WorkersPage })));
 const TestHarnessPage    = lazy(() => import('./pages/TestHarnessPage').then(m => ({ default: m.TestHarnessPage })));
 const MetricsPage        = lazy(() => import('./pages/MetricsPage').then(m => ({ default: m.MetricsPage })));
@@ -49,6 +50,7 @@ const SettingsPage         = lazy(() => import('./pages/SettingsPage').then(m =>
 const ProfilePage          = lazy(() => import('./pages/ProfilePage').then(m => ({ default: m.ProfilePage })));
 const AgentTemplatesPage   = lazy(() => import('./pages/AgentTemplatesPage').then(m => ({ default: m.AgentTemplatesPage })));
 import { NotFoundPage } from './pages/NotFoundPage';
+import { AdminGate } from './components/AdminGate';
 
 import { defaultApi, getStoredToken, clearStoredToken, ApiError, AUTH_EXPIRED_EVENT } from './lib/api';
 import type { NavPage } from './components/Sidebar';
@@ -145,6 +147,7 @@ function renderRoute(route: Route): React.ReactNode {
   // Lazy pages — wrapped in Suspense.
   const lazy_page = (() => {
     switch (page) {
+      case 'tenants':         return <AdminGate><TenantsPage /></AdminGate>;
       case 'workers':         return <WorkersPage />;
       case 'orchestration': return <OrchestrationPage />;
       case 'deployment':  return <DeploymentPage />;
