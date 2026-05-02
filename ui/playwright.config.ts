@@ -137,10 +137,27 @@ export default defineConfig({
   // for remote base URLs the test operator is responsible for the server.
   webServer: useManagedServer
     ? {
-        command: `cd .. && CAIRN_ADMIN_TOKEN=dev-admin-token BEDROCK_API_KEY=test BEDROCK_MODEL_ID=test AWS_REGION=us-west-2 ./target/debug/cairn-app --port ${BASE_PORT}`,
+        // `--allow-missing-sandbox-primitives` bypasses the F65 kernel probe
+        // that would otherwise fatal-exit on hosts without CAP_SYS_ADMIN —
+        // CI runners (AppArmor `kernel.apparmor_restrict_unprivileged_userns=1`
+        // on Ubuntu 24.04+) and most dev laptops hit this. Matches the flag
+        // the smoke job uses in `.github/workflows/ci.yml`.
+        //
+        // `CAIRN_FABRIC_URL` respects the caller's env (defaulting to the
+        // local-loopback Valkey most dev machines run). CI jobs point at
+        // their Valkey service container by setting the var in the job
+        // env; local devs running `npm run test:e2e` against a local
+        // Valkey need no override. The binary's `FabricConfig::from_env`
+        // default is `valkey://127.0.0.1:6379`, so unset also works when
+        // a local Valkey is listening on the default port.
+        //
+        // `CAIRN_FABRIC_WAITPOINT_HMAC_SECRET` + `_KID` are required in
+        // team-mode boot; local-mode accepts unset. We run local-mode
+        // here (no `--mode team` flag), so they're optional.
+        command: `cd .. && CAIRN_ADMIN_TOKEN=dev-admin-token BEDROCK_API_KEY=test BEDROCK_MODEL_ID=test AWS_REGION=us-west-2 ./target/debug/cairn-app --port ${BASE_PORT} --allow-missing-sandbox-primitives`,
         port: BASE_PORT,
         reuseExistingServer: true,
-        timeout: 15_000,
+        timeout: 60_000,
       }
     : undefined,
 });

@@ -351,6 +351,101 @@ jobs:
       - name: vitest
         run: npx vitest run
 
+  # ── 6b. UI E2E (Playwright) ─────────────────────────────────────────────────
+  # Runs the Playwright suite under `ui/e2e/` against a live cairn-app.
+  # Matters because RFC-026 PR-A0a's multi-operator fixtures +
+  # `admin-cross-tenant-isolation.spec.ts` prove the server-side
+  # `TenantAdminGuard` rejects cross-tenant requests — if this job doesn't
+  # run, a regression could silently collapse multi-tenant isolation and
+  # ship unnoticed.
+  #
+  # The managed `webServer` in `ui/playwright.config.ts` launches
+  # `./target/debug/cairn-app --port $BASE_PORT` in local mode + in-memory
+  # store; no Valkey / Postgres / HMAC sidecars required. BEDROCK_* env
+  # shims match the same config — they're placeholders the binary accepts
+  # without exercising the provider (no LLM calls in these specs).
+  ui-e2e:
+    name: ui-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      # FabricServices::start() is called unconditionally during AppState
+      # construction (see crates/cairn-app/src/state.rs#build_runtime_with_optional_fabric)
+      # even in local mode — the "optional" in the name describes the
+      # `Option<Arc<FabricServices>>` field, not a mode-conditional skip.
+      # Without a reachable Valkey, boot fatals with "valkey: timed out".
+      # Same service-container pattern as the smoke job.
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping || redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-ui-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ui-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Build cairn-app debug binary
+        # The managed Playwright webServer runs `./target/debug/cairn-app`.
+        # Building up-front means the per-test `webServer.timeout` (15 s)
+        # doesn't also have to cover an 8+ minute compile.
+        run: cargo build -p cairn-app --bin cairn-app
+        timeout-minutes: 15
+
+      - name: npm install
+        working-directory: ui
+        run: npm install
+
+      - name: Install Playwright Chromium
+        # Cache the browser install separately from node_modules so npm
+        # cache churn doesn't also invalidate browser downloads.
+        working-directory: ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright
+        working-directory: ui
+        # The Playwright webServer launches cairn-app with
+        # `--allow-missing-sandbox-primitives`, so these env vars flow
+        # through to the child process and satisfy FabricServices::start's
+        # boot contract. Secrets are per-run random (HMAC scoped to this
+        # CI cycle) so a leaked log never unlocks a later run.
+        env:
+          CAIRN_FABRIC_URL: valkey://127.0.0.1:6379
+          CAIRN_FABRIC_WAITPOINT_HMAC_KID: ci-ui-e2e
+          CAIRN_CREDENTIAL_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+        run: |
+          export CAIRN_FABRIC_WAITPOINT_HMAC_SECRET="$(openssl rand -hex 32)"
+          npx playwright test
+        timeout-minutes: 10
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: ui/playwright-report/
+          if-no-files-found: warn
+          retention-days: 7
+
   # ── 7. Smoke (release gatekeeper) ───────────────────────────────────────────
   # The HTTP smoke suite at `scripts/smoke-test.sh` is CLAUDE.md's named
   # "release gatekeeper" — 95 end-to-end checks against a running cairn-app.
