@@ -1772,7 +1772,23 @@ async fn real_main() {
                 std::net::SocketAddr::V4(_) => format!("http://127.0.0.1:{}", bound.port()),
                 std::net::SocketAddr::V6(_) => format!("http://[::1]:{}", bound.port()),
             };
-            let kick_token = admin_token.clone();
+            // #636: the admin token can be rotated at runtime via
+            // `POST /v1/admin/rotate-token`, which revokes the old
+            // entry and registers a new one in the shared
+            // `ServiceTokenRegistry`. A stale clone of `admin_token`
+            // here would 401 the worker's loopback POST after the
+            // first rotation (seed-token flow in LiveHarness, or any
+            // real credential-rotation). Read the current admin token
+            // out of the registry on every kick so rotation stays
+            // transparent.
+            //
+            // `find_service_token_by_name` short-circuits on the first
+            // match and avoids the `Vec<(String, AuthPrincipal)>` clone
+            // that `all_entries` would otherwise produce (Gemini review
+            // on PR #646).
+            let service_tokens = lib_state.service_tokens.clone();
+            let current_admin_token =
+                move || -> Option<String> { service_tokens.find_service_token_by_name("admin") };
             tokio::spawn(async move {
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(300))
@@ -1804,6 +1820,14 @@ async fn real_main() {
                     }
                     last_kick.insert(key, now);
                     let url = format!("{kick_url}/v1/runs/{}/orchestrate", run_id.as_str());
+                    let Some(kick_token) = current_admin_token() else {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            "F49: no admin token registered; auto-resume kick dropped. \
+                             Operator must re-POST /orchestrate manually."
+                        );
+                        continue;
+                    };
                     tracing::info!(
                         run_id = %run_id,
                         "F49: auto-resume orchestrate worker firing POST"

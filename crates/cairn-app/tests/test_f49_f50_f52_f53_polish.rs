@@ -180,6 +180,109 @@ async fn f49_kick_is_no_op_before_install() {
     assert!(!delivered, "pre-install kick returns false");
 }
 
+#[tokio::test]
+async fn f49_kick_accepts_repeat_kicks_and_worker_dedups() {
+    // #636: the SSE publish loop fires one kick per approval resolution.
+    // A single run can resolve two tool-call approvals within a few
+    // milliseconds (operator "approve all" click). The SENDER is
+    // unbounded and MUST accept every kick — dedup is the worker's
+    // responsibility (5s per-run window in main.rs). This test asserts
+    // the sender never rejects a second kick for the same run; that
+    // would silently drop a real kick if the dedup window ever needs
+    // to shrink to zero.
+    let sender = Arc::new(cairn_app::state::OrchestrateKickSender::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RunId>();
+    sender.install(tx);
+
+    let run_id = RunId::new("r-doublekick");
+    assert!(sender.kick(run_id.clone()), "first kick must succeed");
+    assert!(
+        sender.kick(run_id.clone()),
+        "second kick within the same ms must also succeed — dedup is the worker's job, not the sender's"
+    );
+
+    // Both kicks must have reached the channel; the worker task will
+    // drop the second one inside its own dedup window.
+    let first = rx.recv().await.expect("first yield");
+    let second = rx.recv().await.expect("second yield");
+    assert_eq!(first, run_id);
+    assert_eq!(second, run_id);
+}
+
+/// Mirror of the main.rs auto-resume worker dedup window logic.
+/// Exercised as a pure unit test so the guard-against-double-kick
+/// invariant is machine-checked alongside #636. The real worker's
+/// dedup is an inline block inside `main.rs`; keeping a mirror here
+/// means anyone touching the window gets CI coverage for the
+/// invariant the block encodes (5s per-run dedup).
+fn mirror_should_fire_kick(
+    last_kick: &mut std::collections::HashMap<String, std::time::Instant>,
+    run_id: &RunId,
+    now: std::time::Instant,
+    dedup_window: std::time::Duration,
+) -> bool {
+    last_kick.retain(|_, t| now.duration_since(*t) < dedup_window);
+    let key = run_id.as_str().to_owned();
+    if let Some(prev) = last_kick.get(&key) {
+        if now.duration_since(*prev) < dedup_window {
+            return false;
+        }
+    }
+    last_kick.insert(key, now);
+    true
+}
+
+#[test]
+fn f49_worker_dedup_drops_second_kick_within_window() {
+    // #636: two kicks on the same run_id within the 5s window collapse
+    // to one POST. The second kick must return `false` (dropped) so the
+    // orchestrator handler is not hit concurrently for the same run —
+    // FF's lease renewal is not idempotent against concurrent renewers.
+    let mut last_kick = std::collections::HashMap::new();
+    let dedup = std::time::Duration::from_secs(5);
+    let run = RunId::new("r-dedup");
+    let t0 = std::time::Instant::now();
+    assert!(
+        mirror_should_fire_kick(&mut last_kick, &run, t0, dedup),
+        "first kick must fire"
+    );
+    let t1 = t0 + std::time::Duration::from_millis(250);
+    assert!(
+        !mirror_should_fire_kick(&mut last_kick, &run, t1, dedup),
+        "second kick within 5s window must be dropped"
+    );
+}
+
+#[test]
+fn f49_worker_dedup_fires_after_window_expires() {
+    let mut last_kick = std::collections::HashMap::new();
+    let dedup = std::time::Duration::from_secs(5);
+    let run = RunId::new("r-dedup");
+    let t0 = std::time::Instant::now();
+    assert!(mirror_should_fire_kick(&mut last_kick, &run, t0, dedup));
+    let t1 = t0 + std::time::Duration::from_secs(6);
+    assert!(
+        mirror_should_fire_kick(&mut last_kick, &run, t1, dedup),
+        "kick outside the dedup window must fire"
+    );
+}
+
+#[test]
+fn f49_worker_dedup_scoped_per_run() {
+    // A kick for run A must NOT suppress a kick for run B arriving in
+    // the same tick. The dedup window is per-run_id.
+    let mut last_kick = std::collections::HashMap::new();
+    let dedup = std::time::Duration::from_secs(5);
+    let a = RunId::new("r-a");
+    let b = RunId::new("r-b");
+    let t0 = std::time::Instant::now();
+    assert!(mirror_should_fire_kick(&mut last_kick, &a, t0, dedup));
+    assert!(
+        mirror_should_fire_kick(&mut last_kick, &b, t0, dedup),
+        "different run_id must not be suppressed by another run's recent kick"
+    );
+}
+
 // ── F53: termination-reason → FailureClass classifier ────────────────────────
 //
 // The classifier is a private helper in handlers::runs, but its

@@ -186,8 +186,49 @@ pub(crate) async fn publish_runtime_frames_since(
         // none AND the run is still Running, enqueue a kick for the
         // background worker to POST /v1/runs/:id/orchestrate again so
         // the operator doesn't have to.
-        if let cairn_domain::RuntimeEvent::ApprovalResolved(e) = &stored.envelope.payload {
-            maybe_auto_resume_orchestrate(state, e).await;
+        //
+        // #636: tool-call approvals (ToolCallApproved/ToolCallRejected)
+        // also need the kick. Pre-#636 the hook only fired for plan
+        // approvals (ApprovalResolved). Tool-call approvals resolved
+        // via the UI left the run parked in `waiting_approval` forever
+        // because nothing re-entered the orchestrate loop — the operator
+        // had to manually re-POST `/orchestrate` to make progress. For
+        // multi-tool-call runs (10–50 approvals), that made the UI
+        // approval experience unusable.
+        match &stored.envelope.payload {
+            cairn_domain::RuntimeEvent::ApprovalResolved(e) => {
+                maybe_auto_resume_orchestrate_for_plan(state, e).await;
+            }
+            cairn_domain::RuntimeEvent::ApprovalRequested(e) => {
+                // An approval requested mid-suspended-run doesn't need
+                // to kick — the same iteration that proposed it already
+                // parked the loop. No-op here to keep variants explicit
+                // (so a future variant addition at this call site
+                // surfaces a match warning instead of a silent miss).
+                let _ = e;
+            }
+            cairn_domain::RuntimeEvent::ToolCallApproved(e) => {
+                maybe_auto_resume_orchestrate_for_tool_call(
+                    state,
+                    &e.call_id,
+                    "tool_call_approved",
+                )
+                .await;
+            }
+            cairn_domain::RuntimeEvent::ToolCallRejected(e) => {
+                // Rejection also drives the run forward: the loop's
+                // approval-drain path reads the Rejected state row on
+                // the next iteration and emits a synthetic tool-error
+                // so DECIDE can react instead of re-proposing the same
+                // call forever.
+                maybe_auto_resume_orchestrate_for_tool_call(
+                    state,
+                    &e.call_id,
+                    "tool_call_rejected",
+                )
+                .await;
+            }
+            _ => {}
         }
 
         // OTLP export (RFC 021): send each event to the exporter.
@@ -380,38 +421,79 @@ fn push_notification_for_event(state: &Arc<AppState>, stored: &cairn_store::Stor
 
 // ── F49: auto-resume orchestrate kick ────────────────────────────────────────
 
-/// F49: if the resolved approval belongs to a run and no other pending
-/// approvals exist for the same run and the run is still in state
-/// `Running`, enqueue a kick on the `orchestrate_kick_tx` channel so
-/// the background worker re-enters the orchestrate loop without
-/// operator action.
+/// F49 + #636: central gate used by both the plan-approval
+/// (`ApprovalResolved`) and the tool-call-approval
+/// (`ToolCallApproved` / `ToolCallRejected`) auto-resume paths.
 ///
-/// Every check is best-effort — a transient store blip or a missing
-/// run_id degrades gracefully to the pre-F49 behaviour (operator
-/// re-POSTs `/orchestrate`). No panics, no 5xxs from this path.
-async fn maybe_auto_resume_orchestrate(state: &Arc<AppState>, e: &cairn_domain::ApprovalResolved) {
-    use cairn_store::projections::{ApprovalReadModel, RunReadModel};
-    let Some(run_id) = resolve_run_for_approval(state, &e.approval_id).await else {
-        return;
+/// Fires `orchestrate_kick_tx.kick(run_id)` only when ALL of:
+///
+///   1. No other plan approval is pending on this run.
+///   2. No other tool-call approval is pending on this run.
+///   3. The run record exists and is in state `Running`.
+///
+/// Both pending-check axes are load-bearing: a mid-run loop can have
+/// both a plan approval and several tool-call approvals in flight at
+/// the same time, and kicking before ALL of them resolve would rerun
+/// the orchestrator only to re-park on the next unresolved gate —
+/// wasting an LLM round-trip and an FF lease renewal.
+///
+/// Every check is best-effort. A transient store error or missing
+/// record degrades gracefully to the pre-#636 behaviour (the operator
+/// re-POSTs `/orchestrate` manually). No panics, no 5xxs, no log spam
+/// on the hot path.
+async fn try_kick_auto_resume(
+    state: &Arc<AppState>,
+    run_id: &cairn_domain::RunId,
+    trigger: &'static str,
+) {
+    use cairn_store::projections::{
+        ApprovalReadModel, RunReadModel, ToolCallApprovalReadModel, ToolCallApprovalState,
     };
 
-    // Any other pending approvals for this run block auto-resume.
-    match ApprovalReadModel::has_pending_for_run(state.runtime.store.as_ref(), &run_id).await {
+    // 1. Plan approvals pending.
+    match ApprovalReadModel::has_pending_for_run(state.runtime.store.as_ref(), run_id).await {
         Ok(true) => return,
         Ok(false) => {}
         Err(err) => {
             tracing::debug!(
                 run_id = %run_id,
+                trigger,
                 error = %err,
-                "F49: skip auto-resume (cannot read pending approvals)"
+                "F49: skip auto-resume (cannot read pending plan approvals)"
             );
             return;
         }
     }
 
-    // Run must exist and still be Running — auto-resume on a terminal
-    // or paused run would race with the state machine.
-    let run_rec = match RunReadModel::get(state.runtime.store.as_ref(), &run_id).await {
+    // 2. #636: tool-call approvals pending. Use `list_for_run` + filter
+    // by Pending because there is no dedicated `has_pending_for_run`
+    // helper on `ToolCallApprovalReadModel` yet. The per-run list is
+    // expected to stay small (≤ O(iterations × approvals-per-round))
+    // so the short-circuit scan below is cheap.
+    let tool_pending = {
+        let reader: &dyn ToolCallApprovalReadModel = state.runtime.store.as_ref();
+        match reader.list_for_run(run_id).await {
+            Ok(rows) => rows
+                .into_iter()
+                .any(|r| r.state == ToolCallApprovalState::Pending),
+            Err(err) => {
+                tracing::debug!(
+                    run_id = %run_id,
+                    trigger,
+                    error = %err,
+                    "F49: skip auto-resume (cannot read pending tool-call approvals)"
+                );
+                return;
+            }
+        }
+    };
+    if tool_pending {
+        return;
+    }
+
+    // 3. Run must exist and still be Running — auto-resume on a
+    // terminal or paused run would race with the state machine.
+    let run_rec = match RunReadModel::get(state.runtime.store.as_ref(), run_id).await {
         Ok(Some(r)) => r,
         _ => return,
     };
@@ -419,15 +501,64 @@ async fn maybe_auto_resume_orchestrate(state: &Arc<AppState>, e: &cairn_domain::
         return;
     }
 
-    // Best-effort enqueue. `kick` returns false when the channel is
-    // not installed yet (early startup) — same behaviour as pre-F49.
+    // Guard against double-kick — the channel itself is unbounded, but
+    // main.rs's worker applies a 5s per-run dedup window so a burst of
+    // resolutions (e.g. a "approve all" operator click) collapses to
+    // one POST. The `kick` call is best-effort: it returns false when
+    // the channel hasn't been installed (early startup or non-http
+    // roles) — same behaviour as pre-F49.
     if state.orchestrate_kick_tx.kick(run_id.clone()) {
         tracing::info!(
             run_id = %run_id,
-            approval_id = %e.approval_id,
-            "F49: queued auto-resume orchestrate kick"
+            trigger,
+            "F49/#636: queued auto-resume orchestrate kick"
         );
     }
+}
+
+/// F49: plan-approval path. `ApprovalResolved` carries the approval id
+/// but not the run id, so we walk the approval projection first.
+async fn maybe_auto_resume_orchestrate_for_plan(
+    state: &Arc<AppState>,
+    e: &cairn_domain::ApprovalResolved,
+) {
+    let Some(run_id) = resolve_run_for_plan_approval(state, &e.approval_id).await else {
+        return;
+    };
+    try_kick_auto_resume(state, &run_id, "plan_approval_resolved").await;
+}
+
+/// #636: tool-call-approval path. `ToolCallApproved` /
+/// `ToolCallRejected` both carry the `call_id` but not the `run_id`
+/// directly — we look the run up via `ToolCallApprovalReadModel::get`.
+async fn maybe_auto_resume_orchestrate_for_tool_call(
+    state: &Arc<AppState>,
+    call_id: &cairn_domain::ToolCallId,
+    trigger: &'static str,
+) {
+    use cairn_store::projections::ToolCallApprovalReadModel;
+    let reader: &dyn ToolCallApprovalReadModel = state.runtime.store.as_ref();
+    let run_id = match reader.get(call_id).await {
+        Ok(Some(rec)) => rec.run_id,
+        Ok(None) => {
+            tracing::debug!(
+                call_id = %call_id,
+                trigger,
+                "#636: skip auto-resume (tool-call approval record missing)"
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::debug!(
+                call_id = %call_id,
+                trigger,
+                error = %err,
+                "#636: skip auto-resume (cannot read tool-call approval record)"
+            );
+            return;
+        }
+    };
+    try_kick_auto_resume(state, &run_id, trigger).await;
 }
 
 /// Walk from approval_id → run_id via the approval projection. The
@@ -437,7 +568,7 @@ async fn maybe_auto_resume_orchestrate(state: &Arc<AppState>, e: &cairn_domain::
 /// Transient store errors are logged at debug and degrade to "no
 /// run_id" so auto-resume is best-effort — operators can always
 /// re-POST `/orchestrate` manually (the pre-F49 behaviour).
-async fn resolve_run_for_approval(
+async fn resolve_run_for_plan_approval(
     state: &Arc<AppState>,
     approval_id: &cairn_domain::ApprovalId,
 ) -> Option<cairn_domain::RunId> {
