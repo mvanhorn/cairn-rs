@@ -65,16 +65,27 @@ test.describe('scope picker — dropdowns, breadcrumb, empty-state hint', () => 
     await expect(trigger).toBeVisible();
   });
 
-  // Skipped in CI: requires pre-existing tenant/workspace/project data.
-  // Tracked at #618 for a seed-data fixture.
-  test.skip('scope dropdown cascades: tenant → workspace → project', async ({ page }) => {
+  test('scope dropdown cascades: tenant → workspace → project', async ({ page }) => {
     await resetToDefaultScope(page);
     await signIn(page);
     await nav(page, 'dashboard');
 
-    // Open popover
-    await page.getByTestId('scope-trigger').click();
-    await expect(page.getByTestId('scope-popover')).toBeVisible();
+    // When `cairn_scope` is cleared, multi-tenant deployments auto-open
+    // the popover via `SCOPE_NEEDS_PICK_EVENT` (see App.tsx). A blind
+    // click on `scope-trigger` would toggle that auto-open back off
+    // and leave the picker closed — the original flake.
+    //
+    // Check if the popover is already visible; click only when closed.
+    // `waitFor` with a short timeout is the correct Playwright API —
+    // `isVisible({ timeout })` silently ignores the timeout (Gemini review).
+    const popover = page.getByTestId('scope-popover');
+    const trigger = page.getByTestId('scope-trigger');
+    try {
+      await popover.waitFor({ state: 'visible', timeout: 1000 });
+    } catch {
+      await trigger.click();
+    }
+    await expect(popover).toBeVisible();
 
     // Tenant select shows the seeded tenant.
     const tenantSelect = page.getByTestId('scope-tenant-select');

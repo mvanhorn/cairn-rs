@@ -116,6 +116,23 @@ export async function nav(page: Page, hash: string) {
   await page.waitForLoadState("domcontentloaded");
   // Wait for the page content to render (sidebar visible = app is mounted)
   await page.getByTestId("sidebar").waitFor({ state: "visible", timeout: 5000 }).catch(() => {});
+
+  // Dismiss the scope picker if it auto-opened. `SCOPE_NEEDS_PICK_EVENT`
+  // in `App.tsx` auto-opens the popover when cairn-app has multiple
+  // tenants but no `cairn_scope` is cached. Without this, every spec
+  // that runs after any spec which creates a tenant gets its clicks
+  // intercepted by a scope-popover that opens on navigation.
+  // Tests that explicitly exercise the picker (`scope-picker.spec.ts`)
+  // don't use this helper to open it, so they're unaffected.
+  const popover = page.getByTestId("scope-popover");
+  const visible = await popover
+    .waitFor({ state: "visible", timeout: 200 })
+    .then(() => true)
+    .catch(() => false);
+  if (visible) {
+    await page.keyboard.press("Escape").catch(() => {});
+    await popover.waitFor({ state: "hidden", timeout: 1000 }).catch(() => {});
+  }
 }
 
 // ── API helpers ──────────────────────────────────────────────────────────────

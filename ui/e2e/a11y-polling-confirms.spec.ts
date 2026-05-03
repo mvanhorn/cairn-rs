@@ -125,9 +125,7 @@ test.describe("RunDetailPage — Cancel + Export aria-label (#385)", () => {
 // ── #386 — TokenInput label↔input association ───────────────────────────────
 
 test.describe("CostCalculatorPage — TokenInput label binding (#386)", () => {
-  // Skipped in CI: assumes seed cost data / runs that a fresh cairn-app boot
-  // doesn't carry. Tracked at cairn-rs #618 (Playwright seed-data roadmap).
-  test.skip("clicking the 'Input tokens' label focuses its input", async ({ page }) => {
+  test("clicking the 'Input tokens' label focuses its input", async ({ page }) => {
     await signIn(page);
     await nav(page, "cost-calc");
 
@@ -223,8 +221,7 @@ test.describe("DecisionsPage — auth token helper (#387)", () => {
 // ── #388 — Batch create partial success uses toast.warning ──────────────────
 
 test.describe("RunsPage — batch create partial success (#388)", () => {
-  // Skipped in CI: requires existing runs context. Tracked at #618.
-  test.skip("3-of-5 batch shows a single amber 'Partial:' warning toast", async ({
+  test("3-of-5 batch shows a single amber 'Partial:' warning toast", async ({
     page,
   }) => {
     // Stub POST /v1/runs/batch to return 3 ok / 2 failures. No
@@ -265,15 +262,22 @@ test.describe("RunsPage — batch create partial success (#388)", () => {
     await signIn(page);
     await nav(page, "runs");
 
-    // Open the batch-create modal. The "Batch" button copy varies; match
-    // via the role + text fragment.
-    await page.getByRole("button", { name: /Batch|New|Create/i }).first().click();
-    // Fill in a count of 5 to match our stub.
-    const countInput = page.getByLabel(/Number of runs/i);
+    // Open the batch-create modal. The button's accessible name is
+    // exactly "Batch Create" (from RunsPage.tsx). The earlier broad
+    // `/Batch|New|Create/i` regex matched unrelated buttons that also
+    // contained "Create" in their name and opened a different modal,
+    // making the test brittle.
+    await page.getByRole("button", { name: /^Batch Create$/i }).click();
+    // The modal's `Number of runs` <label> is not bound to its input
+    // via `htmlFor`, so `getByLabel` can't find the input. Locate the
+    // input by proximity to the label text instead.
+    const modal = page.getByRole("heading", { name: /Batch Create Runs/i }).locator("..").locator("..");
+    await expect(modal).toBeVisible({ timeout: 5_000 });
+    const countInput = modal.locator("input[type=\"number\"]").first();
     await expect(countInput).toBeVisible({ timeout: 5_000 });
     await countInput.fill("5");
-    // Submit.
-    await page.getByRole("button", { name: /^Create$|^Create runs$/i }).first().click();
+    // Submit — Batch Create modal's submit button has distinct text.
+    await modal.getByRole("button", { name: /Create .*5.* runs?|^Create$/i }).click();
 
     // Exactly one amber "Partial:" toast — NOT a success toast, NOT an
     // error toast. This is what #388 changed.
@@ -302,9 +306,11 @@ test.describe("RunDetailPage — children polling hygiene (#389)", () => {
     return rid;
   }
 
-  // Skipped in CI: createRun() requires session/run plumbing not present
-  // in a fresh boot. Tracked at #618.
-  test.skip("503 on children endpoint halts the 15s polling loop", async ({ page, request }) => {
+  test("503 on children endpoint halts the 15s polling loop", async ({ page, request }) => {
+    // This test intentionally waits 17s to verify the polling loop halted.
+    // The global `timeout: 15_000` in playwright.config.ts would fire first;
+    // extend per-test.
+    test.setTimeout(30_000);
     const rid = await createRun(request);
 
     let callCount = 0;
