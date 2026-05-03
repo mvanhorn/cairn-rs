@@ -889,10 +889,14 @@ test.describe("24. Real LLM Calls", () => {
     }
   });
 
-  // Gated on PLAYWRIGHT_LIVE_LLM=1 — runs nightly via the `ui-e2e-llm`
-  // workflow with ZAI_API_KEY wired through CAIRN_BRAIN_URL/KEY.
+  // Local-only: gated on PLAYWRIGHT_LIVE_LLM=1. CI deliberately does not
+  // run this — burning provider tokens on every PR is both costly and
+  // noisy. Local run:
+  //   CAIRN_BRAIN_URL=https://api.z.ai/api/coding/paas/v4/ \
+  //   CAIRN_BRAIN_KEY=$ZAI_API_KEY CAIRN_BRAIN_MODEL=glm-4.7 \
+  //   PLAYWRIGHT_LIVE_LLM=1 npx playwright test operator-journey
   test("orchestrate: real model completes a run", async ({ request }) => {
-    test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
+    test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
     const sid = `orch_sess_${id()}`, rid = `orch_run_${id()}`;
     await post(request, "/v1/sessions", { session_id: sid, ...scope });
     await post(request, "/v1/runs", { run_id: rid, session_id: sid, ...scope });
@@ -914,9 +918,9 @@ test.describe("24. Real LLM Calls", () => {
     }
   });
 
-  // Gated on PLAYWRIGHT_LIVE_LLM=1 — see sibling test above.
+  // Local-only: gated on PLAYWRIGHT_LIVE_LLM=1 — see sibling test above for run command.
   test("orchestrate with memory: model can search ingested knowledge", async ({ request }) => {
-    test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
+    test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
     // Ingest a document
     await post(request, "/v1/memory/ingest", {
       document_id: `llm_doc_${id()}`,

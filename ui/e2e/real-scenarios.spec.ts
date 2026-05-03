@@ -85,12 +85,14 @@ test.setTimeout(90_000);
 //             is meaningful, tokens were counted, and events were recorded
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Gated on PLAYWRIGHT_LIVE_LLM=1 — runs nightly via the `ui-e2e-llm`
-// workflow with ZAI_API_KEY wired through CAIRN_BRAIN_URL/KEY. The
-// per-PR `ui-e2e` job leaves this skipped because ZAI keys burn
-// tokens on every test run.
+// Local-only: gated on PLAYWRIGHT_LIVE_LLM=1. CI deliberately does not
+// run this — burning provider tokens on every PR is both costly and
+// noisy. Local run:
+//   CAIRN_BRAIN_URL=https://api.z.ai/api/coding/paas/v4/ \
+//   CAIRN_BRAIN_KEY=$ZAI_API_KEY CAIRN_BRAIN_MODEL=glm-4.7 \
+//   PLAYWRIGHT_LIVE_LLM=1 npx playwright test real-scenarios
 test("S1: Orchestrate with real LLM → meaningful response + token accounting + events", async ({ request }) => {
-  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
   const sid = `s1_sess_${uid()}`, rid = `s1_run_${uid()}`;
 
   // Create session + run
@@ -159,9 +161,9 @@ test("S2: Generate → real tokens counted, latency measured", async ({ request 
 //             Verify the model's response references the ingested knowledge.
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Gated on PLAYWRIGHT_LIVE_LLM=1 — see S1 above for rationale.
+// Local-only: gated on PLAYWRIGHT_LIVE_LLM=1 — see S1 above for the run command.
 test("S3: Memory-augmented orchestration — model uses ingested knowledge", async ({ request }) => {
-  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
   const secret = `cairn-secret-${uid()}`;
 
   // Ingest a document with a unique fact
@@ -317,9 +319,9 @@ test("S6: Dynamic provider routing — create → route → delete → fallback"
 //             verify the generate endpoint picks up the new default
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Gated on PLAYWRIGHT_LIVE_LLM=1 — see S1 above for rationale.
+// Local-only: gated on PLAYWRIGHT_LIVE_LLM=1 — see S1 above for the run command.
 test("S7: Hot-reload settings — change default model, verify resolution", async ({ request }) => {
-  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
   const originalModel = "original-model-before";
   const newModel = "hot-reloaded-model-after";
 
