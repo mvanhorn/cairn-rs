@@ -85,9 +85,12 @@ test.setTimeout(90_000);
 //             is meaningful, tokens were counted, and events were recorded
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Skipped in CI: requires a configured LLM provider. Tracked at #618
-// for a PLAYWRIGHT_LIVE_LLM=1 nightly gate.
-test.skip("S1: Orchestrate with real LLM → meaningful response + token accounting + events", async ({ request }) => {
+// Gated on PLAYWRIGHT_LIVE_LLM=1 — runs nightly via the `ui-e2e-llm`
+// workflow with ZAI_API_KEY wired through CAIRN_BRAIN_URL/KEY. The
+// per-PR `ui-e2e` job leaves this skipped because ZAI keys burn
+// tokens on every test run.
+test("S1: Orchestrate with real LLM → meaningful response + token accounting + events", async ({ request }) => {
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
   const sid = `s1_sess_${uid()}`, rid = `s1_run_${uid()}`;
 
   // Create session + run
@@ -156,8 +159,9 @@ test("S2: Generate → real tokens counted, latency measured", async ({ request 
 //             Verify the model's response references the ingested knowledge.
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Skipped in CI: requires a configured LLM provider + memory backend. #618.
-test.skip("S3: Memory-augmented orchestration — model uses ingested knowledge", async ({ request }) => {
+// Gated on PLAYWRIGHT_LIVE_LLM=1 — see S1 above for rationale.
+test("S3: Memory-augmented orchestration — model uses ingested knowledge", async ({ request }) => {
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
   const secret = `cairn-secret-${uid()}`;
 
   // Ingest a document with a unique fact
@@ -313,8 +317,9 @@ test("S6: Dynamic provider routing — create → route → delete → fallback"
 //             verify the generate endpoint picks up the new default
 // ═════════════════════════════════════════════════════════════════════════════
 
-// Skipped in CI: requires a configured LLM provider. #618.
-test.skip("S7: Hot-reload settings — change default model, verify resolution", async ({ request }) => {
+// Gated on PLAYWRIGHT_LIVE_LLM=1 — see S1 above for rationale.
+test("S7: Hot-reload settings — change default model, verify resolution", async ({ request }) => {
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
   const originalModel = "original-model-before";
   const newModel = "hot-reloaded-model-after";
 

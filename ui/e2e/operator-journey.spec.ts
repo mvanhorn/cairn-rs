@@ -889,9 +889,10 @@ test.describe("24. Real LLM Calls", () => {
     }
   });
 
-  // Skipped in CI: requires a configured LLM provider (Bedrock/OpenRouter).
-  // Tracked at #618 for a PLAYWRIGHT_LIVE_LLM=1 nightly gate.
-  test.skip("orchestrate: real model completes a run", async ({ request }) => {
+  // Gated on PLAYWRIGHT_LIVE_LLM=1 — runs nightly via the `ui-e2e-llm`
+  // workflow with ZAI_API_KEY wired through CAIRN_BRAIN_URL/KEY.
+  test("orchestrate: real model completes a run", async ({ request }) => {
+    test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
     const sid = `orch_sess_${id()}`, rid = `orch_run_${id()}`;
     await post(request, "/v1/sessions", { session_id: sid, ...scope });
     await post(request, "/v1/runs", { run_id: rid, session_id: sid, ...scope });
@@ -913,9 +914,9 @@ test.describe("24. Real LLM Calls", () => {
     }
   });
 
-  // Skipped in CI: requires a configured LLM provider + memory backend.
-  // Tracked at #618.
-  test.skip("orchestrate with memory: model can search ingested knowledge", async ({ request }) => {
+  // Gated on PLAYWRIGHT_LIVE_LLM=1 — see sibling test above.
+  test("orchestrate with memory: model can search ingested knowledge", async ({ request }) => {
+    test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set");
     // Ingest a document
     await post(request, "/v1/memory/ingest", {
       document_id: `llm_doc_${id()}`,

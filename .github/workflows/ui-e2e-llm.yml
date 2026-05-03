@@ -1,0 +1,150 @@
+name: ui-e2e-llm
+
+# Nightly Playwright run against a real LLM provider.
+#
+# The per-PR `ui-e2e` job skips 5 specs that need a configured LLM
+# provider (real-scenarios S1/S3/S7 + operator-journey orchestrate × 2)
+# via `PLAYWRIGHT_LIVE_LLM` gate. This workflow runs those specs once
+# a day with the ZAI_API_KEY repo secret so upstream provider wire-
+# format regressions + cairn's orchestrator path against a real model
+# surface before a tenant hits them in production.
+#
+# Policy:
+#   * Nightly cron (minute 37 of hour 7 UTC — off-peak for ZAI and
+#     off the round minute to avoid all-cron-job stampede).
+#   * workflow_dispatch for investigations.
+#   * If ZAI_API_KEY is absent, the job SKIPS without failing.
+#   * Failures surface via GitHub Actions run status + watcher emails.
+#
+# Why ZAI and not Bedrock: deployment's Bedrock path is MiniMax-only
+# right now (see `.env.cairn.bak` chain history), and the Playwright
+# orchestrator specs prompt for short-form arithmetic that any
+# OpenAI-compat model can answer. ZAI's GLM Coding Plan endpoint is
+# the cheapest + fastest way to exercise the whole stack.
+
+"on":
+  schedule:
+    # Daily at 07:37 UTC. Off-peak for ZAI; off the round minute so
+    # this job doesn't collide with the all-cron-at-07:00 GitHub
+    # scheduler stampede.
+    - cron: "37 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ui-e2e-llm
+  cancel-in-progress: false
+
+jobs:
+  ui-e2e-llm:
+    name: ui-e2e-llm
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      # Same reason as the per-PR `ui-e2e` job: FabricServices::start()
+      # boots unconditionally even in local mode, and requires a
+      # reachable Valkey. See .github/workflows/ci.yml `ui-e2e`.
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping || redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CARGO_TERM_COLOR: always
+      SQLX_OFFLINE: "true"
+    steps:
+      - name: Probe for ZAI_API_KEY secret
+        id: has_key
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+        # Secrets aren't exposed in `if:` expressions; compare in a
+        # shell step + export a step output. Empty string = secret
+        # not configured.
+        run: |
+          if [ -z "${ZAI_API_KEY:-}" ]; then
+            echo "ZAI_API_KEY secret not configured. Job will skip."
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.has_key.outputs.has_key == 'true'
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.has_key.outputs.has_key == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.has_key.outputs.has_key == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - uses: actions/cache@v4
+        if: steps.has_key.outputs.has_key == 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-ui-e2e-llm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ui-e2e-llm-
+            ${{ runner.os }}-cargo-ui-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Build cairn-app debug binary
+        if: steps.has_key.outputs.has_key == 'true'
+        run: cargo build -p cairn-app --bin cairn-app
+        timeout-minutes: 20
+
+      - name: npm install
+        if: steps.has_key.outputs.has_key == 'true'
+        working-directory: ui
+        run: npm install
+
+      - name: Install Playwright Chromium
+        if: steps.has_key.outputs.has_key == 'true'
+        working-directory: ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright with live ZAI
+        if: steps.has_key.outputs.has_key == 'true'
+        working-directory: ui
+        # Env var flow:
+        #   * `CAIRN_BRAIN_URL` + `CAIRN_BRAIN_KEY` are picked up by
+        #     cairn-app at boot (see `main.rs` `openai_compat_brain`)
+        #     and register a generation provider with no cairn-layer
+        #     setup calls required by the tests.
+        #   * `PLAYWRIGHT_LIVE_LLM=1` un-gates the 5 LLM-dependent
+        #     specs; the Playwright config passes this through the
+        #     managed webServer env.
+        #   * Other env vars mirror the per-PR `ui-e2e` gate so the
+        #     managed webServer boots successfully (AppArmor probe
+        #     skip, FF HMAC, credential key).
+        env:
+          CAIRN_BRAIN_URL: https://api.z.ai/api/coding/paas/v4/
+          CAIRN_BRAIN_KEY: ${{ secrets.ZAI_API_KEY }}
+          CAIRN_BRAIN_MODEL: glm-4.6
+          PLAYWRIGHT_LIVE_LLM: "1"
+          CAIRN_FABRIC_URL: valkey://127.0.0.1:6379
+          CAIRN_FABRIC_WAITPOINT_HMAC_KID: ci-ui-e2e-llm
+          CAIRN_CREDENTIAL_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+        run: |
+          export CAIRN_FABRIC_WAITPOINT_HMAC_SECRET="$(openssl rand -hex 32)"
+          npx playwright test
+        timeout-minutes: 15
+
+      - name: Upload Playwright report on failure
+        if: failure() && steps.has_key.outputs.has_key == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-llm
+          path: ui/playwright-report/
+          if-no-files-found: warn
+          retention-days: 14
