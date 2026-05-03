@@ -512,7 +512,18 @@ export type FailureClass =
    * the lease re-claim. Tracked upstream at
    * https://github.com/avifenesh/FlowFabric/issues/371.
    */
-  | "terminal_write_deadlock";
+  | "terminal_write_deadlock"
+  /**
+   * #660: orchestrator's strict completion gate refused the LLM's
+   * `complete_run` because the F47 `completion_verification` sidecar
+   * reported errors (typically a failing `cargo build`/`cargo check`).
+   * The loop re-enters DECIDE; after three consecutive rejections the
+   * run terminates with this class so operators can distinguish
+   * "model could not converge past a failing build" from a generic
+   * `execution_error`. Flag: `orchestrator_strict_completion_gate`
+   * (default `true`). See RFC-F47 + issue #660.
+   */
+  | "verification_rejected";
 
 /** GET /v1/runs — array of RunRecord */
 export interface RunRecord {

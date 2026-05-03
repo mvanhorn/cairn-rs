@@ -96,7 +96,15 @@ pub(super) fn redact_provider_error(raw: Option<&str>) -> Option<String> {
 /// so operators can still filter failed runs by class.
 pub(super) fn classify_failed_reason(reason: &str) -> cairn_domain::FailureClass {
     let lower = reason.to_ascii_lowercase();
-    if lower.contains("lease") && (lower.contains("expir") || lower.contains("lost")) {
+    // #660: the strict completion gate emits a reason string that
+    // starts with the literal `verification_rejected:` prefix (see
+    // `crates/cairn-orchestrator/src/loop_runner.rs` — the LoopConfig
+    // rustdoc documents the contract). Match the prefix so a future
+    // change to the error list / attempt count suffix can't silently
+    // drop the classification back to `ExecutionError`.
+    if lower.starts_with("verification_rejected") {
+        cairn_domain::FailureClass::VerificationRejected
+    } else if lower.contains("lease") && (lower.contains("expir") || lower.contains("lost")) {
         cairn_domain::FailureClass::LeaseExpired
     } else if lower.contains("timed out") || lower.contains("timeout") {
         cairn_domain::FailureClass::TimedOut
@@ -216,5 +224,49 @@ mod tests {
     #[test]
     fn redact_provider_error_none_stays_none() {
         assert_eq!(redact_provider_error(None), None);
+    }
+
+    /// #660: the orchestrator's strict completion gate emits a reason
+    /// string prefixed `verification_rejected:` when the LLM refuses to
+    /// converge away from a failing build. The handler must translate
+    /// that into `FailureClass::VerificationRejected` so operators can
+    /// filter failed runs by class without re-parsing free-form reason
+    /// text.
+    #[test]
+    fn classify_failed_reason_matches_verification_rejected_prefix() {
+        use cairn_domain::FailureClass;
+        let reason = "verification_rejected: 3 error(s) after 3 complete_run attempts. \
+                      First errors: error[E0308]: mismatched types | error: could not \
+                      compile `demo` | error: linker failed";
+        assert_eq!(
+            classify_failed_reason(reason),
+            FailureClass::VerificationRejected,
+            "#660: the `verification_rejected:` prefix is the wire contract \
+             between the loop runner and this classifier; a change here \
+             must be reflected in the loop runner's reason format."
+        );
+    }
+
+    /// #660: lowercase match on the prefix catches case drift from
+    /// future log formatters without regressing the classification.
+    #[test]
+    fn classify_failed_reason_matches_verification_rejected_case_insensitive() {
+        use cairn_domain::FailureClass;
+        assert_eq!(
+            classify_failed_reason("Verification_Rejected: 1 error(s)"),
+            FailureClass::VerificationRejected,
+        );
+    }
+
+    /// Sanity: unrelated reasons still land on `ExecutionError`, so the
+    /// `verification_rejected` arm isn't accidentally shadowing another
+    /// class.
+    #[test]
+    fn classify_failed_reason_falls_through_on_unrelated_reasons() {
+        use cairn_domain::FailureClass;
+        assert_eq!(
+            classify_failed_reason("tool error: stdout exceeded 1MB"),
+            FailureClass::ExecutionError,
+        );
     }
 }

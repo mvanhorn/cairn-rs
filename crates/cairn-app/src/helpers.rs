@@ -412,6 +412,66 @@ pub(crate) async fn persist_run_u32_default(
         .map(|_| ())
 }
 
+/// #660: read a run's per-run boolean default. Accepts either a native
+/// JSON bool or a string spelling (`"true"`, `"false"`, `"1"`, `"0"`,
+/// `"yes"`, `"no"`) so operators flipping the flag via a curl one-liner
+/// against `PUT /v1/settings/defaults/project/<proj>/run:<id>:<suffix>`
+/// (which currently stringifies JSON primitives to strings) get the
+/// behaviour they expect.
+///
+/// Returns `None` when the key is absent or the value is a shape we
+/// cannot cleanly coerce — callers then fall back to their own default.
+pub(crate) async fn resolve_run_bool_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+) -> Option<bool> {
+    let key = run_default_key(run_id, suffix);
+    let value = state
+        .runtime
+        .defaults
+        .resolve(project, &key)
+        .await
+        .ok()
+        .flatten()?;
+    if let Some(b) = value.as_bool() {
+        return Some(b);
+    }
+    if let Some(s) = value.as_str() {
+        let trimmed = s.trim().to_ascii_lowercase();
+        return match trimmed.as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// #660: persist a run's per-run boolean default. Stored as a native
+/// JSON bool so the read path can route through
+/// [`resolve_run_bool_default`] without extra coercion.
+pub(crate) async fn persist_run_bool_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: bool,
+) -> Result<(), cairn_runtime::RuntimeError> {
+    state
+        .runtime
+        .defaults
+        .set(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            serde_json::Value::Bool(value),
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Resolve a task's session_id.
 ///
 /// Returns the `session_id` already persisted on the task record when present.

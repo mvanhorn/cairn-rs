@@ -702,6 +702,14 @@ where
         // in practice (providers routinely report usage) but we refuse
         // to silently accept a stuck under-count.
         let mut decide_usage_absent_warned = false;
+        // Issue #660: strict completion-gate rejection counter. Increments
+        // every time the LLM proposes `complete_run` while the F47
+        // verification accumulator still has non-empty errors. Three
+        // consecutive rejections end the run in `Failed
+        // (VerificationRejected)` so a non-converging model can't ping-
+        // pong against the gate until `max_iterations` exhausts the
+        // budget. Gated by `config.orchestrator_strict_completion_gate`.
+        let mut completion_gate_rejections: u32 = 0;
 
         tracing::info!(
             run_id    = %ctx.run_id,
@@ -1002,7 +1010,9 @@ where
             }
 
             // ── (3) DECIDE ────────────────────────────────────────────────────
-            let decide_output = self.decide.decide(ctx, &gather_output).await.map_err(|e| {
+            // `mut` so the #660 strict completion gate can strip a refused
+            // `complete_run` proposal in place before execute dispatches it.
+            let mut decide_output = self.decide.decide(ctx, &gather_output).await.map_err(|e| {
                 tracing::error!(run_id = %ctx.run_id, iteration = ctx.iteration, error = %e, "decide failed");
                 e
             })?;
@@ -1366,6 +1376,140 @@ where
                     error     = %e,
                     "intent checkpoint save failed — continuing without intent checkpoint"
                 );
+            }
+
+            // ── (4c) #660 strict completion gate ─────────────────────────────
+            //
+            // Belt-and-suspenders for the role-prompt completion gate
+            // shipped in #662. The role prompt tells the LLM "don't emit
+            // `complete_run` with a failing `completion_verification`";
+            // this gate enforces it in case the LLM lies. When the
+            // accumulator has at least one error line AND DECIDE emitted
+            // a `CompleteRun` proposal:
+            //
+            //   * Strip the `CompleteRun` from `decide_output.proposals`
+            //     so execute never dispatches `RunService::complete`
+            //     (which would flip the run to `state=completed`).
+            //   * Push a synthesised `StepSummary` into `step_history`
+            //     carrying a short excerpt of the first errors so the
+            //     next DECIDE turn sees the rejection + the concrete
+            //     diagnostics in its user-message context.
+            //   * On the third consecutive rejection, terminate with
+            //     `LoopTermination::Failed { reason = "verification_rejected: …" }`
+            //     so `finalize_run_failure` can map the reason to
+            //     `FailureClass::VerificationRejected` (issue #660). Three
+            //     rejections is enough for a genuinely self-correcting
+            //     model to recover; any more would just burn budget
+            //     against a stuck loop.
+            //
+            // Soft-fail posture: if anything in the gate's inspection goes
+            // sideways (unlikely — it's a pure read of `verification_acc`),
+            // log WARN + fall through to the pre-fix behaviour. A platform
+            // gate that blocks the happy path when its own check breaks
+            // is worse than the non-authoritative baseline.
+            if self.config.orchestrator_strict_completion_gate {
+                let gate_would_reject = decide_output
+                    .proposals
+                    .iter()
+                    .any(|p| p.action_type == cairn_domain::ActionType::CompleteRun)
+                    && verification_acc.error_count() > 0;
+
+                if gate_would_reject {
+                    let error_count = verification_acc.error_count();
+                    let preview: Vec<String> = verification_acc
+                        .errors()
+                        .iter()
+                        .take(crate::context::COMPLETION_GATE_ERROR_PREVIEW)
+                        .cloned()
+                        .collect();
+
+                    completion_gate_rejections = completion_gate_rejections.saturating_add(1);
+
+                    tracing::warn!(
+                        run_id        = %ctx.run_id,
+                        iteration     = ctx.iteration,
+                        rejection_num = completion_gate_rejections,
+                        error_count,
+                        "#660 strict completion gate rejecting complete_run — \
+                         verification accumulator has errors"
+                    );
+
+                    if completion_gate_rejections >= crate::context::MAX_COMPLETION_GATE_REJECTIONS
+                    {
+                        // Budget cap hit. Terminate the run so it can't
+                        // ping-pong against the gate until `max_iterations`.
+                        // Reason string is matched by the handler's
+                        // `classify_failed_reason` to set the run's
+                        // `FailureClass::VerificationRejected` terminal
+                        // state. Keep the literal prefix stable — it's a
+                        // contract with `crates/cairn-app/src/handlers/runs/helpers.rs`.
+                        let reason = format!(
+                            "verification_rejected: {error_count} error(s) after \
+                             {completion_gate_rejections} complete_run attempts. \
+                             First errors: {}",
+                            preview.join(" | "),
+                        );
+                        tracing::warn!(
+                            run_id    = %ctx.run_id,
+                            iteration = ctx.iteration,
+                            %reason,
+                            "#660 completion gate hit rejection cap — failing run"
+                        );
+                        return Ok(LoopTermination::Failed { reason });
+                    }
+
+                    // Strip the CompleteRun proposal(s) from this turn's
+                    // decide output so execute dispatches only the
+                    // non-terminal remainder (most turns have nothing
+                    // else, in which case execute is a no-op).
+                    decide_output
+                        .proposals
+                        .retain(|p| p.action_type != cairn_domain::ActionType::CompleteRun);
+
+                    // Synthesised rejection step so the next DECIDE turn
+                    // sees the concrete error excerpts in its user
+                    // message via the `## Step history` section (see
+                    // `decide_impl::build_user_message`). Marked
+                    // `succeeded=false` so the model reads it as a
+                    // failure signal, not a completed action.
+                    let rejection_summary = if preview.is_empty() {
+                        format!(
+                            "complete_run refused by strict completion gate: \
+                             verification accumulator has {error_count} error(s). \
+                             Fix them before calling complete_run again \
+                             (attempt {completion_gate_rejections} of {}).",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                        )
+                    } else {
+                        format!(
+                            "complete_run refused by strict completion gate: \
+                             verification reports {error_count} error(s). \
+                             Fix them before calling complete_run again \
+                             (attempt {completion_gate_rejections} of {}). \
+                             First errors: {}",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                            preview.join(" | "),
+                        )
+                    };
+                    let rejection_step = StepSummary {
+                        iteration: ctx.iteration,
+                        action_kind: "complete_run_rejected".to_owned(),
+                        summary: rejection_summary,
+                        succeeded: false,
+                    };
+                    step_history.push(rejection_step);
+                    ctx.step_history = step_history.clone();
+
+                    // If nothing non-terminal is left to dispatch this
+                    // turn, skip execute entirely and let the next
+                    // iteration re-run DECIDE with the rejection
+                    // summary in view. Otherwise fall through to the
+                    // normal execute path for the remaining proposals.
+                    if decide_output.proposals.is_empty() {
+                        ctx.iteration = ctx.iteration.saturating_add(1);
+                        continue;
+                    }
+                }
             }
 
             // ── (5a) FF stream: tool_call frames (intent) ────────────────────

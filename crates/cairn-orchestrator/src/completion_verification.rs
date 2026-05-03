@@ -19,8 +19,16 @@
 //!   [`MAX_LINE_LEN`] chars. Scanning may use small per-call temporaries
 //!   but memory retained across a run is proportional to the cap, not the
 //!   tool_output size.
-//! * Non-authoritative. The scanner reports what tool outputs contain; the
+//! * Advisory by default, enforcing when the strict completion gate is on.
+//!   The scanner itself still just reports what tool outputs contain; the
 //!   orchestrator's loop signal remains the source of truth for run state.
+//!   Since issue #660 the loop additionally consults the accumulator via
+//!   [`VerificationAccumulator::error_count`] when the LLM proposes
+//!   `CompleteRun` — with `orchestrator_strict_completion_gate = true`
+//!   (default) a non-zero error count rejects the `complete_run` and
+//!   re-enters DECIDE so the model must address the diagnostics before
+//!   terminating the run. Operators who want the legacy "LLM calls it
+//!   done no matter what" flow can flip the flag to `false` per run.
 //!
 //! # Usage
 //!
@@ -44,7 +52,7 @@
 use cairn_domain::{CommandOutcome, CompletionVerification};
 use serde_json::Value;
 
-use crate::context::{ActionResult, ActionStatus};
+use crate::context::ActionResult;
 
 /// Maximum number of warning or error entries kept per bucket. Lines past
 /// this cap are silently dropped; the count is implicit in the vector
@@ -150,6 +158,24 @@ impl VerificationAccumulator {
         }
     }
 
+    /// #660: non-consuming peek at the accumulated error lines. Used by
+    /// the strict completion gate in `loop_runner` to decide whether to
+    /// reject an LLM-proposed `CompleteRun` before it reaches the
+    /// execute phase. Returning a slice keeps callers from being able
+    /// to mutate the bucket; the loop only reads to build a rejection
+    /// `StepSummary` that steers the next DECIDE turn.
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+
+    /// #660: non-consuming count of scanned error lines. Equivalent to
+    /// `self.errors().len()` but keeps the call sites clear at the
+    /// completion-gate decision point — the zero-check is the only
+    /// thing the gate really cares about on the hot path.
+    pub fn error_count(&self) -> usize {
+        self.errors.len()
+    }
+
     fn buckets_full(&self) -> bool {
         self.warnings.len() >= MAX_ENTRIES_PER_BUCKET && self.errors.len() >= MAX_ENTRIES_PER_BUCKET
     }
@@ -193,6 +219,19 @@ pub fn extract_verification(tool_results: &[ActionResult]) -> CompletionVerifica
 /// only when no canonical key matched — that fallback path does allocate
 /// but covers tool adapters that flatten their payload into a
 /// non-standard shape.
+///
+/// **Only scans `tool_output`.** `ActionStatus::Failed.reason` is
+/// deliberately excluded: those strings (e.g. `"Error [NOT_FOUND]: File
+/// not found: …"`) are tool-invocation-layer bookkeeping — the tool
+/// couldn't run, argument invalid, file missing, etc. — not build /
+/// compile diagnostics. F35 already handles these via
+/// `LoopSignal::Continue` so the LLM can adapt. Routing them into the
+/// `errors` bucket would cause the #660 completion gate to reject
+/// `complete_run` on benign exploration failures (agent trying to read
+/// a file that doesn't exist yet) that have nothing to do with whether
+/// the produced code builds. The gate must fire only on real tool
+/// output — cargo/rustc/clippy/pytest/ruff diagnostics — which lives in
+/// `tool_output`, not in the orchestrator's bookkeeping reason.
 fn iter_text_sources(result: &ActionResult) -> Vec<std::borrow::Cow<'_, str>> {
     use std::borrow::Cow;
     let mut out: Vec<Cow<'_, str>> = Vec::new();
@@ -213,9 +252,6 @@ fn iter_text_sources(result: &ActionResult) -> Vec<std::borrow::Cow<'_, str>> {
             }
             other => out.push(Cow::Owned(other.to_string())),
         }
-    }
-    if let ActionStatus::Failed { reason } = &result.status {
-        out.push(Cow::Borrowed(reason.as_str()));
     }
     out
 }
@@ -481,17 +517,33 @@ error[E0308]: mismatched types
         assert_eq!(v.tool_results_scanned, 1);
     }
 
-    /// Failed tool call: warnings emitted on stderr-turned-reason still
-    /// flow into the bucket so operators see them even on error paths.
+    /// #660 regression guard: `ActionStatus::Failed.reason` strings are
+    /// tool-invocation-layer bookkeeping (file not found, invalid args,
+    /// etc.) — NOT build diagnostics. They must not flow into the
+    /// `errors` bucket because the strict completion gate consults that
+    /// bucket to decide whether to reject `complete_run`. If these
+    /// benign tool-runtime failures poisoned the count, the gate would
+    /// fire on every exploration attempt (agent reads a file that
+    /// doesn't exist yet, etc.) which F35 explicitly routes as
+    /// `LoopSignal::Continue`. The test at
+    /// `crates/cairn-app/tests/test_f35_tool_errors_as_feedback.rs`
+    /// guards the end-to-end behavior; this unit test pins the
+    /// scanner's contract.
     #[test]
-    fn failed_tool_contributes_reason_text_to_scan() {
+    fn failed_tool_reason_does_not_leak_into_buckets() {
         let v = extract_verification(&[failed_bash(
-            "cargo build",
-            "warning: unused import: Foo\nerror: could not compile `cairn-app`",
+            "cat /nope",
+            "Error [NOT_FOUND]: File not found: /nope",
         )]);
-        assert_eq!(v.warnings.len(), 1);
-        assert_eq!(v.errors.len(), 1);
-        assert!(v.errors[0].contains("could not compile"));
+        assert!(
+            v.errors.is_empty(),
+            "Failed.reason must not feed the errors bucket; got {:?}",
+            v.errors
+        );
+        assert!(v.warnings.is_empty());
+        // But the tool_results_scanned counter still advances — the
+        // scanner saw the frame, it just had nothing to bucket.
+        assert_eq!(v.tool_results_scanned, 1);
     }
 
     /// Rust's bracketed diagnostic form `error[E0308]: …` must match the

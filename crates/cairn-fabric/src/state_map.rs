@@ -63,6 +63,12 @@ pub fn failure_class_category(failure_class: FailureClass) -> &'static str {
         FailureClass::LeaseExpired => "lease",
         FailureClass::CanceledByOperator => "operator",
         FailureClass::TerminalWriteDeadlock => "deadlock",
+        // #660: strict completion gate refused `complete_run` while
+        // `completion_verification.errors` was non-empty, three times in a
+        // row. Treated as a policy-class failure on the FF side — the run
+        // was forcibly stopped by a cairn-level quality gate, not by a
+        // runtime error or operator.
+        FailureClass::VerificationRejected => "policy",
     }
 }
 
@@ -82,6 +88,7 @@ pub fn failure_class_reason(failure_class: FailureClass) -> &'static str {
         FailureClass::LeaseExpired => "lease_expired",
         FailureClass::CanceledByOperator => "canceled_by_operator",
         FailureClass::TerminalWriteDeadlock => "terminal_write_deadlock",
+        FailureClass::VerificationRejected => "verification_rejected",
     }
 }
 

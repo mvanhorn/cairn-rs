@@ -71,6 +71,16 @@ pub enum FailureClass {
     /// the deadlock as a terminal state (rather than a zombie `running`
     /// row) and can correlate against the upstream issue.
     TerminalWriteDeadlock,
+    /// #660: the orchestrator's strict completion gate refused the LLM's
+    /// `complete_run` action because the F47 `completion_verification`
+    /// sidecar reported one or more errors (typically a failing
+    /// `cargo build` / `cargo check`). The loop re-enters DECIDE so the
+    /// model can fix the diagnostics; after three consecutive rejections
+    /// the run terminates with this class so operators can distinguish
+    /// "model could not converge past a failing build" from a generic
+    /// `ExecutionError`. Flag: `orchestrator_strict_completion_gate`
+    /// (default `true`). See RFC-F47 + issue #660.
+    VerificationRejected,
 }
 
 /// Canonical pause reasons in v1.

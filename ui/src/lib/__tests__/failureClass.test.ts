@@ -40,6 +40,7 @@ export const FAILURE_CLASS_VALUES = [
   "lease_expired",
   "canceled_by_operator",
   "terminal_write_deadlock",
+  "verification_rejected",
 ] as const satisfies readonly FailureClass[];
 
 // ── Compile-time coverage ────────────────────────────────────────────────────

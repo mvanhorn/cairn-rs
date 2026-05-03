@@ -28,7 +28,10 @@ use crate::handlers::runs::helpers::{classify_failed_reason, finalize_run_failur
 use crate::helpers::{load_run_visible_to_tenant, working_dir_for_run};
 use crate::sandbox::workspace_error_response;
 use crate::state::AppState;
-use crate::{resolve_run_mode_default, resolve_run_string_default, resolve_run_u32_default};
+use crate::{
+    resolve_run_bool_default, resolve_run_mode_default, resolve_run_string_default,
+    resolve_run_u32_default,
+};
 
 /// Body for `POST /v1/runs/:id/orchestrate`.
 ///
@@ -715,6 +718,18 @@ async fn orchestrate_run_handler_inner(
         resolve_run_mode_default(state.as_ref(), &run.project, &run.run_id).await;
     let default_max_iterations =
         resolve_run_u32_default(state.as_ref(), &run.project, &run.run_id, "max_iterations").await;
+    // #660: strict completion gate flag. Absent key → None → default
+    // `true` flows in via `LoopConfig::default()` below. Operators who
+    // want the legacy "LLM calls it done no matter what" flow flip the
+    // key via `PUT /v1/settings/defaults/project/<proj>/run:<id>:orchestrator_strict_completion_gate`
+    // with body `{"value": false}`.
+    let default_strict_completion_gate = resolve_run_bool_default(
+        state.as_ref(),
+        &run.project,
+        &run.run_id,
+        "orchestrator_strict_completion_gate",
+    )
+    .await;
 
     // #651: capture presence flags BEFORE the `Option::or` chain moves the
     // fields out of `body`. An operator-supplied `goal` on the first
@@ -825,6 +840,39 @@ async fn orchestrate_run_handler_inner(
                 run_id = %run.run_id,
                 error = %err,
                 "#651: failed to persist run max_iterations default; auto-resume may fall back to LoopConfig default"
+            );
+        }
+    }
+
+    // #660: persist the strict completion gate flag once per run so every
+    // auto-resume kick reads a stable value instead of racing the
+    // (currently unset → default true) None path. Mirrors the shape used
+    // for `max_iterations` above — back-fill on first contact, leave
+    // alone after. A body-level override is NOT part of this PR: the
+    // per-run flip channel is the defaults-projection PUT documented in
+    // the LoopConfig rustdoc + the OpenAPI note on the orchestrate
+    // handler. Keeping the request body out of it limits the surface.
+    //
+    // Resolve the concrete value we want to persist here (before `cfg`
+    // is built below) so we do not have to cross-reference `cfg` from
+    // above it.
+    if default_strict_completion_gate.is_none() {
+        let backfill_value =
+            cairn_orchestrator::LoopConfig::default().orchestrator_strict_completion_gate;
+        if let Err(err) = crate::persist_run_bool_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "orchestrator_strict_completion_gate",
+            backfill_value,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = %run.run_id,
+                error = %err,
+                "#660: failed to persist run orchestrator_strict_completion_gate default; \
+                 auto-resume iterations will fall back to LoopConfig default"
             );
         }
     }
@@ -1341,6 +1389,15 @@ async fn orchestrate_run_handler_inner(
     }
     if let Some(t) = body.timeout_ms {
         cfg.timeout_ms = t;
+    }
+    // #660: route the per-run default into LoopConfig. Absent → inherit
+    // LoopConfig::default() (strict gate ON). Present → trust the
+    // persisted value. The first orchestrate POST for a run back-fills
+    // the default below so subsequent auto-resume kicks observe a
+    // stable value rather than falling through to the default on
+    // every iteration.
+    if let Some(gate) = default_strict_completion_gate {
+        cfg.orchestrator_strict_completion_gate = gate;
     }
 
     // F65 PR-3: resolve the default breaker caps via the RuntimeConfig

@@ -2127,3 +2127,406 @@ async fn run_suspension_does_not_evict_harness_tools_caches() {
          the run will resume and needs the read-before-edit state",
     );
 }
+
+// ── #660: strict completion gate ──────────────────────────────────────────
+//
+// Four unit tests cover the gate's full decision tree:
+//
+//   1. Gate ON + prior iteration populated the verification accumulator
+//      with errors + LLM proposes `complete_run` → rejected; loop
+//      continues. Execute must NOT have dispatched the CompleteRun.
+//   2. Gate ON + no errors → CompleteRun flows through to Completed.
+//   3. Gate ON + errors + three rejections in a row → loop terminates
+//      with `LoopTermination::Failed` whose reason prefix routes to
+//      `FailureClass::VerificationRejected` in the handler.
+//   4. Gate OFF + errors + CompleteRun → CompleteRun accepted,
+//      Completed termination. Proves the flag is load-bearing.
+//
+// The tests share a two-phase decide/execute fixture so the
+// verification accumulator sees a failing `cargo build` tool_output on
+// iteration 0, the LLM proposes `complete_run` on iteration 1+, and the
+// assertions land on whichever arm the gate resolves to.
+
+/// Scripted execute that on iteration 0 returns a bash-class
+/// `ActionResult` carrying the provided stdout (drives the verification
+/// accumulator), and on iteration 1+ mirrors the decide phase's
+/// CompleteRun proposal back with `LoopSignal::Done` so the loop ends
+/// Completed unless the gate intercepts. Tracks the total dispatch
+/// count so tests can prove CompleteRun was (or was not) actually
+/// executed.
+mod gate_fixtures {
+    use super::*;
+    use crate::context::ExecuteOutcome;
+
+    pub(super) struct TwoPhaseExecute {
+        pub iter0_stdout: String,
+        pub iter0_exit_code: i32,
+        /// Counts how many times `execute` was invoked.
+        pub dispatch_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Counts how many times a `CompleteRun` proposal actually
+        /// survived to the execute phase. If the gate stripped it the
+        /// counter stays at zero; if the gate let it through the
+        /// counter increments.
+        pub complete_run_dispatches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExecutePhase for TwoPhaseExecute {
+        async fn execute(
+            &self,
+            _ctx: &OrchestrationContext,
+            decide: &DecideOutput,
+        ) -> Result<ExecuteOutcome, OrchestratorError> {
+            let n = self
+                .dispatch_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let carries_complete_run = decide
+                .proposals
+                .iter()
+                .any(|p| p.action_type == ActionType::CompleteRun);
+            if carries_complete_run {
+                self.complete_run_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            let results: Vec<ActionResult> = decide
+                .proposals
+                .iter()
+                .map(|p| {
+                    // Iteration 0: synthesise a bash-class tool_output
+                    // carrying the configured cargo stdout so the F47
+                    // accumulator populates its error bucket.
+                    let tool_output = if n == 0
+                        && p.action_type == ActionType::InvokeTool
+                        && p.tool_name.as_deref() == Some("bash")
+                    {
+                        let mut map = serde_json::Map::new();
+                        map.insert(
+                            "stdout".into(),
+                            serde_json::Value::String(self.iter0_stdout.clone()),
+                        );
+                        map.insert(
+                            "exit_code".into(),
+                            serde_json::Value::from(self.iter0_exit_code),
+                        );
+                        Some(serde_json::Value::Object(map))
+                    } else {
+                        None
+                    };
+                    ActionResult {
+                        proposal: p.clone(),
+                        status: ActionStatus::Succeeded,
+                        tool_output,
+                        invocation_id: None,
+                        duration_ms: 0,
+                    }
+                })
+                .collect();
+
+            // Iteration 0: any tool invocation is non-terminal.
+            // Iteration 1+: if the decide output still has a
+            // CompleteRun we end with Done; otherwise Continue
+            // so the loop proceeds (the gate stripped the terminal).
+            let loop_signal = if n == 0 {
+                LoopSignal::Continue
+            } else if carries_complete_run {
+                LoopSignal::Done
+            } else {
+                LoopSignal::Continue
+            };
+
+            Ok(ExecuteOutcome {
+                results,
+                loop_signal,
+            })
+        }
+    }
+
+    /// DECIDE stub that returns a bash tool call on iteration 0 and a
+    /// `CompleteRun` proposal on every subsequent iteration. Mirrors
+    /// the dogfood R4 failure mode (LLM proposes complete_run while the
+    /// previous bash tool_result shows borrow-checker errors).
+    pub(super) struct BashThenCompleteDecide {
+        pub calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DecidePhase for BashThenCompleteDecide {
+        async fn decide(
+            &self,
+            _ctx: &OrchestrationContext,
+            _gather: &GatherOutput,
+        ) -> Result<DecideOutput, OrchestratorError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                return Ok(DecideOutput {
+                    raw_response: r#"[{"action_type":"invoke_tool","tool_name":"bash"}]"#
+                        .to_owned(),
+                    proposals: vec![ActionProposal {
+                        action_type: ActionType::InvokeTool,
+                        description: "run cargo build".to_owned(),
+                        confidence: 0.9,
+                        tool_name: Some("bash".to_owned()),
+                        tool_args: Some(serde_json::json!({ "command": "cargo build" })),
+                        requires_approval: false,
+                    }],
+                    calibrated_confidence: 0.9,
+                    requires_approval: false,
+                    model_id: "test-model".to_owned(),
+                    latency_ms: 20,
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+            }
+            Ok(DecideOutput {
+                raw_response: r#"[{"action_type":"complete_run"}]"#.to_owned(),
+                proposals: vec![ActionProposal {
+                    action_type: ActionType::CompleteRun,
+                    description: "all done".to_owned(),
+                    confidence: 0.95,
+                    tool_name: None,
+                    tool_args: None,
+                    requires_approval: false,
+                }],
+                calibrated_confidence: 0.95,
+                requires_approval: false,
+                model_id: "test-model".to_owned(),
+                latency_ms: 10,
+                input_tokens: None,
+                output_tokens: None,
+            })
+        }
+    }
+
+    /// Cargo-like stdout carrying two `error:` lines that the F47
+    /// accumulator's regex will bucket. Reused across tests.
+    pub(super) const CARGO_ERROR_STDOUT: &str = "\
+error[E0382]: borrow of moved value: `x`\n   --> src/lib.rs:3:5\n\
+error[E0502]: cannot borrow `y` as mutable because it is also borrowed as immutable\n   --> src/lib.rs:10:5\n\
+warning: unused import: `std::io::Write`\n   --> src/lib.rs:1:5\n\
+error: could not compile `demo` due to 2 previous errors\n";
+}
+
+/// #660 (1): gate ON + errors + CompleteRun → gate rejects; loop
+/// continues rather than completing; execute never sees the
+/// CompleteRun proposal.
+#[tokio::test]
+async fn completion_gate_rejects_complete_run_when_verification_has_errors() {
+    use gate_fixtures::{BashThenCompleteDecide, TwoPhaseExecute, CARGO_ERROR_STDOUT};
+
+    let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let complete_run_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Cap iterations at 4 so we can observe at least one rejection + one
+    // re-decide turn (iter 0 bash, iter 1 rejected complete_run, iter 2
+    // re-proposed complete_run…). We don't want the cap to collide with
+    // the gate's own 3-rejection cap here — that's the next test.
+    let config = LoopConfig {
+        max_iterations: 4,
+        breakers: permissive_breakers(),
+        // Strict gate ON (default, but pin it explicitly to document intent).
+        orchestrator_strict_completion_gate: true,
+        ..Default::default()
+    };
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        BashThenCompleteDecide {
+            calls: decide_calls.clone(),
+        },
+        TwoPhaseExecute {
+            iter0_stdout: CARGO_ERROR_STDOUT.to_owned(),
+            iter0_exit_code: 101,
+            dispatch_count: dispatch_count.clone(),
+            complete_run_dispatches: complete_run_dispatches.clone(),
+        },
+        config,
+    );
+
+    let result = lp.run(ctx()).await.unwrap();
+
+    // With max_iterations=4 and each rejection bumping the counter,
+    // the loop terminates either via MaxIterationsReached (if the gate
+    // lets every re-decide fire) or Failed(VerificationRejected) once
+    // the 3-reject cap hits. Both are valid "did NOT complete" shapes
+    // for this test — the load-bearing invariant is that
+    // `LoopTermination::Completed` is NOT observed.
+    assert!(
+        !matches!(result, LoopTermination::Completed { .. }),
+        "gate must block `complete_run` when verification errors are \
+         present; got {result:?}"
+    );
+
+    // The decide phase must have been re-invoked after the first
+    // CompleteRun proposal, proving the loop re-entered DECIDE instead
+    // of terminating.
+    assert!(
+        decide_calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "DECIDE must re-run after a rejection (iter 0 bash + iter 1+ \
+         complete_run attempts); got {} decide calls",
+        decide_calls.load(std::sync::atomic::Ordering::SeqCst),
+    );
+
+    // Execute must never have dispatched a CompleteRun — the gate
+    // strips the proposal in place before the execute phase runs.
+    assert_eq!(
+        complete_run_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "CompleteRun must never reach execute while the gate is rejecting",
+    );
+}
+
+/// #660 (2): gate ON + clean verification → CompleteRun passes through
+/// as the pre-fix behaviour. Pins that the gate doesn't accidentally
+/// reject happy-path runs.
+#[tokio::test]
+async fn completion_gate_allows_complete_run_when_verification_clean() {
+    use gate_fixtures::{BashThenCompleteDecide, TwoPhaseExecute};
+
+    let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let complete_run_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let config = LoopConfig {
+        max_iterations: 5,
+        breakers: permissive_breakers(),
+        orchestrator_strict_completion_gate: true,
+        ..Default::default()
+    };
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        BashThenCompleteDecide {
+            calls: decide_calls.clone(),
+        },
+        TwoPhaseExecute {
+            // Clean stdout — no `error:` lines for the accumulator to bucket.
+            iter0_stdout: "    Finished dev [unoptimized + debuginfo] target(s) in 3.2s\n"
+                .to_owned(),
+            iter0_exit_code: 0,
+            dispatch_count: dispatch_count.clone(),
+            complete_run_dispatches: complete_run_dispatches.clone(),
+        },
+        config,
+    );
+
+    let result = lp.run(ctx()).await.unwrap();
+
+    assert!(
+        matches!(result, LoopTermination::Completed { .. }),
+        "clean verification + complete_run must terminate as Completed; got {result:?}"
+    );
+    assert_eq!(
+        complete_run_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "CompleteRun must have reached execute exactly once on the happy path",
+    );
+}
+
+/// #660 (3): gate ON + errors + three CompleteRun attempts →
+/// `LoopTermination::Failed` with the contract reason prefix. Proves
+/// the rejection cap prevents budget burn and that the failure reason
+/// carries the `verification_rejected:` prefix the handler's
+/// `classify_failed_reason` keys on.
+#[tokio::test]
+async fn completion_gate_force_fails_after_three_rejections() {
+    use gate_fixtures::{BashThenCompleteDecide, TwoPhaseExecute, CARGO_ERROR_STDOUT};
+
+    let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let complete_run_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Max iterations comfortably above the 3-reject cap so the cap is
+    // what fires the failure, not the iteration budget.
+    let config = LoopConfig {
+        max_iterations: 20,
+        breakers: permissive_breakers(),
+        orchestrator_strict_completion_gate: true,
+        ..Default::default()
+    };
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        BashThenCompleteDecide {
+            calls: decide_calls.clone(),
+        },
+        TwoPhaseExecute {
+            iter0_stdout: CARGO_ERROR_STDOUT.to_owned(),
+            iter0_exit_code: 101,
+            dispatch_count: dispatch_count.clone(),
+            complete_run_dispatches: complete_run_dispatches.clone(),
+        },
+        config,
+    );
+    let result = lp.run(ctx()).await.unwrap();
+
+    match result {
+        LoopTermination::Failed { reason } => {
+            assert!(
+                reason.starts_with("verification_rejected:"),
+                "#660: Failed reason MUST start with `verification_rejected:` — \
+                 this prefix is the wire contract with \
+                 `classify_failed_reason` in the HTTP handler. Got: {reason}"
+            );
+            // Evidence of the triggering errors must travel back to the
+            // operator so the run's failure is actionable without
+            // digging through the event log.
+            assert!(
+                reason.contains("error"),
+                "reason should include at least one error excerpt; got: {reason}"
+            );
+        }
+        other => panic!("expected LoopTermination::Failed(verification_rejected), got {other:?}"),
+    }
+
+    // And CompleteRun never reached execute — the gate blocked all
+    // three attempts before dispatch.
+    assert_eq!(
+        complete_run_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "CompleteRun must never reach execute across all three rejections",
+    );
+}
+
+/// #660 (4): gate OFF + errors + CompleteRun → run completes normally
+/// (legacy behaviour). Proves the flag is load-bearing; operators who
+/// opt out of the gate see the pre-fix flow.
+#[tokio::test]
+async fn completion_gate_disabled_via_settings_flag() {
+    use gate_fixtures::{BashThenCompleteDecide, TwoPhaseExecute, CARGO_ERROR_STDOUT};
+
+    let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let complete_run_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let config = LoopConfig {
+        max_iterations: 5,
+        breakers: permissive_breakers(),
+        // Gate OFF: the pre-#660 behaviour.
+        orchestrator_strict_completion_gate: false,
+        ..Default::default()
+    };
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        BashThenCompleteDecide {
+            calls: decide_calls.clone(),
+        },
+        TwoPhaseExecute {
+            iter0_stdout: CARGO_ERROR_STDOUT.to_owned(),
+            iter0_exit_code: 101,
+            dispatch_count: dispatch_count.clone(),
+            complete_run_dispatches: complete_run_dispatches.clone(),
+        },
+        config,
+    );
+
+    let result = lp.run(ctx()).await.unwrap();
+
+    assert!(
+        matches!(result, LoopTermination::Completed { .. }),
+        "gate disabled → CompleteRun accepted despite errors; got {result:?}"
+    );
+    assert_eq!(
+        complete_run_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "gate disabled → CompleteRun must flow through to execute exactly once",
+    );
+}

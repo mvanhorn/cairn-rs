@@ -381,6 +381,31 @@ pub struct LoopConfig {
     pub compaction: CompactionConfig,
     /// F65 PR-3: circuit-breaker caps enforced by `OrchestratorLoop`.
     pub breakers: BreakerConfig,
+    /// Issue #660: platform-level gate on `complete_run`.
+    ///
+    /// When `true` (default), the loop consults the incremental F47
+    /// `VerificationAccumulator` before dispatching any
+    /// `CompleteRun` proposal. If the accumulator reports at least one
+    /// error line (cargo/rustc/clippy `error:` or `error[EXXXX]:`),
+    /// the `CompleteRun` is refused — the loop synthesises a rejection
+    /// `StepSummary` carrying the first few error excerpts, re-enters
+    /// DECIDE, and gives the model another turn to fix the build.
+    /// After three consecutive rejections the loop terminates with
+    /// `LoopTermination::Failed { reason = "verification_rejected: …" }`
+    /// so the run moves to the terminal [`FailureClass::VerificationRejected`]
+    /// state (see `cairn_domain::lifecycle::FailureClass`).
+    ///
+    /// When `false`, the loop keeps the pre-#660 behaviour: the LLM's
+    /// `CompleteRun` flows through to execute regardless of the
+    /// verification sidecar. Intended for runs that want to surface a
+    /// partial/best-effort summary without blocking on a red build.
+    ///
+    /// Operators override via the per-run defaults projection under
+    /// `run:<id>:orchestrator_strict_completion_gate` (stored as the
+    /// string `"true"` / `"false"`). The HTTP orchestrate handler
+    /// resolves the key with the same 3-layer helper used for
+    /// `max_iterations` + `goal`.
+    pub orchestrator_strict_completion_gate: bool,
 }
 
 impl Default for LoopConfig {
@@ -391,9 +416,27 @@ impl Default for LoopConfig {
             checkpoint_every_n_tool_calls: 1,
             compaction: CompactionConfig::default(),
             breakers: BreakerConfig::default(),
+            // #660: belt-and-suspenders with the role-prompt completion gate.
+            // Default on; flip to false per run to accept partial completions.
+            orchestrator_strict_completion_gate: true,
         }
     }
 }
+
+/// Issue #660: hard cap on consecutive `complete_run` rejections before
+/// the loop gives up and terminates with [`FailureClass::VerificationRejected`].
+///
+/// Chosen as 3 so the model gets at least one "fix" turn after its first
+/// reject + re-attempt (three rejects = three passes where the build still
+/// failed). Lower values would terminate legit self-correcting runs; higher
+/// values would let a broken model burn the full `max_iterations` budget
+/// on rejection ping-pong.
+pub const MAX_COMPLETION_GATE_REJECTIONS: u32 = 3;
+
+/// Issue #660: how many error lines the rejection `StepSummary` should
+/// carry back to DECIDE. The model only needs a few concrete lines to
+/// re-plan; more than three is context pollution.
+pub const COMPLETION_GATE_ERROR_PREVIEW: usize = 3;
 
 // ── BreakerConfig ────────────────────────────────────────────────────────────
 
