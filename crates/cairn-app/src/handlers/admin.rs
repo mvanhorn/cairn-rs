@@ -578,7 +578,7 @@ pub(crate) async fn get_tenant_quota_handler(
 
 pub(crate) async fn set_tenant_quota_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<SetTenantQuotaRequest>,
 ) -> impl IntoResponse {
@@ -621,7 +621,7 @@ pub(crate) async fn get_retention_policy_handler(
 
 pub(crate) async fn set_retention_policy_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<SetRetentionPolicyRequest>,
 ) -> impl IntoResponse {
@@ -643,7 +643,7 @@ pub(crate) async fn set_retention_policy_handler(
 
 pub(crate) async fn apply_retention_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
 ) -> impl IntoResponse {
     match state
@@ -828,7 +828,7 @@ pub(crate) async fn list_request_logs_handler(
 
 pub(crate) async fn compact_event_log_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(id): Path<String>,
     Json(body): Json<CompactEventLogRequest>,
 ) -> impl IntoResponse {
@@ -842,7 +842,7 @@ pub(crate) async fn compact_event_log_handler(
 
 pub(crate) async fn create_snapshot_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(id): Path<String>,
 ) -> axum::response::Response {
     let tenant_id = TenantId::new(id);
@@ -920,7 +920,7 @@ pub(crate) async fn list_snapshots_handler(
 
 pub(crate) async fn restore_from_snapshot_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     use cairn_store::projections::SnapshotReadModel;
@@ -963,7 +963,7 @@ pub(crate) async fn restore_from_snapshot_handler(
 )]
 pub(crate) async fn create_workspace_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateWorkspaceRequest>,
 ) -> impl IntoResponse {
@@ -1046,7 +1046,7 @@ pub(crate) async fn list_workspaces_handler(
 )]
 pub(crate) async fn delete_workspace_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path((tenant_id, workspace_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     match state
@@ -1299,7 +1299,7 @@ const MAX_PLAINTEXT_VALUE_LEN: usize = 4096;
 
 pub(crate) async fn store_credential_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<StoreCredentialRequest>,
 ) -> impl IntoResponse {
@@ -1395,7 +1395,7 @@ pub(crate) async fn list_credentials_handler(
 
 pub(crate) async fn revoke_credential_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     tenant_scope: TenantScope,
     Path((tenant_id, id)): Path<(String, String)>,
 ) -> impl IntoResponse {
@@ -1447,7 +1447,7 @@ pub(crate) async fn revoke_credential_handler(
 
 pub(crate) async fn rotate_credential_key_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<RotateCredentialKeyRequest>,
 ) -> impl IntoResponse {
@@ -1466,7 +1466,7 @@ pub(crate) async fn rotate_credential_key_handler(
 
 pub(crate) async fn create_operator_profile_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateOperatorProfileRequest>,
 ) -> impl IntoResponse {
@@ -1491,8 +1491,10 @@ pub(crate) async fn list_operator_profiles_handler(
     // Closes #404 negative-path: the /v1/admin/* prefix signals
     // admin-only. Operator profiles are roster-sensitive (operator
     // ids, display names, permissions) — non-admins, including
-    // same-tenant operators, must not list.
-    _role: AdminRoleGuard,
+    // same-tenant operators, must not list. RFC-026 flip: still
+    // admin-only, but a tenant-admin on THIS tenant now clears the
+    // guard (god-token no longer required to list their own roster).
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {

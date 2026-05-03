@@ -22,7 +22,9 @@ use crate::errors::{
     parse_session_state, runtime_error_response, store_error_response, validation_error_response,
     AppApiError,
 };
-use crate::extractors::{AdminRoleGuard, HasProjectScope, ProjectJson, ProjectScope, TenantScope};
+use crate::extractors::{
+    AdminRoleGuard, HasProjectScope, ProjectJson, ProjectScope, TenantAdminGuard, TenantScope,
+};
 use crate::state::AppState;
 use crate::{
     event_message, event_type_name, runtime_event_to_activity_entry, ActivityEntry, EventSummary,
@@ -744,7 +746,7 @@ pub(crate) async fn delete_session_snapshots_handler(
 /// check; cross-tenant DELETE is still refused by id).
 pub(crate) async fn delete_session_admin_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path((tenant_id, session_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     // Apply the same shape rules as `create_session_handler` — a URL
