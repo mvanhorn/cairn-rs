@@ -1668,8 +1668,9 @@ mod tests {
         // Legacy text-mode (no native tool calling): mentions invoke_tool envelope.
         let sys = build_system_prompt("orchestrator", &[], false);
         assert!(
-            sys.contains("technical lead"),
-            "should use orchestrator role identity"
+            sys.contains("senior engineer"),
+            "should use orchestrator role identity (senior engineer) — \
+             prompt text is owned by cairn-domain::agent_roles"
         );
         assert!(
             sys.contains("JSON array"),
