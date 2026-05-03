@@ -88,6 +88,53 @@ pub(crate) struct DiagnosisReport {
 // Run helpers
 // ---------------------------------------------------------------------------
 
+/// Pure decision: given the GitHub allowlist and local_fs allowlist for a
+/// project, pick the source for a run's working directory.
+///
+/// Matches the write side's two-bucket model: `POST /v1/projects/:p/repos`
+/// with `host=github` lands in `ProjectRepoAccessService`, and `host=local_fs`
+/// lands in `ProjectLocalPaths`. The resolver checks BOTH buckets — anything
+/// less is dogfood issue #637, where a successful local_fs attach looked like
+/// a no-op because `working_dir_for_run` only read the github bucket and
+/// routed every run to `/tmp/cairn-runs/...`.
+///
+/// Precedence when both buckets are populated: github wins (it's the
+/// primary-path primitive with sandbox semantics; local_fs is the escape
+/// hatch for operator-owned working directories). We still emit a `warn!` at
+/// the call site if both are populated so the operator sees they've
+/// overconfigured a project.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WorkingDirSource {
+    /// GitHub repo — resolver will clone + sandbox.
+    RepoSandbox { repo_id: cairn_workspace::RepoId },
+    /// Operator-attached local filesystem path — used directly as cwd.
+    LocalPath { path: PathBuf },
+    /// Neither bucket populated — resolver will mint an ephemeral
+    /// `/tmp/cairn-runs/<run_id>` directory.
+    Ephemeral,
+}
+
+pub(crate) fn select_working_dir_source(
+    mut repo_ids: Vec<cairn_workspace::RepoId>,
+    mut local_paths: Vec<String>,
+) -> WorkingDirSource {
+    // `list_for_project` and `ProjectLocalPaths::list` already return
+    // sorted data; re-sort defensively so this pure helper doesn't depend
+    // on callers preserving ordering.
+    repo_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    local_paths.sort();
+
+    if let Some(repo_id) = repo_ids.into_iter().next() {
+        return WorkingDirSource::RepoSandbox { repo_id };
+    }
+    if let Some(path) = local_paths.into_iter().next() {
+        return WorkingDirSource::LocalPath {
+            path: PathBuf::from(path),
+        };
+    }
+    WorkingDirSource::Ephemeral
+}
+
 pub(crate) async fn working_dir_for_run(
     state: &AppState,
     run: &RunRecord,
@@ -96,59 +143,126 @@ pub(crate) async fn working_dir_for_run(
         project: run.project.clone(),
     };
     let repo_ids = state.project_repo_access.list_for_project(&repo_ctx).await;
-    let Some(repo_id) = repo_ids.first().cloned() else {
-        // No repo allowlisted — create an isolated ephemeral directory for
-        // this run.  This is expected for API-driven orchestration where the
-        // agent works on external systems (APIs, infra) and doesn't need a
-        // repo checkout.  We NEVER fall back to the server process CWD
-        // because that would expose cairn's own filesystem to agent tools.
-        let ephemeral = std::env::temp_dir()
-            .join("cairn-runs")
-            .join(run.run_id.as_str());
-        if let Err(e) = std::fs::create_dir_all(&ephemeral) {
-            tracing::warn!(
-                run_id = %run.run_id,
-                path = %ephemeral.display(),
-                error = %e,
-                "failed to create ephemeral run directory; falling back to temp root"
-            );
-            return Ok(std::env::temp_dir().join("cairn-runs"));
-        }
-        tracing::debug!(
-            run_id = %run.run_id,
-            path = %ephemeral.display(),
-            "no repo allowlisted for project; using ephemeral run directory"
-        );
-        return Ok(ephemeral);
-    };
+    let local_paths = state.project_local_paths.list(&run.project);
 
-    if repo_ids.len() > 1 {
+    let repo_count = repo_ids.len();
+    let local_count = local_paths.len();
+    let source = select_working_dir_source(repo_ids, local_paths);
+
+    if repo_count > 0 && local_count > 0 {
+        // The two buckets aren't additive — the resolver picks one source.
+        // Surface both counts so an operator who has attached both a github
+        // repo and a local_fs path can see why their local_fs attach
+        // "didn't take effect".
         tracing::warn!(
             run_id = %run.run_id,
             project = ?run.project,
-            selected_repo = %repo_id,
-            repo_count = repo_ids.len(),
-            "multiple repos allowlisted for run; provisioning sandbox from the first sorted repo"
+            repo_count,
+            local_path_count = local_count,
+            "project has both github repos and local_fs paths allowlisted; github repo takes precedence"
         );
     }
 
-    state
-        .repo_clone_cache
-        .ensure_cloned(&run.project.tenant_id, &repo_id)
-        .await?;
+    match source {
+        WorkingDirSource::RepoSandbox { repo_id } => {
+            if repo_count > 1 {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    project = ?run.project,
+                    selected_repo = %repo_id,
+                    repo_count,
+                    "multiple repos allowlisted for run; provisioning sandbox from the first sorted repo"
+                );
+            }
 
-    state
-        .sandbox_service
-        .provision_or_reconnect(
-            &run.run_id,
-            None,
-            run.project.clone(),
-            default_repo_sandbox_policy(repo_id),
-        )
-        .await?;
+            state
+                .repo_clone_cache
+                .ensure_cloned(&run.project.tenant_id, &repo_id)
+                .await?;
 
-    let sandbox = state.sandbox_service.activate(&run.run_id, None).await?;
-    Ok(sandbox.path)
+            state
+                .sandbox_service
+                .provision_or_reconnect(
+                    &run.run_id,
+                    None,
+                    run.project.clone(),
+                    default_repo_sandbox_policy(repo_id),
+                )
+                .await?;
+
+            let sandbox = state.sandbox_service.activate(&run.run_id, None).await?;
+            Ok(sandbox.path)
+        }
+        WorkingDirSource::LocalPath { path } => {
+            // Operator-attached local directory. The path was validated as
+            // absolute + existing + a directory at attach time; verify it
+            // hasn't been deleted out-of-band before handing it to the
+            // orchestrator. On drift, surface it and degrade to ephemeral
+            // so a stale local_fs entry can't silently route every run to
+            // a missing path. Use `tokio::fs::metadata` so the stat call
+            // doesn't block the tokio worker thread under high orchestrate
+            // concurrency — per Gemini review on #648.
+            let is_dir = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    project = ?run.project,
+                    path = %path.display(),
+                    "local_fs path allowlisted for project is no longer a directory on disk; falling back to ephemeral run directory"
+                );
+                return Ok(ephemeral_run_dir(&run.run_id));
+            }
+            if local_count > 1 {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    project = ?run.project,
+                    selected_path = %path.display(),
+                    local_path_count = local_count,
+                    "multiple local_fs paths allowlisted for run; using the first sorted path"
+                );
+            }
+            tracing::info!(
+                run_id = %run.run_id,
+                project = ?run.project,
+                path = %path.display(),
+                "using local_fs working directory from project allowlist"
+            );
+            Ok(path)
+        }
+        WorkingDirSource::Ephemeral => {
+            // Neither bucket populated — create an isolated ephemeral
+            // directory for this run. This is expected for API-driven
+            // orchestration where the agent works on external systems
+            // (APIs, infra) and doesn't need a repo checkout. We NEVER
+            // fall back to the server process CWD because that would
+            // expose cairn's own filesystem to agent tools.
+            Ok(ephemeral_run_dir(&run.run_id))
+        }
+    }
+}
+
+fn ephemeral_run_dir(run_id: &RunId) -> PathBuf {
+    let ephemeral = std::env::temp_dir()
+        .join("cairn-runs")
+        .join(run_id.as_str());
+    if let Err(e) = std::fs::create_dir_all(&ephemeral) {
+        tracing::warn!(
+            run_id = %run_id,
+            path = %ephemeral.display(),
+            error = %e,
+            "failed to create ephemeral run directory; falling back to temp root"
+        );
+        return std::env::temp_dir().join("cairn-runs");
+    }
+    tracing::debug!(
+        run_id = %run_id,
+        path = %ephemeral.display(),
+        "no repo allowlisted for project; using ephemeral run directory"
+    );
+    ephemeral
 }
 
 pub(crate) fn run_default_key(run_id: &RunId, suffix: &str) -> String {
@@ -1932,6 +2046,69 @@ mod tests {
             workspace_id: cairn_domain::WorkspaceId::new("w"),
             project_id: cairn_domain::ProjectId::new("p"),
         }
+    }
+
+    /// Dogfood issue #637 regression: after an operator attaches a
+    /// local_fs path via `POST /v1/projects/:p/repos` with
+    /// `host=local_fs`, the resolver must hand the run a `LocalPath`
+    /// working-directory source — not fall through to `Ephemeral`.
+    /// Before the fix the allowlist was split into two buckets
+    /// (`ProjectRepoAccessService` for github, `ProjectLocalPaths` for
+    /// local_fs) and the resolver only read the first, so every
+    /// orchestrate call logged "no repo allowlisted" and wrote to
+    /// `/tmp/cairn-runs/...` regardless of what the operator had
+    /// attached.
+    #[test]
+    fn select_working_dir_source_prefers_github_then_local_then_ephemeral() {
+        use cairn_workspace::RepoId;
+
+        // Neither bucket populated → ephemeral.
+        assert_eq!(
+            select_working_dir_source(vec![], vec![]),
+            WorkingDirSource::Ephemeral
+        );
+
+        // local_fs only → LocalPath (dogfood #637 fix).
+        let path = "/home/ubuntu/cairn-dogfood-roguelike-v3".to_owned();
+        assert_eq!(
+            select_working_dir_source(vec![], vec![path.clone()]),
+            WorkingDirSource::LocalPath {
+                path: PathBuf::from(&path),
+            }
+        );
+
+        // github only → RepoSandbox.
+        let repo_id = RepoId::parse("owner/repo".to_owned()).unwrap();
+        assert_eq!(
+            select_working_dir_source(vec![repo_id.clone()], vec![]),
+            WorkingDirSource::RepoSandbox {
+                repo_id: repo_id.clone()
+            }
+        );
+
+        // Both populated → github wins (primary-path primitive with
+        // sandbox semantics). The call site emits a warn! so the
+        // operator sees the conflict; the resolver itself picks one.
+        assert_eq!(
+            select_working_dir_source(vec![repo_id.clone()], vec![path.clone()]),
+            WorkingDirSource::RepoSandbox { repo_id }
+        );
+    }
+
+    /// Multiple local_fs paths sort lexicographically; the first one
+    /// wins. Matches `ProjectLocalPaths::list`'s sort + the github path
+    /// tiebreaker ("first sorted repo"), so an operator who attaches
+    /// `/a` and `/b` gets the same deterministic ordering either way.
+    #[test]
+    fn select_working_dir_source_local_paths_sort_stably() {
+        let result =
+            select_working_dir_source(vec![], vec!["/b/later".to_owned(), "/a/first".to_owned()]);
+        assert_eq!(
+            result,
+            WorkingDirSource::LocalPath {
+                path: PathBuf::from("/a/first"),
+            }
+        );
     }
 
     #[test]

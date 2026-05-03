@@ -296,6 +296,229 @@ async fn project_repo_attach_returns_501_for_known_unimplemented_hosts() {
     }
 }
 
+/// Dogfood issue #637 regression: after an operator attaches a local_fs
+/// path via `POST /v1/projects/:p/repos`, `POST /v1/runs/:id/orchestrate`
+/// must use that path as the run's working directory — not silently fall
+/// back to `/tmp/cairn-runs/<run_id>/` with a debug log
+/// "no repo allowlisted for project".
+///
+/// Before the fix, the two paths disagreed: the write lands in the
+/// in-memory `ProjectLocalPaths` bucket while the orchestrator's
+/// resolver only consulted `ProjectRepoAccessService` (the github
+/// allowlist). The resolver now checks both buckets in order
+/// (github → local_fs → ephemeral).
+///
+/// Observable: the resolver emits
+/// `"using local_fs working directory from project allowlist"` at
+/// `info` when the local_fs branch is taken. The test points
+/// `CAIRN_LOG_DIR` at a per-test tempdir so the subprocess writes its
+/// daily-rotating `cairn.*.log` there; after calling orchestrate we
+/// grep that file for the positive log line AND assert the
+/// "no repo allowlisted" fallback line is absent for this run_id.
+///
+/// The orchestrate call is expected to return 503 `no_brain_provider`
+/// because the test doesn't configure an LLM connection — that's fine,
+/// `working_dir_for_run` runs BEFORE the provider lookup so the
+/// resolver still fires and logs.
+#[tokio::test]
+async fn orchestrate_uses_local_fs_path_from_project_allowlist() {
+    // Per-test log dir — isolates stderr capture from sibling tests
+    // sharing the Valkey container. `tempfile::TempDir` auto-cleans
+    // at drop; we Clone the path into the harness env because the
+    // subprocess outlives the `tmp_log` binding otherwise.
+    let tmp_log = tempfile::tempdir().expect("log tempdir");
+    let log_dir_path = tmp_log.path().to_string_lossy().into_owned();
+
+    let h = LiveHarness::setup_with_env(&[
+        // `extra_env` is applied AFTER the harness's own `env(...)`
+        // calls, so this overrides the default `env_remove` on the
+        // subprocess side. The file appender rotates daily, so the
+        // subprocess writes `cairn.log.YYYY-MM-DD` under this dir.
+        ("CAIRN_LOG_DIR", log_dir_path.as_str()),
+        // Explicit override for the subprocess's RUST_LOG so this
+        // test doesn't silently regress if someone tightens the
+        // harness default. The resolver emits the "using local_fs"
+        // line at INFO on the cairn_app target and the ephemeral
+        // fallback line at DEBUG — both live under `cairn_app`, so
+        // `cairn_app=debug` is required to make the negative
+        // "ephemeral fallback did NOT fire" assertion meaningful.
+        ("RUST_LOG", "warn,cairn_app=debug"),
+    ])
+    .await;
+    let p = project_path(&h);
+    let base = &h.base_url;
+
+    // Real directory the operator "attached" — tempfile keeps it
+    // alive for the whole test, so the resolver's existence check
+    // passes.
+    let tmp_repo = tempfile::tempdir().expect("repo tempdir");
+    let repo_path = tmp_repo.path().to_string_lossy().into_owned();
+
+    // 1. Attach local_fs path via the same endpoint the dogfood
+    //    operator used.
+    let res = h
+        .client()
+        .post(format!("{base}/v1/projects/{p}/repos"))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "repo_id": repo_path,
+            "host": "local_fs",
+        }))
+        .send()
+        .await
+        .expect("attach reaches server");
+    assert_eq!(
+        res.status().as_u16(),
+        200,
+        "attach status, body: {}",
+        res.text().await.unwrap_or_default(),
+    );
+
+    // 2. Session + run scoped to this harness's unique triple —
+    //    keeps the run_id disjoint from parallel tests that might
+    //    reuse `default_project`.
+    let suffix = &h.project;
+    let session_id = format!("sess_637_{suffix}");
+    let run_id = format!("run_637_{suffix}");
+    let tenant = &h.tenant;
+    let workspace = &h.workspace;
+    let project = &h.project;
+
+    let r = h
+        .client()
+        .post(format!("{base}/v1/sessions"))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": tenant,
+            "workspace_id": workspace,
+            "project_id": project,
+            "session_id": session_id,
+        }))
+        .send()
+        .await
+        .expect("session reaches server");
+    assert_eq!(
+        r.status().as_u16(),
+        201,
+        "session: {}",
+        r.text().await.unwrap_or_default(),
+    );
+
+    let r = h
+        .client()
+        .post(format!("{base}/v1/runs"))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": tenant,
+            "workspace_id": workspace,
+            "project_id": project,
+            "session_id": session_id,
+            "run_id": run_id,
+        }))
+        .send()
+        .await
+        .expect("run reaches server");
+    assert_eq!(
+        r.status().as_u16(),
+        201,
+        "run: {}",
+        r.text().await.unwrap_or_default(),
+    );
+
+    // 3. Orchestrate. With no LLM configured this returns 503
+    //    no_brain_provider — but that's AFTER `working_dir_for_run`
+    //    runs and emits its breadcrumb, which is what we assert on.
+    let orch_res = h
+        .client()
+        .post(format!("{base}/v1/runs/{run_id}/orchestrate"))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "goal": "local_fs allowlist regression",
+            "max_iterations": 1,
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .expect("orchestrate reaches server");
+    let orch_status = orch_res.status().as_u16();
+    let orch_body = orch_res.text().await.unwrap_or_default();
+    // 503 no_brain_provider is the expected (and benign) outcome in
+    // this test — we're verifying the allowlist resolver, not an
+    // end-to-end LLM call. Any 2xx is also acceptable (would happen
+    // if a future harness default ever registered a mock provider).
+    // A 5xx that isn't 503 signals a real bug introduced on top of
+    // the resolver path.
+    assert!(
+        orch_status == 503 || (200..300).contains(&orch_status),
+        "orchestrate unexpected status {orch_status}: {orch_body}",
+    );
+
+    // 4. Drain any buffered log lines by sleeping briefly — the
+    //    subprocess's non-blocking appender writes on a background
+    //    task, so there's a small window between our HTTP response
+    //    and the log line landing on disk.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let log_body = read_log_dir(tmp_log.path());
+    assert!(
+        !log_body.is_empty(),
+        "expected cairn-app to write logs under {log_dir_path}, got nothing",
+    );
+
+    // Positive assertion: the resolver emitted its "using local_fs"
+    // breadcrumb for THIS run_id and THIS path on a single log line.
+    // Checking all three on a single line (rather than three separate
+    // `contains` over the whole buffer) protects against a future
+    // unrelated log that happens to mention this run's id and path
+    // from masking a real regression where the positive line is
+    // missing.
+    let positive_marker = "using local_fs working directory from project allowlist";
+    let positive_hit = log_body.lines().any(|line| {
+        line.contains(positive_marker) && line.contains(&run_id) && line.contains(&repo_path)
+    });
+    assert!(
+        positive_hit,
+        "expected positive local_fs resolver log for run_id={run_id} and path={repo_path}. Log body:\n{log_body}",
+    );
+
+    // Negative assertion: the pre-fix fallback log MUST NOT appear
+    // for this run_id. A match would mean the resolver couldn't see
+    // the local_fs attach — which is exactly the dogfood #637 bug.
+    let fallback_marker = "no repo allowlisted for project; using ephemeral run directory";
+    let fallback_for_this_run = log_body
+        .lines()
+        .filter(|line| line.contains(&run_id))
+        .any(|line| line.contains(fallback_marker));
+    assert!(
+        !fallback_for_this_run,
+        "regression: resolver fell back to ephemeral for run_id={run_id} despite local_fs allowlist. Log body:\n{log_body}",
+    );
+}
+
+/// Read every `cairn.*.log` file in `log_dir` and concatenate their
+/// contents. The file name is date-stamped (`cairn.log.YYYY-MM-DD`) so
+/// we glob rather than hard-code the rotation suffix.
+fn read_log_dir(log_dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.starts_with("cairn.log"))
+            .unwrap_or(false)
+        {
+            if let Ok(body) = std::fs::read_to_string(&path) {
+                out.push_str(&body);
+            }
+        }
+    }
+    out
+}
+
 #[tokio::test]
 async fn project_repo_default_host_is_github_backward_compat() {
     let h = LiveHarness::setup().await;
