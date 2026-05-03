@@ -308,8 +308,14 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
           </div>
         </div>
 
-        {/* Navigation — grouped */}
-        <nav role="navigation" aria-label="Main navigation" className="flex-1 overflow-y-auto py-2 px-2 space-y-4">
+        {/* Navigation — grouped. `min-h-0` enables flex-shrink so
+            `overflow-y: auto` actually activates on short viewports (#633). */}
+        <nav
+          role="navigation"
+          aria-label="Main navigation"
+          data-testid="sidebar-nav"
+          className="flex-1 min-h-0 overflow-y-auto py-2 px-2 space-y-4"
+        >
           {visibleGroups.map((group) => (
             <div key={group.label}>
               <p className="px-3 pb-1 text-[10px] font-medium text-gray-400 dark:text-zinc-500 uppercase tracking-wider">
@@ -322,11 +328,12 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
                   return (
                     <button
                       key={id}
+                      data-testid={`nav-${id}`}
                       onClick={() => onNavigate(id)}
                       aria-current={active ? 'page' : undefined}
                       aria-label={label}
                       className={clsx(
-                        'w-full flex items-center gap-2.5 px-3 py-1.5 rounded text-[13px] font-medium transition-colors relative',
+                        'w-full flex items-center gap-2.5 px-3 py-1.5 rounded text-[13px] font-medium transition-colors relative scroll-my-2',
                         active
                           ? 'bg-gray-100 dark:bg-zinc-800/80 text-gray-900 dark:text-zinc-100'
                           : 'text-gray-600 dark:text-zinc-400 hover:bg-gray-100 dark:hover:bg-zinc-800/50 hover:text-gray-900 dark:hover:text-zinc-100',
@@ -363,8 +370,8 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
           ))}
         </nav>
 
-        {/* Footer */}
-        <div className="px-3 py-3 border-t border-gray-200 dark:border-zinc-800 space-y-1">
+        {/* Footer — `shrink-0` keeps account/sign-out pinned (#633). */}
+        <div className="shrink-0 px-3 py-3 border-t border-gray-200 dark:border-zinc-800 space-y-1">
           <div className="flex items-center justify-between px-1">
             <p className="text-[11px] text-gray-400 dark:text-zinc-600 font-mono truncate" title={server}>
               {server}
