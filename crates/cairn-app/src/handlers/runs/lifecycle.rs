@@ -39,7 +39,9 @@ use crate::errors::{
     validation_error_response, AppApiError,
 };
 use crate::extractors::{HasProjectScope, ProjectJson, ProjectScope, TenantScope};
-use crate::helpers::{build_run_record_view, load_run_visible_to_tenant};
+use crate::helpers::{
+    build_run_record_view, build_run_record_view_with_subagents, load_run_visible_to_tenant,
+};
 use crate::middleware::ensure_workspace_role_for_project;
 use crate::persist_run_mode_default;
 use crate::persist_run_string_default;
@@ -316,7 +318,10 @@ pub(crate) async fn get_run_handler(
                 // half-shape to operators.
                 _ => None,
             };
-            let run = build_run_record_view(state.as_ref(), run).await;
+            // #661: the detail endpoint populates subagent counts
+            // (list endpoints keep the cheap view). Walks child
+            // runs via `list_by_parent_run`.
+            let run = build_run_record_view_with_subagents(state.as_ref(), run).await;
             match TaskReadModel::list_by_parent_run(
                 state.runtime.store.as_ref(),
                 &run.run.run_id,

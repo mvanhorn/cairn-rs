@@ -185,6 +185,27 @@ pub struct AppMetrics {
     breaker_round_histogram: Mutex<BreakerHistogram<6>>,
     breaker_tokens_histogram: Mutex<BreakerHistogram<6>>,
     breaker_wall_clock_histogram: Mutex<BreakerHistogram<7>>,
+
+    // ── #661: subagent-spawn observability ──────────────────────
+    /// Total `spawn_subagent` decisions emitted by the orchestrator
+    /// since process start. Bumped once per `SubagentSpawned` domain
+    /// event observed by the metrics tap. Monotonic counter: if this
+    /// stays at 0 while orchestrator runs are firing, the LLM is not
+    /// delegating (the diagnostic question #661 was opened to answer).
+    subagent_spawn_total: AtomicU64,
+    /// Distribution of final-iteration counts observed on terminal
+    /// runs. Populated from `RunStateChanged` events landing on a
+    /// terminal state (`completed`, `failed`, `canceled`); the value
+    /// observed is the run's iteration high-water mark tracked by the
+    /// tap's in-flight table.
+    iterations_histogram: Mutex<BreakerHistogram<7>>,
+    /// Rolling window of the most recent terminal runs' subagent-spawn
+    /// outcomes. Each slot is `true` when the run reached terminal
+    /// state WITHOUT spawning any subagent; `false` when at least one
+    /// spawn fired. The reader takes `sum(window) / len(window)` to
+    /// produce `cairn_orchestrator_inline_run_ratio`. Fixed-capacity
+    /// so a noisy tenant can't unbounded-grow the gauge series.
+    inline_run_window: Mutex<InlineRunWindow>,
 }
 
 /// F65 PR-3: per-kind breaker-trip distribution sample. Distinct from
@@ -223,6 +244,56 @@ pub(crate) const BREAKER_TOKENS_BUCKETS: [u64; 6] =
 pub(crate) const BREAKER_WALL_CLOCK_BUCKETS: [u64; 7] = [
     30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000,
 ];
+
+/// #661: bucket edges for `cairn_orchestrator_iterations_per_run`.
+/// Covers the realistic range of iterations we see on cairn runs: a
+/// trivial one-shot completes in 1-2, a typical executor run lands
+/// around 5-15, and anything past 30 is almost always a run that
+/// would have benefited from subagent delegation (the signal #661
+/// is trying to surface). `+Inf` catches the breaker-tripped ceiling.
+pub(crate) const RUN_ITERATIONS_BUCKETS: [u64; 7] = [1, 3, 5, 10, 20, 30, 50];
+
+/// #661: rolling-window capacity for the inline-run-ratio gauge.
+/// 100 is the number called out in the issue brief; it gives the
+/// dashboard a quick-reacting signal without amplifying a single
+/// unusual run into a dramatic dip.
+pub(crate) const INLINE_RUN_WINDOW_CAPACITY: usize = 100;
+
+/// #661: fixed-capacity ring buffer of the most recent `bool`
+/// outcomes per terminal run (`true` = ran inline, no subagents;
+/// `false` = spawned at least one subagent). Implemented as a
+/// `VecDeque` because the reader side needs to scan all slots to
+/// sum, and a ring-buffer with explicit head/tail adds nothing
+/// given the tiny fixed size. Held behind a Mutex on `AppMetrics`.
+#[derive(Debug, Default)]
+pub(crate) struct InlineRunWindow {
+    outcomes: std::collections::VecDeque<bool>,
+}
+
+impl InlineRunWindow {
+    fn record(&mut self, inline: bool) {
+        if self.outcomes.len() == INLINE_RUN_WINDOW_CAPACITY {
+            self.outcomes.pop_front();
+        }
+        self.outcomes.push_back(inline);
+    }
+
+    /// Fraction of inline runs in the window. Returns `None` when the
+    /// window is empty so the renderer can omit the gauge — a 0.0
+    /// sample with no data would read as "full delegation" and mislead
+    /// operators.
+    fn ratio(&self) -> Option<f64> {
+        if self.outcomes.is_empty() {
+            return None;
+        }
+        let inline = self.outcomes.iter().filter(|&&v| v).count();
+        Some(inline as f64 / self.outcomes.len() as f64)
+    }
+
+    fn len(&self) -> usize {
+        self.outcomes.len()
+    }
+}
 
 /// Per-tenant gauge bundle. Held behind a single mutex so updates
 /// are atomic per tenant and reader-side iteration doesn't need to
@@ -356,6 +427,58 @@ pub(crate) fn record_breaker_threshold_warn(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     *m.entry(label.to_owned()).or_insert(0) += 1;
+}
+
+/// #661: bump the `cairn_orchestrator_subagent_spawn_total` counter.
+/// Called once per `SubagentSpawned` event observed by the metrics
+/// tap. The counter is process-lifetime — persistent state lives in
+/// the event log (`SubagentSpawned` + parent/child run lineage).
+pub(crate) fn record_subagent_spawn(metrics: &AppMetrics) {
+    metrics.subagent_spawn_total.fetch_add(1, Ordering::Relaxed);
+}
+
+/// #661: observe a terminal run's final iteration count. Populates
+/// the `cairn_orchestrator_iterations_per_run` histogram. Fired by
+/// the metrics tap when a `RunStateChanged` transitions to a
+/// terminal state — the `iteration` argument is the high-water mark
+/// tracked for that run in `iterations_inflight`. Runs with no
+/// recorded iterations (handler-initiated complete/cancel, no
+/// orchestrator loop ran) observe `0`.
+///
+/// Only called from the metrics tap (gated on
+/// `metrics-core`/`metrics-providers`); the no-feature build
+/// skips the tap so this function is unreferenced there. Kept
+/// unconditional on the type surface so no callers anywhere else
+/// need a cfg guard.
+#[cfg_attr(
+    not(any(feature = "metrics-core", feature = "metrics-providers")),
+    allow(dead_code)
+)]
+pub(crate) fn observe_run_iterations(metrics: &AppMetrics, iteration: u32) {
+    let mut h = metrics
+        .iterations_histogram
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    observe_histogram(&mut h, &RUN_ITERATIONS_BUCKETS, iteration as u64);
+}
+
+/// #661: record whether a just-terminated run delegated to a
+/// subagent. `true` = ran entirely inline (no `SubagentSpawned`
+/// event seen for this parent run); `false` = at least one child
+/// spawned. Reader side derives
+/// `cairn_orchestrator_inline_run_ratio`.
+///
+/// See the dead-code note on `observe_run_iterations` above.
+#[cfg_attr(
+    not(any(feature = "metrics-core", feature = "metrics-providers")),
+    allow(dead_code)
+)]
+pub(crate) fn record_inline_run_outcome(metrics: &AppMetrics, inline: bool) {
+    let mut w = metrics
+        .inline_run_window
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    w.record(inline);
 }
 
 /// Record one observation into a breaker histogram using **sparse
@@ -916,7 +1039,70 @@ impl AppMetrics {
         // feature.
         self.render_breakers_into(&mut lines);
 
+        // #661: subagent-spawn observability. Always-on — the
+        // counter/histogram/ratio are the diagnostic loop for the
+        // orchestrator prompt rewrite in #662. A noisy 0 is a useful
+        // signal.
+        self.render_subagent_observability_into(&mut lines);
+
         lines.join("\n")
+    }
+
+    /// #661: render the subagent-spawn counter, iterations-per-run
+    /// histogram, and rolling inline-run ratio gauge. Rendered even
+    /// when the counter is zero (a visible `0` is the point — it's
+    /// the diagnostic signal that the orchestrator LLM isn't
+    /// delegating).
+    fn render_subagent_observability_into(&self, lines: &mut Vec<String>) {
+        // ── counter ──
+        lines.push(
+            "# HELP cairn_orchestrator_subagent_spawn_total Total spawn_subagent decisions emitted by the orchestrator since process start."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_subagent_spawn_total counter".to_owned());
+        lines.push(format!(
+            "cairn_orchestrator_subagent_spawn_total {}",
+            self.subagent_spawn_total.load(Ordering::Relaxed)
+        ));
+
+        // ── iterations histogram ──
+        render_breaker_histogram(
+            lines,
+            "cairn_orchestrator_iterations_per_run",
+            "Distribution of final-iteration counts observed when a run reaches a terminal state (completed/failed/canceled).",
+            &self
+                .iterations_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            &RUN_ITERATIONS_BUCKETS,
+        );
+
+        // ── inline-run ratio gauge ──
+        lines.push(
+            "# HELP cairn_orchestrator_inline_run_ratio Fraction of the last N terminal runs that finished without spawning any subagent. Emitted only when N > 0; the companion `_samples` gauge carries the current window size (ceiling: 100)."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_inline_run_ratio gauge".to_owned());
+        let window = self
+            .inline_run_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ratio) = window.ratio() {
+            // Six-decimal precision — plenty for a 100-sample window
+            // (finest granularity: 1/100 = 0.01) without flooding
+            // the scrape with phantom digits.
+            lines.push(format!("cairn_orchestrator_inline_run_ratio {ratio:.6}"));
+        }
+        lines.push(
+            "# HELP cairn_orchestrator_inline_run_ratio_samples Number of terminal-run outcomes currently held in the inline-run ratio window (0..=100)."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_inline_run_ratio_samples gauge".to_owned());
+        lines.push(format!(
+            "cairn_orchestrator_inline_run_ratio_samples {}",
+            window.len()
+        ));
     }
 
     /// F65 PR-3: render the breaker counters + per-kind histograms.
@@ -1909,6 +2095,119 @@ mod tests {
             sparse_rendered,
             cumulative.to_vec(),
             "sparse-then-render MUST equal cumulative-increment for the same input",
+        );
+    }
+
+    // ── #661: subagent-spawn observability ──────────────────────────
+
+    #[test]
+    fn subagent_spawn_counter_renders_zero_on_empty() {
+        let metrics = AppMetrics::default();
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_subagent_spawn_total 0"),
+            "counter must render as 0 when never incremented — \
+             that zero is the diagnostic signal #661 surfaces;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn subagent_spawn_counter_tracks_monotonic_increments() {
+        let metrics = AppMetrics::default();
+        record_subagent_spawn(&metrics);
+        record_subagent_spawn(&metrics);
+        record_subagent_spawn(&metrics);
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_subagent_spawn_total 3"),
+            "counter should read 3 after 3 increments;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn iterations_histogram_observes_on_both_completed_and_failed_terminals() {
+        // #661: the histogram observation fires on both completed AND
+        // failed (and canceled) terminals. A breaker-tripped run that
+        // completes at iteration 32 is as much a distribution sample as
+        // a clean-complete at iteration 4. Validating the histogram
+        // itself receives the samples independent of terminal kind.
+        let metrics = AppMetrics::default();
+        observe_run_iterations(&metrics, 3); // "completed"
+        observe_run_iterations(&metrics, 32); // "failed at breaker"
+        observe_run_iterations(&metrics, 8); // "canceled mid-run"
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_iterations_per_run_count 3"),
+            "histogram count must be 3 after 3 observations;\n\ngot:\n{rendered}"
+        );
+        // sum = 3 + 32 + 8 = 43
+        assert!(
+            rendered.contains("cairn_orchestrator_iterations_per_run_sum 43"),
+            "histogram sum must match the inputs;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn inline_run_ratio_omitted_until_first_sample() {
+        let metrics = AppMetrics::default();
+        let rendered = metrics.render_prometheus();
+        assert!(
+            !rendered.contains("\ncairn_orchestrator_inline_run_ratio "),
+            "ratio must be absent until the first terminal run — \
+             0.0 with no data would mislead operators;\n\ngot:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cairn_orchestrator_inline_run_ratio_samples 0"),
+            "samples gauge must render as 0 even when the ratio is absent;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn inline_run_ratio_averages_window_contents() {
+        let metrics = AppMetrics::default();
+        // 3 inline runs, 1 delegated run → ratio 0.75
+        record_inline_run_outcome(&metrics, true);
+        record_inline_run_outcome(&metrics, true);
+        record_inline_run_outcome(&metrics, false);
+        record_inline_run_outcome(&metrics, true);
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_inline_run_ratio 0.750000"),
+            "3 inline / 1 delegated should give 0.75;\n\ngot:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cairn_orchestrator_inline_run_ratio_samples 4"),
+            "samples gauge must reflect window size;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn inline_run_ratio_window_caps_at_capacity() {
+        let metrics = AppMetrics::default();
+        // Fill past capacity; the oldest samples should evict FIFO.
+        // After this sequence the window holds exactly
+        // INLINE_RUN_WINDOW_CAPACITY entries, all `false` because the
+        // terminal half was delegated.
+        for _ in 0..(INLINE_RUN_WINDOW_CAPACITY + 50) {
+            record_inline_run_outcome(&metrics, true); // these evict
+        }
+        for _ in 0..INLINE_RUN_WINDOW_CAPACITY {
+            record_inline_run_outcome(&metrics, false);
+        }
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(&format!(
+                "cairn_orchestrator_inline_run_ratio_samples {}",
+                INLINE_RUN_WINDOW_CAPACITY
+            )),
+            "samples gauge must cap at INLINE_RUN_WINDOW_CAPACITY;\n\ngot:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cairn_orchestrator_inline_run_ratio 0.000000"),
+            "all {INLINE_RUN_WINDOW_CAPACITY} most-recent samples are \
+             'delegated'; ratio must be 0 — the earlier 'inline' samples \
+             evicted past the capacity;\n\ngot:\n{rendered}",
+            INLINE_RUN_WINDOW_CAPACITY = INLINE_RUN_WINDOW_CAPACITY,
         );
     }
 }

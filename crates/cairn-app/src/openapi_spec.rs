@@ -233,6 +233,21 @@ pub const OPENAPI_JSON: &str = r##"{
             "$ref": "#/components/schemas/TerminalRecoveryRecord",
             "nullable": true,
             "description": "F64: present only when the cairn-side terminal-write recovery loop fired for this run (the bridge workaround for FF#371). Omitted on the hot path."
+          },
+          "subagents_spawned": {
+            "type": "integer",
+            "nullable": true,
+            "description": "#661: count of child runs (`spawn_subagent` delegations) observed for this run. Populated by `GET /v1/runs/:id` (detail) — omitted from list responses to keep the batch shape flat. Counted from `RunReadModel::list_by_parent_run`; includes non-terminal children."
+          },
+          "subagents_completed": {
+            "type": "integer",
+            "nullable": true,
+            "description": "#661: child runs that reached `completed` terminal state. Populated alongside `subagents_spawned` by the detail endpoint."
+          },
+          "subagents_failed": {
+            "type": "integer",
+            "nullable": true,
+            "description": "#661: child runs that reached `failed` or `canceled` terminal state. `canceled` is aggregated here because an operator cancelling a delegated child saw the delegation as unsuccessful."
           }
         }
       },

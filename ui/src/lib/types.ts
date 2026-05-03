@@ -537,6 +537,17 @@ export interface RunRecord {
   sandbox_id?: string;
   /** RFC 016: sandbox filesystem path */
   sandbox_path?: string;
+  /**
+   * #661: count of child runs (`spawn_subagent` delegations) the
+   * orchestrator spawned under this run. Populated only by
+   * `GET /v1/runs/:id` — list endpoints omit these to keep the
+   * batch shape flat.
+   */
+  subagents_spawned?: number;
+  /** #661: child runs that terminated in `completed`. */
+  subagents_completed?: number;
+  /** #661: child runs that terminated in `failed` or `canceled`. */
+  subagents_failed?: number;
 }
 
 // ── Run sub-resources ─────────────────────────────────────────────────────────

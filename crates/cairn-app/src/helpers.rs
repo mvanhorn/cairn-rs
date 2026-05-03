@@ -38,6 +38,28 @@ pub(crate) struct RunRecordView {
     pub(crate) sandbox_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sandbox_path: Option<String>,
+    /// #661: subagents this run has spawned. Computed at GET time
+    /// from `RunReadModel::list_by_parent_run(run_id)` — we don't
+    /// add a counter to the `RunRecord` projection because the
+    /// child-run rows already carry the lineage and a read-time
+    /// walk is O(fan-out) per run (typically 0-5). Omitted from
+    /// list responses to keep the batch shape flat; populated only
+    /// by `build_run_record_view_with_subagents` which the detail
+    /// handler calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagents_spawned: Option<u32>,
+    /// #661: subagents that reached `Completed` terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagents_completed: Option<u32>,
+    /// #661: subagents that reached `Failed` or `Canceled` terminal
+    /// state.  `Canceled` is counted as failed for operator-facing
+    /// delegation-effectiveness reporting: an operator who canceled
+    /// a child run saw the delegation attempt as unsuccessful, and
+    /// the alternative (a separate `_canceled` field) splits a
+    /// signal that's already small (typical run spawns 0-3
+    /// children).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagents_failed: Option<u32>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -445,6 +467,120 @@ pub(crate) async fn build_run_record_view(state: &AppState, run: RunRecord) -> R
         created_by_trigger_id,
         sandbox_id,
         sandbox_path,
+        subagents_spawned: None,
+        subagents_completed: None,
+        subagents_failed: None,
+    }
+}
+
+/// #661: like [`build_run_record_view`] but also populates the
+/// subagent lineage counters. Computed from
+/// `RunReadModel::list_by_parent_run` — the child-run projection
+/// rows are the canonical source for the parent→child relationship
+/// (minted by `TaskServiceImpl::spawn_subagent`). We walk up to
+/// 500 children per scrape; a run that spawned more is either a
+/// runaway (operators want to see that) or malformed. `limit` is
+/// generous enough that the cap won't fire in normal operation
+/// while keeping the worst-case read bounded.
+///
+/// Used by `GET /v1/runs/:id` where the counts are operator-visible
+/// signal on the delegation-effectiveness loop from #661. The list
+/// handler (`GET /v1/runs`) continues to call the cheap
+/// `build_run_record_view`: fan-out per run per scrape is the wrong
+/// cost to pay on a list endpoint.
+pub(crate) async fn build_run_record_view_with_subagents(
+    state: &AppState,
+    run: RunRecord,
+) -> RunRecordView {
+    let mut view = build_run_record_view(state, run).await;
+    let (spawned, completed, failed) = count_subagents_for_run(state, &view.run.run_id).await;
+    view.subagents_spawned = Some(spawned);
+    view.subagents_completed = Some(completed);
+    view.subagents_failed = Some(failed);
+    view
+}
+
+/// #661: walk the child-run lineage of `parent_run_id` and tally
+/// terminal states. Returns `(spawned, completed, failed_or_canceled)`
+/// where `spawned` is the total count of child runs observed
+/// (includes non-terminal), `completed` is `RunState::Completed`,
+/// and `failed_or_canceled` is `RunState::Failed + RunState::Canceled`.
+///
+/// On store error: logs at `warn!` and returns zeroed counts. A GET
+/// on `/v1/runs/:id` that partially fails to resolve subagent
+/// counts should surface a zero rather than 500 the whole detail
+/// request — the counts are operator signal, not load-bearing on
+/// the run itself.
+///
+/// # Cost (Gemini review on #664)
+///
+/// `RunReadModel::list_by_parent_run` returns full `RunRecord`
+/// rows. We only read `state`, so the row body (including large
+/// fields like `completion_summary` + `completion_verification`)
+/// is deserialised-then-discarded on every `GET /v1/runs/:id`.
+/// Acceptable today because:
+///
+/// - The typical orchestrator run spawns 0-3 children, so the
+///   fan-out is bounded by `0..=5` rows for the vast majority of
+///   runs.
+/// - `MAX_CHILDREN = 500` caps the worst case; a run hitting that
+///   ceiling is a separate operator-visible issue (runaway
+///   delegation) dashboards already surface via
+///   `cairn_orchestrator_subagent_spawn_total`.
+/// - The detail endpoint is not on the hot path. List + stream
+///   are; neither populates these fields.
+///
+/// A dedicated `RunReadModel` method like
+/// `count_states_by_parent_run` that runs a
+/// `SELECT state, COUNT(*) GROUP BY state` at the storage layer
+/// would be lighter. Deferred until a real run spawns >50
+/// children and scrape latency starts to matter — the current
+/// semantics + call sites are unchanged by that optimisation, so
+/// the follow-up is pure replacement-in-place of this helper.
+pub(crate) async fn count_subagents_for_run(
+    state: &AppState,
+    parent_run_id: &RunId,
+) -> (u32, u32, u32) {
+    use cairn_domain::lifecycle::RunState;
+    // 500 is a deliberately generous cap: the typical orchestrator
+    // run spawns 0-3 children. A run hitting this ceiling is a
+    // separate operator-visible issue (runaway delegation) that
+    // dashboards based on `cairn_orchestrator_subagent_spawn_total`
+    // will already surface.
+    const MAX_CHILDREN: usize = 500;
+    match RunReadModel::list_by_parent_run(
+        state.runtime.store.as_ref(),
+        parent_run_id,
+        MAX_CHILDREN,
+    )
+    .await
+    {
+        Ok(children) => {
+            let mut completed = 0u32;
+            let mut failed = 0u32;
+            for child in &children {
+                match child.state {
+                    RunState::Completed => completed = completed.saturating_add(1),
+                    RunState::Failed | RunState::Canceled => {
+                        failed = failed.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            // `children.len()` bounded by MAX_CHILDREN (500) which
+            // fits a u32 trivially — but use `saturating` conversion
+            // in case MAX_CHILDREN grows in a future patch.
+            let spawned = u32::try_from(children.len()).unwrap_or(u32::MAX);
+            (spawned, completed, failed)
+        }
+        Err(err) => {
+            tracing::warn!(
+                parent_run_id = %parent_run_id,
+                error = %err,
+                "failed to list child runs for subagent counts — reporting zero"
+            );
+            (0, 0, 0)
+        }
     }
 }
 

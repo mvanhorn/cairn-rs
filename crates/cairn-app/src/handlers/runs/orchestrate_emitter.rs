@@ -104,6 +104,20 @@ impl cairn_orchestrator::OrchestratorEventEmitter for TracingEmitter {
         d: &cairn_orchestrator::DecideOutput,
     ) {
         self.inner.on_decide_completed(ctx, d).await;
+        // #661: count `SpawnSubagent` proposals at the decision
+        // boundary — this measures LLM *intent* to delegate, before
+        // the downstream permission/role validation that can reject
+        // a well-formed proposal. Hooking the domain event
+        // (`SubagentSpawned`) would undercount cases where the LLM
+        // tried to delegate but was refused.
+        let spawn_count = d
+            .proposals
+            .iter()
+            .filter(|p| p.action_type == cairn_domain::ActionType::SpawnSubagent)
+            .count();
+        for _ in 0..spawn_count {
+            crate::metrics::record_subagent_spawn(self.metrics.as_ref());
+        }
         crate::tracing_emitter::record_decide_trace(
             ctx,
             d,
