@@ -1,4 +1,4 @@
-//! Background lease-keeper for long-running orchestrate calls (#639).
+//! Background lease-keeper for long-running orchestrate calls (#639, #655).
 //!
 //! # The problem
 //!
@@ -27,7 +27,7 @@
 //!
 //! [FlowFabric#371]: https://github.com/avifenesh/FlowFabric/issues/371
 //!
-//! # The fix
+//! # The fix (#639 + #655)
 //!
 //! A background tokio task per live run that calls
 //! `RunService::renew_lease_if_stale` every `lease_ttl_ms / 3`. The
@@ -39,6 +39,39 @@
 //! The registry is a single map keyed by `RunId`; `ensure_running`
 //! does an atomic check-and-insert so concurrent orchestrate handlers
 //! don't spawn duplicate keepers for the same run.
+//!
+//! ## Suspension awareness (#655)
+//!
+//! #647 shipped the keeper, but dogfood round 3 (2026-05-03) re-
+//! reproduced `TerminalWriteDeadlock` on real multi-iteration
+//! approval-gated runs. Root cause: FF's phase machine puts an
+//! execution into a non-runnable phase
+//! (`attempt_interrupted` / `waiting_approval`) while a tool-call
+//! approval is pending; `ff_renew_lease` and `ff_claim_execution`
+//! both reject with `execution_not_eligible` in that phase. The
+//! #647 keeper logged the conflict at DEBUG and retried on the next
+//! tick, which accomplished nothing except log churn — the lease's
+//! wall-clock expiry still ticked down untouched. When the operator
+//! finally resolved the approval and cairn dispatched the terminal
+//! FCALL, the lease was dead → F64 30 s recovery exhausted →
+//! `Failed(TerminalWriteDeadlock)`.
+//!
+//! The cairn-side fix (Option 2 from #655): the keeper observes the
+//! projection at each tick and SKIPS the renew FCALL when the run is
+//! suspended (either `ApprovalReadModel::has_pending_for_run` OR a
+//! pending `ToolCallApprovalReadModel` row for this run). Suspended
+//! ticks log at TRACE — no FF FCALL, no churn. When the keeper
+//! observes the transition from suspended → runnable, it immediately
+//! fires a renew (which, via `RunService::renew_lease_if_stale`,
+//! falls back to a full `issue_grant_and_claim` when the lease
+//! wall-clock has expired) so the wall-clock deadline is reset
+//! before the next terminal FCALL leaves the orchestrator.
+//!
+//! Upstream ask (the long-term fix): FF offering a suspension-safe
+//! liveness primitive — either widening `ff_renew_lease`'s phase
+//! gate or exposing a dedicated `ff_heartbeat_execution` FCALL that
+//! accepts `waiting_approval` / `attempt_interrupted`. Tracked as
+//! FF#371 (closed, pending reopen request).
 //!
 //! # Exit conditions
 //!
@@ -66,6 +99,10 @@ use std::time::Duration;
 
 use cairn_domain::{RunId, SessionId};
 use cairn_runtime::RunService;
+use cairn_store::projections::{
+    ApprovalReadModel, ToolCallApprovalReadModel, ToolCallApprovalState,
+};
+use cairn_store::InMemoryStore;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -136,11 +173,21 @@ impl LeaseKeeperRegistry {
     /// keeper sleeps `lease_ttl_ms / 3` between renewals so there are
     /// three renewal attempts per TTL window (matching FF's own
     /// internal renewer).
+    ///
+    /// `store` feeds the suspension-aware skip logic (#655): the
+    /// keeper reads `ApprovalReadModel::has_pending_for_run` and
+    /// `ToolCallApprovalReadModel::list_for_run` each tick to detect
+    /// when the run is in an approval-pending suspension (FF's
+    /// `execution_not_eligible` phase). A projection read is a
+    /// single HashMap lookup in-memory / single SQL row on pg/sqlite
+    /// — cheaper than the round-trip FCALL it replaces, and with no
+    /// wire-time error churn on a cycle that was going to 409 anyway.
     pub async fn ensure_running(
         &self,
         run_id: RunId,
         session_id: SessionId,
         runs: Arc<dyn RunService>,
+        store: Arc<InMemoryStore>,
         lease_ttl_ms: u64,
     ) {
         let mut guard = self.inner.lock().await;
@@ -165,7 +212,15 @@ impl LeaseKeeperRegistry {
         let task_run_id = run_id.clone();
         let task_session = session_id.clone();
         let join = tokio::spawn(async move {
-            run_keeper_loop(task_run_id, task_session, runs, interval, worker_cancel).await;
+            run_keeper_loop(
+                task_run_id,
+                task_session,
+                runs,
+                store,
+                interval,
+                worker_cancel,
+            )
+            .await;
         });
         guard.insert(run_id, LeaseKeeperHandle { cancel, join });
     }
@@ -223,10 +278,61 @@ impl LeaseKeeperRegistry {
     }
 }
 
+/// Returns `true` when the run is in an approval-pending suspension
+/// that rejects `ff_renew_lease` / `ff_claim_execution` with
+/// `execution_not_eligible`.
+///
+/// Covers both suspension surfaces:
+///
+/// 1. **Operator approvals** (`ApprovalRequested` → `/v1/approvals`):
+///    read via `ApprovalReadModel::has_pending_for_run`, which
+///    matches any approval whose `decision` is still `None`.
+/// 2. **Tool-call approvals** (F26 BP-v2 flow, `/v1/tool-call-approvals`):
+///    read via `ToolCallApprovalReadModel::list_for_run`, filtered to
+///    rows in `Pending` state. This is the surface the 2026-05-03
+///    dogfood run hit — the orchestrator returns 202 `waiting_approval`
+///    without flipping `RunState` to `WaitingApproval`, so a run-state
+///    check alone would miss it.
+///
+/// Projection-read failures fall through to `false` (treat as
+/// runnable) with a WARN log — masking a suspension miss by skipping a
+/// renew is strictly worse than emitting one extra FCALL that FF may
+/// reject. Pre-#655 behaviour is preserved on the failure path.
+async fn is_suspended(store: &InMemoryStore, run_id: &RunId) -> bool {
+    match ApprovalReadModel::has_pending_for_run(store, run_id).await {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %err,
+                "#655 lease keeper: ApprovalReadModel::has_pending_for_run failed; \
+                 assuming runnable and proceeding with renew"
+            );
+            return false;
+        }
+    }
+    match ToolCallApprovalReadModel::list_for_run(store, run_id).await {
+        Ok(rows) => rows
+            .iter()
+            .any(|r| r.state == ToolCallApprovalState::Pending),
+        Err(err) => {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %err,
+                "#655 lease keeper: ToolCallApprovalReadModel::list_for_run failed; \
+                 assuming runnable and proceeding with renew"
+            );
+            false
+        }
+    }
+}
+
 async fn run_keeper_loop(
     run_id: RunId,
     session_id: SessionId,
     runs: Arc<dyn RunService>,
+    store: Arc<InMemoryStore>,
     interval: Duration,
     cancel: CancellationToken,
 ) {
@@ -235,6 +341,17 @@ async fn run_keeper_loop(
         interval_ms = interval.as_millis() as u64,
         "#639 lease keeper started"
     );
+    // #655: suspension-awareness. When `true`, the previous tick
+    // observed the run inside an approval-pending suspension and
+    // skipped its renew call. On the next observed transition to
+    // runnable we force-renew IMMEDIATELY (without waiting for the
+    // next periodic tick) so the FF lease's wall-clock expiry is
+    // reset before the orchestrator's resume path dispatches the
+    // next terminal FCALL. Without this immediate renew on resume,
+    // a run suspended for longer than `lease_ttl_ms` lands back in
+    // Running with an already-dead lease — the exact dogfood-round-3
+    // failure shape #655 closes.
+    let mut was_suspended = false;
     loop {
         tokio::select! {
             biased;
@@ -244,6 +361,39 @@ async fn run_keeper_loop(
             }
             _ = tokio::time::sleep(interval) => {}
         }
+
+        // #655: suspension probe BEFORE issuing the renew FCALL.
+        // A projection read is orders of magnitude cheaper than an
+        // FCALL that FF is going to 409 anyway, and skipping the
+        // FCALL removes the log churn the pre-fix keeper produced.
+        if is_suspended(&store, &run_id).await {
+            if !was_suspended {
+                tracing::debug!(
+                    run_id = %run_id,
+                    "#655 lease keeper: run entered approval-pending suspension; \
+                     pausing renew FCALLs until resume observed"
+                );
+            } else {
+                // Trace-level so a long approval wait doesn't flood
+                // production logs. A single DEBUG line on entry + a
+                // single DEBUG line on exit is enough operator signal.
+                tracing::trace!(
+                    run_id = %run_id,
+                    "#655 lease keeper: suspension still active; skipping renew tick"
+                );
+            }
+            was_suspended = true;
+            continue;
+        }
+
+        if was_suspended {
+            tracing::debug!(
+                run_id = %run_id,
+                "#655 lease keeper: suspension resolved; firing immediate renew \
+                 to reset lease wall-clock before the next terminal FCALL"
+            );
+        }
+        was_suspended = false;
 
         // Wrap the renew call in the same `select!` so cancellation
         // can interrupt an in-flight FCALL instead of waiting for
@@ -279,11 +429,16 @@ async fn run_keeper_loop(
                 }
             }
             Err(err) if err.is_transient_phase_conflict() => {
-                // Mid-approval / mid-write sub-phases — the existing
-                // lease is still valid; the keeper just can't renew
-                // it right now. Retry on the next tick. F58
-                // tolerates the same class at the orchestrate
-                // handler entry; keep the behaviour consistent.
+                // Pre-#655 this branch fired on every tick of a
+                // long approval wait — the suspension probe above
+                // now absorbs the known-suspended case. Any residual
+                // transient conflict (tool invocation mid-write,
+                // scanner race) is still tolerated: the existing
+                // lease is still valid, the keeper just can't renew
+                // it at this exact instant. Re-check suspension on
+                // the next tick so an approval that lands in the
+                // race window still flips the keeper into the
+                // skip-renew mode.
                 tracing::debug!(
                     run_id = %run_id,
                     error = %err,
@@ -475,6 +630,7 @@ mod tests {
     async fn ensure_running_dedups_concurrent_inserts() {
         let registry = Arc::new(LeaseKeeperRegistry::new());
         let runs: Arc<dyn RunService> = Arc::new(MockRuns::default());
+        let store = Arc::new(InMemoryStore::new());
         let run_id = RunId::new("run_dedup");
         let session_id = SessionId::new("sess_dedup");
 
@@ -482,10 +638,12 @@ mod tests {
         for _ in 0..50 {
             let r = registry.clone();
             let runs = runs.clone();
+            let store = store.clone();
             let run_id = run_id.clone();
             let session_id = session_id.clone();
             handles.push(tokio::spawn(async move {
-                r.ensure_running(run_id, session_id, runs, 10_000).await;
+                r.ensure_running(run_id, session_id, runs, store, 10_000)
+                    .await;
             }));
         }
         for h in handles {
@@ -507,6 +665,7 @@ mod tests {
         let registry = Arc::new(LeaseKeeperRegistry::new());
         let mock = Arc::new(MockRuns::default());
         let runs: Arc<dyn RunService> = mock.clone();
+        let store = Arc::new(InMemoryStore::new());
 
         for i in 0..3 {
             registry
@@ -514,6 +673,7 @@ mod tests {
                     RunId::new(format!("run_shutdown_{i}")),
                     SessionId::new(format!("sess_shutdown_{i}")),
                     runs.clone(),
+                    store.clone(),
                     // Fast ticker so the keeper is definitely inside
                     // the sleep (cancellation path) on shutdown.
                     1_500,
@@ -540,6 +700,7 @@ mod tests {
     async fn keeper_exits_on_terminal_state() {
         let registry = Arc::new(LeaseKeeperRegistry::new());
         let mock = Arc::new(MockRuns::default());
+        let store = Arc::new(InMemoryStore::new());
         // First renew: still running. Second renew: Completed — the
         // keeper must exit after observing this.
         mock.push_response(Ok(MockRuns::running(RunState::Running)))
@@ -552,7 +713,7 @@ mod tests {
         let session_id = SessionId::new("sess_terminal");
 
         registry
-            .ensure_running(run_id.clone(), session_id, runs, 1_500)
+            .ensure_running(run_id.clone(), session_id, runs, store, 1_500)
             .await;
 
         // Wait up to 2s for the keeper to observe the Completed
@@ -574,6 +735,174 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(mock.renew_calls.load(Ordering::SeqCst) >= 2);
+
+        registry.shutdown_all().await;
+    }
+
+    /// #655 regression: when the run has a pending tool-call approval
+    /// the keeper MUST skip the renew FCALL. Otherwise every keeper
+    /// tick during a long approval wait churns FF with
+    /// `execution_not_eligible` rejections — the exact pre-fix
+    /// log-spam shape dogfood round 3 surfaced. The skip is
+    /// projection-driven: the keeper reads
+    /// `ToolCallApprovalReadModel::list_for_run` and short-circuits
+    /// when any row is `Pending`.
+    #[tokio::test]
+    async fn keeper_skips_renew_while_tool_call_approval_pending() {
+        use cairn_domain::{
+            ApprovalMatchPolicy, ProjectId, ProjectKey, RuntimeEvent, SessionId, TenantId,
+            ToolCallId, ToolCallProposed, WorkspaceId,
+        };
+        use cairn_runtime::make_envelope;
+        use cairn_store::EventLog;
+
+        let registry = Arc::new(LeaseKeeperRegistry::new());
+        let mock = Arc::new(MockRuns::default());
+        let runs: Arc<dyn RunService> = mock.clone();
+        let store = Arc::new(InMemoryStore::new());
+
+        let run_id = RunId::new("run_655_tool_call");
+        let session_id = SessionId::new("sess_655_tool_call");
+        let project = ProjectKey {
+            tenant_id: TenantId::new("t"),
+            workspace_id: WorkspaceId::new("w"),
+            project_id: ProjectId::new("p"),
+        };
+
+        // Seed the tool-call-approval projection via the real
+        // event-log path so the suspension probe observes a `Pending`
+        // row on its first tick. Using `append` exercises the same
+        // code path operator UIs hit, which means a projection
+        // regression would surface here too.
+        let proposed = make_envelope(RuntimeEvent::ToolCallProposed(ToolCallProposed {
+            project: project.clone(),
+            call_id: ToolCallId::new("call_655_pending"),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            tool_name: "bash".to_owned(),
+            tool_args: serde_json::json!({}),
+            display_summary: String::new(),
+            match_policy: ApprovalMatchPolicy::Exact,
+            proposed_at_ms: 0,
+        }));
+        store
+            .append(&[proposed])
+            .await
+            .expect("tool-call-proposed event must append");
+
+        registry
+            .ensure_running(run_id.clone(), session_id, runs, store.clone(), 1_500)
+            .await;
+
+        // Tick interval is 500 ms (1500 / 3). Wait three intervals —
+        // in the pre-#655 code this window would produce at least 2
+        // `renew_lease_if_stale` calls. Post-fix: the suspension
+        // probe short-circuits every tick and the mock's renew
+        // counter stays at zero.
+        tokio::time::sleep(Duration::from_millis(1_800)).await;
+
+        let renews = mock.renew_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            renews, 0,
+            "#655: keeper must NOT call renew_lease_if_stale while a \
+             tool-call approval is pending; observed {renews} renews"
+        );
+
+        registry.shutdown_all().await;
+    }
+
+    /// #655: when a pending tool-call approval resolves
+    /// (`ToolCallApproved` event appended → projection flips
+    /// `Pending → Approved`), the keeper must fire an immediate renew
+    /// on the NEXT tick — not wait out another full interval. This
+    /// resets the FF lease's wall-clock deadline so the terminal
+    /// FCALL the orchestrator dispatches on resume has a fresh lease
+    /// to write against.
+    #[tokio::test]
+    async fn keeper_force_renews_on_suspension_resolution() {
+        use cairn_domain::{
+            ApprovalMatchPolicy, ProjectId, ProjectKey, RuntimeEvent, SessionId, TenantId,
+            ToolCallApproved, ToolCallId, ToolCallProposed, WorkspaceId,
+        };
+        use cairn_runtime::make_envelope;
+        use cairn_store::EventLog;
+
+        let registry = Arc::new(LeaseKeeperRegistry::new());
+        let mock = Arc::new(MockRuns::default());
+        let runs: Arc<dyn RunService> = mock.clone();
+        let store = Arc::new(InMemoryStore::new());
+
+        let run_id = RunId::new("run_655_resolve");
+        let session_id = SessionId::new("sess_655_resolve");
+        let project = ProjectKey {
+            tenant_id: TenantId::new("t"),
+            workspace_id: WorkspaceId::new("w"),
+            project_id: ProjectId::new("p"),
+        };
+        let call_id = ToolCallId::new("call_655_resolve");
+
+        let proposed = make_envelope(RuntimeEvent::ToolCallProposed(ToolCallProposed {
+            project: project.clone(),
+            call_id: call_id.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            tool_name: "bash".to_owned(),
+            tool_args: serde_json::json!({}),
+            display_summary: String::new(),
+            match_policy: ApprovalMatchPolicy::Exact,
+            proposed_at_ms: 0,
+        }));
+        store
+            .append(&[proposed])
+            .await
+            .expect("tool-call-proposed event must append");
+
+        // 1500 ms TTL → 500 ms tick.
+        registry
+            .ensure_running(
+                run_id.clone(),
+                session_id.clone(),
+                runs,
+                store.clone(),
+                1_500,
+            )
+            .await;
+
+        // Stay suspended for ~1 s (two ticks). No renews must fire.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(
+            mock.renew_calls.load(Ordering::SeqCst),
+            0,
+            "#655: no renews should fire while pending"
+        );
+
+        // Resolve the approval by appending `ToolCallApproved`. The
+        // NEXT keeper tick must see the transition and fire an
+        // immediate renew.
+        let approved = make_envelope(RuntimeEvent::ToolCallApproved(ToolCallApproved {
+            project,
+            call_id,
+            session_id,
+            operator_id: cairn_domain::OperatorId::new("op_655"),
+            scope: cairn_domain::ApprovalScope::Once,
+            approved_tool_args: None,
+            approved_at_ms: 0,
+        }));
+        store
+            .append(&[approved])
+            .await
+            .expect("tool-call-approved event must append");
+
+        // One tick is 500 ms; give two ticks' slack (1100 ms) so
+        // the test is deterministic even on loaded CI schedulers.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let renews = mock.renew_calls.load(Ordering::SeqCst);
+        assert!(
+            renews >= 1,
+            "#655: keeper must force-renew after suspension resolves; \
+             observed {renews} renews"
+        );
 
         registry.shutdown_all().await;
     }

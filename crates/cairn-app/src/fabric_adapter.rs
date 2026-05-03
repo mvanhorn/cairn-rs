@@ -635,6 +635,25 @@ const F59_MIN_REMAINING_MS: u64 = 10_000;
 /// execution hash (typical sub-ms on loopback Valkey); the
 /// orthogonal correctness win from renewing before the FCALL
 /// dominates the extra round-trip.
+/// #655 pre-terminal renew retry schedule.
+///
+/// When the pre-terminal renew hits `execution_not_eligible` after a
+/// suspension resume, FF's phase machine is still catching up to
+/// cairn's approval-resolution event. Tolerating the first failure
+/// (the pre-#655 F59 behaviour) hands the terminal FCALL an already-
+/// dead lease because `renew_lease_if_stale` never reached its
+/// `claim_with_snapshot` fallback. Retrying on a short backoff gives
+/// FF time to clear the residual phase state without spraying the
+/// lease-keeper's projection-driven skip logic into this tight path.
+///
+/// Five steps, ~3 s total: the overwhelming majority of
+/// `execution_not_eligible` windows clear within one FF scanner
+/// cycle (~1.5 s). The schedule's final arm covers back-to-back
+/// approval resumes where the scanner is still advancing the prior
+/// iteration. Anything longer than this still falls through to F64's
+/// 30 s bounded recovery loop — same ceiling as pre-#655.
+const F59_PHASE_RETRY_BACKOFF_MS: [u64; 5] = [100, 250, 500, 1_000, 1_500];
+
 async fn f59_prelude_renew(
     fabric: &Arc<FabricServices>,
     project: &ProjectKey,
@@ -642,25 +661,80 @@ async fn f59_prelude_renew(
     run_id: &RunId,
     fcall: &'static str,
 ) -> Result<(), RuntimeError> {
-    match fabric
-        .runs
-        .renew_lease_if_stale(project, session_id, run_id, F59_MIN_REMAINING_MS)
-        .await
-        .map_err(fabric_err_to_runtime)
-    {
-        Ok(_) => Ok(()),
-        Err(err) if err.is_transient_phase_conflict() => {
-            tracing::debug!(
-                run_id = %run_id,
-                fcall,
-                error = %err,
-                "F59: pre-terminal renew hit transient phase conflict; \
-                 continuing with existing lease"
-            );
-            Ok(())
+    // Extract the renewal invocation into a closure so the initial
+    // attempt and retry attempts share one call site — keeps the
+    // error classification logic consistent and avoids the "did we
+    // remember to update both arms?" maintenance hazard. Gemini
+    // review on #658 flagged the duplication.
+    let renew = || async {
+        fabric
+            .runs
+            .renew_lease_if_stale(project, session_id, run_id, F59_MIN_REMAINING_MS)
+            .await
+            .map_err(fabric_err_to_runtime)
+    };
+
+    // First attempt: hot path. If the lease is fresh or can be
+    // extended/reclaimed in a single hop, we're done in one FCALL.
+    let mut last_err = match renew().await {
+        Ok(_) => return Ok(()),
+        Err(err) if err.is_transient_phase_conflict() => err,
+        Err(err) => return Err(err),
+    };
+
+    // #655 retry loop: FF's phase is momentarily non-eligible. This
+    // is the post-suspension-resume race where the `ToolCallApproved`
+    // event has landed in cairn's projection but FF's execution
+    // hasn't been nudged back to `runnable`/`active` yet. A short
+    // backoff lets FF's scanners advance without ever falling
+    // through to the coarser F64 loop.
+    //
+    // Cancellation: this fn is called from the axum request handler
+    // (inside `FabricServiceRunAdapter::complete / fail / cancel`).
+    // No explicit CancellationToken is available on this path, but
+    // the reqwest client aborts the entire future tree on disconnect
+    // and the 30 s F64 ceiling dominates this 3 s retry window, so
+    // extending this helper with a token would be cosmetic — the
+    // HTTP transport already provides the escape hatch. Gemini
+    // review on #658 suggested wrapping `sleep` in `tokio::select!`
+    // for cancellation symmetry with the lease-keeper's
+    // long-running loop; declining because the shapes are
+    // different (keeper is a background task with an owned token;
+    // this is a bounded async call chain) and adding a unused
+    // token plumb-through on every call site would regress the
+    // surface without operator-visible benefit.
+    for backoff_ms in F59_PHASE_RETRY_BACKOFF_MS {
+        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        match renew().await {
+            Ok(_) => {
+                tracing::debug!(
+                    run_id = %run_id,
+                    fcall,
+                    backoff_ms,
+                    "#655 F59: pre-terminal renew cleared after short-backoff retry"
+                );
+                return Ok(());
+            }
+            Err(err) if err.is_transient_phase_conflict() => {
+                last_err = err;
+            }
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
     }
+
+    // Still transient after the full schedule. Fall through with
+    // the pre-#655 behaviour: log + tolerate so the terminal FCALL
+    // either succeeds against the existing lease (happy path when
+    // only the PHASE was wrong, not the lease) or triggers F64's
+    // bounded recovery (happy path when the lease itself died).
+    tracing::debug!(
+        run_id = %run_id,
+        fcall,
+        error = %last_err,
+        "F59: pre-terminal renew still transient after retry schedule; \
+         continuing with existing lease (F64 recovery may engage)"
+    );
+    Ok(())
 }
 
 /// F64: bounded terminal-write recovery loop.

@@ -683,12 +683,17 @@ async fn orchestrate_run_handler_inner(
         // because the trait is already auto-in-scope at the vtable
         // call site.
         let lease_ttl_ms = fabric.runtime.lease_ttl_ms();
+        // #655: pass the cairn-store projection handle so the keeper's
+        // suspension probe can read `ApprovalReadModel` +
+        // `ToolCallApprovalReadModel` on each tick and skip renew
+        // FCALLs that FF would 409 with `execution_not_eligible`.
         state
             .lease_keepers
             .ensure_running(
                 refreshed.run_id.clone(),
                 refreshed.session_id.clone(),
                 state.runtime.runs.clone(),
+                state.runtime.store.clone(),
                 lease_ttl_ms,
             )
             .await;
