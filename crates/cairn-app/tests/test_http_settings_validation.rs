@@ -38,10 +38,25 @@ async fn rejects_empty_model_id() {
 }
 
 #[tokio::test]
-async fn rejects_unknown_model_id() {
+async fn accepts_forward_reference_model_id() {
+    // Regression for #656: operator setup scripts naturally order
+    // `PUT brain_model` (primary setting) before `POST
+    // /v1/providers/connections`. The validator used to reject the
+    // first PUT because no catalog or connection advertised the
+    // model yet — a chicken-and-egg failure that misled triage into
+    // filing the issue as a boot-readiness race (#652). The
+    // authoritative "is this model routable" check moved to
+    // orchestrate time (`handlers/runs/orchestrate.rs` returns 503
+    // `preferred_model_unavailable` with the connection inventory
+    // when a configured default has no backing connection).
     let h = LiveHarness::setup().await;
     let r = put_default(&h, "brain_model", json!("completely-made-up-model-xyz")).await;
-    assert_eq!(r.status().as_u16(), 422, "unknown model must 422");
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "forward-reference model must persist: body={}",
+        r.text().await.unwrap_or_default(),
+    );
 }
 
 #[tokio::test]
@@ -179,13 +194,15 @@ async fn accepts_model_id_from_connected_provider_supported_models() {
         r.text().await.unwrap_or_default(),
     );
 
-    // Sanity check the rejection path is still live: a model NOT in the
-    // catalog and NOT on any connection still 422s.
+    // Forward references (models not in catalog + not on any connection)
+    // are accepted at PUT time. See #656: the catalog-existence check
+    // moved to orchestrate time. The only PUT-time failure modes for
+    // model-id keys are now "empty string" and "> MODEL_ID_MAX_LEN".
     let r = put_default(&h, "brain_model", json!("qwen/not-a-real-route:free")).await;
     assert_eq!(
         r.status().as_u16(),
-        422,
-        "uncontested unknown model must still 422"
+        200,
+        "forward reference must persist at PUT time (orchestrate-time check surfaces the real error)",
     );
 }
 

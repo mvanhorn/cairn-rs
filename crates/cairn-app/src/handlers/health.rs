@@ -26,9 +26,7 @@ use cairn_api::{CriticalEventSummary, DashboardOverview};
 use cairn_domain::{
     ProjectId, ProjectKey, RunId, RunState, RuntimeEvent, SessionId, TenantId, WorkspaceId,
 };
-use cairn_runtime::{
-    DefaultsService, LicenseService, ProviderBindingService, ProviderConnectionService,
-};
+use cairn_runtime::{DefaultsService, LicenseService, ProviderBindingService};
 use cairn_store::{EventLog, StoredEvent};
 use cairn_tools::{PluginHost, PluginRegistry};
 
@@ -917,10 +915,17 @@ pub(crate) async fn get_tls_settings_handler(
     }
 }
 
-/// Known model-id keys. Values for these keys must resolve to a real
-/// model in the static provider registry AND be listed in at least one
-/// active provider connection's `supported_models` (mirrors the PR #185
-/// UI-side filter, now enforced server-side). Closes #228.
+/// Known model-id keys. Values for these keys are validated as
+/// non-empty, length-capped strings. Crucially we do NOT reject based
+/// on "is this model present in the catalog or on a provider connection
+/// right now": operator setup scripts commonly do `PUT brain_model`
+/// first (it's the "primary" setting) and then `POST
+/// /v1/providers/connections` second, so PUT-time existence was a
+/// foot-gun (#656). The authoritative "is this model routable"
+/// check runs at orchestrate time in
+/// `crates/cairn-app/src/handlers/runs/orchestrate.rs` and returns a
+/// typed 503 `preferred_model_unavailable` with the full connection
+/// inventory — that's the layer where the operator actually cares.
 const MODEL_ID_KEYS: &[&str] = &[
     "brain_model",
     "generate_model",
@@ -951,62 +956,39 @@ const INTEGER_ONLY_KEYS: &[&str] = &["stuck_run_threshold_ms", "timeout_ms", "ma
 const MODEL_ID_MAX_LEN: usize = 256;
 const PROMPT_LIKE_MAX_LEN: usize = 4096;
 
-/// Resolve the tenant ids to check for "active connection supports model".
-///
-/// - `Scope::Tenant` → exactly that tenant.
-/// - `Scope::Workspace` → lookup the workspace's owning tenant.
-/// - `Scope::Project` → lookup the project's owning tenant.
-/// - `Scope::System` → every tenant in the store (best-effort,
-///   capped list of 200 to keep the handler bounded).
-async fn resolve_tenants_for_scope(
-    state: &AppState,
-    scope: cairn_domain::Scope,
-    scope_id: &str,
-) -> Vec<TenantId> {
-    use cairn_domain::{Scope, WorkspaceId};
-    use cairn_store::projections::{TenantReadModel, WorkspaceReadModel};
+/// Typed rejection from `validate_setting_value`. The handler
+/// converts this into an HTTP response AND logs at INFO so dogfood
+/// and production operator scripts that only see access-log lines
+/// (`status=422 latency=0ms`) can see *why* the PUT was rejected
+/// without rerunning with `-v`. Motivated by #656 — the missing log
+/// line misled triage into filing the case as a boot-readiness race.
+struct SettingValidationError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
 
-    match scope {
-        Scope::Tenant => vec![TenantId::new(scope_id)],
-        Scope::Workspace => {
-            match WorkspaceReadModel::get(state.runtime.store.as_ref(), &WorkspaceId::new(scope_id))
-                .await
-            {
-                Ok(Some(record)) => vec![record.tenant_id],
-                _ => Vec::new(),
-            }
+impl SettingValidationError {
+    fn validation(message: String) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "validation_error",
+            message,
         }
-        Scope::Project => {
-            // Project scope_id is just the project_id; the owning
-            // tenant is not trivially addressable without the full
-            // ProjectKey. Fall back to scanning all tenants so
-            // validation doesn't false-reject on project scope.
-            TenantReadModel::list(state.runtime.store.as_ref(), 200, 0)
-                .await
-                .map(|records| records.into_iter().map(|r| r.tenant_id).collect())
-                .unwrap_or_default()
-        }
-        Scope::System => TenantReadModel::list(state.runtime.store.as_ref(), 200, 0)
-            .await
-            .map(|records| records.into_iter().map(|r| r.tenant_id).collect())
-            .unwrap_or_default(),
     }
 }
 
-async fn validate_setting_value(
-    state: &AppState,
-    scope: cairn_domain::Scope,
-    scope_id: &str,
+fn validate_setting_value(
     key: &str,
     value: &serde_json::Value,
-) -> Result<(), axum::response::Response> {
+) -> Result<(), SettingValidationError> {
     // Numeric keys: reject non-numbers, enforce range.
     if let Some((_, min, max)) = NUMERIC_KEYS.iter().find(|(k, _, _)| *k == key) {
         let n = value
             .as_f64()
-            .ok_or_else(|| validation_error_response(format!("{key} must be a number")))?;
+            .ok_or_else(|| SettingValidationError::validation(format!("{key} must be a number")))?;
         if !n.is_finite() || n < *min || n > *max {
-            return Err(validation_error_response(format!(
+            return Err(SettingValidationError::validation(format!(
                 "{key} must be within [{min}, {max}]"
             )));
         }
@@ -1014,164 +996,47 @@ async fn validate_setting_value(
         // silently drop a fractional value, which then falls back to the
         // hard-coded default and misleads the operator. Reject at PUT.
         if INTEGER_ONLY_KEYS.contains(&key) && n.fract() != 0.0 {
-            return Err(validation_error_response(format!(
+            return Err(SettingValidationError::validation(format!(
                 "{key} must be a whole number"
             )));
         }
         return Ok(());
     }
 
-    // Model-id keys: must be non-empty string in registry AND supported
-    // by at least one active provider connection for the tenant scope.
+    // Model-id keys: must be a non-empty, length-capped string. We
+    // deliberately DO NOT verify the model exists in any catalog or on
+    // any provider connection at PUT time. Setup flows naturally order
+    // `PUT brain_model` (the primary setting) before `POST
+    // /v1/providers/connections` — rejecting forward references made
+    // the onboarding script fail its first call and misled operators
+    // (#656). The authoritative "is this model routable right now"
+    // check lives in `handlers/runs/orchestrate.rs` and returns a typed
+    // 503 `preferred_model_unavailable` with the full connection
+    // inventory when a configured default has no backing connection at
+    // orchestrate time. That's the right layer for the check: it only
+    // fires when a run actually tries to route, and it gives the
+    // operator the full inventory + a one-liner fix in the same body.
     if MODEL_ID_KEYS.contains(&key) {
         let model_id = value
             .as_str()
-            .ok_or_else(|| validation_error_response(format!("{key} must be a string")))?;
+            .ok_or_else(|| SettingValidationError::validation(format!("{key} must be a string")))?;
         if model_id.is_empty() {
-            return Err(validation_error_response(format!(
+            return Err(SettingValidationError::validation(format!(
                 "{key} must not be empty"
             )));
         }
         if model_id.len() > MODEL_ID_MAX_LEN {
-            return Err(validation_error_response(format!(
+            return Err(SettingValidationError::validation(format!(
                 "{key} exceeds max length {MODEL_ID_MAX_LEN}"
             )));
         }
-        // Valid model-ID set = union of:
-        //  (a) LiteLLM catalog (+ cairn TOML overlay + operator overrides)
-        //      — the reference catalog at `state.model_registry`, used for
-        //      cost metadata and the UI "pick a model" pickers.
-        //  (b) `supported_models` declared on ANY provider connection in
-        //      scope for this setting. Each provider family carries its own
-        //      ID namespace (OpenRouter: `qwen/qwen3-coder:free`,
-        //      Bedrock: `bedrock/us-east-1/…`, Baseten: `baseten/…`) and
-        //      the operator's connection IS the authoritative list for
-        //      what that tenant can route to.
-        //  (c) The in-memory `provider_registry` snapshot — connections
-        //      materialized from startup env fallbacks that haven't been
-        //      persisted to the store yet.
-        //
-        // Why (a) AND (b): The LiteLLM catalog is big (2 600+ entries) but
-        // not exhaustive — operators can connect custom endpoints (Ollama
-        // local models, private OpenAI-compatible gateways, new OpenRouter
-        // models shipped between catalog refreshes). Conversely, a system-
-        // scope default may reference a catalog-only model that no tenant
-        // has a connection for yet (e.g. immediately after setup) — we
-        // still accept it so the dashboard flow works in any order.
-        //
-        // The legacy static `cairn_domain::provider_registry::*` tables are
-        // intentionally NOT consulted here: they predate LiteLLM import
-        // and the IDs they carry (e.g. `openai/gpt-4o`, `anthropic/claude-*`)
-        // are already present in the bundled catalog (a). Operator-connected
-        // routes with their own provider-family namespaces (e.g. OpenRouter
-        // `qwen/qwen3-coder:free`) were never in the static tables, which is
-        // precisely what F20/F21 reported.
-        //
-        // Closes #228 (server-side validation), F20/F21 (OpenRouter IDs).
-
-        // (a) LiteLLM catalog check — in-memory, no IO.
-        if state.model_registry.get(model_id).is_some() {
-            return Ok(());
-        }
-
-        // (c) In-memory registry snapshot. Checked BEFORE the per-tenant
-        // store scan in (b) because it's zero-latency and commonly covers
-        // env-provisioned startup fallbacks before any store row exists.
-        let snapshot = state.runtime.provider_registry.snapshot();
-        if snapshot.connections.iter().any(|c| c.model == model_id) {
-            return Ok(());
-        }
-
-        // (b) Operator-connected provider models. Walk every tenant the
-        // scope covers — a system-scope default is valid as long as *some*
-        // tenant configured a connection for this model; a tenant-scope
-        // default must be valid for that specific tenant. Paginate until
-        // exhaustion so large installs (>200 connections per tenant) don't
-        // false-reject on the second page.
-        //
-        // Per-tenant scan is an N+1 pattern for system scope. The three
-        // mitigations are: (c) already short-circuits when the cached
-        // snapshot has the model; `resolve_tenants_for_scope` itself caps
-        // at 200 tenants (best-effort); this handler runs on settings PUT
-        // only — a rare, operator-initiated, human-latency path — not the
-        // orchestration hot loop. A bulk `exists_by_model_id` query would
-        // avoid the loop but requires a new trait method on
-        // `ProviderConnectionService` with Postgres/SQLite/InMemory
-        // impls — intentionally deferred (tracked as post-merge follow-up)
-        // to keep this PR scoped to the F20/F21 correctness fix.
-        const PAGE_SIZE: usize = 200;
-        const MAX_PAGES_PER_TENANT: usize = 50; // 10 000-connection ceiling
-                                                // Authoritative scopes (Tenant/Workspace/Project) resolve to
-                                                // exactly one tenant — if its store lookup fails we CANNOT say
-                                                // the model is unknown, so we surface 503 instead of misleading
-                                                // 422. System scope walks many tenants as a best-effort fan-out;
-                                                // a single tenant's store hiccup there is logged-but-skipped so
-                                                // one bad row can't block a system-wide default update.
-        use cairn_domain::Scope;
-        let authoritative = matches!(scope, Scope::Tenant | Scope::Workspace | Scope::Project);
-        let tenants = resolve_tenants_for_scope(state, scope, scope_id).await;
-        for tenant in &tenants {
-            for page in 0..MAX_PAGES_PER_TENANT {
-                let offset = page * PAGE_SIZE;
-                let records = match state
-                    .runtime
-                    .provider_connections
-                    .list(tenant, PAGE_SIZE, offset)
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(err) => {
-                        if authoritative {
-                            return Err(AppApiError::new(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "provider_connection_lookup_failed",
-                                format!(
-                                    "could not verify {key}={model_id}: \
-                                     provider connections unavailable for \
-                                     tenant {tenant}: {err}",
-                                ),
-                            )
-                            .into_response());
-                        }
-                        tracing::warn!(
-                            tenant = %tenant,
-                            error = %err,
-                            "skipping tenant during system-scope model validation",
-                        );
-                        break;
-                    }
-                };
-                if records
-                    .iter()
-                    .any(|r| r.supported_models.iter().any(|m| m == model_id))
-                {
-                    return Ok(());
-                }
-                if records.len() < PAGE_SIZE {
-                    break; // last page reached
-                }
-            }
-        }
-
-        // Nothing matched. 422 with an actionable message pointing the
-        // operator at both surfaces they can fix it from.
-        return Err(AppApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unknown_model",
-            format!(
-                "{key}={model_id} is not available. Valid values are either \
-                 a LiteLLM catalog ID (browse via GET /v1/models/catalog) or \
-                 a model listed in `supported_models` on one of your \
-                 configured provider connections (GET /v1/providers/connections).",
-            ),
-        )
-        .into_response());
+        return Ok(());
     }
 
     // Generic string-length cap for everything else.
     if let Some(s) = value.as_str() {
         if s.len() > PROMPT_LIKE_MAX_LEN {
-            return Err(validation_error_response(format!(
+            return Err(SettingValidationError::validation(format!(
                 "{key} exceeds max length {PROMPT_LIKE_MAX_LEN}"
             )));
         }
@@ -1181,29 +1046,62 @@ async fn validate_setting_value(
 
 pub(crate) async fn set_default_setting_handler(
     State(state): State<Arc<AppState>>,
-    Path((scope, scope_id, key)): Path<(String, String, String)>,
+    Path((scope_name, scope_id, key)): Path<(String, String, String)>,
     Json(body): Json<SetDefaultSettingRequest>,
 ) -> impl IntoResponse {
-    let Some(scope) = parse_scope_name(&scope) else {
+    let Some(scope) = parse_scope_name(&scope_name) else {
+        // Log before returning — the default access-log line
+        // (`status=422 latency=0ms`) does not include the rejection
+        // reason, and operator scripts that see only that line had no
+        // way to diagnose setup failures (#656).
+        tracing::info!(
+            scope = %scope_name,
+            scope_id = %scope_id,
+            key = %key,
+            code = "invalid_scope",
+            "settings PUT rejected: unknown scope name",
+        );
         return validation_error_response("invalid scope");
     };
 
-    // Per-key validation (closes #228). Unknown/empty/oversized values
-    // now 422 instead of silently persisting.
-    if let Err(resp) =
-        validate_setting_value(state.as_ref(), scope, &scope_id, &key, &body.value).await
-    {
-        return resp;
+    // Per-key validation (closes #228). Empty / oversized / non-numeric
+    // values for numeric keys now 422 instead of silently persisting.
+    // Model-id values are accepted as forward references and verified
+    // at orchestrate time (#656).
+    if let Err(err) = validate_setting_value(&key, &body.value) {
+        tracing::info!(
+            scope = %scope_name,
+            scope_id = %scope_id,
+            key = %key,
+            code = %err.code,
+            status = err.status.as_u16(),
+            reason = %err.message,
+            "settings PUT rejected: validation failed",
+        );
+        return AppApiError::new(err.status, err.code, err.message).into_response();
     }
 
     match state
         .runtime
         .defaults
-        .set(scope, scope_id, key, body.value)
+        .set(scope, scope_id.clone(), key.clone(), body.value)
         .await
     {
         Ok(setting) => (StatusCode::OK, Json(setting)).into_response(),
-        Err(err) => runtime_error_response(err),
+        Err(err) => {
+            // 5xx — a real store / runtime failure, not an operator
+            // input mistake. Log at WARN so production log pipelines
+            // that filter out INFO still surface it.
+            tracing::warn!(
+                scope = %scope_name,
+                scope_id = %scope_id,
+                key = %key,
+                code = "runtime_error",
+                reason = %err,
+                "settings PUT failed: runtime error persisting default",
+            );
+            runtime_error_response(err)
+        }
     }
 }
 

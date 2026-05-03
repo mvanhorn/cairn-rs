@@ -33,11 +33,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
-/// The `generate_model` key accepts any model id present in the bundled
-/// LiteLLM catalog; `gpt-4o-mini` is stable across catalog refreshes
-/// and doesn't require a live provider-connection lookup. Using it
-/// short-circuits `validate_setting_value` on path (a) of the model-id
-/// validator (cf. `handlers/health.rs`).
+/// The `generate_model` key accepts any non-empty, length-capped
+/// string id. `gpt-4o-mini` is a stable LiteLLM catalog entry; using
+/// it here keeps the test self-documenting even though the validator
+/// no longer consults the catalog at PUT time (#656 moved that check
+/// to orchestrate time).
 const MODEL_KEY: &str = "generate_model";
 const MODEL_VALUE: &str = "gpt-4o-mini";
 
@@ -234,9 +234,10 @@ async fn three_back_to_back_puts_after_readiness_all_succeed() {
     assert_eq!(h.wait_for_ready().await, StatusCode::OK);
 
     // Three different keys so the handler doesn't short-circuit on a
-    // duplicate-row optimization in the defaults service. Each key is
-    // in MODEL_ID_KEYS (see `handlers/health.rs`) so the validator
-    // accepts `gpt-4o-mini` via the bundled LiteLLM catalog.
+    // duplicate-row optimization in the defaults service. All are in
+    // MODEL_ID_KEYS (see `handlers/health.rs`); after #656 they accept
+    // any non-empty, length-capped string — the catalog/connection
+    // check moved to orchestrate time.
     for key in &["generate_model", "brain_model", "stream_model"] {
         let url = format!("{}/v1/settings/defaults/system/system/{}", h.base_url, key);
         let res = h
