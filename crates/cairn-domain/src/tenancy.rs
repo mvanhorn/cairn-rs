@@ -94,6 +94,19 @@ impl ProjectKey {
         }
     }
 
+    /// The conventional above-project scope used for system-owned
+    /// settings and defaults (e.g. `provider_credential_<id>`,
+    /// `provider_endpoint_<id>`, brain/worker model defaults).
+    ///
+    /// `DefaultsService::resolve` and the system-scope settings API
+    /// both treat `("system", "system", "system")` as the catch-all
+    /// that project-scoped resolve falls back to. Centralising the
+    /// constructor removes three copies of the magic-string triple
+    /// across the app binary and avoids typo-regressions.
+    pub fn system() -> Self {
+        Self::new("system", "system", "system")
+    }
+
     pub fn workspace_key(&self) -> WorkspaceKey {
         WorkspaceKey {
             tenant_id: self.tenant_id.clone(),

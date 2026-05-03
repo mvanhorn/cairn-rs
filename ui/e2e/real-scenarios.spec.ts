@@ -289,6 +289,19 @@ test("S6: Dynamic provider routing — create → route → delete → fallback"
   const connId = `s6_conn_${uid()}`;
   const testModel = `s6-model-${uid()}`;
 
+  // #634: openai-compatible now requires a credential binding at
+  // registration. Mint one so the POST below doesn't 422 on a
+  // contract-agnostic routing test. The credential value is unused —
+  // this test doesn't actually call upstream — but the binding is
+  // mandatory for non-ollama/non-bedrock adapters.
+  const credResp = await post(request, `/v1/admin/tenants/${scope.tenant_id}/credentials`, {
+    provider_id: connId,
+    plaintext_value: `sk-s6-stub-${uid()}`,
+  });
+  expect(credResp.status).toBeLessThan(300);
+  const credentialId = credResp.body?.id as string;
+  expect(credentialId).toBeTruthy();
+
   // Create a provider connection
   const createResp = await post(request, "/v1/providers/connections", {
     ...scope,
@@ -296,6 +309,7 @@ test("S6: Dynamic provider routing — create → route → delete → fallback"
     provider_family: "openai-compatible",
     adapter_type: "openai-compatible",
     supported_models: [testModel],
+    credential_id: credentialId,
   });
   expect(createResp.status).toBeLessThan(300);
 

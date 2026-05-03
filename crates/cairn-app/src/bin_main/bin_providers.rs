@@ -211,7 +211,7 @@ pub(crate) async fn resolve_connection_probe_material(
     state: &AppState,
     connection_id: &str,
 ) -> (Option<String>, Option<String>) {
-    let system_project = cairn_domain::ProjectKey::new("system", "system", "system");
+    let system_project = cairn_domain::ProjectKey::system();
 
     let endpoint_key = format!("provider_endpoint_{connection_id}");
     let endpoint_url = match state

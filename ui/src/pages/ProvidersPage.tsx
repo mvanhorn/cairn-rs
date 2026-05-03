@@ -1066,7 +1066,14 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
               {(Object.entries(PROVIDER_KINDS) as [ProviderKind, ProviderKindMeta][]).map(([k, m]) => (
                 <button
                   key={k}
-                  onClick={() => { selectKind(k); setStep(1); }}
+                  data-testid={`provider-kind-${k}`}
+                  // Tile click ONLY selects the kind. Advancing to the
+                  // Connection step is done by "Next →" in the footer.
+                  // Previously the tile also called `setStep(1)`, which
+                  // made every subsequent "Next →" click skip straight
+                  // over the Connection step (Type → Connection → Models
+                  // looked like Type → Models to the operator). See #634.
+                  onClick={() => selectKind(k)}
                   className={clsx(
                     "flex items-start gap-2 p-3 rounded-lg border text-left transition-colors",
                     kind === k
@@ -1128,9 +1135,13 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
 
               {kind !== "ollama" && (
                 <label className="block">
-                  <span className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">API Key</span>
+                  <span className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">
+                    API Key <span className="text-red-400">*</span>
+                  </span>
                   <input
                     type="password"
+                    data-testid="provider-api-key"
+                    required
                     value={apiKey}
                     onChange={e => setApiKey(e.target.value)}
                     placeholder="sk-… or $ENV_VAR_NAME"
@@ -1138,7 +1149,7 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
                     className="mt-1.5 w-full rounded-md bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 px-3 py-2 text-xs text-gray-800 dark:text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
                   />
                   <p className="mt-1 text-[10px] text-gray-400 dark:text-zinc-600">
-                    Paste a key directly, or prefix with <code className="text-[10px] font-mono text-indigo-400">$</code> to reference an env var (e.g. <code className="text-[10px] font-mono text-indigo-400">$BEDROCK_API_KEY</code>).
+                    Required. Paste a key directly, or prefix with <code className="text-[10px] font-mono text-indigo-400">$</code> to reference an env var (e.g. <code className="text-[10px] font-mono text-indigo-400">$BEDROCK_API_KEY</code>). Ollama is the only provider that can register without a key.
                   </p>
                 </label>
               )}

@@ -1810,6 +1810,9 @@ async fn memory_and_provider_routes_round_trip() {
         .unwrap();
     assert_eq!(search_response.status(), StatusCode::OK);
 
+    // #634: non-ollama adapters now require a credential binding. This
+    // roundtrip smoke test only cares about route wiring, so use ollama
+    // (the one adapter that registers without a credential).
     let connection_response = app
         .oneshot(
             Request::builder()
@@ -1820,9 +1823,9 @@ async fn memory_and_provider_routes_round_trip() {
                 .body(Body::from(
                     serde_json::json!({
                         "tenant_id": "default_tenant",
-                        "provider_connection_id": "conn_http_openai",
-                        "provider_family": "openai",
-                        "adapter_type": "responses_api"
+                        "provider_connection_id": "conn_http_ollama",
+                        "provider_family": "ollama",
+                        "adapter_type": "ollama"
                     })
                     .to_string(),
                 ))

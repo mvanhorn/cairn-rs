@@ -44,11 +44,14 @@ async fn team_app() -> axum::Router {
 }
 
 fn provider_connection_body() -> serde_json::Value {
+    // #634: non-ollama adapters now require a credential binding. These
+    // entitlement tests only care about tier gating (local vs team), so
+    // use ollama (the one adapter that registers without a credential).
     serde_json::json!({
         "tenant_id": "default_tenant",
         "provider_connection_id": "conn_test_1",
-        "provider_family": "openai",
-        "adapter_type": "responses_api"
+        "provider_family": "ollama",
+        "adapter_type": "ollama"
     })
 }
 

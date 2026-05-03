@@ -246,6 +246,35 @@ pub(crate) struct EvaluateGuardrailPolicyRequest {
     pub action: String,
 }
 
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Returns true when the named adapter needs an operator-supplied API key
+/// to successfully authenticate against its upstream endpoint.
+///
+/// The exceptions — adapters that authenticate without a cairn-stored
+/// credential — are:
+/// - `ollama`: unauthenticated; the adapter talks to a local daemon.
+/// - `bedrock` / `bedrock-compat`: SigV4 using AWS environment or
+///   instance-profile credentials (`AWS_ACCESS_KEY_ID`,
+///   `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, IMDS, etc.).
+///
+/// Matching is case-insensitive and accepts the common `_` and `-`
+/// spellings (`bedrock_compat`, `bedrock-compat`) so the handler behaves
+/// identically regardless of which spelling the client sent.
+///
+/// Unknown / operator-supplied adapter strings are conservatively treated
+/// as "requires credential" — a typo or a generic OpenAI-compatible
+/// endpoint still needs a key in practice, and returning 422 with a
+/// pointer to the credentials API is strictly better than silently
+/// registering a connection that 401s on the first call.
+fn adapter_requires_credential(adapter_type: &str) -> bool {
+    let normalized = adapter_type.trim().to_lowercase().replace('_', "-");
+    !matches!(
+        normalized.as_str(),
+        "ollama" | "bedrock" | "bedrock-compat" | "bedrock-converse" | "bedrock-openai",
+    )
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 pub(crate) async fn list_provider_health_handler(
@@ -627,6 +656,45 @@ pub(crate) async fn create_provider_connection_handler(
         return denied;
     }
 
+    // #634: refuse credential-less registration for adapters that require
+    // a key at runtime. Previously the handler silently accepted the
+    // payload, stored a connection record with no credential binding, and
+    // the operator only discovered the missing key on the first chat or
+    // /test call (401 from upstream). That made the UI wizard's
+    // "Register Provider" path look successful while producing a
+    // provider that could never route.
+    //
+    // Adapters exempt from this check:
+    //   - ollama: runs unauthenticated against a local endpoint.
+    //   - bedrock / bedrock-compat: authenticate via AWS SigV4 using
+    //     environment / instance-profile credentials, not a cairn-stored
+    //     API key.
+    //
+    // Operators who intentionally want a credential-less shell can still
+    // achieve it by pre-creating the `provider_credential_<conn_id>`
+    // default via /v1/settings/defaults before POSTing here. That gives
+    // them an explicit escape hatch, while blocking the silent-breakage
+    // path that bit the dogfood run.
+    if body.credential_id.is_none() && adapter_requires_credential(&body.adapter_type) {
+        let key = format!("provider_credential_{}", body.provider_connection_id);
+        let system_project = cairn_domain::ProjectKey::system();
+        let already_bound = matches!(
+            state.runtime.defaults.resolve(&system_project, &key).await,
+            Ok(Some(_)),
+        );
+        if !already_bound {
+            return AppApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "credential_required",
+                format!(
+                    "adapter \"{}\" requires an API key: either pass `credential_id` in the request body (create one via POST /v1/admin/tenants/:id/credentials) or pre-bind one via PUT /v1/settings/defaults/system/system/provider_credential_{}",
+                    body.adapter_type, body.provider_connection_id,
+                ),
+            )
+            .into_response();
+        }
+    }
+
     let before = crate::handlers::sse::current_event_head(&state).await;
     let conn_id = body.provider_connection_id.clone();
     let credential_id = body.credential_id.clone();
@@ -703,7 +771,7 @@ pub(crate) async fn resolve_provider_key_handler(
 
     let credential_id_str = connection_id.as_str();
     let cred_key = format!("provider_credential_{credential_id_str}");
-    let system_project = cairn_domain::ProjectKey::new("system", "system", "system");
+    let system_project = cairn_domain::ProjectKey::system();
     match state.runtime.defaults.resolve(&system_project, &cred_key).await {
         Ok(Some(setting)) => {
             if let Some(cred_id) = setting.as_str() {
@@ -1009,5 +1077,62 @@ pub(crate) async fn evaluate_guardrail_policy_handler(
         Ok(decision) => (StatusCode::OK, Json(decision)).into_response(),
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adapter_requires_credential;
+
+    #[test]
+    fn ollama_exempt() {
+        assert!(!adapter_requires_credential("ollama"));
+        assert!(!adapter_requires_credential("Ollama"));
+        assert!(!adapter_requires_credential("  OLLAMA  "));
+    }
+
+    #[test]
+    fn bedrock_exempt_all_spellings() {
+        // Bedrock family authenticates via AWS SigV4 (env / instance
+        // profile), not a cairn-stored API key.
+        assert!(!adapter_requires_credential("bedrock"));
+        assert!(!adapter_requires_credential("bedrock-compat"));
+        assert!(!adapter_requires_credential("bedrock_compat"));
+        assert!(!adapter_requires_credential("bedrock-converse"));
+        assert!(!adapter_requires_credential("bedrock-openai"));
+    }
+
+    #[test]
+    fn everything_else_requires_credential() {
+        // Representative sample across families — openai-shaped, native
+        // Z.ai, Google Gemini, azure — every one needs a key.
+        for adapter in [
+            "openai",
+            "anthropic",
+            "zai",
+            "zai-coding",
+            "google",
+            "deepseek",
+            "xai",
+            "groq",
+            "azure-openai",
+            "openrouter",
+            "minimax",
+            "openai-compatible",
+        ] {
+            assert!(
+                adapter_requires_credential(adapter),
+                "{adapter} should require a credential",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_adapters_fail_closed() {
+        // A typo or brand-new adapter must refuse the write rather than
+        // silently accept — 422 with `credential_required` is strictly
+        // better than a registered-but-broken connection.
+        assert!(adapter_requires_credential("typo-adapter"));
+        assert!(adapter_requires_credential("my-custom-proxy"));
     }
 }
