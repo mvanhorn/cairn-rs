@@ -1862,30 +1862,34 @@ async fn real_main() {
             });
         }
 
-        // RFC 020 §"Startup order" step 6: flip readiness to ready in a
-        // background task so the HTTP listener is already accepting
-        // connections (liveness + `/health/ready` responding 503 with the
-        // progress JSON) by the time the final flip happens. In normal
-        // production this races the first client request and wins; under
-        // `CAIRN_TEST_STARTUP_DELAY_MS` (dev/test builds only) we sleep
-        // first so integration tests can observe the 503-with-progress
-        // response the RFC 020 contract promises.
-        let readiness_for_flip = lib_state.readiness.clone();
-        tokio::spawn(async move {
-            #[cfg(debug_assertions)]
-            if let Ok(ms) = std::env::var("CAIRN_TEST_STARTUP_DELAY_MS") {
-                if let Ok(delay) = ms.parse::<u64>() {
-                    tracing::warn!(
-                        delay_ms = delay,
-                        "CAIRN_TEST_STARTUP_DELAY_MS set — delaying readiness flip \
-                         (debug build only; release strips this hook)"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-            }
-            readiness_for_flip.mark_ready();
-            tracing::info!("cairn-app readiness: /health/ready now returns 200");
-        });
+        // RFC 020 §"Startup order" step 6: defer readiness flip until
+        // AFTER `axum::serve` has entered its accept loop.
+        //
+        // Closes #652. The previous implementation spawned `mark_ready`
+        // into an independent `tokio::spawn` task alongside the
+        // awaited-inline `axum::serve(...)`. On a multi-thread runtime
+        // the spawned task could run BEFORE the awaited serve future
+        // was first polled. That produced a window in which:
+        //
+        //   1. `/health/ready` flipped to 200 (atomic set on worker A).
+        //   2. The `cairn-app readiness: /health/ready now returns 200`
+        //      log line emitted.
+        //   3. Operator boot automation (polls `/health/ready` in a
+        //      loop) observed the 200 and immediately fired a PUT/POST.
+        //   4. axum's accept loop had not yet drained the kernel's
+        //      listen backlog, so the request sat in the queue — and
+        //      when the handler chain DID finally receive it, the
+        //      request body and middleware state sometimes failed to
+        //      hydrate, surfacing as 422 `missing field <X>` even for
+        //      well-formed bodies.
+        //
+        // We now SPAWN `axum::serve` instead of inline-awaiting it, then
+        // yield the scheduler twice (belt-and-braces on single-worker
+        // test runtimes) so the serve task is guaranteed to have been
+        // polled — i.e. the listener is actively accepting — before
+        // `mark_ready()` fires. The `CAIRN_TEST_STARTUP_DELAY_MS` hook
+        // (debug builds only) is preserved so RFC-020 integration
+        // tests can still observe the 503-with-progress contract.
 
         // ── F65 PR-5: snapshot GC sweeper ────────────────────────────────────
         // Hourly-default TTL sweep over workspace_snapshots. Defaults:
@@ -1976,16 +1980,99 @@ async fn real_main() {
         // rate-limit middleware's `resolved_client_ip` can fall back
         // to the TCP peer when no `X-Forwarded-For` header is set.
         // Closes #649 (localhost CI traffic no longer trips the limiter).
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            wait_for_shutdown_signal().await;
-            let _ = signal_tx.send(true);
-        })
-        .await
-        .unwrap_or_else(|e| eprintln!("server error: {e}"));
+        //
+        // #652 boot-readiness race fix: `axum::serve` is spawned into
+        // its own task rather than awaited inline. That lets the main
+        // task yield the scheduler below so the serve task's accept
+        // loop is guaranteed to be polled — and therefore actively
+        // draining the kernel listen backlog — BEFORE readiness flips
+        // to 200. Without this the `/health/ready` 200 flip and the
+        // axum accept loop entering ready-state race, producing the
+        // silent "missing field <X>" 422s the dogfood user's boot
+        // automation hit on every cold boot.
+        let serve_handle = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                wait_for_shutdown_signal().await;
+                let _ = signal_tx.send(true);
+            })
+            .await
+            .unwrap_or_else(|e| eprintln!("server error: {e}"));
+        });
+
+        // Yield the scheduler so the spawned `serve_handle` task has at
+        // least two chances to be polled by the tokio runtime. On a
+        // multi-threaded runtime this is almost always instant; on a
+        // single-worker test runtime we need the double yield to
+        // guarantee the accept loop is live before we advertise
+        // readiness. `yield_now` is not a sleep — it returns `Pending`
+        // once, which cedes control to the scheduler.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Now — and only now — flip readiness. The accept loop is
+        // active, so a client polling `/health/ready` and then
+        // immediately firing a PUT/POST will hit a fully-running
+        // axum pipeline, not a cold backlog.
+        //
+        // `CAIRN_TEST_STARTUP_DELAY_MS` is cached behind a `OnceLock`
+        // per repo convention (Gemini review on #654) — boot-time
+        // static config is read once, never per-boot-iteration. The
+        // inner `cfg!(debug_assertions)` gate keeps release builds
+        // from ever consulting the variable, same as the previous
+        // `#[cfg(debug_assertions)]` path.
+        {
+            use std::sync::OnceLock;
+            static DELAY_MS: OnceLock<Option<u64>> = OnceLock::new();
+            let delay_override = *DELAY_MS.get_or_init(|| {
+                if cfg!(debug_assertions) {
+                    std::env::var("CAIRN_TEST_STARTUP_DELAY_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                } else {
+                    None
+                }
+            });
+
+            let readiness_for_flip = lib_state.readiness.clone();
+            if let Some(delay) = delay_override {
+                // Defer the flip into a spawned task so the server
+                // keeps processing `/health/ready` during the delay —
+                // that is exactly the window the RFC-020 integration
+                // test asserts against (503-with-progress body).
+                tracing::warn!(
+                    delay_ms = delay,
+                    "CAIRN_TEST_STARTUP_DELAY_MS set — delaying readiness flip \
+                     (debug build only; release strips this hook)"
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    readiness_for_flip.mark_ready();
+                    tracing::info!("cairn-app readiness: /health/ready now returns 200");
+                });
+            } else {
+                readiness_for_flip.mark_ready();
+                tracing::info!("cairn-app readiness: /health/ready now returns 200");
+            }
+        }
+
+        // Wait for the serve task to complete. When `axum::serve`
+        // returns (graceful shutdown or I/O error), the `serve_handle`
+        // join resolves and we fall through to the shutdown cleanup.
+        //
+        // A join error (panic in the serve task, runtime-level abort)
+        // means the HTTP server is dead and the process cannot
+        // function. Exit 1 so the process supervisor (systemd /
+        // Kubernetes) restarts us rather than leaving a zombie
+        // process whose `/health/ready` still reports 200 but which
+        // no longer services requests. Gemini review on #654.
+        if let Err(err) = serve_handle.await {
+            eprintln!("axum serve task join error: {err}");
+            std::process::exit(1);
+        }
 
         watchdog.abort();
         // F65 PR-5: abort the GC sweeper so graceful shutdown doesn't
