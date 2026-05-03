@@ -1,12 +1,14 @@
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowLeft, Loader2, AlertTriangle, CheckCircle2, Inbox, Download,
+  ArrowLeft, Loader2, AlertTriangle, CheckCircle2, Inbox, Download, Plus,
 } from "lucide-react";
 import { clsx } from "clsx";
 import { StatCard } from "../components/StatCard";
 import { StateBadge } from "../components/StateBadge";
 import { CopyButton } from "../components/CopyButton";
 import { useToast } from "../components/Toast";
+import { NewRunDialog } from "../components/NewRunDialog";
 import { ApiError, defaultApi } from "../lib/api";
 import { errorMessage } from "../lib/errors";
 import { table as tablePreset } from "../lib/design-system";
@@ -113,6 +115,11 @@ interface SessionDetailPageProps {
 
 export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps) {
   const toast = useToast();
+  const qc = useQueryClient();
+  // Controls the "New Run" dialog (issue #635). Mounted inline so the
+  // component's own state (goal/iterations/planMode) resets between
+  // openings without a manual reset hook.
+  const [showNewRun, setShowNewRun] = useState(false);
 
   // Fetch session metadata from the list.
   const { data: sessions } = useQuery({
@@ -246,6 +253,29 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
             </div>
             <div className="flex items-center gap-3 shrink-0">
               {session && <SessionPill state={session.state} />}
+              {/* #635 — primary CTA. Disabled when the session no longer
+                  accepts new runs (terminal states) so the operator does
+                  not kick off work that will immediately fail on the
+                  session_state_gate. Hidden when the session record has
+                  not hydrated yet (fail-closed until we know the state). */}
+              <button
+                data-testid="session-new-run-btn"
+                onClick={() => setShowNewRun(true)}
+                disabled={!session || session.state !== "open"}
+                title={
+                  !session
+                    ? "Loading session…"
+                    : session.state === "open"
+                      ? "Create a new run under this session"
+                      : `Cannot create a run — session is ${session.state}.`
+                }
+                className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
+                           bg-indigo-600 hover:bg-indigo-500 text-white
+                           transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Plus size={12} />
+                New Run
+              </button>
               <button
                 data-testid="session-export-btn"
                 data-pending={exportSessionMut.isPending ? "true" : "false"}
@@ -366,7 +396,20 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
               </div>
             </div>
           ) : runs.length === 0 ? (
-            <p className="text-[13px] text-gray-400 dark:text-zinc-600 italic py-4">No runs in this session.</p>
+            <div className="flex flex-col items-start gap-3 py-4">
+              <p className="text-[13px] text-gray-400 dark:text-zinc-600 italic">No runs in this session yet.</p>
+              {session?.state === "open" && (
+                <button
+                  data-testid="session-new-run-empty-btn"
+                  onClick={() => setShowNewRun(true)}
+                  className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
+                             bg-indigo-600 hover:bg-indigo-500 text-white transition-colors"
+                >
+                  <Plus size={12} />
+                  Create first run
+                </button>
+              )}
+            </div>
           ) : (
             <div className="rounded-lg border border-gray-200 dark:border-zinc-800 overflow-x-auto">
               <table className="min-w-full text-[13px]">
@@ -416,6 +459,30 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
             </div>
           )}
         </Section>
+
+        {/* #635 — New-run dialog. Mounted conditionally so the component's
+            local state (goal/iterations/plan-mode) resets cleanly between
+            openings. Navigation to the new run happens inside `onCreated`
+            so operators land on the detail page where orchestration
+            telemetry and logs show up live. */}
+        {showNewRun && (
+          <NewRunDialog
+            sessionId={sessionId}
+            onClose={() => setShowNewRun(false)}
+            onCreated={(run) => {
+              setShowNewRun(false);
+              // Refresh the session's runs list — the created run
+              // should appear immediately in the table above even if
+              // the operator clicks Back to session after landing on
+              // run detail. Also invalidate the global runs list so
+              // the Runs page updates if it is mounted in the
+              // background.
+              void qc.invalidateQueries({ queryKey: ["session-runs", sessionId] });
+              void qc.invalidateQueries({ queryKey: ["runs"] });
+              window.location.hash = `run/${encodeURIComponent(run.run_id)}`;
+            }}
+          />
+        )}
 
         {/* LLM Traces table */}
         <Section title={`LLM Traces${traces.length > 0 ? ` (${traces.length})` : ""}`}>
