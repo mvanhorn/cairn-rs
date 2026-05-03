@@ -1971,13 +1971,21 @@ async fn real_main() {
             std::process::exit(0);
         });
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                wait_for_shutdown_signal().await;
-                let _ = signal_tx.send(true);
-            })
-            .await
-            .unwrap_or_else(|e| eprintln!("server error: {e}"));
+        // `into_make_service_with_connect_info::<SocketAddr>()` populates
+        // `ConnectInfo<SocketAddr>` in the request extensions so the
+        // rate-limit middleware's `resolved_client_ip` can fall back
+        // to the TCP peer when no `X-Forwarded-For` header is set.
+        // Closes #649 (localhost CI traffic no longer trips the limiter).
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown_signal().await;
+            let _ = signal_tx.send(true);
+        })
+        .await
+        .unwrap_or_else(|e| eprintln!("server error: {e}"));
 
         watchdog.abort();
         // F65 PR-5: abort the GC sweeper so graceful shutdown doesn't

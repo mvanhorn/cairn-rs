@@ -1901,10 +1901,18 @@ impl AppBootstrap {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
-            .await
-            .map_err(|err| format!("axum server failed: {err}"))
+        // `into_make_service_with_connect_info::<SocketAddr>()` populates
+        // `ConnectInfo<SocketAddr>` in each request's extensions. The
+        // rate-limit middleware (`resolved_client_ip`) reads that
+        // extension when `X-Forwarded-For` is absent so localhost
+        // traffic can be identified and exempted. Closes #649.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|err| format!("axum server failed: {err}"))
     }
 
     async fn serve_with_tls_shutdown<F>(
@@ -1928,9 +1936,13 @@ impl AppBootstrap {
             shutdown_handle.graceful_shutdown(None);
         });
 
+        // Match the non-TLS path: install `ConnectInfo<SocketAddr>` so
+        // the rate-limit middleware can resolve the client IP and
+        // apply the loopback exemption (#649) uniformly across both
+        // transports.
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|err| format!("axum TLS server failed: {err}"))
     }

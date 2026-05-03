@@ -1,13 +1,14 @@
 //! HTTP middleware: authentication, rate limiting, observability.
 
 use std::{
+    net::SocketAddr,
     sync::{atomic::Ordering, Arc},
     time::Instant,
 };
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{MatchedPath, Request, State},
+    extract::{ConnectInfo, MatchedPath, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -91,6 +92,55 @@ pub(crate) async fn rate_limit_middleware(
         request.uri().path(),
         "/health" | "/ready" | "/metrics" | "/version"
     ) {
+        return next.run(request).await;
+    }
+
+    // ── Loopback exemption (closes #649) ────────────────────────────────
+    //
+    // Requests from a *direct* loopback caller bypass the rate limiter.
+    // "Direct" means two things must both hold:
+    //   (a) the TCP peer IP is loopback (127.0.0.0/8 or ::1), AND
+    //   (b) the request carries no forwarding headers — no
+    //       `X-Forwarded-For` and no `Forwarded` (RFC 7239).
+    //
+    // Motivation: our own CI job runs cairn-app and Playwright on the
+    // same GitHub Actions runner, so every test request originates
+    // from 127.0.0.1 over a direct socket and shares the single
+    // `dev-admin-token` bucket (1000 req/min). A 122-spec × 2-worker
+    // suite trips that limit deterministically — the limiter is
+    // correctly doing its job, but it is the wrong layer.
+    //
+    // Security — why (b) is mandatory (Gemini r1 high-severity catch):
+    //   A naive check of "is the resolved client IP loopback?" that
+    //   trusted `X-Forwarded-For` over the TCP peer would let any
+    //   external attacker forge `X-Forwarded-For: 127.0.0.1` and
+    //   walk straight past the limiter. Instead we ignore forwarding
+    //   headers for exemption purposes: their *presence* is the
+    //   signal that a proxy handled this request, at which point
+    //   the limiter is exactly the layer that should be doing its
+    //   job. An attacker cannot synthesize the absence of a header
+    //   through a proxy they don't control.
+    //
+    // Security — why this does not widen attack surface:
+    //   1. Production deployments always terminate a reverse proxy
+    //      in front of cairn-app. The proxy sets `X-Forwarded-For`
+    //      (and/or `Forwarded`) on every request, so condition (b)
+    //      is always false for external traffic and the limiter
+    //      continues to apply.
+    //   2. The direct-peer path only matters for callers on the
+    //      same host — in a proxied deployment that means
+    //      colocated processes already inside the trust boundary.
+    //   3. Auth is unchanged. A loopback caller without a valid
+    //      `CAIRN_ADMIN_TOKEN` still gets rejected by
+    //      `auth_middleware` upstream.
+    //
+    // Caveat, called out explicitly: a deployment that exposes
+    // cairn-app on loopback of a shared (multi-tenant) host without
+    // a reverse proxy would lose rate-limit protection on that path.
+    // That is not a supported production topology — `docs/ops/`
+    // mandates reverse-proxy fronting — but an operator on a shared
+    // VM should know the limiter no longer gates their peers.
+    if is_direct_loopback_request(&request) {
         return next.run(request).await;
     }
 
@@ -476,6 +526,43 @@ pub(crate) fn request_rate_limit_key(request: &Request) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Returns `true` iff the request originated from a direct loopback
+/// socket and carries no reverse-proxy forwarding headers.
+///
+/// This is the exemption predicate for the rate limiter (closes #649).
+/// Both conditions must hold:
+///   1. The TCP peer (`ConnectInfo<SocketAddr>`) is loopback
+///      (127.0.0.0/8 or ::1) per [`IpAddr::is_loopback`].
+///   2. Neither `X-Forwarded-For` nor `Forwarded` (RFC 7239) is
+///      present on the request.
+///
+/// Condition 2 is the security gate (Gemini r1 high-severity catch).
+/// If we exempted on peer alone we'd be fine, but if we ever let
+/// `X-Forwarded-For: 127.0.0.1` classify a request as loopback, any
+/// external attacker who could reach a proxy that doesn't strip
+/// inbound `X-Forwarded-For` would trivially bypass rate limiting.
+/// Treating the *presence* of any forwarding header as "this came
+/// through a proxy, apply the limiter" keeps the exemption confined
+/// to the CI + local-dev topology we care about and removes the
+/// header-trust surface entirely. An attacker cannot synthesise the
+/// absence of a header through infrastructure they don't control.
+fn is_direct_loopback_request(request: &Request) -> bool {
+    // Any forwarding header — even an empty one, even a nonsense
+    // value — disqualifies the request from the exemption. We do
+    // not parse or validate the header; its mere presence is the
+    // "this was proxied" signal.
+    if request.headers().contains_key("x-forwarded-for")
+        || request.headers().contains_key("forwarded")
+    {
+        return false;
+    }
+
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(addr)| addr.ip().is_loopback())
 }
 
 /// Returns a lowercase hex SHA-256 digest of `token`. Closes #490: the
@@ -1295,6 +1382,120 @@ mod tests {
             hash_rate_limit_token(""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         );
+    }
+
+    // ── #649: loopback exemption ──────────────────────────────────────────
+    //
+    // The rate-limit middleware bypasses bucket accounting when
+    // `is_direct_loopback_request` returns true — i.e. when the TCP
+    // peer is 127.0.0.0/8 or ::1 AND the request carries no
+    // `X-Forwarded-For` / `Forwarded` header. These tests pin every
+    // fork of that predicate, including the spoofing scenarios that
+    // Gemini r1 flagged as high severity.
+
+    fn connect_info_request(peer: &str) -> Request<Body> {
+        let addr: SocketAddr = peer.parse().expect("valid socket addr");
+        let mut req = Request::builder()
+            .uri("/v1/runs")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
+    }
+
+    #[test]
+    fn rate_limit_bypasses_ipv4_loopback() {
+        // Peer = 127.0.0.1, no X-Forwarded-For → direct-loopback →
+        // middleware short-circuits before touching the bucket map,
+        // so no amount of repeat traffic can trip the 1 000/min
+        // limit.
+        let req = connect_info_request("127.0.0.1:54321");
+        assert!(is_direct_loopback_request(&req));
+    }
+
+    #[test]
+    fn rate_limit_bypasses_ipv6_loopback() {
+        // IPv6 ::1 is the v6 loopback. Same bypass contract as v4.
+        let req = connect_info_request("[::1]:54321");
+        assert!(is_direct_loopback_request(&req));
+    }
+
+    #[test]
+    fn rate_limit_respects_x_forwarded_for_over_loopback() {
+        // Production topology: a reverse proxy terminates TLS on the
+        // same host as cairn-app. The TCP peer is loopback AND the
+        // proxy sets `X-Forwarded-For`. The exemption MUST NOT fire
+        // — otherwise a proxied deployment would silently disable the
+        // rate limiter.
+        let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let mut req = Request::builder()
+            .uri("/v1/runs")
+            .header("x-forwarded-for", "8.8.8.8")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        assert!(
+            !is_direct_loopback_request(&req),
+            "presence of X-Forwarded-For must disqualify the exemption \
+             even when the TCP peer is 127.0.0.1",
+        );
+    }
+
+    #[test]
+    fn rate_limit_still_applies_to_rfc1918() {
+        // Peer inside RFC 1918 private space (10.0.0.0/8) is NOT
+        // loopback — the exemption must not leak to LAN traffic.
+        let req = connect_info_request("10.0.0.1:54321");
+        assert!(!is_direct_loopback_request(&req));
+    }
+
+    /// Gemini r1 HIGH: an external attacker must NOT be able to
+    /// bypass the limiter by forging `X-Forwarded-For: 127.0.0.1`.
+    /// The exemption ignores the header entirely for classification
+    /// purposes — only the TCP peer matters, and the presence of
+    /// *any* forwarding header disqualifies the request.
+    #[test]
+    fn rate_limit_spoofed_x_forwarded_for_loopback_does_not_bypass() {
+        let addr: SocketAddr = "203.0.113.42:40000".parse().unwrap(); // TEST-NET-3
+        let mut req = Request::builder()
+            .uri("/v1/runs")
+            .header("x-forwarded-for", "127.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        assert!(
+            !is_direct_loopback_request(&req),
+            "forged X-Forwarded-For: 127.0.0.1 from a public peer must \
+             never bypass the rate limiter",
+        );
+    }
+
+    /// The alternate RFC 7239 `Forwarded:` header must also
+    /// disqualify the exemption — a proxy that speaks Forwarded
+    /// instead of X-Forwarded-For is still a proxy.
+    #[test]
+    fn rate_limit_forwarded_header_also_disqualifies() {
+        let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let mut req = Request::builder()
+            .uri("/v1/runs")
+            .header("forwarded", "for=8.8.8.8")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        assert!(!is_direct_loopback_request(&req));
+    }
+
+    /// A request with no `ConnectInfo` extension falls through — no
+    /// bypass, no panic. Applies to any axum `serve()` that wasn't
+    /// wired with `into_make_service_with_connect_info` (test
+    /// harnesses, or a misconfigured future server).
+    #[test]
+    fn rate_limit_no_connect_info_does_not_bypass() {
+        let req = Request::builder()
+            .uri("/v1/runs")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_direct_loopback_request(&req));
     }
 
     // ── classify_body_read_error (audit #483 follow-up, #564 review) ───────
