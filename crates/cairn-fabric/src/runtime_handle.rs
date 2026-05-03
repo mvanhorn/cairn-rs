@@ -42,23 +42,28 @@
 //!
 //! # Valkey escape hatches
 //!
-//! Two services still need Valkey-specific primitives that FF has
-//! not yet surfaced through `EngineBackend`: `SignalBridge` does
-//! `ff_deliver_signal` via a raw `ferriskey::Client::fcall`, and
-//! `FabricSchedulerService` wraps `flowfabric::scheduler::Scheduler`
-//! which is `ferriskey::Client`-constructed. The trait exposes:
+//! Two Valkey-specific escape hatches remain on the trait:
 //!
-//! - [`FabricRuntimeHandle::valkey_client`] — `Option<&ferriskey::Client>`
-//!   for constructors that need one.
+//! - [`FabricRuntimeHandle::valkey_client`] — `Option<&ferriskey::Client>`.
+//!   `FabricSchedulerService::new` threads this through to
+//!   `ff_scheduler::Scheduler::new` so the Valkey partition scanner
+//!   (`ZRANGEBYSCORE` + `exec_core` `HGET`) keeps working. On PG the
+//!   client is `None`; FF 0.15 accepts that and the scanner degrades
+//!   to `Ok(None)`. Post-FF-0.15 the method no longer gates
+//!   construction — the cairn scheduler service constructs on both
+//!   backends. See
+//!   `docs/CONSUMER_MIGRATION_0.15_scheduler_agnostic.md` for the
+//!   FF-side contract.
 //! - [`FabricRuntimeHandle::fcall`] — Valkey FCALL on Valkey,
 //!   `FabricError::Engine(EngineError::Unavailable)` on Postgres.
+//!   Production callers route through `EngineBackend` trait methods
+//!   instead; this is a narrow internal hatch.
 //!
-//! On the Postgres runtime both return `None` / `Unavailable`.
-//! Callers that need them must gate their code paths behind the
-//! Valkey-backend check or tolerate the `Unavailable` error
-//! (the scheduler + signal-delivery surfaces are covered by
-//! cairn-rs' own "worker code paths are Valkey-gated" contract —
-//! full-app mode on PG does not spin a worker loop).
+//! FF 0.15 closed [FF#511](https://github.com/avifenesh/FlowFabric/issues/511):
+//! `FabricSchedulerService::claim_for_worker` no longer returns
+//! `EngineError::Unavailable` on PG — it either serves a real claim
+//! (Valkey, scanner path) or degrades to `Ok(None)` (PG, no scanner
+//! primitive yet). The last service-layer parity gap is closed.
 //!
 //! [`PostgresFabricRuntime`]: crate::postgres_boot::PostgresFabricRuntime
 

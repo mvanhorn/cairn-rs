@@ -1605,3 +1605,140 @@ async fn pg_list_incoming_edges_for_standalone_eid_is_empty() {
         edges.len()
     );
 }
+
+// ── FF 0.15 — new admission / budget trait methods ────────────────────
+//
+// FF 0.15 added four new `EngineBackend` methods that underpin the
+// scheduler's admission path. Bodied on PG for two of the four; the
+// other two (scheduler-owned primitives) keep the default
+// `Unavailable` per the FF 0.15 migration guide. See
+// `docs/CONSUMER_MIGRATION_0.15_scheduler_agnostic.md` §Trait additions.
+
+/// `read_quota_policy_limits` on a never-created quota policy must
+/// return `Ok(None)` (absence is a well-defined "no admission
+/// configured" signal per the contract, not an error).
+///
+/// This test pins the cairn-side cast from `Arc<PostgresControlPlane>`
+/// into the `EngineBackend` trait — a regression that loses the PG
+/// body would surface as `Err(EngineError::Unavailable)` from the
+/// default impl.
+#[tokio::test]
+async fn pg_read_quota_policy_limits_absent_returns_none() {
+    use flowfabric::core::contracts::QuotaPolicyLimits;
+
+    let cp = control_plane().await;
+    // Quota policy id that has never been written.
+    let qpid = QuotaPolicyId::new();
+
+    let result: Result<Option<QuotaPolicyLimits>, _> =
+        cp.backend.read_quota_policy_limits(&qpid).await;
+
+    match result {
+        Ok(None) => { /* expected */ }
+        Ok(Some(snap)) => {
+            panic!("fresh QuotaPolicyId must return None, got limits snapshot: {snap:?}")
+        }
+        Err(e) => panic!(
+            "PG read_quota_policy_limits must have a real body post-FF-0.15, \
+             got error: {e}"
+        ),
+    }
+}
+
+/// `release_admission` on a never-admitted slot must be idempotent —
+/// the FF contract says releasing an already-released (or never-taken)
+/// slot is a no-op, returning `ReleaseAdmissionResult::Released`.
+#[tokio::test]
+async fn pg_release_admission_on_fresh_slot_is_idempotent() {
+    use flowfabric::core::contracts::{ReleaseAdmissionArgs, ReleaseAdmissionResult};
+
+    let cp = control_plane().await;
+    let qpid = QuotaPolicyId::new();
+    let eid = test_eid("pg_release_admission_fresh");
+
+    let args = ReleaseAdmissionArgs::new(qpid.clone(), eid);
+    let result = cp
+        .backend
+        .release_admission(args)
+        .await
+        .expect("PG release_admission must succeed (idempotent contract)");
+
+    assert!(
+        matches!(result, ReleaseAdmissionResult::Released),
+        "PG release_admission must return Released (idempotent), got {result:?}"
+    );
+}
+
+/// `block_execution_for_admission` keeps the default `Unavailable` on
+/// PG in FF 0.15 — it's a scheduler-owned primitive and the PG
+/// backend has no body. Pin this contract so a future FF body landing
+/// without a cairn-side integration trips the test (and prompts us to
+/// route cairn's admission-block path through it).
+#[tokio::test]
+async fn pg_block_execution_for_admission_returns_unavailable() {
+    use flowfabric::core::contracts::{BlockExecutionForAdmissionArgs, BlockingReason};
+    use flowfabric::core::partition::{Partition, PartitionFamily};
+    use flowfabric::core::types::TimestampMs;
+
+    let cp = control_plane().await;
+    let eid = test_eid("pg_block_admission_unavail");
+    let partition = Partition {
+        family: PartitionFamily::Flow,
+        index: 0,
+    };
+    let args = BlockExecutionForAdmissionArgs::new(
+        eid,
+        LaneId::new("cairn"),
+        partition,
+        BlockingReason::WaitingForQuota,
+        None,
+        TimestampMs(0),
+    );
+
+    let err = cp
+        .backend
+        .block_execution_for_admission(args)
+        .await
+        .expect_err("block_execution_for_admission is scheduler-owned; PG default is Unavailable");
+
+    match err {
+        EngineError::Unavailable { op } => {
+            assert_eq!(
+                op, "block_execution_for_admission",
+                "expected Unavailable op label to match trait method name, got {op}"
+            );
+        }
+        other => panic!(
+            "expected EngineError::Unavailable, got: {other:?}. \
+             If FF added a PG body, wire cairn's admission-block path through it."
+        ),
+    }
+}
+
+/// `read_budget_usage_and_limits` keeps the default `Unavailable` on
+/// PG in FF 0.15 — scheduler-owned primitive, no PG body yet. Same
+/// rationale as `pg_block_execution_for_admission_returns_unavailable`.
+#[tokio::test]
+async fn pg_read_budget_usage_and_limits_returns_unavailable() {
+    let cp = control_plane().await;
+    let bid = BudgetId::new();
+
+    let err = cp
+        .backend
+        .read_budget_usage_and_limits(&bid)
+        .await
+        .expect_err("read_budget_usage_and_limits is scheduler-owned; PG default is Unavailable");
+
+    match err {
+        EngineError::Unavailable { op } => {
+            assert_eq!(
+                op, "read_budget_usage_and_limits",
+                "expected Unavailable op label to match trait method name, got {op}"
+            );
+        }
+        other => panic!(
+            "expected EngineError::Unavailable, got: {other:?}. \
+             If FF added a PG body, wire cairn's budget-read path through it."
+        ),
+    }
+}

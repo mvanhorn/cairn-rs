@@ -1469,9 +1469,9 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferriskey"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b98824c1cc5ca77d3f45cb055cde96edd39028271ce8280448071561f5974ce3"
+checksum = "cdf362a39e13c2e63632e136cbd0b820dea1b04f7f0f71fce218ca951a4cdc71"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1514,9 +1514,9 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-postgres"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a9a1a3810239e97c2774dfc6bc074cbb7409b0e3a09974dc17d36791878e28c"
+checksum = "8d0412c50aa469a22f9e45fab6b05716b550371a50735cffb9b160fa67730ad7"
 dependencies = [
  "async-trait",
  "ff-core",
@@ -1534,9 +1534,9 @@ dependencies = [
 
 [[package]]
 name = "ff-backend-valkey"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1001106ed2e46b7687f0216abc1c2f89813fe1bc0fafc98a4fe0d2cb326d9f8"
+checksum = "872677a502b8455da5630b513234055c71ab10be956e5f23474988b1f69812a2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1556,9 +1556,9 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2665ffed8221b8708ae84872cf1410b2c8da6daddca2699fc91717cacb6af89c"
+checksum = "391d88c3b1e06d23eaef88af0210c5aca4527ab27e61c620fcc8ffe8087a02cc"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1577,9 +1577,9 @@ dependencies = [
 
 [[package]]
 name = "ff-engine"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea4c037c998523e490f2b07e0c796bb674c9104325ee815dbf10958589af8b47"
+checksum = "db6cceac6382081c790c6226ce65b59ac9dec5325d049e319be53c4fccd742b2"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",
@@ -1593,9 +1593,9 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "792042acd106a1822986d1ffd99160043c4888de97528a26f26ae662eb182846"
+checksum = "1f57c5bf81d5f6f2f3d9c3f7e4e31573342f839239710aa54a01a7b74336feda"
 dependencies = [
  "opentelemetry",
  "opentelemetry-prometheus",
@@ -1605,9 +1605,9 @@ dependencies = [
 
 [[package]]
 name = "ff-scheduler"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a9bd779a8f963c11609fd5beef868d06e54a70a8d2738333df2da15876dc113"
+checksum = "041d5921546f93847796fb4338d7bff64e5138bbda996de4d2a630c55e8dc0d1"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -1619,9 +1619,9 @@ dependencies = [
 
 [[package]]
 name = "ff-script"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0836517ac449531fb26e0de4250c021bc8155dd88c8b88ae189de413bfdba64"
+checksum = "65e18b38475a2eae099438646371e04a33dfc4dafe8b180c1195b739434cffe4"
 dependencies = [
  "ferriskey",
  "ff-core",
@@ -1633,9 +1633,9 @@ dependencies = [
 
 [[package]]
 name = "ff-sdk"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0b40504c778ee7af397cbfac0fcc70b501135fe5509c7ec14aece6261ce597d"
+checksum = "d9e6f7270e6ffa4f298d94c968eb6e59f1a6eec651d78179a93f3bdd86360db8"
 dependencies = [
  "ferriskey",
  "ff-backend-valkey",
@@ -1679,9 +1679,9 @@ dependencies = [
 
 [[package]]
 name = "flowfabric"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc2efdaa6265385736fb8af233c63d40ce3f76ed91709bbf2fbe1235fb261f1d"
+checksum = "5c3c2125ca44a48b437708f4791f4ddf3c3ba89754549c2dc310eb55bd246f45"
 dependencies = [
  "ff-backend-postgres",
  "ff-backend-valkey",

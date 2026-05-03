@@ -231,3 +231,67 @@ async fn pg_signal_bridge_deliver_reaches_engine_backend() {
 
     services.shutdown().await;
 }
+
+/// Proves `FabricSchedulerService::claim_for_worker` reaches the
+/// FF 0.15 backend-agnostic scheduler on PG — it no longer returns
+/// `EngineError::Unavailable { op: "scheduler_claim_for_worker ..." }`.
+///
+/// Closes [FF#511](https://github.com/avifenesh/FlowFabric/issues/511):
+/// FF 0.15 added `Scheduler::new_with_backend(Weak<dyn EngineBackend>, _)`,
+/// so cairn's scheduler service now constructs on PG runtimes too.
+///
+/// FF 0.15 kept the partition-scanner path (`ZRANGEBYSCORE` +
+/// `exec_core` `HGET`) Valkey-specialised, so on PG the scheduler
+/// degrades to `Ok(None)` instead of claiming a real execution. That's
+/// the contract this test pins: `Ok(None)` on a fresh PG aggregate with
+/// no submitted executions, and — critically — *not*
+/// `Err(FabricError::Engine(EngineError::Unavailable))`, which was the
+/// pre-FF-0.15 behaviour this bump closes.
+#[tokio::test]
+async fn pg_scheduler_claim_for_worker_does_not_return_unavailable() {
+    let pg = shared_pg().await;
+    let config = pg_fabric_config(&pg.url);
+    let event_log: Arc<dyn EventLog + Send + Sync> = Arc::new(InMemoryStore::default());
+    let services = FabricServices::start(config, event_log)
+        .await
+        .expect("boot");
+
+    let lane = LaneId::new("cairn");
+    let worker = WorkerId::new("test-worker");
+    let instance = WorkerInstanceId::new("test-worker-i1");
+    let grant_ttl_ms = 5_000;
+
+    // PG aggregate has zero submitted executions, so the scheduler's
+    // scanner has nothing to claim. Pre-FF-0.15 this would return
+    // `Err(Unavailable)` at the constructor-gate; post-FF-0.15 it
+    // constructs and the scanner returns `None`.
+    let result = services
+        .scheduler
+        .claim_for_worker(&lane, &worker, &instance, grant_ttl_ms)
+        .await;
+
+    match result {
+        Ok(None) => { /* expected: scanner found nothing */ }
+        Ok(Some(grant)) => panic!(
+            "fresh PG aggregate returned a claim grant without any submitted \
+             executions — scheduler state may be polluted. grant: {grant:?}"
+        ),
+        Err(e) => {
+            let rendered = format!("{e}");
+            assert!(
+                !rendered.contains("Unavailable"),
+                "PG scheduler must NOT return Unavailable after FF 0.15 \
+                 (FF#511 closed); got: {rendered}"
+            );
+            // If FF ever surfaces a different typed error on the
+            // scanner path, assert on THIS message so the regression
+            // reason stays obvious.
+            panic!(
+                "unexpected error from claim_for_worker on an empty PG \
+                 aggregate — expected Ok(None). got: {rendered}"
+            );
+        }
+    }
+
+    services.shutdown().await;
+}

@@ -65,7 +65,7 @@ test-harness = ["fabric-valkey", "dep:testcontainers", "dep:testcontainers-modul
 # without that feature cairn-fabric consumes only the backend-agnostic
 # surface (core::types, core::contracts, sdk::task types, engine
 # traits) that FF exposes with default features.
-flowfabric = { version = "0.14", default-features = false }
+flowfabric = { version = "0.15", default-features = false }
 # `ff-observability` is only wired inside the Valkey runtime
 # (`FabricRuntime::start` constructs an `Arc<Metrics>` and hands it
 # to `Engine::start_with_completions`). Gate it behind
@@ -77,7 +77,7 @@ flowfabric = { version = "0.14", default-features = false }
 # and no FF metrics surface on cairn-app's `/metrics` endpoint. The
 # shim exists for no-observability embedded builds; cairn is never
 # that, so we always want the real backend.
-ff-observability = { version = "0.14", features = ["enabled"], optional = true }
+ff-observability = { version = "0.15", features = ["enabled"], optional = true }
 # ferriskey is the Valkey driver FF's control-plane path constructs
 # FCALL ARGV against. The remaining direct `ferriskey::Client` users
 # are gated behind `fabric-valkey`:
@@ -91,7 +91,7 @@ ff-observability = { version = "0.14", features = ["enabled"], optional = true }
 #     (all legacy Lua FCALLs except suspend, which moved to typed).
 # Do not add new direct ferriskey usage; route through the engine
 # traits instead.
-ferriskey = { version = "0.14", optional = true }
+ferriskey = { version = "0.15", optional = true }
 # PR-C3: direct handle to the PostgreSQL backend crate. Gated behind
 # `fabric-postgres` so a default (Valkey-only) build neither compiles
 # nor links the PG driver. `flowfabric/postgres` pulls this crate in
@@ -100,7 +100,7 @@ ferriskey = { version = "0.14", optional = true }
 # without the `flowfabric::backend::postgres` re-export detour. PR-C4
 # will exercise `PostgresBackend::connect` inside
 # `PostgresFabricRuntime::start`.
-ff-backend-postgres = { version = "0.14", optional = true }
+ff-backend-postgres = { version = "0.15", optional = true }
 
 # Cairn crates
 cairn-domain = { path = "../cairn-domain" }
@@ -168,7 +168,7 @@ futures = "0.3"
 # synthesise a pre-Wave-1c handle byte buffer and assert the 0.9+
 # decode compat path still accepts it. The `test-fixtures` feature is
 # dev-only on ff-core — production binaries never link it.
-ff-core = { version = "0.14", features = ["test-fixtures"] }
+ff-core = { version = "0.15", features = ["test-fixtures"] }
 # PR-C4a: `postgres_control_plane_live.rs` needs a direct sqlx pool to
 # run FF migrations (`apply_migrations(&pool)`) on the testcontainer
 # before constructing the `PostgresBackend` handle. Dev-only; production
