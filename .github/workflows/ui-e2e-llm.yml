@@ -130,7 +130,7 @@ jobs:
         env:
           CAIRN_BRAIN_URL: https://api.z.ai/api/coding/paas/v4/
           CAIRN_BRAIN_KEY: ${{ secrets.ZAI_API_KEY }}
-          CAIRN_BRAIN_MODEL: glm-4.6
+          CAIRN_BRAIN_MODEL: glm-4.7
           PLAYWRIGHT_LIVE_LLM: "1"
           CAIRN_FABRIC_URL: valkey://127.0.0.1:6379
           CAIRN_FABRIC_WAITPOINT_HMAC_KID: ci-ui-e2e-llm
