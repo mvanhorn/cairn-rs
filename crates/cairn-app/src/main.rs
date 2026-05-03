@@ -1986,6 +1986,13 @@ async fn real_main() {
         if let Some(h) = gc_handle.as_ref() {
             h.abort();
         }
+        // #639: drain background lease keepers so their per-run
+        // `RunService` handles don't outlive the fabric connection
+        // pool. `shutdown_all` is idempotent, awaits every keeper,
+        // and returns in <1s on a quiesced system (keepers cancel
+        // out of their sleep via the CancellationToken). The
+        // registry lives on the lib-side `AppState`.
+        lib_state.lease_keepers.shutdown_all().await;
         eprintln!("shutdown: all connections drained");
         flush_state_to_disk(&state_for_flush).await;
         eprintln!("shutdown: complete");

@@ -662,6 +662,38 @@ async fn orchestrate_run_handler_inner(
             .into_response();
     }
 
+    // #639: spawn a background lease-keeper for this run so long
+    // approval-paced flows can't let the FF lease expire between
+    // orchestrate HTTP calls. The keeper calls
+    // `RunService::renew_lease_if_stale` every `lease_ttl_ms / 3` and
+    // self-exits when it observes a terminal state or a non-transient
+    // renew error. Idempotent: `ensure_running` atomically checks
+    // under a mutex and no-ops if a keeper is already alive for this
+    // run_id, so concurrent orchestrate calls never spawn duplicates.
+    //
+    // Only runs when the Fabric services aggregate is installed —
+    // pure in-memory test harnesses (`AppState.fabric = None`) don't
+    // have a lease to renew. The lease TTL comes from FabricConfig
+    // (default 180 s; operator-overridable via
+    // `CAIRN_FABRIC_LEASE_TTL_MS`).
+    if let Some(fabric) = state.fabric.as_ref() {
+        // `lease_ttl_ms` is a `FabricRuntimeHandle` trait method; the
+        // method is reachable via the `Arc<dyn FabricRuntimeHandle>`
+        // field on `FabricServices.runtime` without a `use` import
+        // because the trait is already auto-in-scope at the vtable
+        // call site.
+        let lease_ttl_ms = fabric.runtime.lease_ttl_ms();
+        state
+            .lease_keepers
+            .ensure_running(
+                refreshed.run_id.clone(),
+                refreshed.session_id.clone(),
+                state.runtime.runs.clone(),
+                lease_ttl_ms,
+            )
+            .await;
+    }
+
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

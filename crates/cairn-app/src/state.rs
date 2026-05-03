@@ -403,6 +403,17 @@ pub struct AppState {
     /// retry hit a different node; that gap closes with a future
     /// FF-backed shared cache.
     pub idempotency_cache: Arc<crate::idempotency::IdempotencyCache>,
+    /// #639: background lease-keeper registry.
+    ///
+    /// One `tokio::spawn`'d keeper per live run; each keeper calls
+    /// `RunService::renew_lease_if_stale` every `lease_ttl_ms / 3` so
+    /// long approval-paced flows can't let FF's lease expire between
+    /// orchestrate HTTP calls. The registry is atomic on
+    /// `ensure_running` (concurrent orchestrate handlers don't spawn
+    /// duplicates) and the keeper self-exits on terminal state or
+    /// fatal renew error. See `crate::lease_keeper` for the full
+    /// contract.
+    pub lease_keepers: Arc<crate::lease_keeper::LeaseKeeperRegistry>,
 }
 
 /// F50: dynamic-dispatch wrapper so the lib crate can push
@@ -950,6 +961,7 @@ impl AppState {
             orchestrate_kick_tx: Arc::new(OrchestrateKickSender::new()),
             notification_sink: Arc::new(NotificationSink::new()),
             idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new()),
+            lease_keepers: Arc::new(crate::lease_keeper::LeaseKeeperRegistry::new()),
         };
         state.runtime.store.reset_usage_counters();
 
