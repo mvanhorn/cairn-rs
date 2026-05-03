@@ -70,10 +70,12 @@ pub mod valkey_impl;
 #[cfg(feature = "fabric-postgres")]
 pub mod postgres_control_plane_impl;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
-use flowfabric::core::types::{EdgeId, ExecutionId, FlowId, LaneId, WorkerId, WorkerInstanceId};
+use flowfabric::core::types::{
+    EdgeId, ExecutionId, FlowId, LaneId, Namespace, WorkerId, WorkerInstanceId,
+};
 
 use crate::error::FabricError;
 
@@ -85,7 +87,7 @@ pub use control_plane_types::{
     ExecutionLeaseContext, ExpiredLease, FailExecutionOutcome, FailRunInput, FlowCancelOutcome,
     IssueGrantAndClaimInput, QuotaAdmission, RenewLeaseInput, ResumeRunInput, RotationFailure,
     RotationOutcome, StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
-    WorkerRegistration,
+    WorkerRegistration, WorkerSummary,
 };
 #[cfg(feature = "fabric-postgres")]
 pub use postgres_control_plane_impl::PostgresControlPlane;
@@ -227,34 +229,72 @@ pub trait Engine: Send + Sync {
         tags: &BTreeMap<String, String>,
     ) -> Result<(), FabricError>;
 
-    // ── Worker registry (Phase D PR 1) ──────────────────────────────────
+    // ── Worker registry (RFC-025 — FF 0.14 trait-routed) ────────────────
+    //
+    // FF 0.14 shipped 5 new `EngineBackend` trait methods covering the
+    // worker-pool lifecycle + live-worker readback + expired-lease
+    // enumeration (RFC-025 Phase 1-6). Cairn's cairn-side `Engine`
+    // trait mirrors them so services stay backend-agnostic. Both
+    // in-tree impls — [`valkey_impl::ValkeyEngine`] and
+    // [`postgres_control_plane_impl::PostgresControlPlane`] — route
+    // directly to the FF trait method; no bespoke per-backend commands.
 
-    /// Register a worker instance. Writes the worker hash, stamps the
-    /// initial heartbeat timestamp, adds the instance to the global
-    /// workers index, and registers each `key=value` capability on
-    /// the capability index. TTL = `3 × lease_ttl_ms` — dead workers
-    /// auto-expire if heartbeats stop.
+    /// Register (or idempotently refresh) a worker instance.
+    ///
+    /// Re-registering the same `instance_id` overwrites caps + lanes +
+    /// TTL (RFC-025 §9.3). FF 0.14 rejects re-registering with a
+    /// different `worker_id` under the same `instance_id` with
+    /// `Validation(InvalidInput, "instance_id reassigned")`.
+    ///
+    /// `liveness_ttl_ms` is stored alongside the registration so
+    /// `heartbeat_worker` refreshes to the same value without the
+    /// caller re-supplying it.
     async fn register_worker(
         &self,
         worker_id: &WorkerId,
         instance_id: &WorkerInstanceId,
-        capabilities: &[String],
+        namespace: &Namespace,
+        lanes: &BTreeSet<LaneId>,
+        capabilities: &BTreeSet<String>,
+        liveness_ttl_ms: u64,
     ) -> Result<WorkerRegistration, FabricError>;
 
-    /// Update the worker's `last_heartbeat_ms` field and extend its
-    /// TTL. Called on every worker tick.
-    async fn heartbeat_worker(&self, instance_id: &WorkerInstanceId) -> Result<(), FabricError>;
+    /// Refresh the worker-instance liveness TTL. Returns
+    /// `HeartbeatWorkerOutcome::NotRegistered` transparently via
+    /// [`FabricError`] on the TTL-expired-between-heartbeats race.
+    async fn heartbeat_worker(
+        &self,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+    ) -> Result<(), FabricError>;
 
-    /// Explicitly mark a worker dead (`is_alive = false`). The TTL
-    /// path covers the implicit case; this is the opt-out for graceful
-    /// shutdown.
-    async fn mark_worker_dead(&self, instance_id: &WorkerInstanceId) -> Result<(), FabricError>;
+    /// Operator-driven worker death (distinct from passive TTL expiry).
+    /// `reason` is capped at 256 bytes and must not contain control
+    /// characters; oversize / invalid reject with
+    /// `EngineError::Validation`. Idempotent: marking an already-absent
+    /// instance is a no-op success.
+    async fn mark_worker_dead(
+        &self,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+        reason: &str,
+    ) -> Result<(), FabricError>;
 
-    // ── Task lifecycle reads (Phase D PR 2b) ────────────────────────────
+    /// Enumerate live workers (RFC-025 Phase 6, §9.4) in the given
+    /// namespace. Pass `namespace = None` for a cross-namespace sweep
+    /// (auth enforced at the cairn-app admin route, NOT the trait
+    /// boundary).
+    async fn list_workers(
+        &self,
+        namespace: Option<&Namespace>,
+    ) -> Result<Vec<control_plane_types::WorkerSummary>, FabricError>;
+
+    // ── Task lifecycle reads ────────────────────────────────────────────
 
     /// Enumerate executions whose active lease has expired as of
-    /// `now_ms`, capped at `limit`. Read-only ZRANGEBYSCORE over FF's
-    /// `lease_expiry` zset across every execution partition.
+    /// `now_ms`, capped at `limit`. FF 0.14 routes this through
+    /// `EngineBackend::list_expired_leases`; every in-tree backend
+    /// ships a body (Valkey, Postgres, SQLite).
     ///
     /// FF's server-side lease_expiry scanner handles reclaim — this
     /// primitive exists so cairn can surface a projection of

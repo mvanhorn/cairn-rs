@@ -24,10 +24,10 @@ use crate::runtime_handle::FabricRuntimeHandle;
 /// executions can't grow the map unbounded.
 const LANE_ID_CACHE_MAX: usize = 1024;
 
-/// Read the HMAC waitpoint token for `waitpoint_id` via FF 0.13's
-/// `EngineBackend::read_waitpoint_token` trait method
-/// (`ff-core-0.13.0/src/engine_backend.rs:306`). Cairn never caches the
-/// token — FF owns it from mint (`ff_suspend_execution`) to reveal.
+/// Read the HMAC waitpoint token for `waitpoint_id` via FF's
+/// `EngineBackend::read_waitpoint_token` trait method. Cairn never
+/// caches the token — FF owns it from mint (`ff_suspend_execution`)
+/// to reveal.
 ///
 /// Returns `Err(Validation)` ONLY when the field is missing or empty — i.e.
 /// the waitpoint hash has never been written, or was deleted. FF does NOT
@@ -37,6 +37,23 @@ const LANE_ID_CACHE_MAX: usize = 1024;
 /// state boundary where it belongs. That separation matters — mixing
 /// "waitpoint never existed" with "waitpoint is closed" at the auth layer
 /// would re-create the exact oracle FF's Lua took pains to eliminate.
+///
+/// # FF 0.14 wrappers NOT adopted (intentional)
+///
+/// FF 0.14 ships two optional consumer surfaces over this trait method:
+///
+/// * `ff_sdk::FlowFabricAdminClient::read_waitpoint_token` — HTTP-
+///   fronted wrapper. Not adopted because cairn holds the
+///   `Arc<dyn EngineBackend>` in-process and the HTTP detour would
+///   add a network hop for zero benefit.
+/// * `ff_sdk::signal_bridge::verify_and_deliver` — packages
+///   "read token → constant-time compare → forward via
+///   `FlowFabricWorker::deliver_signal`" for consumers that don't
+///   already own signal-bridge logic. Not adopted because cairn's
+///   `SignalBridge` is richer (multi-signal-type dispatch, lane-id
+///   cache, cairn-specific error enum, FCALL-direct delivery path)
+///   and already calls this primitive. Adopting FF's composite would
+///   drop cairn-specific behaviour and add a router hop.
 ///
 /// Pre-PR-C2 this was a direct `ferriskey::Client::hget` against
 /// `{exec}:waitpoint:<wp>`; PR-C2 routes it through the backend trait
@@ -801,10 +818,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use flowfabric::core::types::{EdgeId, FlowId, WorkerId, WorkerInstanceId};
+    use flowfabric::core::types::{EdgeId, FlowId, Namespace, WorkerId, WorkerInstanceId};
 
     use crate::engine::{
-        control_plane_types::{ExpiredLease, WorkerRegistration},
+        control_plane_types::{ExpiredLease, WorkerRegistration, WorkerSummary},
         EdgeSnapshot, Engine, ExecutionSnapshot, FlowSnapshot,
     };
 
@@ -909,20 +926,32 @@ mod tests {
             &self,
             _worker_id: &WorkerId,
             _instance_id: &WorkerInstanceId,
-            _capabilities: &[String],
+            _namespace: &Namespace,
+            _lanes: &std::collections::BTreeSet<LaneId>,
+            _capabilities: &std::collections::BTreeSet<String>,
+            _liveness_ttl_ms: u64,
         ) -> Result<WorkerRegistration, FabricError> {
             unimplemented!("unused in lane-id tests")
         }
         async fn heartbeat_worker(
             &self,
             _instance_id: &WorkerInstanceId,
+            _namespace: &Namespace,
         ) -> Result<(), FabricError> {
             unimplemented!("unused in lane-id tests")
         }
         async fn mark_worker_dead(
             &self,
             _instance_id: &WorkerInstanceId,
+            _namespace: &Namespace,
+            _reason: &str,
         ) -> Result<(), FabricError> {
+            unimplemented!("unused in lane-id tests")
+        }
+        async fn list_workers(
+            &self,
+            _namespace: Option<&Namespace>,
+        ) -> Result<Vec<WorkerSummary>, FabricError> {
             unimplemented!("unused in lane-id tests")
         }
         async fn list_expired_leases(

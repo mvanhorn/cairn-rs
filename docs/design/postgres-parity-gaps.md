@@ -1,15 +1,18 @@
 # Postgres backend parity gaps
 
-Last updated: 2026-05-01 (PR-C4c)
+Last updated: 2026-05-03 (FF 0.14 adoption)
 
 Cairn-rs's `fabric-postgres` feature is a work-in-progress backend. This
 document tracks:
 
-1. **Bucket-C trait methods** that currently return
-   `EngineError::Unavailable { op }` on Postgres (5 methods).
-2. **Service-layer parity** — the Valkey-specific operations that
-   still surface `Unavailable` on PG even though the full service
-   aggregate now boots (PR-C4c).
+1. **Trait-level parity** — every method on cairn's `Engine` +
+   `ControlPlaneBackend` now routes through an `EngineBackend` trait
+   body on Postgres; bucket-C is **closed**.
+2. **Service-layer parity** — two cairn-side surfaces
+   (`FabricSchedulerService::claim_for_worker`,
+   `SignalBridge::deliver_*_signal`) still surface `Unavailable` on
+   PG because they depend on `ferriskey::Client` / Lua-FCALL primitives
+   FF has not yet exposed on `EngineBackend`.
 3. **Operator guide** — what works, what fails, and how to choose a
    backend.
 
@@ -17,60 +20,48 @@ The Valkey backend is the complete reference implementation. Every
 cairn feature that ships on Valkey is presumed to work on Valkey; this
 document only enumerates deltas relative to that baseline.
 
-## Bucket C — trait methods returning `Unavailable` on Postgres
+## Trait-level parity — closed by FF 0.14
 
-Each method returns
-`Err(FabricError::Engine(Box::new(EngineError::Unavailable { op: "<method>" })))`
-rather than panicking. Callers can branch on this variant to degrade
-gracefully or surface a classified error to operators.
+FF 0.14 landed the two upstream asks that held bucket-C open:
 
-| Method | Gap reason | Upstream | Workaround |
-|---|---|---|---|
-| `list_incoming_edges` | FF 0.13's `EngineBackend` trait has no point-query for an execution's incoming edges; SDK-only today. | [FF#477](https://github.com/avifenesh/FlowFabric/issues/477) | Use Valkey backend. Cairn's internal schedulers always own the `FlowId` at the call site, so an alternative path exists once the trait surfaces the primitive. |
-| `register_worker` | FF 0.13's `EngineBackend` trait has no worker-registry primitive. | [FF#473](https://github.com/avifenesh/FlowFabric/issues/473) | Use Valkey backend. Cairn-app's worker paths are Valkey-gated today; PG-only deployments wait on FF#473. |
-| `heartbeat_worker` | Same as `register_worker`. | FF#473 | Use Valkey backend. |
-| `mark_worker_dead` | Same as `register_worker`. | FF#473 | Use Valkey backend. |
-| `list_expired_leases` | FF handles lease reclaim server-side via each backend's scanner; no operator-facing trait read exposed. | FF#473 (bundles with worker-registry) | Use Valkey backend for operator dashboards; PG deployments lose only the "expired leases" surface on the dashboards, not reclaim correctness. |
+- **FF#473** (RFC-025 worker-registry parity): 5 new `EngineBackend`
+  trait methods — `register_worker`, `heartbeat_worker`,
+  `mark_worker_dead`, `list_expired_leases`, `list_workers` — with
+  bodies on every in-tree backend (Valkey, Postgres, SQLite).
+- **FF#477** (`list_incoming_edges` on Postgres): surfaced as two
+  composable trait primitives — `resolve_execution_flow_id` +
+  `list_edges(flow_id, direction)` — with Postgres-native bodies.
+
+Cairn-rs adopted both in the FF 0.13 → 0.14 bump. The
+`PostgresControlPlane` impl now delegates verbatim for all 37/37
+trait methods; no `Unavailable` returns remain at the trait layer.
 
 Integration tests in
 `crates/cairn-fabric/tests/postgres_control_plane_live.rs` assert the
-typed `Unavailable` response for each method. A regression that
-replaces the typed error with a panic or a wrong `op` literal trips
-CI.
+delegation end-to-end on a live Postgres container. The PG
+register_worker / idempotent-refresh tests are currently `#[ignore]`
+pending an FF 0.14 upstream fix: `ff_backend_postgres::register_worker`
+uses `RETURNING (xmax = 0)` in a `query_scalar`, which PG 16 rejects
+with `0A000: cannot retrieve a system column in this context`
+(`execTuples.c:tts_virtual_getsysattr`). The one-line upstream fix is
+either `RETURNING xmax` + client-side comparison or `RETURNING (xmax
+= 0)::boolean`. The Valkey register_worker path is fully covered in
+`crates/cairn-fabric/tests/integration/test_control_plane.rs` so the
+cairn adapter + trait-delegation shape is regression-safe in the
+meantime.
 
-## Service-layer parity (PR-C4c)
+## Service-layer parity — two surfaces still Valkey-only
 
-`FabricServices::start(BackendKind::Postgres)` now returns `Ok(_)` —
-the full service aggregate boots against a `PostgresFabricRuntime`.
-cairn-rs#602 is closed.
-
-### What changed
-
-Service constructors (`FabricRunService::new`,
-`FabricTaskService::new`, `FabricSessionService::new`,
-`FabricQuotaService::new`, `FabricSchedulerService::new`,
-`SignalBridge::new`) accept `Arc<dyn FabricRuntimeHandle>` instead of
-`Arc<FabricRuntime>`. Both the Valkey `FabricRuntime` and
-`PostgresFabricRuntime` impl the trait — the aggregate's construction
-chain is shared between the two backends in `build_services`.
-
-The `FabricServices` struct exposes two runtime slots:
-
-- `pub runtime: Arc<dyn FabricRuntimeHandle>` — backend-agnostic,
-  always populated.
-- `pub valkey_runtime: Option<Arc<FabricRuntime>>` — concrete Valkey
-  runtime. `Some(_)` on Valkey boots, `None` on PG boots. Callers
-  that need `ferriskey::Client`, `ff_observability::Metrics`, or the
-  instance-tag backfill branch gate on the `Option`.
-
-### Surfaces that still return `Unavailable` on PG
+`FabricServices::start(BackendKind::Postgres)` returns `Ok(_)` and the
+full service aggregate boots against a `PostgresFabricRuntime`
+(cairn-rs#602, landed in PR-C4c).
 
 Two cairn-side services wrap primitives FF's `EngineBackend` trait
 does not yet surface natively:
 
-- **`FabricSchedulerService::claim_for_worker`** — FF 0.13's
-  `ff_scheduler::Scheduler::new` takes `ferriskey::Client`. The PG
-  runtime's `valkey_client()` returns `None`, so the inner
+- **`FabricSchedulerService::claim_for_worker`** — FF 0.14's
+  `ff_scheduler::Scheduler::new` still takes `ferriskey::Client`. The
+  PG runtime's `valkey_client()` returns `None`, so the inner
   `Scheduler` is skipped and `claim_for_worker` returns
   `EngineError::Unavailable { op: "scheduler_claim_for_worker (Postgres backend has no ff-scheduler)" }`.
   Cairn-app's worker loop is gated at the app layer on a Valkey
@@ -90,12 +81,12 @@ primitives on `EngineBackend`.
 
 - `FabricServices::start` boot.
 - `FabricRunService` / `FabricTaskService` / `FabricSessionService` /
-  `FabricQuotaService` — every method that routes through
-  `ControlPlaneBackend` + `Engine` (27 bucket-B + 3 bucket-A trait
-  methods). That's the entire run / task / flow lifecycle,
-  dependency staging, eligibility evaluation, lease renewal,
-  cancel/complete/fail paths, budget + quota primitives, HMAC
-  rotation, claim issuance.
+  `FabricQuotaService` / `FabricWorkerService` — every method that
+  routes through `ControlPlaneBackend` + `Engine`. That's the entire
+  run / task / flow lifecycle, dependency staging, eligibility
+  evaluation, lease renewal, cancel/complete/fail paths, budget +
+  quota primitives, HMAC rotation, claim issuance, and the
+  RFC-025 worker-pool primitives.
 - `FabricRotationService::rotate_waitpoint_hmac` — via
   `ControlPlaneBackend`.
 
@@ -106,21 +97,23 @@ primitives on `EngineBackend`.
 | Deployment shape | Recommended backend |
 |---|---|
 | Full cairn-app in `--mode team` (runs, tasks, sessions, approvals) — HTTP CRUD surfaces only | **Valkey** or **Postgres** (PR-C4c: full aggregate boots on both) |
-| Full cairn-app in `--mode team` with worker pool (`cairn-app` claim loop) | **Valkey** until FF#473 lands — scheduler's `claim_for_worker` needs a `ferriskey::Client` today |
+| Full cairn-app in `--mode team` with worker pool (`cairn-app` claim loop) | **Valkey** — scheduler's `claim_for_worker` needs a `ferriskey::Client` today |
 | Full cairn-app in `--mode team` with signal delivery (approvals, tool-result, child-completed) | **Valkey** until FF surfaces a trait-level `deliver_signal` cairn can consume |
 | Full cairn-app in `--mode local` | **Valkey** (local-mode shares the signal-delivery path) |
-| Control-plane-only integration (third-party tool calling `PostgresControlPlane` for flow / edge / execution reads + lifecycle primitives) | **Postgres** works for 32/37 trait methods; 5 bucket-C methods return `Unavailable` |
+| Control-plane-only integration (third-party tool calling `PostgresControlPlane` for flow / edge / execution reads + lifecycle primitives + worker registry) | **Postgres** — all 37 trait methods have real bodies |
 
 ### What works on `fabric-postgres` today
 
 - **`FabricServices::start(BackendKind::Postgres)` boots the full
-  service aggregate** (PR-C4c). Run / task / session / quota /
-  rotation surfaces all route through the same `ControlPlaneBackend`
-  + `Engine` traits on both backends.
-- 27 bucket-B trait methods — run/task/flow lifecycle, dependency
-  staging, eligibility evaluation, lease renewal, cancel/complete/fail
-  paths, budget + quota primitives, HMAC rotation, claim issuance.
-- 3 bucket-A trait methods — execution tag get/set, flow tag set.
+  service aggregate** (PR-C4c).
+- **All 37 `Engine` + `ControlPlaneBackend` trait methods** — run /
+  task / flow lifecycle, dependency staging, eligibility evaluation,
+  lease renewal, cancel / complete / fail paths, budget + quota
+  primitives, HMAC rotation, claim issuance, execution + flow tag
+  reads/writes, RFC-025 worker-pool primitives
+  (`register_worker` / `heartbeat_worker` / `mark_worker_dead` /
+  `list_workers` / `list_expired_leases`), and `list_incoming_edges`
+  via the `resolve_execution_flow_id` + `list_edges` composition.
 - Direct `PostgresControlPlane` construction for control-plane-only
   callers.
 
@@ -134,16 +127,6 @@ primitives on `EngineBackend`.
   because `ff_deliver_signal` is a Valkey Lua FCALL. Signal-delivery
   surfaces (approvals, tool-result, child-completed) are
   app-layer-gated to Valkey.
-- **Worker registry** — 4 bucket-C methods return `Unavailable`. No
-  regression in cairn-app today because worker paths are
-  Valkey-gated, but tenants wanting PG-only deployments must wait for
-  FF#473.
-- **`list_incoming_edges`** — returns `Unavailable`. Scheduler-internal
-  callers own the `FlowId` at the site, so composing on top of
-  `describe_flow` is a viable alternative once FF#477 lands.
-- **`list_expired_leases`** — returns `Unavailable`. Reclaim itself
-  works (FF's server-side scanner handles it per-backend); only the
-  operator dashboard's "currently expired" read degrades.
 - **`/metrics`'s `ff_observability` block** — rendered only on Valkey.
   The PG backend has no registry today; cairn-side metrics still
   surface.
@@ -152,7 +135,8 @@ primitives on `EngineBackend`.
 
 ### Error shape for callers
 
-All `Unavailable` responses surface as:
+`Unavailable` responses from the two remaining service-layer surfaces
+surface as:
 
 ```rust
 Err(FabricError::Engine(Box::new(EngineError::Unavailable {
@@ -160,27 +144,14 @@ Err(FabricError::Engine(Box::new(EngineError::Unavailable {
 })))
 ```
 
-Match on the typed variant to branch:
-
-```rust
-match cp.list_incoming_edges(&eid).await {
-    Ok(edges) => { /* Valkey path */ }
-    Err(FabricError::Engine(e)) => match *e {
-        EngineError::Unavailable { op } => {
-            // PG fallback — choose: degrade the read, or surface a
-            // 503 with the op name in the detail field.
-        }
-        other => return Err(FabricError::Engine(Box::new(other))),
-    },
-    Err(other) => return Err(other),
-}
-```
+Match on the typed variant to branch.
 
 ## Cross-references
 
 - [cairn-rs#346](https://github.com/avifenesh/cairn-rs/issues/346) — Postgres opt-in feature (closed by PR-C4b).
 - [cairn-rs#347](https://github.com/avifenesh/cairn-rs/issues/347) — backend-agnosticism meta (closed by PR-C4b).
 - [cairn-rs#602](https://github.com/avifenesh/cairn-rs/issues/602) — service-constructor refactor (closed by PR-C4c).
-- [FF#473](https://github.com/avifenesh/FlowFabric/issues/473) — worker-registry parity upstream.
-- [FF#477](https://github.com/avifenesh/FlowFabric/issues/477) — `list_incoming_edges` trait surfacing upstream.
-- [`docs/design/ff-migration/pr-c4a-classification.md`](ff-migration/pr-c4a-classification.md) — per-method bucket A/B/C classification.
+- [FF#473](https://github.com/avifenesh/FlowFabric/issues/473) — worker-registry parity upstream (closed by FF 0.14).
+- [FF#477](https://github.com/avifenesh/FlowFabric/issues/477) — `list_incoming_edges` trait surfacing upstream (closed by FF 0.14).
+- [FF 0.14 consumer migration guide](https://github.com/avifenesh/FlowFabric/blob/main/docs/CONSUMER_MIGRATION_0.14_worker_registry.md).
+- [`docs/design/ff-migration/pr-c4a-classification.md`](ff-migration/pr-c4a-classification.md) — per-method bucket A/B/C classification (historical).

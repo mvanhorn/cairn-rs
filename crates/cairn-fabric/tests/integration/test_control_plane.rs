@@ -17,7 +17,7 @@
 //! [`ControlPlaneBackend`]: cairn_fabric::engine::ControlPlaneBackend
 //! [`Engine`]: cairn_fabric::engine::Engine
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use cairn_fabric::engine::{
     AddExecutionToFlowInput, ApplyDependencyToChildInput, BudgetSpendOutcome, CancelFlowInput,
@@ -318,12 +318,19 @@ async fn engine_register_heartbeat_mark_dead_roundtrip() {
     let h = TestHarness::setup().await;
     let wid = WorkerId::new(format!("cp_w_{}", uuid::Uuid::new_v4()));
     let iid = WorkerInstanceId::new(format!("cp_i_{}", uuid::Uuid::new_v4()));
-    let caps = vec!["gpu=true".to_owned(), "linux=x86_64".to_owned()];
+    let ns = Namespace::new(format!("cp_ns_{}", uuid::Uuid::new_v4()));
+    let lanes: BTreeSet<LaneId> = ["default".to_owned(), "gpu".to_owned()]
+        .into_iter()
+        .map(LaneId::new)
+        .collect();
+    let caps: BTreeSet<String> = ["gpu=true".to_owned(), "linux=x86_64".to_owned()]
+        .into_iter()
+        .collect();
 
     let reg = h
         .fabric
         .worker
-        .register_worker(&wid, &iid, &caps)
+        .register_worker(&wid, &iid, &ns, &lanes, &caps)
         .await
         .expect("register_worker");
     assert_eq!(reg.worker_id, wid);
@@ -335,17 +342,117 @@ async fn engine_register_heartbeat_mark_dead_roundtrip() {
         reg.registered_at_ms
     );
 
-    // Heartbeat must succeed.
+    // Heartbeat must succeed on the same namespace.
     h.fabric
         .worker
-        .heartbeat_worker(&iid)
+        .heartbeat_worker(&iid, &ns)
         .await
         .expect("heartbeat_worker");
 
-    // Mark dead must succeed (idempotent — no pre-state required).
+    // `list_workers` in the same namespace must include our instance.
+    let workers = h
+        .fabric
+        .worker
+        .list_workers(Some(&ns))
+        .await
+        .expect("list_workers");
+    assert!(
+        workers.iter().any(|w| w.instance_id == iid),
+        "registered worker must appear in list_workers; got entries {:?}",
+        workers.iter().map(|w| &w.instance_id).collect::<Vec<_>>()
+    );
+    let entry = workers
+        .iter()
+        .find(|w| w.instance_id == iid)
+        .expect("registered instance present");
+    assert_eq!(entry.worker_id, wid);
+    assert_eq!(entry.namespace, ns);
+    assert!(entry.lanes.contains(&LaneId::new("gpu")));
+    assert!(entry.capabilities.contains("gpu=true"));
+    assert!(
+        entry.liveness_ttl_ms >= 1_000,
+        "liveness_ttl_ms must be non-trivial, got {}",
+        entry.liveness_ttl_ms
+    );
+
+    // Mark dead must succeed. RFC-025 §9: idempotent — marking an
+    // already-absent instance also succeeds (see second call below).
     h.fabric
         .worker
-        .mark_worker_dead(&iid)
+        .mark_worker_dead(&iid, &ns, "test_shutdown")
+        .await
+        .expect("mark_worker_dead");
+
+    // Idempotent replay — must not error.
+    h.fabric
+        .worker
+        .mark_worker_dead(&iid, &ns, "test_shutdown")
+        .await
+        .expect("mark_worker_dead idempotent");
+
+    h.teardown().await;
+}
+
+/// RFC-025 §9.3: re-registering the same `instance_id` with the same
+/// `worker_id` overwrites caps + lanes + TTL and returns success
+/// (`Refreshed` at the FF layer). Cairn's adapter doesn't distinguish
+/// `Registered` vs `Refreshed` — both surface as `Ok(_)` — but the
+/// second call must not error and must overwrite the caps set we
+/// can observe via list_workers.
+#[tokio::test]
+async fn engine_register_worker_is_idempotent_on_same_instance() {
+    let h = TestHarness::setup().await;
+    let wid = WorkerId::new(format!("cp_w_{}", uuid::Uuid::new_v4()));
+    let iid = WorkerInstanceId::new(format!("cp_i_{}", uuid::Uuid::new_v4()));
+    let ns = Namespace::new(format!("cp_ns_{}", uuid::Uuid::new_v4()));
+    let lanes: BTreeSet<LaneId> = ["default".to_owned()]
+        .into_iter()
+        .map(LaneId::new)
+        .collect();
+    let caps_v1: BTreeSet<String> = ["gpu=true".to_owned()].into_iter().collect();
+    let caps_v2: BTreeSet<String> = ["gpu=false".to_owned(), "arch=arm64".to_owned()]
+        .into_iter()
+        .collect();
+
+    h.fabric
+        .worker
+        .register_worker(&wid, &iid, &ns, &lanes, &caps_v1)
+        .await
+        .expect("register v1");
+
+    h.fabric
+        .worker
+        .register_worker(&wid, &iid, &ns, &lanes, &caps_v2)
+        .await
+        .expect("register v2 must refresh, not error");
+
+    // Post-refresh state must reflect v2's caps set (RFC-025 §9.3
+    // overwrite semantics).
+    let workers = h
+        .fabric
+        .worker
+        .list_workers(Some(&ns))
+        .await
+        .expect("list_workers");
+    let entry = workers
+        .iter()
+        .find(|w| w.instance_id == iid)
+        .expect("instance present after refresh");
+    assert!(
+        entry.capabilities.contains("gpu=false") && entry.capabilities.contains("arch=arm64"),
+        "refresh must overwrite caps; got {:?}",
+        entry.capabilities
+    );
+    assert!(
+        !entry.capabilities.contains("gpu=true"),
+        "v1 caps must not linger after refresh; got {:?}",
+        entry.capabilities
+    );
+
+    // Cleanup.
+    h.fabric
+        .worker
+        .mark_worker_dead(&iid, &ns, "test_cleanup")
         .await
         .expect("mark_worker_dead");
 

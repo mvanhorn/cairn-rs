@@ -120,6 +120,26 @@ pub struct WorkerRegistration {
     pub registered_at_ms: u64,
 }
 
+/// Row returned by
+/// [`Engine::list_workers`](super::Engine::list_workers).
+///
+/// Mirror of FF 0.14's `WorkerInfo` reduced to the fields cairn's
+/// operator surfaces consume. Keeps the PG/Valkey return shapes
+/// identical so dashboards render without a backend branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerSummary {
+    pub worker_id: flowfabric::core::types::WorkerId,
+    pub instance_id: flowfabric::core::types::WorkerInstanceId,
+    pub namespace: flowfabric::core::types::Namespace,
+    pub lanes: std::collections::BTreeSet<flowfabric::core::types::LaneId>,
+    pub capabilities: std::collections::BTreeSet<String>,
+    /// Last heartbeat or registration-refresh timestamp, epoch millis.
+    pub last_heartbeat_ms: i64,
+    pub liveness_ttl_ms: u64,
+    /// Initial registration timestamp, epoch millis.
+    pub registered_at_ms: i64,
+}
+
 // ── Phase D PR 2a: run / session / claim lifecycle mirrors ──────────────
 
 /// Result of a `create_run_execution` call.

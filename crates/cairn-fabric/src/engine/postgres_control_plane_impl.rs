@@ -1,31 +1,22 @@
 //! PostgreSQL-backed implementations of the cairn-side [`Engine`] +
 //! [`ControlPlaneBackend`] traits.
 //!
-//! # Scope (PR-C4a)
+//! # Scope (FF 0.14)
 //!
-//! PR-C4a fills in **bucket A** and **bucket B** method bodies:
+//! FF 0.14 closed the two upstream asks that held bucket-C open:
 //!
-//! - **Bucket A** (direct delegate, no conversion): `get_execution_tag`,
-//!   `set_execution_tag`, `set_flow_tag`. The cairn trait and the
-//!   FF `EngineBackend` trait share identical argument shapes and
-//!   return types, so these collapse to one-line delegates.
+//! - **FF#473** (worker-registry parity): 5 new `EngineBackend`
+//!   trait methods (`register_worker`, `heartbeat_worker`,
+//!   `mark_worker_dead`, `list_expired_leases`, `list_workers`),
+//!   every in-tree backend (Valkey, Postgres, SQLite) ships a body.
+//! - **FF#477** (`list_incoming_edges`): surfaced on `EngineBackend`
+//!   with a Postgres-native body.
 //!
-//! - **Bucket B** (delegate + cairn ↔ FF conversion): the remaining
-//!   27 methods in scope. A file-local `mod conversions` owns the
-//!   per-method mappings between cairn's mirror types (the structs
-//!   under [`crate::engine::control_plane_types`]) and FF 0.13's
-//!   contracts types.
-//!
-//! - **Bucket C** (no FF trait primitive exists today): 5 methods
-//!   — `list_incoming_edges`, `register_worker`, `heartbeat_worker`,
-//!   `mark_worker_dead`, `list_expired_leases`. Still
-//!   `unimplemented!("PR-C4")` in PR-C4a; PR-C4b flips them to
-//!   typed `EngineError::Unavailable { op }` and records the parity
-//!   gap in `docs/design/postgres-parity-gaps.md`. The four
-//!   worker-registry primitives are tracked upstream at FF#473.
-//!
-//! See `docs/design/ff-migration/pr-c4a-classification.md` for the
-//! full per-method table.
+//! Every cairn trait method here now routes through the FF 0.14
+//! trait; bucket-C is closed. The file-local `mod conversions` owns
+//! the per-method mappings between cairn's mirror types (the
+//! structs under [`crate::engine::control_plane_types`]) and FF
+//! 0.14's contracts types.
 //!
 //! # Why one struct, two impls
 //!
@@ -38,14 +29,17 @@
 //! avoids a cross-file jump on every body while still letting the
 //! two traits live in their own `impl` blocks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use flowfabric::core::contracts::{
+    HeartbeatWorkerArgs, HeartbeatWorkerOutcome, ListExpiredLeasesArgs, ListWorkersArgs,
+    MarkWorkerDeadArgs, RegisterWorkerArgs, RegisterWorkerOutcome,
+};
 use flowfabric::core::engine_backend::EngineBackend;
-use flowfabric::core::engine_error::EngineError;
 use flowfabric::core::types::{
-    BudgetId, EdgeId, ExecutionId, FlowId, LaneId, QuotaPolicyId, TimestampMs, WorkerId,
+    BudgetId, EdgeId, ExecutionId, FlowId, LaneId, Namespace, QuotaPolicyId, TimestampMs, WorkerId,
     WorkerInstanceId,
 };
 
@@ -58,7 +52,7 @@ use super::control_plane_types::{
     CreateRunExecutionInput, DeliverApprovalSignalInput, EligibilityResult, ExecutionCreated,
     ExpiredLease, FailExecutionOutcome, FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput,
     QuotaAdmission, RenewLeaseInput, ResumeRunInput, RotationOutcome, StageDependencyEdgeInput,
-    StageDependencyOutcome, SubmitTaskInput, WorkerRegistration,
+    StageDependencyOutcome, SubmitTaskInput, WorkerRegistration, WorkerSummary,
 };
 use super::snapshots::{EdgeSnapshot, ExecutionSnapshot, FlowSnapshot};
 use super::Engine;
@@ -143,19 +137,40 @@ impl Engine for PostgresControlPlane {
 
     async fn list_incoming_edges(
         &self,
-        _execution_id: &ExecutionId,
+        execution_id: &ExecutionId,
     ) -> Result<Vec<EdgeSnapshot>, FabricError> {
-        // Bucket C — FF 0.13's `EngineBackend` trait has no
-        // point-query primitive for "incoming edges of an execution".
-        // FF's SDK-facing `list_incoming_edges` composes on top of
-        // per-flow edge state that isn't exposed as a trait primitive
-        // on PG yet (tracked in `docs/design/postgres-parity-gaps.md`).
-        // Return the typed `Unavailable` variant so callers that
-        // land on the PG backend see a classified failure instead of
-        // a panic.
-        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
-            op: "list_incoming_edges",
-        })))
+        // FF 0.14 closed FF#477 with two trait primitives rather than
+        // a composite SDK-level method: `resolve_execution_flow_id`
+        // (eid → flow_id pivot) + `list_edges(flow_id, direction)`.
+        // ff-sdk's `list_incoming_edges` composes these two. On PG
+        // both primitives have native bodies, so we replicate the
+        // composition in-line.
+        let flow_id = match self
+            .backend
+            .resolve_execution_flow_id(execution_id)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?
+        {
+            Some(fid) => fid,
+            // Standalone execution (no flow) — no dependency edges
+            // possible by construction. Matches the Valkey path's
+            // empty-SMEMBERS result.
+            None => return Ok(Vec::new()),
+        };
+        let edges = self
+            .backend
+            .list_edges(
+                &flow_id,
+                flowfabric::core::contracts::EdgeDirection::Incoming {
+                    to_node: execution_id.clone(),
+                },
+            )
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        Ok(edges
+            .into_iter()
+            .map(conversions::ff_edge_snapshot_to_cairn)
+            .collect())
     }
 
     async fn get_execution_tag(
@@ -241,47 +256,147 @@ impl Engine for PostgresControlPlane {
 
     async fn register_worker(
         &self,
-        _worker_id: &WorkerId,
-        _instance_id: &WorkerInstanceId,
-        _capabilities: &[String],
+        worker_id: &WorkerId,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+        lanes: &BTreeSet<LaneId>,
+        capabilities: &BTreeSet<String>,
+        liveness_ttl_ms: u64,
     ) -> Result<WorkerRegistration, FabricError> {
-        // Bucket C — FF 0.13 has no worker-registry trait primitive.
-        // Tracked upstream at FF#473; cairn-app's worker paths are
-        // Valkey-gated so this surface is exercised from operator
-        // dashboards only. See `docs/design/postgres-parity-gaps.md`.
-        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
-            op: "register_worker",
-        })))
+        // FF 0.14 closed FF#473 — `register_worker` now ships on
+        // `EngineBackend` with bodies for every in-tree backend.
+        // PG uses `INSERT … ON CONFLICT DO UPDATE RETURNING (xmax=0)`
+        // + a 30-s `ttl_sweep` scanner (no native PEXPIRE).
+        let now = TimestampMs::now();
+        let args = RegisterWorkerArgs::new(
+            worker_id.clone(),
+            instance_id.clone(),
+            lanes.clone(),
+            capabilities.clone(),
+            liveness_ttl_ms,
+            namespace.clone(),
+            now,
+        );
+        let outcome = self
+            .backend
+            .register_worker(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        // `RegisterWorkerOutcome` is `#[non_exhaustive]`; fail loud on a
+        // future FF variant so the cairn mapping is audited rather than
+        // silently dropped.
+        match outcome {
+            RegisterWorkerOutcome::Registered | RegisterWorkerOutcome::Refreshed => {
+                Ok(WorkerRegistration {
+                    worker_id: worker_id.clone(),
+                    instance_id: instance_id.clone(),
+                    capabilities: capabilities.iter().cloned().collect(),
+                    registered_at_ms: now.0.max(0) as u64,
+                })
+            }
+            other => Err(FabricError::Internal(format!(
+                "unhandled RegisterWorkerOutcome variant (post-FF 0.14 addition): {other:?}"
+            ))),
+        }
     }
 
-    async fn heartbeat_worker(&self, _instance_id: &WorkerInstanceId) -> Result<(), FabricError> {
-        // Bucket C — see `register_worker` above. FF#473.
-        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
-            op: "heartbeat_worker",
-        })))
+    async fn heartbeat_worker(
+        &self,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+    ) -> Result<(), FabricError> {
+        let args =
+            HeartbeatWorkerArgs::new(instance_id.clone(), namespace.clone(), TimestampMs::now());
+        let outcome = self
+            .backend
+            .heartbeat_worker(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        match outcome {
+            HeartbeatWorkerOutcome::Refreshed { .. } => Ok(()),
+            HeartbeatWorkerOutcome::NotRegistered => Err(FabricError::Validation {
+                reason: format!(
+                    "worker instance {instance_id} liveness key absent — re-register required"
+                ),
+            }),
+            other => Err(FabricError::Internal(format!(
+                "unhandled HeartbeatWorkerOutcome variant (post-FF 0.14 addition): {other:?}"
+            ))),
+        }
     }
 
-    async fn mark_worker_dead(&self, _instance_id: &WorkerInstanceId) -> Result<(), FabricError> {
-        // Bucket C — see `register_worker` above. FF#473.
-        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
-            op: "mark_worker_dead",
-        })))
+    async fn mark_worker_dead(
+        &self,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+        reason: &str,
+    ) -> Result<(), FabricError> {
+        let args = MarkWorkerDeadArgs::new(
+            instance_id.clone(),
+            namespace.clone(),
+            reason.to_owned(),
+            TimestampMs::now(),
+        );
+        self.backend
+            .mark_worker_dead(args)
+            .await
+            .map(|_| ())
+            .map_err(|e| FabricError::Engine(Box::new(e)))
+    }
+
+    async fn list_workers(
+        &self,
+        namespace: Option<&Namespace>,
+    ) -> Result<Vec<WorkerSummary>, FabricError> {
+        let mut args = ListWorkersArgs::new();
+        args.namespace = namespace.cloned();
+        let result = self
+            .backend
+            .list_workers(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        Ok(result
+            .entries
+            .into_iter()
+            .map(|w| WorkerSummary {
+                worker_id: w.worker_id,
+                instance_id: w.worker_instance_id,
+                namespace: w.namespace,
+                lanes: w.lanes,
+                capabilities: w.capabilities,
+                last_heartbeat_ms: w.last_heartbeat_ms.0,
+                liveness_ttl_ms: w.liveness_ttl_ms,
+                registered_at_ms: w.registered_at_ms.0,
+            })
+            .collect())
     }
 
     async fn list_expired_leases(
         &self,
-        _now_ms: u64,
-        _limit: usize,
+        now_ms: u64,
+        limit: usize,
     ) -> Result<Vec<ExpiredLease>, FabricError> {
-        // Bucket C — FF has no operator-facing expired-leases read
-        // on the trait (lease expiry is handled server-side by each
-        // backend's scanner). Cairn surfaces this for operator
-        // dashboards only; the read model degrades gracefully on PG
-        // with a typed `Unavailable` until we either expose a trait
-        // primitive upstream or add a PG-native table scan.
-        Err(FabricError::Engine(Box::new(EngineError::Unavailable {
-            op: "list_expired_leases",
-        })))
+        // FF 0.14 closed FF#473 — `list_expired_leases` now ships on
+        // `EngineBackend` for every in-tree backend. PG queries the
+        // `ff_execution_lease_expiry` index ordered by
+        // `(expires_at_ms ASC, execution_id ASC)`.
+        let mut args = ListExpiredLeasesArgs::new(TimestampMs::from_millis(now_ms as i64));
+        args.limit = Some(
+            limit.min(flowfabric::core::contracts::LIST_EXPIRED_LEASES_MAX_LIMIT as usize) as u32,
+        );
+        let result = self
+            .backend
+            .list_expired_leases(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        Ok(result
+            .entries
+            .into_iter()
+            .map(|e| ExpiredLease {
+                execution_id: e.execution_id,
+                expires_at_ms: e.expires_at_ms.0.max(0) as u64,
+            })
+            .collect())
     }
 }
 

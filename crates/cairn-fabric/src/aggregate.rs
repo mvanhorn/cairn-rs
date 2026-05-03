@@ -117,13 +117,15 @@ impl FabricServices {
                 // takes `Arc<dyn FabricRuntimeHandle>` (PR-C4c)
                 // instead of `Arc<FabricRuntime>`, and
                 // `PostgresFabricRuntime` impls the same trait so
-                // the PG runtime is drop-in. Bucket-C methods on
-                // `PostgresControlPlane` (worker registry +
-                // `list_incoming_edges`) still return typed
-                // `EngineError::Unavailable` — cairn-app's worker
-                // loop is gated at the app layer on a Valkey
-                // backend, so those surfaces never reach the PG
-                // full-aggregate-boot path.
+                // the PG runtime is drop-in. FF 0.14 closed the
+                // final bucket-C gaps (worker registry via FF#473,
+                // list_incoming_edges via FF#477) so every trait
+                // method on `PostgresControlPlane` has a real body
+                // now. The two remaining PG-vs-Valkey deltas
+                // (`FabricSchedulerService::claim_for_worker`,
+                // `SignalBridge::deliver_*_signal`) live at the
+                // service layer and are app-layer-gated to Valkey;
+                // see `docs/design/postgres-parity-gaps.md`.
                 #[cfg(feature = "fabric-postgres")]
                 {
                     Self::start_postgres(config, event_log, cursor_store).await
@@ -335,7 +337,13 @@ impl FabricServices {
             control_plane.clone(),
         );
         let scheduler = FabricSchedulerService::new(&runtime);
-        let worker = FabricWorkerService::new(engine.clone());
+        // Preserve pre-FF-0.14 behaviour: the bespoke Valkey path stamped
+        // `PEXPIRE` at `lease_ttl_ms * 3`. FF 0.14's
+        // `RegisterWorkerArgs::liveness_ttl_ms` replaces that PEXPIRE —
+        // keep the same 3× multiplier so dashboards + soak behaviour
+        // carry over identically.
+        let worker =
+            FabricWorkerService::new(engine.clone(), runtime.lease_ttl_ms().saturating_mul(3));
         let budgets = FabricBudgetService::new(control_plane.clone());
         let quotas = FabricQuotaService::new(control_plane.clone(), runtime.clone());
         let rotation = FabricRotationService::new(control_plane.clone());
