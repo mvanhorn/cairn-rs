@@ -190,6 +190,7 @@ function RowItem({
   return (
     <button
       onClick={onClick}
+      data-testid={`approval-row-${row.id}`}
       className={clsx(
         "w-full flex items-center gap-3 px-3 h-9 text-left transition-colors border-l-2",
         selected
@@ -289,6 +290,58 @@ function LegacyDrawerBody({
 
 type ScopeType = "once" | "session";
 
+/** Best-effort extraction of a path argument from the tool's args payload.
+ *  Mirrors `crates/cairn-runtime/src/tool_call_approvals.rs::extract_path_arg`
+ *  (top-level `"path"`), with a conservative widening to `"file_path"` and
+ *  `"cwd"` so the UI can pre-seed a sensible default for the operator when
+ *  they flip to `ExactPath`/`ProjectScopedPath`. Non-path tools return
+ *  `null` — the input stays empty and the operator types the root. */
+function extractPathLike(args: unknown): string | null {
+  if (!args || typeof args !== "object") return null;
+  const obj = args as Record<string, unknown>;
+  for (const key of ["path", "file_path", "cwd", "working_dir"]) {
+    const v = obj[key];
+    if (typeof v === "string" && v.trim()) return v;
+  }
+  return null;
+}
+
+/** Derive a plausible project root from a path-like argument. Strips the
+ *  trailing segment so a path like `/workspaces/proj/src/lib.rs` seeds
+ *  `/workspaces/proj/src`. Operators typically widen this by hand when
+ *  they want to cover the full repo; pre-filling a directory is still
+ *  cheaper than staring at an empty box. Absolute root is preserved. */
+function deriveProjectRoot(pathLike: string | null): string {
+  if (!pathLike) return "";
+  const trimmed = pathLike.replace(/\/+$/, "");
+  const lastSep = trimmed.lastIndexOf("/");
+  if (lastSep <= 0) return trimmed || "/";
+  return trimmed.slice(0, lastSep);
+}
+
+/** Build the wire-shape match policy from the drawer state. Returns
+ *  `undefined` when the operator would submit an empty path/root — the
+ *  caller keeps the Approve button disabled in that case so we never
+ *  POST a malformed payload. */
+function buildMatchPolicy(
+  kind: ApprovalMatchPolicy["kind"],
+  path: string,
+  projectRoot: string,
+): ApprovalMatchPolicy | undefined {
+  switch (kind) {
+    case "exact":
+      return { kind: "exact" };
+    case "exact_path": {
+      const trimmed = path.trim();
+      return trimmed ? { kind: "exact_path", path: trimmed } : undefined;
+    }
+    case "project_scoped_path": {
+      const trimmed = projectRoot.trim();
+      return trimmed ? { kind: "project_scoped_path", project_root: trimmed } : undefined;
+    }
+  }
+}
+
 function ToolCallDrawerBody({
   record,
   onClose,
@@ -306,11 +359,31 @@ function ToolCallDrawerBody({
     () => JSON.stringify(record.amended_tool_args ?? record.original_tool_args, null, 2),
     [record],
   );
+  // Seed path / project_root from the tool args (or the proposal's
+  // captured match policy, if the server pre-populated one). The
+  // operator can override either input before approving.
+  const seededPath = useMemo(() => {
+    const liveArgs = record.amended_tool_args ?? record.original_tool_args;
+    const fromArgs = extractPathLike(liveArgs);
+    if (fromArgs) return fromArgs;
+    if (record.match_policy.kind === "exact_path") return record.match_policy.path;
+    if (record.match_policy.kind === "project_scoped_path") return record.match_policy.project_root;
+    return "";
+  }, [record]);
+  const seededRoot = useMemo(() => {
+    if (record.match_policy.kind === "project_scoped_path") return record.match_policy.project_root;
+    const liveArgs = record.amended_tool_args ?? record.original_tool_args;
+    return deriveProjectRoot(extractPathLike(liveArgs));
+  }, [record]);
+
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(effectiveArgs);
   const [scopeType, setScopeType] = useState<ScopeType>("once");
-  const [matchOverride, setMatchOverride] =
-    useState<ApprovalMatchPolicy | undefined>(undefined);
+  const [matchKind, setMatchKind] = useState<ApprovalMatchPolicy["kind"]>(
+    record.match_policy.kind,
+  );
+  const [pathInput, setPathInput] = useState(seededPath);
+  const [rootInput, setRootInput] = useState(seededRoot);
   const [rejectReason, setRejectReason] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
 
@@ -335,13 +408,23 @@ function ToolCallDrawerBody({
       toast.error(`Amend failed — ${err instanceof Error ? err.message : "try again."}`),
   });
 
+  // Build the match policy from the current drawer state. `undefined`
+  // means "the operator's pick requires an input they haven't filled
+  // in yet" — we surface that as a disabled Approve button so we never
+  // POST an empty path / project_root.
+  const sessionMatchPolicy =
+    scopeType === "session"
+      ? buildMatchPolicy(matchKind, pathInput, rootInput)
+      : undefined;
+  const sessionReady = scopeType === "once" || sessionMatchPolicy !== undefined;
+
   const approve = useMutation({
     mutationFn: () =>
       defaultApi.approveApproval(record.call_id, {
         scope:
           scopeType === "once"
             ? { type: "once" }
-            : { type: "session", match_policy: matchOverride },
+            : { type: "session", match_policy: sessionMatchPolicy },
       }),
     onSuccess: () => {
       toast.success("Tool call approved.");
@@ -443,13 +526,17 @@ function ToolCallDrawerBody({
 
       {pending && !editing && (
         <>
-          <fieldset className="flex flex-col gap-2 pt-1 border-t border-gray-200 dark:border-zinc-800">
+          <fieldset
+            data-testid="approval-scope-fieldset"
+            className="flex flex-col gap-2 pt-1 border-t border-gray-200 dark:border-zinc-800"
+          >
             <legend className="text-[11px] font-medium uppercase tracking-wide text-gray-400 dark:text-zinc-500 pt-2">
               Scope
             </legend>
             <label className="flex items-center gap-2 text-[12px]">
               <input
                 type="radio"
+                data-testid="approval-scope-once"
                 checked={scopeType === "once"}
                 onChange={() => setScopeType("once")}
                 className="accent-indigo-500"
@@ -459,23 +546,31 @@ function ToolCallDrawerBody({
             <label className="flex items-center gap-2 text-[12px]">
               <input
                 type="radio"
+                data-testid="approval-scope-session"
                 checked={scopeType === "session"}
                 onChange={() => setScopeType("session")}
                 className="accent-indigo-500"
               />
-              <span>
-                Session — widen to matching calls via{" "}
-                <span className="font-mono text-[11px] text-gray-500 dark:text-zinc-400">
-                  {(matchOverride ?? record.match_policy).kind}
-                </span>
-              </span>
+              <span>For this session, applied to…</span>
             </label>
             {scopeType === "session" && (
               <MatchPolicyPicker
-                current={matchOverride ?? record.match_policy}
-                onChange={setMatchOverride}
+                kind={matchKind}
+                onKindChange={setMatchKind}
+                path={pathInput}
+                onPathChange={setPathInput}
+                projectRoot={rootInput}
+                onProjectRootChange={setRootInput}
               />
             )}
+            <ScopePreview
+              toolName={record.tool_name}
+              scopeType={scopeType}
+              matchKind={matchKind}
+              path={pathInput}
+              projectRoot={rootInput}
+              ready={sessionReady}
+            />
           </fieldset>
 
           {rejectOpen ? (
@@ -513,13 +608,22 @@ function ToolCallDrawerBody({
               <button
                 onClick={() => setRejectOpen(true)}
                 disabled={busy}
+                data-testid="approval-reject-btn"
                 className="flex-1 px-3 h-8 rounded text-[12px] font-medium bg-red-900/40 text-red-300 hover:bg-red-900/70 border border-red-800/50 transition-colors disabled:opacity-40 inline-flex items-center justify-center gap-1.5"
               >
                 <X size={13} /> Reject
               </button>
               <button
                 onClick={() => approve.mutate()}
-                disabled={busy}
+                disabled={busy || !sessionReady}
+                data-testid="approval-approve-btn"
+                title={
+                  !sessionReady
+                    ? matchKind === "exact_path"
+                      ? "Enter a file path before approving."
+                      : "Enter a project root before approving."
+                    : undefined
+                }
                 className="flex-1 px-3 h-8 rounded text-[12px] font-medium bg-emerald-900/50 text-emerald-200 hover:bg-emerald-900 border border-emerald-800/50 transition-colors disabled:opacity-40 inline-flex items-center justify-center gap-1.5"
               >
                 {approve.isPending ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />}
@@ -541,64 +645,144 @@ function ToolCallDrawerBody({
   );
 }
 
+/**
+ * Sub-choice for "For this session, applied to…" — renders the shape-
+ * specific input (file path for `exact_path`, project root for
+ * `project_scoped_path`) and a dropdown that picks between the three
+ * `ApprovalMatchPolicy` variants. Kept as a controlled component so the
+ * parent drawer owns all of the submit-time state.
+ *
+ * Decomposing match-policy state into three flat scalars (kind + path +
+ * projectRoot) rather than the tagged-union type keeps the operator's
+ * edits sticky across dropdown flips: if they type a path, flip to
+ * `project_scoped_path`, tweak the root, and flip back, the path they
+ * originally typed is still there. The narrower `current: ApprovalMatchPolicy`
+ * union the drawer used before dropped typed-in fields on every flip.
+ */
 function MatchPolicyPicker({
-  current,
-  onChange,
+  kind,
+  onKindChange,
+  path,
+  onPathChange,
+  projectRoot,
+  onProjectRootChange,
 }: {
-  current: ApprovalMatchPolicy;
-  onChange: (p: ApprovalMatchPolicy | undefined) => void;
+  kind: ApprovalMatchPolicy["kind"];
+  onKindChange: (k: ApprovalMatchPolicy["kind"]) => void;
+  path: string;
+  onPathChange: (v: string) => void;
+  projectRoot: string;
+  onProjectRootChange: (v: string) => void;
 }) {
-  const kind = current.kind;
   return (
     <div className="ml-5 flex flex-col gap-1.5 text-[11px] text-gray-500 dark:text-zinc-400">
       <label className="flex items-center gap-2">
-        <span className="w-20">Policy</span>
+        <span className="w-20">Apply to</span>
         <select
+          data-testid="approval-match-policy-select"
           value={kind}
-          onChange={e => {
-            const next = e.target.value as ApprovalMatchPolicy["kind"];
-            if (next === "exact") onChange({ kind: "exact" });
-            else if (next === "exact_path")
-              onChange({
-                kind: "exact_path",
-                path: "path" in current ? current.path : "project_root" in current ? current.project_root : "",
-              });
-            else if (next === "project_scoped_path")
-              onChange({
-                kind: "project_scoped_path",
-                project_root:
-                  "project_root" in current ? current.project_root : "path" in current ? current.path : "",
-              });
-          }}
+          onChange={e => onKindChange(e.target.value as ApprovalMatchPolicy["kind"])}
           className="flex-1 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded px-2 h-7 text-[11px] text-gray-700 dark:text-zinc-300 focus:outline-none focus:border-indigo-500"
         >
-          <option value="exact">exact</option>
-          <option value="exact_path">exact_path</option>
-          <option value="project_scoped_path">project_scoped_path</option>
+          <option value="exact">Exactly this call</option>
+          <option value="exact_path">Same file path</option>
+          <option value="project_scoped_path">Anywhere inside project root</option>
         </select>
       </label>
-      {current.kind === "exact_path" && (
+      {kind === "exact_path" && (
         <label className="flex items-center gap-2">
-          <span className="w-20">Path</span>
+          <span className="w-20">File path</span>
           <input
-            value={current.path}
-            onChange={e => onChange({ kind: "exact_path", path: e.target.value })}
+            data-testid="approval-match-policy-path"
+            value={path}
+            onChange={e => onPathChange(e.target.value)}
             placeholder="/abs/path/to/file"
+            spellCheck={false}
             className="flex-1 font-mono bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded px-2 h-7 text-[11px] text-gray-700 dark:text-zinc-300 focus:outline-none focus:border-indigo-500"
           />
         </label>
       )}
-      {current.kind === "project_scoped_path" && (
+      {kind === "project_scoped_path" && (
         <label className="flex items-center gap-2">
-          <span className="w-20">Root</span>
+          <span className="w-20">Project root</span>
           <input
-            value={current.project_root}
-            onChange={e => onChange({ kind: "project_scoped_path", project_root: e.target.value })}
+            data-testid="approval-match-policy-project-root"
+            value={projectRoot}
+            onChange={e => onProjectRootChange(e.target.value)}
             placeholder="/workspaces/proj"
+            spellCheck={false}
             className="flex-1 font-mono bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded px-2 h-7 text-[11px] text-gray-700 dark:text-zinc-300 focus:outline-none focus:border-indigo-500"
           />
         </label>
       )}
+    </div>
+  );
+}
+
+/**
+ * Render a single sentence under the radios describing the blast radius
+ * the operator is about to authorise. This is the operator-facing
+ * shorthand for "what does Approve-with-Session actually do?" — the
+ * domain semantics live in `crates/cairn-domain/src/approvals.rs`.
+ *
+ * Shown only when `session` is selected. For `once` the blast radius is
+ * trivially "this call only" and the radio label already says that.
+ */
+function ScopePreview({
+  toolName,
+  scopeType,
+  matchKind,
+  path,
+  projectRoot,
+  ready,
+}: {
+  toolName: string;
+  scopeType: ScopeType;
+  matchKind: ApprovalMatchPolicy["kind"];
+  path: string;
+  projectRoot: string;
+  ready: boolean;
+}) {
+  if (scopeType !== "session") return null;
+
+  let body: React.ReactNode;
+  if (!ready) {
+    body = (
+      <span className="text-amber-500 dark:text-amber-400">
+        Fill in the {matchKind === "exact_path" ? "file path" : "project root"} to
+        preview the blast radius.
+      </span>
+    );
+  } else if (matchKind === "exact") {
+    body = (
+      <>
+        Approves this call and any future <code className="font-mono">{toolName}</code> call with
+        byte-identical arguments in the same session.
+      </>
+    );
+  } else if (matchKind === "exact_path") {
+    body = (
+      <>
+        Approves any future <code className="font-mono">{toolName}</code> call whose path
+        equals <code className="font-mono">{path.trim()}</code> in the same session.
+      </>
+    );
+  } else {
+    const root = projectRoot.trim();
+    body = (
+      <>
+        Approves any future <code className="font-mono">{toolName}</code> call whose path is
+        inside <code className="font-mono">{root}</code> (i.e. <code className="font-mono">{root.replace(/\/+$/, "")}/**</code>) in the same session.
+      </>
+    );
+  }
+
+  return (
+    <div
+      data-testid="approval-scope-preview"
+      className="ml-5 mt-1 text-[11px] leading-relaxed text-gray-500 dark:text-zinc-400"
+    >
+      {body}
     </div>
   );
 }
