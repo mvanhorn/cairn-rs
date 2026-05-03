@@ -724,7 +724,32 @@ async fn orchestrate_run_handler_inner(
         .into_response();
     }
 
-    let is_bedrock_model = model_id.contains('.') && !model_id.contains('/');
+    // Bedrock IDs follow `<vendor>.<model>[-<version>][:<suffix>]` — the
+    // leading segment before the first `.` is a known AWS Bedrock vendor.
+    // Any other `.`-containing id (e.g. `glm-4.7`, `gpt-4.1`, `llama-3.2`)
+    // is a version number on a non-Bedrock model and must NOT route
+    // through the Bedrock provider. Previous heuristic
+    // (`contains('.') && !contains('/')`) mis-routed every dotted
+    // version string, blocking every OpenAI-compat brain path.
+    const BEDROCK_VENDORS: &[&str] = &[
+        "anthropic",
+        "meta",
+        "amazon",
+        "minimax",
+        "cohere",
+        "ai21",
+        "stability",
+        "mistral",
+        // AWS cross-region inference prefixes (e.g. `us.anthropic.claude-...`).
+        "us",
+        "eu",
+        "apac",
+    ];
+    let is_bedrock_model = model_id
+        .split('.')
+        .next()
+        .map(|vendor| BEDROCK_VENDORS.contains(&vendor))
+        .unwrap_or(false);
     let brain = match state
         .runtime
         .provider_registry
