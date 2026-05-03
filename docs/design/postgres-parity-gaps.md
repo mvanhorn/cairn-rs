@@ -1,6 +1,6 @@
 # Postgres backend parity gaps
 
-Last updated: 2026-05-03 (FF 0.14 adoption)
+Last updated: 2026-05-03 (FF 0.14.1 — PG register_worker green)
 
 Cairn-rs's `fabric-postgres` feature is a work-in-progress backend. This
 document tracks:
@@ -38,17 +38,11 @@ trait methods; no `Unavailable` returns remain at the trait layer.
 
 Integration tests in
 `crates/cairn-fabric/tests/postgres_control_plane_live.rs` assert the
-delegation end-to-end on a live Postgres container. The PG
-register_worker / idempotent-refresh tests are currently `#[ignore]`
-pending an FF 0.14 upstream fix: `ff_backend_postgres::register_worker`
-uses `RETURNING (xmax = 0)` in a `query_scalar`, which PG 16 rejects
-with `0A000: cannot retrieve a system column in this context`
-(`execTuples.c:tts_virtual_getsysattr`). The one-line upstream fix is
-either `RETURNING xmax` + client-side comparison or `RETURNING (xmax
-= 0)::boolean`. The Valkey register_worker path is fully covered in
-`crates/cairn-fabric/tests/integration/test_control_plane.rs` so the
-cairn adapter + trait-delegation shape is regression-safe in the
-meantime.
+delegation end-to-end on a live Postgres container. All 33 PG
+control-plane tests — including `pg_register_heartbeat_mark_dead_roundtrip`
+and `pg_register_worker_is_idempotent_on_same_instance` — pass on
+FF 0.14.1 against PG 16 (FlowFabric PR #509 replaced the broken
+`RETURNING (xmax = 0)` clause; tracked as cairn-rs #508, closed).
 
 ## Service-layer parity — two surfaces still Valkey-only
 
@@ -153,5 +147,6 @@ Match on the typed variant to branch.
 - [cairn-rs#602](https://github.com/avifenesh/cairn-rs/issues/602) — service-constructor refactor (closed by PR-C4c).
 - [FF#473](https://github.com/avifenesh/FlowFabric/issues/473) — worker-registry parity upstream (closed by FF 0.14).
 - [FF#477](https://github.com/avifenesh/FlowFabric/issues/477) — `list_incoming_edges` trait surfacing upstream (closed by FF 0.14).
+- [FF#508](https://github.com/avifenesh/FlowFabric/issues/508) — `register_worker` PG 16 `RETURNING (xmax = 0)` fix (closed by FF 0.14.1).
 - [FF 0.14 consumer migration guide](https://github.com/avifenesh/FlowFabric/blob/main/docs/CONSUMER_MIGRATION_0.14_worker_registry.md).
 - [`docs/design/ff-migration/pr-c4a-classification.md`](ff-migration/pr-c4a-classification.md) — per-method bucket A/B/C classification (historical).

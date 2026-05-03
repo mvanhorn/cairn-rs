@@ -1445,22 +1445,17 @@ fn test_namespace(seed: &str) -> Namespace {
     Namespace::new(format!("pg_test_{seed}_{}", uuid::Uuid::new_v4()))
 }
 
-/// Blocked on an FF 0.14 upstream bug: `ff_backend_postgres`'s
-/// `register_worker` SQL uses `RETURNING (xmax = 0)` in a
-/// `query_scalar` — PG 16 rejects with
-/// `0A000: cannot retrieve a system column in this context`
-/// (`execTuples.c:tts_virtual_getsysattr`). The fix is a one-line
-/// rewrite to `RETURNING xmax` + client-side comparison, or a cast
-/// `RETURNING (xmax = 0)::boolean AS inserted`. Cairn's adapter +
-/// trait delegation are verified against Valkey by
-/// `crates/cairn-fabric/tests/integration/test_control_plane.rs::engine_register_*`
-/// in the meantime.
+/// End-to-end round-trip for the worker-registry trait surface that
+/// landed with FF 0.14 / RFC-025 (`register_worker` →
+/// `heartbeat_worker` → `list_workers` → `mark_worker_dead`). Exercises
+/// the delegation + cairn-mirror ↔ FF-wire conversion on the PG
+/// control-plane path, alongside the Valkey coverage in
+/// `crates/cairn-fabric/tests/integration/test_control_plane.rs`.
 ///
-/// TODO(FF-upstream): remove `#[ignore]` + filed issue URL once
-/// FF ships the fix.
+/// Un-ignored in FF 0.14.1 (FlowFabric PR #509 fixed the upstream
+/// `RETURNING (xmax = 0)` bug; cairn #508 tracked the cairn-side
+/// gap).
 #[tokio::test]
-#[ignore = "FF 0.14 upstream bug: ff_backend_postgres register_worker \
-            `RETURNING (xmax = 0)` fails on PG 16 with 0A000 system-column error"]
 async fn pg_register_heartbeat_mark_dead_roundtrip() {
     let cp = control_plane().await;
     let ns = test_namespace("register_roundtrip");
@@ -1518,13 +1513,12 @@ async fn pg_register_heartbeat_mark_dead_roundtrip() {
         .expect("mark_worker_dead idempotent replay on PG");
 }
 
-/// Blocked on the same FF 0.14 upstream bug as
-/// `pg_register_heartbeat_mark_dead_roundtrip`. Kept in-tree so the
-/// idempotent-refresh assertion auto-runs once the upstream fix
-/// lands.
+/// Idempotent-refresh contract: re-registering the SAME
+/// `WorkerInstanceId` with different capabilities must succeed (not
+/// error) and must overwrite the caps on the existing row.
+/// Un-ignored in FF 0.14.1 alongside
+/// `pg_register_heartbeat_mark_dead_roundtrip`.
 #[tokio::test]
-#[ignore = "FF 0.14 upstream bug: ff_backend_postgres register_worker \
-            `RETURNING (xmax = 0)` fails on PG 16 with 0A000 system-column error"]
 async fn pg_register_worker_is_idempotent_on_same_instance() {
     let cp = control_plane().await;
     let ns = test_namespace("register_idempotent");
