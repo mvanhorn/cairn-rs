@@ -28,7 +28,7 @@ use crate::handlers::runs::helpers::{classify_failed_reason, finalize_run_failur
 use crate::helpers::{load_run_visible_to_tenant, working_dir_for_run};
 use crate::sandbox::workspace_error_response;
 use crate::state::AppState;
-use crate::{resolve_run_mode_default, resolve_run_string_default};
+use crate::{resolve_run_mode_default, resolve_run_string_default, resolve_run_u32_default};
 
 /// Body for `POST /v1/runs/:id/orchestrate`.
 ///
@@ -708,6 +708,23 @@ async fn orchestrate_run_handler_inner(
         resolve_run_string_default(state.as_ref(), &run.project, &run.run_id, "agent_role").await;
     let default_run_mode =
         resolve_run_mode_default(state.as_ref(), &run.project, &run.run_id).await;
+    let default_max_iterations =
+        resolve_run_u32_default(state.as_ref(), &run.project, &run.run_id, "max_iterations").await;
+
+    // #651: capture presence flags BEFORE the `Option::or` chain moves the
+    // fields out of `body`. An operator-supplied `goal` on the first
+    // `/orchestrate` POST MUST be persisted into the run's "goal" default
+    // so the empty-body auto-resume kick from the F49 worker
+    // (`main.rs::auto-resume orchestrate worker firing POST`) recovers
+    // the objective on every subsequent iteration. Without this, the LLM
+    // sees the fallback "Execute the run objective." string and completes
+    // the run with a "no objective" summary (issue #651 root cause).
+    let body_has_goal = body.goal.is_some();
+    let body_has_max_iterations = body.max_iterations.is_some();
+    let goal_value = body
+        .goal
+        .or(default_goal.clone())
+        .unwrap_or_else(|| "Execute the run objective.".to_owned());
 
     let ctx = OrchestrationContext {
         project: run.project.clone(),
@@ -715,10 +732,7 @@ async fn orchestrate_run_handler_inner(
         run_id: run.run_id.clone(),
         task_id: None,
         iteration: 0,
-        goal: body
-            .goal
-            .or(default_goal)
-            .unwrap_or_else(|| "Execute the run objective.".to_owned()),
+        goal: goal_value.clone(),
         agent_type: run
             .agent_role_id
             .clone()
@@ -734,6 +748,81 @@ async fn orchestrate_run_handler_inner(
             .approval_timeout_ms
             .map(std::time::Duration::from_millis),
     };
+
+    // #651: persist the resolved `goal` into the run's per-run defaults
+    // projection so the empty-body auto-resume POST from the F49 worker
+    // recovers the objective on every follow-up iteration. Two cases
+    // cover every call path:
+    //
+    //   1. Body supplied `goal` (explicit operator request): persist —
+    //      refreshes the default so the latest operator intent wins.
+    //   2. Body omitted `goal` AND no default is stored yet (legacy run
+    //      that pre-dates the persistence patch in lifecycle.rs):
+    //      back-fill from the fallback string. This is cheap and keeps
+    //      the invariant "once orchestrate has resolved a goal, the
+    //      default holds it".
+    //
+    // Best-effort: a defaults-projection write failure logs at WARN and
+    // the in-flight iteration still uses `ctx.goal`. The next auto-resume
+    // kick would fall through to the fallback — but that is strictly no
+    // worse than the pre-fix behaviour and is surfaced in logs.
+    if body_has_goal || default_goal.is_none() {
+        if let Err(err) = crate::persist_run_string_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "goal",
+            &goal_value,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = %run.run_id,
+                error = %err,
+                "#651: failed to persist run goal default; auto-resume may lose objective"
+            );
+        }
+    }
+
+    // #651: same shape for `max_iterations`. An operator who specifies a
+    // 50-iteration cap on the first POST expects that cap to hold across
+    // every auto-resume; without persistence the empty-body kick falls
+    // back to `LoopConfig::default().max_iterations` (20) which can
+    // terminate long multi-tool runs early.
+    //
+    // Three cases:
+    //   1. Body carries a value → persist it (fresh operator intent).
+    //   2. Body omits, no default stored yet → back-fill with
+    //      `cairn_orchestrator::LoopConfig::default().max_iterations`
+    //      so a follow-up auto-resume reads a concrete value instead of
+    //      falling through to the same default via the None path. This
+    //      keeps the defaults projection authoritative once orchestrate
+    //      has touched a run.
+    //   3. Body omits, default already stored → nothing to do.
+    let persist_iter: Option<u32> = if body_has_max_iterations {
+        body.max_iterations
+    } else if default_max_iterations.is_none() {
+        Some(cairn_orchestrator::LoopConfig::default().max_iterations)
+    } else {
+        None
+    };
+    if let Some(v) = persist_iter {
+        if let Err(err) = crate::persist_run_u32_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "max_iterations",
+            v,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = %run.run_id,
+                error = %err,
+                "#651: failed to persist run max_iterations default; auto-resume may fall back to LoopConfig default"
+            );
+        }
+    }
 
     // Cairn picks the model. The caller describes the task; the control
     // plane resolves the preferred model from system defaults and derives
@@ -1236,8 +1325,13 @@ async fn orchestrate_run_handler_inner(
     let decide = LlmDecidePhase::from_routed(routed).with_tools(registry.clone());
 
     // Build loop config first so checkpoint policy is available for execute.
+    // #651: fall back to the persisted `max_iterations` default when the
+    // body omits the field. The F49 auto-resume worker POSTs `{}` so
+    // without this lookup every follow-up iteration drops back to
+    // `LoopConfig::default().max_iterations` (20) and overrides the
+    // operator-chosen cap from the first POST.
     let mut cfg = LoopConfig::default();
-    if let Some(m) = body.max_iterations {
+    if let Some(m) = body.max_iterations.or(default_max_iterations) {
         cfg.max_iterations = m;
     }
     if let Some(t) = body.timeout_ms {

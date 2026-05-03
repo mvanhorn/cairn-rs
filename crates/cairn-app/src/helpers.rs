@@ -346,6 +346,50 @@ pub(crate) async fn persist_run_string_default(
         .map(|_| ())
 }
 
+/// #651: read a run's per-run u32 default. Used to recover
+/// `max_iterations` on the empty-body auto-resume POST so the first
+/// operator-chosen cap survives every subsequent kick.
+pub(crate) async fn resolve_run_u32_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+) -> Option<u32> {
+    let key = run_default_key(run_id, suffix);
+    state
+        .runtime
+        .defaults
+        .resolve(project, &key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+/// #651: persist a run's per-run u32 default (currently only
+/// `max_iterations`). Mirrors `persist_run_string_default` — stored in
+/// the same `defaults` projection under the `run:<id>:<suffix>` key.
+pub(crate) async fn persist_run_u32_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: u32,
+) -> Result<(), cairn_runtime::RuntimeError> {
+    state
+        .runtime
+        .defaults
+        .set(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            serde_json::Value::Number(serde_json::Number::from(value)),
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Resolve a task's session_id.
 ///
 /// Returns the `session_id` already persisted on the task record when present.
