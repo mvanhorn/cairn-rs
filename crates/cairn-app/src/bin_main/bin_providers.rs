@@ -185,40 +185,26 @@ pub(crate) struct DiscoverModelsQuery {
     adapter_type: Option<String>,
 }
 
+/// Decrypt a stored [`CredentialRecord`] using the runtime's master key.
+///
+/// Thin delegator to [`cairn_runtime::CredentialServiceImpl::decrypt_record`]
+/// so every call site — probe helpers, discover-preview — shares exactly one
+/// decryption routine with the rest of the runtime (provider registry, credential
+/// service rotate path). Dogfood #632 traced a silent 401 to a previous
+/// implementation that reinvented AES-GCM with a SHA256-derived key, which
+/// disagreed with the real master-key-encrypted ciphertext and always failed;
+/// `.ok()`-swallowed failures then dropped the Authorization header on every
+/// probe. Keeping one decrypt path means a future key-material change lands
+/// everywhere at once.
 pub(crate) fn decrypt_provider_credential(
+    state: &AppState,
     record: &cairn_domain::credentials::CredentialRecord,
 ) -> Result<String, String> {
-    use aes_gcm::aead::{Aead, KeyInit};
-    use aes_gcm::{Aes256Gcm, Key, Nonce};
-    use sha2::{Digest, Sha256};
-
-    let seed = record.key_id.as_deref().unwrap_or("cairn-local-test-key");
-    let digest = Sha256::digest(seed.as_bytes());
-    let mut key_material = [0u8; 32];
-    key_material.copy_from_slice(&digest[..32]);
-
-    let key = Key::<Aes256Gcm>::from_slice(&key_material);
-    let cipher = Aes256Gcm::new(key);
-
-    let encrypted_at_ms = record
-        .encrypted_at_ms
-        .ok_or_else(|| "credential missing encrypted_at_ms".to_owned())?;
-    let nonce_digest = Sha256::digest(
-        format!(
-            "{}:{}:{encrypted_at_ms}",
-            record.tenant_id.as_str(),
-            record.provider_id
-        )
-        .as_bytes(),
-    );
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes.copy_from_slice(&nonce_digest[..12]);
-
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, record.encrypted_value.as_ref())
-        .map_err(|e| format!("credential decryption failed: {e}"))?;
-    String::from_utf8(plaintext).map_err(|e| format!("credential plaintext invalid utf-8: {e}"))
+    state
+        .runtime
+        .credentials
+        .decrypt_record(record)
+        .map_err(|e| format!("credential decryption failed: {e}"))
 }
 
 pub(crate) async fn resolve_connection_probe_material(
@@ -238,7 +224,13 @@ pub(crate) async fn resolve_connection_probe_material(
             .as_str()
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
-            .map(str::to_owned),
+            // Normalise trailing slashes at the source so every probe-URL
+            // builder that appends `/models` or `/api/tags` produces a
+            // single-slash join even if the operator stored the endpoint
+            // with a trailing `/` (Gemini review on #632 — the probe
+            // would otherwise emit `https://host//models` and some
+            // upstreams reject double-slash paths).
+            .map(|value| value.trim_end_matches('/').to_owned()),
         _ => None,
     };
 
@@ -257,10 +249,28 @@ pub(crate) async fn resolve_connection_probe_material(
         Some(credential_id) => match state
             .runtime
             .credentials
-            .get(&cairn_domain::CredentialId::new(credential_id))
+            .get(&cairn_domain::CredentialId::new(credential_id.as_str()))
             .await
         {
-            Ok(Some(record)) if record.active => decrypt_provider_credential(&record).ok(),
+            Ok(Some(record)) if record.active => {
+                // Decrypt failure here is rare (wrong master key, ciphertext
+                // corruption). Log at warn so operators can diagnose the
+                // silent-401 class of bug #632 traced — previously this
+                // branch used `.ok()` and the probe silently dropped the
+                // Authorization header.
+                match decrypt_provider_credential(state, &record) {
+                    Ok(plaintext) => Some(plaintext),
+                    Err(e) => {
+                        tracing::warn!(
+                            connection_id = connection_id,
+                            credential_id = %credential_id,
+                            error = %e,
+                            "probe credential decryption failed — probe will run without auth header",
+                        );
+                        None
+                    }
+                }
+            }
             _ => None,
         },
         None => None,
@@ -404,7 +414,7 @@ pub(crate) async fn discover_models_preview_handler(
                             )
                                 .into_response();
                         }
-                        match decrypt_provider_credential(&record) {
+                        match decrypt_provider_credential(&state, &record) {
                             Ok(plaintext) => Some(plaintext),
                             Err(e) => {
                                 tracing::error!(
@@ -831,6 +841,74 @@ pub(crate) fn compute_max_output_tokens(context_window: u32, input_estimate: u32
     available.min(quarter_ctx).max(256)
 }
 
+/// Resolve the canonical default base URL for a provider adapter's `/test`
+/// probe when the connection record has no operator-supplied `endpoint_url`.
+///
+/// Before #632 the probe fell through to `state.openai_compat`'s base URL for
+/// every non-Ollama, non-Bedrock adapter — which in practice meant a zai /
+/// anthropic / deepseek / etc. connection probed a completely unrelated
+/// endpoint and always returned 401 even with a valid credential. Each
+/// backend has a known canonical base URL; honour it.
+///
+/// Returns `None` for adapter types with no known default (generic
+/// `openai-compatible`, unknown names) — the caller falls back to
+/// `state.openai_compat` for those, which is the legacy behaviour and still
+/// correct when an operator has explicitly wired `OPENAI_COMPAT_BASE_URL`
+/// for a custom endpoint.
+pub(crate) fn default_probe_base_url_for_adapter(adapter_type: &str) -> Option<&'static str> {
+    use cairn_providers::wire::openai_compat::ProviderConfig;
+    use cairn_providers::wire::zai::ZaiConfig;
+
+    let lowered = adapter_type.to_lowercase();
+    // Z.ai has its own wire module with two tiers. Coding-plan operators hit
+    // a different URL than general paas; mapping both explicitly lets the
+    // probe follow the same URL the runtime adapter would use.
+    match lowered.as_str() {
+        "zai-coding" | "z_ai_coding" | "z-ai-coding" | "zai_coding" | "glm-coding" => {
+            return Some(ZaiConfig::CODING.default_base_url);
+        }
+        "zai" | "z_ai" | "z-ai" | "z.ai" => return Some(ZaiConfig::GENERAL.default_base_url),
+        _ => {}
+    }
+    // For the remaining OpenAI-compatible family members, defer to the
+    // provider-registry preset table. `ProviderConfig::from_name` returns
+    // `Self::default()` for unknown names — detect that via the static `name`
+    // discriminator and return `None` so the caller can fall through to the
+    // env-wired `state.openai_compat` slot instead of blindly using the
+    // generic localhost placeholder.
+    let cfg = ProviderConfig::from_name(&lowered);
+    if cfg.name == ProviderConfig::default().name {
+        None
+    } else {
+        Some(cfg.default_base_url)
+    }
+}
+
+/// Human-readable reason string for a non-2xx probe response.
+///
+/// Used by the `/test` handler to replace the old `"returned non-2xx"`
+/// sentinel with status-code-specific guidance so operators can tell a bad
+/// credential apart from a bad URL apart from a rate limit. Unknown codes
+/// fall back to a generic phrasing.
+pub(crate) fn probe_detail_for_status(status: u16) -> String {
+    match status {
+        401 => "401 Unauthorized — credential rejected; verify the stored API key or endpoint URL"
+            .to_owned(),
+        403 => "403 Forbidden — credential accepted but not permitted for this endpoint or model"
+            .to_owned(),
+        404 => {
+            "404 Not Found — endpoint URL path does not expose a models catalog; check adapter_type"
+                .to_owned()
+        }
+        429 => "429 Too Many Requests — provider is rate-limiting this credential".to_owned(),
+        500 => "500 Internal Server Error — upstream provider failure; retry later".to_owned(),
+        502 => "502 Bad Gateway — upstream provider unreachable".to_owned(),
+        503 => "503 Service Unavailable — upstream provider temporarily down".to_owned(),
+        504 => "504 Gateway Timeout — upstream provider did not respond in time".to_owned(),
+        code => format!("HTTP {code} — non-2xx response from upstream"),
+    }
+}
+
 /// `GET /v1/providers/connections/:id/test`
 ///
 /// Probes the provider endpoint and returns reachability + round-trip latency.
@@ -915,12 +993,33 @@ pub(crate) async fn test_connection_handler(
         // Probe the base URL — a 403 or 404 still means reachable.
         (base, auth)
     } else {
+        // OpenAI-compat family (openai, anthropic, zai, zai-coding, deepseek,
+        // xai, groq, google/gemini, openrouter, minimax, azure-openai,
+        // bedrock-compat, openai-compatible). Precedence for the base URL:
+        //   1. explicit ?endpoint_url= query override
+        //   2. operator-configured `endpoint_url` on the stored connection
+        //   3. the adapter's own canonical default (#632 fix — previously
+        //      fell straight through to `state.openai_compat`, which used
+        //      a completely unrelated base and always returned 401 for any
+        //      zai/anthropic/etc. connection not given an explicit endpoint)
+        //   4. the env-wired generic `openai_compat` slot as a last resort
+        //      (preserves behaviour for custom operator-supplied endpoints
+        //      where `adapter_type` is "openai-compatible" or unknown)
         let base = query
             .endpoint_url
             .as_deref()
             .map(|u| u.trim_end_matches('/').to_owned())
             .or_else(|| stored_endpoint.clone())
-            .or_else(|| state.openai_compat.as_ref().map(|p| p.base_url.to_string()));
+            .or_else(|| {
+                default_probe_base_url_for_adapter(&adapter_type)
+                    .map(|u| u.trim_end_matches('/').to_owned())
+            })
+            .or_else(|| {
+                state
+                    .openai_compat
+                    .as_ref()
+                    .map(|p| p.base_url.as_str().trim_end_matches('/').to_owned())
+            });
         match base {
             Some(b) => {
                 let key = query
@@ -966,11 +1065,14 @@ pub(crate) async fn test_connection_handler(
                 resp.status().is_success()
             };
             let detail = if ok && resp.status().is_success() {
-                "reachable"
+                "reachable".to_owned()
             } else if ok {
-                "reachable (auth required)"
+                // Bedrock path: non-2xx still counts as reachable. Surface
+                // the status code so the operator can tell "credential
+                // bound to the wrong region" apart from "endpoint up".
+                format!("reachable ({})", probe_detail_for_status(status))
             } else {
-                "returned non-2xx"
+                probe_detail_for_status(status)
             };
             (
                 StatusCode::OK,

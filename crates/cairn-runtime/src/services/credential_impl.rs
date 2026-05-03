@@ -300,6 +300,22 @@ impl<S> CredentialServiceImpl<S> {
     pub fn master_key_fingerprint(&self) -> String {
         self.master_key.fingerprint()
     }
+
+    /// Decrypt a previously-stored [`CredentialRecord`] using this
+    /// service's master key. Returns the plaintext value.
+    ///
+    /// Callers outside the runtime (e.g. the provider `/test` probe
+    /// handler in cairn-app) need to forward the operator's API key to
+    /// the upstream provider for reachability checks. Before this
+    /// method existed, the probe path rolled its own SHA256-seeded
+    /// decryption that was incompatible with the production master-key
+    /// encryption scheme — every probe sent no Authorization header and
+    /// every provider replied 401 even with a valid stored credential
+    /// (dogfood #632). Exposing the real decrypt here keeps one
+    /// ciphertext format per deployment.
+    pub fn decrypt_record(&self, record: &CredentialRecord) -> Result<String, RuntimeError> {
+        decrypt_value(self.master_key.as_ref(), &record.encrypted_value)
+    }
 }
 
 fn now_ms() -> u64 {
