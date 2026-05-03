@@ -391,9 +391,21 @@ pub(crate) async fn create_tenant_handler(
 
 pub(crate) async fn get_tenant_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.runtime.tenants.get(&TenantId::new(id)).await {
+    // RFC 026 PR-A7b: scope the read. Admin service account keeps
+    // cross-tenant visibility; a same-tenant operator can GET their
+    // own tenant record (needed for basic UI bootstrap). A foreign-
+    // tenant operator gets 404 — never 403 — so tenant existence is
+    // not leaked (mirrors the oracle-avoidance pattern in
+    // `list_credentials_handler` #447).
+    let target = TenantId::new(id);
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found")
+            .into_response();
+    }
+    match state.runtime.tenants.get(&target).await {
         Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
         Ok(None) => {
             AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found").into_response()
@@ -475,9 +487,19 @@ pub(crate) async fn patch_tenant_handler(
 
 pub(crate) async fn get_tenant_overview_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let tenant_id = TenantId::new(id);
+
+    // RFC 026 PR-A7b: scope the read. Admin bypass preserved for
+    // cross-tenant observability; same-tenant operator sees their
+    // own overview (needed by the UI dashboard); foreign-tenant
+    // operator gets 404 to avoid leaking tenant existence.
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &tenant_id {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found")
+            .into_response();
+    }
 
     match state.runtime.tenants.get(&tenant_id).await {
         Ok(None) => {
@@ -566,6 +588,10 @@ pub(crate) async fn get_tenant_overview_handler(
 
 pub(crate) async fn get_tenant_quota_handler(
     State(state): State<Arc<AppState>>,
+    // RFC 026 PR-A7b: quota values (ceilings, burn rate, limits) are
+    // admin-sensitive. Gate strictly on `TenantAdminGuard` so only
+    // god-token or tenant-admin role on THIS tenant can read.
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
 ) -> impl IntoResponse {
     match QuotaReadModel::get_quota(state.runtime.store.as_ref(), &TenantId::new(tenant_id)).await {
@@ -600,6 +626,11 @@ pub(crate) async fn set_tenant_quota_handler(
 
 pub(crate) async fn get_retention_policy_handler(
     State(state): State<Arc<AppState>>,
+    // RFC 026 PR-A7b: retention policy (data lifetime / purge
+    // windows) is admin-sensitive. Gate strictly on
+    // `TenantAdminGuard` — god-token or tenant-admin role on THIS
+    // tenant only.
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
 ) -> impl IntoResponse {
     match RetentionPolicyReadModel::get_by_tenant(
@@ -884,6 +915,10 @@ pub(crate) async fn create_snapshot_handler(
 
 pub(crate) async fn list_snapshots_handler(
     State(state): State<Arc<AppState>>,
+    // RFC 026 PR-A7b: snapshot catalogue exposes backup identifiers
+    // and timing — admin-sensitive. Gate strictly on
+    // `TenantAdminGuard`.
+    _role: TenantAdminGuard,
     Path(id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
@@ -1004,20 +1039,26 @@ impl ListWorkspacesQuery {
 
 pub(crate) async fn list_workspaces_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(tenant_id): Path<String>,
     Query(query): Query<ListWorkspacesQuery>,
 ) -> impl IntoResponse {
+    // RFC 026 PR-A7b: workspace navigation is not admin-sensitive —
+    // any operator on the tenant needs to see their workspaces to
+    // use the UI. Admin bypass keeps cross-tenant visibility;
+    // foreign-tenant operator gets an empty-equivalent 404 (rather
+    // than an enumeration oracle).
+    let target = TenantId::new(tenant_id);
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found")
+            .into_response();
+    }
     // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
     let limit = query.limit();
     match state
         .runtime
         .workspaces
-        .list_by_tenant(
-            &TenantId::new(tenant_id),
-            limit + 1,
-            query.offset(),
-            query.include_archived,
-        )
+        .list_by_tenant(&target, limit + 1, query.offset(), query.include_archived)
         .await
     {
         Ok(mut items) => {
