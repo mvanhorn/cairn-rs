@@ -99,10 +99,15 @@ test("S1: Orchestrate with real LLM → meaningful response + token accounting +
   await post(request, "/v1/sessions", { session_id: sid, ...scope });
   await post(request, "/v1/runs", { run_id: rid, session_id: sid, ...scope });
 
-  // Orchestrate with a real prompt that has a verifiable answer
+  // Orchestrate with a real prompt that has a verifiable answer.
+  // cairn-app's OrchestrateRequest uses `goal` (the task description)
+  // and `max_iterations` (the loop cap), NOT `input` / `max_steps` —
+  // serde silently drops unknown fields so earlier revisions with those
+  // fields ran the orchestrator with no user prompt at all, which made
+  // the model ask for clarification instead of answering.
   const orch = await post(request, `/v1/runs/${rid}/orchestrate`, {
-    input: "What is 2 + 2? Reply with just the number.",
-    max_steps: 1,
+    goal: "What is 2 + 2? Reply with just the number.",
+    max_iterations: 1,
   });
 
   if (orch.status === 200) {
@@ -187,8 +192,8 @@ test("S3: Memory-augmented orchestration — model uses ingested knowledge", asy
   await post(request, "/v1/runs", { run_id: rid, session_id: sid, ...scope });
 
   const orch = await post(request, `/v1/runs/${rid}/orchestrate`, {
-    input: `What is the secret project codename? Search memory for it.`,
-    max_steps: 2,
+    goal: `What is the secret project codename? Search memory for it.`,
+    max_iterations: 2,
   });
 
   if (orch.status === 200) {
@@ -244,13 +249,13 @@ test("S5: Multi-run session — two runs with independent event trails", async (
   // Run A: orchestrate
   await post(request, "/v1/runs", { run_id: ridA, session_id: sid, ...scope });
   const orchA = await post(request, `/v1/runs/${ridA}/orchestrate`, {
-    input: "Say hello.", max_steps: 1,
+    goal: "Say hello.", max_iterations: 1,
   });
 
   // Run B: orchestrate with different prompt
   await post(request, "/v1/runs", { run_id: ridB, session_id: sid, ...scope });
   const orchB = await post(request, `/v1/runs/${ridB}/orchestrate`, {
-    input: "Say goodbye.", max_steps: 1,
+    goal: "Say goodbye.", max_iterations: 1,
   });
 
   // REAL EXPECTATION: both runs have events, and they don't cross-contaminate
@@ -369,8 +374,8 @@ test("S8: Full agent workflow through UI with real LLM", async ({ page, request 
 
   // Real orchestration
   const orch = await post(request, `/v1/runs/${rid}/orchestrate`, {
-    input: "What is the capital of France? Answer in one word.",
-    max_steps: 1,
+    goal: "What is the capital of France? Answer in one word.",
+    max_iterations: 1,
   });
 
   if (orch.status === 200) {
@@ -604,8 +609,8 @@ test("S13: THE FULL MONTY — complete product lifecycle with real LLM", async (
 
   // ── 6. Orchestrate with real LLM ──
   const orch = await post(request, `/v1/runs/${rid}/orchestrate`, {
-    input: "What is the capital of France? One word answer.",
-    max_steps: 1,
+    goal: "What is the capital of France? One word answer.",
+    max_iterations: 1,
   });
 
   let llmWorked = false;

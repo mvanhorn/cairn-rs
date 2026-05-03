@@ -903,7 +903,7 @@ test.describe("24. Real LLM Calls", () => {
 
     const resp = await request.post(`${BASE}/v1/runs/${rid}/orchestrate`, {
       headers: HDR,
-      data: { input: "Say hello", max_steps: 1 },
+      data: { goal: "Say hello", max_iterations: 1 },
       timeout: 30_000,
     });
 
@@ -937,7 +937,7 @@ test.describe("24. Real LLM Calls", () => {
     // Orchestrate asking about the ingested knowledge
     const resp = await request.post(`${BASE}/v1/runs/${rid}/orchestrate`, {
       headers: HDR,
-      data: { input: "How many LLM providers does Cairn support?", max_steps: 2 },
+      data: { goal: "How many LLM providers does Cairn support?", max_iterations: 2 },
       timeout: 30_000,
     });
 
@@ -1020,7 +1020,7 @@ test("FULL JOURNEY: health → connect → session → orchestrate (real LLM) �
   await test.step("4. Orchestrate with real LLM", async () => {
     const orchResp = await request.post(`${BASE}/v1/runs/${rid}/orchestrate`, {
       headers: HDR,
-      data: { input: "Summarize what Cairn does in one sentence.", max_steps: 1 },
+      data: { goal: "Summarize what Cairn does in one sentence.", max_iterations: 1 },
       timeout: 30_000,
     });
     if (orchResp.status() === 200) {
