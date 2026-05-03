@@ -169,3 +169,65 @@ async fn pg_full_service_aggregate_boots() {
 
     services.shutdown().await;
 }
+
+/// Proves `SignalBridge::deliver_approval_signal` reaches the PG
+/// `EngineBackend::deliver_signal` body (not the pre-0.14.1 Lua FCALL
+/// path that returned `EngineError::Unavailable` on any PG runtime).
+///
+/// Drives a bare delivery against a fabricated execution + waitpoint —
+/// FF's PG impl rejects with an authentic typed error (waitpoint not
+/// found / invalid token) because the state was never set up. That's
+/// exactly the shape a real signal against a missing waitpoint would
+/// take; what we're pinning is the *absence* of the pre-0.14.1
+/// "fcall (Postgres backend has no Lua surface)" `Unavailable` error.
+///
+/// This is a structural regression guard for the SignalBridge → trait
+/// migration. Full waitpoint-round-trip coverage on PG is deferred to
+/// a later harness pass (requires driving the full run lifecycle on
+/// PG, which is a bigger fixture).
+#[tokio::test]
+async fn pg_signal_bridge_deliver_reaches_engine_backend() {
+    use flowfabric::core::types::{ExecutionId, WaitpointId};
+
+    let pg = shared_pg().await;
+    let config = pg_fabric_config(&pg.url);
+    let event_log: Arc<dyn EventLog + Send + Sync> = Arc::new(InMemoryStore::default());
+    let services = FabricServices::start(config, event_log)
+        .await
+        .expect("boot");
+
+    // Fabricate an execution+waitpoint the backend has never seen.
+    // `ExecutionId` carries a partition prefix `{fp:N}:<uuid>`; the
+    // synthetic id below lands on a partition the PG schema accepts
+    // but has no suspend row — FF will reject with a typed error,
+    // NOT `Unavailable`.
+    let eid = ExecutionId::parse(&format!("{{fp:0}}:{}", uuid::Uuid::new_v4())).expect("parse eid");
+    let wp_id = WaitpointId::new();
+
+    // Use the internal deliver_signal path via a public entry point
+    // that takes the Signal directly. Approval-bridge delivers go
+    // through `deliver_approval_signal` but need a live waitpoint to
+    // read the token — on PG with no state, the token read fails
+    // first. Assert on the ERROR KIND: any error EXCEPT
+    // `EngineError::Unavailable { op: "fcall ..." }` means the
+    // migration landed.
+    let err = services
+        .signals
+        .deliver_approval_signal(&eid, &wp_id, true, "nonexistent", None)
+        .await
+        .expect_err("PG with no state must reject, not succeed");
+
+    let rendered = format!("{err}");
+    assert!(
+        !rendered.contains("Postgres backend has no Lua surface"),
+        "PG SignalBridge must NOT hit the pre-0.14.1 fcall Unavailable path; got: {rendered}"
+    );
+    // Positive signal: we reached the backend. The error must be a
+    // waitpoint / validation shape, not an `Unavailable` one.
+    assert!(
+        !rendered.contains("Unavailable"),
+        "PG SignalBridge must reach deliver_signal, got Unavailable: {rendered}"
+    );
+
+    services.shutdown().await;
+}

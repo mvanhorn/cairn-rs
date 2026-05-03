@@ -347,7 +347,7 @@ impl FabricServices {
         let budgets = FabricBudgetService::new(control_plane.clone());
         let quotas = FabricQuotaService::new(control_plane.clone(), runtime.clone());
         let rotation = FabricRotationService::new(control_plane.clone());
-        let signals = SignalBridge::new(runtime.clone(), engine.clone());
+        let signals = SignalBridge::new(runtime.clone());
 
         Ok(Self {
             runtime,

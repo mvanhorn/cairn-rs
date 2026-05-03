@@ -1,6 +1,6 @@
 # Postgres backend parity gaps
 
-Last updated: 2026-05-03 (FF 0.14.1 — PG register_worker green)
+Last updated: 2026-05-03 (FF 0.14.1 — SignalBridge backend-agnostic)
 
 Cairn-rs's `fabric-postgres` feature is a work-in-progress backend. This
 document tracks:
@@ -8,11 +8,12 @@ document tracks:
 1. **Trait-level parity** — every method on cairn's `Engine` +
    `ControlPlaneBackend` now routes through an `EngineBackend` trait
    body on Postgres; bucket-C is **closed**.
-2. **Service-layer parity** — two cairn-side surfaces
-   (`FabricSchedulerService::claim_for_worker`,
-   `SignalBridge::deliver_*_signal`) still surface `Unavailable` on
-   PG because they depend on `ferriskey::Client` / Lua-FCALL primitives
-   FF has not yet exposed on `EngineBackend`.
+2. **Service-layer parity** — one cairn-side surface
+   (`FabricSchedulerService::claim_for_worker`) still surfaces
+   `Unavailable` on PG because it depends on `ff_scheduler::Scheduler`,
+   which FF has not yet made backend-agnostic ([FF#511](https://github.com/avifenesh/FlowFabric/issues/511)).
+   `SignalBridge::deliver_*_signal` now routes through
+   `EngineBackend::deliver_signal` and works on both backends.
 3. **Operator guide** — what works, what fails, and how to choose a
    backend.
 
@@ -44,32 +45,29 @@ and `pg_register_worker_is_idempotent_on_same_instance` — pass on
 FF 0.14.1 against PG 16 (FlowFabric PR #509 replaced the broken
 `RETURNING (xmax = 0)` clause; tracked as cairn-rs #508, closed).
 
-## Service-layer parity — two surfaces still Valkey-only
+## Service-layer parity — one surface still Valkey-only
 
 `FabricServices::start(BackendKind::Postgres)` returns `Ok(_)` and the
 full service aggregate boots against a `PostgresFabricRuntime`
 (cairn-rs#602, landed in PR-C4c).
 
-Two cairn-side services wrap primitives FF's `EngineBackend` trait
-does not yet surface natively:
+One cairn-side service still wraps a primitive FF's `EngineBackend`
+trait does not yet surface natively:
 
-- **`FabricSchedulerService::claim_for_worker`** — FF 0.14's
+- **`FabricSchedulerService::claim_for_worker`** — FF 0.14.1's
   `ff_scheduler::Scheduler::new` still takes `ferriskey::Client`. The
   PG runtime's `valkey_client()` returns `None`, so the inner
   `Scheduler` is skipped and `claim_for_worker` returns
   `EngineError::Unavailable { op: "scheduler_claim_for_worker (Postgres backend has no ff-scheduler)" }`.
   Cairn-app's worker loop is gated at the app layer on a Valkey
   backend, so this branch is unreachable on today's PG
-  full-app-mode deploys.
-- **`SignalBridge::deliver_*_signal`** — cairn still dispatches
-  `ff_deliver_signal` via a raw `ferriskey::Client::fcall`. The
-  `FabricRuntimeHandle::fcall` trait method returns
-  `EngineError::Unavailable { op: "fcall (Postgres backend has no Lua surface)" }`
-  on PG. Signal-delivery surfaces (approval resolution, tool-result,
-  child-completed) are Valkey-gated at the app layer.
+  full-app-mode deploys. Tracked at [FF#511](https://github.com/avifenesh/FlowFabric/issues/511)
+  — FF upstream ask for a backend-agnostic `Scheduler` constructor.
 
-Both limitations will retire when FF surfaces the equivalent
-primitives on `EngineBackend`.
+`SignalBridge` now routes through `EngineBackend::deliver_signal`
+verbatim — the raw `ff_deliver_signal` Lua FCALL is gone. Signal
+delivery (approval resolution, tool-result, child-completed) works
+on both Valkey and Postgres via the trait method's bodied impls.
 
 ### What works end-to-end on PG
 
@@ -91,9 +89,9 @@ primitives on `EngineBackend`.
 | Deployment shape | Recommended backend |
 |---|---|
 | Full cairn-app in `--mode team` (runs, tasks, sessions, approvals) — HTTP CRUD surfaces only | **Valkey** or **Postgres** (PR-C4c: full aggregate boots on both) |
-| Full cairn-app in `--mode team` with worker pool (`cairn-app` claim loop) | **Valkey** — scheduler's `claim_for_worker` needs a `ferriskey::Client` today |
-| Full cairn-app in `--mode team` with signal delivery (approvals, tool-result, child-completed) | **Valkey** until FF surfaces a trait-level `deliver_signal` cairn can consume |
-| Full cairn-app in `--mode local` | **Valkey** (local-mode shares the signal-delivery path) |
+| Full cairn-app in `--mode team` with worker pool (`cairn-app` claim loop) | **Valkey** — scheduler's `claim_for_worker` needs a `ferriskey::Client` today ([FF#511](https://github.com/avifenesh/FlowFabric/issues/511)) |
+| Full cairn-app in `--mode team` with signal delivery (approvals, tool-result, child-completed) | **Valkey** or **Postgres** — routes through `EngineBackend::deliver_signal` |
+| Full cairn-app in `--mode local` | **Valkey** or **Postgres** — same signal-delivery trait path |
 | Control-plane-only integration (third-party tool calling `PostgresControlPlane` for flow / edge / execution reads + lifecycle primitives + worker registry) | **Postgres** — all 37 trait methods have real bodies |
 
 ### What works on `fabric-postgres` today
@@ -117,10 +115,7 @@ primitives on `EngineBackend`.
   because `ff_scheduler::Scheduler` is `ferriskey::Client`-bound.
   Cairn-app's worker loop is app-layer-gated to Valkey, so PG
   full-app-mode deploys that serve only HTTP CRUD are unaffected.
-- **`SignalBridge::deliver_*_signal`** — returns `Unavailable` on PG
-  because `ff_deliver_signal` is a Valkey Lua FCALL. Signal-delivery
-  surfaces (approvals, tool-result, child-completed) are
-  app-layer-gated to Valkey.
+  Tracked at [FF#511](https://github.com/avifenesh/FlowFabric/issues/511).
 - **`/metrics`'s `ff_observability` block** — rendered only on Valkey.
   The PG backend has no registry today; cairn-side metrics still
   surface.
@@ -148,5 +143,6 @@ Match on the typed variant to branch.
 - [FF#473](https://github.com/avifenesh/FlowFabric/issues/473) — worker-registry parity upstream (closed by FF 0.14).
 - [FF#477](https://github.com/avifenesh/FlowFabric/issues/477) — `list_incoming_edges` trait surfacing upstream (closed by FF 0.14).
 - [FF#508](https://github.com/avifenesh/FlowFabric/issues/508) — `register_worker` PG 16 `RETURNING (xmax = 0)` fix (closed by FF 0.14.1).
+- [FF#511](https://github.com/avifenesh/FlowFabric/issues/511) — backend-agnostic `Scheduler` constructor (open; last service-layer PG parity gap).
 - [FF 0.14 consumer migration guide](https://github.com/avifenesh/FlowFabric/blob/main/docs/CONSUMER_MIGRATION_0.14_worker_registry.md).
 - [`docs/design/ff-migration/pr-c4a-classification.md`](ff-migration/pr-c4a-classification.md) — per-method bucket A/B/C classification (historical).
