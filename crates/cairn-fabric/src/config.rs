@@ -352,12 +352,20 @@ impl FabricConfig {
         match &self.backend.connection {
             BackendConnection::Valkey(vk) => {
                 if vk.port == 0 {
-                    return Err(FabricError::Config("valkey port must be > 0".into()));
+                    return Err(FabricError::Config(
+                        "CAIRN_FABRIC_URL has port=0; set a non-zero TCP port \
+                         (e.g. `valkey://localhost:6379`)."
+                            .into(),
+                    ));
                 }
             }
             BackendConnection::Postgres(pg) => {
                 if pg.url.is_empty() {
-                    return Err(FabricError::Config("postgres url must not be empty".into()));
+                    return Err(FabricError::Config(
+                        "CAIRN_FABRIC_URL is empty for a Postgres backend; \
+                         set it to a `postgres://user:pass@host:5432/db` URL."
+                            .into(),
+                    ));
                 }
             }
             other => {
@@ -368,22 +376,43 @@ impl FabricConfig {
             }
         }
         if self.lease_ttl_ms < 1000 {
-            return Err(FabricError::Config("lease_ttl_ms must be >= 1000".into()));
+            return Err(FabricError::Config(format!(
+                "CAIRN_FABRIC_LEASE_TTL_MS must be >= 1000 (got {}); \
+                 set it to a millisecond value of 1000 or greater, \
+                 or unset it to accept the 180000 default.",
+                self.lease_ttl_ms
+            )));
         }
         if self.max_concurrent_tasks < 1 {
             return Err(FabricError::Config(
-                "max_concurrent_tasks must be >= 1".into(),
+                "CAIRN_FABRIC_MAX_TASKS must be >= 1; \
+                 set it to a positive integer (e.g. `4`) or unset it to \
+                 accept the 4 default."
+                    .into(),
             ));
         }
         if self.grant_ttl_ms == 0 {
-            return Err(FabricError::Config("grant_ttl_ms must be > 0".into()));
+            return Err(FabricError::Config(
+                "CAIRN_FABRIC_GRANT_TTL_MS must be > 0; \
+                 set it to a positive millisecond value (e.g. `5000`) or \
+                 unset it to accept the 5000 default."
+                    .into(),
+            ));
         }
         if self.fcall_timeout_ms == 0 {
-            return Err(FabricError::Config("fcall_timeout_ms must be > 0".into()));
+            return Err(FabricError::Config(
+                "CAIRN_FABRIC_FCALL_TIMEOUT_MS must be > 0; \
+                 set it to a positive millisecond value (e.g. `5000`) or \
+                 unset it to accept the 5000 default."
+                    .into(),
+            ));
         }
         if self.signal_dedup_ttl_ms == 0 {
             return Err(FabricError::Config(
-                "signal_dedup_ttl_ms must be > 0".into(),
+                "CAIRN_FABRIC_SIGNAL_DEDUP_TTL_MS must be > 0; \
+                 set it to a positive millisecond value (e.g. `86400000`) or \
+                 unset it to accept the 86400000 default."
+                    .into(),
             ));
         }
         // HMAC secret: if supplied, MUST be exactly 64 hex chars (256-bit
@@ -392,13 +421,16 @@ impl FabricConfig {
         if let Some(secret) = &self.waitpoint_hmac_secret {
             if secret.len() != 64 {
                 return Err(FabricError::Config(format!(
-                    "waitpoint_hmac_secret must be 64 hex chars (32 bytes), got {}",
+                    "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET must be 64 hex chars (32 bytes), got {}. \
+                     Generate a fresh secret with `openssl rand -hex 32`.",
                     secret.len()
                 )));
             }
             if !secret.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(FabricError::Config(
-                    "waitpoint_hmac_secret must be hex-encoded (0-9, a-f, A-F only)".into(),
+                    "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET must be hex-encoded (0-9, a-f, A-F only). \
+                     Generate a fresh secret with `openssl rand -hex 32`."
+                        .into(),
                 ));
             }
             // Kid must be present and non-empty iff secret is set. An empty
@@ -407,7 +439,10 @@ impl FabricConfig {
             if let Some(kid) = &self.waitpoint_hmac_kid {
                 if kid.is_empty() {
                     return Err(FabricError::Config(
-                        "waitpoint_hmac_kid must not be empty when waitpoint_hmac_secret is set"
+                        "CAIRN_FABRIC_WAITPOINT_HMAC_KID must not be empty when \
+                         CAIRN_FABRIC_WAITPOINT_HMAC_SECRET is set. \
+                         Set it to a stable operator-chosen identifier (e.g. `k1`) or \
+                         unset it to accept the `k1` default."
                             .into(),
                     ));
                 }
@@ -418,13 +453,19 @@ impl FabricConfig {
                 // the validation path.
                 if kid.contains(':') {
                     return Err(FabricError::Config(format!(
-                        "waitpoint_hmac_kid must not contain ':' (FF field-name delimiter): {kid:?}"
+                        "CAIRN_FABRIC_WAITPOINT_HMAC_KID must not contain ':' \
+                         (FF reserves ':' as a hash-field delimiter): {kid:?}. \
+                         Pick a colon-free identifier (e.g. `k1`, `k-2026-05`)."
                     )));
                 }
             }
         } else if self.waitpoint_hmac_kid.is_some() {
             return Err(FabricError::Config(
-                "waitpoint_hmac_kid set but waitpoint_hmac_secret is None".into(),
+                "CAIRN_FABRIC_WAITPOINT_HMAC_KID is set, but \
+                 CAIRN_FABRIC_WAITPOINT_HMAC_SECRET is missing. \
+                 Generate a 32-byte hex secret with `openssl rand -hex 32` and export it, \
+                 or unset CAIRN_FABRIC_WAITPOINT_HMAC_KID."
+                    .into(),
             ));
         }
         Ok(())
@@ -1242,25 +1283,31 @@ mod tests {
     #[test]
     fn rejects_zero_port() {
         let result = test_config(0, 30_000, 4);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("port"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_URL") && err.contains("port=0"),
+            "expected env-var-named port error, got: {err}"
+        );
     }
 
     #[test]
     fn rejects_low_lease_ttl() {
         let result = test_config(6379, 500, 4);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("lease_ttl_ms"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_LEASE_TTL_MS"),
+            "expected env-var-named lease-ttl error, got: {err}"
+        );
     }
 
     #[test]
     fn rejects_zero_concurrent_tasks() {
         let result = test_config(6379, 30_000, 0);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("max_concurrent_tasks"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_MAX_TASKS"),
+            "expected env-var-named max-tasks error, got: {err}"
+        );
     }
 
     // Gated on `fabric-postgres` because reaching the "postgres url
@@ -1282,8 +1329,8 @@ mod tests {
         cfg.backend_kind = BackendKind::Postgres;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
-            err.contains("postgres url must not be empty"),
-            "expected empty-url error, got: {err}"
+            err.contains("CAIRN_FABRIC_URL") && err.contains("Postgres backend"),
+            "expected env-var-named empty-url error, got: {err}"
         );
     }
 
@@ -1384,8 +1431,9 @@ mod tests {
         config.waitpoint_hmac_kid = Some(String::new());
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("waitpoint_hmac_kid must not be empty"),
-            "expected empty-kid error, got {err}"
+            err.contains("CAIRN_FABRIC_WAITPOINT_HMAC_KID must not be empty")
+                && err.contains("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET is set"),
+            "expected env-var-named empty-kid error, got {err}"
         );
     }
 
@@ -1403,13 +1451,190 @@ mod tests {
     #[test]
     fn hmac_kid_without_secret_errors() {
         // Operator set a kid but forgot the secret: fail loud instead of
-        // silently seeding nothing.
+        // silently seeding nothing. Message must name the env var the
+        // operator touched (issue #631) — the internal field name is
+        // ungreppable from the operator's shell.
         let mut config = base_config();
         config.waitpoint_hmac_kid = Some("k1".into());
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("waitpoint_hmac_kid set but waitpoint_hmac_secret is None"),
-            "expected missing-secret error, got {err}"
+            err.contains("CAIRN_FABRIC_WAITPOINT_HMAC_KID is set")
+                && err.contains("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET is missing"),
+            "expected env-var-named missing-secret error, got {err}"
+        );
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "expected remediation hint naming the openssl command, got {err}"
+        );
+    }
+
+    // ── Issue #631 regression tests: every validate() error names the
+    //    env var the operator must set, never the internal field name. ───────
+
+    /// Collect every error message `validate()` can produce for the HMAC
+    /// pair, by exercising each failure arm. Used by the regression guards
+    /// below to prove no message leaks a Rust field name back to operators.
+    fn hmac_validate_error_messages() -> Vec<String> {
+        let mut out = Vec::new();
+
+        // kid-without-secret (the exact case from issue #631)
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_kid = Some("k1".into());
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // secret too short
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(63));
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // secret too long
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(65));
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // secret non-hex
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("g".repeat(64));
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // kid empty with secret set
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(64));
+        cfg.waitpoint_hmac_kid = Some(String::new());
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // kid contains colon
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(64));
+        cfg.waitpoint_hmac_kid = Some("bad:kid".into());
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        out
+    }
+
+    #[test]
+    fn hmac_error_messages_name_env_var_not_field_name() {
+        // The original #631 defect: the fatal string spoke "waitpoint_hmac_secret"
+        // (the private Rust field) instead of "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET"
+        // (the env var the operator controls). Lock both invariants:
+        //
+        // 1. Every HMAC validation error message must contain at least one of
+        //    the real env var names. An operator reading the fatal should be
+        //    able to grep their shell config for the symbol named in the log.
+        // 2. No HMAC message may leak the lowercase Rust field names
+        //    `waitpoint_hmac_secret` / `waitpoint_hmac_kid`. Case-sensitive,
+        //    so the uppercased env-var form still passes this guard.
+        for msg in hmac_validate_error_messages() {
+            assert!(
+                msg.contains("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET")
+                    || msg.contains("CAIRN_FABRIC_WAITPOINT_HMAC_KID"),
+                "HMAC validate error must name the env var, got: {msg}"
+            );
+            assert!(
+                !msg.contains("waitpoint_hmac_secret"),
+                "HMAC validate error must not leak the Rust field name \
+                 `waitpoint_hmac_secret`, got: {msg}"
+            );
+            assert!(
+                !msg.contains("waitpoint_hmac_kid"),
+                "HMAC validate error must not leak the Rust field name \
+                 `waitpoint_hmac_kid`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn hmac_kid_without_secret_has_remediation_hint() {
+        // Production-quality fatals point at the fix. The exact case from
+        // #631 (kid set, secret missing) must include the openssl command
+        // the operator can run, plus the unset-alternative.
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_kid = Some("k1".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "expected openssl remediation hint, got: {err}"
+        );
+        assert!(
+            err.contains("unset CAIRN_FABRIC_WAITPOINT_HMAC_KID"),
+            "expected unset-alternative in remediation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn hmac_secret_length_error_has_remediation_hint() {
+        // A truncated / oversized secret is a common paste error; the fatal
+        // must name the command that regenerates a correct one.
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(63));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "expected openssl remediation hint on length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn hmac_secret_non_hex_error_has_remediation_hint() {
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("g".repeat(64));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "expected openssl remediation hint on non-hex error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn numeric_validate_error_messages_name_env_var() {
+        // Sibling audit to the HMAC regression above: the lease / tasks /
+        // grant / fcall / signal-dedup guards used the same field-name
+        // pattern. Each must name its CAIRN_FABRIC_* env var so operators
+        // can act on the fatal without reading the source.
+
+        // lease_ttl_ms < 1000
+        let mut cfg = base_config();
+        cfg.lease_ttl_ms = 500;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_LEASE_TTL_MS"),
+            "lease-ttl error must name CAIRN_FABRIC_LEASE_TTL_MS, got: {err}"
+        );
+
+        // max_concurrent_tasks = 0
+        let mut cfg = base_config();
+        cfg.max_concurrent_tasks = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_MAX_TASKS"),
+            "max-tasks error must name CAIRN_FABRIC_MAX_TASKS, got: {err}"
+        );
+
+        // grant_ttl_ms = 0
+        let mut cfg = base_config();
+        cfg.grant_ttl_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_GRANT_TTL_MS"),
+            "grant-ttl error must name CAIRN_FABRIC_GRANT_TTL_MS, got: {err}"
+        );
+
+        // fcall_timeout_ms = 0
+        let mut cfg = base_config();
+        cfg.fcall_timeout_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_FCALL_TIMEOUT_MS"),
+            "fcall-timeout error must name CAIRN_FABRIC_FCALL_TIMEOUT_MS, got: {err}"
+        );
+
+        // signal_dedup_ttl_ms = 0
+        let mut cfg = base_config();
+        cfg.signal_dedup_ttl_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_SIGNAL_DEDUP_TTL_MS"),
+            "signal-dedup error must name CAIRN_FABRIC_SIGNAL_DEDUP_TTL_MS, got: {err}"
         );
     }
 }
