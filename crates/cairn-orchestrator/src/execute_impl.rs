@@ -1234,6 +1234,16 @@ impl RuntimeExecutePhase {
                 // co-locate the child task on the parent's session.
                 let child_session_id = ctx.session_id.clone();
 
+                // #670 G3: mint a real `child_run_id` so the adapter
+                // creates a concrete child `RunRecord` (instead of
+                // passing `None` and leaving the child invisible in
+                // `GET /v1/runs/:id/children`). The id is derived from
+                // the fresh task id so replays of this execute phase
+                // produce a stable, traceable child-run id rather than
+                // a random uuid that would collide with a retry's
+                // idempotency contract.
+                let child_run_id = cairn_domain::RunId::new_subagent_for_task(&child_task_id);
+
                 match self
                     .task_service
                     .spawn_subagent(
@@ -1242,7 +1252,7 @@ impl RuntimeExecutePhase {
                         ctx.task_id.clone(),
                         child_task_id.clone(),
                         child_session_id,
-                        None, // child run created in G3 — see #670
+                        Some(child_run_id),
                         // #670 G2: carry the LLM's delegation intent
                         // through to the `SubagentSpawned` event +
                         // `subagent_spawns` projection row.

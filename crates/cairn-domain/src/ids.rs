@@ -110,6 +110,41 @@ define_id!(WorkspaceId);
 // F65: workspace-filesystem snapshots used by the orchestrator session redesign.
 define_id!(WorkspaceSnapshotId);
 
+/// Issue #670: stable prefix for LLM-initiated subagent child runs.
+///
+/// The orchestrator's `spawn_subagent` execute branch derives the
+/// child run id from the child task id (itself a fresh uuid) — the
+/// prefix is applied via [`RunId::new_subagent_for_task`]. The
+/// `FabricTaskServiceAdapter::spawn_subagent` override's fallback
+/// path (when callers pass `child_run_id: None` — test fakes and
+/// pre-G3 callers) uses [`RunId::new_subagent_for_parent`]. Keeping
+/// the prefix constant here stops the two sites from drifting.
+pub const SUBAGENT_RUN_ID_PREFIX: &str = "run_subagent_";
+
+impl RunId {
+    /// Mint a child-run id derived from the child task id. Used on
+    /// the LLM-initiated spawn path (`execute_impl`): the task id is
+    /// a fresh uuid minted earlier in the same execute phase, so
+    /// pairing `run_subagent_<task>` gives a stable, traceable link
+    /// between the audit row and the child run.
+    pub fn new_subagent_for_task(child_task_id: &TaskId) -> Self {
+        Self::new(format!(
+            "{SUBAGENT_RUN_ID_PREFIX}{}",
+            child_task_id.as_str()
+        ))
+    }
+
+    /// Mint a fallback child-run id derived from the parent run id.
+    /// Used on the adapter-level default-impl fallback path when
+    /// callers (test fakes, pre-G3 code) pass `child_run_id: None` —
+    /// matches the pre-G3 behaviour of
+    /// `RunService::spawn_subagent`'s default impl so the fallback
+    /// id shape is unchanged across the G1→G3 boundary.
+    pub fn new_subagent_for_parent(parent_run_id: &RunId) -> Self {
+        Self::new(format!("subagent_{}", parent_run_id.as_str()))
+    }
+}
+
 // ── Serde migration helpers ───────────────────────────────────────────────
 //
 // Per audit #473, the ID newtypes no longer implement `Default`.

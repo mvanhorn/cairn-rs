@@ -2003,27 +2003,36 @@ impl TaskService for FabricTaskServiceAdapter {
             .map_err(fabric_err_to_runtime)
     }
 
-    /// Issue #670 G1+G2 override: emit `RuntimeEvent::SubagentSpawned`
-    /// after a successful `FabricTaskService::submit`, carrying the
-    /// LLM's delegation context (goal + role) verbatim.
+    /// Issue #670 G1+G2+G3 override: create a child `RunRecord`,
+    /// submit the child task, and emit `RuntimeEvent::SubagentSpawned`
+    /// carrying the LLM's delegation context (goal + role) verbatim.
     ///
-    /// Before this override the trait's default was used, which only
-    /// calls `submit` — the `subagent_spawns` read model stayed empty
-    /// in production because nothing ever emitted the domain event.
-    /// With this override the spawn audit row lands on every backend
-    /// (in-memory + pg + sqlite) with the same shape the pre-G1
-    /// store-layer tests simulate, and the parent→child linkage is
-    /// visible on `GET /v1/runs/:id/subagent-spawns`.
+    /// G1 (shipped #671): emit `RuntimeEvent::SubagentSpawned` so the
+    /// `subagent_spawns` projection captures the parent→child linkage.
+    /// G2 (shipped #671): carry `goal` + `role` through verbatim from
+    /// the LLM's `ActionProposal`.
+    /// **G3 (this PR):** create a real child `RunRecord` at spawn time
+    /// — previously `child_run_id` was always `None` and the child
+    /// showed up nowhere in the UI. After G3, `GET /v1/runs/:id/children`
+    /// returns the child row, `RunReadModel::list_by_parent_run` resolves,
+    /// and the `subagent_spawns.child_run_id` column is populated.
     ///
-    /// Ordering: we `submit` first (which emits `TaskCreated`), then
-    /// enqueue `SubagentSpawned`. The event bridge is FIFO, so the
-    /// InMemoryStore projection always sees `TaskCreated` before
-    /// `SubagentSpawned` — the latter's applier tries to update the
-    /// task row's `parent_run_id` in place, which is a no-op when the
-    /// task row is missing (matches the pre-G1 contract; see
-    /// `in_memory.rs` `SubagentSpawned` arm). If `submit` fails we
-    /// return the error without touching the bridge, matching the
-    /// default impl's failure mode.
+    /// Phase ordering (all via the same `EventBridge`, FIFO):
+    /// 1. `fabric.runs.start` → emits `BridgeEvent::ExecutionCreated`
+    ///    → `RunCreated` on the cairn-domain side. Creates the row the
+    ///    rest of this method will reference.
+    /// 2. `fabric.tasks.submit` → emits `BridgeEvent::TaskCreated`.
+    /// 3. `fabric.bridge.emit(SubagentSpawned)` → writes the audit row
+    ///    with `child_run_id = Some(child_run_id)` so the row points
+    ///    at the real child run created in Phase 1.
+    ///
+    /// Failure modes: each phase propagates its error and short-
+    /// circuits the downstream ones. If the run creation in Phase 1
+    /// succeeds but the task submit in Phase 2 fails, the child
+    /// `RunRecord` is orphaned — a follow-up increment (G5) wires
+    /// recovery on orphan child runs. Acceptable for G3 because the
+    /// caller returns an execute-layer `Failed` that the orchestrator
+    /// surfaces to the operator.
     async fn spawn_subagent(
         &self,
         project: &ProjectKey,
@@ -2035,10 +2044,36 @@ impl TaskService for FabricTaskServiceAdapter {
         goal: String,
         role: String,
     ) -> Result<TaskRecord, RuntimeError> {
-        // Phase 1: submit the child task via the real fabric path. This
-        // also emits `BridgeEvent::TaskCreated`, so the child row lands
-        // on the `tasks` projection before `SubagentSpawned` tries to
-        // patch its parent linkage.
+        // G3: child_run_id should be Some(id) on the LLM-initiated
+        // path (execute_impl mints one). If the caller passed None
+        // (test fakes, pre-G3 callers), fall back to the convention
+        // `subagent_<parent>` so we always create a concrete child
+        // RunRecord. Matches the default impl of
+        // `RunService::spawn_subagent` behaviour.
+        let child_run_id =
+            child_run_id.unwrap_or_else(|| RunId::new_subagent_for_parent(&parent_run_id));
+
+        // Phase 1: create the child RunRecord with parent linkage via
+        // the real fabric path. This emits `BridgeEvent::ExecutionCreated`
+        // which the bridge translates to `RuntimeEvent::RunCreated`,
+        // threading `parent_run_id` onto the domain event so operator
+        // queries like `RunReadModel::list_by_parent_run` see the
+        // child.
+        self.fabric
+            .runs
+            .start(
+                project,
+                &child_session_id,
+                child_run_id.clone(),
+                Some(parent_run_id.clone()),
+            )
+            .await
+            .map_err(fabric_err_to_runtime)?;
+
+        // Phase 2: submit the child task via the real fabric path.
+        // This also emits `BridgeEvent::TaskCreated`, so the child
+        // row lands on the `tasks` projection before `SubagentSpawned`
+        // tries to patch its parent linkage.
         let record = self
             .fabric
             .tasks
@@ -2053,10 +2088,8 @@ impl TaskService for FabricTaskServiceAdapter {
             .await
             .map_err(fabric_err_to_runtime)?;
 
-        // Phase 2: emit the spawn fact. This flows through the
-        // EventBridge → EventLog → InMemoryStore.apply chain, which
-        // writes the `subagent_spawns` projection row on every
-        // backend.
+        // Phase 3: emit the spawn fact. Carries the real child_run_id
+        // now (G3); was always None in G1+G2.
         self.fabric
             .bridge
             .emit(BridgeEvent::SubagentSpawned {
@@ -2064,7 +2097,7 @@ impl TaskService for FabricTaskServiceAdapter {
                 parent_task_id,
                 child_task_id,
                 child_session_id,
-                child_run_id,
+                child_run_id: Some(child_run_id),
                 project: project.clone(),
                 goal,
                 role,
