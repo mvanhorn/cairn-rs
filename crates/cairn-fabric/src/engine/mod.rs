@@ -73,9 +73,6 @@ pub mod postgres_control_plane_impl;
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
-use flowfabric::core::types::{
-    EdgeId, ExecutionId, FlowId, LaneId, Namespace, WorkerId, WorkerInstanceId,
-};
 
 use crate::error::FabricError;
 
@@ -88,6 +85,20 @@ pub use control_plane_types::{
     IssueGrantAndClaimInput, QuotaAdmission, RenewLeaseInput, ResumeRunInput, RotationFailure,
     RotationOutcome, StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
     WorkerRegistration, WorkerSummary,
+};
+// Re-export the FF contracts + state-vector types the `Engine` trait's
+// `read_execution_info` surface depends on, plus the typed id surface
+// the trait methods take by reference. Keeps downstream callers (e.g.
+// `cairn_app::lease_keeper`) off a direct `flowfabric` dep while still
+// letting them pattern-match the full state vector (#666) and
+// instantiate `Engine` mocks in tests.
+pub use flowfabric::core::contracts::ExecutionInfo;
+pub use flowfabric::core::state::{
+    AttemptState, BlockingReason, EligibilityState, LifecyclePhase, OwnershipState, PublicState,
+    StateVector, TerminalOutcome,
+};
+pub use flowfabric::core::types::{
+    EdgeId, ExecutionId, FlowId, LaneId, Namespace, WorkerId, WorkerInstanceId,
 };
 #[cfg(feature = "fabric-postgres")]
 pub use postgres_control_plane_impl::PostgresControlPlane;
@@ -308,4 +319,27 @@ pub trait Engine: Send + Sync {
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<control_plane_types::ExpiredLease>, FabricError>;
+
+    /// Read FF's full execution state vector for `id`.
+    ///
+    /// `Ok(None)` ⇒ no such execution in FF (id minted but never
+    /// submitted, or purged). `Ok(Some(_))` returns the 7-dimension
+    /// [`StateVector`](flowfabric::core::state::StateVector) that
+    /// drives FF's FCALL gating rules.
+    ///
+    /// The cairn-side lease keeper (issue #666) uses this probe to
+    /// classify the execution's `lifecycle_phase` / `attempt_state` /
+    /// `ownership_state` before issuing `ff_renew_lease`. FF rejects
+    /// renews on any `lifecycle_phase != "active"` or
+    /// `attempt_state == "attempt_interrupted"`; without this probe
+    /// cairn had to infer the phase from its own projection, which
+    /// lags FF on rapid suspend/resume cycles (dogfood R5, 2026-05-03).
+    ///
+    /// FF 0.15 ships this on `EngineBackend` — both `valkey_impl` and
+    /// `postgres_control_plane_impl` forward directly to
+    /// `EngineBackend::read_execution_info`.
+    async fn read_execution_info(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ExecutionInfo>, FabricError>;
 }

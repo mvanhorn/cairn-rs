@@ -34,8 +34,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flowfabric::core::contracts::{
-    HeartbeatWorkerArgs, HeartbeatWorkerOutcome, ListExpiredLeasesArgs, ListWorkersArgs,
-    MarkWorkerDeadArgs, RegisterWorkerArgs, RegisterWorkerOutcome,
+    ExecutionInfo, HeartbeatWorkerArgs, HeartbeatWorkerOutcome, ListExpiredLeasesArgs,
+    ListWorkersArgs, MarkWorkerDeadArgs, RegisterWorkerArgs, RegisterWorkerOutcome,
 };
 use flowfabric::core::engine_backend::EngineBackend;
 use flowfabric::core::types::{
@@ -397,6 +397,20 @@ impl Engine for PostgresControlPlane {
                 expires_at_ms: e.expires_at_ms.0.max(0) as u64,
             })
             .collect())
+    }
+
+    async fn read_execution_info(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ExecutionInfo>, FabricError> {
+        // FF 0.15 ships `read_execution_info` on `EngineBackend` with
+        // a concrete Postgres body (see `exec_core::read_execution_info_impl`).
+        // We forward verbatim — the read lives server-side so cairn
+        // never touches FF's `ff_exec_core` table layout (issue #666).
+        self.backend
+            .read_execution_info(id)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))
     }
 }
 

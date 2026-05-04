@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use flowfabric::core::contracts::{
-    HeartbeatWorkerArgs, HeartbeatWorkerOutcome, ListExpiredLeasesArgs, ListWorkersArgs,
-    MarkWorkerDeadArgs, RegisterWorkerArgs, RegisterWorkerOutcome,
+    ExecutionInfo, HeartbeatWorkerArgs, HeartbeatWorkerOutcome, ListExpiredLeasesArgs,
+    ListWorkersArgs, MarkWorkerDeadArgs, RegisterWorkerArgs, RegisterWorkerOutcome,
 };
 use flowfabric::core::keys::{ExecKeyContext, FlowKeyContext};
 use flowfabric::core::partition::{execution_partition, flow_partition};
@@ -457,6 +457,22 @@ impl Engine for ValkeyEngine {
                 expires_at_ms: e.expires_at_ms.0.max(0) as u64,
             })
             .collect())
+    }
+
+    async fn read_execution_info(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ExecutionInfo>, FabricError> {
+        // FF 0.15 ships `read_execution_info` on `EngineBackend` with
+        // a concrete Valkey body that HGETALLs `exec_core` and parses
+        // the 7-dimension state vector. We forward verbatim — the
+        // parse lives server-side so cairn never sees the raw hash
+        // fields (issue #666).
+        self.runtime
+            .backend
+            .read_execution_info(id)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))
     }
 }
 

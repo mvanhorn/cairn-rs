@@ -686,17 +686,27 @@ async fn orchestrate_run_handler_inner(
         // because the trait is already auto-in-scope at the vtable
         // call site.
         let lease_ttl_ms = fabric.runtime.lease_ttl_ms();
-        // #655: pass the cairn-store projection handle so the keeper's
-        // suspension probe can read `ApprovalReadModel` +
-        // `ToolCallApprovalReadModel` on each tick and skip renew
-        // FCALLs that FF would 409 with `execution_not_eligible`.
+        // #666: pass the cairn-fabric Engine handle + pre-minted
+        // ExecutionId so the keeper can probe FF's state vector via
+        // `read_execution_info` each tick and skip renew FCALLs only
+        // when FF reports a non-renewable lifecycle_phase /
+        // attempt_state / ownership_state. Supersedes the #655
+        // projection-based suspension probe, which lagged FF on
+        // rapid auto-resume cycles (dogfood R5, 2026-05-03).
+        let execution_id = cairn_fabric::id_map::session_run_to_execution_id(
+            &refreshed.project,
+            &refreshed.session_id,
+            &refreshed.run_id,
+            fabric.runtime.partition_config(),
+        );
         state
             .lease_keepers
             .ensure_running(
                 refreshed.run_id.clone(),
                 refreshed.session_id.clone(),
+                execution_id,
                 state.runtime.runs.clone(),
-                state.runtime.store.clone(),
+                fabric.engine.clone(),
                 lease_ttl_ms,
             )
             .await;

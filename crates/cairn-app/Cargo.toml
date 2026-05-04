@@ -164,6 +164,14 @@ libc = "0.2"
 # tests under `tests/integration/` can point the spawned cairn-app
 # subprocess at a shared live Valkey.
 cairn-fabric = { path = "../cairn-fabric", features = ["test-harness"] }
+# `test_666_rapid_auto_resume_keeper.rs` builds a `FabricConfig` via
+# struct literal against the shared Valkey testcontainer, which
+# requires `flowfabric::core::backend::BackendConfig::valkey(...)` +
+# the typed `WorkerId`/`WorkerInstanceId`/`Namespace`/`LaneId`
+# constructors. Version pin must match cairn-fabric's flowfabric
+# version or the re-exported types from `cairn_fabric::engine::*`
+# won't line up with locally-constructed equivalents.
+flowfabric = { version = "0.15", default-features = false, features = ["valkey"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 # Full-binary HTTP driver for LiveHarness — tests launch the real
 # `cairn-app` binary on an ephemeral port and drive it via reqwest.
