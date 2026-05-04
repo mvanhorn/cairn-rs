@@ -89,6 +89,42 @@ pub(crate) struct TaskRecordDoc {
     updated_at: u64,
 }
 
+/// Issue #670 G1+G2: serialised `subagent_spawns` projection row.
+/// One row per `spawn_subagent` execution, carrying the LLM's
+/// delegation context (goal + role) verbatim.
+#[derive(Clone, Debug, serde::Serialize, ToSchema)]
+pub(crate) struct SubagentSpawnRowDoc {
+    child_task_id: String,
+    parent_run_id: String,
+    parent_task_id: Option<String>,
+    child_session_id: String,
+    child_run_id: Option<String>,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    goal: String,
+    role: String,
+    spawned_at_ms: u64,
+}
+
+impl From<cairn_store::projections::SubagentSpawnRecord> for SubagentSpawnRowDoc {
+    fn from(r: cairn_store::projections::SubagentSpawnRecord) -> Self {
+        Self {
+            child_task_id: r.child_task_id.to_string(),
+            parent_run_id: r.parent_run_id.to_string(),
+            parent_task_id: r.parent_task_id.map(|t| t.to_string()),
+            child_session_id: r.child_session_id.to_string(),
+            child_run_id: r.child_run_id.map(|r| r.to_string()),
+            tenant_id: r.project.tenant_id.to_string(),
+            workspace_id: r.project.workspace_id.to_string(),
+            project_id: r.project.project_id.to_string(),
+            goal: r.goal,
+            role: r.role,
+            spawned_at_ms: r.spawned_at_ms,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, ToSchema)]
 pub(crate) struct TenantRecordDoc {
     tenant_id: String,
@@ -1049,6 +1085,10 @@ impl AppBootstrap {
             )
             .route("/v1/runs/:id/spawn", post(spawn_subagent_run_handler))
             .route("/v1/runs/:id/children", get(list_child_runs_handler))
+            .route(
+                "/v1/runs/:id/subagent-spawns",
+                get(list_subagent_spawns_handler),
+            )
             .route("/v1/runs/:id/orchestrate", post(orchestrate_run_handler))
             .route(
                 "/v1/plugins/:id/capabilities",

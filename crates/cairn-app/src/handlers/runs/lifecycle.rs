@@ -29,7 +29,7 @@ use cairn_domain::{
     SessionId, TaskId, WorkspaceRole,
 };
 use cairn_runtime::RuntimeError;
-use cairn_store::projections::{PauseScheduleReadModel, TaskReadModel};
+use cairn_store::projections::{PauseScheduleReadModel, SubagentSpawnReadModel, TaskReadModel};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -51,7 +51,7 @@ use crate::{
     PaginationQuery, RunRecordView, DEFAULT_PROJECT_ID, DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID,
 };
 #[allow(unused_imports)]
-use crate::{RunListResponseDoc, RunRecordDoc};
+use crate::{RunListResponseDoc, RunRecordDoc, SubagentSpawnRowDoc};
 use cairn_store::projections::TaskRecord;
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
@@ -933,6 +933,109 @@ pub(crate) async fn list_child_runs_handler(
             (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
         Err(err) => runtime_error_response(err),
+    }
+}
+
+/// Issue #670 G1+G2: list `subagent_spawns` projection rows for a
+/// parent run. Distinct from `list_child_runs` which enumerates child
+/// `RunRecord`s — those require G3 (child-run creation at spawn time).
+/// This handler returns the audit rows emitted when an LLM-driven
+/// `spawn_subagent` action executes; each row carries the child task
+/// id, the delegated goal, and the delegated role.
+///
+/// Operators use this endpoint to audit what the parent actually
+/// delegated — the `goal` text is verbatim from the LLM's
+/// `spawn_subagent` proposal (`tool_args["goal"]`), which means it's
+/// model-authored and can derive from run context the LLM saw. A
+/// compromised or context-poisoned model could in principle echo
+/// secrets it was shown into this string; treat it as
+/// untrusted-but-auditable. G1+G2 does not redact — the whole point
+/// of the audit row is verbatim fidelity. Operators who need
+/// redaction should layer it at read time (follow-up issue, tracked
+/// alongside the #668 chain-of-thought redaction design).
+///
+/// **Consistency note:** this endpoint reads the `subagent_spawns`
+/// projection, which is written asynchronously via the Fabric
+/// `EventBridge` (issue #568). A read immediately after an
+/// orchestrate iteration that proposed a `spawn_subagent` can
+/// observe an empty list if the read races the async bridge — the
+/// orchestrate handler returns as soon as the event is *enqueued*,
+/// not after it lands in the projection. Operators building
+/// read-after-write workflows on this endpoint should either
+/// subscribe to `/v1/stream` (real-time) or retry on empty (bounded;
+/// the bridge applies within milliseconds under normal load).
+pub(crate) async fn list_subagent_spawns_handler(
+    State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
+    Path(id): Path<String>,
+    Query(query): Query<PaginationQuery>,
+) -> impl IntoResponse {
+    let parent_run_id = RunId::new(id);
+    let parent_run =
+        match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &parent_run_id).await {
+            Ok(Some(run)) => run,
+            Ok(None) => return run_not_found_response(),
+            Err(response) => return response,
+        };
+
+    match SubagentSpawnReadModel::list_by_parent_run(
+        state.runtime.store.as_ref(),
+        &parent_run.run_id,
+    )
+    .await
+    {
+        Ok(all) => {
+            // `list_by_parent_run` has no limit/offset surface on the
+            // projection trait, so apply pagination client-side. For
+            // G1+G2 a run's spawn fan-out is bounded by `max_iterations`
+            // (one spawn per orchestrator iteration) and operators
+            // usually want the first page anyway; paging over very
+            // large spawn fan-outs is rare enough that slicing in
+            // memory is acceptable. Revisit if G3+ lands fan-out
+            // patterns that produce thousands of rows per run.
+            // Clamp limit to at least 1 locally — the shared
+            // `PaginationQuery::limit()` caps the upper bound but
+            // allows `?limit=0`, which would produce an empty slice
+            // with `has_more=true` whenever the total is non-zero.
+            // That's surprising and conflicts with the OpenAPI
+            // description; force `limit >= 1` here so the response
+            // always contains at least the first row when one exists.
+            let limit = query.limit().max(1);
+            let offset = query.offset();
+            let total = all.len();
+            let slice_start = offset.min(total);
+            let slice_end = total.min(slice_start.saturating_add(limit));
+            let has_more = slice_end < total;
+            let rows: Vec<SubagentSpawnRowDoc> = all[slice_start..slice_end]
+                .iter()
+                .cloned()
+                .map(SubagentSpawnRowDoc::from)
+                .collect();
+            (
+                StatusCode::OK,
+                Json(ListResponse {
+                    items: rows,
+                    has_more,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::warn!(
+                run_id = %parent_run.run_id,
+                error = %err,
+                "#670 list_subagent_spawns: projection read failed",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new(
+                    500,
+                    "subagent_spawns_query_failed",
+                    format!("subagent_spawns projection read failed: {err}"),
+                )),
+            )
+                .into_response()
+        }
     }
 }
 

@@ -2388,6 +2388,20 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "200": { "description": "Child run list" }, "404": { "description": "Parent run not found" } }
       }
     },
+    "/v1/runs/{id}/subagent-spawns": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List subagent-spawn audit rows for a parent run (#670)",
+        "description": "Returns one row per `spawn_subagent` execution from the LLM's `ActionProposal`. Distinct from `/children` which lists child RunRecords — child runs are created by epic #670 G3 (not yet shipped); this endpoint shows the delegation audit (goal + role) immediately when the execute layer fires. Operators use it to see what the parent actually delegated verbatim.",
+        "operationId": "listSubagentSpawns",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 }, "description": "Max rows to return. Effective range is [1, 1000] — values below 1 are treated as 1, values above 1000 are clamped to 1000. Default 100." },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 }, "description": "Zero-based offset into the sorted spawn list." }
+        ],
+        "responses": { "200": { "description": "Subagent spawn audit list (with `hasMore` flag when truncated)" }, "404": { "description": "Parent run not found" } }
+      }
+    },
     "/v1/runs/{id}/interventions": {
       "get": {
         "tags": ["Runs"],

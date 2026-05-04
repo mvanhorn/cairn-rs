@@ -1180,6 +1180,11 @@ CREATE INDEX IF NOT EXISTS idx_signal_ingestions_project
     ON signal_ingestions (tenant_id, workspace_id, project_id, timestamp_ms, signal_id);
 
 -- RFC-025 Phase 2b.2b m3: subagent_spawns parity table (pg V053 — RFC 014).
+-- #670 G2: `goal` + `role` capture the LLM's delegation context taken
+-- from the `spawn_subagent` `ActionProposal` (tool_args["goal"] and
+-- tool_name respectively). Defaults mirror the `#[serde(default)]` on
+-- the `SubagentSpawned` domain event so a pre-G2 event replayed after
+-- the schema change persists as empty strings instead of NULL.
 CREATE TABLE IF NOT EXISTS subagent_spawns (
     child_task_id     TEXT    PRIMARY KEY,
     tenant_id         TEXT    NOT NULL,
@@ -1189,7 +1194,9 @@ CREATE TABLE IF NOT EXISTS subagent_spawns (
     parent_task_id    TEXT,
     child_session_id  TEXT    NOT NULL,
     child_run_id      TEXT,
-    spawned_at_ms     INTEGER NOT NULL
+    spawned_at_ms     INTEGER NOT NULL,
+    goal              TEXT    NOT NULL DEFAULT '',
+    role              TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_subagent_spawns_parent_run

@@ -677,8 +677,8 @@ impl PgSyncProjection {
                     "INSERT INTO subagent_spawns (
                         child_task_id, tenant_id, workspace_id, project_id,
                         parent_run_id, parent_task_id, child_session_id,
-                        child_run_id, spawned_at_ms
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        child_run_id, spawned_at_ms, goal, role
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                      ON CONFLICT (child_task_id) DO NOTHING",
                 )
                 .bind(e.child_task_id.as_str())
@@ -690,6 +690,12 @@ impl PgSyncProjection {
                 .bind(e.child_session_id.as_str())
                 .bind(e.child_run_id.as_ref().map(|r| r.as_str()))
                 .bind(now)
+                // #670 G2: LLM delegation context. Backfilled as empty
+                // strings on replay of pre-G2 rows via the
+                // `#[serde(default)]` on `SubagentSpawned.goal` and
+                // `.role` (see events.rs).
+                .bind(e.goal.as_str())
+                .bind(e.role.as_str())
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;

@@ -420,6 +420,17 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_operator_tenant_roles",
         include_str!("migrations/V066__create_operator_tenant_roles.sql"),
     ),
+    // Epic #670 G2: extend the subagent_spawns projection with
+    // the LLM's delegation intent (goal + role). The G1 emitter
+    // writes these columns on every spawn; without this migration
+    // the INSERT fails with "column \"goal\" of relation does not
+    // exist" on existing pg installs that already have
+    // subagent_spawns from V049.
+    (
+        67,
+        "subagent_spawns_goal_role",
+        include_str!("migrations/V067__subagent_spawns_goal_role.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

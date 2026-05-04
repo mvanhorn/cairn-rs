@@ -38,6 +38,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `GET` | `/v1/runs/:id/sla` | Preserve |  |
 | `POST` | `/v1/runs/:id/sla` | Preserve |  |
 | `POST` | `/v1/runs/:id/spawn` | Preserve |  |
+| `GET` | `/v1/runs/:id/subagent-spawns` | Preserve | #670 G1+G2; query: limit?, offset?; `{ items, hasMore }` rows from the `subagent_spawns` projection with LLM-delegated `goal` + `role` |
 | `GET` | `/v1/runs/:id/tasks` | Preserve |  |
 | `POST` | `/v1/runs/:id/tasks` | Preserve |  |
 | `GET` | `/v1/runs/:id/telemetry` | Preserve | F29 CD; live-aggregated `{state, stuck, provider_calls, tool_invocations, totals, phase_timings}` |

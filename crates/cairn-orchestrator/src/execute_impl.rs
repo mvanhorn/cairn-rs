@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use cairn_domain::{
     policy::ApprovalRequirement,
     tool_invocation::{ToolInvocationOutcomeKind, ToolInvocationTarget},
-    ActionType, ApprovalId, CheckpointId, ExecutionClass, RuntimeEvent, SessionId, TaskId,
+    ActionType, ApprovalId, CheckpointId, ExecutionClass, RuntimeEvent, TaskId,
     ToolInvocationCacheHit, ToolInvocationId, ToolRecoveryPaused,
 };
 use cairn_runtime::{
@@ -1137,8 +1137,102 @@ impl RuntimeExecutePhase {
 
             // ── SpawnSubagent ──────────────────────────────────────────────
             ActionType::SpawnSubagent => {
+                // #670 G2: extract the LLM's delegation context from
+                // the `ActionProposal`. Before this extraction the
+                // execute layer silently dropped `tool_args.goal` and
+                // `tool_name` — the child had no goal, no role. The
+                // prompt (see `decide_impl::build_system_prompt`)
+                // documents the expected shape:
+                //
+                //     spawn_subagent: tool_name = role,
+                //                     tool_args = {"goal": "..."}
+                //
+                // so a missing goal / role is a malformed proposal the
+                // LLM emitted — return `Failed` with a clear reason
+                // rather than silently succeeding with empty context.
+
+                // Role: `proposal.tool_name` with known-role validation.
+                // The prompt mentions three roles; any other string is
+                // a behaviour regression we want visible in
+                // `ActionStatus::Failed.reason`.
+                const VALID_ROLES: &[&str] = &["executor", "researcher", "reviewer"];
+                let role = match proposal.tool_name.as_deref() {
+                    Some(r) if VALID_ROLES.contains(&r) => r.to_owned(),
+                    Some(other) => {
+                        return Ok(ActionResult {
+                            proposal: proposal.clone(),
+                            status: ActionStatus::Failed {
+                                reason: format!(
+                                    "spawn_subagent: tool_name must be one of {:?} \
+                                     (the LLM emitted `{}` — prompt regression or \
+                                     malformed proposal)",
+                                    VALID_ROLES, other
+                                ),
+                            },
+                            tool_output: None,
+                            invocation_id: None,
+                            duration_ms: 0,
+                        });
+                    }
+                    None => {
+                        return Ok(ActionResult {
+                            proposal: proposal.clone(),
+                            status: ActionStatus::Failed {
+                                reason: format!(
+                                    "spawn_subagent: tool_name is required and must be one of {:?} \
+                                     (the LLM emitted a proposal without `tool_name` — \
+                                     malformed ActionProposal)",
+                                    VALID_ROLES
+                                ),
+                            },
+                            tool_output: None,
+                            invocation_id: None,
+                            duration_ms: 0,
+                        });
+                    }
+                };
+
+                // Goal: `proposal.tool_args["goal"]` as a non-empty string.
+                // Whitespace-only goals are treated as missing — they
+                // give the child no useful context.
+                let goal = match proposal
+                    .tool_args
+                    .as_ref()
+                    .and_then(|args| args.get("goal"))
+                    .and_then(|g| g.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(g) => g.to_owned(),
+                    None => {
+                        return Ok(ActionResult {
+                            proposal: proposal.clone(),
+                            status: ActionStatus::Failed {
+                                reason: "spawn_subagent: tool_args[\"goal\"] is required \
+                                         and must be a non-empty string (the LLM emitted \
+                                         an incomplete spawn proposal — the prompt \
+                                         requires `{\"goal\": \"...\"}`)"
+                                    .to_owned(),
+                            },
+                            tool_output: None,
+                            invocation_id: None,
+                            duration_ms: 0,
+                        });
+                    }
+                };
+
                 let child_task_id = TaskId::new(new_id("child_task"));
-                let child_session_id = SessionId::new(new_id("child_sess"));
+                // #670 G1+G2: scope the child task to the parent's
+                // session. The `TaskService::spawn_subagent` rustdoc
+                // says "subagent tasks are scoped to the parent's
+                // session" and SQLite's `tasks.session_id` is a FK to
+                // `sessions(session_id)` — minting a fresh session id
+                // here (the pre-#670 behaviour) creates rows with a
+                // dangling FK and breaks projections on dual-write
+                // backends. G3 will introduce a proper child Session
+                // when child runs are created; until then we
+                // co-locate the child task on the parent's session.
+                let child_session_id = ctx.session_id.clone();
 
                 match self
                     .task_service
@@ -1148,7 +1242,12 @@ impl RuntimeExecutePhase {
                         ctx.task_id.clone(),
                         child_task_id.clone(),
                         child_session_id,
-                        None, // child run created when child task → running (RFC 005)
+                        None, // child run created in G3 — see #670
+                        // #670 G2: carry the LLM's delegation intent
+                        // through to the `SubagentSpawned` event +
+                        // `subagent_spawns` projection row.
+                        goal,
+                        role,
                     )
                     .await
                 {

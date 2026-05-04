@@ -98,6 +98,8 @@ async fn subagent_spawn_lowers_inline_run_ratio_and_observes_iterations() {
                 child_task_id: TaskId::new("tk_exec_child"),
                 child_session_id: SessionId::new("s_child"),
                 child_run_id: None,
+                goal: "observability-test-goal".to_owned(),
+                role: "executor".to_owned(),
             }),
             "spawn1",
         )])

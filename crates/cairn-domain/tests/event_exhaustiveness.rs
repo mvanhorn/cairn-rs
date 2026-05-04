@@ -938,6 +938,8 @@ fn all_variants() -> Vec<RuntimeEvent> {
             child_task_id: task(),
             child_session_id: sess(),
             child_run_id: None,
+            goal: "exhaustiveness-sample-goal".to_owned(),
+            role: "executor".to_owned(),
         }),
         RuntimeEvent::RecoveryAttempted(RecoveryAttempted {
             project: p(),

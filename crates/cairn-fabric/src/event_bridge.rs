@@ -161,6 +161,36 @@ pub enum BridgeEvent {
         outcome: String,
         occurred_at_ms: u64,
     },
+    /// Issue #670 G1+G2: LLM-initiated subagent spawn. Emitted by the
+    /// `FabricTaskServiceAdapter::spawn_subagent` override immediately
+    /// after the underlying `FabricTaskService::submit` (which emits
+    /// its own `TaskCreated`). Carries the LLM's delegation intent —
+    /// the sub-goal and the role — so the `subagent_spawns` projection
+    /// captures the spawn audit row with the operator context the
+    /// parent actually delegated with.
+    ///
+    /// Distinct from the operator-initiated path
+    /// (`POST /v1/runs/:id/spawn` → `RunService::spawn_subagent`),
+    /// which creates a child `RunRecord` via the `RunCreated` event
+    /// and does NOT flow through `TaskService::spawn_subagent`.
+    SubagentSpawned {
+        parent_run_id: RunId,
+        parent_task_id: Option<TaskId>,
+        child_task_id: TaskId,
+        child_session_id: SessionId,
+        /// Child run is created by a separate increment (G3 in `#670`);
+        /// this field is always `None` for G1+G2 and reserved for the
+        /// follow-up PR that wires child-run creation.
+        child_run_id: Option<RunId>,
+        project: ProjectKey,
+        /// Sub-goal the parent delegated, taken from the LLM's
+        /// `ActionProposal.tool_args["goal"]` string.
+        goal: String,
+        /// Agent role the parent delegated to, taken from the LLM's
+        /// `ActionProposal.tool_name` string (pre-validated against the
+        /// known-role allow-list by the execute layer).
+        role: String,
+    },
 }
 
 /// Internal consumer-channel payload. Wraps `BridgeEvent` with an
@@ -172,6 +202,15 @@ pub enum BridgeEvent {
 /// every event `emit`ted after the flush lands after. Callers can thus
 /// safely read-after-write against their own emit by awaiting a flush
 /// between the emit and the store read (issue #568).
+///
+/// `#[allow(clippy::large_enum_variant)]`: the `Event` variant wraps
+/// a `BridgeEvent` which is intentionally a flat enum for cache
+/// locality on the hot path. Boxing every event would add an alloc
+/// per emit on a channel that carries every runtime event in the
+/// process — a perf regression bigger than the memory saving. The
+/// gap (`Event` ≈ 240 B, `Flush` ≈ 8 B) is tolerated because `Flush`
+/// fires rarely (operator-triggered read-after-write barriers).
+#[allow(clippy::large_enum_variant)]
 enum ConsumerItem {
     Event(BridgeEvent),
     Flush(oneshot::Sender<()>),
@@ -386,6 +425,7 @@ fn bridge_event_type_name(event: &BridgeEvent) -> &'static str {
         BridgeEvent::SessionArchived { .. } => "SessionArchived",
         BridgeEvent::TaskDependencyAdded { .. } => "TaskDependencyAdded",
         BridgeEvent::TerminalRecoveryAttempted { .. } => "TerminalRecoveryAttempted",
+        BridgeEvent::SubagentSpawned { .. } => "SubagentSpawned",
     }
 }
 
@@ -617,6 +657,29 @@ fn bridge_event_to_runtime_event(event: &BridgeEvent) -> RuntimeEvent {
                 occurred_at_ms: *occurred_at_ms,
             },
         ),
+        // #670 G1+G2: LLM-initiated subagent spawn. Translates
+        // straight across — the domain event carries the same field
+        // set plus the two new G2 strings (goal + role) the execute
+        // layer populates from the `ActionProposal`.
+        BridgeEvent::SubagentSpawned {
+            parent_run_id,
+            parent_task_id,
+            child_task_id,
+            child_session_id,
+            child_run_id,
+            project,
+            goal,
+            role,
+        } => RuntimeEvent::SubagentSpawned(cairn_domain::events::SubagentSpawned {
+            project: project.clone(),
+            parent_run_id: parent_run_id.clone(),
+            parent_task_id: parent_task_id.clone(),
+            child_task_id: child_task_id.clone(),
+            child_session_id: child_session_id.clone(),
+            child_run_id: child_run_id.clone(),
+            goal: goal.clone(),
+            role: role.clone(),
+        }),
     }
 }
 

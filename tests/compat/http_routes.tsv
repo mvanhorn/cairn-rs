@@ -199,6 +199,7 @@ GET	/v1/runs/:id/export	preserve	-	-
 GET	/v1/runs/:id/interventions	preserve	-	-
 GET	/v1/runs/:id/replay	preserve	-	-
 GET	/v1/runs/:id/sla	preserve	-	-
+GET	/v1/runs/:id/subagent-spawns	preserve	-	-
 GET	/v1/runs/:id/tasks	preserve	-	-
 GET	/v1/runs/:id/telemetry	preserve	-	-
 GET	/v1/runs/:id/tool-invocations	preserve	-	-

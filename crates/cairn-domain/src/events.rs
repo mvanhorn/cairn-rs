@@ -1267,6 +1267,20 @@ pub struct ExternalWorkerReactivated {
     pub reactivated_at: u64,
 }
 
+/// RFC 014 / issue #670 G1+G2: parent→child subagent spawn fact.
+///
+/// Emitted once per `TaskService::spawn_subagent` call when the
+/// orchestrator executes a `spawn_subagent` proposal from the LLM. The
+/// event captures the LLM's **intent** — the sub-goal the parent
+/// delegated, and the role it delegated to — in addition to the
+/// parent/child linkage.
+///
+/// `goal` and `role` are required in the domain contract but carry
+/// `#[serde(default)]` so older event-log entries (pre-G2, where the
+/// fields did not exist) still deserialise cleanly as empty strings.
+/// New emitters MUST populate them; an empty string post-G2 indicates
+/// the execute layer dropped the LLM proposal context and should be
+/// treated as a bug (see G2 in `#670`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentSpawned {
     pub project: ProjectKey,
@@ -1275,6 +1289,20 @@ pub struct SubagentSpawned {
     pub child_task_id: TaskId,
     pub child_session_id: SessionId,
     pub child_run_id: Option<RunId>,
+    /// Sub-goal the parent run delegated, taken verbatim from the
+    /// `ActionProposal.tool_args["goal"]` string the LLM emitted.
+    /// Empty string when the event was appended before G2 shipped
+    /// (`#670`) — operators should treat such rows as legacy audit
+    /// records with no delegated-goal context.
+    #[serde(default)]
+    pub goal: String,
+    /// Agent role the parent delegated to. Mirrors
+    /// `ActionProposal.tool_name` when `action_type=SpawnSubagent`.
+    /// Typically one of `executor`, `researcher`, `reviewer`; the
+    /// execute layer validates against the known-role allow-list
+    /// before emitting. Empty for pre-G2 events.
+    #[serde(default)]
+    pub role: String,
 }
 
 /// Recovery attempt fact per RFC 002.

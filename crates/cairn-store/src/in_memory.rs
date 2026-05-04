@@ -1970,6 +1970,12 @@ impl InMemoryStore {
                         child_session_id: e.child_session_id.clone(),
                         child_run_id: e.child_run_id.clone(),
                         spawned_at_ms: now,
+                        // #670 G2: carry the LLM delegation context
+                        // from the event verbatim. Pre-G2 events
+                        // deserialise with empty strings via
+                        // `#[serde(default)]`.
+                        goal: e.goal.clone(),
+                        role: e.role.clone(),
                     });
             }
             // Audit/linkage events that don't update core projections.

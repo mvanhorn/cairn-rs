@@ -711,6 +711,8 @@ mod tests {
                 child_task_id: TaskId::new("child_task"),
                 child_session_id: SessionId::new("child_sess"),
                 child_run_id: Some(RunId::new("child_run")),
+                goal: String::new(),
+                role: String::new(),
             },
         ))];
 

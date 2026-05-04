@@ -258,6 +258,39 @@ impl DbAdapter for SqliteAdapter {
                 .map_err(|e| StoreError::Migration(format!("{stmt}: {e}")))?;
         }
 
+        // Epic #670 G2: `subagent_spawns` grew `goal` + `role`
+        // columns. `SCHEMA_SQL` below wires them into CREATE TABLE for
+        // fresh installs; this ALTER catches existing SQLite databases
+        // upgraded in place. The pg side handles this via V067 migration.
+        let existing_spawn_cols: std::collections::HashSet<String> =
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM pragma_table_info('subagent_spawns')",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Migration(format!("pragma subagent_spawns: {e}")))?
+            .into_iter()
+            .collect();
+        if !existing_spawn_cols.is_empty() {
+            for (col, ddl) in [
+                (
+                    "goal",
+                    "ALTER TABLE subagent_spawns ADD COLUMN goal TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "role",
+                    "ALTER TABLE subagent_spawns ADD COLUMN role TEXT NOT NULL DEFAULT ''",
+                ),
+            ] {
+                if !existing_spawn_cols.contains(col) {
+                    sqlx::query(ddl)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| StoreError::Migration(format!("{ddl}: {e}")))?;
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -4742,6 +4775,11 @@ struct SqliteSubagentSpawnRow {
     child_session_id: String,
     child_run_id: Option<String>,
     spawned_at_ms: i64,
+    // #670 G2: LLM delegation context. Non-nullable with DEFAULT ''
+    // on the table so pre-G2 rows surface as empty strings — matches
+    // the `#[serde(default)]` replay contract on the domain event.
+    goal: String,
+    role: String,
 }
 
 impl SqliteSubagentSpawnRow {
@@ -4758,13 +4796,16 @@ impl SqliteSubagentSpawnRow {
             child_session_id: cairn_domain::SessionId::new(self.child_session_id),
             child_run_id: self.child_run_id.map(cairn_domain::RunId::new),
             spawned_at_ms: self.spawned_at_ms.max(0) as u64,
+            goal: self.goal,
+            role: self.role,
         }
     }
 }
 
 const SUBAGENT_SPAWN_SELECT_COLS_SQLITE: &str =
     "child_task_id, tenant_id, workspace_id, project_id, parent_run_id, \
-     parent_task_id, child_session_id, child_run_id, spawned_at_ms";
+     parent_task_id, child_session_id, child_run_id, spawned_at_ms, \
+     goal, role";
 
 #[async_trait]
 impl crate::projections::SubagentSpawnReadModel for SqliteAdapter {

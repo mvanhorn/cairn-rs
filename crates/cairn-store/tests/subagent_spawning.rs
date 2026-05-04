@@ -87,6 +87,8 @@ async fn subagent_spawned_links_child_to_parent() {
                 child_task_id: child_task(),
                 child_session_id: parent_session(), // same session for this test
                 child_run_id: Some(child_run()),
+                goal: "delegated sub-goal".to_owned(),
+                role: "executor".to_owned(),
             }),
         )])
         .await
@@ -156,6 +158,8 @@ async fn list_by_session_returns_parent_and_child_runs() {
                     child_task_id: child_task(),
                     child_session_id: parent_session(),
                     child_run_id: Some(child_run()),
+                    goal: "delegated sub-goal".to_owned(),
+                    role: "executor".to_owned(),
                 }),
             ),
             ev(
@@ -224,6 +228,8 @@ async fn child_run_state_is_independent_of_parent() {
                     child_task_id: child_task(),
                     child_session_id: parent_session(),
                     child_run_id: Some(child_run()),
+                    goal: "delegated sub-goal".to_owned(),
+                    role: "executor".to_owned(),
                 }),
             ),
             ev(
@@ -349,6 +355,8 @@ async fn subagent_tree_hierarchy_is_queryable() {
                     child_task_id: child_task(),
                     child_session_id: parent_session(),
                     child_run_id: Some(child_run()),
+                    goal: "delegated sub-goal".to_owned(),
+                    role: "executor".to_owned(),
                 }),
             ),
             ev(
@@ -378,6 +386,8 @@ async fn subagent_tree_hierarchy_is_queryable() {
                     child_task_id: grandchild_task.clone(),
                     child_session_id: parent_session(),
                     child_run_id: Some(grandchild.clone()),
+                    goal: "level-2 sub-goal".to_owned(),
+                    role: "researcher".to_owned(),
                 }),
             ),
             ev(
@@ -483,6 +493,8 @@ async fn multiple_subagents_from_same_parent() {
                         child_task_id: TaskId::new(task_n),
                         child_session_id: parent_session(),
                         child_run_id: Some(child.clone()),
+                        goal: format!("sub-goal for {}", child.as_str()),
+                        role: "executor".to_owned(),
                     }),
                 ),
                 ev(

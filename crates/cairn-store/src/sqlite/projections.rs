@@ -645,8 +645,8 @@ impl SqliteSyncProjection {
                     "INSERT INTO subagent_spawns (
                         child_task_id, tenant_id, workspace_id, project_id,
                         parent_run_id, parent_task_id, child_session_id,
-                        child_run_id, spawned_at_ms
-                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        child_run_id, spawned_at_ms, goal, role
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(child_task_id) DO NOTHING",
                 )
                 .bind(e.child_task_id.as_str())
@@ -658,6 +658,10 @@ impl SqliteSyncProjection {
                 .bind(e.child_session_id.as_str())
                 .bind(e.child_run_id.as_ref().map(|r| r.as_str()))
                 .bind(now)
+                // #670 G2: LLM delegation context — see pg applier and
+                // `SubagentSpawned` in cairn-domain for replay semantics.
+                .bind(e.goal.as_str())
+                .bind(e.role.as_str())
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;

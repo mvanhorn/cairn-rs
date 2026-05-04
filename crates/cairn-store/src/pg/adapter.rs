@@ -4110,6 +4110,12 @@ struct SubagentSpawnRow {
     child_session_id: String,
     child_run_id: Option<String>,
     spawned_at_ms: i64,
+    // #670 G2: LLM delegation context. Non-nullable with DEFAULT ''
+    // on the table (migration V067) so pre-G2 rows surface as empty
+    // strings — matches the `#[serde(default)]` replay contract on
+    // the domain event.
+    goal: String,
+    role: String,
 }
 
 impl SubagentSpawnRow {
@@ -4126,13 +4132,16 @@ impl SubagentSpawnRow {
             child_session_id: cairn_domain::SessionId::new(self.child_session_id),
             child_run_id: self.child_run_id.map(cairn_domain::RunId::new),
             spawned_at_ms: self.spawned_at_ms.max(0) as u64,
+            goal: self.goal,
+            role: self.role,
         }
     }
 }
 
 const SUBAGENT_SPAWN_SELECT_COLS: &str =
     "child_task_id, tenant_id, workspace_id, project_id, parent_run_id, \
-     parent_task_id, child_session_id, child_run_id, spawned_at_ms";
+     parent_task_id, child_session_id, child_run_id, spawned_at_ms, \
+     goal, role";
 
 #[async_trait]
 impl crate::projections::SubagentSpawnReadModel for PgAdapter {

@@ -466,6 +466,8 @@ mod tests {
             child_task_id: cairn_domain::TaskId::new("tk_child"),
             child_session_id: cairn_domain::SessionId::new("s_child"),
             child_run_id: None,
+            goal: "tap-test-goal".to_owned(),
+            role: "executor".to_owned(),
         });
         process_event(&metrics, &tracker, &event);
 

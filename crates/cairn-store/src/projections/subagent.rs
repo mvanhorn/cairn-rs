@@ -17,6 +17,11 @@ use crate::error::StoreError;
 /// projection-time wall clock (millisecond) captured by the applier,
 /// mirroring the pattern used by `SessionCreated` + `RunCreated`
 /// which also have no on-event timestamp.
+///
+/// `goal` + `role` capture the LLM's delegation intent (`#670` G2):
+/// the sub-goal the parent run asked for and the agent role it
+/// delegated to. Both are empty strings on pre-G2 rows (pre-existing
+/// event-log entries that predate the G2 extension).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentSpawnRecord {
     pub child_task_id: TaskId,
@@ -26,6 +31,8 @@ pub struct SubagentSpawnRecord {
     pub child_session_id: SessionId,
     pub child_run_id: Option<RunId>,
     pub spawned_at_ms: u64,
+    pub goal: String,
+    pub role: String,
 }
 
 #[async_trait]
