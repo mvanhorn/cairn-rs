@@ -3534,6 +3534,42 @@ impl SqliteSyncProjection {
             // observability surface (SSE + metrics) with no projection
             // table — the event log itself is the audit trail.
             RuntimeEvent::SandboxCrashRecovered(_) => {}
+            RuntimeEvent::LlmCompletionRecorded(e) => {
+                // Issue #668: persist the LLM round-trip body. Keyed
+                // on `trace_id` (UNIQUE); re-application is a no-op
+                // via ON CONFLICT DO NOTHING.
+                sqlx::query(
+                    "INSERT INTO llm_completions
+                         (trace_id, tenant_id, workspace_id, project_id,
+                          session_id, run_id, model_id,
+                          system_prompt, messages_json,
+                          response_text, tool_calls_json,
+                          recorded_at_ms, created_at)
+                     VALUES
+                         (?, ?, ?, ?,
+                          ?, ?, ?,
+                          ?, ?,
+                          ?, ?,
+                          ?, ?)
+                     ON CONFLICT(trace_id) DO NOTHING",
+                )
+                .bind(e.trace_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.session_id.as_str())
+                .bind(e.run_id.as_ref().map(|r| r.as_str()))
+                .bind(e.model_id.as_str())
+                .bind(e.system_prompt.as_str())
+                .bind(e.messages_json.as_str())
+                .bind(e.response_text.as_str())
+                .bind(e.tool_calls_json.as_str())
+                .bind(e.recorded_at_ms as i64)
+                .bind(now)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+            }
         }
 
         Ok(())

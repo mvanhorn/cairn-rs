@@ -120,6 +120,9 @@ fn decide_done() -> DecideOutput {
         latency_ms: 10,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
     }
 }
 
@@ -156,6 +159,9 @@ fn decide_tool(tool: &str) -> DecideOutput {
         latency_ms: 20,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
     }
 }
 
@@ -557,6 +563,9 @@ async fn requires_approval_suspends_immediately() {
         latency_ms: 0,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
     };
 
     let lp = OrchestratorLoop::new(
@@ -743,6 +752,9 @@ async fn build_step_summary_handles_flattened_results_without_misalignment() {
         latency_ms: 10,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
     };
 
     // Only the InvokeTool result was recorded; the CompleteRun
@@ -1111,6 +1123,9 @@ async fn loop_runner_carries_discovered_tools_to_next_iteration() {
                 latency_ms: 0,
                 input_tokens: None,
                 output_tokens: None,
+                system_prompt: String::new(),
+                messages_json: "[]".to_owned(),
+                tool_calls_json: "[]".to_owned(),
             })
         }
     }
@@ -1859,6 +1874,9 @@ async fn rejected_drain_dedups_across_iterations() {
                     latency_ms: 1,
                     input_tokens: None,
                     output_tokens: None,
+                    system_prompt: String::new(),
+                    messages_json: "[]".to_owned(),
+                    tool_calls_json: "[]".to_owned(),
                 })
             } else {
                 Ok(decide_done())
@@ -2276,6 +2294,9 @@ mod gate_fixtures {
                     latency_ms: 20,
                     input_tokens: None,
                     output_tokens: None,
+                    system_prompt: String::new(),
+                    messages_json: "[]".to_owned(),
+                    tool_calls_json: "[]".to_owned(),
                 });
             }
             Ok(DecideOutput {
@@ -2294,6 +2315,9 @@ mod gate_fixtures {
                 latency_ms: 10,
                 input_tokens: None,
                 output_tokens: None,
+                system_prompt: String::new(),
+                messages_json: "[]".to_owned(),
+                tool_calls_json: "[]".to_owned(),
             })
         }
     }

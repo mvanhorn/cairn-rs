@@ -168,6 +168,12 @@ pub enum RuntimeEvent {
     ProjectCreated(ProjectCreated),
     RouteDecisionMade(RouteDecisionMade),
     ProviderCallCompleted(ProviderCallCompleted),
+    /// Issue #668: post-redaction LLM round-trip body. Emitted alongside
+    /// `ProviderCallCompleted` so operators can audit the actual prompt
+    /// the LLM received + the response it returned, not just the
+    /// token/cost metadata. See `LlmCompletionRecorded` for the body
+    /// shape and `LlmPromptOutputReadModel` for the projection.
+    LlmCompletionRecorded(LlmCompletionRecorded),
     SoulPatchProposed(SoulPatchProposed),
     SoulPatchApplied(SoulPatchApplied),
     /// GAP-006: session-level accumulated cost updated after a provider call.
@@ -393,6 +399,7 @@ impl RuntimeEvent {
             RuntimeEvent::ProjectCreated(event) => &event.project,
             RuntimeEvent::RouteDecisionMade(event) => &event.project,
             RuntimeEvent::ProviderCallCompleted(event) => &event.project,
+            RuntimeEvent::LlmCompletionRecorded(event) => &event.project,
             RuntimeEvent::SoulPatchProposed(event) => &event.project,
             RuntimeEvent::SoulPatchApplied(event) => &event.project,
             RuntimeEvent::SessionCostUpdated(event) => &event.project,
@@ -682,6 +689,7 @@ impl RuntimeEvent {
             RuntimeEvent::ProjectCreated(_) => None,
             RuntimeEvent::RouteDecisionMade(_) => None,
             RuntimeEvent::ProviderCallCompleted(_) => None,
+            RuntimeEvent::LlmCompletionRecorded(_) => None,
             RuntimeEvent::SoulPatchProposed(_) => None,
             RuntimeEvent::SoulPatchApplied(_) => None,
             RuntimeEvent::SessionCostUpdated(_) => None,
@@ -1902,6 +1910,65 @@ pub struct ProviderCallCompleted {
     /// Unix epoch ms when the provider response was received.
     #[serde(default)]
     pub finished_at: u64,
+}
+
+/// Issue #668: post-redaction LLM round-trip body.
+///
+/// Emitted once per successful LLM provider call alongside
+/// `ProviderCallCompleted`. Where `ProviderCallCompleted` / `LlmCallTrace`
+/// carry only metadata (tokens, latency, cost, model id), this event
+/// carries the actual prompt + response text. Operators use the
+/// persisted body to debug why the LLM made a specific decision —
+/// answering "what did the model see?" and "what did it say?".
+///
+/// **Redaction contract:** all free-text fields (`system_prompt`,
+/// `messages_json`, `response_text`) are redacted via
+/// `cairn_providers::redact::redact_secrets` BEFORE being placed in the
+/// event. Consumers can assume API keys, bearer tokens, and
+/// provider-key literals have been stripped. The `tool_calls_json`
+/// field is serialised directly from the model's structured output and
+/// is redacted the same way.
+///
+/// **Provenance:** the `trace_id` matches the `provider_call_id` of
+/// the sibling `ProviderCallCompleted` event for the same call, so
+/// operators can join the two by id.
+///
+/// **Size:** body fields can be tens of kilobytes for long prompts +
+/// reasoning chains. The projection applier caps individual field
+/// length (`CAIRN_LLM_TRACE_MAX_FIELD_BYTES`, default 256 KiB) and
+/// truncates over-long fields with a `[TRUNCATED]` marker so the
+/// event log stays bounded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmCompletionRecorded {
+    pub project: ProjectKey,
+    /// Matches `ProviderCallCompleted.provider_call_id` for the sibling
+    /// metadata event, so the two can be joined for operator queries.
+    pub trace_id: String,
+    /// Session the call belongs to.
+    pub session_id: crate::ids::SessionId,
+    /// Run the call belongs to. `None` for out-of-run calls (rare; kept
+    /// symmetric with `ProviderCallCompleted.run_id`).
+    #[serde(default)]
+    pub run_id: Option<crate::ids::RunId>,
+    /// Model identifier actually used (resolved post-routing).
+    pub model_id: String,
+    /// Full system prompt the LLM received, post-redaction.
+    pub system_prompt: String,
+    /// JSON-serialised `Vec<Message>` (role + content) sent to the
+    /// provider, post-redaction. Serialised rather than typed so the
+    /// schema evolves with the provider's message shape without
+    /// domain-layer migrations.
+    pub messages_json: String,
+    /// Free-text response from the provider, post-redaction. Empty
+    /// when the model went straight to native tool calls without any
+    /// prose.
+    pub response_text: String,
+    /// JSON-serialised `Vec<ToolCall>` the LLM proposed, post-redaction.
+    /// Empty JSON array for legacy text-parsing responses. Structured
+    /// tool calls are the preferred surface.
+    pub tool_calls_json: String,
+    /// Unix epoch ms when the body was recorded.
+    pub recorded_at_ms: u64,
 }
 
 /// A soul patch has been proposed and is awaiting operator review.

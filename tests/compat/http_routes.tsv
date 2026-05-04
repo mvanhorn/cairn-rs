@@ -217,6 +217,7 @@ GET	/v1/sessions/:id/events	preserve	-	-
 GET	/v1/sessions/:id/export	preserve	-	-
 GET	/v1/sessions/:id/llm-traces	preserve	path param: id	LLM call traces for session
 GET	/v1/sessions/:id/runs	preserve	-	-
+GET	/v1/sessions/:session_id/llm-traces/:trace_id/body	preserve	-	-
 GET	/v1/settings	preserve	-	deployment settings
 GET	/v1/settings/defaults/:scope/:scope_id/:key	preserve	-	-
 GET	/v1/settings/defaults/all	preserve	-	-

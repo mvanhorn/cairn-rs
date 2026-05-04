@@ -256,6 +256,15 @@ pub const REGISTRY: &[ProjectionEntry] = &[
         },
     },
     ProjectionEntry {
+        // Issue #668: LLM chain-of-thought body capture. Sibling to
+        // ProviderCallCompleted — that event holds metadata, this one
+        // holds the prompt + response text (post-redaction).
+        variant: "LlmCompletionRecorded",
+        status: ProjectionStatus::Projected {
+            table: Some("llm_completions"),
+        },
+    },
+    ProjectionEntry {
         variant: "RecoveryAttempted",
         status: ProjectionStatus::Projected {
             table: Some("recovery_attempts"),
@@ -1498,8 +1507,14 @@ mod tests {
         //     backing table `tenants` (same table `TenantCreated` maintains;
         //     PATCH appliers `UPDATE` only the supplied fields). Unblocks
         //     the admin-UI tenant rename flow. Net: +1 Projected → 128 / 33 / 0.
+        //   * Issue #668: `LlmCompletionRecorded` added as Projected with
+        //     backing table `llm_completions` (pg V068 + sqlite schema.rs).
+        //     Sibling to `ProviderCallCompleted` — captures the LLM's
+        //     post-redaction prompt + response body so operators can audit
+        //     chain-of-thought, not just metadata. Net: +1 Projected →
+        //     129 / 33 / 0.
         assert_eq!(
-            projected, 128,
+            projected, 129,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
@@ -1507,7 +1522,7 @@ mod tests {
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 161);
+        assert_eq!(projected + ephemeral + stubbed, 162);
     }
 
     #[test]

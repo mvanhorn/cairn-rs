@@ -388,7 +388,21 @@ impl DecidePhase for LlmDecidePhase {
         let resp = success.response;
         let resolved_model_id = success.model_id;
         let latency_ms = t0.elapsed().as_millis() as u64;
-        let raw_response = resp.text.clone();
+
+        // #668 audit-trail provenance: track which messages + which
+        // response the persisted body should reflect. The JSON-retry
+        // path below can make a second LLM call with a stricter
+        // `retry_messages` — when that retry returns the parsed
+        // proposals we keep, the audit body MUST reflect the retry
+        // (its prompt, its response, its tool_calls), not the original
+        // malformed-JSON call that we discarded. Mutable so the retry
+        // path can overwrite.
+        //
+        // Initialised to the first call's values; the retry-success
+        // branch rewrites them.
+        let mut effective_messages: Vec<serde_json::Value> = messages.clone();
+        let mut effective_response_text: String = resp.text.clone();
+        let mut effective_tool_calls: Vec<serde_json::Value> = resp.tool_calls.clone();
 
         // ── Native tool call path ────────────────────────────────────────────
         // If the model returned structured tool_calls (via native tool calling),
@@ -420,18 +434,35 @@ impl DecidePhase for LlmDecidePhase {
                 ];
                 match self
                     .routed
-                    .generate(retry_messages, &self.settings, &tool_defs)
+                    .generate(retry_messages.clone(), &self.settings, &tool_defs)
                     .await
                 {
                     Ok(ok2) => {
                         let r2 = ok2.response;
-                        if !r2.tool_calls.is_empty() {
+                        let retry_accepted = if !r2.tool_calls.is_empty() {
                             parsed = tool_calls_to_proposals(&r2.tool_calls, &tool_descs);
+                            true
                         } else {
                             let second = parse_proposals(&r2.text);
                             if !is_fallback_escalation(&second) {
                                 parsed = second;
+                                true
+                            } else {
+                                false
                             }
+                        };
+                        if retry_accepted {
+                            // #668 audit-trail provenance: when the
+                            // retry produces the proposals we keep,
+                            // the persisted body must reflect the
+                            // retry's prompt + response + tool_calls,
+                            // not the first (discarded) call's.
+                            // Otherwise operators debugging the run
+                            // see the prompt that DIDN'T produce the
+                            // proposals they're staring at.
+                            effective_messages = retry_messages;
+                            effective_response_text = r2.text.clone();
+                            effective_tool_calls = r2.tool_calls.clone();
                         }
                     }
                     Err(_) => {
@@ -464,8 +495,25 @@ impl DecidePhase for LlmDecidePhase {
             .map(|p| p.confidence)
             .fold(0.0_f64, f64::max);
 
+        // Issue #668: capture the prompt + tool_calls JSON for chain-of-
+        // thought body persistence downstream. Serialisation failures
+        // fall back to empty strings rather than killing decide — the
+        // body is observability, not a correctness invariant.
+        //
+        // Uses `effective_*` rather than the first call's buffers so
+        // the audit trail reflects whichever LLM call the orchestrator
+        // actually acted on (see #672 Copilot review on the retry
+        // provenance bug).
+        let messages_json =
+            serde_json::to_string(&effective_messages).unwrap_or_else(|_| "[]".to_owned());
+        let tool_calls_json = if effective_tool_calls.is_empty() {
+            "[]".to_owned()
+        } else {
+            serde_json::to_string(&effective_tool_calls).unwrap_or_else(|_| "[]".to_owned())
+        };
+
         Ok(DecideOutput {
-            raw_response,
+            raw_response: effective_response_text,
             proposals,
             calibrated_confidence,
             requires_approval,
@@ -476,6 +524,9 @@ impl DecidePhase for LlmDecidePhase {
             latency_ms,
             input_tokens: resp.input_tokens,
             output_tokens: resp.output_tokens,
+            system_prompt: system,
+            messages_json,
+            tool_calls_json,
         })
     }
 }

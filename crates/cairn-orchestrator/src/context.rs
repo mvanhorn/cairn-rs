@@ -169,6 +169,21 @@ pub struct DecideOutput {
     pub input_tokens: Option<u32>,
     /// Output (completion) token count from the provider response.
     pub output_tokens: Option<u32>,
+    /// Issue #668: system prompt the LLM received for this decide
+    /// iteration. Retained so the orchestrator's post-decide tracing
+    /// can persist the full round-trip body for operator audit (see
+    /// `LlmCompletionRecorded`). Pre-redaction — the emit site runs
+    /// `cairn_providers::redact::redact_secrets` before persisting.
+    pub system_prompt: String,
+    /// Issue #668: JSON-serialised `Vec<Message>` (role + content) the
+    /// orchestrator sent to the provider. Serialised rather than typed
+    /// so the wire shape evolves with the provider library without
+    /// forcing a domain-layer migration. Pre-redaction.
+    pub messages_json: String,
+    /// Issue #668: JSON-serialised `Vec<ToolCall>` the model returned
+    /// via native tool calling, or `[]` if the model went through the
+    /// legacy JSON-array text path. Pre-redaction.
+    pub tool_calls_json: String,
 }
 
 impl DecideOutput {
@@ -569,6 +584,9 @@ mod tests {
             latency_ms: 0,
             input_tokens: None,
             output_tokens: None,
+            system_prompt: String::new(),
+            messages_json: "[]".to_owned(),
+            tool_calls_json: "[]".to_owned(),
         }
     }
 

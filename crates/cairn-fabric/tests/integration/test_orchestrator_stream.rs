@@ -169,6 +169,9 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
         latency_ms: 1_200,
         input_tokens: Some(500),
         output_tokens: Some(200),
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
     };
 
     let sink: Arc<dyn TaskFrameSink> = Arc::new(claimed);

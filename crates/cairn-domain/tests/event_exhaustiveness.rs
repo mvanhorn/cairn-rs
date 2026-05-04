@@ -295,6 +295,9 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::ProviderCallCompleted(_) => {
             assert!(eref.is_none());
         }
+        RuntimeEvent::LlmCompletionRecorded(_) => {
+            assert!(eref.is_none());
+        }
         RuntimeEvent::SoulPatchProposed(_) => {
             assert!(eref.is_none());
         }
@@ -1154,6 +1157,18 @@ fn all_variants() -> Vec<RuntimeEvent> {
             started_at: 0,
             finished_at: 0,
         }),
+        RuntimeEvent::LlmCompletionRecorded(cairn_domain::events::LlmCompletionRecorded {
+            project: p(),
+            trace_id: "trace_exhaust".to_owned(),
+            session_id: SessionId::new("sess_exhaust"),
+            run_id: None,
+            model_id: "gpt-4o".to_owned(),
+            system_prompt: "you are an agent".to_owned(),
+            messages_json: "[]".to_owned(),
+            response_text: "ok".to_owned(),
+            tool_calls_json: "[]".to_owned(),
+            recorded_at_ms: ts,
+        }),
         RuntimeEvent::SoulPatchProposed(SoulPatchProposed {
             project: p(),
             patch_id: "sp1".to_owned(),
@@ -1981,13 +1996,13 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 161 variants in the RuntimeEvent enum (158 baseline + RFC 026 PR-A0
+    // 162 variants in the RuntimeEvent enum (158 baseline + RFC 026 PR-A0
     // TenantRoleGranted + TenantRoleRevoked + RFC 026 PR-A2
-    // TenantUpdated).
+    // TenantUpdated + issue #668 LlmCompletionRecorded).
     assert_eq!(
         variants.len(),
-        161,
-        "all_variants() must construct exactly 161 RuntimeEvent instances"
+        162,
+        "all_variants() must construct exactly 162 RuntimeEvent instances"
     );
 }
 

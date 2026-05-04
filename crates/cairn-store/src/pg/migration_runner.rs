@@ -431,6 +431,14 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "subagent_spawns_goal_role",
         include_str!("migrations/V067__subagent_spawns_goal_role.sql"),
     ),
+    // Issue #668: LLM chain-of-thought body projection. Sibling
+    // to provider_calls — stores system prompt, messages, response
+    // text, and tool calls for every successful LLM call.
+    (
+        68,
+        "create_llm_completions",
+        include_str!("migrations/V068__create_llm_completions.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

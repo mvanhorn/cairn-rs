@@ -105,6 +105,9 @@ fn decide_with(proposals: Vec<ActionProposal>) -> DecideOutput {
         latency_ms: 0,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
     }
 }
 

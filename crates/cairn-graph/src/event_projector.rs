@@ -379,6 +379,7 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::ProjectCreated(_)
             | RuntimeEvent::RouteDecisionMade(_)
             | RuntimeEvent::ProviderCallCompleted(_)
+            | RuntimeEvent::LlmCompletionRecorded(_)
             | RuntimeEvent::OutcomeRecorded(_)
             | RuntimeEvent::ScheduledTaskCreated(_)
             | RuntimeEvent::PlanProposed(_)

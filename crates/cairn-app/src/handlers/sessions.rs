@@ -450,6 +450,89 @@ pub(crate) async fn get_session_cost_handler(
     }
 }
 
+/// Issue #668: `GET /v1/sessions/:id/llm-traces/:trace_id/body` —
+/// fetch the full LLM round-trip body for a single trace.
+///
+/// Sibling to `GET /v1/sessions/:id/llm-traces` which returns the
+/// metadata (tokens, latency, cost). This endpoint returns the
+/// post-redaction prompt + response + tool-calls so operators can
+/// audit what the LLM was shown and what it said.
+///
+/// **Scope: admin-only.** Bodies can carry sensitive context the LLM
+/// saw (run artifacts, tool outputs, operator conversations); even
+/// after redaction of known secret patterns, they're strictly more
+/// sensitive than the tokens/latency/cost the metadata endpoint
+/// exposes. Gated behind `is_admin_principal` — System tokens and
+/// the `admin` ServiceAccount pass; regular operator tokens (even
+/// for the owning tenant) get 404 (matching the body-not-available
+/// response so operators can't probe for trace existence).
+///
+/// Returns 404 when:
+///   * the caller isn't an admin principal (uniform 404 so the
+///     endpoint can't be used to enumerate traces via timing/status);
+///   * the session doesn't exist;
+///   * the trace id doesn't exist (or `CAIRN_LLM_TRACE_BODIES_ENABLED=false`);
+///   * the trace belongs to a different session (prevents cross-
+///     session id-guessing).
+pub(crate) async fn get_session_llm_trace_body_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Extension(principal): axum::extract::Extension<cairn_api::auth::AuthPrincipal>,
+    tenant_scope: TenantScope,
+    Path((session_id, trace_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // #668 security: admin-only. Return 404 (not 403) for non-admin
+    // so the endpoint can't be used to enumerate which sessions /
+    // traces exist.
+    if !crate::extractors::is_admin_principal(&principal) {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "trace body not found")
+            .into_response();
+    }
+    let _ = tenant_scope; // admin bypasses tenant scope; retained for future non-admin paths
+
+    let session_id = SessionId::new(session_id);
+
+    // Confirm the session exists. Admin principals can read across
+    // tenants so no tenant-match check here — is_admin_principal
+    // above is the gate.
+    let session = match state.runtime.sessions.lookup_any_admin(&session_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "session not found")
+                .into_response();
+        }
+        Err(err) => return runtime_error_response(err),
+    };
+
+    match cairn_store::projections::LlmCompletionBodyReadModel::get_by_trace_id(
+        state.runtime.store.as_ref(),
+        &trace_id,
+    )
+    .await
+    {
+        Ok(Some(row)) if row.session_id == session_id => {
+            let _ = session; // retained for future logging; unused here
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "trace_id":        row.trace_id,
+                    "model_id":        row.model_id,
+                    "session_id":      row.session_id,
+                    "run_id":          row.run_id,
+                    "system_prompt":   row.system_prompt,
+                    "messages_json":   row.messages_json,
+                    "response_text":   row.response_text,
+                    "tool_calls_json": row.tool_calls_json,
+                    "recorded_at_ms":  row.recorded_at_ms,
+                })),
+            )
+                .into_response()
+        }
+        Ok(_) => AppApiError::new(StatusCode::NOT_FOUND, "not_found", "trace body not found")
+            .into_response(),
+        Err(err) => store_error_response(err),
+    }
+}
+
 /// `GET /v1/sessions/:id/llm-traces` — per-session LLM call trace history (GAP-010).
 ///
 /// Returns up to 200 traces for the session, most-recent first.

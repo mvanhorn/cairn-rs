@@ -4846,6 +4846,90 @@ impl crate::projections::SubagentSpawnReadModel for SqliteAdapter {
     }
 }
 
+// ── Issue #668: LLM completion body read model ──
+
+#[derive(sqlx::FromRow)]
+struct SqliteLlmCompletionBodyRow {
+    trace_id: String,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    session_id: String,
+    run_id: Option<String>,
+    model_id: String,
+    system_prompt: String,
+    messages_json: String,
+    response_text: String,
+    tool_calls_json: String,
+    recorded_at_ms: i64,
+}
+
+impl SqliteLlmCompletionBodyRow {
+    fn into_record(self) -> crate::projections::LlmCompletionBodyRecord {
+        crate::projections::LlmCompletionBodyRecord {
+            trace_id: self.trace_id,
+            project: cairn_domain::tenancy::ProjectKey::new(
+                self.tenant_id,
+                self.workspace_id,
+                self.project_id,
+            ),
+            session_id: cairn_domain::SessionId::new(self.session_id),
+            run_id: self.run_id.map(cairn_domain::RunId::new),
+            model_id: self.model_id,
+            system_prompt: self.system_prompt,
+            messages_json: self.messages_json,
+            response_text: self.response_text,
+            tool_calls_json: self.tool_calls_json,
+            recorded_at_ms: self.recorded_at_ms.max(0) as u64,
+        }
+    }
+}
+
+const LLM_COMPLETION_BODY_SELECT_COLS_SQLITE: &str =
+    "trace_id, tenant_id, workspace_id, project_id, \
+     session_id, run_id, model_id, \
+     system_prompt, messages_json, \
+     response_text, tool_calls_json, recorded_at_ms";
+
+#[async_trait]
+impl crate::projections::LlmCompletionBodyReadModel for SqliteAdapter {
+    async fn get_by_trace_id(
+        &self,
+        trace_id: &str,
+    ) -> Result<Option<crate::projections::LlmCompletionBodyRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {LLM_COMPLETION_BODY_SELECT_COLS_SQLITE} FROM llm_completions
+             WHERE trace_id = ?"
+        );
+        let row: Option<SqliteLlmCompletionBodyRow> = sqlx::query_as(&sql)
+            .bind(trace_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(SqliteLlmCompletionBodyRow::into_record))
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+    ) -> Result<Vec<crate::projections::LlmCompletionBodyRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {LLM_COMPLETION_BODY_SELECT_COLS_SQLITE} FROM llm_completions
+             WHERE session_id = ?
+             ORDER BY recorded_at_ms ASC, trace_id ASC"
+        );
+        let rows: Vec<SqliteLlmCompletionBodyRow> = sqlx::query_as(&sql)
+            .bind(session_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(SqliteLlmCompletionBodyRow::into_record)
+            .collect())
+    }
+}
+
 // ── RFC-025 Phase 2b.2b m4: user_messages read model ──
 
 #[derive(sqlx::FromRow)]

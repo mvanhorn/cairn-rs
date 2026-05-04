@@ -167,6 +167,9 @@ fn decide_with(proposal: ActionProposal) -> DecideOutput {
         latency_ms: 0,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
     }
 }
 
@@ -292,6 +295,9 @@ async fn parallel_calls_of_same_tool_get_distinct_ids() {
         latency_ms: 0,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
     };
     execute.execute(&ctx, &decide).await.expect("dispatch");
 

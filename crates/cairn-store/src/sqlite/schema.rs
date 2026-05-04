@@ -1205,6 +1205,37 @@ CREATE INDEX IF NOT EXISTS idx_subagent_spawns_parent_run
 CREATE INDEX IF NOT EXISTS idx_subagent_spawns_project
     ON subagent_spawns (tenant_id, workspace_id, project_id, spawned_at_ms, child_task_id);
 
+-- Issue #668: LLM chain-of-thought body projection (pg V068).
+-- Sibling to provider_calls — stores the full round-trip body
+-- (system prompt + messages + response + tool_calls) alongside the
+-- metadata on provider_calls / llm_traces. Used by operators to
+-- audit what the LLM was shown and what it said.
+CREATE TABLE IF NOT EXISTS llm_completions (
+    trace_id         TEXT    PRIMARY KEY,
+    tenant_id        TEXT    NOT NULL,
+    workspace_id     TEXT    NOT NULL,
+    project_id       TEXT    NOT NULL,
+    session_id       TEXT    NOT NULL,
+    run_id           TEXT,
+    model_id         TEXT    NOT NULL,
+    system_prompt    TEXT    NOT NULL DEFAULT '',
+    messages_json    TEXT    NOT NULL DEFAULT '[]',
+    response_text    TEXT    NOT NULL DEFAULT '',
+    tool_calls_json  TEXT    NOT NULL DEFAULT '[]',
+    recorded_at_ms   INTEGER NOT NULL,
+    created_at       INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_completions_session_time
+    ON llm_completions (session_id, recorded_at_ms);
+
+CREATE INDEX IF NOT EXISTS idx_llm_completions_run
+    ON llm_completions (run_id)
+    WHERE run_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_llm_completions_tenant_time
+    ON llm_completions (tenant_id, recorded_at_ms);
+
 -- RFC-025 Phase 2b.2b m4: user_messages parity table (pg V054).
 CREATE TABLE IF NOT EXISTS user_messages (
     run_id          TEXT    NOT NULL,

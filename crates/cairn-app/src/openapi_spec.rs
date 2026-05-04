@@ -696,6 +696,22 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "200": { "description": "Trace list" } }
       }
     },
+    "/v1/sessions/{session_id}/llm-traces/{trace_id}/body": {
+      "get": {
+        "tags": ["Sessions"],
+        "summary": "LLM chain-of-thought body for a single trace (#668, admin-only)",
+        "description": "Admin-only audit endpoint. Returns the post-redaction system prompt, messages, response text, and proposed tool calls for one LLM round-trip. Sibling to `GET /v1/sessions/{id}/llm-traces` which returns metadata only. Gated behind the System / admin-ServiceAccount principal check — regular operator tokens receive 404 (not 403) so the endpoint cannot be used to enumerate sessions or traces. Secrets (API keys, bearer tokens, provider-key literals) are stripped via `cairn_providers::redact::redact_secrets` before persistence. Individual fields are capped at `CAIRN_LLM_TRACE_MAX_FIELD_BYTES` (default 256 KiB) with a `[TRUNCATED]` suffix on overflow. Tenants that have set `CAIRN_LLM_TRACE_BODIES_ENABLED=false` get 404 because no row was ever written.",
+        "operationId": "getSessionLlmTraceBody",
+        "parameters": [
+          { "name": "session_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trace_id",   "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "LLM round-trip body (system prompt, messages, response, tool calls)" },
+          "404": { "description": "Non-admin caller, session not found, trace id unknown, cross-session id, or tenant opted out" }
+        }
+      }
+    },
     "/v1/runs": {
       "get": {
         "tags": ["Runs"],

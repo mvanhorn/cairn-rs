@@ -56,6 +56,38 @@ pub fn arm_fail_next_append(skip: u32, fail: u32) {
     FAIL_APPEND_FAIL_REMAINING.store(fail, Ordering::Release);
 }
 
+/// Issue #668: cap on the number of resident `LlmCompletionBodyRecord`
+/// rows kept in the `InMemoryStore.llm_completion_bodies` projection.
+///
+/// Default 5000; override via `CAIRN_LLM_TRACE_IN_MEMORY_CAP=<n>`.
+/// Clamped to [100, 100_000] to stop typos (`=0`, `=99999999`) from
+/// either disabling the projection or letting it grow unboundedly.
+///
+/// The durable backends (pg + sqlite) keep the full history; the
+/// in-memory cap is a live-memory upper bound, not a retention
+/// policy. Operators querying pages deeper than the cap on an
+/// in-memory (`--db memory`) deployment will see gaps — acceptable
+/// because `--db memory` is dev-only and already announces
+/// "ALL DATA WILL BE LOST on restart".
+fn llm_completion_bodies_cap() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        const DEFAULT: usize = 5_000;
+        const MIN: usize = 100;
+        const MAX: usize = 100_000;
+        match std::env::var("CAIRN_LLM_TRACE_IN_MEMORY_CAP") {
+            Ok(v) => v
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .unwrap_or(DEFAULT)
+                .clamp(MIN, MAX),
+            Err(_) => DEFAULT,
+        }
+    })
+}
+
 fn now_millis() -> u64 {
     // Matches pg/sqlite backends' fallback on clock skew: a clock before
     // UNIX_EPOCH (container misconfiguration) MUST NOT panic the store.
@@ -125,6 +157,12 @@ struct State {
     workspace_costs: HashMap<(String, String), cairn_domain::providers::WorkspaceCostRecord>,
     /// GAP-010: LLM call trace records derived from ProviderCallCompleted events.
     llm_traces: Vec<cairn_domain::LlmCallTrace>,
+    /// Issue #668: LLM chain-of-thought body records keyed by
+    /// `trace_id`. Written from `LlmCompletionRecorded` events
+    /// (emitted alongside `ProviderCallCompleted` from the orchestrator).
+    /// Separate from `llm_traces` so the big text fields don't bloat
+    /// the metadata projection.
+    llm_completion_bodies: HashMap<String, crate::projections::LlmCompletionBodyRecord>,
     operator_profiles: HashMap<String, crate::projections::OperatorProfileRecord>,
     full_operator_profiles: HashMap<String, cairn_domain::org::OperatorProfile>,
     /// RFC 026 PR-A0: operator → tenant-role mapping keyed on
@@ -358,6 +396,7 @@ impl InMemoryStore {
                 project_costs: HashMap::new(),
                 workspace_costs: HashMap::new(),
                 llm_traces: Vec::new(),
+                llm_completion_bodies: HashMap::new(),
                 operator_profiles: HashMap::new(),
                 full_operator_profiles: HashMap::new(),
                 operator_tenant_roles: HashMap::new(),
@@ -2629,6 +2668,70 @@ impl InMemoryStore {
                         stored_at: event.stored_at,
                     };
                     state.events.push(sc_derived);
+                }
+            }
+            RuntimeEvent::LlmCompletionRecorded(e) => {
+                // Issue #668: store the LLM round-trip body keyed by
+                // `trace_id`. Replay semantics: re-applying the event
+                // (restart, dual-write, etc.) overwrites the row with
+                // the latest payload — a re-emit carrying different
+                // text for the same trace_id would indicate an
+                // orchestrator bug, so last-write-wins keeps the
+                // projection convergent without silently hiding
+                // double-emit surprises.
+                //
+                // **Memory bound** (Copilot review on #672): bodies can
+                // be hundreds of KiB each; unbounded accumulation in
+                // this always-warm projection would OOM a busy
+                // deployment AND bloat the startup replay that warms
+                // this projection on restart. We cap the map at
+                // `llm_completion_bodies_cap()` entries (default 5000,
+                // env-overridable via `CAIRN_LLM_TRACE_IN_MEMORY_CAP`)
+                // with FIFO eviction of the oldest `recorded_at_ms`.
+                // Durable backends (pg + sqlite) keep the full history;
+                // operators querying pages deeper than the cap get
+                // served from those. In-memory deployments (`--db memory`)
+                // trade long-history body queries for bounded RAM —
+                // acceptable since `--db memory` already announces
+                // "ALL DATA WILL BE LOST on restart".
+                let record = crate::projections::LlmCompletionBodyRecord {
+                    trace_id: e.trace_id.clone(),
+                    project: e.project.clone(),
+                    session_id: e.session_id.clone(),
+                    run_id: e.run_id.clone(),
+                    model_id: e.model_id.clone(),
+                    system_prompt: e.system_prompt.clone(),
+                    messages_json: e.messages_json.clone(),
+                    response_text: e.response_text.clone(),
+                    tool_calls_json: e.tool_calls_json.clone(),
+                    recorded_at_ms: e.recorded_at_ms,
+                };
+                let is_replace = state
+                    .llm_completion_bodies
+                    .insert(e.trace_id.clone(), record)
+                    .is_some();
+                let cap = llm_completion_bodies_cap();
+                if !is_replace && state.llm_completion_bodies.len() > cap {
+                    // Find the oldest (smallest `recorded_at_ms`, break
+                    // ties on trace_id for determinism) and drop it.
+                    // O(N) per eviction — acceptable because evictions
+                    // are rare (only when over cap) and N is bounded
+                    // by the cap. A BTreeSet indexed on recorded_at_ms
+                    // would make this O(log N) but doubles the
+                    // per-insert cost on the hot path; not worth the
+                    // complexity until a profile shows it matters.
+                    if let Some(oldest_key) = state
+                        .llm_completion_bodies
+                        .iter()
+                        .min_by(|a, b| {
+                            a.1.recorded_at_ms
+                                .cmp(&b.1.recorded_at_ms)
+                                .then_with(|| a.0.cmp(b.0))
+                        })
+                        .map(|(k, _)| k.clone())
+                    {
+                        state.llm_completion_bodies.remove(&oldest_key);
+                    }
                 }
             }
             RuntimeEvent::TenantCreated(e) => {
@@ -4925,6 +5028,42 @@ impl crate::projections::LlmCallTraceReadModel for InMemoryStore {
         results.sort_by_key(|r| std::cmp::Reverse(r.created_at_ms));
         results.truncate(limit);
         Ok(results)
+    }
+}
+
+// -- LlmCompletionBodyReadModel (issue #668) --
+
+#[async_trait]
+impl crate::projections::LlmCompletionBodyReadModel for InMemoryStore {
+    async fn get_by_trace_id(
+        &self,
+        trace_id: &str,
+    ) -> Result<Option<crate::projections::LlmCompletionBodyRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.llm_completion_bodies.get(trace_id).cloned())
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+    ) -> Result<Vec<crate::projections::LlmCompletionBodyRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::LlmCompletionBodyRecord> = state
+            .llm_completion_bodies
+            .values()
+            .filter(|r| r.session_id == *session_id)
+            .cloned()
+            .collect();
+        // Ascending by recorded_at_ms so the UI can render turns
+        // chronologically. `recorded_at_ms` may tie across iterations
+        // that completed in the same millisecond; break with
+        // `trace_id` so the order is stable across queries.
+        rows.sort_by(|a, b| {
+            a.recorded_at_ms
+                .cmp(&b.recorded_at_ms)
+                .then_with(|| a.trace_id.cmp(&b.trace_id))
+        });
+        Ok(rows)
     }
 }
 

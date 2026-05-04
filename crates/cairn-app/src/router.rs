@@ -1629,6 +1629,10 @@ impl AppBootstrap {
                 "/v1/sessions/:id/llm-traces",
                 get(get_session_llm_traces_handler),
             )
+            .route(
+                "/v1/sessions/:session_id/llm-traces/:trace_id/body",
+                get(get_session_llm_trace_body_handler),
+            )
             // ── Graph ─────────────────────────────────────────────────────────────────
             .route(
                 "/v1/graph/execution-trace/:run_id",
