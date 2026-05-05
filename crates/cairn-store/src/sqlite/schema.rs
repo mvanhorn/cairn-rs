@@ -1213,6 +1213,14 @@ CREATE INDEX IF NOT EXISTS idx_subagent_spawns_parent_run
 CREATE INDEX IF NOT EXISTS idx_subagent_spawns_project
     ON subagent_spawns (tenant_id, workspace_id, project_id, spawned_at_ms, child_task_id);
 
+-- #670 G5: child_run_id lookup index for the parent-auto-resume
+-- terminal hook (cairn-fabric `fire_parent_resume_if_child`). Mirrors
+-- pg V070. Partial index on NOT NULL because the column is nullable
+-- and the terminal-hook lookup never queries for NULL.
+CREATE INDEX IF NOT EXISTS idx_subagent_spawns_child_run_id
+    ON subagent_spawns (child_run_id)
+    WHERE child_run_id IS NOT NULL;
+
 -- Issue #668: LLM chain-of-thought body projection (pg V068).
 -- Sibling to provider_calls — stores the full round-trip body
 -- (system prompt + messages + response + tool_calls) alongside the

@@ -1354,6 +1354,30 @@ async fn real_main() {
         eprintln!("store: service-layer events will dual-write to SQLite");
     }
 
+    // ── #670 G5 parent auto-resume wiring ─────────────────────────────────────
+    // After a child run terminates, the cairn-fabric terminal hook
+    // (FabricRunService::{complete, fail, cancel}) fires a
+    // child_completed signal to the parent's waitpoint and invokes
+    // `ParentAutoResume::resume_parent_run` to re-drive the parent's
+    // orchestrator loop via `drive_run_iteration`. Installing the
+    // wiring here is a no-op when the feature is unused (no
+    // spawn_subagent proposals == no suspensions == no resume
+    // callbacks fire), so the installation is unconditional.
+    if let Some(ref fabric) = lib_state.fabric {
+        let signal_bridge = fabric.signals.clone();
+        let subagent_spawns = lib_state.runtime.store.clone()
+            as Arc<dyn cairn_store::projections::SubagentSpawnReadModel>;
+        let auto_resume = Arc::new(
+            cairn_app::parent_auto_resume_impl::AppStateParentAutoResume::new(Arc::downgrade(
+                &lib_state,
+            )),
+        ) as Arc<dyn cairn_fabric::parent_auto_resume::ParentAutoResume>;
+        fabric
+            .runs
+            .set_subagent_resume_wiring(signal_bridge, subagent_spawns, auto_resume);
+        eprintln!("G5: parent auto-resume wiring installed on FabricRunService");
+    }
+
     // ── Demo seed data (local mode only, only when event log is empty) ─────────
     // Skip seeding when a durable backend (Postgres/SQLite) already has events
     // from a previous run.  After startup replay the in-memory store's head

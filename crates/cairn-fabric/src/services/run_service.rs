@@ -27,6 +27,15 @@ pub struct FabricRunService {
     bridge: Arc<EventBridge>,
     engine: Arc<dyn Engine>,
     control_plane: Arc<dyn ControlPlaneBackend>,
+    // #670 G5: optional handles for child-terminal → parent-signal
+    // + auto-resume. Set post-construction via setters; unset
+    // defaults to no-op (pre-G5 behaviour, parent needs manual
+    // operator re-POST to resume after child completes).
+    signal_bridge: std::sync::RwLock<Option<Arc<crate::signal_bridge::SignalBridge>>>,
+    subagent_spawns:
+        std::sync::RwLock<Option<Arc<dyn cairn_store::projections::SubagentSpawnReadModel>>>,
+    parent_auto_resume:
+        std::sync::RwLock<Option<Arc<dyn crate::parent_auto_resume::ParentAutoResume>>>,
 }
 
 impl FabricRunService {
@@ -41,7 +50,99 @@ impl FabricRunService {
             bridge,
             engine,
             control_plane,
+            signal_bridge: std::sync::RwLock::new(None),
+            subagent_spawns: std::sync::RwLock::new(None),
+            parent_auto_resume: std::sync::RwLock::new(None),
         }
+    }
+
+    /// #670 G5: install the subagent-terminal → parent-resume
+    /// plumbing. Wired at boot by cairn-app. Safe to skip; unset
+    /// defaults to pre-G5 behaviour (parent manual re-POST).
+    pub fn set_subagent_resume_wiring(
+        &self,
+        signal_bridge: Arc<crate::signal_bridge::SignalBridge>,
+        subagent_spawns: Arc<dyn cairn_store::projections::SubagentSpawnReadModel>,
+        parent_auto_resume: Arc<dyn crate::parent_auto_resume::ParentAutoResume>,
+    ) {
+        *self
+            .signal_bridge
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(signal_bridge);
+        *self
+            .subagent_spawns
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(subagent_spawns);
+        *self
+            .parent_auto_resume
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(parent_auto_resume);
+    }
+
+    /// #670 G5: fire-and-forget the child→parent signal + parent
+    /// auto-resume after a terminal child transition. Spawns a
+    /// tokio task so the caller (complete/fail/cancel) isn't blocked
+    /// on FF round-trips. All failures log WARN; the parent falls
+    /// back to manual re-POST.
+    fn fire_parent_resume_if_child(&self, record: &RunRecord, success: bool) {
+        let Some(parent_run_id) = record.parent_run_id.clone() else {
+            return;
+        };
+        tracing::info!(
+            child_run_id = %record.run_id,
+            parent_run_id = %parent_run_id,
+            success,
+            "G5: firing child→parent resume pipeline",
+        );
+        let (signal_bridge, subagent_spawns, parent_auto_resume) = {
+            let sb = self
+                .signal_bridge
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let ss = self
+                .subagent_spawns
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let par = self
+                .parent_auto_resume
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            (sb, ss, par)
+        };
+        let (Some(signal_bridge), Some(subagent_spawns), Some(parent_auto_resume)) =
+            (signal_bridge, subagent_spawns, parent_auto_resume)
+        else {
+            // No G5 wiring installed; pre-G5 behaviour (operator re-POST).
+            return;
+        };
+
+        let engine = self.engine.clone();
+        let runtime = self.runtime.clone();
+        let child_run_id = record.run_id.clone();
+        let project = record.project.clone();
+        tokio::spawn(async move {
+            if let Err(err) = fire_child_completed_and_resume_parent(
+                engine,
+                runtime,
+                signal_bridge,
+                subagent_spawns,
+                parent_auto_resume,
+                project,
+                parent_run_id,
+                child_run_id,
+                success,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    "G5: fire_child_completed_and_resume_parent failed",
+                );
+            }
+        });
     }
 
     /// Mint the session-scoped `ExecutionId` for a cairn run.
@@ -597,6 +698,9 @@ impl FabricRunService {
                 prev_state: Some(prev_state),
             })
             .await;
+        // #670 G5: if this was a child run, signal the parent's
+        // waitpoint and trigger auto-resume.
+        self.fire_parent_resume_if_child(&record, true);
         Ok(record)
     }
 
@@ -647,6 +751,10 @@ impl FabricRunService {
                     prev_state: Some(prev_state),
                 })
                 .await;
+            // #670 G5: child run terminal-failed → signal parent +
+            // auto-resume. success=false in the signal payload so
+            // future observability can distinguish fail from complete.
+            self.fire_parent_resume_if_child(&record, false);
         }
         Ok(record)
     }
@@ -686,6 +794,9 @@ impl FabricRunService {
                 prev_state: Some(prev_state),
             })
             .await;
+        // #670 G5: child run cancelled → signal parent + auto-resume.
+        // success=false since the child did not reach Completed.
+        self.fire_parent_resume_if_child(&record, false);
         Ok(record)
     }
 
@@ -913,6 +1024,107 @@ impl FabricRunService {
         record_result
     }
 
+    /// #670 G5: suspend the parent run on the `child_completed:<child_task_id>`
+    /// waitpoint. Called from the service-layer (the HTTP orchestrate
+    /// handler's execute phase, via `TaskService::spawn_subagent`'s
+    /// adapter) when the LLM proposes `spawn_subagent` — parallel to
+    /// `enter_waiting_approval` but keyed on the subagent's task id
+    /// rather than the run's approval id.
+    ///
+    /// Commits FF's `ff_suspend_execution` via `suspend_by_triple` and
+    /// emits `BridgeEvent::ExecutionSuspended { to: WaitingDependency,
+    /// pause_reason: RuntimeSuspension("subagent:<child_task_id>") }`
+    /// so the projection + operator dashboards show the parent paused
+    /// with the correct reason.
+    ///
+    /// Closes the signal-before-suspend race: callers invoke this
+    /// BEFORE the child run can possibly terminate, so the waitpoint
+    /// is bound by the time `deliver_child_completed_signal` fires.
+    pub async fn enter_waiting_subagent(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+        run_id: &RunId,
+        child_task_id: &cairn_domain::TaskId,
+    ) -> Result<RunRecord, FabricError> {
+        let eid = self.execution_id(project, session_id, run_id);
+        let snapshot =
+            self.engine
+                .describe_execution(&eid)
+                .await?
+                .ok_or_else(|| FabricError::NotFound {
+                    entity: "run",
+                    id: run_id.to_string(),
+                })?;
+        let prev_state = ff_public_state_to_run_state(&snapshot);
+        let lease = self.resolve_lease_context(&snapshot);
+
+        // `WaitingSubagent` sanitizes the task id then prefixes
+        // `child_completed:` — same shape as `typed_subagent` (worker-
+        // SDK path) and as `SignalBridge::deliver_child_completed_signal`
+        // (the signal that will resume this waitpoint). Using the
+        // generic `RuntimeSuspension` variant here would double-sanitize
+        // the `:` separator and the matcher would never fire.
+        let fence = crate::suspension::build_lease_fence(&lease)?;
+        let args = crate::suspension::build_suspend_args(
+            crate::suspension::SuspendCase::WaitingSubagent {
+                child_task_id: child_task_id.as_str(),
+                timeout_ms: None,
+            },
+        );
+        crate::suspension::suspend_by_triple(self.runtime.backend(), eid, fence, args).await?;
+
+        // Emit unconditionally. `to = WaitingDependency` is deliberate:
+        // FF's `state_map::ff_public_state_to_run_state` translates
+        // `PublicState::Suspended` to `RunState::Paused` for every
+        // suspension kind (approval, subagent, policy, operator),
+        // which loses the subagent-vs-operator-pause distinction on
+        // the cairn side. Forcing `WaitingDependency` here keeps the
+        // operator-visible state semantically accurate for
+        // dashboards + the ChildRunDriver's scan predicate which
+        // includes Running-and-parent-id-set but would incorrectly
+        // match a paused parent if the projection wrote `Paused`.
+        //
+        // If `read_run_record` fails after the FCALL committed we
+        // still emit with `WaitingDependency` — the state is already
+        // correct at the FF level (suspended with blocking_reason =
+        // waiting_for_signal); the emit just reflects cairn's
+        // semantic view.
+        let record_result = self.read_run_record(project, session_id, run_id).await;
+        let project_for_emit = record_result
+            .as_ref()
+            .map(|r| r.project.clone())
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    run_id = %run_id,
+                    error = %e,
+                    "enter_waiting_subagent: read_run_record failed after ff_suspend_execution \
+                     committed — using caller-supplied project for emit"
+                );
+                project.clone()
+            });
+        self.bridge
+            .emit(BridgeEvent::ExecutionSuspended {
+                run_id: run_id.clone(),
+                project: project_for_emit,
+                prev_state: Some(prev_state),
+                to: RunState::WaitingDependency,
+                // Subagent suspensions have no scheduled `resume_after_ms`
+                // — they unblock on `child_completed:<task_id>` only —
+                // so resume_after_ms is None. `RuntimeSuspension` is the
+                // correct kind (the run is waiting on a system-generated
+                // signal, not an operator pause or approval).
+                pause_reason: Some(cairn_domain::lifecycle::PauseReason {
+                    kind: cairn_domain::lifecycle::PauseReasonKind::RuntimeSuspension,
+                    detail: Some(format!("subagent:{}", child_task_id.as_str())),
+                    resume_after_ms: None,
+                    actor: None,
+                }),
+            })
+            .await;
+        record_result
+    }
+
     pub async fn resolve_approval(
         &self,
         project: &ProjectKey,
@@ -1096,6 +1308,128 @@ fn build_run_record(
         in_flight_descendants: 0,
         root_run_id: None,
     })
+}
+
+/// #670 G5: orchestrate the two-step child-terminal → parent-resume
+/// flow. Called from a `tokio::spawn`'d task after the cairn-side
+/// terminal bridge emit commits.
+///
+/// Steps:
+/// 1. Look up the child's `subagent_spawns` row to resolve
+///    `child_task_id`. Without this we can't compute the waitpoint
+///    key the parent is bound on.
+/// 2. Describe the parent's FF execution and read
+///    `current_waitpoint`. If the parent has no current waitpoint
+///    (e.g. pre-G5 parent that never suspended, or the parent
+///    already resumed via a concurrent operator re-POST), skip the
+///    signal step silently.
+/// 3. Deliver `child_completed:<child_task_id>` via
+///    `SignalBridge::deliver_child_completed_signal`. Failures log
+///    WARN; the parent falls back to manual operator re-POST.
+/// 4. Invoke `ParentAutoResume::resume_parent_run` so the parent's
+///    orchestrator loop re-enters via cairn-app's
+///    `drive_run_iteration`. This step is wrapped in its own
+///    async call so the callback implementor controls its own
+///    failure-recovery semantics.
+#[allow(clippy::too_many_arguments)]
+async fn fire_child_completed_and_resume_parent(
+    engine: Arc<dyn Engine>,
+    runtime: Arc<dyn FabricRuntimeHandle>,
+    signal_bridge: Arc<crate::signal_bridge::SignalBridge>,
+    subagent_spawns: Arc<dyn cairn_store::projections::SubagentSpawnReadModel>,
+    parent_auto_resume: Arc<dyn crate::parent_auto_resume::ParentAutoResume>,
+    child_project: ProjectKey,
+    parent_run_id: RunId,
+    child_run_id: RunId,
+    success: bool,
+) -> Result<(), FabricError> {
+    // Step 1: resolve child_task_id via the subagent_spawns read-model.
+    let spawn_record = subagent_spawns
+        .get_by_child_run_id(&child_run_id)
+        .await
+        .map_err(|e| FabricError::Bridge(format!("G5 subagent_spawns lookup: {e}")))?;
+    let Some(spawn_record) = spawn_record else {
+        // Child wasn't spawned via the subagent path (maybe an
+        // operator-created child run with a parent_run_id but no
+        // subagent_spawns row). Nothing to signal.
+        tracing::debug!(
+            child_run_id = %child_run_id,
+            "G5: no subagent_spawns row for child; skipping parent signal",
+        );
+        return Ok(());
+    };
+    let child_task_id = spawn_record.child_task_id;
+
+    // Step 2: describe parent's FF execution + read its current waitpoint.
+    // We need the parent's session_id — the spawn_record has
+    // `child_session_id` (the child's session). Children co-locate on
+    // the parent's session today (G3 contract) so child_session_id
+    // IS the parent's session_id, but we read the parent's actual
+    // session via the record's `child_session_id` (which equals the
+    // parent's session by construction). No separate lookup needed.
+    let parent_session_id = spawn_record.child_session_id;
+    let partition_config = runtime.partition_config();
+    let parent_exec_id = crate::id_map::session_run_to_execution_id(
+        &child_project,
+        &parent_session_id,
+        &parent_run_id,
+        partition_config,
+    );
+    let snapshot = engine.describe_execution(&parent_exec_id).await?;
+    let Some(snapshot) = snapshot else {
+        tracing::debug!(
+            parent_run_id = %parent_run_id,
+            "G5: parent execution not found; skipping signal",
+        );
+        return Ok(());
+    };
+    let Some(parent_waitpoint_id) = snapshot.current_waitpoint.clone() else {
+        // Parent has no active waitpoint — either it never suspended
+        // (operator-re-POST happened faster than this task) or the
+        // pre-G5 path ran. Skip silently.
+        tracing::debug!(
+            parent_run_id = %parent_run_id,
+            "G5: parent has no current waitpoint; skipping signal",
+        );
+        return Ok(());
+    };
+
+    // Step 3: deliver the signal. Best-effort.
+    match signal_bridge
+        .deliver_child_completed_signal(
+            &parent_exec_id,
+            &parent_waitpoint_id,
+            child_task_id.as_str(),
+            success,
+        )
+        .await
+    {
+        Ok(outcome) => {
+            tracing::info!(
+                parent_run_id = %parent_run_id,
+                child_task_id = %child_task_id,
+                ?outcome,
+                "G5: child_completed signal delivered",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                parent_run_id = %parent_run_id,
+                child_task_id = %child_task_id,
+                "G5: deliver_child_completed_signal failed; parent will \
+                 not auto-resume (operator must re-POST /orchestrate).",
+            );
+            return Ok(());
+        }
+    }
+
+    // Step 4: trigger parent auto-resume via the callback.
+    parent_auto_resume
+        .resume_parent_run(child_project, parent_session_id, parent_run_id)
+        .await;
+
+    Ok(())
 }
 
 #[cfg(test)]

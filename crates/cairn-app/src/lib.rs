@@ -23,6 +23,7 @@ pub mod metrics_otel;
 pub mod metrics_tap;
 pub mod middleware;
 pub mod openapi_spec;
+pub mod parent_auto_resume_impl;
 pub mod repo_routes;
 pub mod router;
 pub mod sandbox;

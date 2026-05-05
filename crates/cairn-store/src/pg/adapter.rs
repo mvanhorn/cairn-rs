@@ -4297,6 +4297,27 @@ impl crate::projections::SubagentSpawnReadModel for PgAdapter {
         Ok(row.map(SubagentSpawnRow::into_record))
     }
 
+    async fn get_by_child_run_id(
+        &self,
+        child_run_id: &cairn_domain::RunId,
+    ) -> Result<Option<crate::projections::SubagentSpawnRecord>, StoreError> {
+        // Point lookup on `child_run_id`. Served by the partial
+        // index `idx_subagent_spawns_child_run_id` (pg V070) — the
+        // terminal hook fires on every child completion so an
+        // indexed lookup is load-bearing.
+        let sql = format!(
+            "SELECT {SUBAGENT_SPAWN_SELECT_COLS} FROM subagent_spawns
+             WHERE child_run_id = $1
+             LIMIT 1"
+        );
+        let row: Option<SubagentSpawnRow> = sqlx::query_as(&sql)
+            .bind(child_run_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(row.map(SubagentSpawnRow::into_record))
+    }
+
     async fn list_by_parent_run(
         &self,
         parent_run_id: &cairn_domain::RunId,

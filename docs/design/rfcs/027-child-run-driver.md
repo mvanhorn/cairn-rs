@@ -129,7 +129,7 @@ Claim routes through `issue_grant_and_claim` (`crates/cairn-fabric/src/services/
 
 ### Waitpoint key shape
 
-G5's parent-suspend path uses `child_task_id` as the waitpoint key, matching `suspend_for_subagent` at `cairn-fabric/src/worker_sdk.rs:430`.
+G5's `enter_waiting_subagent` uses `SuspendCase::WaitingSubagent { child_task_id }` which builds a `child_completed:<sanitized_task_id>` signal matcher. The `:` separator is preserved because sanitization applies to the task id only (not the already-prefixed signal name). This matches `SignalBridge::deliver_child_completed_signal`'s shape. See `suspension.rs::SuspendCase::WaitingSubagent` and the unit regression guard `service_waiting_subagent_matches_deliver_signal_shape`.
 
 ## Implementation plan
 
@@ -194,9 +194,21 @@ The plan splits the work into 9 PRs across G4-G8. PR-1b was originally a single 
 
 **~50 LOC.** Default flipped `CAIRN_CHILD_RUN_DRIVER_ENABLED=true`. Merge-gated on the Track-3 verification gate (see §Sequencing). This is the PR that actually turns on subagent execution in production.
 
-### G5 (PR 2) — Parent suspend on `subagent_waitpoint`
+### G5 (PR 2) — Parent auto-resume on subagent completion
 
-Parent run's execute phase, on `ActionStatus::SubagentSpawned`, calls `suspend_for_subagent` with the `child_task_id` key. Child's `RunCompleted` emit (from PR-1b-3) fires a FF signal to the parent's waitpoint. Parent resumes, observes child's final state via `step_history`, continues. **~400 LOC + 200 LOC test.** Depends on PR-1b-5.
+**SHIPPED.** +585/-2 across 15 files (3 new). Closes the signal-before-suspend race and auto-resumes the parent when a child terminates — without operator re-POST of `/orchestrate`.
+
+Key design decisions implemented (some differ from the original spec):
+
+- `FabricTaskServiceAdapter::spawn_subagent` calls `RunService::enter_waiting_subagent` with `SuspendCase::WaitingSubagent { child_task_id }` **before** emitting `BridgeEvent::SubagentSpawned`. This closes the race: the parent's FF execution is suspended on the `child_completed:<child_task_id>` waitpoint before the child can possibly terminate.
+
+- New `SuspendCase::WaitingSubagent` variant in `suspension.rs` sanitizes the task id first then prefixes `child_completed:`, preserving the `:` separator. The original generic `RuntimeSuspension` variant would double-sanitize the `:` into `_` and the signal would never match.
+
+- IoC trait `cairn_fabric::parent_auto_resume::ParentAutoResume` installed at the crate boundary (avoids a reverse dependency: cairn-fabric cannot import cairn-app's `drive_run_iteration`). `AppStateParentAutoResume` in cairn-app holds a `Weak<AppState>` to avoid the Arc cycle.
+
+- Terminal hook (`complete`/`fail`/`cancel`) calls `fire_parent_resume_if_child` which spawns a tokio task that: (1) resolves `child_task_id` via `SubagentSpawnReadModel::get_by_child_run_id`, (2) delivers `child_completed:<task_id>` signal to the parent's FF waitpoint, (3) invokes `ParentAutoResume::resume_parent_run` to re-drive the parent's orchestrator loop.
+
+- **~587 LOC + 341 LOC integration test.** Shipped against PR-1b-5 (driver default-on).
 
 ### G6 (PR 3) — `agent_role_id` threading
 

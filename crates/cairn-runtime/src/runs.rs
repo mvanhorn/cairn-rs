@@ -159,6 +159,30 @@ pub trait RunService: Send + Sync {
         run_id: &RunId,
     ) -> Result<RunRecord, RuntimeError>;
 
+    /// #670 G5: transition a parent run to `WaitingDependency` while
+    /// it waits on the `child_completed:<child_task_id>` signal.
+    /// Called from `TaskService::spawn_subagent`'s adapter before
+    /// the execute phase returns `SubagentSpawned` so the waitpoint
+    /// is bound BEFORE the child can possibly run.
+    ///
+    /// Default impl returns `InvalidTransition` — the in-memory test
+    /// fakes don't support fabric-backed suspension, and the
+    /// production path overrides this on `FabricRunServiceAdapter`.
+    /// The default impl signals the missing plumbing to callers
+    /// rather than silently succeeding.
+    async fn enter_waiting_subagent(
+        &self,
+        _session_id: &SessionId,
+        run_id: &RunId,
+        _child_task_id: &cairn_domain::TaskId,
+    ) -> Result<RunRecord, RuntimeError> {
+        Err(RuntimeError::InvalidTransition {
+            entity: "run",
+            from: format!("{:?}", run_id),
+            to: "waiting_dependency".to_owned(),
+        })
+    }
+
     /// Transition a run out of WaitingApproval after approval resolution.
     ///
     /// On approve: resumes to Running.

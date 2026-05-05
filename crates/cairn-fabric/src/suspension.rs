@@ -241,6 +241,19 @@ pub(crate) enum SuspendCase<'a> {
         approval_id: &'a str,
         timeout_ms: Option<u64>,
     },
+    /// #670 G5: service-layer subagent-wait suspension. Resume on
+    /// `child_completed:<sanitized_task_id>` — identical shape to the
+    /// worker-SDK [`typed_subagent`] helper. The existing
+    /// [`RuntimeSuspension`] variant is unusable here because its
+    /// resume_condition sanitizes the full pre-built signal name
+    /// (turning the `:` separator into `_`) which then no longer
+    /// matches [`SignalBridge::deliver_child_completed_signal`] (which
+    /// sanitizes only the task id and preserves the `:` separator).
+    /// Dedicated variant keeps the sanitize-once-after-prefix shape.
+    WaitingSubagent {
+        child_task_id: &'a str,
+        timeout_ms: Option<u64>,
+    },
 }
 
 impl SuspendCase<'_> {
@@ -253,6 +266,7 @@ impl SuspendCase<'_> {
             Self::RuntimeSuspension { .. } => SuspensionReasonCode::WaitingForSignal,
             Self::PolicyHold { .. } => SuspensionReasonCode::PausedByPolicy,
             Self::WaitingForApproval { .. } => SuspensionReasonCode::WaitingForApproval,
+            Self::WaitingSubagent { .. } => SuspensionReasonCode::WaitingForSignal,
         }
     }
 
@@ -287,6 +301,18 @@ impl SuspendCase<'_> {
                 }
             }
             Self::WaitingForApproval { .. } => approval_resume_condition(waitpoint_key),
+            Self::WaitingSubagent { child_task_id, .. } => {
+                // Sanitize the child task id first, then prefix — this
+                // preserves the `:` separator in the matcher, matching
+                // the shape that
+                // `SignalBridge::deliver_child_completed_signal` emits.
+                let safe = sanitize_signal_component(child_task_id);
+                let signal = format!("child_completed:{safe}");
+                ResumeCondition::Single {
+                    waitpoint_key: waitpoint_key.to_owned(),
+                    matcher: SignalMatcher::ByName(signal),
+                }
+            }
         }
     }
 
@@ -317,6 +343,10 @@ impl SuspendCase<'_> {
             } => (*resume_after_ms, TimeoutBehavior::Fail),
             // Approval timeouts escalate to operator review.
             Self::WaitingForApproval { timeout_ms, .. } => (*timeout_ms, TimeoutBehavior::Escalate),
+            // Subagent timeouts fail the parent run — a stuck child
+            // should not keep the parent suspended forever. Mirrors
+            // `typed_subagent`'s TimeoutBehavior::Fail choice.
+            Self::WaitingSubagent { timeout_ms, .. } => (*timeout_ms, TimeoutBehavior::Fail),
         };
         compute_timeout(ms, behavior)
     }
@@ -626,6 +656,51 @@ mod tests {
             }
             other => panic!("expected Single, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn service_waiting_subagent_matches_deliver_signal_shape() {
+        // Regression guard for #670 G5: the service-layer
+        // enter_waiting_subagent path must build a matcher whose name
+        // matches what SignalBridge::deliver_child_completed_signal
+        // emits. Both sides sanitize ONLY the task id, then prefix
+        // `child_completed:`, preserving the `:` separator. If this
+        // test fails, parent runs will stuck at waiting_dependency.
+        let args = build_suspend_args(SuspendCase::WaitingSubagent {
+            child_task_id: "task:42",
+            timeout_ms: None,
+        });
+        assert_eq!(args.reason_code, SuspensionReasonCode::WaitingForSignal);
+        let wp = bound_wp_key(&args);
+        match &args.resume_condition {
+            ResumeCondition::Single {
+                waitpoint_key,
+                matcher,
+            } => {
+                assert_eq!(waitpoint_key, &wp);
+                match matcher {
+                    SignalMatcher::ByName(n) => {
+                        // Input `task:42` has one `:` which gets
+                        // sanitized to `_`. The `child_completed:`
+                        // prefix is applied AFTER sanitization, so its
+                        // `:` is preserved.
+                        assert_eq!(n, "child_completed:task_42");
+                    }
+                    other => panic!("expected ByName, got {other:?}"),
+                }
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_waiting_subagent_timeout_fails_run() {
+        let args = build_suspend_args(SuspendCase::WaitingSubagent {
+            child_task_id: "child_42",
+            timeout_ms: Some(10_000),
+        });
+        assert_eq!(args.timeout_behavior, TimeoutBehavior::Fail);
+        assert!(args.timeout_at.is_some());
     }
 
     #[test]

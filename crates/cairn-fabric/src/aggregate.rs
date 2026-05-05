@@ -57,7 +57,7 @@ pub struct FabricServices {
     pub budgets: FabricBudgetService,
     pub quotas: FabricQuotaService,
     pub rotation: FabricRotationService,
-    pub signals: SignalBridge,
+    pub signals: Arc<SignalBridge>,
     bridge_handle: JoinHandle<()>,
     lease_history: Option<LeaseHistorySubscriber>,
 }
@@ -347,7 +347,7 @@ impl FabricServices {
         let budgets = FabricBudgetService::new(control_plane.clone());
         let quotas = FabricQuotaService::new(control_plane.clone(), runtime.clone());
         let rotation = FabricRotationService::new(control_plane.clone());
-        let signals = SignalBridge::new(runtime.clone());
+        let signals = Arc::new(SignalBridge::new(runtime.clone()));
 
         Ok(Self {
             runtime,

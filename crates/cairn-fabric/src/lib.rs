@@ -107,6 +107,8 @@ pub mod lease_history_subscriber;
 // trait is impl'd by both the Valkey [`FabricRuntime`] (here) and
 // [`PostgresFabricRuntime`] (`postgres_boot.rs`).
 #[cfg(feature = "fabric-valkey")]
+pub mod parent_auto_resume;
+#[cfg(feature = "fabric-valkey")]
 pub mod runtime_handle;
 #[cfg(feature = "fabric-valkey")]
 pub mod services;

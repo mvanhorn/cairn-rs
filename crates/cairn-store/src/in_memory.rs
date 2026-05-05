@@ -6786,6 +6786,18 @@ impl crate::projections::SubagentSpawnReadModel for InMemoryStore {
         Ok(state.subagent_spawns.get(child_task_id.as_str()).cloned())
     }
 
+    async fn get_by_child_run_id(
+        &self,
+        child_run_id: &cairn_domain::RunId,
+    ) -> Result<Option<crate::projections::SubagentSpawnRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .subagent_spawns
+            .values()
+            .find(|r| r.child_run_id.as_ref() == Some(child_run_id))
+            .cloned())
+    }
+
     async fn list_by_parent_run(
         &self,
         parent_run_id: &cairn_domain::RunId,

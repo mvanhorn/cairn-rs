@@ -1399,6 +1399,20 @@ impl RunService for FabricRunServiceAdapter {
             .map_err(fabric_err_to_runtime)
     }
 
+    async fn enter_waiting_subagent(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        child_task_id: &TaskId,
+    ) -> Result<RunRecord, RuntimeError> {
+        let project = resolve_run_project_checking_session(&self.store, run_id, session_id).await?;
+        self.fabric
+            .runs
+            .enter_waiting_subagent(&project, session_id, run_id, child_task_id)
+            .await
+            .map_err(fabric_err_to_runtime)
+    }
+
     async fn resolve_approval(
         &self,
         session_id: &SessionId,
@@ -2060,6 +2074,7 @@ impl TaskService for FabricTaskServiceAdapter {
                 id: parent_run_id.as_str().to_owned(),
             })?;
         let parent_project = parent.project.clone();
+        let parent_session_id = parent.session_id.clone();
         let parent_tenant = parent_project.tenant_id.clone();
 
         // G3: child_run_id should be Some(id) on the LLM-initiated
@@ -2271,6 +2286,39 @@ impl TaskService for FabricTaskServiceAdapter {
                 return Err(phase2_err);
             }
         };
+
+        // #670 G5: suspend the parent on `child_completed:<child_task_id>`
+        // BEFORE emitting the `SubagentSpawned` fact. Closes the
+        // signal-before-suspend race — by the time this method returns
+        // and execute_impl yields `ActionStatus::SubagentSpawned`, the
+        // parent's FF execution is already suspended on the waitpoint
+        // that the child's terminal will signal against.
+        //
+        // Best-effort: a suspend failure logs WARN but does NOT block
+        // the spawn (the operator can still manually re-POST
+        // /orchestrate as the pre-G5 fallback). The spawn itself
+        // already committed Phase-1/2 side effects; tearing those down
+        // on a suspend failure would leak more than it prevents.
+        if let Err(err) = self
+            .fabric
+            .runs
+            .enter_waiting_subagent(
+                &parent_project,
+                &parent_session_id,
+                &parent_run_id,
+                &child_task_id,
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                parent_run_id = %parent_run_id,
+                child_task_id = %child_task_id,
+                "G5: enter_waiting_subagent failed; parent stays Running. \
+                 Auto-resume will not fire on child completion; operator \
+                 must manually re-POST /v1/runs/:id/orchestrate.",
+            );
+        }
 
         // Phase 3: emit the spawn fact. Carries the real child_run_id
         // now (G3); was always None in G1+G2.

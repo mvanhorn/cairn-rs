@@ -45,6 +45,24 @@ pub trait SubagentSpawnReadModel: Send + Sync {
         child_task_id: &TaskId,
     ) -> Result<Option<SubagentSpawnRecord>, StoreError>;
 
+    /// #670 G5: look up the spawn record by child **run** id (not task).
+    /// Feeds the `RunService::{complete,fail,cancel}` terminal hook
+    /// that maps a terminating child back to the parent's waitpoint
+    /// key. The child's RunRecord carries `parent_run_id` but NOT
+    /// `child_task_id`; the spawn record carries both, so the terminal
+    /// hook resolves child_task_id → waitpoint via this method.
+    ///
+    /// Semantically a point lookup. pg/sqlite serve the query via
+    /// the partial index `idx_subagent_spawns_child_run_id` (pg
+    /// V070, sqlite schema.rs). In-memory does a linear scan of the
+    /// all-spawns HashMap — acceptable for the in-memory backend's
+    /// dev-only scope and the terminal-hook fire-and-forget call
+    /// path.
+    async fn get_by_child_run_id(
+        &self,
+        child_run_id: &RunId,
+    ) -> Result<Option<SubagentSpawnRecord>, StoreError>;
+
     /// Enumerate all subagents spawned from a single parent run, in
     /// `(spawned_at_ms ASC, child_task_id ASC)` order.
     async fn list_by_parent_run(
