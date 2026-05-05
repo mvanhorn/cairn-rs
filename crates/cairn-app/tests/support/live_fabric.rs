@@ -114,6 +114,18 @@ impl LiveHarness {
         Self::setup_with_storage_and_env(HarnessStorage::InMemory, extra_env).await
     }
 
+    /// Combined variant for SIGKILL+recovery tests that need both
+    /// durable storage (so the event log survives the subprocess
+    /// exit) and env-var customization (e.g. shortened lease TTL so
+    /// FF's scanner re-eligibles the dead claim quickly).
+    /// Introduced for PR-1b-4 (#670 G4).
+    pub async fn setup_with_sqlite_and_env(extra_env: &[(&str, &str)]) -> Self {
+        let suffix_hint = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
+        let mut path = std::env::temp_dir();
+        path.push(format!("cairn-liveharness-{suffix_hint}.db"));
+        Self::setup_with_storage_and_env(HarnessStorage::Sqlite(path), extra_env).await
+    }
+
     async fn setup_with_storage(storage: HarnessStorage) -> Self {
         Self::setup_with_storage_and_env(storage, &[]).await
     }

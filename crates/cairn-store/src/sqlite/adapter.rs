@@ -506,13 +506,19 @@ impl RunReadModel for SqliteAdapter {
         rows.into_iter().map(RunRow::into_record).collect()
     }
 
-    /// #670 G4 / RFC 027: pushed-down predicate for the
-    /// `ChildRunDriver` scan. sqlite uses the same
-    /// `idx_runs_parent` partial index as pg.
-    async fn list_pending_children(&self, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
+    /// #670 G4 / RFC 027 + PR-1b-4: pushed-down predicate for the
+    /// `ChildRunDriver` scan — child runs in `Pending` or `Running`
+    /// state. sqlite uses the same `idx_runs_parent` partial index
+    /// as pg. `Running` is included so the driver can re-claim
+    /// crashed children post-recovery; FF's atomic
+    /// `issue_grant_and_claim` rejects live-lease duplicates.
+    async fn list_driver_claimable_children(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, StoreError> {
         let sql = format!(
             "SELECT {RUN_SELECT_COLS} FROM runs \
-             WHERE state = 'pending' AND parent_run_id IS NOT NULL \
+             WHERE state IN ('pending', 'running') AND parent_run_id IS NOT NULL \
              ORDER BY created_at ASC, run_id ASC \
              LIMIT $1"
         );
@@ -705,6 +711,24 @@ impl crate::projections::RunDescendantsCounter for SqliteAdapter {
             Some((new_count,)) => Ok(DescendantsCapOutcome::Admitted { new_count }),
             None => Ok(DescendantsCapOutcome::RootNotFound),
         }
+    }
+
+    async fn list_nonzero_descendant_counters(&self) -> Result<Vec<(RunId, i64)>, StoreError> {
+        const RECONCILE_LIMIT: i64 = 10_000;
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT run_id, in_flight_descendants FROM runs \
+             WHERE in_flight_descendants <> 0 \
+             ORDER BY run_id ASC \
+             LIMIT ?1",
+        )
+        .bind(RECONCILE_LIMIT)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, n)| (RunId::new(id), n))
+            .collect())
     }
 }
 

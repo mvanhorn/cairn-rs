@@ -160,25 +160,49 @@ pub trait RunReadModel: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RunRecord>, StoreError>;
 
-    /// #670 G4 / RFC 027: list pending child runs (state = Pending
-    /// AND parent_run_id IS NOT NULL), ordered by `(created_at,
-    /// run_id)` ASC. Feeds the [`crate::projections::RunDescendantsCounter`]-adjacent
-    /// `ChildRunDriver` scan loop; the predicate is pushed into the
-    /// SQL layer so a tenant with many pending root runs cannot
-    /// starve the driver by overflowing a generic `list_by_state`
-    /// paged scan (Gemini review on PR #678, HIGH).
+    /// #670 G4 / RFC 027 + PR-1b-4: list child runs the
+    /// `ChildRunDriver` is eligible to claim — `parent_run_id IS
+    /// NOT NULL` AND `state IN (Pending, Running)`, ordered by
+    /// `(created_at, run_id)` ASC.
+    ///
+    /// **Why Running too?** Pending alone starves crashed children:
+    /// post-SIGKILL the child row stays in `Running` because RFC
+    /// 020's recovery sweep emits only advisory markers for
+    /// non-wedged Running runs (the main orchestrator's HTTP-pull
+    /// model expects an operator to re-POST `/orchestrate` to
+    /// resume). Child runs have no operator — the driver IS the
+    /// resumption actor. FF's atomic `issue_grant_and_claim`
+    /// rejects duplicate claims, so including live-lease children
+    /// in the scan is safe: the driver attempts a claim via
+    /// `drive_run_iteration` → `renew_lease_if_stale`; if the
+    /// lease is healthy elsewhere, FF rejects with
+    /// `execution_not_eligible` and the iteration surfaces via
+    /// `iterations_err_total`.
+    ///
+    /// The predicate is pushed into the SQL layer so a tenant with
+    /// many pending/running root runs cannot starve the driver by
+    /// overflowing a generic `list_by_state` paged scan (Gemini
+    /// review on PR #678, HIGH).
     ///
     /// Default implementation (fallback for backends that haven't
-    /// specialised yet) delegates to `list_by_state(Pending, limit *
-    /// 4)` and filters in memory. The `* 4` multiplier is a crude
-    /// hedge against the starvation case; backends SHOULD override
-    /// with an indexed SQL query. In-memory and pg/sqlite all
-    /// override below.
-    async fn list_pending_children(&self, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
-        let wide = self
-            .list_by_state(RunState::Pending, limit.saturating_mul(4))
-            .await?;
-        Ok(wide
+    /// specialised yet) union-scans Pending + Running via two
+    /// `list_by_state` calls and filters in memory. Backends SHOULD
+    /// override with an indexed SQL query; in-memory and pg/sqlite
+    /// all override below.
+    async fn list_driver_claimable_children(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, StoreError> {
+        let wide_limit = limit.saturating_mul(4);
+        let mut pending = self.list_by_state(RunState::Pending, wide_limit).await?;
+        let running = self.list_by_state(RunState::Running, wide_limit).await?;
+        pending.extend(running);
+        pending.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(pending
             .into_iter()
             .filter(|r| r.parent_run_id.is_some())
             .take(limit)
@@ -302,6 +326,27 @@ pub trait RunDescendantsCounter: Send + Sync {
         &self,
         root_run_id: &RunId,
     ) -> Result<DescendantsCapOutcome, StoreError>;
+
+    /// #670 G4 PR-1b-4: list every root run with a non-zero
+    /// `in_flight_descendants` counter. Used by cairn-app's boot
+    /// reconciliation pass: the counter is mutated via direct SQL
+    /// UPDATE (not event-sourced), so the event-log replay that
+    /// rebuilds the in-memory projection does NOT restore the
+    /// counter's authoritative value. After replay, cairn-app reads
+    /// this list from the durable backend and writes the values onto
+    /// the in-memory projection via
+    /// [`InMemoryStore::restore_descendants_counter`], reconciling
+    /// the two views.
+    ///
+    /// Implementations SHOULD cap the result set at a defensive
+    /// limit to avoid loading millions of rows at boot; real
+    /// deployments of cairn today have at most thousands of live
+    /// roots with active descendants, so a 10k cap is more than
+    /// sufficient. Rows past the cap would have their counter stay
+    /// at 0 on the in-memory projection until a live write resets
+    /// it, which is worse than reconciling them but still
+    /// durable-side-correct (the durable backend is authoritative).
+    async fn list_nonzero_descendant_counters(&self) -> Result<Vec<(RunId, i64)>, StoreError>;
 }
 
 /// Outcome of a [`RunDescendantsCounter`] operation. Returning a

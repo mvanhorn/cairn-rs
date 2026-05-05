@@ -78,11 +78,11 @@ const CONCURRENCY_MAX: usize = 32;
 const IDLE_TICK: Duration = Duration::from_millis(500);
 
 /// Max child rows the driver observes per tick. The scan goes
-/// through `RunReadModel::list_pending_children` which pushes
-/// `state = 'pending' AND parent_run_id IS NOT NULL` into the SQL
-/// layer (hitting `idx_runs_parent` partial index on pg/sqlite), so
-/// pending ROOT runs do NOT inflate the result set — this limit
-/// bounds actual child rows, not the full Pending population.
+/// through `RunReadModel::list_driver_claimable_children` which
+/// pushes `state IN ('pending', 'running') AND parent_run_id IS
+/// NOT NULL` into the SQL layer (hitting `idx_runs_parent` partial
+/// index on pg/sqlite), so non-child runs do NOT inflate the
+/// result set — this limit bounds actual child rows.
 const SCAN_LIMIT: usize = 128;
 
 /// Metrics surface. Every counter is an atomic so the reader side
@@ -260,19 +260,28 @@ async fn tick(
         return;
     }
 
-    // RFC 027 §contract 4: claim predicate is
-    //   state == Pending AND parent_run_id IS NOT NULL
+    // RFC 027 §contract 4 + PR-1b-4: claim predicate is
+    //   state IN (Pending, Running) AND parent_run_id IS NOT NULL
     // Startup ordering guarantees recover_all has already transitioned
-    // anything unrecoverable to Failed, so the Pending filter cannot
-    // pick up a crashed run that should be reclaimed by recovery.
-    let children =
-        match RunReadModel::list_pending_children(state.runtime.store.as_ref(), SCAN_LIMIT).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(error = %err, "child-run driver scan failed");
-                return;
-            }
-        };
+    // anything unrecoverable to Failed, so the filter cannot pick up
+    // a crashed-and-wedged run that should be reclaimed by recovery.
+    // Running is included so post-SIGKILL children (which stay in
+    // Running per RFC 020's advisory-marker recovery for non-wedged
+    // runs) get re-claimed by the driver — FF's atomic
+    // `issue_grant_and_claim` rejects live-lease duplicates, so
+    // including them is safe.
+    let children = match RunReadModel::list_driver_claimable_children(
+        state.runtime.store.as_ref(),
+        SCAN_LIMIT,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "child-run driver scan failed");
+            return;
+        }
+    };
 
     let count = children.len() as u64;
     if count == 0 {
@@ -283,10 +292,9 @@ async fn tick(
         .fetch_add(count, Ordering::Relaxed);
 
     for child in children {
-        // Double-claim filter (task #164): between one tick issuing
-        // `drive_run_iteration` and the child transitioning to
-        // Running (which takes it out of the `list_pending_children`
-        // result set), the next tick's scan can see the same row.
+        // Double-claim filter (task #164): two adjacent ticks can see
+        // the same child row before the per-spawned-task cleanup
+        // drains the in_flight set.
         // FF's `ff_claim_execution` rejects the second claim
         // atomically with `execution_not_eligible` so this is a
         // correctness non-issue, but filtering here avoids wasted

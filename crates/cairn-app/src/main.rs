@@ -761,6 +761,68 @@ async fn real_main() {
         }
     }
 
+    // ── Descendant-counter reconciliation (#670 G4 PR-1b-4) ──────────────────
+    // The `in_flight_descendants` counter on the `runs` projection is
+    // mutated via direct SQL UPDATE (not event-sourced), so the event-
+    // log replay above did NOT restore its value — it's been rebuilt
+    // back to 0 on every row. The durable backend still holds the
+    // authoritative value; read it back and write it onto the
+    // in-memory projection. Without this, any cairn-app restart
+    // resets every active root's descendant counter to 0 and the
+    // cap-gate stops working until a live decrement underflows
+    // obviously.
+    //
+    // Cheap: the list is capped (10 000 rows by the primitive) and
+    // in practice there are at most a handful of root runs with
+    // active descendants at any given time. Skipped entirely when
+    // there is no durable backend (--db memory).
+    {
+        use cairn_store::projections::RunDescendantsCounter;
+        let durable_counter: Option<Arc<dyn RunDescendantsCounter>> = if let Some(ref backend) = pg
+        {
+            Some(backend.adapter.clone() as Arc<dyn RunDescendantsCounter>)
+        } else if let Some(ref backend) = sqlite {
+            Some(backend.adapter.clone() as Arc<dyn RunDescendantsCounter>)
+        } else {
+            None
+        };
+        if let Some(counter) = durable_counter {
+            match counter.list_nonzero_descendant_counters().await {
+                Ok(rows) => {
+                    let n = rows.len();
+                    for (run_id, value) in rows {
+                        lib_state
+                            .runtime
+                            .store
+                            .restore_descendants_counter(&run_id, value)
+                            .await;
+                    }
+                    if n > 0 {
+                        eprintln!(
+                            "store: reconciled {n} root(s) with non-zero in_flight_descendants \
+                             from durable backend into in-memory projection"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Non-fatal: counters drift to 0 until the next live
+                    // increment, but the cairn-app is still serviceable.
+                    // WARN so production logging pipelines pick it up —
+                    // Gemini review on #680 flagged an eprintln! here
+                    // that wouldn't survive a logs filter (`eprintln!`
+                    // goes to stderr but doesn't carry structured
+                    // severity; tracing::warn! does both).
+                    tracing::warn!(
+                        error = %e,
+                        "store: descendant-counter reconciliation failed. \
+                         Live counters may be inaccurate until a subsequent \
+                         increment/decrement writes.",
+                    );
+                }
+            }
+        }
+    }
+
     // ── Seed the service-layer event ID counter above existing events ─────────
     // The make_envelope() counter starts at 0 on each process startup and
     // generates IDs like "evt_<timestamp>_<n>".  Seeding with the current
@@ -1275,12 +1337,20 @@ async fn real_main() {
             .runtime
             .store
             .set_secondary_log(pg_backend.event_log.clone());
+        state
+            .runtime
+            .store
+            .set_secondary_descendants_counter(pg_backend.adapter.clone());
         eprintln!("store: service-layer events will dual-write to Postgres");
     } else if let Some(ref sq_backend) = state.sqlite {
         state
             .runtime
             .store
             .set_secondary_log(sq_backend.event_log.clone());
+        state
+            .runtime
+            .store
+            .set_secondary_descendants_counter(sq_backend.adapter.clone());
         eprintln!("store: service-layer events will dual-write to SQLite");
     }
 

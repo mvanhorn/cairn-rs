@@ -347,6 +347,26 @@ pub struct InMemoryStore {
     /// is best-effort: failures are logged but do NOT roll back the in-memory
     /// write, preserving the existing availability guarantee.
     secondary_log: std::sync::RwLock<Option<Arc<dyn EventLog + Send + Sync>>>,
+
+    /// #670 G4 PR-1b-4: optional durable secondary descendant counter
+    /// backend. `try_increment_descendants` / `decrement_descendants`
+    /// dual-write here AFTER the in-memory write completes — the
+    /// counter is a projection mutation, not an event, so it would
+    /// otherwise drift to 0 on restart (the event-log replay
+    /// rebuilds the in-memory projection but there are no events
+    /// to replay for the counter itself).
+    ///
+    /// When set, the in-memory arm remains authoritative for the
+    /// cap-check decision (the CAS loop runs in-memory first). The
+    /// durable secondary write follows the in-memory decision: if
+    /// the in-memory admit said "under cap, new_count=N", the
+    /// durable backend sees an UPDATE that sets its counter to
+    /// the SAME N via its own atomic primitive. Dual-write is
+    /// best-effort like the event log; failures log a WARN and the
+    /// durable value drifts by one until the next live write
+    /// reconciles.
+    secondary_counter:
+        std::sync::RwLock<Option<Arc<dyn crate::projections::RunDescendantsCounter + Send + Sync>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,7 +476,24 @@ impl InMemoryStore {
             usage_counters: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             secondary_log: std::sync::RwLock::new(None),
+            secondary_counter: std::sync::RwLock::new(None),
         }
+    }
+
+    /// #670 G4 PR-1b-4: install a durable secondary descendant
+    /// counter backend (e.g. pg or sqlite adapter). After this call,
+    /// every `try_increment_descendants` / `decrement_descendants`
+    /// that lands in the in-memory arm is followed by an equivalent
+    /// write against the durable backend. Without this, the counter
+    /// is not durable across restart.
+    pub fn set_secondary_descendants_counter(
+        &self,
+        backend: Arc<dyn crate::projections::RunDescendantsCounter + Send + Sync>,
+    ) {
+        *self
+            .secondary_counter
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(backend);
     }
 
     fn increment_usage_for_project(
@@ -3790,16 +3827,25 @@ impl RunReadModel for InMemoryStore {
         Ok(results)
     }
 
-    /// #670 G4 / RFC 027: pushed-down predicate for the
-    /// `ChildRunDriver` scan — filters `Pending AND parent_run_id
-    /// IS NOT NULL` so the driver doesn't have to page through
-    /// pending roots.
-    async fn list_pending_children(&self, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
+    /// #670 G4 / RFC 027 + PR-1b-4: pushed-down predicate for the
+    /// `ChildRunDriver` scan — child runs in `Pending` or `Running`
+    /// state. `Running` is included so the driver can re-claim
+    /// crashed children post-recovery; FF's atomic
+    /// `issue_grant_and_claim` rejects live-lease duplicates.
+    async fn list_driver_claimable_children(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, StoreError> {
         let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut results: Vec<RunRecord> = store
             .runs
             .values()
-            .filter(|r| r.state == cairn_domain::RunState::Pending && r.parent_run_id.is_some())
+            .filter(|r| {
+                matches!(
+                    r.state,
+                    cairn_domain::RunState::Pending | cairn_domain::RunState::Running
+                ) && r.parent_run_id.is_some()
+            })
             .cloned()
             .collect();
         results.sort_by(|a, b| {
@@ -3899,27 +3945,54 @@ impl crate::projections::RunDescendantsCounter for InMemoryStore {
         cap: i64,
     ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
         use crate::projections::DescendantsCapOutcome;
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let row = match state.runs.get_mut(root_run_id.as_str()) {
-            Some(r) => r,
-            None => return Ok(DescendantsCapOutcome::RootNotFound),
+        let outcome = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let row = match state.runs.get_mut(root_run_id.as_str()) {
+                Some(r) => r,
+                None => return Ok(DescendantsCapOutcome::RootNotFound),
+            };
+            // Atomic check-and-increment under the state lock. The durable
+            // backends (pg/sqlite) use `UPDATE ... WHERE counter < :cap
+            // RETURNING` for the same semantic; InMemory uses lock
+            // exclusion. Both reject above the cap deterministically.
+            if row.in_flight_descendants >= cap {
+                DescendantsCapOutcome::CapReached
+            } else {
+                row.in_flight_descendants += 1;
+                // Bump version + updated_at so stale-run detection and
+                // every other version-watching consumer see the change.
+                // (Copilot review on #676.)
+                row.version = row.version.saturating_add(1);
+                row.updated_at = now_millis();
+                DescendantsCapOutcome::Admitted {
+                    new_count: row.in_flight_descendants,
+                }
+            }
         };
-        // Atomic check-and-increment under the state lock. The durable
-        // backends (pg/sqlite) use `UPDATE ... WHERE counter < :cap
-        // RETURNING` for the same semantic; InMemory uses lock
-        // exclusion. Both reject above the cap deterministically.
-        if row.in_flight_descendants >= cap {
-            return Ok(DescendantsCapOutcome::CapReached);
+        // #670 G4 PR-1b-4: dual-write to the durable secondary
+        // backend. Only mirror `Admitted` outcomes — `CapReached`
+        // and `RootNotFound` mean we didn't mutate the in-memory
+        // arm either. Best-effort per the `secondary_log` pattern;
+        // failures log a WARN so ops sees the drift.
+        if matches!(outcome, DescendantsCapOutcome::Admitted { .. }) {
+            let backend = self
+                .secondary_counter
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(backend) = backend {
+                if let Err(err) = backend.try_increment_descendants(root_run_id, cap).await {
+                    tracing::warn!(
+                        error = %err,
+                        root_run_id = %root_run_id,
+                        "secondary-counter increment failed; in-memory and durable \
+                         counters now drift by 1. Next live increment/decrement or \
+                         a restart-time reconciliation will resync.",
+                    );
+                }
+            }
         }
-        row.in_flight_descendants += 1;
-        // Bump version + updated_at so stale-run detection and
-        // every other version-watching consumer see the change.
-        // (Copilot review on #676 — without this, roots with
-        // active descendants would still look idle.)
-        row.version = row.version.saturating_add(1);
-        row.updated_at = now_millis();
-        let new_count = row.in_flight_descendants;
-        Ok(DescendantsCapOutcome::Admitted { new_count })
+        Ok(outcome)
     }
 
     async fn decrement_descendants(
@@ -3927,23 +4000,64 @@ impl crate::projections::RunDescendantsCounter for InMemoryStore {
         root_run_id: &cairn_domain::RunId,
     ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
         use crate::projections::DescendantsCapOutcome;
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let row = match state.runs.get_mut(root_run_id.as_str()) {
-            Some(r) => r,
-            None => return Ok(DescendantsCapOutcome::RootNotFound),
+        let outcome = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let row = match state.runs.get_mut(root_run_id.as_str()) {
+                Some(r) => r,
+                None => return Ok(DescendantsCapOutcome::RootNotFound),
+            };
+            // Unconditional decrement. Post-decrement can go negative if
+            // a caller bug produces more decrements than increments;
+            // we return the negative count rather than panicking. The
+            // adapter layer surfaces negative values as a WARN metric per
+            // RFC 027 (see `child_run_driver_descendant_underflow_total`).
+            row.in_flight_descendants -= 1;
+            // Bump version + updated_at: see `try_increment_descendants`
+            // rationale above.
+            row.version = row.version.saturating_add(1);
+            row.updated_at = now_millis();
+            DescendantsCapOutcome::Admitted {
+                new_count: row.in_flight_descendants,
+            }
         };
-        // Unconditional decrement. Post-decrement can go negative if
-        // a caller bug produces more decrements than increments;
-        // we return the negative count rather than panicking. The
-        // adapter layer surfaces negative values as a WARN metric per
-        // RFC 027 (see `child_run_driver_descendant_underflow_total`).
-        row.in_flight_descendants -= 1;
-        // Bump version + updated_at: see `try_increment_descendants`
-        // rationale above.
-        row.version = row.version.saturating_add(1);
-        row.updated_at = now_millis();
-        let new_count = row.in_flight_descendants;
-        Ok(DescendantsCapOutcome::Admitted { new_count })
+        // Dual-write to the durable secondary. Best-effort.
+        let backend = self
+            .secondary_counter
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(backend) = backend {
+            if let Err(err) = backend.decrement_descendants(root_run_id).await {
+                tracing::warn!(
+                    error = %err,
+                    root_run_id = %root_run_id,
+                    "secondary-counter decrement failed; in-memory and durable \
+                     counters now drift by 1.",
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn list_nonzero_descendant_counters(
+        &self,
+    ) -> Result<Vec<(cairn_domain::RunId, i64)>, StoreError> {
+        // Cap at 10_000 rows to match pg + sqlite and bound memory
+        // (Gemini review on #680, MEDIUM). Sort before truncate so
+        // the cap is deterministic across a wider population —
+        // without the sort, the HashMap's iteration order would
+        // pick an arbitrary slice.
+        const RECONCILE_LIMIT: usize = 10_000;
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(cairn_domain::RunId, i64)> = state
+            .runs
+            .values()
+            .filter(|r| r.in_flight_descendants != 0)
+            .map(|r| (r.run_id.clone(), r.in_flight_descendants))
+            .collect();
+        out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        out.truncate(RECONCILE_LIMIT);
+        Ok(out)
     }
 }
 
@@ -7091,6 +7205,29 @@ impl crate::projections::F65CheckpointReadModel for InMemoryStore {
 // ── Convenience query methods for cairn-app ───────────────────────────────
 
 impl InMemoryStore {
+    /// #670 G4 PR-1b-4: restore a root run's `in_flight_descendants`
+    /// counter to a specific value. Used by cairn-app's boot
+    /// reconciliation pass after the event-log replay re-initialises
+    /// the in-memory projection: the descendant counter is mutated
+    /// via direct SQL UPDATE (not event-sourced), so replay rebuilds
+    /// the projection with counter=0. cairn-app reads the authoritative
+    /// values from the durable backend via
+    /// `RunDescendantsCounter::list_nonzero_descendant_counters` and
+    /// writes them back here.
+    ///
+    /// No-op if `root_run_id` is missing from the projection
+    /// (shouldn't happen for a row that came from the durable
+    /// backend, but safely tolerated). Unlike `try_increment_*` and
+    /// `decrement_descendants`, this does NOT bump `version` or
+    /// `updated_at` — the reconciliation pass is a projection repair,
+    /// not a logical state change.
+    pub async fn restore_descendants_counter(&self, root_run_id: &cairn_domain::RunId, value: i64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(row) = state.runs.get_mut(root_run_id.as_str()) {
+            row.in_flight_descendants = value;
+        }
+    }
+
     /// Count runs currently in active states (Running or Leased).
     pub async fn count_active_runs(&self) -> u64 {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
