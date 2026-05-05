@@ -1,26 +1,30 @@
 //! #670 G4 / RFC 027: `ChildRunDriver` — tokio loop that claims and
-//! executes child subagent runs via the same FF primitive the main
-//! orchestrator uses.
+//! executes child subagent runs via the same orchestrator pipeline
+//! the HTTP `/orchestrate` handler uses.
 //!
-//! ## What this module ships in PR-1b-3
+//! ## What this module ships
 //!
-//! The **scaffolding** only: the tokio loop, cancel token, lifecycle
-//! management (start / stop / JoinHandle), the feature-flag gate, the
-//! claim predicate (`state == Pending AND parent_run_id IS NOT NULL`),
-//! the runtime-isolation semaphores, and the metrics-counter atoms.
+//! The child-run driver: a tokio-spawned background loop owned by
+//! `AppState` that, each tick, scans the runs projection for
+//! `Pending` rows with `parent_run_id IS NOT NULL`, dispatches each
+//! to `drive_run_iteration` (the shared orchestrator helper extracted
+//! from `orchestrate_run_handler_inner`), and respects a concurrency
+//! semaphore so one busy tenant doesn't starve HTTP handlers.
 //!
-//! The driver does **not** actually claim or execute anything yet.
-//! Every tick it:
+//! Child runs drive through the exact same gather → decide → execute
+//! pipeline as operator-initiated runs — provider routing,
+//! credentials, circuit breakers, dual checkpoints, approvals. The
+//! driver is merely the pull-model dispatcher; the engine is shared.
 //!
-//! 1. Respects the `CAIRN_CHILD_RUN_DRIVER_ENABLED` gate — when off
-//!    (default), the loop sleeps and bumps the idle counter; no store
-//!    read, no FF call, no work. This is the posture for PR-1b-3 → 1b-4.
-//! 2. When on (flipped by PR-1b-5), the loop performs a bounded scan
-//!    for pending children, respects the concurrency semaphore, and
-//!    logs what it would claim. The actual `issue_grant_and_claim`
-//!    call + orchestrator invocation is wired in PR-1b-5 alongside the
-//!    flag flip so the enablement and the behaviour change land in the
-//!    same PR with dedicated tests.
+//! ## Feature flag (default-on, explicit opt-out)
+//!
+//! `CAIRN_CHILD_RUN_DRIVER_ENABLED` defaults to enabled. Set to
+//! `"false"` / `"0"` / `"off"` / `"no"` (case-insensitive) to
+//! disable. The opt-out list is deliberately forgiving because
+//! operators disabling an otherwise-working feature reach for
+//! whichever truthy-adjacent value feels natural; strict `"false"`
+//! would burn someone mid-incident. The disabled branch is a cheap
+//! atomic bump + sleep — zero store reads, zero FF calls.
 //!
 //! ## Boot ordering (non-negotiable)
 //!
@@ -40,22 +44,25 @@
 //! persistent state of its own; FF's lease machinery reclaims any
 //! in-flight child on next boot.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use cairn_runtime::runs::RunService;
-use cairn_store::projections::RunReadModel;
-use cairn_store::InMemoryStore;
+use cairn_domain::RunId;
+use cairn_store::projections::{RunReadModel, RunRecord};
 
-/// Feature flag: when set to `"true"` (case-insensitive), the driver
-/// performs its scan loop. Any other value — including unset — leaves
-/// the driver in no-op mode: it ticks, sleeps, and does nothing.
-/// Default false per RFC 027. PR-1b-5 flips the default to true.
+use crate::handlers::runs::{drive_run_iteration, OrchestrateRequest};
+use crate::state::AppState;
+
+/// Feature flag: default-on. Set to `"false"`/`"0"`/`"off"`/`"no"`
+/// (case-insensitive) to disable. Any other value — including unset
+/// or the literal `"true"` — leaves the driver enabled. PR-1b-5
+/// flipped the default from the PR-1b-3 scaffolding-off posture.
 pub const ENABLED_ENV: &str = "CAIRN_CHILD_RUN_DRIVER_ENABLED";
 
 /// Tokio task budget: max concurrent child-run iterations. Clamp
@@ -76,9 +83,6 @@ const IDLE_TICK: Duration = Duration::from_millis(500);
 /// layer (hitting `idx_runs_parent` partial index on pg/sqlite), so
 /// pending ROOT runs do NOT inflate the result set — this limit
 /// bounds actual child rows, not the full Pending population.
-/// (Gemini review on #678, HIGH: earlier design used a generic
-/// `list_by_state` scan that could be starved by many pending
-/// roots.)
 const SCAN_LIMIT: usize = 128;
 
 /// Metrics surface. Every counter is an atomic so the reader side
@@ -92,9 +96,22 @@ pub struct ChildRunDriverMetrics {
     /// Ticks where the flag was on and the driver scanned for work.
     pub ticks_enabled: AtomicU64,
     /// Pending child rows observed across all ticks (monotonic sum).
-    /// Ratio `ticks_enabled / observed_children_total` roughly tracks
-    /// queue depth over time.
     pub observed_children_total: AtomicU64,
+    /// Child iterations actually dispatched to `drive_run_iteration`.
+    /// Distinct from `observed_children_total` because the in-flight
+    /// filter may skip a child that's already being processed by an
+    /// earlier tick's spawned task.
+    pub iterations_dispatched_total: AtomicU64,
+    /// Iterations that returned `Ok(response)` (the orchestrator
+    /// loop ran to termination; the response's status is the HTTP
+    /// shape the HTTP handler would have returned for the same run).
+    pub iterations_ok_total: AtomicU64,
+    /// Iterations that returned `Err(response)` (pre-loop early
+    /// return: lease renewal failed, credential missing, breaker
+    /// override invalid, etc.). Counted separately because the
+    /// driver should surface these on a distinct dashboard series —
+    /// they indicate configuration drift operators need to fix.
+    pub iterations_err_total: AtomicU64,
     /// Backpressure hits — semaphore permits exhausted at tick start.
     /// Non-zero sustained value means `CONCURRENCY_MAX` should go up
     /// or the child-run iteration budget should go down.
@@ -120,7 +137,7 @@ impl ChildRunDriver {
     /// and SIGHUP-style restart without reaching into this code.
     /// When the flag is off, every tick is a cheap atomic bump +
     /// sleep.
-    pub fn start(store: Arc<InMemoryStore>, runs: Arc<dyn RunService>) -> Self {
+    pub fn start(state: Arc<AppState>) -> Self {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let metrics = Arc::new(ChildRunDriverMetrics::default());
@@ -128,9 +145,10 @@ impl ChildRunDriver {
 
         let concurrency = resolve_concurrency();
         let permits = Arc::new(Semaphore::new(concurrency));
+        let in_flight: Arc<Mutex<HashSet<RunId>>> = Arc::new(Mutex::new(HashSet::new()));
 
         let join = tokio::spawn(async move {
-            run_loop(store, runs, cancel_clone, metrics_clone, permits).await;
+            run_loop(state, cancel_clone, metrics_clone, permits, in_flight).await;
         });
 
         Self {
@@ -184,21 +202,31 @@ fn driver_enabled() -> bool {
     driver_enabled_from(std::env::var(ENABLED_ENV).ok().as_deref())
 }
 
-/// Pure helper: testable without mutating process env.
+/// Default-on. Explicit opt-out via `"false"`/`"0"`/`"off"`/`"no"`
+/// (case-insensitive, trimmed). Anything else — including unset,
+/// `"true"`, `"1"`, or operator typos — leaves the driver enabled.
+/// The opt-out list is forgiving because operators disabling an
+/// otherwise-working feature during an incident will reach for
+/// whichever truthy-adjacent value feels natural; strict `"false"`
+/// would burn someone.
 fn driver_enabled_from(raw: Option<&str>) -> bool {
-    raw.is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    let normalised = raw.map(|v| v.trim().to_ascii_lowercase());
+    !matches!(
+        normalised.as_deref(),
+        Some("false") | Some("0") | Some("off") | Some("no")
+    )
 }
 
 async fn run_loop(
-    store: Arc<InMemoryStore>,
-    _runs: Arc<dyn RunService>,
+    state: Arc<AppState>,
     cancel: CancellationToken,
     metrics: Arc<ChildRunDriverMetrics>,
     permits: Arc<Semaphore>,
+    in_flight: Arc<Mutex<HashSet<RunId>>>,
 ) {
     tracing::info!(
         concurrency = permits.available_permits(),
-        "child-run driver started (gated on {})",
+        "child-run driver started (opt-out via {}=false)",
         ENABLED_ENV,
     );
 
@@ -209,16 +237,17 @@ async fn run_loop(
                 return;
             }
             _ = tokio::time::sleep(IDLE_TICK) => {
-                tick(&store, &metrics, &permits).await;
+                tick(&state, &metrics, &permits, &in_flight).await;
             }
         }
     }
 }
 
 async fn tick(
-    store: &Arc<InMemoryStore>,
+    state: &Arc<AppState>,
     metrics: &Arc<ChildRunDriverMetrics>,
     permits: &Arc<Semaphore>,
+    in_flight: &Arc<Mutex<HashSet<RunId>>>,
 ) {
     if !driver_enabled() {
         metrics.ticks_disabled.fetch_add(1, Ordering::Relaxed);
@@ -236,33 +265,140 @@ async fn tick(
     // Startup ordering guarantees recover_all has already transitioned
     // anything unrecoverable to Failed, so the Pending filter cannot
     // pick up a crashed run that should be reclaimed by recovery.
-    //
-    // `list_pending_children` pushes both clauses into the SQL layer
-    // (Gemini review on #678, HIGH): a generic `list_by_state` scan
-    // would starve children whenever the Pending population is
-    // dominated by pending ROOT runs.
-    let children = match RunReadModel::list_pending_children(store.as_ref(), SCAN_LIMIT).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(error = %err, "child-run driver scan failed");
-            return;
-        }
-    };
+    let children =
+        match RunReadModel::list_pending_children(state.runtime.store.as_ref(), SCAN_LIMIT).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %err, "child-run driver scan failed");
+                return;
+            }
+        };
 
     let count = children.len() as u64;
-    if count > 0 {
-        metrics
-            .observed_children_total
-            .fetch_add(count, Ordering::Relaxed);
+    if count == 0 {
+        return;
+    }
+    metrics
+        .observed_children_total
+        .fetch_add(count, Ordering::Relaxed);
 
-        // PR-1b-3 scaffolding: observe only. The actual claim +
-        // orchestrator-loop-invocation wiring ships in PR-1b-5
-        // alongside the feature-flag flip so both land together
-        // with a dedicated integration test (RFC 027 §PR-1b-5).
+    for child in children {
+        // Double-claim filter (task #164): between one tick issuing
+        // `drive_run_iteration` and the child transitioning to
+        // Running (which takes it out of the `list_pending_children`
+        // result set), the next tick's scan can see the same row.
+        // FF's `ff_claim_execution` rejects the second claim
+        // atomically with `execution_not_eligible` so this is a
+        // correctness non-issue, but filtering here avoids wasted
+        // work + the `execution_not_eligible` warning noise FF
+        // emits. The set is per-process, populated on dispatch and
+        // drained when the spawned task returns.
+        {
+            let mut guard = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            if !guard.insert(child.run_id.clone()) {
+                continue;
+            }
+        }
+
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            // No permits left — put the child back (we claimed the
+            // in-flight slot but aren't going to dispatch it) and
+            // break. The tick ends; next tick picks up where this
+            // one left off.
+            let mut guard = in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            guard.remove(&child.run_id);
+            metrics.backpressure_total.fetch_add(1, Ordering::Relaxed);
+            break;
+        };
+
+        let state_for_task = state.clone();
+        let metrics_for_task = metrics.clone();
+        let in_flight_for_task = in_flight.clone();
+        let child_run_id_for_cleanup = child.run_id.clone();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            // Panic-safe in-flight cleanup (Gemini review on #679,
+            // MEDIUM). Without this Drop guard, a panic inside
+            // `dispatch_child_iteration` would leak the RunId in the
+            // HashSet forever — that run would never be dispatched
+            // again by this process instance. The Drop impl runs even
+            // on panic, and we recover from a poisoned lock so the
+            // set stays usable if a sibling task already panicked
+            // while holding the mutex.
+            struct InFlightGuard {
+                run_id: RunId,
+                set: Arc<Mutex<HashSet<RunId>>>,
+            }
+            impl Drop for InFlightGuard {
+                fn drop(&mut self) {
+                    let mut g = self.set.lock().unwrap_or_else(|e| e.into_inner());
+                    g.remove(&self.run_id);
+                }
+            }
+            let _guard = InFlightGuard {
+                run_id: child_run_id_for_cleanup,
+                set: in_flight_for_task,
+            };
+            dispatch_child_iteration(state_for_task, child, &metrics_for_task).await;
+        });
+    }
+}
+
+/// Run one orchestrator iteration against `child`. The driver calls
+/// the same `drive_run_iteration` helper the HTTP `/orchestrate`
+/// handler uses so both paths share provider routing, credentials,
+/// circuit breakers, dual checkpoints, and approvals.
+async fn dispatch_child_iteration(
+    state: Arc<AppState>,
+    child: RunRecord,
+    metrics: &Arc<ChildRunDriverMetrics>,
+) {
+    metrics
+        .iterations_dispatched_total
+        .fetch_add(1, Ordering::Relaxed);
+
+    // Drive the child with its persisted per-run defaults — the
+    // orchestrator helper's `body.max_iterations.or(persisted)` +
+    // `body.goal.or(persisted)` fallback chain picks up whatever the
+    // spawn path wrote to the run's defaults. The driver has no
+    // operator-level override to impose; it's a system actor driving
+    // what's already on the row.
+    let body = OrchestrateRequest::default();
+    let child_run_id = child.run_id.clone();
+    let result = drive_run_iteration(state, child, body).await;
+
+    // Gemini review on #679 (MEDIUM): the `Result<Response, Response>`
+    // return shape splits "pre-loop error" vs "loop ran" for the
+    // HTTP wrapper's dispatch convenience — but some pre-loop arms
+    // return `200 OK` (already-terminal short-circuit) and some
+    // post-loop arms return `502 BAD_GATEWAY` (AllProvidersExhausted).
+    // Matching on `Ok/Err` would mis-classify both for metrics +
+    // logs. Inspect the HTTP status instead: 2xx = iteration did
+    // the right thing (succeeded or benignly short-circuited);
+    // anything else = the driver should surface it for operator
+    // attention.
+    let response = match &result {
+        Ok(r) => r,
+        Err(r) => r,
+    };
+    let status = response.status();
+    if status.is_success() {
+        metrics.iterations_ok_total.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
-            pending_children = count,
-            "child-run driver observed pending children (scaffolding \
-             scan; claim path wires in PR-1b-5)",
+            run_id = %child_run_id,
+            status = %status,
+            "child-run driver: iteration completed",
+        );
+    } else {
+        metrics.iterations_err_total.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            run_id = %child_run_id,
+            status = %status,
+            "child-run driver: iteration returned non-success status — \
+             see drive_run_iteration logs for the classified reason \
+             (lease renewal, credential missing, breaker override, \
+             providers exhausted, etc.)",
         );
     }
 }
@@ -294,21 +430,30 @@ mod tests {
         assert_eq!(resolve_concurrency_from(Some("32")), CONCURRENCY_MAX);
     }
 
-    /// Feature flag is case-insensitive but strict on value shape —
-    /// "true" / "TRUE" yes, everything else (including "1", "yes") no.
-    /// Strictness means operators cannot accidentally enable the
-    /// driver by setting the var to a truthy-looking but invalid value.
+    /// Default-on: unset, empty, whitespace, and operator typos all
+    /// leave the driver enabled. Only the explicit opt-out tokens
+    /// disable it.
     #[test]
-    fn driver_enabled_requires_literal_true() {
-        for v in ["true", "TRUE", "True", "tRuE"] {
-            assert!(driver_enabled_from(Some(v)), "expected enabled for {v:?}");
+    fn driver_enabled_default_on_except_for_explicit_opt_out() {
+        // Opt-out tokens (disabled).
+        for v in [
+            "false", "FALSE", "False", "fAlSe", "0", "off", "OFF", "no", "No", " false ", "\tfalse",
+        ] {
+            assert!(
+                !driver_enabled_from(Some(v)),
+                "expected disabled for opt-out token {v:?}"
+            );
         }
-        for v in ["false", "FALSE", "0", "1", "yes", "on", ""] {
-            assert!(!driver_enabled_from(Some(v)), "expected disabled for {v:?}");
+        // Default-on tokens (enabled).
+        for v in ["true", "1", "yes", "on", "", "something-weird"] {
+            assert!(
+                driver_enabled_from(Some(v)),
+                "expected enabled for non-opt-out value {v:?}"
+            );
         }
         assert!(
-            !driver_enabled_from(None),
-            "expected disabled when unset (None)"
+            driver_enabled_from(None),
+            "expected enabled when env unset (default-on posture)"
         );
     }
 }

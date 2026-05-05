@@ -18,7 +18,7 @@ use axum::{
     Json,
 };
 
-use cairn_store::projections::ApprovalReadModel;
+use cairn_store::projections::{ApprovalReadModel, RunRecord};
 
 use crate::errors::{
     api_error_with_details, run_not_found_response, runtime_error_response, AppApiError,
@@ -42,7 +42,7 @@ use crate::{
 /// does NOT use `serde(deny_unknown_fields)` — by default Serde ignores
 /// unknown fields on Deserialize, so the legacy payload is accepted
 /// without error and the field is discarded.
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 pub(crate) struct OrchestrateRequest {
     #[serde(default)]
     pub(crate) goal: Option<String>,
@@ -319,6 +319,57 @@ async fn orchestrate_run_handler_inner(
     Json(body): Json<OrchestrateRequest>,
 ) -> axum::response::Response {
     use cairn_domain::RunId;
+    let run_id = RunId::new(run_id_str);
+    // T6a-C2: tenant scope MUST gate orchestration — this kicks off LLM calls
+    // and burns provider budget. Cross-tenant orchestrate is a budget DoS.
+    let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return run_not_found_response();
+        }
+        Err(response) => return response,
+    };
+    match drive_run_iteration(state, run, body).await {
+        Ok(response) => response,
+        Err(response) => response,
+    }
+}
+
+/// #670 G4 PR-1b-5: shared orchestrator-iteration body used by both
+/// the HTTP `POST /v1/runs/:id/orchestrate` handler and the
+/// `ChildRunDriver` tick. Runs ONE gather → decide → execute cycle
+/// against `run` using `body` for per-call overrides (goal,
+/// max_iterations, approval timeout, breaker overrides).
+///
+/// ## Return shape (intentional pragma)
+///
+/// `Result<Response, Response>` is NOT `Result<Success, Error>`.
+/// The split indicates "pre-loop early return" (`Err`) vs "the
+/// orchestrator loop ran to termination" (`Ok`). Both arms contain
+/// a fully-built `axum::response::Response` carrying the exact
+/// body and status code the HTTP handler would return. The HTTP
+/// wrapper unwraps either arm. The driver inspects the response's
+/// HTTP status for metric categorization: 2xx means the iteration
+/// did the right thing (terminated cleanly or short-circuited
+/// benignly), anything else means the driver should surface the
+/// response for operator attention.
+///
+/// The `Err`-for-OK case: the "already terminal" short-circuit
+/// returns `200 OK` in an `Err` arm because it fires before the
+/// loop. That means driver metrics / HTTP-wrapper mapping MUST key
+/// on the response's status code, never on `Result::is_ok()`.
+///
+/// Why not a typed `DriveError` enum? The 20+ pre-loop early returns
+/// carry carefully-crafted SEC-007-redacted error messages. A typed
+/// enum would be 500+ LOC of shimming with zero behavior gain, and
+/// both callers care only about the HTTP status anyway. This shape
+/// is pragmatic, not idiomatic — documented here so future edits
+/// don't try to "fix" it.
+pub(crate) async fn drive_run_iteration(
+    state: Arc<AppState>,
+    run: RunRecord,
+    body: OrchestrateRequest,
+) -> Result<axum::response::Response, axum::response::Response> {
     use cairn_harness_tools::{
         HarnessBash, HarnessBashKill, HarnessBashOutput, HarnessBuiltin, HarnessEdit, HarnessGlob,
         HarnessGrep, HarnessLsp, HarnessMultiEdit, HarnessRead, HarnessWebFetch, HarnessWrite,
@@ -355,17 +406,10 @@ async fn orchestrate_run_handler_inner(
         ToolSearchTool, WaitForTaskTool,
     };
 
-    let run_id = RunId::new(run_id_str);
-
-    // T6a-C2: tenant scope MUST gate orchestration — this kicks off LLM calls
-    // and burns provider budget. Cross-tenant orchestrate is a budget DoS.
-    let run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return run_not_found_response();
-        }
-        Err(response) => return response,
-    };
+    // `run_id` local preserved from the pre-refactor shape so downstream
+    // tracing sites (in the post-loop error match) continue to format the
+    // same identifier. `RunRecord.run_id` is the canonical source now.
+    let run_id = run.run_id.clone();
 
     // Terminal runs (Completed / Failed / Canceled) must short-circuit
     // before the orchestration loop. Re-entering the loop on a finalized
@@ -393,22 +437,22 @@ async fn orchestrate_run_handler_inner(
                     run_state = ?other,
                     "RunState::is_terminal returned true for unhandled variant — update orchestrate_run_handler",
                 );
-                return AppApiError::new(
+                return Err(AppApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     "run is in an unexpected terminal state",
                 )
-                .into_response();
+                .into_response());
             }
         };
-        return (
+        return Err((
             StatusCode::OK,
             Json(serde_json::json!({
                 "termination": termination,
                 "run_state": run.state,
             })),
         )
-            .into_response();
+            .into_response());
     }
 
     // Transition run to Running if it's still Pending
@@ -621,7 +665,7 @@ async fn orchestrate_run_handler_inner(
                     error = %err,
                     "F51: failed to refresh run lease before orchestrate loop"
                 );
-                return runtime_error_response(err);
+                return Err(runtime_error_response(err));
             }
         }
     };
@@ -647,22 +691,22 @@ async fn orchestrate_run_handler_inner(
                     run_state = ?other,
                     "RunState::is_terminal returned true for unhandled variant — update orchestrate_run_handler",
                 );
-                return AppApiError::new(
+                return Err(AppApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
                     "run is in an unexpected terminal state",
                 )
-                .into_response();
+                .into_response());
             }
         };
-        return (
+        return Err((
             StatusCode::OK,
             Json(serde_json::json!({
                 "termination": termination,
                 "run_state": refreshed.state,
             })),
         )
-            .into_response();
+            .into_response());
     }
 
     // #639: spawn a background lease-keeper for this run so long
@@ -718,7 +762,7 @@ async fn orchestrate_run_handler_inner(
         .as_millis() as u64;
     let working_dir = match working_dir_for_run(state.as_ref(), &run).await {
         Ok(path) => path,
-        Err(err) => return workspace_error_response(err),
+        Err(err) => return Err(workspace_error_response(err)),
     };
     let default_goal =
         resolve_run_string_default(state.as_ref(), &run.project, &run.run_id, "goal").await;
@@ -900,12 +944,12 @@ async fn orchestrate_run_handler_inner(
         model.trim().to_owned()
     };
     if model_id.is_empty() || model_id == "default" {
-        return AppApiError::new(
+        return Err(AppApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_brain_provider",
             "No default LLM model configured. Set brain_model or generate_model on the system scope, or add a provider connection via POST /v1/providers/connections.",
         )
-        .into_response();
+        .into_response());
     }
 
     // Bedrock IDs follow `<vendor>.<model>[-<version>][:<suffix>]` — the
@@ -950,24 +994,24 @@ async fn orchestrate_run_handler_inner(
                 match &state.bedrock_provider {
                     Some(provider) => provider.clone(),
                     None => {
-                        return AppApiError::new(
+                        return Err(AppApiError::new(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "no_bedrock_provider",
                             "Bedrock model requested but AWS credentials not configured.",
                         )
-                        .into_response();
+                        .into_response());
                     }
                 }
             } else {
                 match &state.brain_provider {
                     Some(provider) => provider.clone(),
                     None => {
-                        return AppApiError::new(
+                        return Err(AppApiError::new(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "no_brain_provider",
                             "No LLM provider configured. Add one via POST /v1/providers/connections, or set CAIRN_BRAIN_URL / OPENROUTER_API_KEY / OLLAMA_HOST.",
                         )
-                        .into_response()
+                        .into_response());
                     }
                 }
             }
@@ -980,7 +1024,7 @@ async fn orchestrate_run_handler_inner(
             // the concrete tenant into the remediation URL so
             // operators can copy-paste without substitution.
             let tenant = run.project.tenant_id.as_str();
-            return AppApiError::new(
+            return Err(AppApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "provider_credential_missing",
                 format!(
@@ -992,9 +1036,9 @@ async fn orchestrate_run_handler_inner(
                      UpdateProviderConnectionRequest) alongside credential_id=<credential id>.",
                 ),
             )
-            .into_response();
+            .into_response());
         }
-        Err(err) => return runtime_error_response(err),
+        Err(err) => return Err(runtime_error_response(err)),
     };
 
     let gather = StandardGatherPhase::builder(state.runtime.store.clone())
@@ -1218,7 +1262,7 @@ async fn orchestrate_run_handler_inner(
             .await
         {
             Ok(s) => s,
-            Err(err) => return runtime_error_response(err),
+            Err(err) => return Err(runtime_error_response(err)),
         };
 
         let mut bindings: Vec<cairn_runtime::RoutedBinding> = Vec::new();
@@ -1245,14 +1289,14 @@ async fn orchestrate_run_handler_inner(
             // needs to know immediately that routing is gone, not discover
             // it later via a delayed approval card. 503 also tells well-
             // behaved callers to back off + retry after operator fix.
-            return AppApiError::new(
+            return Err(AppApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "preferred_model_unavailable",
                 format!(
                     "System-default model '{model_id}' is not advertised by any active provider connection for this tenant. Active connections + supported_models: {inventory}. Fix by updating `brain_model`/`generate_model` at PUT /v1/settings/defaults/system/<key>, adding the model to a connection's `supported_models`, or creating a new connection via POST /v1/providers/connections.",
                 ),
             )
-            .into_response();
+            .into_response());
         }
 
         let order: Vec<usize> = match preferred_idx {
@@ -1369,7 +1413,7 @@ async fn orchestrate_run_handler_inner(
     if routed.is_empty() && !credential_missing_connections.is_empty() {
         let conns = credential_missing_connections.join(", ");
         let tenant = run.project.tenant_id.as_str();
-        return AppApiError::new(
+        return Err(AppApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "provider_credential_missing",
             format!(
@@ -1382,7 +1426,7 @@ async fn orchestrate_run_handler_inner(
                  UpdateProviderConnectionRequest) alongside credential_id=<credential id>.",
             ),
         )
-        .into_response();
+        .into_response());
     }
 
     let decide = LlmDecidePhase::from_routed(routed).with_tools(registry.clone());
@@ -1448,8 +1492,12 @@ async fn orchestrate_run_handler_inner(
                 // other validation error in runs.rs uses it, and clients
                 // that parse `code`/`message` previously saw `undefined`
                 // because this hand-rolled `json!` omitted them.
-                return AppApiError::new(StatusCode::BAD_REQUEST, "invalid_breaker_override", e)
-                    .into_response();
+                return Err(AppApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_breaker_override",
+                    e,
+                )
+                .into_response());
             }
         };
 
@@ -1508,7 +1556,7 @@ async fn orchestrate_run_handler_inner(
 
     if let Some(backend) = selected_backend {
         if !backend.reports_usage() && breakers.token_cap < PROVIDER_USAGE_SENTINEL {
-            return AppApiError::new(
+            return Err(AppApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "provider_does_not_report_usage",
                 format!(
@@ -1524,7 +1572,7 @@ async fn orchestrate_run_handler_inner(
                     breakers.token_cap,
                 ),
             )
-            .into_response();
+            .into_response());
         }
     }
     // `None` means the registry couldn't classify the active backend
@@ -1612,332 +1660,335 @@ async fn orchestrate_run_handler_inner(
             std::sync::Arc::new(CheckpointServiceImpl::new(state.runtime.store.clone())),
         ));
 
-    match OrchestratorLoop::new(gather, decide, execute, cfg)
-        .with_emitter(emitter)
-        .with_checkpoint_hook(dual_ckpt_hook)
-        .with_approval_reader(tool_call_approval_reader_for_drain)
-        .run(ctx)
-        .await
-    {
-        Ok(LoopTermination::Completed {
-            summary,
-            verification,
-        }) => {
-            // F47 PR2: persist the completion annotation via an
-            // event-sourced `RunCompletionAnnotated`. Emitted AFTER
-            // `runs.complete` has flipped the run to the terminal state
-            // (the CompleteRun ActionType inside the loop already fired
-            // that FCALL) — this event only annotates the terminal
-            // run with the LLM summary + extractor-produced evidence.
-            //
-            // Failures to append are logged + swallowed so a transient
-            // store outage never turns a successful run into an HTTP
-            // error. The operator still has the summary in the HTTP
-            // response body (and on the SSE `orchestrate_finished`
-            // frame); the annotation is best-effort durability on top.
-            use cairn_domain::{RunCompletionAnnotated, RuntimeEvent};
-            use cairn_runtime::make_envelope;
-            // Checked conversion (Copilot review on #313): `as_millis()`
-            // returns `u128` and `as u64` would silently truncate past
-            // year 584 million. `unwrap_or_default()` mapped pre-epoch
-            // clocks to `0`. Clamp to `i64::MAX` ms (year 292 million)
-            // rather than `u64::MAX` because the pg / sqlite
-            // projection appliers `try_from::<i64>` the value — a
-            // `u64::MAX` clamp would trip the projection error path
-            // and block the annotation from persisting at all. An
-            // `i64::MAX` clamp still produces an obviously-broken
-            // timestamp operators can spot AND lands in the durable
-            // projection. Pre-epoch (`duration_since` error) explicitly
-            // clamps to `0`.
-            let occurred_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| u64::try_from(d.as_millis().min(i64::MAX as u128)).unwrap_or(0))
-                .unwrap_or(0);
-            let annotation = make_envelope(RuntimeEvent::RunCompletionAnnotated(
-                RunCompletionAnnotated {
-                    project: run.project.clone(),
-                    session_id: run.session_id.clone(),
-                    run_id: run.run_id.clone(),
-                    summary: summary.clone(),
-                    verification: verification.clone(),
-                    occurred_at_ms,
-                },
-            ));
-            if let Err(e) = state.runtime.store.append(&[annotation]).await {
-                tracing::warn!(
-                    run_id = %run.run_id,
-                    error = %e,
-                    "F47 PR2: failed to persist RunCompletionAnnotated — \
-                     completion summary + verification will not survive \
-                     past the SSE stream on this run"
-                );
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "termination": "completed", "summary": summary, "model_id": model_id,
-                })),
-            )
-                .into_response()
-        }
-        Ok(LoopTermination::Failed { reason }) => {
-            // F53: flip run.state from Running to Failed. Without this,
-            // GET /v1/runs/:id keeps reporting state=running forever and
-            // the operator has no durable record of the terminal failure.
-            // The "reason" string may mention lease expiry, provider error,
-            // etc.; we map to a FailureClass heuristically and otherwise
-            // default to ExecutionError.
-            let failure_class = classify_failed_reason(&reason);
-            finalize_run_failure(state.as_ref(), &run.session_id, &run.run_id, failure_class).await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "termination": "failed", "reason": reason,
-                })),
-            )
-                .into_response()
-        }
-        Ok(LoopTermination::MaxIterationsReached) => {
-            // F53: same treatment as Failed — max iterations is a terminal
-            // failure and the run must not stay in state=running.
-            finalize_run_failure(
-                state.as_ref(),
-                &run.session_id,
-                &run.run_id,
-                cairn_domain::FailureClass::ExecutionError,
-            )
-            .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "termination": "max_iterations_reached",
-                })),
-            )
-                .into_response()
-        }
-        Ok(LoopTermination::TimedOut) => {
-            // F53: same treatment — wall-clock timeout is terminal.
-            finalize_run_failure(
-                state.as_ref(),
-                &run.session_id,
-                &run.run_id,
-                cairn_domain::FailureClass::TimedOut,
-            )
-            .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "termination": "timed_out",
-                })),
-            )
-                .into_response()
-        }
-        Ok(LoopTermination::WaitingApproval { approval_id }) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "termination": "waiting_approval", "approval_id": approval_id.as_str(),
-            })),
-        )
-            .into_response(),
-        Ok(LoopTermination::WaitingSubagent { child_task_id }) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({
-                "termination": "waiting_subagent", "child_task_id": child_task_id.as_str(),
-            })),
-        )
-            .into_response(),
-        Ok(LoopTermination::PlanProposed { plan_markdown }) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "termination": "plan_proposed",
-                "outcome": "plan_proposed",
-                "plan_markdown": plan_markdown,
-            })),
-        )
-            .into_response(),
-        Ok(LoopTermination::BreakerTripped { trip }) => {
-            // F65 PR-3: a circuit breaker tripped mid-run. The loop
-            // already emitted `RuntimeEvent::CircuitBreakerTripped` via
-            // the emitter hook (and appended a `Checkpoint` at the last
-            // completed iteration); here we flip the run to the terminal
-            // failure state so `GET /v1/runs/:id` stops reporting
-            // `state=running`. Classification is `ExecutionError` —
-            // breaker trips are operator-facing policy enforcement, not
-            // timeout classes (the wall-clock breaker is distinct from
-            // the legacy `timeout_ms` path which still maps to
-            // `FailureClass::TimedOut`).
-            finalize_run_failure(
-                state.as_ref(),
-                &run.session_id,
-                &run.run_id,
-                cairn_domain::FailureClass::ExecutionError,
-            )
-            .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "termination": "breaker_tripped",
-                    "which": trip.which,
-                    "measured": trip.measured,
-                    "limit": trip.limit,
-                    "at_iteration": trip.at_iteration,
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            // T6a-H9: log the full error details (for ops) but send a
-            // sanitized stable message to the client. The full Display
-            // may embed provider URLs, model names, partial LLM output,
-            // credential fragments, etc. — none of which belong in a 5xx
-            // body. User-caused errors (NotFound, InvalidTransition)
-            // still surface a friendly code + short message.
-            tracing::warn!(run_id = %run_id, error = %e, "orchestration failed");
-            let (status, code, msg): (_, &'static str, String) = match &e {
-                cairn_orchestrator::OrchestratorError::Runtime(
-                    cairn_runtime::error::RuntimeError::NotFound { .. },
-                ) => (StatusCode::NOT_FOUND, "not_found", e.to_string()),
-                cairn_orchestrator::OrchestratorError::Runtime(
-                    cairn_runtime::error::RuntimeError::InvalidTransition { .. },
-                ) => (StatusCode::CONFLICT, "invalid_transition", e.to_string()),
-                cairn_orchestrator::OrchestratorError::Gather(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    "gather_error",
-                    "upstream gather phase failed".to_owned(),
-                ),
-                cairn_orchestrator::OrchestratorError::Decide(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    "decide_error",
-                    "upstream decide phase failed".to_owned(),
-                ),
-                cairn_orchestrator::OrchestratorError::AllProvidersExhausted { attempts } => {
-                    // F15 + F17: every binding × model in the routed chain
-                    // failed with fallback-eligible errors. Surface a
-                    // single ToolCallApprovalService proposal with the
-                    // full summary so the operator can rotate credentials,
-                    // add a provider, or abort.
-                    // SEC-007: redact summary before handing it to logs or
-                    // to the operator-facing approval card. `summary` is
-                    // built from `ProviderAdapterError::to_string()` which
-                    // may embed upstream response bodies; those can echo
-                    // bearer tokens if a misconfigured provider rejected
-                    // the request with the auth header included.
-                    let summary = cairn_providers::redact_secrets(
-                        &cairn_orchestrator::format_attempt_summary(attempts),
-                    );
-                    // Best-effort: if the approval submission itself fails
-                    // (store-append error, cache issue) we still return 502
-                    // with the inline summary, but we MUST log the drop so
-                    // operators have a trace that no card appeared in the
-                    // tool-call-approvals UI. Never silently discard a
-                    // `store.append`-backed Result.
-                    if let Err(err) =
-                        super::orchestrate_exhaustion::submit_all_providers_exhausted_proposal(
-                            state.as_ref(),
-                            &run,
-                            &model_id,
-                            attempts,
-                            &summary,
-                        )
-                        .await
-                    {
-                        tracing::error!(
-                            run_id = %run.run_id,
-                            error = %err,
-                            "failed to submit providers-exhausted tool-call approval; operator will not see the card in the UI (HTTP 502 body still carries the summary)"
-                        );
-                    }
-                    // SEC-007: `summary` + `a.error_message` are built from
-                    // `ProviderAdapterError::to_string()` which for
-                    // `ServerError` / `StructuredOutputInvalid` carries the
-                    // upstream response body (truncated + redacted, but
-                    // still provider-internal). Log the full detail and
-                    // return only classification to the caller. The
-                    // operator can correlate via `run_id` in the logs or
-                    // view the full summary in the tool-call-approval
-                    // card submitted above.
+    Ok(
+        match OrchestratorLoop::new(gather, decide, execute, cfg)
+            .with_emitter(emitter)
+            .with_checkpoint_hook(dual_ckpt_hook)
+            .with_approval_reader(tool_call_approval_reader_for_drain)
+            .run(ctx)
+            .await
+        {
+            Ok(LoopTermination::Completed {
+                summary,
+                verification,
+            }) => {
+                // F47 PR2: persist the completion annotation via an
+                // event-sourced `RunCompletionAnnotated`. Emitted AFTER
+                // `runs.complete` has flipped the run to the terminal state
+                // (the CompleteRun ActionType inside the loop already fired
+                // that FCALL) — this event only annotates the terminal
+                // run with the LLM summary + extractor-produced evidence.
+                //
+                // Failures to append are logged + swallowed so a transient
+                // store outage never turns a successful run into an HTTP
+                // error. The operator still has the summary in the HTTP
+                // response body (and on the SSE `orchestrate_finished`
+                // frame); the annotation is best-effort durability on top.
+                use cairn_domain::{RunCompletionAnnotated, RuntimeEvent};
+                use cairn_runtime::make_envelope;
+                // Checked conversion (Copilot review on #313): `as_millis()`
+                // returns `u128` and `as u64` would silently truncate past
+                // year 584 million. `unwrap_or_default()` mapped pre-epoch
+                // clocks to `0`. Clamp to `i64::MAX` ms (year 292 million)
+                // rather than `u64::MAX` because the pg / sqlite
+                // projection appliers `try_from::<i64>` the value — a
+                // `u64::MAX` clamp would trip the projection error path
+                // and block the annotation from persisting at all. An
+                // `i64::MAX` clamp still produces an obviously-broken
+                // timestamp operators can spot AND lands in the durable
+                // projection. Pre-epoch (`duration_since` error) explicitly
+                // clamps to `0`.
+                let occurred_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| u64::try_from(d.as_millis().min(i64::MAX as u128)).unwrap_or(0))
+                    .unwrap_or(0);
+                let annotation = make_envelope(RuntimeEvent::RunCompletionAnnotated(
+                    RunCompletionAnnotated {
+                        project: run.project.clone(),
+                        session_id: run.session_id.clone(),
+                        run_id: run.run_id.clone(),
+                        summary: summary.clone(),
+                        verification: verification.clone(),
+                        occurred_at_ms,
+                    },
+                ));
+                if let Err(e) = state.runtime.store.append(&[annotation]).await {
                     tracing::warn!(
-                        run_id = %run_id,
-                        attempt_count = attempts.len(),
-                        full_summary = %summary,
-                        "all providers exhausted during orchestration"
-                    );
-                    // Closes #416: canonical envelope (`status_code`,
-                    // `code`, `message`, `request_id`) with per-attempt
-                    // diagnostics and termination sentinel folded under
-                    // `details`. SDK parsers keyed on `code`/`message`
-                    // previously saw `null` because the outer object used
-                    // `error_code`/`remediation` as peer fields.
-                    let remediation = "One or more of: rotate credentials, top up provider credits, add a provider connection via POST /v1/providers/connections, update system defaults via PUT /v1/settings/defaults/system/brain_model (or generate_model), or edit a connection's `supported_models`. Full per-model failure summary is available in the tool-call-approvals UI.";
-                    let details = serde_json::json!({
-                        "termination": "providers_exhausted",
-                        "attempts": attempts.iter().map(|a| serde_json::json!({
-                            "model_id": a.model_id,
-                            "reason_code": a.reason_code,
-                        })).collect::<Vec<_>>(),
-                    });
-                    return api_error_with_details(
-                        StatusCode::BAD_GATEWAY,
-                        "all_providers_exhausted",
-                        remediation,
-                        details,
+                        run_id = %run.run_id,
+                        error = %e,
+                        "F47 PR2: failed to persist RunCompletionAnnotated — \
+                         completion summary + verification will not survive \
+                         past the SSE stream on this run"
                     );
                 }
-                cairn_orchestrator::OrchestratorError::ProviderAuthFailed {
-                    binding_id,
-                    model_id: m,
-                    detail,
-                } => {
-                    // SEC-007: `detail` is built by openai_compat from the
-                    // upstream response body + the provider's internal
-                    // config name. Never forward that to the API caller —
-                    // it can carry credential-adjacent fragments or
-                    // proprietary internals. Run through `redact_secrets`
-                    // even in server-side logs so any bearer tokens / keys
-                    // that happened to echo back in the upstream body get
-                    // scrubbed before hitting log aggregators. Response
-                    // body carries only a stable opaque classification.
-                    let detail_safe = cairn_providers::redact_secrets(detail);
-                    tracing::warn!(
-                        run_id = %run_id,
-                        binding_id = %binding_id,
-                        model_id = %m,
-                        detail = %detail_safe,
-                        "provider auth failed during orchestration"
-                    );
-                    (
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "termination": "completed", "summary": summary, "model_id": model_id,
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(LoopTermination::Failed { reason }) => {
+                // F53: flip run.state from Running to Failed. Without this,
+                // GET /v1/runs/:id keeps reporting state=running forever and
+                // the operator has no durable record of the terminal failure.
+                // The "reason" string may mention lease expiry, provider error,
+                // etc.; we map to a FailureClass heuristically and otherwise
+                // default to ExecutionError.
+                let failure_class = classify_failed_reason(&reason);
+                finalize_run_failure(state.as_ref(), &run.session_id, &run.run_id, failure_class)
+                    .await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "termination": "failed", "reason": reason,
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(LoopTermination::MaxIterationsReached) => {
+                // F53: same treatment as Failed — max iterations is a terminal
+                // failure and the run must not stay in state=running.
+                finalize_run_failure(
+                    state.as_ref(),
+                    &run.session_id,
+                    &run.run_id,
+                    cairn_domain::FailureClass::ExecutionError,
+                )
+                .await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "termination": "max_iterations_reached",
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(LoopTermination::TimedOut) => {
+                // F53: same treatment — wall-clock timeout is terminal.
+                finalize_run_failure(
+                    state.as_ref(),
+                    &run.session_id,
+                    &run.run_id,
+                    cairn_domain::FailureClass::TimedOut,
+                )
+                .await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "termination": "timed_out",
+                    })),
+                )
+                    .into_response()
+            }
+            Ok(LoopTermination::WaitingApproval { approval_id }) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "termination": "waiting_approval", "approval_id": approval_id.as_str(),
+                })),
+            )
+                .into_response(),
+            Ok(LoopTermination::WaitingSubagent { child_task_id }) => (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "termination": "waiting_subagent", "child_task_id": child_task_id.as_str(),
+                })),
+            )
+                .into_response(),
+            Ok(LoopTermination::PlanProposed { plan_markdown }) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "termination": "plan_proposed",
+                    "outcome": "plan_proposed",
+                    "plan_markdown": plan_markdown,
+                })),
+            )
+                .into_response(),
+            Ok(LoopTermination::BreakerTripped { trip }) => {
+                // F65 PR-3: a circuit breaker tripped mid-run. The loop
+                // already emitted `RuntimeEvent::CircuitBreakerTripped` via
+                // the emitter hook (and appended a `Checkpoint` at the last
+                // completed iteration); here we flip the run to the terminal
+                // failure state so `GET /v1/runs/:id` stops reporting
+                // `state=running`. Classification is `ExecutionError` —
+                // breaker trips are operator-facing policy enforcement, not
+                // timeout classes (the wall-clock breaker is distinct from
+                // the legacy `timeout_ms` path which still maps to
+                // `FailureClass::TimedOut`).
+                finalize_run_failure(
+                    state.as_ref(),
+                    &run.session_id,
+                    &run.run_id,
+                    cairn_domain::FailureClass::ExecutionError,
+                )
+                .await;
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "termination": "breaker_tripped",
+                        "which": trip.which,
+                        "measured": trip.measured,
+                        "limit": trip.limit,
+                        "at_iteration": trip.at_iteration,
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                // T6a-H9: log the full error details (for ops) but send a
+                // sanitized stable message to the client. The full Display
+                // may embed provider URLs, model names, partial LLM output,
+                // credential fragments, etc. — none of which belong in a 5xx
+                // body. User-caused errors (NotFound, InvalidTransition)
+                // still surface a friendly code + short message.
+                tracing::warn!(run_id = %run_id, error = %e, "orchestration failed");
+                let (status, code, msg): (_, &'static str, String) = match &e {
+                    cairn_orchestrator::OrchestratorError::Runtime(
+                        cairn_runtime::error::RuntimeError::NotFound { .. },
+                    ) => (StatusCode::NOT_FOUND, "not_found", e.to_string()),
+                    cairn_orchestrator::OrchestratorError::Runtime(
+                        cairn_runtime::error::RuntimeError::InvalidTransition { .. },
+                    ) => (StatusCode::CONFLICT, "invalid_transition", e.to_string()),
+                    cairn_orchestrator::OrchestratorError::Gather(_) => (
+                        StatusCode::BAD_GATEWAY,
+                        "gather_error",
+                        "upstream gather phase failed".to_owned(),
+                    ),
+                    cairn_orchestrator::OrchestratorError::Decide(_) => (
+                        StatusCode::BAD_GATEWAY,
+                        "decide_error",
+                        "upstream decide phase failed".to_owned(),
+                    ),
+                    cairn_orchestrator::OrchestratorError::AllProvidersExhausted { attempts } => {
+                        // F15 + F17: every binding × model in the routed chain
+                        // failed with fallback-eligible errors. Surface a
+                        // single ToolCallApprovalService proposal with the
+                        // full summary so the operator can rotate credentials,
+                        // add a provider, or abort.
+                        // SEC-007: redact summary before handing it to logs or
+                        // to the operator-facing approval card. `summary` is
+                        // built from `ProviderAdapterError::to_string()` which
+                        // may embed upstream response bodies; those can echo
+                        // bearer tokens if a misconfigured provider rejected
+                        // the request with the auth header included.
+                        let summary = cairn_providers::redact_secrets(
+                            &cairn_orchestrator::format_attempt_summary(attempts),
+                        );
+                        // Best-effort: if the approval submission itself fails
+                        // (store-append error, cache issue) we still return 502
+                        // with the inline summary, but we MUST log the drop so
+                        // operators have a trace that no card appeared in the
+                        // tool-call-approvals UI. Never silently discard a
+                        // `store.append`-backed Result.
+                        if let Err(err) =
+                            super::orchestrate_exhaustion::submit_all_providers_exhausted_proposal(
+                                state.as_ref(),
+                                &run,
+                                &model_id,
+                                attempts,
+                                &summary,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                run_id = %run.run_id,
+                                error = %err,
+                                "failed to submit providers-exhausted tool-call approval; operator will not see the card in the UI (HTTP 502 body still carries the summary)"
+                            );
+                        }
+                        // SEC-007: `summary` + `a.error_message` are built from
+                        // `ProviderAdapterError::to_string()` which for
+                        // `ServerError` / `StructuredOutputInvalid` carries the
+                        // upstream response body (truncated + redacted, but
+                        // still provider-internal). Log the full detail and
+                        // return only classification to the caller. The
+                        // operator can correlate via `run_id` in the logs or
+                        // view the full summary in the tool-call-approval
+                        // card submitted above.
+                        tracing::warn!(
+                            run_id = %run_id,
+                            attempt_count = attempts.len(),
+                            full_summary = %summary,
+                            "all providers exhausted during orchestration"
+                        );
+                        // Closes #416: canonical envelope (`status_code`,
+                        // `code`, `message`, `request_id`) with per-attempt
+                        // diagnostics and termination sentinel folded under
+                        // `details`. SDK parsers keyed on `code`/`message`
+                        // previously saw `null` because the outer object used
+                        // `error_code`/`remediation` as peer fields.
+                        let remediation = "One or more of: rotate credentials, top up provider credits, add a provider connection via POST /v1/providers/connections, update system defaults via PUT /v1/settings/defaults/system/brain_model (or generate_model), or edit a connection's `supported_models`. Full per-model failure summary is available in the tool-call-approvals UI.";
+                        let details = serde_json::json!({
+                            "termination": "providers_exhausted",
+                            "attempts": attempts.iter().map(|a| serde_json::json!({
+                                "model_id": a.model_id,
+                                "reason_code": a.reason_code,
+                            })).collect::<Vec<_>>(),
+                        });
+                        return Ok(api_error_with_details(
+                            StatusCode::BAD_GATEWAY,
+                            "all_providers_exhausted",
+                            remediation,
+                            details,
+                        ));
+                    }
+                    cairn_orchestrator::OrchestratorError::ProviderAuthFailed {
+                        binding_id,
+                        model_id: m,
+                        detail,
+                    } => {
+                        // SEC-007: `detail` is built by openai_compat from the
+                        // upstream response body + the provider's internal
+                        // config name. Never forward that to the API caller —
+                        // it can carry credential-adjacent fragments or
+                        // proprietary internals. Run through `redact_secrets`
+                        // even in server-side logs so any bearer tokens / keys
+                        // that happened to echo back in the upstream body get
+                        // scrubbed before hitting log aggregators. Response
+                        // body carries only a stable opaque classification.
+                        let detail_safe = cairn_providers::redact_secrets(detail);
+                        tracing::warn!(
+                            run_id = %run_id,
+                            binding_id = %binding_id,
+                            model_id = %m,
+                            detail = %detail_safe,
+                            "provider auth failed during orchestration"
+                        );
+                        (
                         StatusCode::SERVICE_UNAVAILABLE,
                         "provider_auth_failed",
                         "Provider authentication failed. Rotate the credential via POST /v1/admin/credentials/rotate or update the provider connection.".to_owned(),
                     )
-                }
-                cairn_orchestrator::OrchestratorError::ProviderInvalidRequest {
-                    binding_id,
-                    model_id: m,
-                    detail,
-                } => {
-                    // Same SEC-007 redaction rationale as ProviderAuthFailed.
-                    let detail_safe = cairn_providers::redact_secrets(detail);
-                    tracing::warn!(
-                        run_id = %run_id,
-                        binding_id = %binding_id,
-                        model_id = %m,
-                        detail = %detail_safe,
-                        "provider rejected request during orchestration"
-                    );
-                    (
+                    }
+                    cairn_orchestrator::OrchestratorError::ProviderInvalidRequest {
+                        binding_id,
+                        model_id: m,
+                        detail,
+                    } => {
+                        // Same SEC-007 redaction rationale as ProviderAuthFailed.
+                        let detail_safe = cairn_providers::redact_secrets(detail);
+                        tracing::warn!(
+                            run_id = %run_id,
+                            binding_id = %binding_id,
+                            model_id = %m,
+                            detail = %detail_safe,
+                            "provider rejected request during orchestration"
+                        );
+                        (
                         StatusCode::BAD_GATEWAY,
                         "provider_invalid_request",
                         "Provider rejected the request. This indicates a bug in cairn's prompt construction — please file an issue.".to_owned(),
                     )
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "orchestration_error",
-                    "orchestration failed — see server logs".to_owned(),
-                ),
-            };
-            AppApiError::new(status, code, msg).into_response()
-        }
-    }
+                    }
+                    _ => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "orchestration_error",
+                        "orchestration failed — see server logs".to_owned(),
+                    ),
+                };
+                AppApiError::new(status, code, msg).into_response()
+            }
+        },
+    )
 }

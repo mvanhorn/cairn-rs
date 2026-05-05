@@ -75,7 +75,9 @@ pub(crate) use lifecycle::{
 #[allow(unused_imports)]
 pub(crate) use lifecycle::{__path_create_run_handler, __path_list_runs_handler};
 #[allow(unused_imports)]
-pub(crate) use orchestrate::{orchestrate_run_handler, BreakerOverrides, OrchestrateRequest};
+pub(crate) use orchestrate::{
+    drive_run_iteration, orchestrate_run_handler, BreakerOverrides, OrchestrateRequest,
+};
 #[allow(unused_imports)]
 pub(crate) use plan::{
     approve_plan_handler, reject_plan_handler, revise_plan_handler, ApprovePlanRequest,

@@ -1589,18 +1589,18 @@ async fn real_main() {
     // parent_run_id IS NOT NULL` claim predicate cannot pick up a
     // crashed run that should be reclaimed by recovery.
     //
-    // Gated on `CAIRN_CHILD_RUN_DRIVER_ENABLED=true`. Default off;
-    // PR-1b-5 flips the default. The driver is constructed regardless
-    // so metrics surfaces reflect reality and the task's lifecycle
-    // is tied to cairn-app's — no per-request spawning, no zombie
-    // tasks on shutdown.
-    let mut child_run_driver = cairn_app::child_run_driver::ChildRunDriver::start(
-        lib_state.runtime.store.clone(),
-        lib_state.runtime.runs.clone(),
-    );
+    // Default-on. Set `CAIRN_CHILD_RUN_DRIVER_ENABLED=false` to
+    // disable (production escape hatch). PR-1b-5 flipped the default
+    // and wired the claim path — the driver now calls
+    // `drive_run_iteration` per pending child via the same
+    // orchestrator pipeline the HTTP `/orchestrate` handler uses.
+    // The task's lifecycle is tied to cairn-app's; graceful shutdown
+    // below calls `.shutdown().await`.
+    let mut child_run_driver =
+        cairn_app::child_run_driver::ChildRunDriver::start(lib_state.clone());
     tracing::info!(
         boot_id = %boot_id,
-        "child-run driver scaffolding launched (PR-1b-3; claim path in PR-1b-5)",
+        "child-run driver started (PR-1b-5 claim path live; opt-out via CAIRN_CHILD_RUN_DRIVER_ENABLED=false)",
     );
 
     // ── Startup replays (trigger service only) ───────────────────────────────
