@@ -523,7 +523,18 @@ export type FailureClass =
    * `execution_error`. Flag: `orchestrator_strict_completion_gate`
    * (default `true`). See RFC-F47 + issue #660.
    */
-  | "verification_rejected";
+  | "verification_rejected"
+  /**
+   * #670 G4 / RFC 027 §Orphan-child: child subagent run whose spawn
+   * failed between Phase-1 (child row created) and Phase-2 (task
+   * submitted). Set either automatically by the Child Run Driver
+   * adapter on synchronous Phase-2 failure (PR-1b-3), or manually by
+   * an operator via
+   * `POST /v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan` for
+   * rows that leaked because cairn-app crashed between the two
+   * phases.
+   */
+  | "orphan_child";
 
 /** GET /v1/runs — array of RunRecord */
 export interface RunRecord {

@@ -1540,6 +1540,24 @@ pub const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/v1/admin/tenants/{tenant_id}/runs/{id}/cancel-orphan": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Cancel an orphaned child run (#670 G4 / RFC 027)",
+        "description": "Operator recovery path for a child subagent run that leaked into `Pending` because cairn-app crashed between Phase-1 (child row created) and Phase-2 (task submitted). Transitions the run to `Failed` with `failure_class = \"orphan_child\"`; the standard terminal path fires the descendant-counter decrement against the captured `root_run_id`, releasing the cap slot so the parent can spawn again.\n\nGuarded by `TenantAdminGuard`. The run is resolved by id, then its `project.tenant_id` is verified against the URL's `:tenant_id` — a mistyped tenant path returns 404, not 403, so admin actions cannot be used to probe other tenants' run ids.\n\n**Preconditions (violation returns 404/422; no mutation):**\n- run exists AND belongs to the URL's tenant (else 404)\n- run is a child (`parent_run_id IS NOT NULL`) — roots cannot be orphaned (else 422)\n- run is in `Pending` state — non-pending runs aren't orphans (else 422)\n\nReturns 204 on success (no body; consistent with the admin session-delete terminal-transition pattern).",
+        "operationId": "cancelOrphanRun",
+        "parameters": [
+          { "name": "tenant_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id",        "in": "path", "required": true, "schema": { "type": "string" }, "description": "Child run id" }
+        ],
+        "responses": {
+          "204": { "description": "Run transitioned to `Failed(OrphanChild)`." },
+          "403": { "description": "Structured `tenant_role_missing` body when the caller lacks `TenantRole::Admin` on `:tenant_id`." },
+          "404": { "description": "Run not found, or exists under a different tenant." },
+          "422": { "description": "Run is a root (not a child) OR run is not in `Pending` state." }
+        }
+      }
+    },
     "/v1/settings": {
       "get": {
         "tags": ["Admin"],

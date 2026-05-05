@@ -57,6 +57,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `POST` | `/v1/admin/tenants/:tenant_id/quota` | Preserve |  |
 | `GET` | `/v1/admin/tenants/:tenant_id/retention-policy` | Preserve |  |
 | `POST` | `/v1/admin/tenants/:tenant_id/retention-policy` | Preserve |  |
+| `POST` | `/v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan` | Preserve | #670 G4 / RFC 027 §Orphan-child: operator recovery for child runs wedged in `Pending` after a crash between spawn Phase-1 and Phase-2. Transitions to `Failed(OrphanChild)` and releases the descendant-counter slot on the captured root. Rejects roots (422) and non-Pending state (422); wrong tenant in path returns 404 (not 403). |
 | `DELETE` | `/v1/admin/tenants/:tenant_id/sessions/:session_id` | Preserve | Admin-scoped session delete. |
 | `GET` | `/v1/admin/tenants/:tenant_id/workspaces` | Preserve |  |
 | `POST` | `/v1/admin/tenants/:tenant_id/workspaces` | Preserve |  |

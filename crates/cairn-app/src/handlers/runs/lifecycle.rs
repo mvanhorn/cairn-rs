@@ -25,8 +25,8 @@ use axum::{
 use cairn_api::auth::AuthPrincipal;
 use cairn_api::http::{ApiError, ListResponse};
 use cairn_domain::{
-    PauseReason, PauseReasonKind, ProjectKey, ResumeTrigger, RunId, RunResumeTarget, RunState,
-    SessionId, TaskId, WorkspaceRole,
+    FailureClass, PauseReason, PauseReasonKind, ProjectKey, ResumeTrigger, RunId, RunResumeTarget,
+    RunState, SessionId, TaskId, WorkspaceRole,
 };
 use cairn_runtime::RuntimeError;
 use cairn_store::projections::{PauseScheduleReadModel, SubagentSpawnReadModel, TaskReadModel};
@@ -38,7 +38,9 @@ use crate::errors::{
     now_ms, parse_run_state, run_not_found_response, runtime_error_response, store_error_response,
     validation_error_response, AppApiError,
 };
-use crate::extractors::{HasProjectScope, ProjectJson, ProjectScope, TenantScope};
+use crate::extractors::{
+    HasProjectScope, ProjectJson, ProjectScope, TenantAdminGuard, TenantScope,
+};
 use crate::helpers::{
     build_run_record_view, build_run_record_view_with_subagents, load_run_visible_to_tenant,
 };
@@ -1109,6 +1111,81 @@ pub(crate) async fn recover_run_handler(
         })),
     )
         .into_response()
+}
+
+/// `POST /v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan` — #670 G4 /
+/// RFC 027 §Orphan-child: operator-driven recovery path for a child
+/// subagent run that leaked into `Pending` because cairn-app crashed
+/// between Phase-1 (child row created) and Phase-2 (task submitted).
+///
+/// Transitions the run to `Failed(OrphanChild)`. The standard terminal
+/// path fires the descendant-counter decrement against the captured
+/// `root_run_id`, releasing the cap slot so the parent can spawn again.
+///
+/// Validation (any violation returns 404 or 422; no mutation):
+///   * Run must exist. Resolved id-wise; not tenant-scoped read, so
+///     admin can address any tenant's run.
+///   * Run's `project.tenant_id` must equal the URL's `:tenant_id`.
+///     This prevents a mistyped path from silently orphaning the
+///     wrong tenant's run (same posture as the admin session-delete
+///     handler — admin bypasses the scope read check but must name
+///     the right tenant in the path).
+///   * Run must actually be a child (`parent_run_id.is_some()`).
+///     Roots have no parent to leak them; the endpoint refuses to
+///     mark a root as orphaned.
+///   * Run must be in `Pending`. Non-pending runs aren't orphans —
+///     they're already running, completed, or terminal. Transitioning
+///     a non-Pending run to `Failed(OrphanChild)` would mis-classify.
+///
+/// Returns 204 on success (no body — follow the session-delete admin
+/// pattern for consistency across admin terminal-transition endpoints).
+pub(crate) async fn cancel_orphan_run_handler(
+    State(state): State<Arc<AppState>>,
+    _role: TenantAdminGuard,
+    Path((tenant_id, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let run_id = RunId::new(&id);
+
+    let run = match state.runtime.runs.get(&run_id).await {
+        Ok(Some(run)) if run.project.tenant_id.as_str() == tenant_id => run,
+        // Admin addressed a real run but named the wrong tenant in
+        // the path, OR the run doesn't exist. Collapse both into 404
+        // — NOT 403 — so admin actions cannot be used to probe
+        // other tenants' run ids (matches the admin session-delete
+        // handler posture: the "exists under a different tenant"
+        // case is indistinguishable from "does not exist").
+        Ok(Some(_)) | Ok(None) => return run_not_found_response(),
+        Err(err) => return runtime_error_response(err),
+    };
+
+    if run.parent_run_id.is_none() {
+        return validation_error_response(
+            "cancel-orphan is only valid for child runs (parent_run_id IS NOT NULL); \
+             a root run has no parent to have leaked it",
+        );
+    }
+
+    if run.state != RunState::Pending {
+        return validation_error_response(format!(
+            "cancel-orphan is only valid for runs in Pending state \
+             (observed {:?}); non-Pending runs are not orphans",
+            run.state,
+        ));
+    }
+
+    let before = current_event_head(&state).await;
+    match state
+        .runtime
+        .runs
+        .fail(&run.session_id, &run_id, FailureClass::OrphanChild)
+        .await
+    {
+        Ok(_) => {
+            publish_runtime_frames_since(&state, before).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => runtime_error_response(err),
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

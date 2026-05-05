@@ -81,6 +81,21 @@ pub enum FailureClass {
     /// `ExecutionError`. Flag: `orchestrator_strict_completion_gate`
     /// (default `true`). See RFC-F47 + issue #660.
     VerificationRejected,
+    /// #670 G4 / RFC 027 §Orphan-child: a child subagent run whose
+    /// spawn failed between Phase-1 (child `RunRecord` created) and
+    /// Phase-2 (task submitted), leaving a `Pending` row with no
+    /// driver claiming it. The Child Run Driver adapter fails such
+    /// runs synchronously on Phase-2 failure (PR-1b-3); the operator
+    /// endpoint `POST /v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan`
+    /// provides the manual recovery path for runs wedged by a crash
+    /// between those two phases (e.g. SIGKILL on cairn-app mid-spawn).
+    ///
+    /// Only valid for non-root child runs; the operator endpoint
+    /// rejects orphan-cancel on root runs (roots have no parent to
+    /// have leaked them). The `Failed` terminal fires the standard
+    /// descendant-counter decrement path, releasing the cap slot on
+    /// the captured `root_run_id`.
+    OrphanChild,
 }
 
 /// Canonical pause reasons in v1.

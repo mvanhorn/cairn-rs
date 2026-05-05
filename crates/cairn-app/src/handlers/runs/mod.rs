@@ -60,8 +60,8 @@ pub(crate) use intervene::{
 };
 #[allow(unused_imports)]
 pub(crate) use lifecycle::{
-    cancel_run_handler, claim_run_handler, create_run_handler, get_run_handler,
-    list_child_runs_handler, list_due_run_resumes_handler, list_runs_handler,
+    cancel_orphan_run_handler, cancel_run_handler, claim_run_handler, create_run_handler,
+    get_run_handler, list_child_runs_handler, list_due_run_resumes_handler, list_runs_handler,
     list_subagent_spawns_handler, pause_run_handler, process_scheduled_run_resumes_handler,
     recover_run_handler, resume_run_handler, spawn_subagent_run_handler, CreateRunRequest,
     PauseRunRequest, ResumeRunRequest, RunCompletion, RunDetailResponse, RunListQuery,

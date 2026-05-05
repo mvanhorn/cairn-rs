@@ -69,6 +69,13 @@ pub fn failure_class_category(failure_class: FailureClass) -> &'static str {
         // was forcibly stopped by a cairn-level quality gate, not by a
         // runtime error or operator.
         FailureClass::VerificationRejected => "policy",
+        // #670 G4 / RFC 027 §Orphan-child: a child whose spawn leaked
+        // between Phase-1 and Phase-2. Bucketed as `execution` because
+        // the failure is an execution-layer plumbing breakage (not a
+        // policy decision and not an operator action), even though an
+        // operator may be the one transitioning the leaked `Pending`
+        // row to `Failed` via the cancel-orphan endpoint.
+        FailureClass::OrphanChild => "execution",
     }
 }
 
@@ -89,6 +96,7 @@ pub fn failure_class_reason(failure_class: FailureClass) -> &'static str {
         FailureClass::CanceledByOperator => "canceled_by_operator",
         FailureClass::TerminalWriteDeadlock => "terminal_write_deadlock",
         FailureClass::VerificationRejected => "verification_rejected",
+        FailureClass::OrphanChild => "orphan_child",
     }
 }
 

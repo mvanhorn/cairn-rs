@@ -293,6 +293,7 @@ POST	/v1/admin/tenants/:tenant_id/credentials/rotate-key	preserve	-	-
 POST	/v1/admin/tenants/:tenant_id/operator-profiles	preserve	-	-
 POST	/v1/admin/tenants/:tenant_id/quota	preserve	-	-
 POST	/v1/admin/tenants/:tenant_id/retention-policy	preserve	-	-
+POST	/v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan	preserve	-	-
 POST	/v1/admin/tenants/:tenant_id/workspaces	preserve	-	-
 POST	/v1/admin/workspaces/:id/shares	preserve	-	-
 POST	/v1/admin/workspaces/:workspace_id/members	preserve	-	-

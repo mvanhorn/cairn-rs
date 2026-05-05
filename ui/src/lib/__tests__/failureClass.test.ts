@@ -41,6 +41,7 @@ export const FAILURE_CLASS_VALUES = [
   "canceled_by_operator",
   "terminal_write_deadlock",
   "verification_rejected",
+  "orphan_child",
 ] as const satisfies readonly FailureClass[];
 
 // ── Compile-time coverage ────────────────────────────────────────────────────

@@ -461,6 +461,12 @@ impl AppBootstrap {
                     (HttpMethod::Delete, "/v1/admin/tenants/:tenant_id/sessions/:session_id") => {
                         router.route(&path, delete(delete_session_admin_handler))
                     }
+                    // #670 G4 / RFC 027 §Orphan-child: operator recovery for
+                    // runs wedged in `Pending` because cairn-app crashed
+                    // between the child-row-create and task-submit phases.
+                    (HttpMethod::Post, "/v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan") => {
+                        router.route(&path, post(cancel_orphan_run_handler))
+                    }
                     (HttpMethod::Get, "/v1/admin/tenants/:tenant_id/operator-profiles") => {
                         router.route(&path, get(list_operator_profiles_handler))
                     }
@@ -1304,6 +1310,14 @@ impl AppBootstrap {
             .route(
                 "/v1/admin/tenants/:tenant_id/sessions/:session_id",
                 delete(delete_session_admin_handler),
+            )
+            // #670 G4 / RFC 027 §Orphan-child: operator recovery path
+            // for child runs that leaked into `Pending` when cairn-app
+            // crashed between Phase-1 (child row created) and Phase-2
+            // (task submitted). Transitions to `Failed(OrphanChild)`.
+            .route(
+                "/v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan",
+                post(cancel_orphan_run_handler),
             )
             .route(
                 "/v1/admin/tenants/:tenant_id/operator-profiles",

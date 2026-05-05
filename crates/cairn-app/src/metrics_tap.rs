@@ -361,6 +361,7 @@ fn failure_label(fc: cairn_domain::lifecycle::FailureClass) -> &'static str {
         FailureClass::CanceledByOperator => "canceled_by_operator",
         FailureClass::TerminalWriteDeadlock => "terminal_write_deadlock",
         FailureClass::VerificationRejected => "verification_rejected",
+        FailureClass::OrphanChild => "orphan_child",
     }
 }
 
