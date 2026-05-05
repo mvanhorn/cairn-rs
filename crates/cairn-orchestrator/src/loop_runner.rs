@@ -664,7 +664,16 @@ where
         // Local step history — carried across iterations within this invocation.
         // On resume from a checkpoint the gather phase rebuilds history from the
         // store; this vec accumulates steps taken during the *current* invocation.
-        let mut step_history: Vec<StepSummary> = Vec::new();
+        //
+        // #670 G7: seed from `ctx.step_history` so callers (e.g. cairn-app's
+        // `drive_run_iteration`) can prepend cross-run context before the
+        // loop starts. Without this seed the loop overwrites `ctx.step_history`
+        // with its own empty vec at the top of the first gather, dropping
+        // the subagent-completion entries that G7 injects. `std::mem::take`
+        // avoids a clone: the caller's `ctx.step_history` is consumed into
+        // the local vec, then re-synced on the next `ctx.step_history =
+        // step_history.clone()` below.
+        let mut step_history: Vec<StepSummary> = std::mem::take(&mut ctx.step_history);
         let mut last_compaction_iteration: Option<u32> = None;
         // F25 drain dedup ledger: every approved `ToolCallId` the drain
         // has processed in THIS `run_inner` invocation. Prevents

@@ -800,6 +800,29 @@ pub(crate) async fn drive_run_iteration(
         .or(default_goal.clone())
         .unwrap_or_else(|| "Execute the run objective.".to_owned());
 
+    // #670 G7: surface terminal subagent children onto this parent's
+    // step_history BEFORE the first decide phase runs. Without this
+    // the parent's LLM auto-resumes (via G5) with an empty
+    // step_history and no visibility into what its delegation
+    // produced — so it either re-spawns the same subagent or
+    // completes without using the child's output. Helper returns an
+    // empty vec for runs with no terminal children (top-level runs,
+    // parents of still-running children, etc.) so this is a no-op
+    // on the non-subagent hot path.
+    //
+    // Limit 32: matches the default `CAIRN_MAX_CONCURRENT_DESCENDANTS`
+    // headroom. If a parent ever has more than 32 terminal children
+    // (historic reruns accumulated over a long session) we'd truncate
+    // silently, but the orchestrator's step_history pruning (based on
+    // prompt token budget, see `decide_impl.rs`) would drop the oldest
+    // entries first anyway — so 32 here is already generous.
+    let seeded_steps = crate::subagent_steps::build_subagent_complete_steps(
+        state.runtime.runs.as_ref(),
+        &run.run_id,
+        32,
+    )
+    .await;
+
     let ctx = OrchestrationContext {
         project: run.project.clone(),
         session_id: run.session_id.clone(),
@@ -816,7 +839,7 @@ pub(crate) async fn drive_run_iteration(
         working_dir: working_dir.clone(),
         run_mode: body.mode.clone().or(default_run_mode).unwrap_or_default(),
         discovered_tool_names: vec![],
-        step_history: vec![],
+        step_history: seeded_steps,
         is_recovery: false,
         approval_timeout: body
             .approval_timeout_ms

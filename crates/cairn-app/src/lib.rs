@@ -30,6 +30,7 @@ pub mod sandbox;
 pub mod sandbox_f65_bridges;
 pub mod sse_hooks;
 pub mod state;
+pub mod subagent_steps;
 pub mod telemetry_routes;
 pub mod tokens;
 pub mod tool_impls;

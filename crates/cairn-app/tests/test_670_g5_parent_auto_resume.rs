@@ -51,7 +51,17 @@ async fn chat_handler(
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     let n = state.hits.fetch_add(1, Ordering::SeqCst);
-    let is_child_prompt = body.to_string().contains("run_subagent_");
+    // Distinguish parent vs child by the child's role prompt. The
+    // parent uses the orchestrator role (system prompt starts "You
+    // are a senior engineer…"); the child uses the `researcher`
+    // role ("technical analyst…"). Matching on the `run_subagent_`
+    // run-id substring used to work pre-G7, but G7 seeds the
+    // child's run id into the PARENT's step_history — the parent's
+    // resume turn then also contains `run_subagent_` and would be
+    // miscounted as a child call. Role-based detection is stable
+    // under G7.
+    let body_text = body.to_string();
+    let is_child_prompt = body_text.contains("technical analyst");
     let content = if is_child_prompt {
         state.child_calls.fetch_add(1, Ordering::SeqCst);
         // Child always completes on its first orchestrator turn.
