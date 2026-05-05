@@ -7,6 +7,7 @@
 //!   cairn-app --addr 0.0.0.0          # bind all interfaces
 
 pub mod bootstrap;
+pub mod child_run_driver;
 pub mod errors;
 pub mod extractors;
 pub mod fabric_adapter;

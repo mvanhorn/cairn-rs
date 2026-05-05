@@ -5,12 +5,12 @@
 //!
 //! 1. Fresh `RunCreated` on a root initialises `root_run_id =
 //!    run_id` and `in_flight_descendants = 0`.
-//! 2. A non-root `RunCreated` initialises `root_run_id = None` —
-//!    the subagent spawn path (G4 PR-1b-3) will set it via a
-//!    separate projection shape change (the spawn emits a
-//!    `RunCreated` event carrying the resolved root id, and the
-//!    `RunCreated` projection writes it atomically); the counter
-//!    primitive itself only mutates the ROOT row, never the child.
+//! 2. A non-root `RunCreated` inherits the parent's `root_run_id`
+//!    at projection time (PR-1b-3 shipped the projection shape
+//!    change). The legacy case where the parent chain is broken
+//!    (parent row absent or pre-V069 with `root_run_id = None`)
+//!    leaves the child's `root_run_id = None` too; the decrement
+//!    path's no-op-on-None branch handles this correctly.
 //! 3. `try_increment_descendants` admits below the cap, returning
 //!    the post-increment count.
 //! 4. `try_increment_descendants` rejects at the cap with
@@ -41,8 +41,8 @@
 use std::sync::Arc;
 
 use cairn_domain::{
-    EventEnvelope, EventId, EventSource, ProjectKey, RunCreated, RunId, RuntimeEvent,
-    SessionCreated, SessionId,
+    EventEnvelope, EventId, EventSource, ProjectKey, RunCreated, RunId, RunState, RunStateChanged,
+    RuntimeEvent, SessionCreated, SessionId, StateTransition,
 };
 use cairn_store::{
     projections::{DescendantsCapOutcome, RunDescendantsCounter, RunReadModel},
@@ -104,16 +104,20 @@ async fn run_created_initialises_root_run_id_on_roots_and_zero_counter() {
     assert_eq!(record.root_run_id.as_ref(), Some(&root));
 }
 
+/// #670 G4 PR-1b-3: non-root `RunCreated` now inherits the parent's
+/// `root_run_id` at projection time (RFC 027 §root-chain). The PR-1b-1
+/// test asserted the pre-PR-1b-3 shape (child `root_run_id = None`);
+/// PR-1b-3 flips the contract because the projection now resolves the
+/// parent chain atomically on the INSERT.
 #[tokio::test]
-async fn run_created_leaves_root_run_id_none_on_non_roots() {
+async fn run_created_inherits_parent_root_run_id_on_non_roots() {
     let store = InMemoryStore::new();
-    let session = SessionId::new("sess_child_none");
-    let parent = RunId::new("run_parent_none");
-    let child = RunId::new("run_child_none");
+    let session = SessionId::new("sess_child_inherit");
+    let parent = RunId::new("run_parent_inherit");
+    let child = RunId::new("run_child_inherit");
     seed_session(&store, &session).await;
     seed_root_run(&store, &session, &parent).await;
 
-    // Non-root RunCreated — G3 path creates children this way.
     store
         .append(&[envelope(RuntimeEvent::RunCreated(RunCreated {
             project: project(),
@@ -129,11 +133,65 @@ async fn run_created_leaves_root_run_id_none_on_non_roots() {
     let record = RunReadModel::get(&store, &child).await.unwrap().unwrap();
     assert_eq!(record.in_flight_descendants, 0);
     assert_eq!(
+        record.root_run_id.as_ref(),
+        Some(&parent),
+        "non-root RunCreated must inherit the parent's root_run_id at \
+         projection time — the child and the parent share the same \
+         absolute root so the descendant-counter decrement on the \
+         child's terminal event targets the correct root row"
+    );
+}
+
+/// Legacy case: parent row has `root_run_id = None` (pre-V069 child
+/// that was never backfilled). The child's projection cannot inherit
+/// a root that isn't there; it stays None. Decrement path's
+/// no-op-on-None handles this correctly.
+#[tokio::test]
+async fn run_created_leaves_root_run_id_none_when_parent_chain_is_legacy() {
+    let store = InMemoryStore::new();
+    let session = SessionId::new("sess_legacy_chain");
+    let legacy_parent = RunId::new("run_legacy_parent");
+    let child = RunId::new("run_under_legacy");
+    seed_session(&store, &session).await;
+
+    // Seed a legacy parent manually — simulates a pre-V069 child that
+    // landed before the root-resolver projection change. The RunCreated
+    // carries a parent_run_id pointing at something that doesn't exist
+    // in the projection (i.e. the row is absent entirely, the parent
+    // chain is broken).
+    store
+        .append(&[envelope(RuntimeEvent::RunCreated(RunCreated {
+            project: project(),
+            run_id: legacy_parent.clone(),
+            session_id: session.clone(),
+            parent_run_id: Some(RunId::new("run_absent_grandparent")),
+            prompt_release_id: None,
+            agent_role_id: None,
+        }))])
+        .await
+        .unwrap();
+
+    // Now a child of that legacy parent — its parent has root_run_id =
+    // None (because the grandparent is absent), so the child also lands
+    // with None.
+    store
+        .append(&[envelope(RuntimeEvent::RunCreated(RunCreated {
+            project: project(),
+            run_id: child.clone(),
+            session_id: session.clone(),
+            parent_run_id: Some(legacy_parent.clone()),
+            prompt_release_id: None,
+            agent_role_id: None,
+        }))])
+        .await
+        .unwrap();
+
+    let record = RunReadModel::get(&store, &child).await.unwrap().unwrap();
+    assert_eq!(
         record.root_run_id, None,
-        "non-root RunCreated must leave root_run_id NULL in PR-1b-1 — \
-         PR-1b-3 will ship the projection shape change that resolves \
-         the root at spawn time and writes it here in the same \
-         transaction as the RunCreated event"
+        "child under a legacy parent-chain (parent.root_run_id = None) \
+         must leave root_run_id = None; the decrement path's no-op-on-\
+         None branch handles the broken chain correctly per RFC 027",
     );
 }
 
@@ -287,6 +345,113 @@ async fn underflow_returns_negative_count_not_panic() {
          Negative counts are the auditable signal RFC 027 specifies \
          (`child_run_driver_descendant_underflow_total` metric on the \
          adapter layer)."
+    );
+}
+
+/// RFC 027 §97: on a non-root descendant's terminal event, the root's
+/// `in_flight_descendants` counter decrements by 1 through the
+/// projection (not through a trait-level store call). The test seeds a
+/// parent + child, bumps the parent's counter to 1, emits a
+/// `RunStateChanged → Completed` for the child, then reads the parent
+/// and asserts the counter is 0.
+#[tokio::test]
+async fn child_terminal_event_decrements_root_counter_via_projection() {
+    let store = InMemoryStore::new();
+    let session = SessionId::new("sess_term_dec");
+    let root = RunId::new("run_root_term_dec");
+    let child = RunId::new("run_child_term_dec");
+
+    seed_session(&store, &session).await;
+    seed_root_run(&store, &session, &root).await;
+
+    // Seed the child under the root — projection inherits the root id
+    // on the child's row.
+    store
+        .append(&[envelope(RuntimeEvent::RunCreated(RunCreated {
+            project: project(),
+            run_id: child.clone(),
+            session_id: session.clone(),
+            parent_run_id: Some(root.clone()),
+            prompt_release_id: None,
+            agent_role_id: None,
+        }))])
+        .await
+        .unwrap();
+
+    // Bump the counter to 1 (real spawn path would do this).
+    store.try_increment_descendants(&root, 16).await.unwrap();
+    let r0 = RunReadModel::get(&store, &root).await.unwrap().unwrap();
+    assert_eq!(r0.in_flight_descendants, 1);
+
+    // Transition child terminal. The projection must decrement the
+    // root's counter as a side effect.
+    store
+        .append(&[envelope(RuntimeEvent::RunStateChanged(RunStateChanged {
+            project: project(),
+            run_id: child.clone(),
+            transition: StateTransition {
+                from: Some(RunState::Pending),
+                to: RunState::Completed,
+            },
+            failure_class: None,
+            pause_reason: None,
+            resume_trigger: None,
+        }))])
+        .await
+        .unwrap();
+
+    let r1 = RunReadModel::get(&store, &root).await.unwrap().unwrap();
+    assert_eq!(
+        r1.in_flight_descendants, 0,
+        "child's terminal state transition must decrement the root's \
+         in_flight_descendants counter via the projection (RFC 027 \
+         §97). root record: {r1:?}",
+    );
+    assert!(
+        r1.version > r0.version,
+        "decrement-on-terminal must bump the root's version so \
+         stale-run detection / other version watchers observe the \
+         change"
+    );
+}
+
+/// A ROOT's terminal transition MUST NOT decrement anything — roots
+/// don't have a parent-chain entry to charge. The predicate
+/// `parent_run_id IS NOT NULL` gates this on the pg/sqlite side; the
+/// in-memory projection's `.filter(|rec| rec.parent_run_id.is_some())`
+/// is the equivalent. Test: seed a root, transition it to Completed,
+/// assert the root's own counter stays at 0 (not wrapped to -1).
+#[tokio::test]
+async fn root_terminal_event_does_not_decrement_self() {
+    let store = InMemoryStore::new();
+    let session = SessionId::new("sess_root_term");
+    let root = RunId::new("run_root_term_self");
+
+    seed_session(&store, &session).await;
+    seed_root_run(&store, &session, &root).await;
+
+    store
+        .append(&[envelope(RuntimeEvent::RunStateChanged(RunStateChanged {
+            project: project(),
+            run_id: root.clone(),
+            transition: StateTransition {
+                from: Some(RunState::Pending),
+                to: RunState::Completed,
+            },
+            failure_class: None,
+            pause_reason: None,
+            resume_trigger: None,
+        }))])
+        .await
+        .unwrap();
+
+    let r = RunReadModel::get(&store, &root).await.unwrap().unwrap();
+    assert_eq!(
+        r.in_flight_descendants, 0,
+        "root's own terminal transition must not decrement its own \
+         counter (roots have no parent-chain decrement target). \
+         observed in_flight_descendants={}",
+        r.in_flight_descendants,
     );
 }
 

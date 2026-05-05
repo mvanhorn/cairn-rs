@@ -34,7 +34,8 @@ use cairn_runtime::runs::RunService;
 use cairn_runtime::sessions::SessionService;
 use cairn_runtime::tasks::TaskService;
 use cairn_store::projections::{
-    RunReadModel, RunRecord, SessionReadModel, SessionRecord, TaskReadModel, TaskRecord,
+    DescendantsCapOutcome, RunDescendantsCounter, RunReadModel, RunRecord, SessionReadModel,
+    SessionRecord, TaskReadModel, TaskRecord,
 };
 use cairn_store::InMemoryStore;
 
@@ -2052,16 +2053,14 @@ impl TaskService for FabricTaskServiceAdapter {
         // SEC-007, we don't `to_string()` the raw driver text into
         // `RuntimeError::Internal` (which would leak constraint
         // names / schema fragments into the public error surface).
-        let parent_project = {
-            use cairn_store::projections::RunReadModel;
-            let parent = RunReadModel::get(self.store.as_ref(), &parent_run_id)
-                .await?
-                .ok_or_else(|| RuntimeError::NotFound {
-                    entity: "run",
-                    id: parent_run_id.as_str().to_owned(),
-                })?;
-            parent.project
-        };
+        let parent = RunReadModel::get(self.store.as_ref(), &parent_run_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound {
+                entity: "run",
+                id: parent_run_id.as_str().to_owned(),
+            })?;
+        let parent_project = parent.project.clone();
+        let parent_tenant = parent_project.tenant_id.clone();
 
         // G3: child_run_id should be Some(id) on the LLM-initiated
         // path (execute_impl mints one). If the caller passed None
@@ -2077,7 +2076,8 @@ impl TaskService for FabricTaskServiceAdapter {
         // which the bridge translates to `RuntimeEvent::RunCreated`,
         // threading `parent_run_id` onto the domain event so operator
         // queries like `RunReadModel::list_by_parent_run` see the
-        // child.
+        // child. The projection (PR-1b-3 change) inherits the parent's
+        // `root_run_id` onto the child's row inside the same INSERT.
         self.fabric
             .runs
             .start(
@@ -2089,11 +2089,125 @@ impl TaskService for FabricTaskServiceAdapter {
             .await
             .map_err(fabric_err_to_runtime)?;
 
+        // #670 G4 / RFC 027 §79-99: descendant-counter fan-out gate.
+        // After Phase-1 lands the child row (with its `root_run_id`
+        // inherited from parent), we issue the atomic compare-and-
+        // increment on the ROOT row. Per RFC 027 §89 the durable
+        // backend's `UPDATE ... WHERE counter < :cap RETURNING` is
+        // the authoritative arbiter; two concurrent spawns against
+        // the same root cannot both admit above the cap.
+        //
+        // Resolving the root: prefer the parent's own `root_run_id`
+        // (set by the projection during the parent's own spawn or
+        // by the V069 backfill for a legacy root). If the parent
+        // has `None` here — meaning it was created pre-PR-1b-3 or
+        // the backfill hasn't reached this chain — fall back to
+        // charging the PARENT itself as the root. That's correct
+        // for the common case where the parent IS the root; for a
+        // legacy-chain mid-depth case the cap still gates the
+        // subtree, just at the nearest ancestor we can identify
+        // without a O(depth) chain walk on the hot path.
+        let root_for_cap = parent
+            .root_run_id
+            .clone()
+            .unwrap_or_else(|| parent_run_id.clone());
+        let cap = spawn_cap();
+        match self
+            .store
+            .try_increment_descendants(&root_for_cap, cap)
+            .await?
+        {
+            DescendantsCapOutcome::Admitted { .. } => {
+                // Counter slot reserved. Proceed with Phase-2.
+            }
+            DescendantsCapOutcome::CapReached => {
+                // Roll back Phase-1 — cancel the child run we just
+                // created so the Pending row doesn't leak. The
+                // projection emits `RunStateChanged → Canceled`,
+                // which has `parent_run_id.is_some()` and a
+                // `root_run_id` (just inherited), so the projection's
+                // terminal decrement fires against the root. BUT we
+                // did NOT increment (we're here because the increment
+                // rejected), so that decrement will produce an
+                // auditable underflow of -1 — the RFC-027 §93 signal
+                // operators see on
+                // `child_run_driver_descendant_underflow_total`.
+                //
+                // Acceptable trade-off: guaranteed row cleanup beats
+                // a clean counter. A truly clean rollback would
+                // require event-schema surgery (a RunCreated variant
+                // that doesn't inherit the root, or a direct DELETE
+                // on the projection that bypasses the event log —
+                // both larger than this RFC's scope).
+                //
+                // Gemini #678: if `runs.cancel` fails here, the child
+                // run leaks in Pending. Once PR-1b-5 wires the driver
+                // claim path, a leaked Pending child with a
+                // parent_run_id would be picked up on the next tick
+                // and executed — bypassing the quota. Log ERROR so
+                // operators see the leak; the run's state is the
+                // authoritative signal they'd grep for.
+                if let Err(err) = self
+                    .fabric
+                    .runs
+                    .cancel(&parent_project, &child_session_id, &child_run_id)
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        parent_run_id = %parent_run_id,
+                        child_run_id = %child_run_id,
+                        root_for_cap = %root_for_cap,
+                        "RFC-027 §89: cap-rollback cancel failed — child \
+                         run leaks in Pending. Once the ChildRunDriver \
+                         claim path (PR-1b-5) is enabled, this row will \
+                         be executed and the quota bypassed. Operator \
+                         recovery: POST \
+                         /v1/admin/tenants/:tenant/runs/:id/cancel-orphan",
+                    );
+                }
+                return Err(RuntimeError::QuotaExceeded {
+                    tenant_id: parent_tenant.to_string(),
+                    quota_type: "concurrent_descendants".to_owned(),
+                    current: cap as u32,
+                    limit: cap as u32,
+                });
+            }
+            DescendantsCapOutcome::RootNotFound => {
+                // Root row missing. Shouldn't happen (we just read
+                // the parent and it points at a real root), but if
+                // it does, surface as internal — not something the
+                // operator can fix. Roll back Phase-1 anyway; if
+                // that fails, log (Gemini #678) — a leaked Pending
+                // child with a parent_run_id would be picked up by
+                // the driver once PR-1b-5 enables it.
+                if let Err(err) = self
+                    .fabric
+                    .runs
+                    .cancel(&parent_project, &child_session_id, &child_run_id)
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        parent_run_id = %parent_run_id,
+                        child_run_id = %child_run_id,
+                        root_for_cap = %root_for_cap,
+                        "RFC-027: RootNotFound rollback cancel failed — \
+                         child run leaks in Pending. Operator recovery: \
+                         POST /v1/admin/tenants/:tenant/runs/:id/cancel-orphan",
+                    );
+                }
+                return Err(RuntimeError::Internal(format!(
+                    "descendant counter root row not found: {root_for_cap}",
+                )));
+            }
+        }
+
         // Phase 2: submit the child task via the real fabric path.
         // This also emits `BridgeEvent::TaskCreated`, so the child
         // row lands on the `tasks` projection before `SubagentSpawned`
         // tries to patch its parent linkage.
-        let record = self
+        let record = match self
             .fabric
             .tasks
             .submit(
@@ -2105,7 +2219,58 @@ impl TaskService for FabricTaskServiceAdapter {
                 Some(&child_session_id),
             )
             .await
-            .map_err(fabric_err_to_runtime)?;
+            .map_err(fabric_err_to_runtime)
+        {
+            Ok(record) => record,
+            Err(phase2_err) => {
+                // RFC 027 §107: Phase-2 failed after Phase-1 landed
+                // and the counter was incremented. Synchronously
+                // fail the child as `OrphanChild`; the `Failed`
+                // terminal fires the projection's decrement path
+                // against the root, releasing the cap slot in the
+                // same write. We do NOT re-attempt Phase-2 — the
+                // orphan state is the correct terminal for a child
+                // whose task row never materialised.
+                if let Err(fail_err) = self
+                    .fabric
+                    .runs
+                    .fail(
+                        &parent_project,
+                        &child_session_id,
+                        &child_run_id,
+                        FailureClass::OrphanChild,
+                    )
+                    .await
+                {
+                    // RFC 027 §109-111: the compensating fail itself
+                    // failed. Log ERROR and fire a compensating
+                    // direct-decrement so the counter slot is still
+                    // released even without the `Failed` terminal
+                    // event firing. Counter drift under compounded
+                    // failure is the tolerated worst-case (§111).
+                    tracing::error!(
+                        error = %fail_err,
+                        parent_run_id = %parent_run_id,
+                        child_run_id = %child_run_id,
+                        root_for_cap = %root_for_cap,
+                        "RFC-027 §109: compensating fail(OrphanChild) failed after \
+                         Phase-2 error; issuing direct decrement on descendant counter \
+                         (child_run_driver_orphan_fail_failed_total)",
+                    );
+                    if let Err(dec_err) = self.store.decrement_descendants(&root_for_cap).await {
+                        tracing::error!(
+                            error = %dec_err,
+                            root_for_cap = %root_for_cap,
+                            "RFC-027 §111: compensating decrement failed after fail() \
+                             also failed — counter leak. Operators see this on \
+                             child_run_driver_orphan_counter_leak_total; the underflow-\
+                             on-next-legit-decrement path is tolerated per §93.",
+                        );
+                    }
+                }
+                return Err(phase2_err);
+            }
+        };
 
         // Phase 3: emit the spawn fact. Carries the real child_run_id
         // now (G3); was always None in G1+G2.
@@ -2125,6 +2290,20 @@ impl TaskService for FabricTaskServiceAdapter {
 
         Ok(record)
     }
+}
+
+/// #670 G4 / RFC 027 §99: per-root cap on concurrent descendants.
+/// Default 16, clamp [1, 256]. Override via
+/// `CAIRN_MAX_CONCURRENT_DESCENDANTS`.
+fn spawn_cap() -> i64 {
+    const DEFAULT: i64 = 16;
+    const MIN: i64 = 1;
+    const MAX: i64 = 256;
+    std::env::var("CAIRN_MAX_CONCURRENT_DESCENDANTS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|n| n.clamp(MIN, MAX))
+        .unwrap_or(DEFAULT)
 }
 
 // ── SessionService adapter ───────────────────────────────────────────────────

@@ -1581,6 +1581,28 @@ async fn real_main() {
         }
     }
 
+    // ── Child-run driver (RFC 027 / #670 G4 PR-1b-3) ─────────────────────────
+    // Start AFTER `RecoveryService::recover_all` completes (direct
+    // sequential await — no tokio-spawn race window). RFC 027
+    // §contract 3: anything unrecoverable has already transitioned
+    // to `Failed` by this point, so the driver's `Pending +
+    // parent_run_id IS NOT NULL` claim predicate cannot pick up a
+    // crashed run that should be reclaimed by recovery.
+    //
+    // Gated on `CAIRN_CHILD_RUN_DRIVER_ENABLED=true`. Default off;
+    // PR-1b-5 flips the default. The driver is constructed regardless
+    // so metrics surfaces reflect reality and the task's lifecycle
+    // is tied to cairn-app's — no per-request spawning, no zombie
+    // tasks on shutdown.
+    let mut child_run_driver = cairn_app::child_run_driver::ChildRunDriver::start(
+        lib_state.runtime.store.clone(),
+        lib_state.runtime.runs.clone(),
+    );
+    tracing::info!(
+        boot_id = %boot_id,
+        "child-run driver scaffolding launched (PR-1b-3; claim path in PR-1b-5)",
+    );
+
     // ── Startup replays (trigger service only) ───────────────────────────────
     // Walks the event log at boot to rebuild the in-memory
     // `TriggerService` cache so pre-existing trigger + template data
@@ -2088,6 +2110,12 @@ async fn real_main() {
         // out of their sleep via the CancellationToken). The
         // registry lives on the lib-side `AppState`.
         lib_state.lease_keepers.shutdown_all().await;
+        // #670 G4 / RFC 027: drain the child-run driver's tokio loop.
+        // Idempotent — just cancels the token and awaits the join
+        // handle. When the driver is gated off the loop's sleep is
+        // interrupted by the cancel token so this returns within one
+        // tick (< 500ms).
+        child_run_driver.shutdown().await;
         eprintln!("shutdown: all connections drained");
         flush_state_to_disk(&state_for_flush).await;
         eprintln!("shutdown: complete");

@@ -160,6 +160,31 @@ pub trait RunReadModel: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RunRecord>, StoreError>;
 
+    /// #670 G4 / RFC 027: list pending child runs (state = Pending
+    /// AND parent_run_id IS NOT NULL), ordered by `(created_at,
+    /// run_id)` ASC. Feeds the [`crate::projections::RunDescendantsCounter`]-adjacent
+    /// `ChildRunDriver` scan loop; the predicate is pushed into the
+    /// SQL layer so a tenant with many pending root runs cannot
+    /// starve the driver by overflowing a generic `list_by_state`
+    /// paged scan (Gemini review on PR #678, HIGH).
+    ///
+    /// Default implementation (fallback for backends that haven't
+    /// specialised yet) delegates to `list_by_state(Pending, limit *
+    /// 4)` and filters in memory. The `* 4` multiplier is a crude
+    /// hedge against the starvation case; backends SHOULD override
+    /// with an indexed SQL query. In-memory and pg/sqlite all
+    /// override below.
+    async fn list_pending_children(&self, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
+        let wide = self
+            .list_by_state(RunState::Pending, limit.saturating_mul(4))
+            .await?;
+        Ok(wide
+            .into_iter()
+            .filter(|r| r.parent_run_id.is_some())
+            .take(limit)
+            .collect())
+    }
+
     /// RFC 010: list non-terminal (active) runs across ALL sessions in a project.
     ///
     /// Operators must be able to view active runs regardless of which session

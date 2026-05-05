@@ -37,7 +37,7 @@ pub use completion_verification::extract_verification;
 pub use context::{
     ActionResult, ActionStatus, BreakerConfig, CompactionConfig, DecideOutput, ExecuteOutcome,
     GatherOutput, LoopConfig, LoopSignal, LoopTermination, OrchestrationContext, StepSummary,
-    COMPLETION_GATE_ERROR_PREVIEW, MAX_COMPLETION_GATE_REJECTIONS,
+    COMPLETION_GATE_ERROR_PREVIEW, DEFAULT_MAX_ITERATIONS, MAX_COMPLETION_GATE_REJECTIONS,
 };
 pub use decide::DecidePhase;
 pub use decide_impl::{estimate_tokens, LlmDecidePhase, TokenBudget};

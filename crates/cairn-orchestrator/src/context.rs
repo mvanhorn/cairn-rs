@@ -423,10 +423,18 @@ pub struct LoopConfig {
     pub orchestrator_strict_completion_gate: bool,
 }
 
+/// Default iteration cap for a run's orchestrator loop. Extracted
+/// from the magic number embedded in `LoopConfig::default` so other
+/// callers (child-run driver in RFC 027 §Child resource budgets) can
+/// reference the cairn-wide default by name rather than duplicating
+/// the literal. Operator override continues to flow through the
+/// per-run / per-project / per-system `max_iterations` default.
+pub const DEFAULT_MAX_ITERATIONS: u32 = 20;
+
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 20,
+            max_iterations: DEFAULT_MAX_ITERATIONS,
             timeout_ms: 5 * 60 * 1_000, // 5 minutes
             checkpoint_every_n_tool_calls: 1,
             compaction: CompactionConfig::default(),

@@ -97,20 +97,26 @@ impl SqliteSyncProjection {
             }
 
             RuntimeEvent::RunCreated(e) => {
-                // #670 G4 PR-1b-1: initialise `root_run_id` (pg
-                // projection has the matching write). Root runs
-                // self-reference; non-root runs leave it NULL
-                // here — the subagent spawn path (G4 PR-1b-3)
-                // will set it when it mints a child via
-                // `try_increment_descendants`.
-                let root_run_id: Option<&str> = if e.parent_run_id.is_none() {
-                    Some(e.run_id.as_str())
-                } else {
-                    None
-                };
+                // #670 G4 / RFC 027: initialise `root_run_id`. Three
+                // shapes, matching the pg projection's sub-SELECT form:
+                //   1. Root (no parent) → self-reference.
+                //   2. Child with parent row present → inherit the
+                //      parent's `root_run_id` so the whole chain
+                //      shares one absolute root.
+                //   3. Child with parent row missing → NULL. The
+                //      decrement path's no-op-on-NULL handles this.
+                //
+                // Non-determinism note: sub-SELECT reads the parent's
+                // current `root_run_id`. Parent events land before
+                // child events on replay (parent must exist for the
+                // spawn to have succeeded), so the read is stable.
                 sqlx::query(
-                    "INSERT INTO runs (run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at, root_run_id)
-                     VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?)",
+                    "INSERT INTO runs (run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at, root_run_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 1, ?7, ?7, \
+                       CASE \
+                         WHEN ?3 IS NULL THEN ?1 \
+                         ELSE (SELECT root_run_id FROM runs WHERE run_id = ?3) \
+                       END)",
                 )
                 .bind(e.run_id.as_str())
                 .bind(e.session_id.as_str())
@@ -119,8 +125,6 @@ impl SqliteSyncProjection {
                 .bind(e.project.workspace_id.as_str())
                 .bind(e.project.project_id.as_str())
                 .bind(now)
-                .bind(now)
-                .bind(root_run_id)
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -139,6 +143,30 @@ impl SqliteSyncProjection {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+                // #670 G4 / RFC 027 §97: on terminal transition of a
+                // non-root descendant, decrement the root's counter.
+                // Mirrors the pg shape; `?1` stands in for the child
+                // run_id, `?2` for the now timestamp.
+                if e.transition.to.is_terminal() {
+                    sqlx::query(
+                        "UPDATE runs \
+                            SET in_flight_descendants = in_flight_descendants - 1, \
+                                version = version + 1, \
+                                updated_at = ?2 \
+                          WHERE run_id = ( \
+                            SELECT root_run_id FROM runs r \
+                             WHERE r.run_id = ?1 \
+                               AND r.parent_run_id IS NOT NULL \
+                               AND r.root_run_id IS NOT NULL \
+                          )",
+                    )
+                    .bind(e.run_id.as_str())
+                    .bind(now)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                }
 
                 // Issue #592: pause_schedules projection — evict-on-resume.
                 // Mirror pg (same SQL shape, `?` placeholders).

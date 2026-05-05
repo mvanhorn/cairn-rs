@@ -238,6 +238,27 @@ impl RunReadModel for PgAdapter {
         rows.into_iter().map(RunRow::into_record).collect()
     }
 
+    /// #670 G4 / RFC 027: pushed-down predicate for the
+    /// `ChildRunDriver` scan. Uses `idx_runs_parent` (partial index
+    /// on `parent_run_id WHERE NOT NULL` from V003) so an IS NOT NULL
+    /// predicate narrows to child rows cheaply before the state
+    /// filter runs.
+    async fn list_pending_children(&self, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE state = 'pending' AND parent_run_id IS NOT NULL \
+             ORDER BY created_at ASC, run_id ASC \
+             LIMIT $1"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+        rows.into_iter().map(RunRow::into_record).collect()
+    }
+
     async fn list_active_by_project(
         &self,
         project: &ProjectKey,

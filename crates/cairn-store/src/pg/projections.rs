@@ -71,24 +71,32 @@ impl PgSyncProjection {
             }
 
             RuntimeEvent::RunCreated(e) => {
-                // #670 G4 PR-1b-1: initialise `root_run_id`. Root
-                // runs (no parent) self-reference; non-root
-                // descendants leave it NULL here — the subagent
-                // spawn path (G4 PR-1b-3) sets it explicitly when
-                // it mints the child via
-                // `try_increment_descendants`. Until PR-1b-3 ships,
-                // children created via G3 get NULL here — consistent
-                // with the RFC 027 contract that pre-PR-1b-3 rows
-                // stay NULL and the decrement path's no-op-on-NULL
-                // is correct for them.
-                let root_run_id: Option<&str> = if e.parent_run_id.is_none() {
-                    Some(e.run_id.as_str())
-                } else {
-                    None
-                };
+                // #670 G4 / RFC 027: initialise `root_run_id`. Three
+                // shapes:
+                //   1. Root (no parent) → self-reference. Backfill path.
+                //   2. Child with parent row present → inherit the
+                //      parent's `root_run_id` (the whole chain shares
+                //      one absolute root). Resolved by sub-SELECT so
+                //      the write is atomic and idempotent on replay.
+                //   3. Child with parent row missing (e.g. legacy /
+                //      pre-PR-1b-1 row) → NULL. The decrement path's
+                //      no-op-on-NULL handles the missing link
+                //      correctly; the repair happens lazily if a
+                //      post-V069 descendant of this chain spawns
+                //      further children (RFC 027 §84 "legacy
+                //      traversal" case).
+                //
+                // Non-determinism note: sub-SELECT reads the parent's
+                // current `root_run_id`. On replay, parent events land
+                // before child events (parent must exist for the
+                // spawn to have succeeded), so the read is stable.
                 sqlx::query(
-                    "INSERT INTO runs (run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at, root_run_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, 'pending', 1, $7, $7, $8)",
+                    "INSERT INTO runs (run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at, root_run_id) \
+                     VALUES ($1, $2, $3, $4, $5, $6, 'pending', 1, $7, $7, \
+                       CASE \
+                         WHEN $3::TEXT IS NULL THEN $1 \
+                         ELSE (SELECT root_run_id FROM runs WHERE run_id = $3) \
+                       END)",
                 )
                 .bind(e.run_id.as_str())
                 .bind(e.session_id.as_str())
@@ -97,7 +105,6 @@ impl PgSyncProjection {
                 .bind(e.project.workspace_id.as_str())
                 .bind(e.project.project_id.as_str())
                 .bind(now)
-                .bind(root_run_id)
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -116,6 +123,36 @@ impl PgSyncProjection {
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+                // #670 G4 / RFC 027 §97: on terminal transition of a
+                // non-root descendant, decrement the root's counter.
+                // The root id is captured on the terminating child's
+                // `root_run_id` — no parent-chain traversal at
+                // terminal time. NULL `root_run_id` is a no-op (pre-
+                // V069 / legacy-chain). Subtract from the root row
+                // via a self-join against the child row; the
+                // predicate `r.root_run_id IS NOT NULL AND
+                // r.parent_run_id IS NOT NULL` gates both the
+                // legacy-chain and root-row cases.
+                if e.transition.to.is_terminal() {
+                    sqlx::query(
+                        "UPDATE runs \
+                            SET in_flight_descendants = in_flight_descendants - 1, \
+                                version = version + 1, \
+                                updated_at = $2 \
+                          WHERE run_id = ( \
+                            SELECT root_run_id FROM runs r \
+                             WHERE r.run_id = $1 \
+                               AND r.parent_run_id IS NOT NULL \
+                               AND r.root_run_id IS NOT NULL \
+                          )",
+                    )
+                    .bind(e.run_id.as_str())
+                    .bind(now)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
+                }
 
                 // Issue #592: pause_schedules projection — evict-on-resume.
                 // Transition → Paused with a non-None `resume_after_ms`

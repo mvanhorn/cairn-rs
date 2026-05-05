@@ -589,19 +589,23 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::RunCreated(e) => {
-                // #670 G4 PR-1b-1: initialise descendant-counter
-                // columns. Root runs (no parent) self-reference on
-                // `root_run_id` so the in-memory projection matches
-                // what pg/sqlite's V069 backfill produces. Non-root
-                // runs leave `root_run_id` as None here — the real
-                // spawn path (G4 PR-1b-3) sets it when it mints the
-                // child via `try_increment_descendants`. In the
-                // meantime, the G3 spawn path creates children with
-                // `None` which is the correct pre-PR-1b-3 shape.
-                let root_run_id = if e.parent_run_id.is_none() {
-                    Some(e.run_id.clone())
-                } else {
-                    None
+                // #670 G4 / RFC 027: initialise `root_run_id`. Mirrors
+                // the pg/sqlite projection's sub-SELECT shape:
+                //   1. Root (no parent) → self-reference.
+                //   2. Child with parent row present → inherit the
+                //      parent's `root_run_id`. The whole chain shares
+                //      one absolute root; read-before-write of the
+                //      parent's value keeps this atomic with the
+                //      child's insertion.
+                //   3. Child with parent row missing → None. The
+                //      decrement path's no-op-on-None handles this
+                //      legacy case.
+                let root_run_id = match e.parent_run_id.as_ref() {
+                    None => Some(e.run_id.clone()),
+                    Some(parent_id) => state
+                        .runs
+                        .get(parent_id.as_str())
+                        .and_then(|parent| parent.root_run_id.clone()),
                 };
                 state.runs.insert(
                     e.run_id.as_str().to_owned(),
@@ -633,6 +637,22 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::RunStateChanged(e) => {
+                // #670 G4 / RFC 027 §97: on terminal transition of a
+                // non-root descendant, decrement the root's
+                // `in_flight_descendants` counter. The root id is
+                // captured at spawn time into the terminating child's
+                // `root_run_id` — no parent-chain traversal at
+                // terminal time. `root_run_id = None` is a no-op
+                // (pre-V069 / legacy-chain case).
+                let terminal_decrement_target: Option<RunId> = if e.transition.to.is_terminal() {
+                    state
+                        .runs
+                        .get(e.run_id.as_str())
+                        .filter(|rec| rec.parent_run_id.is_some())
+                        .and_then(|rec| rec.root_run_id.clone())
+                } else {
+                    None
+                };
                 if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
                     rec.state = e.transition.to;
                     rec.failure_class = e.failure_class;
@@ -640,6 +660,21 @@ impl InMemoryStore {
                     rec.resume_trigger = e.resume_trigger;
                     rec.version += 1;
                     rec.updated_at = now;
+                }
+                if let Some(root_id) = terminal_decrement_target {
+                    if let Some(root_rec) = state.runs.get_mut(root_id.as_str()) {
+                        // Unchecked subtract is deliberate — RFC 027
+                        // §93 specifies `i64` typing so underflow
+                        // surfaces as a negative value that the
+                        // adapter layer surfaces on its
+                        // `child_run_driver_descendant_underflow_total`
+                        // metric. Panicking (or clamping at 0) would
+                        // hide the auditable signal.
+                        root_rec.in_flight_descendants =
+                            root_rec.in_flight_descendants.wrapping_sub(1);
+                        root_rec.version = root_rec.version.saturating_add(1);
+                        root_rec.updated_at = now;
+                    }
                 }
 
                 // Issue #592: pause_schedules projection — evict-on-resume.
@@ -3751,6 +3786,27 @@ impl RunReadModel for InMemoryStore {
             .cloned()
             .collect();
         results.sort_by_key(|r| r.created_at);
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    /// #670 G4 / RFC 027: pushed-down predicate for the
+    /// `ChildRunDriver` scan — filters `Pending AND parent_run_id
+    /// IS NOT NULL` so the driver doesn't have to page through
+    /// pending roots.
+    async fn list_pending_children(&self, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
+        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<RunRecord> = store
+            .runs
+            .values()
+            .filter(|r| r.state == cairn_domain::RunState::Pending && r.parent_run_id.is_some())
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
         results.truncate(limit);
         Ok(results)
     }
