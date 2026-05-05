@@ -1,29 +1,42 @@
-//! Agent runtime, orchestration, and subagent execution boundaries.
+//! Agent runtime primitives: ReAct loop types, streaming shapes,
+//! reflection advisories.
 //!
-//! `cairn-agent` owns the agent execution model:
+//! This crate historically also hosted a higher-level agent-executor
+//! plus subagent-spawning surface, but those code paths were never
+//! wired to production. The real subagent spawning contract is
+//! implemented in cairn-orchestrator (decide/execute phases) plus
+//! the cairn-app fabric adapter's spawn_subagent path via
+//! epic #670 (G3/G5/G6/G7). The dead execute/hook/subagent
+//! scaffolding in this crate was removed in G8 (see RFC 027).
 //!
-//! - **Orchestrator**: high-level agent execution coordination
-//! - **React**: ReAct (Reason + Act) loop step types and control
-//! - **Subagents**: spawn/link types for child task/session creation (RFC 005)
-//! - **Reflection**: self-inspection and advisory signals
+//! What remains:
+//!
+//! - **React**: ReAct (Reason + Act) loop step types. Referenced by
+//!   `cairn_orchestrator::context` via doc-comment only — the
+//!   orchestrator keeps its own `LoopSignal` to avoid the
+//!   cross-crate dependency, but this crate keeps the shapes as the
+//!   authoritative contract definitions.
+//! - **Orchestrator** (this crate's sub-module, NOT
+//!   `cairn-orchestrator`): high-level `AgentConfig` / `AgentType` /
+//!   `StepContext` types. Carried forward for cross-crate evaluator
+//!   hooks that reference `AgentType`.
+//! - **Reflection**: self-inspection advisories.
+//! - **Streaming**: the SSE / streaming-output variant types used
+//!   by `cairn-api::sse_payloads` to assemble the public `/stream`
+//!   surface. Actively used — this is the crate's current
+//!   load-bearing export.
 
-pub mod executor;
-pub mod hooks;
 pub mod orchestrator;
 pub mod react;
 pub mod reflection;
 pub mod streaming;
-pub mod subagents;
 
-pub use executor::{AgentDriver, AgentError, AgentExecutor, ExecutionResult};
-pub use hooks::{HookError, PromptResolver, RuntimeHook, RuntimeHookHandler, SubagentSpawnResult};
 pub use orchestrator::{AgentConfig, AgentType, ResolvedPrompt, StepContext, StepOutcome};
 pub use react::{LoopSignal, ReactPhase};
 pub use reflection::ReflectionAdvisory;
 pub use streaming::{
     AssistantDelta, AssistantEnd, AssistantReasoning, StopReason, StreamingOutput,
 };
-pub use subagents::{SpawnRequest, SubagentLink, SubagentOutcome};
 
 #[cfg(test)]
 mod tests {
