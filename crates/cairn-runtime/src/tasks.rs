@@ -210,18 +210,25 @@ pub trait TaskService: Send + Sync {
 
     /// Spawn a subagent task linked to a parent run.
     ///
-    /// Default impl submits a task with `parent_run_id = Some(parent_run_id)`
-    /// and `priority = 0`. Production impls (the Fabric adapter)
-    /// override this method to ALSO emit `RuntimeEvent::SubagentSpawned`
-    /// so the `subagent_spawns` projection captures the parent→child
-    /// linkage + LLM delegation context. Without that override the
-    /// read model is empty in production — which is exactly the bug
-    /// `#670 G1` closes.
+    /// **#670 G4 PR-1a cross-tenant contract**: this method
+    /// deliberately does NOT accept a `project` parameter. Impls
+    /// MUST derive the child's `ProjectKey` from the parent run's
+    /// row, not from a caller-supplied argument. The production
+    /// impl (`FabricTaskServiceAdapter::spawn_subagent` in
+    /// `cairn-app`) does this via `RunReadModel::get` on its
+    /// `InMemoryStore` handle. The LLM, a role resolver, or any
+    /// future caller therefore has no type-level path to override
+    /// the child's tenancy — a cross-tenant spawn requires breaking
+    /// this signature (detectable by reviewers) rather than passing
+    /// a different argument (silent).
+    ///
+    /// Production impls (the Fabric adapter) override this method
+    /// to emit `RuntimeEvent::SubagentSpawned` so the
+    /// `subagent_spawns` projection captures the parent→child
+    /// linkage + LLM delegation context.
     ///
     /// `child_session_id` / `child_run_id` are carried for the
-    /// `SubagentSpawned` linkage. `child_run_id` is `None` until `G3`
-    /// ships (the follow-up increment that creates a child `RunRecord`
-    /// at spawn time).
+    /// `SubagentSpawned` linkage.
     ///
     /// `goal` is the sub-goal the parent delegated — taken verbatim
     /// from the LLM's `ActionProposal.tool_args["goal"]` string. `role`
@@ -232,37 +239,28 @@ pub trait TaskService: Send + Sync {
     /// them on the emitted `SubagentSpawned` event verbatim so the
     /// projection audit row carries the LLM's actual delegation
     /// context.
+    ///
+    /// The default impl returns an error. `TaskService` has no
+    /// built-in `RunService::get` to derive project from parent, so
+    /// there is no generic way to fulfil the contract from within
+    /// `TaskService`. Impls MUST override. This is not a regression
+    /// — the old default impl accepted a caller-supplied `project`
+    /// which was the very tenancy hole this change closes.
     async fn spawn_subagent(
         &self,
-        project: &ProjectKey,
-        parent_run_id: RunId,
+        _parent_run_id: RunId,
         _parent_task_id: Option<TaskId>,
-        child_task_id: TaskId,
-        child_session_id: SessionId,
+        _child_task_id: TaskId,
+        _child_session_id: SessionId,
         _child_run_id: Option<RunId>,
         _goal: String,
         _role: String,
     ) -> Result<TaskRecord, RuntimeError> {
-        // Subagent tasks are scoped to the parent's session so the
-        // child execution co-locates on the session's FlowId partition
-        // with the parent run.
-        //
-        // NOTE: this default impl submits the task but does NOT emit
-        // `RuntimeEvent::SubagentSpawned`. Production impls MUST
-        // override to emit the event; see
-        // `FabricTaskServiceAdapter::spawn_subagent`. Leaving the
-        // default as submit-only keeps the trait constructable for
-        // test fakes (`FakeFabricTasks` etc.) without forcing every
-        // fake to hand-roll event emission.
-        self.submit(
-            project,
-            Some(&child_session_id),
-            child_task_id,
-            Some(parent_run_id),
-            None,
-            0,
-        )
-        .await
+        Err(RuntimeError::Internal(
+            "TaskService::spawn_subagent default impl called — impls must \
+             override to derive child project from parent run (#670 G4 PR-1a)"
+                .to_owned(),
+        ))
     }
 }
 

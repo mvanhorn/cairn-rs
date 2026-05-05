@@ -2035,7 +2035,6 @@ impl TaskService for FabricTaskServiceAdapter {
     /// surfaces to the operator.
     async fn spawn_subagent(
         &self,
-        project: &ProjectKey,
         parent_run_id: RunId,
         parent_task_id: Option<TaskId>,
         child_task_id: TaskId,
@@ -2044,6 +2043,26 @@ impl TaskService for FabricTaskServiceAdapter {
         goal: String,
         role: String,
     ) -> Result<TaskRecord, RuntimeError> {
+        // #670 G4 PR-1a cross-tenant contract: derive the child's
+        // project from the parent run row. No caller-supplied project
+        // argument exists; the signature prevents tenancy override.
+        //
+        // StoreError flows through `?` directly so the structured
+        // `RuntimeError::Store` classification is preserved — per
+        // SEC-007, we don't `to_string()` the raw driver text into
+        // `RuntimeError::Internal` (which would leak constraint
+        // names / schema fragments into the public error surface).
+        let parent_project = {
+            use cairn_store::projections::RunReadModel;
+            let parent = RunReadModel::get(self.store.as_ref(), &parent_run_id)
+                .await?
+                .ok_or_else(|| RuntimeError::NotFound {
+                    entity: "run",
+                    id: parent_run_id.as_str().to_owned(),
+                })?;
+            parent.project
+        };
+
         // G3: child_run_id should be Some(id) on the LLM-initiated
         // path (execute_impl mints one). If the caller passed None
         // (test fakes, pre-G3 callers), fall back to the convention
@@ -2062,7 +2081,7 @@ impl TaskService for FabricTaskServiceAdapter {
         self.fabric
             .runs
             .start(
-                project,
+                &parent_project,
                 &child_session_id,
                 child_run_id.clone(),
                 Some(parent_run_id.clone()),
@@ -2078,7 +2097,7 @@ impl TaskService for FabricTaskServiceAdapter {
             .fabric
             .tasks
             .submit(
-                project,
+                &parent_project,
                 child_task_id.clone(),
                 Some(parent_run_id.clone()),
                 parent_task_id.clone(),
@@ -2098,7 +2117,7 @@ impl TaskService for FabricTaskServiceAdapter {
                 child_task_id,
                 child_session_id,
                 child_run_id: Some(child_run_id),
-                project: project.clone(),
+                project: parent_project,
                 goal,
                 role,
             })

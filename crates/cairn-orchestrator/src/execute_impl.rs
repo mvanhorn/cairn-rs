@@ -1247,7 +1247,12 @@ impl RuntimeExecutePhase {
                 match self
                     .task_service
                     .spawn_subagent(
-                        &ctx.project,
+                        // #670 G4 PR-1a: no `project` argument. The
+                        // adapter derives the child's project from
+                        // the parent run (ctx.run_id) via its
+                        // internal `RunService::get` hop, so neither
+                        // the orchestrator nor the LLM can influence
+                        // the child's tenancy.
                         ctx.run_id.clone(),
                         ctx.task_id.clone(),
                         child_task_id.clone(),

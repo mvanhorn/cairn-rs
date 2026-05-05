@@ -204,19 +204,54 @@ pub trait RunService: Send + Sync {
 
     /// Spawn a subagent run linked to a parent.
     ///
-    /// Subagent runs inherit the session and are tracked by the parent for
-    /// hierarchical cancellation. Default impl constructs a child id from
-    /// the parent if none supplied and calls [`Self::start`].
+    /// **#670 G4 PR-1a cross-tenant + session-inheritance contract**:
+    /// this method deliberately does NOT accept a `project` parameter.
+    /// The default impl derives the child's `ProjectKey` from the
+    /// parent run's row via [`Self::get`]. Impls that already hold a
+    /// parent-row lookup short-circuit on the same path. No caller can
+    /// pass a `project` that diverges from the parent's — a
+    /// cross-tenant spawn requires breaking this signature (detectable
+    /// by reviewers) rather than passing a different argument (silent).
+    ///
+    /// `session_id` is accepted for callers that have the value in
+    /// hand (e.g. the operator-initiated HTTP path reads it from the
+    /// request body), but the default impl REJECTS it if it does not
+    /// match the parent run's session. Subagent runs inherit the
+    /// parent session — cross-session child runs would break
+    /// hierarchical cancellation and the session-scoped billing
+    /// aggregate. Callers who need a cross-session "child" should
+    /// use a different API (none exists today; filing is explicit
+    /// follow-up work if that need arises).
     async fn spawn_subagent(
         &self,
-        project: &ProjectKey,
         parent_run_id: RunId,
         session_id: &SessionId,
         child_run_id: Option<RunId>,
     ) -> Result<RunRecord, RuntimeError> {
-        let child = child_run_id
-            .unwrap_or_else(|| RunId::new(format!("subagent_{}", parent_run_id.as_str())));
-        self.start(project, session_id, child, Some(parent_run_id))
+        let parent = self
+            .get(&parent_run_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound {
+                entity: "run",
+                id: parent_run_id.as_str().to_owned(),
+            })?;
+        // #670 G4 PR-1a session-inheritance enforcement: child must
+        // live in the parent's session. Callers who pass a mismatched
+        // session id are rejected at this boundary rather than silently
+        // creating a cross-session child.
+        if parent.session_id != *session_id {
+            return Err(RuntimeError::Validation {
+                reason: format!(
+                    "subagent child run must inherit parent's session \
+                     (parent={} parent_session={} caller_session={})",
+                    parent_run_id.as_str(),
+                    parent.session_id.as_str(),
+                    session_id.as_str(),
+                ),
+            });
+        }
+        let child = child_run_id.unwrap_or_else(|| RunId::new_subagent_for_parent(&parent_run_id));
+        self.start(&parent.project, session_id, child, Some(parent_run_id))
             .await
     }
 

@@ -874,15 +874,16 @@ pub(crate) async fn spawn_subagent_run_handler(
         .map(RunId::new)
         .unwrap_or_else(|| RunId::new(format!("run_subagent_{}", Uuid::new_v4())));
     let before = current_event_head(&state).await;
+    // #670 G4 PR-1a: no `project` argument. `RunService::spawn_subagent`
+    // derives the child's project from the parent run row internally;
+    // no caller can pass a different project than the parent's. The
+    // tenant-scope auth read above (line ~839) is retained — it gates
+    // the operator's access to this parent, which is a different
+    // invariant than "child inherits parent tenancy."
     match state
         .runtime
         .runs
-        .spawn_subagent(
-            &parent_run.project,
-            parent_run_id.clone(),
-            &child_session_id,
-            Some(child_run_id),
-        )
+        .spawn_subagent(parent_run_id.clone(), &child_session_id, Some(child_run_id))
         .await
     {
         Ok(child_run) => {
