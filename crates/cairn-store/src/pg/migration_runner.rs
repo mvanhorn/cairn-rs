@@ -439,6 +439,16 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_llm_completions",
         include_str!("migrations/V068__create_llm_completions.sql"),
     ),
+    // Issue #670 G4 PR-1b-1: concurrent-descendants counter on runs.
+    // Adds `in_flight_descendants BIGINT NOT NULL DEFAULT 0` and
+    // `root_run_id TEXT` (nullable) so the subagent driver can bound
+    // per-root fan-out atomically via compare-and-increment. Backfills
+    // `root_run_id = run_id` on existing root runs.
+    (
+        69,
+        "runs_descendants_counter",
+        include_str!("migrations/V069__runs_descendants_counter.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

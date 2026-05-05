@@ -97,9 +97,20 @@ impl SqliteSyncProjection {
             }
 
             RuntimeEvent::RunCreated(e) => {
+                // #670 G4 PR-1b-1: initialise `root_run_id` (pg
+                // projection has the matching write). Root runs
+                // self-reference; non-root runs leave it NULL
+                // here — the subagent spawn path (G4 PR-1b-3)
+                // will set it when it mints a child via
+                // `try_increment_descendants`.
+                let root_run_id: Option<&str> = if e.parent_run_id.is_none() {
+                    Some(e.run_id.as_str())
+                } else {
+                    None
+                };
                 sqlx::query(
-                    "INSERT INTO runs (run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?)",
+                    "INSERT INTO runs (run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at, root_run_id)
+                     VALUES (?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?)",
                 )
                 .bind(e.run_id.as_str())
                 .bind(e.session_id.as_str())
@@ -109,6 +120,7 @@ impl SqliteSyncProjection {
                 .bind(e.project.project_id.as_str())
                 .bind(now)
                 .bind(now)
+                .bind(root_run_id)
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;

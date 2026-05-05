@@ -71,9 +71,24 @@ impl PgSyncProjection {
             }
 
             RuntimeEvent::RunCreated(e) => {
+                // #670 G4 PR-1b-1: initialise `root_run_id`. Root
+                // runs (no parent) self-reference; non-root
+                // descendants leave it NULL here — the subagent
+                // spawn path (G4 PR-1b-3) sets it explicitly when
+                // it mints the child via
+                // `try_increment_descendants`. Until PR-1b-3 ships,
+                // children created via G3 get NULL here — consistent
+                // with the RFC 027 contract that pre-PR-1b-3 rows
+                // stay NULL and the decrement path's no-op-on-NULL
+                // is correct for them.
+                let root_run_id: Option<&str> = if e.parent_run_id.is_none() {
+                    Some(e.run_id.as_str())
+                } else {
+                    None
+                };
                 sqlx::query(
-                    "INSERT INTO runs (run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, 'pending', 1, $7, $7)",
+                    "INSERT INTO runs (run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, state, version, created_at, updated_at, root_run_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, 'pending', 1, $7, $7, $8)",
                 )
                 .bind(e.run_id.as_str())
                 .bind(e.session_id.as_str())
@@ -82,6 +97,7 @@ impl PgSyncProjection {
                 .bind(e.project.workspace_id.as_str())
                 .bind(e.project.project_id.as_str())
                 .bind(now)
+                .bind(root_run_id)
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;

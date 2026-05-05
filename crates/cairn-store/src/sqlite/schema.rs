@@ -71,7 +71,15 @@ CREATE TABLE IF NOT EXISTS runs (
     -- Retained for historical audit/backward-compat even after the
     -- upstream fix lands; only the active recovery-loop code becomes
     -- dead at that point — no schema-removal migration is planned.
-    terminal_write_recovery_json  TEXT
+    terminal_write_recovery_json  TEXT,
+    -- #670 G4 PR-1b-1: concurrent-descendants counter for subagent
+    -- fan-out. Root runs (parent_run_id IS NULL) use their own
+    -- run_id as `root_run_id`; non-root descendants capture the
+    -- absolute root at spawn time. `in_flight_descendants` is i64
+    -- (underflow becomes a signed audit metric, not a wrapping
+    -- catastrophe).
+    in_flight_descendants        INTEGER NOT NULL DEFAULT 0,
+    root_run_id                  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tasks (

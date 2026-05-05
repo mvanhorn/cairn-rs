@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use async_trait::async_trait;
 use cairn_domain::tenancy::ProjectKey;
 use cairn_domain::tool_invocation::{ToolInvocationOutcomeKind, ToolInvocationRecord};
@@ -21,6 +23,16 @@ use crate::projections::{
 
 /// Postgres-backed database adapter.
 ///
+/// Wall-clock millis as `i64` for `updated_at` writes. Mirrors
+/// `in_memory::now_millis` but returns signed — pg/sqlite store
+/// `updated_at` as BIGINT/INTEGER (signed), so match the column type.
+fn now_millis_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 /// Wraps a `sqlx::PgPool` and provides the transactional boundary
 /// that ties event-log appends to synchronous projection updates.
 pub struct PgAdapter {
@@ -125,21 +137,24 @@ impl SessionReadModel for PgAdapter {
     }
 }
 
+/// Column list for `runs` projection reads. Shared across every
+/// `RunReadModel` method so adding a column doesn't require finding
+/// all seven SELECT sites and updating them in lockstep.
+const RUN_SELECT_COLS: &str =
+    "run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, \
+     state, failure_class, version, created_at, updated_at, \
+     completion_summary, completion_verification_json, completion_annotated_at_ms, \
+     terminal_write_recovery_json, in_flight_descendants, root_run_id";
+
 #[async_trait]
 impl RunReadModel for PgAdapter {
     async fn get(&self, run_id: &RunId) -> Result<Option<RunRecord>, StoreError> {
-        let row = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE run_id = $1",
-        )
-        .bind(run_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!("SELECT {RUN_SELECT_COLS} FROM runs WHERE run_id = $1");
+        let row = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(run_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         row.map(RunRow::into_record).transpose()
     }
@@ -150,22 +165,19 @@ impl RunReadModel for PgAdapter {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<RunRecord>, StoreError> {
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE session_id = $1
-             ORDER BY created_at ASC, run_id ASC
-             LIMIT $2 OFFSET $3",
-        )
-        .bind(session_id.as_str())
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE session_id = $1 \
+             ORDER BY created_at ASC, run_id ASC \
+             LIMIT $2 OFFSET $3"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(session_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         rows.into_iter().map(RunRow::into_record).collect()
     }
@@ -190,20 +202,17 @@ impl RunReadModel for PgAdapter {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<RunRecord>, StoreError> {
-        let row = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE session_id = $1 AND parent_run_id IS NULL
-             ORDER BY created_at DESC, run_id DESC
-             LIMIT 1",
-        )
-        .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE session_id = $1 AND parent_run_id IS NULL \
+             ORDER BY created_at DESC, run_id DESC \
+             LIMIT 1"
+        );
+        let row = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(session_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         row.map(RunRow::into_record).transpose()
     }
@@ -213,21 +222,18 @@ impl RunReadModel for PgAdapter {
         state: RunState,
         limit: usize,
     ) -> Result<Vec<RunRecord>, StoreError> {
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE state = $1
-             ORDER BY created_at ASC, run_id ASC
-             LIMIT $2",
-        )
-        .bind(enum_string(&state)?)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE state = $1 \
+             ORDER BY created_at ASC, run_id ASC \
+             LIMIT $2"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(enum_string(&state)?)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         rows.into_iter().map(RunRow::into_record).collect()
     }
@@ -237,24 +243,21 @@ impl RunReadModel for PgAdapter {
         project: &ProjectKey,
         limit: usize,
     ) -> Result<Vec<RunRecord>, StoreError> {
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
-               AND state NOT IN ('completed', 'failed', 'canceled', 'dead_lettered')
-             ORDER BY created_at ASC, run_id ASC
-             LIMIT $4",
-        )
-        .bind(project.tenant_id.as_str())
-        .bind(project.workspace_id.as_str())
-        .bind(project.project_id.as_str())
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3 \
+               AND state NOT IN ('completed', 'failed', 'canceled', 'dead_lettered') \
+             ORDER BY created_at ASC, run_id ASC \
+             LIMIT $4"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
         rows.into_iter().map(RunRow::into_record).collect()
     }
 
@@ -265,21 +268,18 @@ impl RunReadModel for PgAdapter {
     ) -> Result<Vec<RunRecord>, StoreError> {
         // Served by `idx_runs_parent` (V003__create_runs.sql partial
         // index on `parent_run_id WHERE NOT NULL`).
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE parent_run_id = $1
-             ORDER BY created_at ASC, run_id ASC
-             LIMIT $2",
-        )
-        .bind(parent_run_id.as_str())
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE parent_run_id = $1 \
+             ORDER BY created_at ASC, run_id ASC \
+             LIMIT $2"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(parent_run_id.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
         rows.into_iter().map(RunRow::into_record).collect()
     }
 
@@ -315,26 +315,107 @@ impl RunReadModel for PgAdapter {
         let offset_i64 = i64::try_from(offset).map_err(|_| {
             StoreError::Internal(format!("list_stalled: offset={offset} exceeds i64::MAX"))
         })?;
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE tenant_id = $1
-               AND state IN ('running', 'pending')
-               AND updated_at < $2
-             ORDER BY updated_at ASC, run_id ASC
-             LIMIT $3 OFFSET $4",
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE tenant_id = $1 \
+               AND state IN ('running', 'pending') \
+               AND updated_at < $2 \
+             ORDER BY updated_at ASC, run_id ASC \
+             LIMIT $3 OFFSET $4"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(tenant_id.as_str())
+            .bind(stale_cutoff_i64)
+            .bind(limit_i64)
+            .bind(offset_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(RunRow::into_record).collect()
+    }
+}
+
+// -- RunDescendantsCounter (#670 G4 PR-1b-1) --
+
+#[async_trait]
+impl crate::projections::RunDescendantsCounter for PgAdapter {
+    async fn try_increment_descendants(
+        &self,
+        root_run_id: &RunId,
+        cap: i64,
+    ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
+        use crate::projections::DescendantsCapOutcome;
+        // Atomic compare-and-increment in a single SQL round-trip.
+        // The predicate `in_flight_descendants < :cap` evaluates on
+        // pg-side; two concurrent spawns against the same root cannot
+        // both admit above the cap. `RETURNING` returns the post-
+        // increment value so callers can surface it in metrics.
+        //
+        // Also bump `version` + `updated_at` so stale-run detection
+        // and other version-watching consumers observe the change
+        // (Copilot review on #676 — without this, a root with
+        // active descendants would look idle to stale-run sweeps).
+        let now_ms = now_millis_i64();
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE runs
+                SET in_flight_descendants = in_flight_descendants + 1,
+                    version = version + 1,
+                    updated_at = $3
+              WHERE run_id = $1
+                AND in_flight_descendants < $2
+           RETURNING in_flight_descendants",
         )
-        .bind(tenant_id.as_str())
-        .bind(stale_cutoff_i64)
-        .bind(limit_i64)
-        .bind(offset_i64)
-        .fetch_all(&self.pool)
+        .bind(root_run_id.as_str())
+        .bind(cap)
+        .bind(now_ms)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
-        rows.into_iter().map(RunRow::into_record).collect()
+
+        match row {
+            Some((new_count,)) => Ok(DescendantsCapOutcome::Admitted { new_count }),
+            None => {
+                // Either the root doesn't exist or the cap was
+                // reached. Distinguish with a cheap follow-up probe
+                // so callers see the right outcome (cap-reached is
+                // business logic; not-found is a bug condition).
+                let exists: Option<(i64,)> =
+                    sqlx::query_as("SELECT in_flight_descendants FROM runs WHERE run_id = $1")
+                        .bind(root_run_id.as_str())
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| StoreError::Internal(e.to_string()))?;
+                Ok(match exists {
+                    Some(_) => DescendantsCapOutcome::CapReached,
+                    None => DescendantsCapOutcome::RootNotFound,
+                })
+            }
+        }
+    }
+
+    async fn decrement_descendants(
+        &self,
+        root_run_id: &RunId,
+    ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
+        use crate::projections::DescendantsCapOutcome;
+        let now_ms = now_millis_i64();
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE runs
+                SET in_flight_descendants = in_flight_descendants - 1,
+                    version = version + 1,
+                    updated_at = $2
+              WHERE run_id = $1
+           RETURNING in_flight_descendants",
+        )
+        .bind(root_run_id.as_str())
+        .bind(now_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        match row {
+            Some((new_count,)) => Ok(DescendantsCapOutcome::Admitted { new_count }),
+            None => Ok(DescendantsCapOutcome::RootNotFound),
+        }
     }
 }
 
@@ -1040,6 +1121,12 @@ struct RunRow {
     // on the hot path; populated by the TerminalRecoveryAttempted
     // projection when the cairn-side recovery loop fires.
     terminal_write_recovery_json: Option<String>,
+    // #670 G4 PR-1b-1: descendants counter + root pointer.
+    // `in_flight_descendants` is `BIGINT NOT NULL DEFAULT 0` on the
+    // schema; `root_run_id` is `TEXT` (nullable — pre-V069 child rows
+    // stay NULL per the RFC 027 backfill spec).
+    in_flight_descendants: i64,
+    root_run_id: Option<String>,
 }
 
 impl RunRow {
@@ -1095,6 +1182,8 @@ impl RunRow {
                 .map(serde_json::from_str::<crate::projections::TerminalRecoveryRecord>)
                 .transpose()
                 .map_err(|e| StoreError::Serialization(e.to_string()))?,
+            in_flight_descendants: self.in_flight_descendants,
+            root_run_id: self.root_run_id.map(RunId::new),
         })
     }
 }

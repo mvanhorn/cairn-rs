@@ -1089,6 +1089,12 @@ fn build_run_record(
         // Always `None`; callers who want the field read from the
         // cairn-store RunReadModel projection.
         terminal_write_recovery: None,
+        // #670 G4 PR-1b-1: fabric snapshots are FF-derived and carry
+        // no descendant-counter state — that lives on cairn-store's
+        // event-sourced projection. Callers who want those values
+        // read from the RunReadModel projection.
+        in_flight_descendants: 0,
+        root_run_id: None,
     })
 }
 

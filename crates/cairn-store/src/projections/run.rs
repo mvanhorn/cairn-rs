@@ -77,6 +77,47 @@ pub struct RunRecord {
     /// `terminal_write_recovery: null` on every run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_write_recovery: Option<TerminalRecoveryRecord>,
+    /// #670 G4 PR-1b-1: concurrent-descendants counter per root run.
+    ///
+    /// On the root run, this tracks the number of in-flight (non-
+    /// terminal) descendant runs spawned under it. Each
+    /// `SubagentSpawned` event increments the root's counter
+    /// atomically via `try_increment_descendants`; each non-root
+    /// descendant's terminal event (`RunCompleted` / `RunFailed` /
+    /// `RunCanceled`) decrements it.
+    ///
+    /// Non-root runs always have `0` here — the counter only
+    /// accumulates on roots. Value is `i64` (not `u64`) so
+    /// underflow is auditable rather than catastrophic.
+    ///
+    /// `skip_serializing_if == 0`: runs with no descendants
+    /// in-flight stay silent in the response body — no noisy
+    /// `in_flight_descendants: 0` on every run.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub in_flight_descendants: i64,
+    /// #670 G4 PR-1b-1: absolute-root pointer for descendant counter
+    /// accounting.
+    ///
+    /// On a root run (`parent_run_id IS NULL`), this is set to the
+    /// run's own `run_id` by the schema default / backfill. On a
+    /// non-root descendant, this is set at spawn time to the
+    /// captured root id so the decrement path on the descendant's
+    /// terminal event targets the correct counter without
+    /// re-traversing the `parent_run_id` chain.
+    ///
+    /// `None` for pre-V069 rows not touched by the backfill (older
+    /// child runs created before this migration landed). The
+    /// decrement path is a no-op when this is `None` — correct
+    /// because pre-V069 spawns never incremented any counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_run_id: Option<RunId>,
+}
+
+/// Helper for `#[serde(skip_serializing_if = ...)]` on `i64` fields
+/// that are silent-when-zero. serde's builtin `is_zero` only works
+/// on unsigned integers, so define the predicate explicitly.
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 /// F64: projection shape for the latest terminal-write recovery attempt.
@@ -162,4 +203,101 @@ pub trait RunReadModel: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<RunRecord>, StoreError>;
+}
+
+/// #670 G4 PR-1b-1: atomic compare-and-increment / decrement primitive
+/// for the `in_flight_descendants` counter on a root run's row.
+///
+/// **Scope of this primitive**: it reads + mutates only the **root**
+/// row identified by `root_run_id`. It does NOT populate the child
+/// run's own `root_run_id` column — the child's row is created
+/// separately by the `RunCreated` projection, which currently leaves
+/// `root_run_id = None` on non-root runs (see the module-level
+/// comment above). PR-1b-3 ships the complementary change: when the
+/// spawn path mints a child, it will (a) call
+/// [`Self::try_increment_descendants`] on the captured root id to
+/// reserve a slot under the cap, and (b) emit the `RunCreated` event
+/// carrying the resolved root id so the `RunCreated` projection sets
+/// the child's `root_run_id` atomically in the same transaction.
+/// Those are two separate writes that the spawn path composes; they
+/// are not rolled into this one primitive.
+///
+/// **Fan-out gate**: this is the authoritative cap check. The
+/// durable backend's atomic SQL `UPDATE ... WHERE counter < :cap
+/// RETURNING` (on pg/sqlite) or `i64` CAS loop (InMemory) is what
+/// prevents two concurrent spawns from both admitting above the cap.
+/// The in-memory projection dual-writes follow the durable-backend
+/// decision via the adapter-layer rollback-on-reject path specified
+/// in RFC 027 §`in_flight_descendants` counter.
+///
+/// Consumers (the subagent driver in PR-1b-3) call
+/// [`Self::try_increment_descendants`] at spawn time; if it returns
+/// [`DescendantsCapOutcome::CapReached`], the caller rejects the spawn
+/// with `SubagentFanoutLimitReached` + rolls back any Phase-1 side
+/// effects. [`Self::decrement_descendants`] fires on every non-root
+/// descendant's terminal event and on the orphan-child compensating
+/// path (per RFC 027 §Orphan-child).
+///
+/// The primitive lives on main from PR-1b-1 onward but has no
+/// callers until PR-1b-3. PR-1b-1 ships the primitive, PR-1b-3
+/// wires it into the spawn path.
+#[async_trait]
+pub trait RunDescendantsCounter: Send + Sync {
+    /// Conditionally increment `in_flight_descendants` on the row
+    /// identified by `root_run_id`. Returns `Admitted { new_count }`
+    /// on success, `CapReached` when the counter would exceed `cap`,
+    /// and `RootNotFound` when no row matches `root_run_id` (a bug
+    /// condition the caller can surface as `RuntimeError::Internal`).
+    ///
+    /// Atomicity: the durable backend performs the check + increment
+    /// in a single SQL statement; InMemory uses a CAS loop on an
+    /// `i64`. Two concurrent calls against the same root cannot both
+    /// admit above the cap.
+    async fn try_increment_descendants(
+        &self,
+        root_run_id: &RunId,
+        cap: i64,
+    ) -> Result<DescendantsCapOutcome, StoreError>;
+
+    /// Unconditionally decrement `in_flight_descendants` on the row
+    /// identified by `root_run_id`. Returns the post-decrement value.
+    /// Underflow (post-decrement < 0) returns `new_count` negative —
+    /// the adapter surfaces this as a WARN metric per RFC 027; the
+    /// primitive itself does not panic.
+    ///
+    /// Called on every non-root descendant's terminal event, keyed by
+    /// the `root_run_id` captured at spawn time on the descendant's
+    /// row. `RootNotFound` returns without side effect (caller logs).
+    ///
+    /// **No-op on a `None` root_run_id**: callers that pass a pre-
+    /// V069 descendant with `root_run_id = None` see this reflected
+    /// as `RootNotFound`; per RFC 027 that's the correct no-op
+    /// because pre-V069 spawns never incremented anything.
+    async fn decrement_descendants(
+        &self,
+        root_run_id: &RunId,
+    ) -> Result<DescendantsCapOutcome, StoreError>;
+}
+
+/// Outcome of a [`RunDescendantsCounter`] operation. Returning a
+/// typed enum (rather than `Result<i64, CapError>`) keeps the caller's
+/// match arms explicit — the cap-reached path is business logic, not
+/// a surprise error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescendantsCapOutcome {
+    /// Increment or decrement succeeded. `new_count` is the post-op
+    /// value of `in_flight_descendants`. May be negative on decrement
+    /// if a bug caused underflow; callers log, don't panic.
+    Admitted { new_count: i64 },
+    /// Increment rejected because `in_flight_descendants + 1 > cap`.
+    /// Caller rejects the spawn with `SubagentFanoutLimitReached` and
+    /// rolls back any Phase-1 side effects. Only returned from
+    /// [`RunDescendantsCounter::try_increment_descendants`].
+    CapReached,
+    /// No row matched the supplied `root_run_id`. On increment this
+    /// is a bug (root was deleted mid-spawn?) — caller should
+    /// surface `RuntimeError::Internal`. On decrement this is the
+    /// no-op path for pre-V069 descendants (`root_run_id = None`
+    /// resolved on the caller side; adapter sees the absence here).
+    RootNotFound,
 }

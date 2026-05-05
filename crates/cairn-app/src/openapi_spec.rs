@@ -229,6 +229,16 @@ pub const OPENAPI_JSON: &str = r##"{
           "version":       { "type": "integer" },
           "created_at":    { "type": "integer" },
           "updated_at":    { "type": "integer" },
+          "root_run_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "#670 G4 / RFC 027: the root run of this run's subagent tree. Populated on root runs at `RunCreated` time (equal to `run_id`). Left NULL on non-root runs until the embedded Child Run Driver spawn path (PR-1b-3) sets it atomically alongside the root's `in_flight_descendants` increment. Operator dashboards use this to group a root with every descendant it spawned."
+          },
+          "in_flight_descendants": {
+            "type": "integer",
+            "nullable": true,
+            "description": "#670 G4 / RFC 027: count of live (non-terminal) descendant subagent runs rooted at this run. Only meaningful on roots; always 0 on non-roots. Mutated atomically by the Child Run Driver: incremented on spawn (gated by the per-root descendant cap), decremented when a descendant reaches a terminal state. Negative values are an auditable signal of underflow, not a panic — monitored via `child_run_driver_descendant_underflow_total`."
+          },
           "terminal_write_recovery": {
             "$ref": "#/components/schemas/TerminalRecoveryRecord",
             "nullable": true,

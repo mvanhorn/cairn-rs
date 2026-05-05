@@ -589,6 +589,20 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::RunCreated(e) => {
+                // #670 G4 PR-1b-1: initialise descendant-counter
+                // columns. Root runs (no parent) self-reference on
+                // `root_run_id` so the in-memory projection matches
+                // what pg/sqlite's V069 backfill produces. Non-root
+                // runs leave `root_run_id` as None here — the real
+                // spawn path (G4 PR-1b-3) sets it when it mints the
+                // child via `try_increment_descendants`. In the
+                // meantime, the G3 spawn path creates children with
+                // `None` which is the correct pre-PR-1b-3 shape.
+                let root_run_id = if e.parent_run_id.is_none() {
+                    Some(e.run_id.clone())
+                } else {
+                    None
+                };
                 state.runs.insert(
                     e.run_id.as_str().to_owned(),
                     RunRecord {
@@ -609,6 +623,8 @@ impl InMemoryStore {
                         completion_verification: None,
                         completion_annotated_at_ms: None,
                         terminal_write_recovery: None,
+                        in_flight_descendants: 0,
+                        root_run_id,
                     },
                 );
                 // Update run quota counter
@@ -3814,6 +3830,64 @@ impl RunReadModel for InMemoryStore {
                 .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
         });
         Ok(refs.into_iter().skip(offset).take(limit).cloned().collect())
+    }
+}
+
+// -- RunDescendantsCounter (#670 G4 PR-1b-1) --
+
+#[async_trait]
+impl crate::projections::RunDescendantsCounter for InMemoryStore {
+    async fn try_increment_descendants(
+        &self,
+        root_run_id: &cairn_domain::RunId,
+        cap: i64,
+    ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
+        use crate::projections::DescendantsCapOutcome;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let row = match state.runs.get_mut(root_run_id.as_str()) {
+            Some(r) => r,
+            None => return Ok(DescendantsCapOutcome::RootNotFound),
+        };
+        // Atomic check-and-increment under the state lock. The durable
+        // backends (pg/sqlite) use `UPDATE ... WHERE counter < :cap
+        // RETURNING` for the same semantic; InMemory uses lock
+        // exclusion. Both reject above the cap deterministically.
+        if row.in_flight_descendants >= cap {
+            return Ok(DescendantsCapOutcome::CapReached);
+        }
+        row.in_flight_descendants += 1;
+        // Bump version + updated_at so stale-run detection and
+        // every other version-watching consumer see the change.
+        // (Copilot review on #676 — without this, roots with
+        // active descendants would still look idle.)
+        row.version = row.version.saturating_add(1);
+        row.updated_at = now_millis();
+        let new_count = row.in_flight_descendants;
+        Ok(DescendantsCapOutcome::Admitted { new_count })
+    }
+
+    async fn decrement_descendants(
+        &self,
+        root_run_id: &cairn_domain::RunId,
+    ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
+        use crate::projections::DescendantsCapOutcome;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let row = match state.runs.get_mut(root_run_id.as_str()) {
+            Some(r) => r,
+            None => return Ok(DescendantsCapOutcome::RootNotFound),
+        };
+        // Unconditional decrement. Post-decrement can go negative if
+        // a caller bug produces more decrements than increments;
+        // we return the negative count rather than panicking. The
+        // adapter layer surfaces negative values as a WARN metric per
+        // RFC 027 (see `child_run_driver_descendant_underflow_total`).
+        row.in_flight_descendants -= 1;
+        // Bump version + updated_at: see `try_increment_descendants`
+        // rationale above.
+        row.version = row.version.saturating_add(1);
+        row.updated_at = now_millis();
+        let new_count = row.in_flight_descendants;
+        Ok(DescendantsCapOutcome::Admitted { new_count })
     }
 }
 

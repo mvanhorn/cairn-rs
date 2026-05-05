@@ -176,6 +176,8 @@ mod tests {
                 completion_verification: None,
                 completion_annotated_at_ms: None,
                 terminal_write_recovery: None,
+                in_flight_descendants: 0,
+                root_run_id: None,
             },
             RunRecord {
                 run_id: RunId::new("run_2"),
@@ -195,6 +197,8 @@ mod tests {
                 completion_verification: None,
                 completion_annotated_at_ms: None,
                 terminal_write_recovery: None,
+                in_flight_descendants: 0,
+                root_run_id: None,
             },
             RunRecord {
                 run_id: RunId::new("run_3"),
@@ -214,6 +218,8 @@ mod tests {
                 completion_verification: None,
                 completion_annotated_at_ms: None,
                 terminal_write_recovery: None,
+                in_flight_descendants: 0,
+                root_run_id: None,
             },
         ];
 

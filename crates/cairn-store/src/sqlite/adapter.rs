@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use async_trait::async_trait;
 use cairn_domain::tenancy::ProjectKey;
 use cairn_domain::tool_invocation::{ToolInvocationOutcomeKind, ToolInvocationRecord};
@@ -17,6 +19,17 @@ use crate::projections::{
     SessionReadModel, SessionRecord, TaskReadModel, TaskRecord, ToolCallApprovalReadModel,
     ToolCallApprovalRecord, ToolCallApprovalState, ToolInvocationReadModel,
 };
+
+/// Wall-clock millis as `i64` for `updated_at` writes. Mirrors
+/// `pg::adapter::now_millis_i64` — the two backends share the same
+/// column typing (signed BIGINT/INTEGER), so the helper shape is
+/// identical.
+fn now_millis_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
 
 /// SQLite-backed database adapter for local-mode.
 pub struct SqliteAdapter {
@@ -112,6 +125,15 @@ impl DbAdapter for SqliteAdapter {
             ("completion_annotated_at_ms", "INTEGER"),
             // F64: sidecar for terminal-write recovery loop annotations.
             ("terminal_write_recovery_json", "TEXT"),
+            // #670 G4 PR-1b-1: descendants counter (NOT NULL DEFAULT 0)
+            // + root pointer (nullable). SQLite ADD COLUMN requires
+            // constant DEFAULTs; the `NOT NULL DEFAULT 0` is both the
+            // schema constraint (for fresh installs via SCHEMA_SQL) and
+            // the migration-time backfill value for existing rows —
+            // pre-V069 rows get 0, correct because they never
+            // participated in the counter.
+            ("in_flight_descendants", "INTEGER NOT NULL DEFAULT 0"),
+            ("root_run_id", "TEXT"),
         ] {
             let exists = sqlx::query_scalar::<_, i64>(
                 "SELECT 1 FROM pragma_table_info('runs') WHERE name = ? LIMIT 1",
@@ -129,6 +151,20 @@ impl DbAdapter for SqliteAdapter {
                     .map_err(|e| StoreError::Migration(format!("{stmt}: {e}")))?;
             }
         }
+
+        // #670 G4 PR-1b-1: one-time backfill for `root_run_id` on
+        // existing roots. Fresh installs get this via SCHEMA_SQL +
+        // future `RunCreated` projections. In-place upgrades also
+        // need root runs to self-reference so the counter-increment
+        // path can target them. Child runs intentionally stay NULL
+        // (per RFC 027) — pre-V069 spawns never incremented any
+        // counter, so decrement-against-NULL is a correct no-op.
+        let backfill = "UPDATE runs SET root_run_id = run_id \
+                        WHERE parent_run_id IS NULL AND root_run_id IS NULL";
+        sqlx::query(backfill)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Migration(format!("{backfill}: {e}")))?;
 
         // F55: args_json + output_preview on tool_invocations. Pre-F55
         // databases do not get backfilled — the event log is not replayed
@@ -363,21 +399,26 @@ impl SessionReadModel for SqliteAdapter {
     }
 }
 
+/// Column list for `runs` projection reads. Shared across every
+/// `RunReadModel` method so adding a column doesn't require finding
+/// all seven SELECT sites and updating them in lockstep. Kept in
+/// parity with `pg/adapter.rs::RUN_SELECT_COLS` — the two must
+/// evolve together.
+const RUN_SELECT_COLS: &str =
+    "run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, \
+     state, failure_class, version, created_at, updated_at, \
+     completion_summary, completion_verification_json, completion_annotated_at_ms, \
+     terminal_write_recovery_json, in_flight_descendants, root_run_id";
+
 #[async_trait]
 impl RunReadModel for SqliteAdapter {
     async fn get(&self, run_id: &RunId) -> Result<Option<RunRecord>, StoreError> {
-        let row = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE run_id = $1",
-        )
-        .bind(run_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!("SELECT {RUN_SELECT_COLS} FROM runs WHERE run_id = $1");
+        let row = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(run_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         row.map(RunRow::into_record).transpose()
     }
@@ -388,22 +429,19 @@ impl RunReadModel for SqliteAdapter {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<RunRecord>, StoreError> {
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE session_id = $1
-             ORDER BY created_at ASC, run_id ASC
-             LIMIT $2 OFFSET $3",
-        )
-        .bind(session_id.as_str())
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE session_id = $1 \
+             ORDER BY created_at ASC, run_id ASC \
+             LIMIT $2 OFFSET $3"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(session_id.as_str())
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         rows.into_iter().map(RunRow::into_record).collect()
     }
@@ -428,20 +466,17 @@ impl RunReadModel for SqliteAdapter {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<RunRecord>, StoreError> {
-        let row = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE session_id = $1 AND parent_run_id IS NULL
-             ORDER BY created_at DESC, run_id DESC
-             LIMIT 1",
-        )
-        .bind(session_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE session_id = $1 AND parent_run_id IS NULL \
+             ORDER BY created_at DESC, run_id DESC \
+             LIMIT 1"
+        );
+        let row = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(session_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         row.map(RunRow::into_record).transpose()
     }
@@ -455,21 +490,18 @@ impl RunReadModel for SqliteAdapter {
             .ok()
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| format!("{state:?}").to_lowercase());
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE state = $1
-             ORDER BY created_at ASC
-             LIMIT $2",
-        )
-        .bind(&state_str)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE state = $1 \
+             ORDER BY created_at ASC \
+             LIMIT $2"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(&state_str)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
 
         rows.into_iter().map(RunRow::into_record).collect()
     }
@@ -487,14 +519,10 @@ impl RunReadModel for SqliteAdapter {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3
-               AND state NOT IN ({placeholders})
-             ORDER BY created_at ASC
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE tenant_id = $1 AND workspace_id = $2 AND project_id = $3 \
+               AND state NOT IN ({placeholders}) \
+             ORDER BY created_at ASC \
              LIMIT ${}",
             4 + terminal_states.len()
         );
@@ -521,21 +549,18 @@ impl RunReadModel for SqliteAdapter {
     ) -> Result<Vec<RunRecord>, StoreError> {
         // Served by `idx_runs_parent` (V003__create_runs.sql partial
         // index on `parent_run_id WHERE NOT NULL`).
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE parent_run_id = $1
-             ORDER BY created_at ASC, run_id ASC
-             LIMIT $2",
-        )
-        .bind(parent_run_id.as_str())
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE parent_run_id = $1 \
+             ORDER BY created_at ASC, run_id ASC \
+             LIMIT $2"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(parent_run_id.as_str())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
         rows.into_iter().map(RunRow::into_record).collect()
     }
 
@@ -566,26 +591,101 @@ impl RunReadModel for SqliteAdapter {
         let offset_i64 = i64::try_from(offset).map_err(|_| {
             StoreError::Internal(format!("list_stalled: offset={offset} exceeds i64::MAX"))
         })?;
-        let rows = sqlx::query_as::<_, RunRow>(
-            "SELECT run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id,
-                    state, failure_class, version, created_at, updated_at,
-                    completion_summary, completion_verification_json, completion_annotated_at_ms,
-                    terminal_write_recovery_json
-             FROM runs
-             WHERE tenant_id = $1
-               AND state IN ('running', 'pending')
-               AND updated_at < $2
-             ORDER BY updated_at ASC, run_id ASC
-             LIMIT $3 OFFSET $4",
+        let sql = format!(
+            "SELECT {RUN_SELECT_COLS} FROM runs \
+             WHERE tenant_id = $1 \
+               AND state IN ('running', 'pending') \
+               AND updated_at < $2 \
+             ORDER BY updated_at ASC, run_id ASC \
+             LIMIT $3 OFFSET $4"
+        );
+        let rows = sqlx::query_as::<_, RunRow>(&sql)
+            .bind(tenant_id.as_str())
+            .bind(stale_cutoff_i64)
+            .bind(limit_i64)
+            .bind(offset_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(RunRow::into_record).collect()
+    }
+}
+
+// -- RunDescendantsCounter (#670 G4 PR-1b-1) --
+
+#[async_trait]
+impl crate::projections::RunDescendantsCounter for SqliteAdapter {
+    async fn try_increment_descendants(
+        &self,
+        root_run_id: &RunId,
+        cap: i64,
+    ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
+        use crate::projections::DescendantsCapOutcome;
+        // sqlite supports `UPDATE ... RETURNING` since 3.35. Same
+        // semantics as the pg impl: the predicate is evaluated
+        // inside the same statement, concurrent spawns cannot both
+        // admit above the cap.
+        //
+        // Also bump `version` + `updated_at` so stale-run detection
+        // and other version-watching consumers observe the change
+        // (Copilot review on #676).
+        let now_ms = now_millis_i64();
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE runs
+                SET in_flight_descendants = in_flight_descendants + 1,
+                    version = version + 1,
+                    updated_at = ?3
+              WHERE run_id = ?1
+                AND in_flight_descendants < ?2
+           RETURNING in_flight_descendants",
         )
-        .bind(tenant_id.as_str())
-        .bind(stale_cutoff_i64)
-        .bind(limit_i64)
-        .bind(offset_i64)
-        .fetch_all(&self.pool)
+        .bind(root_run_id.as_str())
+        .bind(cap)
+        .bind(now_ms)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
-        rows.into_iter().map(RunRow::into_record).collect()
+
+        match row {
+            Some((new_count,)) => Ok(DescendantsCapOutcome::Admitted { new_count }),
+            None => {
+                let exists: Option<(i64,)> =
+                    sqlx::query_as("SELECT in_flight_descendants FROM runs WHERE run_id = ?1")
+                        .bind(root_run_id.as_str())
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| StoreError::Internal(e.to_string()))?;
+                Ok(match exists {
+                    Some(_) => DescendantsCapOutcome::CapReached,
+                    None => DescendantsCapOutcome::RootNotFound,
+                })
+            }
+        }
+    }
+
+    async fn decrement_descendants(
+        &self,
+        root_run_id: &RunId,
+    ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
+        use crate::projections::DescendantsCapOutcome;
+        let now_ms = now_millis_i64();
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE runs
+                SET in_flight_descendants = in_flight_descendants - 1,
+                    version = version + 1,
+                    updated_at = ?2
+              WHERE run_id = ?1
+           RETURNING in_flight_descendants",
+        )
+        .bind(root_run_id.as_str())
+        .bind(now_ms)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StoreError::Internal(e.to_string()))?;
+        match row {
+            Some((new_count,)) => Ok(DescendantsCapOutcome::Admitted { new_count }),
+            None => Ok(DescendantsCapOutcome::RootNotFound),
+        }
     }
 }
 
@@ -1209,6 +1309,12 @@ struct RunRow {
     completion_annotated_at_ms: Option<i64>,
     // F64: nullable terminal-write recovery annotation (serde-JSON).
     terminal_write_recovery_json: Option<String>,
+    // #670 G4 PR-1b-1: descendants counter + root pointer.
+    // `in_flight_descendants` is `INTEGER NOT NULL DEFAULT 0`;
+    // `root_run_id` is `TEXT` (nullable — pre-V069 child rows stay
+    // NULL per RFC 027).
+    in_flight_descendants: i64,
+    root_run_id: Option<String>,
 }
 
 impl RunRow {
@@ -1262,6 +1368,8 @@ impl RunRow {
                 .map(serde_json::from_str::<crate::projections::TerminalRecoveryRecord>)
                 .transpose()
                 .map_err(|e| StoreError::Serialization(e.to_string()))?,
+            in_flight_descendants: self.in_flight_descendants,
+            root_run_id: self.root_run_id.map(RunId::new),
         })
     }
 }
