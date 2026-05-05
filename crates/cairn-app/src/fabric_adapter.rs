@@ -2089,17 +2089,31 @@ impl TaskService for FabricTaskServiceAdapter {
         // Phase 1: create the child RunRecord with parent linkage via
         // the real fabric path. This emits `BridgeEvent::ExecutionCreated`
         // which the bridge translates to `RuntimeEvent::RunCreated`,
-        // threading `parent_run_id` onto the domain event so operator
-        // queries like `RunReadModel::list_by_parent_run` see the
-        // child. The projection (PR-1b-3 change) inherits the parent's
-        // `root_run_id` onto the child's row inside the same INSERT.
+        // threading `parent_run_id` + (#670 G6) `agent_role_id` onto
+        // the domain event so operator queries like
+        // `RunReadModel::list_by_parent_run` see the child and the
+        // child's orchestrator loop picks the delegated role's
+        // system prompt on its first iteration. The projection
+        // (PR-1b-3 change) inherits the parent's `root_run_id` onto
+        // the child's row inside the same INSERT.
+        //
+        // Role plumbing (G6): `role` is the `tool_name` field of the
+        // LLM's `spawn_subagent` `ActionProposal` (e.g. `"researcher"`,
+        // `"executor"`). Empty string treated as "no role" — the
+        // child's orchestrator loop falls back to `"orchestrator"`
+        // via `orchestrate_run_handler_inner`'s default. The fabric
+        // layer does not validate the id; unknown ids surface
+        // observably at prompt-selection time (the orchestrator's
+        // prompt picker falls through to the default prompt).
+        let child_role = (!role.is_empty()).then(|| role.clone());
         self.fabric
             .runs
-            .start(
+            .start_with_role(
                 &parent_project,
                 &child_session_id,
                 child_run_id.clone(),
                 Some(parent_run_id.clone()),
+                child_role,
             )
             .await
             .map_err(fabric_err_to_runtime)?;

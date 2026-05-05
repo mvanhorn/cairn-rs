@@ -254,7 +254,7 @@ impl FabricRunService {
         run_id: RunId,
         parent_run_id: Option<RunId>,
     ) -> Result<RunRecord, FabricError> {
-        self.start_with_correlation(project, session_id, run_id, parent_run_id, None)
+        self.start_full(project, session_id, run_id, parent_run_id, None, None)
             .await
     }
 
@@ -272,6 +272,63 @@ impl FabricRunService {
         run_id: RunId,
         parent_run_id: Option<RunId>,
         correlation_id: Option<&str>,
+    ) -> Result<RunRecord, FabricError> {
+        self.start_full(
+            project,
+            session_id,
+            run_id,
+            parent_run_id,
+            correlation_id,
+            None,
+        )
+        .await
+    }
+
+    /// #670 G6: `start` but threading the child's `agent_role_id` onto
+    /// `BridgeEvent::ExecutionCreated` → `RunCreated.agent_role_id`.
+    /// Used by the `spawn_subagent` path so the child's orchestrator
+    /// loop picks up the delegated role's system prompt on its first
+    /// iteration (`orchestrate_run_handler_inner` reads
+    /// `run.agent_role_id` into `OrchestrationContext.agent_type`).
+    ///
+    /// Valid role ids come from `cairn_domain::agent_roles::default_roles()`
+    /// (`orchestrator`, `executor`, `researcher`, `reviewer`) or the
+    /// tenant's custom role registry. The fabric layer does not
+    /// validate the id — an unknown id falls through to the
+    /// orchestrator loop's default-prompt fallback so a typo doesn't
+    /// break the run, just picks the wrong prompt (observable in
+    /// projection and SSE).
+    pub async fn start_with_role(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+        run_id: RunId,
+        parent_run_id: Option<RunId>,
+        agent_role_id: Option<String>,
+    ) -> Result<RunRecord, FabricError> {
+        self.start_full(
+            project,
+            session_id,
+            run_id,
+            parent_run_id,
+            None,
+            agent_role_id,
+        )
+        .await
+    }
+
+    /// Internal shared implementation of the three public `start*`
+    /// variants. Keeps a single FF-side + bridge-emit body so the
+    /// wrappers differ only in which optional parameters they
+    /// forward.
+    async fn start_full(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+        run_id: RunId,
+        parent_run_id: Option<RunId>,
+        correlation_id: Option<&str>,
+        agent_role_id: Option<String>,
     ) -> Result<RunRecord, FabricError> {
         let eid = self.execution_id(project, session_id, &run_id);
         let lane_id = self.lane_id(project);
@@ -302,6 +359,15 @@ impl FabricRunService {
         if let Some(corr) = correlation_id.filter(|s| !s.is_empty()) {
             tags.insert("cairn.correlation_id".to_owned(), corr.to_owned());
         }
+        // #670 G6: tag the agent_role_id on the FF exec_core too.
+        // Operators querying FF directly (debug endpoints, lease_history
+        // scans) can filter on `cairn.agent_role_id` just like they
+        // already can on `cairn.parent_run_id` / `cairn.correlation_id`.
+        // The bridge emit below carries the same value to the
+        // projection path via `BridgeEvent::ExecutionCreated`.
+        if let Some(role) = agent_role_id.as_deref().filter(|s| !s.is_empty()) {
+            tags.insert("cairn.agent_role_id".to_owned(), role.to_owned());
+        }
 
         let policy_json = serde_json::json!({
             "max_retries": 0
@@ -327,6 +393,7 @@ impl FabricRunService {
                     project: project.clone(),
                     parent_run_id: parent_run_id.clone(),
                     correlation_id: correlation_id.map(str::to_owned),
+                    agent_role_id: agent_role_id.clone(),
                 })
                 .await;
         }

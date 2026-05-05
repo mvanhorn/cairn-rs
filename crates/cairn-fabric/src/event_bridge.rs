@@ -32,6 +32,15 @@ pub enum BridgeEvent {
         /// downstreams can join back to the originating request. `None`
         /// for internal starts.
         correlation_id: Option<String>,
+        /// #670 G6: agent role id for subagent/child runs created via
+        /// the `spawn_subagent` path. `None` for operator-initiated
+        /// top-level runs — the orchestrator loop defaults to the
+        /// `"orchestrator"` role when this is `None`. For a spawned
+        /// subagent, this carries the role the parent's LLM picked
+        /// (`executor`, `researcher`, `reviewer`, or a custom role
+        /// from the registry) so the child's orchestrator loop can
+        /// select the correct system prompt on its first iteration.
+        agent_role_id: Option<String>,
     },
     ExecutionCompleted {
         run_id: RunId,
@@ -450,13 +459,14 @@ fn bridge_event_to_runtime_event(event: &BridgeEvent) -> RuntimeEvent {
             project,
             parent_run_id,
             correlation_id: _,
+            agent_role_id,
         } => RuntimeEvent::RunCreated(RunCreated {
             project: project.clone(),
             session_id: session_id.clone(),
             run_id: run_id.clone(),
             parent_run_id: parent_run_id.clone(),
             prompt_release_id: None,
-            agent_role_id: None,
+            agent_role_id: agent_role_id.clone(),
         }),
         BridgeEvent::ExecutionCompleted {
             run_id,
@@ -695,6 +705,7 @@ mod tests {
             project: ProjectKey::new("t", "w", "p"),
             parent_run_id: None,
             correlation_id: None,
+            agent_role_id: None,
         };
         let runtime = bridge_event_to_runtime_event(&event);
         assert!(matches!(runtime, RuntimeEvent::RunCreated(_)));
@@ -710,10 +721,32 @@ mod tests {
             project: ProjectKey::new("t", "w", "p"),
             parent_run_id: Some(RunId::new("parent_run")),
             correlation_id: None,
+            agent_role_id: None,
         };
         match bridge_event_to_runtime_event(&event) {
             RuntimeEvent::RunCreated(rc) => {
                 assert_eq!(rc.parent_run_id, Some(RunId::new("parent_run")));
+            }
+            _ => panic!("expected RunCreated"),
+        }
+    }
+
+    // #670 G6 regression: agent_role_id threads through to RunCreated
+    // so the child's orchestrator loop picks up the delegated role's
+    // system prompt on its first iteration.
+    #[test]
+    fn bridge_event_to_runtime_created_propagates_agent_role_id() {
+        let event = BridgeEvent::ExecutionCreated {
+            run_id: RunId::new("child_run"),
+            session_id: SessionId::new("sess_1"),
+            project: ProjectKey::new("t", "w", "p"),
+            parent_run_id: Some(RunId::new("parent_run")),
+            correlation_id: None,
+            agent_role_id: Some("researcher".to_owned()),
+        };
+        match bridge_event_to_runtime_event(&event) {
+            RuntimeEvent::RunCreated(rc) => {
+                assert_eq!(rc.agent_role_id, Some("researcher".to_owned()));
             }
             _ => panic!("expected RunCreated"),
         }
@@ -727,6 +760,7 @@ mod tests {
             project: ProjectKey::new("t", "w", "p"),
             parent_run_id: None,
             correlation_id: Some("corr_xyz".to_owned()),
+            agent_role_id: None,
         };
         assert_eq!(bridge_event_correlation_id(&with_corr), Some("corr_xyz"));
 
@@ -736,6 +770,7 @@ mod tests {
             project: ProjectKey::new("t", "w", "p"),
             parent_run_id: None,
             correlation_id: None,
+            agent_role_id: None,
         };
         assert_eq!(bridge_event_correlation_id(&without_corr), None);
 
