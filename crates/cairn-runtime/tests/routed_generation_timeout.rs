@@ -81,16 +81,21 @@ async fn routed_generation_per_call_timeout_falls_back() {
     });
     let quick = Arc::new(QuickProvider);
 
+    // #693 R3-A: disable same-model retry so this test stays focused
+    // on the bounded-time fallback semantic (one timeout → advance to
+    // next binding). The retry schedule is covered by the
+    // `model_chain` tests; here we want the timeout-driven advance
+    // to fire after a single failed attempt, not after 3 × backoff.
     let svc = RoutedGenerationService::new(vec![
         RoutedBinding {
             binding_id: "slow".into(),
             provider: hung,
-            chain: ModelChain::single("hung-model"),
+            chain: ModelChain::single("hung-model").with_retry_budget(0, Duration::ZERO),
         },
         RoutedBinding {
             binding_id: "fast".into(),
             provider: quick,
-            chain: ModelChain::single("ok-model"),
+            chain: ModelChain::single("ok-model").with_retry_budget(0, Duration::ZERO),
         },
     ])
     // 500ms ceiling — strictly less than the 30s sleep so the routing
@@ -127,16 +132,18 @@ async fn routed_generation_all_hang_exhausts_in_bounded_time() {
     let hung = Arc::new(HangingProvider {
         sleep: Duration::from_secs(30),
     });
+    // #693 R3-A: disable retry so the "N × timeout" bound holds. With
+    // retries, each binding would burn timeout + backoff per retry.
     let svc = RoutedGenerationService::new(vec![
         RoutedBinding {
             binding_id: "b1".into(),
             provider: hung.clone(),
-            chain: ModelChain::single("m1"),
+            chain: ModelChain::single("m1").with_retry_budget(0, Duration::ZERO),
         },
         RoutedBinding {
             binding_id: "b2".into(),
             provider: hung,
-            chain: ModelChain::single("m2"),
+            chain: ModelChain::single("m2").with_retry_budget(0, Duration::ZERO),
         },
     ])
     .with_per_call_timeout(Duration::from_millis(300));

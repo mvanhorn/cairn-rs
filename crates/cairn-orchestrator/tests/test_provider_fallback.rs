@@ -158,6 +158,12 @@ fn err_invalid() -> Programmed {
 }
 
 /// Build a single-binding routed service with the given model chain.
+///
+/// #693 R3-A: disable same-model retry so these fallback integration
+/// tests stay focused on the advance-on-fallback axis. The retry
+/// schedule is covered by the `model_chain` unit tests. Without the
+/// override, `SequencedProvider` scripts would run out of programmed
+/// outcomes (retry consumes the queue 3× per model).
 fn routed_single_binding(
     provider: Arc<SequencedProvider>,
     models: Vec<&str>,
@@ -165,7 +171,8 @@ fn routed_single_binding(
     RoutedGenerationService::new(vec![RoutedBinding {
         binding_id: "b1".to_owned(),
         provider,
-        chain: ModelChain::new(models.iter().map(|s| (*s).to_owned())),
+        chain: ModelChain::new(models.iter().map(|s| (*s).to_owned()))
+            .with_retry_budget(0, std::time::Duration::ZERO),
     }])
 }
 
@@ -285,16 +292,19 @@ async fn test_cross_binding_fallback() {
     // succeeds. This is the cross-binding axis — ProviderRouter territory.
     let p1 = SequencedProvider::new(vec![("a1", vec![err_5xx()])]);
     let p2 = SequencedProvider::new(vec![("b1", vec![ok_response()])]);
+    // #693 R3-A: disable retry so this stays a cross-binding test.
+    // Retry-per-model would consume p1's single "a1" script in 1
+    // attempt + 2 retries × panic — tests the wrong axis.
     let service = RoutedGenerationService::new(vec![
         RoutedBinding {
             binding_id: "binding-a".into(),
             provider: p1.clone(),
-            chain: ModelChain::single("a1"),
+            chain: ModelChain::single("a1").with_retry_budget(0, std::time::Duration::ZERO),
         },
         RoutedBinding {
             binding_id: "binding-b".into(),
             provider: p2.clone(),
-            chain: ModelChain::single("b1"),
+            chain: ModelChain::single("b1").with_retry_budget(0, std::time::Duration::ZERO),
         },
     ]);
     let phase = LlmDecidePhase::from_routed(service);

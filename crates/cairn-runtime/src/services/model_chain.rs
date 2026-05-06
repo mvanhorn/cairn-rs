@@ -50,6 +50,28 @@ use cairn_domain::providers::ProviderAdapterError;
 /// operator can adjust via [`ModelChain::with_rate_limit_cooldown`].
 pub const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
+/// Default same-model retry budget on transient errors BEFORE advancing to
+/// the next model in the chain. Covers R3 dogfood Finding A
+/// (issue #693): free-tier providers routinely return `TimedOut` /
+/// `ServerError` on a first attempt that succeeds on a retry 1-3 s
+/// later. Without this retry, a single transient hiccup exhausts the
+/// chain and escalates to the operator.
+///
+/// `2` retries = up to 3 attempts per model. Picked to cover the
+/// common-case transient bucket (provider request-queue jitter) without
+/// meaningfully delaying genuine-exhaustion escalation (worst case:
+/// ~4 s of backoff sleep before the chain advances — 1 s before
+/// retry 1, 3 s before retry 2).
+pub const DEFAULT_MAX_RETRIES_PER_MODEL: u32 = 2;
+
+/// Base backoff between same-model retries. Multiplied by `3^n` per
+/// attempt (so 1 s before retry 1 and 3 s before retry 2 for the
+/// standard 2-retry budget; 9 s is reached only with a 3rd retry).
+/// Bounded exponential so we sleep through the provider's queue-
+/// jitter window without building a 30 s+ retry storm on a
+/// permanently-broken model.
+pub const DEFAULT_RETRY_BASE_BACKOFF: Duration = Duration::from_secs(1);
+
 /// A single failed attempt in a model chain.
 #[derive(Debug, Clone)]
 pub struct FallbackAttempt {
@@ -154,6 +176,12 @@ pub struct ModelChain {
     models: Vec<String>,
     cooldown: CooldownMap,
     rate_limit_cooldown: Duration,
+    /// #693 R3-A: same-model retry budget on transient errors. See
+    /// [`DEFAULT_MAX_RETRIES_PER_MODEL`].
+    max_retries_per_model: u32,
+    /// #693 R3-A: base backoff between retries (multiplied by `3^n`
+    /// per attempt). See [`DEFAULT_RETRY_BASE_BACKOFF`].
+    retry_base_backoff: Duration,
 }
 
 impl ModelChain {
@@ -175,6 +203,8 @@ impl ModelChain {
             models: deduped,
             cooldown: CooldownMap::new(),
             rate_limit_cooldown: DEFAULT_RATE_LIMIT_COOLDOWN,
+            max_retries_per_model: DEFAULT_MAX_RETRIES_PER_MODEL,
+            retry_base_backoff: DEFAULT_RETRY_BASE_BACKOFF,
         }
     }
 
@@ -190,6 +220,16 @@ impl ModelChain {
 
     pub fn with_cooldown(mut self, map: CooldownMap) -> Self {
         self.cooldown = map;
+        self
+    }
+
+    /// #693 R3-A: override the same-model retry budget. `max_retries`
+    /// is additional attempts AFTER the first — so `max_retries=0`
+    /// disables retry entirely. `base_backoff` is the sleep before
+    /// retry 1; retry N sleeps `base * 3^(N-1)`.
+    pub fn with_retry_budget(mut self, max_retries: u32, base_backoff: Duration) -> Self {
+        self.max_retries_per_model = max_retries;
+        self.retry_base_backoff = base_backoff;
         self
     }
 
@@ -236,39 +276,90 @@ impl ModelChain {
                 continue;
             }
 
-            match attempt(model_id.clone()).await {
-                Ok(value) => {
-                    return FallbackOutcome::Success {
-                        value,
-                        model_id: model_id.clone(),
-                        fallback_position: position,
-                        attempts,
-                    };
-                }
-                Err(err) => {
-                    let attempt_record = FallbackAttempt::new(model_id, &err);
-
-                    // Non-retryable (Auth / InvalidRequest) → escalate.
-                    if !err.is_fallback_eligible() {
-                        attempts.push(attempt_record);
-                        return FallbackOutcome::NonRetryable {
+            // #693 R3-A: same-model retry loop. `max_attempts = 1 +
+            // max_retries_per_model`; retry index 0 is the initial
+            // attempt, 1..N are retries with `base_backoff * 3^(N-1)`
+            // sleeps between them. RateLimited skips the retry loop
+            // entirely — its own cooldown mechanism is correct and
+            // retrying the same model inside the cooldown window would
+            // defeat the purpose.
+            let max_attempts = 1 + self.max_retries_per_model;
+            for attempt_index in 0..max_attempts {
+                match attempt(model_id.clone()).await {
+                    Ok(value) => {
+                        return FallbackOutcome::Success {
+                            value,
                             model_id: model_id.clone(),
-                            err,
+                            fallback_position: position,
                             attempts,
                         };
                     }
+                    Err(err) => {
+                        let attempt_record = FallbackAttempt::new(model_id, &err);
 
-                    // RateLimited → start cooldown before advancing.
-                    if matches!(err, ProviderAdapterError::RateLimited) {
-                        self.cooldown.record(model_id, self.rate_limit_cooldown);
+                        // Non-retryable (Auth / InvalidRequest) →
+                        // escalate immediately. Same semantic as
+                        // pre-R3-A.
+                        if !err.is_fallback_eligible() {
+                            attempts.push(attempt_record);
+                            return FallbackOutcome::NonRetryable {
+                                model_id: model_id.clone(),
+                                err,
+                                attempts,
+                            };
+                        }
+
+                        // RateLimited → cooldown + advance to next
+                        // model. Do NOT retry the same model inside
+                        // its own cooldown window.
+                        if matches!(err, ProviderAdapterError::RateLimited) {
+                            self.cooldown.record(model_id, self.rate_limit_cooldown);
+                            attempts.push(attempt_record);
+                            break;
+                        }
+
+                        attempts.push(attempt_record);
+
+                        // More retries available? Log before sleeping
+                        // so operators see "retry initiated" even if
+                        // the process is killed mid-backoff. Field
+                        // `model_attempt_index` is chain-scoped (0-based,
+                        // resets per-model) and deliberately distinct
+                        // from `RoutedGenerationService::generate`'s
+                        // global `attempt_index` so correlated log
+                        // analysis stays unambiguous.
+                        let retries_left = max_attempts - attempt_index - 1;
+                        if retries_left > 0 {
+                            let backoff = self.retry_backoff_for(attempt_index);
+                            tracing::warn!(
+                                model_id = %model_id,
+                                model_attempt_index = attempt_index,
+                                max_attempts = max_attempts,
+                                backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+                                "model_chain: retrying after transient provider error (#693 R3-A)",
+                            );
+                            tokio::time::sleep(backoff).await;
+                        }
                     }
-
-                    attempts.push(attempt_record);
                 }
             }
         }
 
         FallbackOutcome::Exhausted { attempts }
+    }
+
+    /// Compute the backoff before retry `attempt_index` (0-based —
+    /// so retry 1 uses `base`, retry 2 uses `base * 3`, retry 3 uses
+    /// `base * 9`). Kept as a pure helper for deterministic test
+    /// coverage of the schedule.
+    fn retry_backoff_for(&self, attempt_index: u32) -> Duration {
+        // `3u32.pow(attempt_index)` can overflow if the caller ever
+        // configures a very large retry budget; clamp to 9 (= 3^2,
+        // the standard 3-attempt schedule). Saturating behaviour
+        // means a badly-configured chain worst-case sleeps 9×base
+        // between retries instead of panicking.
+        let multiplier = 3u32.saturating_pow(attempt_index).min(9);
+        self.retry_base_backoff.saturating_mul(multiplier)
     }
 }
 
@@ -412,7 +503,12 @@ mod tests {
 
     #[tokio::test]
     async fn chain_advances_on_5xx_then_succeeds() {
-        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]);
+        // Disable retries so this test isolates the advance-on-5xx
+        // semantic. With retries enabled, m1's second attempt would
+        // succeed and the fallback would never fire — verified by the
+        // dedicated retry-budget tests below.
+        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()])
+            .with_retry_budget(0, Duration::ZERO);
         let mut first = true;
         let outcome = chain
             .run(|m| {
@@ -432,7 +528,11 @@ mod tests {
 
     #[tokio::test]
     async fn chain_advances_on_empty_response() {
-        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]);
+        // Disable retries so this test isolates the advance-on-empty
+        // semantic. #693 R3-A's retry would otherwise consume the
+        // `Err(err_empty())` branch multiple times before advancing.
+        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()])
+            .with_retry_budget(0, Duration::ZERO);
         let mut first = true;
         let outcome = chain
             .run(|m| {
@@ -493,7 +593,11 @@ mod tests {
 
     #[tokio::test]
     async fn chain_exhausts_when_all_fail_retryably() {
-        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned(), "m3".to_owned()]);
+        // Disable retries so this test isolates the per-model advance
+        // invariant (3 models → 3 attempts). See the dedicated
+        // retry-budget tests for the retries-per-model dimension.
+        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned(), "m3".to_owned()])
+            .with_retry_budget(0, Duration::ZERO);
         let outcome: FallbackOutcome<()> = chain.run(|_m| async move { Err(err_5xx()) }).await;
         match outcome {
             FallbackOutcome::Exhausted { attempts } => {
@@ -585,5 +689,176 @@ mod tests {
     fn format_attempt_summary_empty_is_graceful() {
         let s = format_attempt_summary(&[]);
         assert!(s.contains("no models"));
+    }
+
+    // ── #693 R3-A: same-model retry budget tests ──────────────────────────
+
+    /// Transient 5xx on the first attempt recovers on retry. The
+    /// chain must NOT advance to the next model — exhaustion was
+    /// never tripped.
+    #[tokio::test]
+    async fn retry_recovers_after_transient_5xx() {
+        // `retry_base_backoff` shrunk to 1 ms so the test stays
+        // sub-millisecond on real-time tokio (this crate's test
+        // harness doesn't enable tokio-test-util's `start_paused`).
+        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()])
+            .with_retry_budget(2, Duration::from_millis(1));
+        // Budget = 2 retries (3 attempts). Fail once, recover.
+        let mut calls = 0;
+        let outcome = chain
+            .run(|m| {
+                calls += 1;
+                let call = calls;
+                async move {
+                    if call == 1 {
+                        Err(err_5xx())
+                    } else {
+                        Ok(format!("ok-{m}"))
+                    }
+                }
+            })
+            .await;
+        assert_eq!(calls, 2, "expected 1 fail + 1 retry success");
+        match outcome {
+            FallbackOutcome::Success {
+                value,
+                model_id,
+                fallback_position,
+                attempts,
+            } => {
+                assert_eq!(value, "ok-m1");
+                assert_eq!(model_id, "m1", "must recover on same model, not advance");
+                assert_eq!(fallback_position, 0);
+                assert_eq!(attempts.len(), 1, "pre-recover failure recorded");
+                assert_eq!(attempts[0].reason_code, "upstream_5xx");
+            }
+            other => panic!("expected Success via retry, got {other:?}"),
+        }
+    }
+
+    /// Retry budget exhausted → chain advances to next model. Each
+    /// attempt against m1 records a separate `FallbackAttempt`, so
+    /// `attempts` carries `max_retries + 1` entries for m1 before
+    /// m2 is tried.
+    #[tokio::test]
+    async fn retry_exhausts_then_advances_to_next_model() {
+        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()])
+            .with_retry_budget(2, Duration::from_millis(1));
+        // m1 fails all 3 attempts; m2 succeeds on first.
+        let mut calls: Vec<String> = Vec::new();
+        let outcome = chain
+            .run(|m| {
+                calls.push(m.clone());
+                async move {
+                    if m == "m1" {
+                        Err(err_5xx())
+                    } else {
+                        Ok(m)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(
+            calls,
+            vec!["m1", "m1", "m1", "m2"],
+            "3 attempts at m1 (1 initial + 2 retries) then advance to m2",
+        );
+        match outcome {
+            FallbackOutcome::Success {
+                model_id,
+                fallback_position,
+                attempts,
+                ..
+            } => {
+                assert_eq!(model_id, "m2");
+                assert_eq!(fallback_position, 1);
+                assert_eq!(attempts.len(), 3, "all 3 m1 attempts recorded");
+                for a in &attempts {
+                    assert_eq!(a.model_id, "m1");
+                    assert_eq!(a.reason_code, "upstream_5xx");
+                }
+            }
+            other => panic!("expected Success on m2, got {other:?}"),
+        }
+    }
+
+    /// Non-retryable error (Auth) must NOT retry — escalates
+    /// immediately on the first attempt. Protects the pre-R3-A
+    /// invariant.
+    #[tokio::test]
+    async fn non_retryable_short_circuits_without_retry() {
+        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]);
+        let mut calls = 0;
+        let outcome: FallbackOutcome<()> = chain
+            .run(|_m| {
+                calls += 1;
+                async move { Err(err_auth()) }
+            })
+            .await;
+        assert_eq!(calls, 1, "Auth must not retry");
+        match outcome {
+            FallbackOutcome::NonRetryable { model_id, .. } => assert_eq!(model_id, "m1"),
+            other => panic!("expected NonRetryable, got {other:?}"),
+        }
+    }
+
+    /// RateLimited advances to the next model immediately — do NOT
+    /// retry the same model inside its cooldown window. Preserves
+    /// the existing cooldown-vs-retry separation.
+    #[tokio::test]
+    async fn rate_limited_advances_without_same_model_retry() {
+        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]);
+        let mut calls: Vec<String> = Vec::new();
+        let outcome = chain
+            .run(|m| {
+                calls.push(m.clone());
+                async move {
+                    if m == "m1" {
+                        Err(err_rate_limited())
+                    } else {
+                        Ok(m)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(
+            calls,
+            vec!["m1", "m2"],
+            "rate-limited m1 advances to m2 immediately; NO same-model retry inside cooldown",
+        );
+        assert!(matches!(outcome, FallbackOutcome::Success { .. }));
+    }
+
+    /// `with_retry_budget(0, _)` disables retry — exhaustion fires
+    /// on the first attempt per model, matching pre-R3-A behaviour.
+    /// Used by pre-existing tests that isolate advance semantics.
+    #[tokio::test]
+    async fn retry_budget_zero_disables_retry() {
+        let chain = ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()])
+            .with_retry_budget(0, Duration::ZERO);
+        let mut calls = 0;
+        let outcome: FallbackOutcome<()> = chain
+            .run(|_m| {
+                calls += 1;
+                async move { Err(err_5xx()) }
+            })
+            .await;
+        assert_eq!(calls, 2, "1 attempt per model × 2 models");
+        assert!(matches!(outcome, FallbackOutcome::Exhausted { .. }));
+    }
+
+    /// Backoff schedule: `base * 3^n` clamped to `base * 9`. Verifies
+    /// the pure helper without involving the runtime.
+    #[test]
+    fn retry_backoff_schedule_is_base_times_three_to_n() {
+        let chain =
+            ModelChain::new(vec!["m1".to_owned()]).with_retry_budget(5, Duration::from_secs(1));
+        assert_eq!(chain.retry_backoff_for(0), Duration::from_secs(1));
+        assert_eq!(chain.retry_backoff_for(1), Duration::from_secs(3));
+        assert_eq!(chain.retry_backoff_for(2), Duration::from_secs(9));
+        // Clamped at 9× so a misconfigured budget never generates a
+        // 30-minute sleep.
+        assert_eq!(chain.retry_backoff_for(3), Duration::from_secs(9));
+        assert_eq!(chain.retry_backoff_for(10), Duration::from_secs(9));
     }
 }

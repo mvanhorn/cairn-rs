@@ -2029,10 +2029,25 @@ mod tests {
     #[tokio::test]
     async fn decide_propagates_provider_error() {
         // With the fallback chain in place, a retryable provider error
-        // against a single-model chain exhausts immediately and surfaces
-        // `AllProvidersExhausted` with one attempt recorded. Non-retryable
-        // errors (Auth / InvalidRequest) still surface as `Decide(...)`.
-        let phase = LlmDecidePhase::new(Arc::new(FailingProvider), "gemma4");
+        // against a single-model chain exhausts and surfaces
+        // `AllProvidersExhausted`. Non-retryable errors (Auth /
+        // InvalidRequest) still surface as `Decide(...)`.
+        //
+        // #693 R3-A: disable same-model retry via
+        // `with_retry_budget(0, _)` so this test isolates the
+        // exhaustion-on-transport-failure semantic. Without the
+        // override, the retry loop would record 3 attempts
+        // (1 + 2 retries) before falling through — the retry
+        // semantics themselves are covered by the dedicated
+        // `model_chain` tests.
+        let binding = cairn_runtime::RoutedBinding {
+            binding_id: "single".to_owned(),
+            provider: Arc::new(FailingProvider),
+            chain: cairn_runtime::ModelChain::single("gemma4")
+                .with_retry_budget(0, std::time::Duration::ZERO),
+        };
+        let routed = cairn_runtime::RoutedGenerationService::new(vec![binding]);
+        let phase = LlmDecidePhase::from_routed(routed);
         let err = phase.decide(&ctx(), &empty_gather()).await.unwrap_err();
         match err {
             OrchestratorError::AllProvidersExhausted { attempts } => {

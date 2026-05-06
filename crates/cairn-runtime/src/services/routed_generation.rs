@@ -585,16 +585,21 @@ mod tests {
             ),
         ]);
         let p2 = ScriptedProvider::new(vec![("b1", vec![ScriptStep::Ok("ok".into())])]);
+        // #693 R3-A: disable same-model retry so this test stays
+        // focused on the cross-binding fallback axis. Retry-per-model
+        // is covered by the `model_chain` test suite.
         let svc = RoutedGenerationService::new(vec![
             RoutedBinding {
                 binding_id: "binding-a".into(),
                 provider: p1,
-                chain: ModelChain::new(vec!["a1".to_owned(), "a2".to_owned()]),
+                chain: ModelChain::new(vec!["a1".to_owned(), "a2".to_owned()])
+                    .with_retry_budget(0, std::time::Duration::ZERO),
             },
             RoutedBinding {
                 binding_id: "binding-b".into(),
                 provider: p2,
-                chain: ModelChain::new(vec!["b1".to_owned()]),
+                chain: ModelChain::new(vec!["b1".to_owned()])
+                    .with_retry_budget(0, std::time::Duration::ZERO),
             },
         ]);
         let ok = svc.generate(vec![], &settings(), &tools()).await.unwrap();
@@ -673,10 +678,14 @@ mod tests {
                 })],
             ),
         ]);
+        // #693 R3-A: disable same-model retry so the attempts vec
+        // stays at 2 (one per model) — the retry schedule itself
+        // is covered by the `model_chain` tests.
         let svc = RoutedGenerationService::new(vec![RoutedBinding {
             binding_id: "b1".into(),
             provider: p,
-            chain: ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]),
+            chain: ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()])
+                .with_retry_budget(0, std::time::Duration::ZERO),
         }]);
         let err = svc
             .generate(vec![], &settings(), &tools())
