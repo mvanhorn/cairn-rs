@@ -1914,10 +1914,16 @@ mod tests {
     fn system_prompt_references_orchestrator_role() {
         // Legacy text-mode (no native tool calling): mentions invoke_tool envelope.
         let sys = build_system_prompt("orchestrator", &[], false);
+        // #702 fix: the orchestrator role identity is task-neutral
+        // ("senior autonomous orchestrator") rather than the pre-#702
+        // code-biased "senior engineer executing an autonomous coding
+        // run". Assert on the orchestration-specialty anchor that
+        // replaced it. Prompt text is owned by cairn-domain::agent_roles.
         assert!(
-            sys.contains("senior engineer"),
-            "should use orchestrator role identity (senior engineer) — \
-             prompt text is owned by cairn-domain::agent_roles"
+            sys.contains("senior autonomous orchestrator"),
+            "should use orchestrator role identity — prompt text is owned by \
+             cairn-domain::agent_roles and must name the orchestrator's \
+             specialty explicitly"
         );
         assert!(
             sys.contains("JSON array"),
