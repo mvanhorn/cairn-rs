@@ -9,6 +9,14 @@
 //! failure as an operator approval card in the tool-call-approvals UI
 //! so ops can rotate credentials / add a provider / abort the run
 //! without hunting through logs.
+//!
+//! Complementing that card, [`suspend_run_for_providers_exhausted`] flips
+//! the run's lifecycle state to `WaitingApproval` so `GET /v1/runs/:id`
+//! reports the run as blocked-on-operator rather than the stale
+//! `Running` state that was the #693 dogfood R3-B finding. Without the
+//! flip, operators looking at the runs list see `running` and assume
+//! forward progress — but no worker is driving the run; it's waiting
+//! on a human to resolve the `escalate_to_operator` card emitted above.
 
 use std::sync::Arc;
 
@@ -93,4 +101,72 @@ pub(super) async fn submit_all_providers_exhausted_proposal(
         tracing::warn!(error = %e, "failed to submit providers-exhausted tool-call approval");
         e.to_string()
     })
+}
+
+/// Flip the run to `WaitingApproval` after the providers-exhausted
+/// escalation card has been submitted so `GET /v1/runs/:id` no longer
+/// reports the run as `running` while it's actually blocked on operator
+/// action (#693 R3-B).
+///
+/// Reuses the existing `RunService::enter_waiting_approval` primitive
+/// — the same one the regular tool-call approval path relies on — so
+/// that the approve/reject round trip on the escalate_to_operator card
+/// resumes the run through the standard `resolve_approval` path without
+/// bespoke wiring. No new `RunState` variant was introduced: the
+/// operator-visible semantics ("blocked on operator decision") match
+/// `WaitingApproval` exactly, and reusing it keeps dashboards,
+/// lease-keeper suppression (#666 skip-renew-while-pending), and
+/// resume plumbing coherent.
+///
+/// Best-effort like [`submit_all_providers_exhausted_proposal`]: the
+/// caller is already returning HTTP 502 with the inline summary.
+/// Failures here are logged at `error` (not swallowed at `warn`) because
+/// they result in operator-visible state drift: the approval card
+/// appears but the run still reports `state=running`. Surfacing at
+/// `error` gives ops a grep-able marker (`r3b_state_transition_failed`)
+/// that distinguishes this drift from benign `InvalidTransition`
+/// already-terminal races, which log at `debug`.
+pub(super) async fn suspend_run_for_providers_exhausted(
+    state: &AppState,
+    run: &cairn_store::projections::RunRecord,
+) {
+    match state
+        .runtime
+        .runs
+        .enter_waiting_approval(&run.session_id, &run.run_id)
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                run_id = %run.run_id,
+                session_id = %run.session_id,
+                "#693 R3-B: run transitioned to waiting_approval after providers-exhausted escalation"
+            );
+        }
+        Err(err) => {
+            // `InvalidTransition` is the benign already-terminal race:
+            // the loop's terminal handler finalized the run before we
+            // got here, so the state is already past `Running`. Log at
+            // debug and move on.
+            match &err {
+                cairn_runtime::error::RuntimeError::InvalidTransition { .. } => {
+                    tracing::debug!(
+                        run_id = %run.run_id,
+                        error = %err,
+                        "#693 R3-B: run already in a terminal or suspended state; skip waiting_approval flip"
+                    );
+                }
+                _ => {
+                    tracing::error!(
+                        run_id = %run.run_id,
+                        session_id = %run.session_id,
+                        error = %err,
+                        r3b_state_transition_failed = true,
+                        "#693 R3-B: failed to flip run to waiting_approval after providers-exhausted escalation; \
+                         GET /v1/runs/:id may report stale state=running while the escalate_to_operator card is pending"
+                    );
+                }
+            }
+        }
+    }
 }

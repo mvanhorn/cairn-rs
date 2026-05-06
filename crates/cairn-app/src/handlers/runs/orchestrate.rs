@@ -1901,8 +1901,7 @@ pub(crate) async fn drive_run_iteration(
                         // operators have a trace that no card appeared in the
                         // tool-call-approvals UI. Never silently discard a
                         // `store.append`-backed Result.
-                        if let Err(err) =
-                            super::orchestrate_exhaustion::submit_all_providers_exhausted_proposal(
+                        let proposal_submitted = match super::orchestrate_exhaustion::submit_all_providers_exhausted_proposal(
                                 state.as_ref(),
                                 &run,
                                 &model_id,
@@ -1911,11 +1910,32 @@ pub(crate) async fn drive_run_iteration(
                             )
                             .await
                         {
-                            tracing::error!(
-                                run_id = %run.run_id,
-                                error = %err,
-                                "failed to submit providers-exhausted tool-call approval; operator will not see the card in the UI (HTTP 502 body still carries the summary)"
-                            );
+                            Ok(()) => true,
+                            Err(err) => {
+                                tracing::error!(
+                                    run_id = %run.run_id,
+                                    error = %err,
+                                    "failed to submit providers-exhausted tool-call approval; operator will not see the card in the UI (HTTP 502 body still carries the summary)"
+                                );
+                                false
+                            }
+                        };
+                        // #693 R3-B: once the escalate_to_operator card is
+                        // durably persisted, flip the run to `WaitingApproval`
+                        // so `GET /v1/runs/:id` reflects the real state
+                        // ("blocked on human to resolve the exhaustion card")
+                        // rather than the misleading `Running`. Only attempt
+                        // when the proposal actually landed — otherwise
+                        // suspending the run would leave it parked on a
+                        // waitpoint with no card for the operator to
+                        // approve/reject, which is worse than the stale
+                        // `running` that the card-less path already produces.
+                        if proposal_submitted {
+                            super::orchestrate_exhaustion::suspend_run_for_providers_exhausted(
+                                state.as_ref(),
+                                &run,
+                            )
+                            .await;
                         }
                         // SEC-007: `summary` + `a.error_message` are built from
                         // `ProviderAdapterError::to_string()` which for
