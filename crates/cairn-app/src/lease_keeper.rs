@@ -95,6 +95,41 @@
 //! on renew after a positive classification is a real surprise and
 //! logs at WARN so we can forensically reconstruct the race.
 //!
+//! ## Probe→renew race recovery (#685 Finding 3)
+//!
+//! Dogfood 2026-05-05 (`run_670_1778021965`) uncovered a residual
+//! race under 30 s+ LLM latency: the probe says `RenewableActive`,
+//! the renew FCALL arrives ~40 s later (tokio interval slack + the
+//! renew's own `describe_execution` round-trip + FF's scanner
+//! cadence), and FF rejects `execution_not_eligible` because the
+//! state vector has since flipped. The pre-#685 keeper treated that
+//! as fatal and exited — which is strictly worse than retrying,
+//! because a subsequent `/orchestrate` HTTP call is needed to
+//! re-spawn the keeper, and if the operator is waiting on a 2-minute
+//! LLM response there is no HTTP call in flight. The lease then
+//! expires while the run looks healthy from the operator's side.
+//!
+//! The fix is a bounded re-probe on phase-conflict rejections:
+//!
+//!   * Re-probe reports `Terminal` / `ExecutionNotFound`: the run
+//!     completed or vanished between probe and renew; exit clean.
+//!   * Re-probe reports a non-renewable phase: we raced a legitimate
+//!     transition (approval landed, signal delivered, scanner marked
+//!     the attempt); log INFO, continue — the next tick observes the
+//!     new phase on its own probe.
+//!   * Re-probe STILL says `RenewableActive`: cairn-fabric and FF
+//!     disagree on the state vector (scanner mid-flight, or FF
+//!     reshaped the phase inside the RPC). Log WARN with both
+//!     classifications, bump the `probe_renew_classification_mismatch`
+//!     observability counter, and continue — bounded by
+//!     [`KEEPER_CLASSIFICATION_MISMATCH_CAP`] consecutive mismatches
+//!     before we exit and let a later HTTP call re-spawn a fresh
+//!     keeper.
+//!
+//! Non-phase-conflict errors preserve the #666 exit-on-surprise
+//! contract: transport failures and operator-revoked leases should
+//! not silently retry.
+//!
 //! # Exit conditions
 //!
 //! The keeper **task** exits when ANY of:
@@ -197,6 +232,27 @@ const KEEPER_MAX_INTERVAL_MS: u64 = 60_000;
 /// falls back to `lease_ttl_ms / 3` which matches FF's internal
 /// renewer cadence.
 const KEEPER_INTERVAL_ENV: &str = "CAIRN_LEASE_KEEPER_INTERVAL_MS";
+
+/// Consecutive-tick cap on the #685 classification-mismatch retry
+/// path. When `renew_lease_if_stale` returns a phase-conflict
+/// rejection immediately after a positive `RenewableActive` probe,
+/// and the subsequent re-probe STILL says `RenewableActive`, the
+/// keeper is racing FF's internal scanner / expiry cadence in a
+/// window the probe cannot close. One or two of these per run is
+/// expected under 30 s+ LLM latency (issue #685 Finding 3 repro);
+/// three in a row means something is structurally wrong — the lease
+/// is probably dead and FF just hasn't rolled the expiry forward
+/// yet, OR cairn-fabric and FF disagree on the state vector. In
+/// either case we exit so a subsequent `/orchestrate` HTTP call can
+/// spawn a fresh keeper against whatever FF state is current.
+///
+/// The cap is a bound, not a heuristic: the keeper tick interval
+/// (500 ms floor, `lease_ttl_ms / 3` default) is the natural rate
+/// limit. Three consecutive mismatches at the 500 ms floor is
+/// 1.5 s of wall-clock; at the 30 s/3 default it's 30 s. Both are
+/// safely below a minute-scale lease TTL, so the keeper never
+/// burns through a full lease retrying.
+const KEEPER_CLASSIFICATION_MISMATCH_CAP: u32 = 3;
 
 /// Phase classification driving the keeper's per-tick decision
 /// whether to issue `ff_renew_lease` (#666).
@@ -328,6 +384,14 @@ async fn classify_phase(
 ///   class error — i.e. the exact FF phase-conflict rejections the
 ///   pre-#666 keeper's silent-retry classifier papered over —
 ///   `renew_rejections` is incremented.
+/// * Every time a phase-conflict rejection fires after a positive
+///   probe AND the re-probe still reports `RenewableActive` (issue
+///   #685 Finding 3) — the exact probe→renew race that long LLM
+///   calls widen — `probe_renew_classification_mismatch` is
+///   incremented. Pre-#685 this symptom exited the keeper; post-#685
+///   the keeper re-probes and skips the tick instead, so this
+///   counter distinguishes "keeper raced FF and recovered" from
+///   "keeper hit a legitimate phase transition".
 /// * `tick_completed.notify_waiters()` fires at the end of every
 ///   keeper-loop iteration (after the phase probe, after any renew
 ///   result is handled). Test code blocks on
@@ -363,6 +427,18 @@ pub struct KeeperObservability {
     /// pre-#666 `is_transient_phase_conflict` classifier silently
     /// retried on, causing the lease-expiry bug.
     pub renew_rejections: AtomicUsize,
+    /// Count of classification mismatches observed on the #685
+    /// re-probe path: the initial probe said `RenewableActive`, the
+    /// renew FCALL rejected with a phase-conflict error, and the
+    /// re-probe STILL says `RenewableActive`. This signals the
+    /// probe→renew race that long LLM calls widen (issue #685
+    /// Finding 3). Operators watching this counter climb know the
+    /// keeper is racing FF's scanner rather than hitting a legit
+    /// phase transition — which is distinguishable because the
+    /// other branch (re-probe flips to non-renewable) is the
+    /// expected happy path when approval-wait or suspend lands
+    /// between probe and renew.
+    pub probe_renew_classification_mismatch: AtomicUsize,
     /// Notified exactly once at the end of every keeper-loop
     /// iteration (i.e. after the phase probe is evaluated and,
     /// where applicable, after a renew FCALL completes). Tests use
@@ -725,6 +801,13 @@ async fn run_keeper_loop(
     // FF lease's wall-clock has been ticking while we were paused;
     // the orchestrator's next terminal FCALL needs a fresh lease.
     let mut last: Option<PhaseClassification> = None;
+    // #685 Finding 3: count consecutive classification mismatches
+    // (probe said renewable, renew rejected, re-probe STILL says
+    // renewable). Reset on any tick that doesn't hit that exact
+    // path. Exit if we hit `KEEPER_CLASSIFICATION_MISMATCH_CAP` in a
+    // row — FF and cairn-fabric disagree on the state vector, and
+    // continuing to retry buys nothing.
+    let mut consecutive_classification_mismatches: u32 = 0;
     loop {
         tokio::select! {
             biased;
@@ -792,6 +875,21 @@ async fn run_keeper_loop(
                 }
                 last = Some(phase);
                 skip_renew = true;
+                // #685 Finding 3 (Gemini follow-up, PR #688): the
+                // mismatch counter's invariant — per the comment
+                // at the top of `run_keeper_loop` — is "consecutive
+                // mismatches IN A ROW, reset on any tick that
+                // doesn't hit that exact path". The initial probe
+                // reporting a non-renewable phase is NOT Path C
+                // (probe-renewable → renew-rejected → re-probe-
+                // renewable); it's a skip-this-tick outcome. In a
+                // flap scenario (renewable → Suspended → renewable
+                // with the probe/renew race still present) the
+                // mismatch ticks must not accumulate across the
+                // non-renewable detour, otherwise a pair of races
+                // separated by a legitimate Suspended wait would
+                // still trip the cap. Reset here.
+                consecutive_classification_mismatches = 0;
             }
             PhaseClassification::RenewableActive => {
                 if last
@@ -876,43 +974,192 @@ async fn run_keeper_loop(
                     }
                     return;
                 }
+                // A successful renew clears the mismatch streak: we've
+                // proved the keeper and FF agree on a renewable state.
+                consecutive_classification_mismatches = 0;
             }
             Err(err) => {
-                // #666: no silent retry on phase conflict. With the
-                // `read_execution_info` probe above, a
-                // `execution_not_eligible` here means FF flipped the
-                // phase between the probe and the renew — either a
-                // real race (log at WARN with the last classification
-                // so operators can correlate) or a permanent failure
-                // (exit). Either way, ending the loop is safe: a
-                // subsequent `/orchestrate` HTTP call will spawn a
-                // fresh keeper, and the existing lease is still live
-                // until wall-clock expiry.
+                // #685 Finding 3 (dogfood 2026-05-05): the original
+                // #666 keeper treated ANY renew error after a positive
+                // probe as fatal. Under 30s+ LLM latency the probe →
+                // renew gap widens (each tokio interval tick defers to
+                // the runtime, and the renew FCALL itself does its
+                // own `describe_execution`, giving FF's scanner two
+                // sample windows to flip the phase). The dogfood
+                // repro shows `last_classification=RenewableActive
+                // error=execution conflict: execution_not_eligible`,
+                // the keeper exits, and the lease expires while the
+                // operator is still waiting on the LLM call to return.
                 //
-                // Observability: count this as a rejection if it's
-                // an FF phase-conflict class so test code can contrast
-                // pre-fix (many rejections, silently retried) against
-                // post-fix (zero rejections, the probe skipped first).
+                // Fix: on a phase-conflict rejection, re-probe FF.
+                // Three outcomes:
+                //
+                // 1. Re-probe reports `Terminal` / `ExecutionNotFound`
+                //    → exit cleanly, the keeper's job is done. (Would
+                //    be incorrect to retry; the run completed or
+                //    vanished between the original probe and the
+                //    renew FCALL.)
+                // 2. Re-probe reports a non-renewable phase
+                //    (Suspended, RunnableUnclaimed, AttemptInterrupted,
+                //    PhaseInFlight) → we raced a legitimate transition
+                //    (approval landed, signal delivered, scanner
+                //    marked the attempt). Log at INFO, reset the
+                //    mismatch streak, continue: the next tick will
+                //    see the non-renewable phase on its own probe
+                //    and skip the renew cleanly.
+                // 3. Re-probe STILL says `RenewableActive` → cairn-
+                //    fabric and FF disagree on the state vector,
+                //    OR the scanner is flipping the phase inside the
+                //    RPC. Increment the mismatch counter, log WARN
+                //    with both classifications, and fall through to
+                //    the consecutive-mismatch cap. Below the cap we
+                //    continue (skip this tick, re-try on the next);
+                //    above the cap we exit.
+                //
+                // Non-phase-conflict errors preserve the #666
+                // exit-on-surprise contract: they are either
+                // transport-level (FF down) or logic-level (lease
+                // revoked by an operator), and retrying won't
+                // improve the situation.
+                if !is_phase_conflict_rejection(&err) {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        execution_id = %execution_id,
+                        last_classification = ?last,
+                        error = %err,
+                        "#685 lease keeper: renew_lease_if_stale failed with \
+                         non-phase-conflict error; exiting"
+                    );
+                    remove_self_from_registry(&weak_map, &run_id).await;
+                    if let Some(obs) = &observability {
+                        obs.tick_completed.notify_waiters();
+                    }
+                    return;
+                }
+
+                // Phase-conflict rejection: always count it.
                 if let Some(obs) = &observability {
-                    if is_phase_conflict_rejection(&err) {
-                        obs.renew_rejections.fetch_add(1, Ordering::SeqCst);
+                    obs.renew_rejections.fetch_add(1, Ordering::SeqCst);
+                }
+
+                // Re-probe immediately. The `read_execution_info` RPC
+                // is one round-trip against the same backend the
+                // renew FCALL just rejected on; if FF is down the
+                // re-probe errors out (classify_phase returns
+                // PhaseInFlight), which lands us in the non-
+                // renewable branch below — the keeper skips the
+                // tick and tries again on the next interval.
+                let reprobe = classify_phase(engine.as_ref(), &run_id, &execution_id).await;
+
+                match reprobe {
+                    PhaseClassification::Terminal => {
+                        tracing::info!(
+                            run_id = %run_id,
+                            execution_id = %execution_id,
+                            last_classification = ?last,
+                            error = %err,
+                            "#685 lease keeper: renew rejected then re-probe \
+                             reports terminal; exiting cleanly"
+                        );
+                        remove_self_from_registry(&weak_map, &run_id).await;
+                        if let Some(obs) = &observability {
+                            obs.tick_completed.notify_waiters();
+                        }
+                        return;
+                    }
+                    PhaseClassification::ExecutionNotFound => {
+                        tracing::info!(
+                            run_id = %run_id,
+                            execution_id = %execution_id,
+                            last_classification = ?last,
+                            error = %err,
+                            "#685 lease keeper: renew rejected then re-probe \
+                             reports execution missing; exiting cleanly"
+                        );
+                        remove_self_from_registry(&weak_map, &run_id).await;
+                        if let Some(obs) = &observability {
+                            obs.tick_completed.notify_waiters();
+                        }
+                        return;
+                    }
+                    PhaseClassification::RenewableActive => {
+                        // The mismatch path: both probes say
+                        // renewable, FF said otherwise. Bump the
+                        // counter; if we hit the cap, exit.
+                        consecutive_classification_mismatches =
+                            consecutive_classification_mismatches.saturating_add(1);
+                        if let Some(obs) = &observability {
+                            obs.probe_renew_classification_mismatch
+                                .fetch_add(1, Ordering::SeqCst);
+                        }
+
+                        if consecutive_classification_mismatches
+                            >= KEEPER_CLASSIFICATION_MISMATCH_CAP
+                        {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                execution_id = %execution_id,
+                                last_classification = ?last,
+                                reprobe_classification = ?reprobe,
+                                consecutive_mismatches =
+                                    consecutive_classification_mismatches,
+                                cap = KEEPER_CLASSIFICATION_MISMATCH_CAP,
+                                error = %err,
+                                "#685 lease keeper: hit classification-mismatch \
+                                 cap (probe+re-probe both RenewableActive, FF \
+                                 rejected); exiting. Subsequent /orchestrate \
+                                 calls will spawn a fresh keeper."
+                            );
+                            remove_self_from_registry(&weak_map, &run_id).await;
+                            if let Some(obs) = &observability {
+                                obs.tick_completed.notify_waiters();
+                            }
+                            return;
+                        }
+
+                        tracing::warn!(
+                            run_id = %run_id,
+                            execution_id = %execution_id,
+                            last_classification = ?last,
+                            reprobe_classification = ?reprobe,
+                            consecutive_mismatches =
+                                consecutive_classification_mismatches,
+                            cap = KEEPER_CLASSIFICATION_MISMATCH_CAP,
+                            error = %err,
+                            "#685 lease keeper: classification mismatch \
+                             (probe+re-probe both RenewableActive, FF rejected \
+                             renew); skipping this tick, retrying next interval"
+                        );
+                        last = Some(reprobe);
+                        // Fall through to tick_completed notification
+                        // below; `continue`-semantics by virtue of
+                        // being past the `match renew_result`.
+                    }
+                    PhaseClassification::Suspended
+                    | PhaseClassification::RunnableUnclaimed
+                    | PhaseClassification::AttemptInterrupted
+                    | PhaseClassification::PhaseInFlight => {
+                        // Legitimate phase transition between the
+                        // probe and the renew. Reset the mismatch
+                        // streak — this isn't the race we're guarding
+                        // against. Log at INFO (once per transition
+                        // class) so operators can see the keeper
+                        // recovered, then let the next tick sample
+                        // the new phase on its own probe.
+                        tracing::info!(
+                            run_id = %run_id,
+                            execution_id = %execution_id,
+                            last_classification = ?last,
+                            reprobe_classification = ?reprobe,
+                            error = %err,
+                            "#685 lease keeper: phase transitioned between \
+                             probe and renew; skipping this tick, next tick \
+                             will observe the new phase directly"
+                        );
+                        consecutive_classification_mismatches = 0;
+                        last = Some(reprobe);
                     }
                 }
-                tracing::warn!(
-                    run_id = %run_id,
-                    execution_id = %execution_id,
-                    last_classification = ?last,
-                    error = %err,
-                    "#666 lease keeper: renew_lease_if_stale failed after \
-                     positive phase probe; exiting"
-                );
-                // Natural exit (non-transient renew error): drop our
-                // registry entry.
-                remove_self_from_registry(&weak_map, &run_id).await;
-                if let Some(obs) = &observability {
-                    obs.tick_completed.notify_waiters();
-                }
-                return;
             }
         }
 
@@ -981,6 +1228,42 @@ mod tests {
     use cairn_runtime::RunService;
     use cairn_store::projections::RunRecord;
 
+    /// One scripted renew outcome. The optional `then_engine` closure
+    /// lets tests deterministically simulate the race the #685 fix
+    /// closes: inject an error response AND flip the engine's probe
+    /// view of the state vector in the same transaction, so the
+    /// keeper's re-probe sees whatever phase the test is proving the
+    /// recovery path handles. Mutates the engine **after** the
+    /// renew response is produced; the probe ordering inside the
+    /// keeper loop (probe → renew → re-probe) is preserved.
+    #[allow(clippy::type_complexity)]
+    struct MockRenewAction {
+        response: Result<RunRecord, RuntimeError>,
+        /// Optional post-response action on the engine. Awaited on
+        /// the keeper's task thread, before `renew_lease_if_stale`
+        /// returns to the caller — so the re-probe that follows
+        /// observes whatever state the closure installed.
+        then_engine: Option<
+            Box<
+                dyn FnOnce(
+                        Arc<MockEngine>,
+                    )
+                        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                    + Send
+                    + Sync,
+            >,
+        >,
+    }
+
+    impl MockRenewAction {
+        fn response(r: Result<RunRecord, RuntimeError>) -> Self {
+            Self {
+                response: r,
+                then_engine: None,
+            }
+        }
+    }
+
     /// Mock run service that records every `renew_lease_if_stale` call
     /// and returns a caller-controlled sequence of responses. Used to
     /// prove the keeper's exit-on-terminal and shutdown-on-cancel
@@ -992,7 +1275,12 @@ mod tests {
         /// is empty the mock returns a fresh running record so the
         /// keeper continues ticking.
         #[allow(clippy::type_complexity)]
-        responses: Mutex<Vec<Result<RunRecord, RuntimeError>>>,
+        responses: Mutex<Vec<MockRenewAction>>,
+        /// Optional engine handle used by `MockRenewAction::then_engine`
+        /// closures. Tests that don't use the race-simulation path
+        /// leave this `None`; tests that do set it via
+        /// [`MockRuns::with_engine`] before spawning the keeper.
+        engine_for_actions: Mutex<Option<Arc<MockEngine>>>,
     }
 
     impl MockRuns {
@@ -1025,7 +1313,28 @@ mod tests {
         }
 
         async fn push_response(&self, r: Result<RunRecord, RuntimeError>) {
-            self.responses.lock().await.push(r);
+            self.responses
+                .lock()
+                .await
+                .push(MockRenewAction::response(r));
+        }
+
+        /// Queue a scripted renew action: the `response` is returned
+        /// to the keeper, THEN (if provided) `then_engine` is awaited
+        /// against the engine handle installed via `with_engine`.
+        /// The keeper's re-probe on the #685 fix path observes the
+        /// mutated engine state.
+        async fn push_action(&self, action: MockRenewAction) {
+            self.responses.lock().await.push(action);
+        }
+
+        /// Associate an engine handle so queued `then_engine` closures
+        /// can mutate it. Must be called before the keeper is spawned
+        /// or the first renew will fire with `None` and the closure
+        /// becomes a no-op (logged via the test's own assertion on
+        /// the re-probe classification).
+        async fn with_engine(&self, engine: Arc<MockEngine>) {
+            *self.engine_for_actions.lock().await = Some(engine);
         }
     }
 
@@ -1126,11 +1435,26 @@ mod tests {
             _min_remaining_ms: u64,
         ) -> Result<RunRecord, RuntimeError> {
             self.renew_calls.fetch_add(1, Ordering::SeqCst);
-            let mut q = self.responses.lock().await;
-            if q.is_empty() {
-                return Ok(Self::running(RunState::Running));
+            let action = {
+                let mut q = self.responses.lock().await;
+                if q.is_empty() {
+                    return Ok(Self::running(RunState::Running));
+                }
+                q.remove(0)
+            };
+            // Run the post-response mutation BEFORE returning the
+            // response so the keeper's re-probe (which follows
+            // immediately after `renew_lease_if_stale` returns) sees
+            // the mutated engine state. This is the whole point of
+            // `MockRenewAction`: deterministically stage the
+            // probe → renew-fail → re-probe race without sleeps.
+            if let Some(then_engine) = action.then_engine {
+                let engine = self.engine_for_actions.lock().await.clone();
+                if let Some(engine) = engine {
+                    then_engine(engine).await;
+                }
             }
-            q.remove(0)
+            action.response
         }
     }
 
@@ -1863,6 +2187,730 @@ mod tests {
         // And confirm we observed exactly one renew — the terminal one.
         assert_eq!(mock.renew_calls.load(Ordering::SeqCst), 1);
         assert_eq!(obs.renew_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    /// Helper: build a phase-conflict `RuntimeError` of the exact
+    /// shape the FF adapter surfaces on `ff_renew_lease rejected:
+    /// execution_not_eligible`. This is the error the #685 dogfood
+    /// incident observed (`execution conflict:
+    /// execution_not_eligible` in `Display`). Matches
+    /// `is_transient_phase_conflict` so the keeper's observability
+    /// and re-probe paths activate.
+    fn phase_conflict_err() -> RuntimeError {
+        RuntimeError::Conflict {
+            entity: "execution",
+            id: "execution_not_eligible".to_owned(),
+        }
+    }
+
+    /// #685 Finding 3, happy-recovery case:
+    ///
+    /// The probe classifies the execution as `RenewableActive`, the
+    /// renew FCALL rejects with `execution_not_eligible`, and the
+    /// keeper's re-probe ALSO says `RenewableActive` (cairn-fabric
+    /// and FF disagree for one tick, scanner mid-flight). Pre-#685
+    /// the keeper exited on the first mismatch; post-#685 it bumps
+    /// the `probe_renew_classification_mismatch` counter, skips the
+    /// tick, and retries on the NEXT tick — which then succeeds.
+    ///
+    /// Test shape: queue one rejection action followed by a
+    /// successful renew response. Wait for two ticks via the
+    /// observability hook. Assert:
+    ///
+    /// * `renew_attempts == 2` (the rejected tick + the successful
+    ///   retry tick).
+    /// * `renew_rejections == 1` (the first renew).
+    /// * `probe_renew_classification_mismatch == 1` (the re-probe
+    ///   agreed with the initial probe, so the mismatch counter
+    ///   bumps exactly once).
+    /// * The keeper is STILL IN the registry (did not exit).
+    ///
+    /// Pre-fix contrast: the keeper exited after the first
+    /// rejection, so `renew_attempts == 1`,
+    /// `probe_renew_classification_mismatch` did not exist, and the
+    /// registry was empty within ~500 ms. Verified by temporarily
+    /// reverting the `Err(err)` branch to the pre-#685
+    /// `WARN + return` shape — the assertion on
+    /// `renew_attempts == 2` fails.
+    #[tokio::test]
+    async fn keeper_685_reprobe_retries_after_transient_race() {
+        let registry = Arc::new(LeaseKeeperRegistry::new());
+        let mock = Arc::new(MockRuns::default());
+        // First renew: inject the probe→renew race. Return a
+        // phase-conflict error; leave the engine set to
+        // RenewableActive so the re-probe ALSO says renewable —
+        // the exact mismatch the #685 fix must recover from.
+        mock.push_action(MockRenewAction {
+            response: Err(phase_conflict_err()),
+            then_engine: None,
+        })
+        .await;
+        // Second renew: success. Proves the keeper survived the
+        // first tick and is still ticking.
+        mock.push_response(Ok(MockRuns::running(RunState::Running)))
+            .await;
+
+        let runs: Arc<dyn RunService> = mock.clone();
+        let exec_id = test_execution_id();
+        // Engine pinned to RenewableActive for the entire test.
+        let engine_inner = Arc::new(MockEngine::new(make_info(
+            exec_id.clone(),
+            LifecyclePhase::Active,
+            AttemptState::RunningAttempt,
+            OwnershipState::Leased,
+        )));
+        mock.with_engine(engine_inner.clone()).await;
+        let engine: Arc<dyn Engine> = engine_inner.clone();
+
+        let run_id = RunId::new("run_685_retry");
+        let session_id = SessionId::new("sess_685_retry");
+        let obs = Arc::new(KeeperObservability::default());
+
+        registry
+            .ensure_running_with_observability(
+                run_id.clone(),
+                session_id,
+                exec_id,
+                runs,
+                engine,
+                // 1500 ms TTL → 500 ms tick. Two ticks fit well
+                // within a single-digit-second test window.
+                1_500,
+                obs.clone(),
+            )
+            .await;
+
+        // Wait for two ticks. Arm futures before checking counters
+        // so a `notify_waiters()` race can't drop the signal.
+        for tick in 1..=2 {
+            let notified = obs.tick_completed.notified();
+            tokio::pin!(notified);
+            tokio::time::timeout(Duration::from_secs(3), notified)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "keeper did not signal tick {tick}/2 within 3s — \
+                         keeper exited early? \
+                         renew_attempts={} renew_rejections={} mismatches={}",
+                        obs.renew_attempts.load(Ordering::SeqCst),
+                        obs.renew_rejections.load(Ordering::SeqCst),
+                        obs.probe_renew_classification_mismatch
+                            .load(Ordering::SeqCst),
+                    )
+                });
+        }
+
+        let attempts = obs.renew_attempts.load(Ordering::SeqCst);
+        let rejections = obs.renew_rejections.load(Ordering::SeqCst);
+        let mismatches = obs
+            .probe_renew_classification_mismatch
+            .load(Ordering::SeqCst);
+
+        assert_eq!(
+            attempts, 2,
+            "#685: keeper must retry on the next tick after a phase-\
+             conflict rejection whose re-probe agrees with the initial \
+             probe. Pre-fix the keeper exited on the first rejection \
+             and never issued the second renew.\n\n\
+             Observed: renew_attempts={attempts} \
+             renew_rejections={rejections} \
+             probe_renew_classification_mismatch={mismatches}"
+        );
+        assert_eq!(
+            rejections, 1,
+            "#685: exactly one renew should have been rejected \
+             (the first). Observed: rejections={rejections}"
+        );
+        assert_eq!(
+            mismatches, 1,
+            "#685: the mismatch counter must bump exactly once on \
+             the probe+re-probe-both-RenewableActive path. \
+             Observed: mismatches={mismatches}"
+        );
+        assert!(
+            registry.contains(&run_id).await,
+            "#685: keeper must still be registered after one \
+             transient mismatch; pre-fix it had exited"
+        );
+
+        registry.shutdown_all().await;
+    }
+
+    /// #685 Finding 3, bounded-retry case:
+    ///
+    /// Three consecutive classification mismatches force the keeper
+    /// to exit. This proves the fix is a *bounded* retry — not an
+    /// infinite loop that would silently wedge the keeper on a
+    /// permanently broken state vector. The cap is
+    /// [`KEEPER_CLASSIFICATION_MISMATCH_CAP`]; exceeding it logs
+    /// WARN and self-removes from the registry so a subsequent
+    /// `/orchestrate` HTTP call re-spawns a fresh keeper against
+    /// whatever state FF reports at that time.
+    #[tokio::test]
+    async fn keeper_685_exits_after_mismatch_cap() {
+        let registry = Arc::new(LeaseKeeperRegistry::new());
+        let mock = Arc::new(MockRuns::default());
+        // Queue exactly KEEPER_CLASSIFICATION_MISMATCH_CAP
+        // phase-conflict rejections. Engine stays RenewableActive
+        // throughout so every re-probe also says renewable and the
+        // mismatch counter climbs each tick. On the CAP-th tick the
+        // keeper should exit.
+        for _ in 0..KEEPER_CLASSIFICATION_MISMATCH_CAP {
+            mock.push_action(MockRenewAction {
+                response: Err(phase_conflict_err()),
+                then_engine: None,
+            })
+            .await;
+        }
+
+        let runs: Arc<dyn RunService> = mock.clone();
+        let exec_id = test_execution_id();
+        let engine_inner = Arc::new(MockEngine::new(make_info(
+            exec_id.clone(),
+            LifecyclePhase::Active,
+            AttemptState::RunningAttempt,
+            OwnershipState::Leased,
+        )));
+        mock.with_engine(engine_inner.clone()).await;
+        let engine: Arc<dyn Engine> = engine_inner.clone();
+
+        let run_id = RunId::new("run_685_cap");
+        let session_id = SessionId::new("sess_685_cap");
+        let obs = Arc::new(KeeperObservability::default());
+
+        registry
+            .ensure_running_with_observability(
+                run_id.clone(),
+                session_id,
+                exec_id,
+                runs,
+                engine,
+                1_500,
+                obs.clone(),
+            )
+            .await;
+
+        // Poll until the keeper has self-removed from the registry.
+        // At 500 ms per tick × CAP ticks + slack, 5 s is a safe
+        // ceiling. If the keeper wedged in a retry loop (the
+        // anti-pattern this cap guards against) the registry would
+        // still contain `run_id` at deadline and the assertion
+        // fails with a clear message.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.contains(&run_id).await {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "#685: keeper did not exit after {} consecutive \
+                     classification mismatches (would have retried \
+                     forever without the cap). \
+                     renew_attempts={} mismatches={}",
+                    KEEPER_CLASSIFICATION_MISMATCH_CAP,
+                    obs.renew_attempts.load(Ordering::SeqCst),
+                    obs.probe_renew_classification_mismatch
+                        .load(Ordering::SeqCst)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let attempts = obs.renew_attempts.load(Ordering::SeqCst);
+        let mismatches = obs
+            .probe_renew_classification_mismatch
+            .load(Ordering::SeqCst);
+        assert_eq!(
+            attempts as u32, KEEPER_CLASSIFICATION_MISMATCH_CAP,
+            "#685: keeper should have issued exactly CAP renew \
+             attempts before exiting. Observed: attempts={attempts}"
+        );
+        assert_eq!(
+            mismatches as u32, KEEPER_CLASSIFICATION_MISMATCH_CAP,
+            "#685: the mismatch counter should bump once per \
+             attempt at the cap. Observed: mismatches={mismatches}"
+        );
+
+        registry.shutdown_all().await;
+    }
+
+    /// #685 Finding 3, legit-transition recovery case:
+    ///
+    /// The probe classifies the execution as `RenewableActive`, the
+    /// renew FCALL rejects with `execution_not_eligible`, and the
+    /// re-probe reports `Suspended` — a legitimate phase transition
+    /// between the probe and the renew (approval landed mid-tick).
+    /// The keeper should log INFO, reset its mismatch streak, and
+    /// continue — the next tick's probe will see the Suspended
+    /// phase on its own and skip cleanly.
+    ///
+    /// Asserts the mismatch counter does NOT bump on this path —
+    /// the counter is reserved for the probe+re-probe-both-
+    /// RenewableActive case, so operators can distinguish "keeper
+    /// raced FF's scanner" from "keeper saw a legitimate
+    /// transition".
+    #[tokio::test]
+    async fn keeper_685_survives_legit_phase_transition() {
+        let registry = Arc::new(LeaseKeeperRegistry::new());
+        let mock = Arc::new(MockRuns::default());
+        let exec_id = test_execution_id();
+        let engine_inner = Arc::new(MockEngine::new(make_info(
+            exec_id.clone(),
+            LifecyclePhase::Active,
+            AttemptState::RunningAttempt,
+            OwnershipState::Leased,
+        )));
+        mock.with_engine(engine_inner.clone()).await;
+
+        // First renew: fail, AND flip the engine to Suspended
+        // so the keeper's re-probe observes the legitimate
+        // transition.
+        let flip_exec = exec_id.clone();
+        mock.push_action(MockRenewAction {
+            response: Err(phase_conflict_err()),
+            then_engine: Some(Box::new(move |engine: Arc<MockEngine>| {
+                let flip_exec = flip_exec.clone();
+                Box::pin(async move {
+                    engine
+                        .set_info(make_info(
+                            flip_exec,
+                            LifecyclePhase::Suspended,
+                            AttemptState::AttemptInterrupted,
+                            OwnershipState::Leased,
+                        ))
+                        .await;
+                })
+            })),
+        })
+        .await;
+
+        let runs: Arc<dyn RunService> = mock.clone();
+        let engine: Arc<dyn Engine> = engine_inner.clone();
+
+        let run_id = RunId::new("run_685_legit");
+        let session_id = SessionId::new("sess_685_legit");
+        let obs = Arc::new(KeeperObservability::default());
+
+        registry
+            .ensure_running_with_observability(
+                run_id.clone(),
+                session_id,
+                exec_id,
+                runs,
+                engine,
+                1_500,
+                obs.clone(),
+            )
+            .await;
+
+        // Wait for two ticks. First is the race tick; second is
+        // the post-flip tick where the probe should see Suspended
+        // and skip the renew entirely.
+        for tick in 1..=2 {
+            let notified = obs.tick_completed.notified();
+            tokio::pin!(notified);
+            tokio::time::timeout(Duration::from_secs(3), notified)
+                .await
+                .unwrap_or_else(|_| panic!("tick {tick}/2 not signalled"));
+        }
+
+        let attempts = obs.renew_attempts.load(Ordering::SeqCst);
+        let rejections = obs.renew_rejections.load(Ordering::SeqCst);
+        let mismatches = obs
+            .probe_renew_classification_mismatch
+            .load(Ordering::SeqCst);
+
+        assert_eq!(
+            attempts, 1,
+            "#685: only the first tick should have attempted a \
+             renew; the second tick's probe sees Suspended and \
+             skips. Observed: attempts={attempts}"
+        );
+        assert_eq!(
+            rejections, 1,
+            "#685: the first renew is rejected. \
+             Observed: rejections={rejections}"
+        );
+        assert_eq!(
+            mismatches, 0,
+            "#685: a legitimate probe → Suspended transition must \
+             NOT bump the mismatch counter — that counter is \
+             reserved for the probe+re-probe-both-RenewableActive \
+             race. Observed: mismatches={mismatches}"
+        );
+        assert!(
+            registry.contains(&run_id).await,
+            "#685: keeper must still be registered after a legit \
+             phase transition recovery"
+        );
+
+        registry.shutdown_all().await;
+    }
+
+    /// #685 Finding 3, Gemini MEDIUM follow-up (PR #688): the
+    /// `consecutive_classification_mismatches` counter must reset on
+    /// every tick that does NOT hit Path C (probe-renewable → renew-
+    /// rejected → re-probe-renewable). The initial probe reporting a
+    /// non-renewable phase — Path B — is a "skip this tick" outcome,
+    /// and must reset the streak just like a successful renew or a
+    /// legitimate-transition re-probe.
+    ///
+    /// Flap scenario the bug allows, pre-fix:
+    /// 1. Tick 1: probe RenewableActive, renew rejects, re-probe
+    ///    RenewableActive → mismatch counter 1.
+    /// 2. Tick 2: probe RenewableActive, renew rejects, re-probe
+    ///    RenewableActive → mismatch counter 2.
+    /// 3. Tick 3: probe Suspended (approval landed mid-run) →
+    ///    skip_renew = true. **Pre-fix: counter STAYS at 2.**
+    /// 4. Tick 4: probe RenewableActive (approval resolved), renew
+    ///    rejects, re-probe RenewableActive → pre-fix counter hits
+    ///    the cap (3) and the keeper EXITS — even though the two
+    ///    race windows were separated by a legitimate Suspended
+    ///    wait. Post-fix: the Suspended tick reset the counter, so
+    ///    tick 4 is a fresh streak of 1 and the keeper continues.
+    ///
+    /// The test orchestrates the flap deterministically via the
+    /// `tick_completed` hook and asserts the keeper is STILL
+    /// registered after tick 4. Pre-fix (counter not reset) the
+    /// keeper would have self-removed at tick 4; post-fix it stays.
+    ///
+    /// Pre-fix failure evidence: reverting the new
+    /// `consecutive_classification_mismatches = 0` assignment in the
+    /// non-renewable Path B branch causes this test to fail at the
+    /// `registry.contains(&run_id)` assertion within ~5 s.
+    #[tokio::test]
+    async fn keeper_685_mismatch_counter_resets_across_non_renewable_detour() {
+        let registry = Arc::new(LeaseKeeperRegistry::new());
+        let mock = Arc::new(MockRuns::default());
+        let exec_id = test_execution_id();
+
+        // Start engine in RenewableActive so the first two ticks
+        // enter the renew branch and take the mismatch path.
+        let engine_inner = Arc::new(MockEngine::new(make_info(
+            exec_id.clone(),
+            LifecyclePhase::Active,
+            AttemptState::RunningAttempt,
+            OwnershipState::Leased,
+        )));
+        mock.with_engine(engine_inner.clone()).await;
+
+        // Queue three phase-conflict rejections. Engine stays
+        // RenewableActive across them (no `then_engine` flip) so
+        // each re-probe agrees with the initial probe and the
+        // mismatch counter increments.
+        //
+        // Ticks 1+2 consume two rejections → counter reaches 2.
+        // Tick 3 probes Suspended (set from the test coroutine
+        // below) → no renew fires, no queued response consumed.
+        // Tick 4 probes RenewableActive again (test flips it back)
+        // → third queued rejection fires → counter would be 3 pre-
+        // fix, keeper exits. Post-fix: counter reset during tick 3,
+        // so tick 4 is streak=1 and keeper continues.
+        for _ in 0..3 {
+            mock.push_action(MockRenewAction {
+                response: Err(phase_conflict_err()),
+                then_engine: None,
+            })
+            .await;
+        }
+
+        let runs: Arc<dyn RunService> = mock.clone();
+        let engine: Arc<dyn Engine> = engine_inner.clone();
+
+        let run_id = RunId::new("run_685_flap_reset");
+        let session_id = SessionId::new("sess_685_flap_reset");
+        let obs = Arc::new(KeeperObservability::default());
+
+        // 1500 ms TTL → 500 ms tick. Four ticks ≈ 2 s wall-clock.
+        registry
+            .ensure_running_with_observability(
+                run_id.clone(),
+                session_id,
+                exec_id.clone(),
+                runs,
+                engine,
+                1_500,
+                obs.clone(),
+            )
+            .await;
+
+        // Tick 1: probe+re-probe both RenewableActive → mismatch 1.
+        let n1 = obs.tick_completed.notified();
+        tokio::pin!(n1);
+        tokio::time::timeout(Duration::from_secs(3), n1)
+            .await
+            .expect("tick 1/4 (first mismatch) not signalled within 3s");
+        assert_eq!(
+            obs.probe_renew_classification_mismatch
+                .load(Ordering::SeqCst),
+            1,
+            "tick 1 should register the first classification mismatch"
+        );
+
+        // Tick 2: same shape → mismatch 2.
+        let n2 = obs.tick_completed.notified();
+        tokio::pin!(n2);
+        tokio::time::timeout(Duration::from_secs(3), n2)
+            .await
+            .expect("tick 2/4 (second mismatch) not signalled within 3s");
+        assert_eq!(
+            obs.probe_renew_classification_mismatch
+                .load(Ordering::SeqCst),
+            2,
+            "tick 2 should register the second classification mismatch; \
+             one more would hit the cap without a reset"
+        );
+        assert!(
+            registry.contains(&run_id).await,
+            "keeper must still be running after two mismatches (cap is 3)"
+        );
+
+        // Flip the engine to Suspended. The NEXT tick enters Path B
+        // (non-renewable at initial probe) → skip_renew, and the
+        // fix resets `consecutive_classification_mismatches`.
+        engine_inner
+            .set_info(make_info(
+                exec_id.clone(),
+                LifecyclePhase::Suspended,
+                AttemptState::AttemptInterrupted,
+                OwnershipState::Leased,
+            ))
+            .await;
+
+        // Tick 3: probe Suspended → skip_renew = true. No renew
+        // fires, no queued response consumed, tick_completed fires.
+        let n3 = obs.tick_completed.notified();
+        tokio::pin!(n3);
+        tokio::time::timeout(Duration::from_secs(3), n3)
+            .await
+            .expect("tick 3/4 (Suspended skip) not signalled within 3s");
+        let attempts_after_suspended = obs.renew_attempts.load(Ordering::SeqCst);
+        assert_eq!(
+            attempts_after_suspended, 2,
+            "tick 3 must NOT have fired a renew (engine is Suspended); \
+             observed renew_attempts={attempts_after_suspended}"
+        );
+
+        // Flip back to RenewableActive. The next tick's initial
+        // probe enters the renew branch again.
+        engine_inner
+            .set_info(make_info(
+                exec_id.clone(),
+                LifecyclePhase::Active,
+                AttemptState::RunningAttempt,
+                OwnershipState::Leased,
+            ))
+            .await;
+
+        // Tick 4: probe RenewableActive → renew rejects → re-probe
+        // RenewableActive → mismatch.
+        //
+        // Pre-fix: counter was still 2 going into this tick, so it
+        // becomes 3, hits the cap, keeper exits.
+        // Post-fix: counter was reset to 0 on tick 3 (Suspended),
+        // so it becomes 1, well below cap=3, keeper continues.
+        let n4 = obs.tick_completed.notified();
+        tokio::pin!(n4);
+        tokio::time::timeout(Duration::from_secs(3), n4)
+            .await
+            .expect("tick 4/4 (post-flap mismatch) not signalled within 3s");
+
+        let total_mismatches = obs
+            .probe_renew_classification_mismatch
+            .load(Ordering::SeqCst);
+        assert_eq!(
+            total_mismatches, 3,
+            "probe_renew_classification_mismatch is a monotonic \
+             lifetime counter (not the consecutive streak). Across \
+             the 3 renew attempts in this test it must reach 3. \
+             Observed: {total_mismatches}"
+        );
+
+        // The load-bearing assertion: even though the monotonic
+        // counter hit 3, the internal *consecutive* streak was
+        // reset by the Suspended tick, so the keeper must still be
+        // registered. Pre-fix the keeper exits here.
+        assert!(
+            registry.contains(&run_id).await,
+            "#685 follow-up: the keeper must survive a flap where a \
+             non-renewable detour separates two mismatch windows. \
+             Pre-fix the consecutive streak persisted across the \
+             Suspended tick and the keeper hit the cap on tick 4. \
+             renew_attempts={} rejections={} mismatches={}",
+            obs.renew_attempts.load(Ordering::SeqCst),
+            obs.renew_rejections.load(Ordering::SeqCst),
+            total_mismatches,
+        );
+
+        registry.shutdown_all().await;
+    }
+
+    /// #685 Finding 3, terminal-re-probe case:
+    ///
+    /// The probe says `RenewableActive`, the renew rejects
+    /// phase-conflict, and the re-probe reports `Terminal` — the
+    /// run completed between the probe and the renew. Keeper
+    /// should exit cleanly (not WARN + retry) because there's
+    /// nothing left to renew.
+    #[tokio::test]
+    async fn keeper_685_exits_clean_when_reprobe_terminal() {
+        let registry = Arc::new(LeaseKeeperRegistry::new());
+        let mock = Arc::new(MockRuns::default());
+        let exec_id = test_execution_id();
+        let engine_inner = Arc::new(MockEngine::new(make_info(
+            exec_id.clone(),
+            LifecyclePhase::Active,
+            AttemptState::RunningAttempt,
+            OwnershipState::Leased,
+        )));
+        mock.with_engine(engine_inner.clone()).await;
+
+        let flip_exec = exec_id.clone();
+        mock.push_action(MockRenewAction {
+            response: Err(phase_conflict_err()),
+            then_engine: Some(Box::new(move |engine: Arc<MockEngine>| {
+                let flip_exec = flip_exec.clone();
+                Box::pin(async move {
+                    engine
+                        .set_info(make_info(
+                            flip_exec,
+                            LifecyclePhase::Terminal,
+                            AttemptState::AttemptTerminal,
+                            OwnershipState::Unowned,
+                        ))
+                        .await;
+                })
+            })),
+        })
+        .await;
+
+        let runs: Arc<dyn RunService> = mock.clone();
+        let engine: Arc<dyn Engine> = engine_inner.clone();
+
+        let run_id = RunId::new("run_685_terminal");
+        let session_id = SessionId::new("sess_685_terminal");
+        let obs = Arc::new(KeeperObservability::default());
+
+        registry
+            .ensure_running_with_observability(
+                run_id.clone(),
+                session_id,
+                exec_id,
+                runs,
+                engine,
+                1_500,
+                obs.clone(),
+            )
+            .await;
+
+        // Terminal re-probe: the keeper should exit cleanly on
+        // that tick. Poll for registry cleanup — if it stays
+        // registered, the exit path didn't fire.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while registry.contains(&run_id).await {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "#685: keeper did not exit after re-probe observed \
+                     Terminal. attempts={} rejections={} mismatches={}",
+                    obs.renew_attempts.load(Ordering::SeqCst),
+                    obs.renew_rejections.load(Ordering::SeqCst),
+                    obs.probe_renew_classification_mismatch
+                        .load(Ordering::SeqCst)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // And the mismatch counter must not have bumped — the
+        // terminal exit path is separate from the mismatch loop.
+        let mismatches = obs
+            .probe_renew_classification_mismatch
+            .load(Ordering::SeqCst);
+        assert_eq!(
+            mismatches, 0,
+            "#685: terminal re-probe must NOT count as a \
+             classification mismatch. Observed: mismatches={mismatches}"
+        );
+
+        registry.shutdown_all().await;
+    }
+
+    /// #685 Finding 3, non-phase-conflict preservation case:
+    ///
+    /// The probe says `RenewableActive`, the renew rejects with a
+    /// non-phase-conflict error (e.g. `RuntimeError::Internal` —
+    /// transport-level failure, FF crash, malformed response). The
+    /// #685 fix must PRESERVE the #666 contract for these errors:
+    /// exit immediately without re-probing. Retrying on a
+    /// transport failure or a logic-level failure (lease revoked,
+    /// store corrupt) just churns the logs.
+    ///
+    /// Pre-fix contrast: this test passes on BOTH pre-#685 and
+    /// post-#685 code — it's a non-regression guardrail that
+    /// ensures the new re-probe logic doesn't silently widen the
+    /// error-swallowing surface.
+    #[tokio::test]
+    async fn keeper_685_exits_on_non_phase_conflict_error() {
+        let registry = Arc::new(LeaseKeeperRegistry::new());
+        let mock = Arc::new(MockRuns::default());
+        mock.push_response(Err(RuntimeError::Internal(
+            "simulated transport failure".to_owned(),
+        )))
+        .await;
+
+        let runs: Arc<dyn RunService> = mock.clone();
+        let exec_id = test_execution_id();
+        let engine: Arc<dyn Engine> = Arc::new(MockEngine::new(make_info(
+            exec_id.clone(),
+            LifecyclePhase::Active,
+            AttemptState::RunningAttempt,
+            OwnershipState::Leased,
+        )));
+        let run_id = RunId::new("run_685_internal");
+        let session_id = SessionId::new("sess_685_internal");
+        let obs = Arc::new(KeeperObservability::default());
+
+        registry
+            .ensure_running_with_observability(
+                run_id.clone(),
+                session_id,
+                exec_id,
+                runs,
+                engine,
+                1_500,
+                obs.clone(),
+            )
+            .await;
+
+        // Wait for the keeper to exit on the first tick.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while registry.contains(&run_id).await {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "#685 non-regression: keeper must exit on a \
+                     non-phase-conflict error (the #666 contract). \
+                     attempts={} rejections={} mismatches={}",
+                    obs.renew_attempts.load(Ordering::SeqCst),
+                    obs.renew_rejections.load(Ordering::SeqCst),
+                    obs.probe_renew_classification_mismatch
+                        .load(Ordering::SeqCst),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            obs.renew_rejections.load(Ordering::SeqCst),
+            0,
+            "#685: non-phase-conflict errors must NOT count as \
+             phase-conflict rejections"
+        );
+        assert_eq!(
+            obs.probe_renew_classification_mismatch
+                .load(Ordering::SeqCst),
+            0,
+            "#685: non-phase-conflict errors must NOT enter the \
+             re-probe path"
+        );
+
+        registry.shutdown_all().await;
     }
 
     /// Bounded-registry invariant, cancellation path: a keeper that
