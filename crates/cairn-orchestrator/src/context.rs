@@ -461,6 +461,24 @@ pub const MAX_COMPLETION_GATE_REJECTIONS: u32 = 3;
 /// re-plan; more than three is context pollution.
 pub const COMPLETION_GATE_ERROR_PREVIEW: usize = 3;
 
+/// Issue #689 R2-A: hard cap on consecutive malformed `spawn_subagent`
+/// proposals before the loop gives up and terminates with
+/// `LoopTermination::Failed { reason = "malformed_spawn_proposal: …" }`.
+///
+/// Chosen as 3 to mirror `MAX_COMPLETION_GATE_REJECTIONS`: the LLM gets
+/// one free retry after seeing the rejection in `step_history`, a second
+/// retry if the first correction was still wrong, and a third before the
+/// loop assumes the model is permanently broken. Lower values would kill
+/// runs where one rogue LLM emission slipped through a rubric drift;
+/// higher values would let a stuck model burn iterations against the
+/// same rejection message.
+///
+/// The counter is reset whenever a non-malformed action completes
+/// (including a valid spawn, a tool call, or any other successful
+/// proposal) so transient flakes don't accumulate across an otherwise-
+/// healthy run.
+pub const MAX_CONSECUTIVE_MALFORMED_SPAWNS: u32 = 3;
+
 // ── BreakerConfig ────────────────────────────────────────────────────────────
 
 /// F65 PR-3: circuit-breaker caps enforced inside `OrchestratorLoop`.

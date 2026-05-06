@@ -2663,3 +2663,379 @@ async fn completion_gate_disabled_via_settings_flag() {
         "gate disabled → CompleteRun must flow through to execute exactly once",
     );
 }
+
+// ── #689 R2-A: malformed spawn_subagent retry ─────────────────────────────
+//
+// Dogfood R2 Finding A (issue #689, HIGH). The LLM emitted a
+// `spawn_subagent` proposal with missing or empty `tool_args["goal"]`;
+// the execute phase returned `LoopSignal::Failed`, and the run state
+// flipped to Failed on a single bad LLM emission. Expected behaviour:
+// the rejection threads into `step_history`, the loop continues, and
+// the LLM gets to re-emit on the next DECIDE turn. A bounded retry
+// cap (`MAX_CONSECUTIVE_MALFORMED_SPAWNS = 3`) prevents a permanently-
+// broken model from burning the iteration budget.
+//
+// Two tests pin the contract:
+//
+//   A. One malformed spawn, then one valid spawn → loop progresses
+//      through the valid spawn and suspends on WaitSubagent.
+//   B. Three consecutive malformed spawns → loop terminates with
+//      `LoopTermination::Failed` whose reason carries the contract
+//      `malformed_spawn_proposal:` prefix.
+
+mod malformed_spawn_fixtures {
+    use super::*;
+    use crate::context::ExecuteOutcome;
+
+    /// A `DecidePhase` that cycles through a scripted sequence of
+    /// outputs — reused pattern from the `ScriptedDecide` + counter
+    /// approach used by the `#660` gate fixtures.
+    pub(super) struct ScriptedSpawnDecide {
+        pub outputs: Vec<DecideOutput>,
+        pub calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DecidePhase for ScriptedSpawnDecide {
+        async fn decide(
+            &self,
+            _ctx: &OrchestrationContext,
+            _: &GatherOutput,
+        ) -> Result<DecideOutput, OrchestratorError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let idx = n.min(self.outputs.len() - 1);
+            Ok(self.outputs[idx].clone())
+        }
+    }
+
+    /// Execute phase that mirrors the real `RuntimeExecutePhase` for
+    /// the spawn_subagent validation carve-out.
+    ///
+    /// IMPORTANT: this fixture calls the real
+    /// [`crate::execute_impl::derive_signal`] to compute the loop
+    /// signal from each `ActionResult`, exactly as the production
+    /// execute phase does. That way the test exercises the same
+    /// pre-fix-vs-post-fix pivot as the real code: pre-fix (no
+    /// carve-out) maps a `SpawnSubagent` `Failed` to
+    /// `LoopSignal::Failed`; post-fix (with
+    /// `MALFORMED_SPAWN_PROPOSAL_PREFIX`) maps it to
+    /// `LoopSignal::Continue`. Without using the real function, a
+    /// stub that hard-codes `Continue` would silently pass on pre-fix
+    /// code (false-positive guardrail).
+    ///
+    /// For `SpawnSubagent` proposals whose `tool_args` lacks a
+    /// non-empty `goal`, returns `ActionStatus::Failed` tagged with
+    /// the contract prefix; for valid spawns it returns
+    /// `SubagentSpawned`; anything else returns `Succeeded`.
+    pub(super) struct SpawnValidatingExecute {
+        pub dispatch_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pub successful_spawns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pub rejected_spawns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExecutePhase for SpawnValidatingExecute {
+        async fn execute(
+            &self,
+            _ctx: &OrchestrationContext,
+            decide: &DecideOutput,
+        ) -> Result<ExecuteOutcome, OrchestratorError> {
+            self.dispatch_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            let mut results: Vec<ActionResult> = Vec::new();
+
+            for p in decide.proposals.iter() {
+                if p.action_type == ActionType::SpawnSubagent {
+                    let goal_present = p
+                        .tool_args
+                        .as_ref()
+                        .and_then(|v| v.get("goal"))
+                        .and_then(|g| g.as_str())
+                        .map(str::trim)
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if goal_present {
+                        self.successful_spawns
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let child_task_id = TaskId::new("child_task_1");
+                        results.push(ActionResult {
+                            proposal: p.clone(),
+                            status: ActionStatus::SubagentSpawned {
+                                child_task_id: child_task_id.clone(),
+                            },
+                            tool_output: None,
+                            invocation_id: None,
+                            duration_ms: 0,
+                        });
+                    } else {
+                        self.rejected_spawns
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Tag with the same contract prefix the real
+                        // execute phase uses so `derive_signal`'s
+                        // #689 R2-A carve-out fires. Pre-fix code did
+                        // NOT tag this reason — instead it returned
+                        // the same shape but without the prefix, and
+                        // `derive_signal` promoted it to
+                        // `LoopSignal::Failed`. We mirror the post-fix
+                        // reason because the pre-fix reason
+                        // (non-prefixed) would also be correctly
+                        // promoted to `LoopSignal::Failed` by the
+                        // post-fix `derive_signal` (its carve-out
+                        // gates on the prefix), which means **this
+                        // test is load-bearing in both directions**:
+                        //
+                        //   * Pre-fix `derive_signal` (no prefix
+                        //     check) sees non-InvokeTool Failed →
+                        //     `LoopSignal::Failed` → test panics.
+                        //   * Post-fix `derive_signal` sees prefix →
+                        //     `LoopSignal::Continue` → test passes.
+                        results.push(ActionResult {
+                            proposal: p.clone(),
+                            status: ActionStatus::Failed {
+                                reason: format!(
+                                    "{}spawn_subagent: tool_args[\"goal\"] \
+                                     is required and must be a non-empty string",
+                                    crate::execute_impl::MALFORMED_SPAWN_PROPOSAL_PREFIX,
+                                ),
+                            },
+                            tool_output: None,
+                            invocation_id: None,
+                            duration_ms: 0,
+                        });
+                    }
+                } else {
+                    results.push(ActionResult {
+                        proposal: p.clone(),
+                        status: ActionStatus::Succeeded,
+                        tool_output: None,
+                        invocation_id: None,
+                        duration_ms: 0,
+                    });
+                }
+            }
+
+            // Derive the loop signal via the real function under test
+            // so the pre-fix vs post-fix semantics are exercised
+            // end-to-end. See the struct rustdoc for why this is
+            // load-bearing.
+            let mut loop_signal = LoopSignal::Continue;
+            for r in &results {
+                let next = crate::execute_impl::derive_signal(r, &loop_signal);
+                if !matches!(next, LoopSignal::Continue) {
+                    loop_signal = next;
+                    break;
+                }
+            }
+
+            Ok(ExecuteOutcome {
+                results,
+                loop_signal,
+            })
+        }
+    }
+
+    pub(super) fn decide_malformed_spawn() -> DecideOutput {
+        DecideOutput {
+            raw_response:
+                r#"[{"action_type":"spawn_subagent","tool_name":"researcher","tool_args":{}}]"#
+                    .to_owned(),
+            proposals: vec![ActionProposal {
+                action_type: ActionType::SpawnSubagent,
+                description: "delegate research".to_owned(),
+                confidence: 0.8,
+                tool_name: Some("researcher".to_owned()),
+                // Empty tool_args — mirrors the dogfood R2 repro
+                // (run_r2_1778028487): goal missing.
+                tool_args: Some(serde_json::json!({})),
+                requires_approval: false,
+            }],
+            calibrated_confidence: 0.8,
+            requires_approval: false,
+            model_id: "test-model".to_owned(),
+            latency_ms: 20,
+            input_tokens: None,
+            output_tokens: None,
+            system_prompt: String::new(),
+            messages_json: "[]".to_owned(),
+            tool_calls_json: "[]".to_owned(),
+        }
+    }
+
+    pub(super) fn decide_valid_spawn() -> DecideOutput {
+        DecideOutput {
+            raw_response: r#"[{"action_type":"spawn_subagent","tool_name":"researcher","tool_args":{"goal":"investigate X"}}]"#.to_owned(),
+            proposals: vec![ActionProposal {
+                action_type: ActionType::SpawnSubagent,
+                description: "delegate research".to_owned(),
+                confidence: 0.85,
+                tool_name: Some("researcher".to_owned()),
+                tool_args: Some(serde_json::json!({ "goal": "investigate X" })),
+                requires_approval: false,
+            }],
+            calibrated_confidence: 0.85,
+            requires_approval: false,
+            model_id: "test-model".to_owned(),
+            latency_ms: 20,
+            input_tokens: None,
+            output_tokens: None,
+            system_prompt: String::new(),
+            messages_json: "[]".to_owned(),
+            tool_calls_json: "[]".to_owned(),
+        }
+    }
+}
+
+/// #689 R2-A (A): one malformed spawn then one valid spawn. The run
+/// MUST NOT die on the malformed proposal — it must thread the
+/// rejection into `step_history`, re-enter DECIDE, accept the valid
+/// spawn, and suspend on `WaitingSubagent`. Pre-fix the first
+/// malformed proposal promoted to `LoopSignal::Failed` and the run
+/// terminated immediately; this test fails on pre-fix code.
+#[tokio::test]
+async fn malformed_spawn_proposal_does_not_kill_run_and_llm_can_retry() {
+    use malformed_spawn_fixtures::{
+        decide_malformed_spawn, decide_valid_spawn, ScriptedSpawnDecide, SpawnValidatingExecute,
+    };
+
+    let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let successful_spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rejected_spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let config = LoopConfig {
+        max_iterations: 10,
+        breakers: permissive_breakers(),
+        ..Default::default()
+    };
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        ScriptedSpawnDecide {
+            outputs: vec![decide_malformed_spawn(), decide_valid_spawn()],
+            calls: decide_calls.clone(),
+        },
+        SpawnValidatingExecute {
+            dispatch_count: dispatch_count.clone(),
+            successful_spawns: successful_spawns.clone(),
+            rejected_spawns: rejected_spawns.clone(),
+        },
+        config,
+    );
+
+    let result = lp.run(ctx()).await.unwrap();
+
+    // The loop MUST have reached the second iteration and accepted the
+    // valid spawn. Pre-#689 fix this would be `LoopTermination::Failed`
+    // because the first iteration's malformed spawn promoted to
+    // `LoopSignal::Failed`.
+    match result {
+        LoopTermination::WaitingSubagent { child_task_id } => {
+            assert_eq!(
+                child_task_id.as_str(),
+                "child_task_1",
+                "second iteration's valid spawn must produce the expected child_task_id"
+            );
+        }
+        other => panic!(
+            "expected WaitingSubagent after malformed → valid retry; got {other:?}. \
+             This means the malformed proposal terminated the run instead of \
+             letting the LLM retry on the next DECIDE turn."
+        ),
+    }
+
+    // Counter sanity: exactly one malformed rejection and exactly one
+    // successful spawn.
+    assert_eq!(
+        rejected_spawns.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "malformed proposal must have been rejected once"
+    );
+    assert_eq!(
+        successful_spawns.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "valid proposal must have been accepted once"
+    );
+    // DECIDE must have been called twice (iter 0 malformed, iter 1 valid).
+    assert_eq!(
+        decide_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "DECIDE must re-run on the iteration after a malformed spawn"
+    );
+}
+
+/// #689 R2-A (B): three consecutive malformed spawns trip the
+/// bounded-retry cap. The run MUST terminate with
+/// `LoopTermination::Failed` whose reason carries the contract
+/// `malformed_spawn_proposal:` prefix and a mention of the cap so the
+/// operator can see why the run died.
+#[tokio::test]
+async fn malformed_spawn_proposal_bounded_retry_cap_fails_run() {
+    use malformed_spawn_fixtures::{
+        decide_malformed_spawn, ScriptedSpawnDecide, SpawnValidatingExecute,
+    };
+
+    let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let successful_spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let rejected_spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Max iterations well above the cap so the cap is what fires the
+    // failure, not the iteration budget.
+    let config = LoopConfig {
+        max_iterations: 20,
+        breakers: permissive_breakers(),
+        ..Default::default()
+    };
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        // Always return malformed — simulates a permanently-broken
+        // model that can't self-correct.
+        ScriptedSpawnDecide {
+            outputs: vec![decide_malformed_spawn()],
+            calls: decide_calls.clone(),
+        },
+        SpawnValidatingExecute {
+            dispatch_count: dispatch_count.clone(),
+            successful_spawns: successful_spawns.clone(),
+            rejected_spawns: rejected_spawns.clone(),
+        },
+        config,
+    );
+
+    let result = lp.run(ctx()).await.unwrap();
+
+    match result {
+        LoopTermination::Failed { reason } => {
+            assert!(
+                reason.starts_with(crate::execute_impl::MALFORMED_SPAWN_PROPOSAL_PREFIX),
+                "#689 R2-A: Failed reason MUST start with \
+                 `malformed_spawn_proposal:` so the handler's \
+                 `classify_failed_reason` can route to \
+                 `FailureClass::ExecutionError`. Got: {reason}"
+            );
+            assert!(
+                reason.contains("cap of"),
+                "reason MUST mention the cap so the operator sees why the run died. Got: {reason}"
+            );
+        }
+        other => {
+            panic!("expected LoopTermination::Failed(malformed_spawn_proposal); got {other:?}")
+        }
+    }
+
+    // Exactly three rejections — the cap itself.
+    assert_eq!(
+        rejected_spawns.load(std::sync::atomic::Ordering::SeqCst),
+        crate::context::MAX_CONSECUTIVE_MALFORMED_SPAWNS as usize,
+        "rejected_spawns must equal the cap value ({})",
+        crate::context::MAX_CONSECUTIVE_MALFORMED_SPAWNS
+    );
+    // No successful spawns — all attempts were malformed.
+    assert_eq!(
+        successful_spawns.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no valid spawn was proposed, so no successful spawn should have run"
+    );
+}

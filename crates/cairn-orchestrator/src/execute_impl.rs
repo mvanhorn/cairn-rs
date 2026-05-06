@@ -70,6 +70,28 @@ use crate::execute::{ApprovedDispatch, ExecutePhase};
 // so the loop terminates fast with a clear operator-facing reason.
 pub(crate) const UNRECOVERABLE_INTERNAL_PREFIX: &str = "internal_unrecoverable: ";
 
+// ── Malformed-spawn-proposal marker (#689 R2-A) ─────────────────────────────
+//
+// When the LLM emits a `spawn_subagent` proposal without a valid `tool_name`
+// (role) or without a non-empty `tool_args["goal"]`, the execute phase
+// rejects the proposal with `ActionStatus::Failed`. Pre-#689 `derive_signal`
+// treated this as a non-InvokeTool terminal failure and surfaced it as
+// `LoopSignal::Failed`, killing the whole run on a single malformed LLM
+// response — the dogfood R2 Finding A repro (run_r2_1778028487).
+//
+// The LLM can recover from a malformed spawn the same way it recovers from a
+// bad tool_args schema: re-emit the proposal with the missing field. The fix
+// tags the reason with this sentinel prefix so `derive_signal` maps
+// `SpawnSubagent` + prefix-tagged `Failed` to `LoopSignal::Continue`,
+// threading the rejection into `step_history` via `build_step_summary` so
+// the next DECIDE turn sees the validation error and can correct.
+//
+// Unbounded retry would let a permanently-broken model burn the whole
+// iteration budget against the gate. `loop_runner` counts consecutive
+// malformed spawns and terminates with `LoopTermination::Failed` once the
+// cap is hit (see `MAX_CONSECUTIVE_MALFORMED_SPAWNS` in `context.rs`).
+pub(crate) const MALFORMED_SPAWN_PROPOSAL_PREFIX: &str = "malformed_spawn_proposal: ";
+
 // ── RuntimeExecutePhase ───────────────────────────────────────────────────────
 
 /// Concrete `ExecutePhase` that routes `ActionProposal` variants through the
@@ -1159,13 +1181,19 @@ impl RuntimeExecutePhase {
                 let role = match proposal.tool_name.as_deref() {
                     Some(r) if VALID_ROLES.contains(&r) => r.to_owned(),
                     Some(other) => {
+                        // #689 R2-A: tag with `MALFORMED_SPAWN_PROPOSAL_PREFIX` so
+                        // `derive_signal` maps this to `LoopSignal::Continue`
+                        // and the LLM gets to correct the proposal on the
+                        // next DECIDE turn (the rejection lands in
+                        // `step_history` via `build_step_summary`). Pre-#689
+                        // a single malformed spawn killed the whole run.
                         return Ok(ActionResult {
                             proposal: proposal.clone(),
                             status: ActionStatus::Failed {
                                 reason: format!(
-                                    "spawn_subagent: tool_name must be one of {:?} \
-                                     (the LLM emitted `{}` — prompt regression or \
-                                     malformed proposal)",
+                                    "{MALFORMED_SPAWN_PROPOSAL_PREFIX}spawn_subagent: \
+                                     tool_name must be one of {:?} (the LLM emitted \
+                                     `{}` — malformed proposal; re-emit with a valid role)",
                                     VALID_ROLES, other
                                 ),
                             },
@@ -1179,9 +1207,10 @@ impl RuntimeExecutePhase {
                             proposal: proposal.clone(),
                             status: ActionStatus::Failed {
                                 reason: format!(
-                                    "spawn_subagent: tool_name is required and must be one of {:?} \
+                                    "{MALFORMED_SPAWN_PROPOSAL_PREFIX}spawn_subagent: \
+                                     tool_name is required and must be one of {:?} \
                                      (the LLM emitted a proposal without `tool_name` — \
-                                     malformed ActionProposal)",
+                                     malformed proposal; re-emit with a valid role)",
                                     VALID_ROLES
                                 ),
                             },
@@ -1205,14 +1234,20 @@ impl RuntimeExecutePhase {
                 {
                     Some(g) => g.to_owned(),
                     None => {
+                        // #689 R2-A: see `MALFORMED_SPAWN_PROPOSAL_PREFIX`
+                        // rustdoc — demoted from terminal failure to
+                        // continue-with-step-history-feedback so the LLM
+                        // gets a retry instead of the run dying.
                         return Ok(ActionResult {
                             proposal: proposal.clone(),
                             status: ActionStatus::Failed {
-                                reason: "spawn_subagent: tool_args[\"goal\"] is required \
-                                         and must be a non-empty string (the LLM emitted \
-                                         an incomplete spawn proposal — the prompt \
-                                         requires `{\"goal\": \"...\"}`)"
-                                    .to_owned(),
+                                reason: format!(
+                                    "{MALFORMED_SPAWN_PROPOSAL_PREFIX}spawn_subagent: \
+                                     tool_args[\"goal\"] is required and must be a \
+                                     non-empty string (the LLM emitted an incomplete \
+                                     spawn proposal — the prompt requires \
+                                     `{{\"goal\": \"...\"}}`; re-emit with a concrete goal)"
+                                ),
                             },
                             tool_output: None,
                             invocation_id: None,
@@ -1742,12 +1777,20 @@ async fn legacy_approval_gate_result(
 /// and terminated the run on the first tool miss (dogfood v4 evidence
 /// in PR #295).
 ///
-/// Non-InvokeTool failures (CompleteRun / SpawnSubagent /
-/// SendNotification / EscalateToOperator / CreateMemory service errors)
-/// remain terminal — they represent orchestrator-level bookkeeping that
-/// the LLM cannot recover from by picking a different action, so
-/// promoting them to `LoopSignal::Failed` is the correct short-circuit.
-fn derive_signal(result: &ActionResult, current: &LoopSignal) -> LoopSignal {
+/// Non-InvokeTool failures (CompleteRun / SendNotification /
+/// EscalateToOperator / CreateMemory service errors) remain terminal —
+/// they represent orchestrator-level bookkeeping that the LLM cannot
+/// recover from by picking a different action, so promoting them to
+/// `LoopSignal::Failed` is the correct short-circuit.
+///
+/// **#689 R2-A exception.** `SpawnSubagent` failures tagged with
+/// `MALFORMED_SPAWN_PROPOSAL_PREFIX` are LLM-recoverable — a missing
+/// role or empty goal is a malformed proposal the model can re-emit
+/// next turn once the rejection surfaces in `step_history`. Those map
+/// to `LoopSignal::Continue`. Non-prefixed SpawnSubagent failures
+/// (e.g. `TaskService::spawn_subagent` service error) remain terminal;
+/// the LLM cannot fix an infrastructure error by re-proposing.
+pub(crate) fn derive_signal(result: &ActionResult, current: &LoopSignal) -> LoopSignal {
     if !matches!(current, LoopSignal::Continue) {
         return current.clone();
     }
@@ -1777,10 +1820,30 @@ fn derive_signal(result: &ActionResult, current: &LoopSignal) -> LoopSignal {
         // picking a different tool / args. Those short-circuit to
         // `LoopSignal::Failed` so the run fails fast instead of
         // burning iterations on calls that will never succeed.
+        //
+        // #689 R2-A exception: a `SpawnSubagent` failure tagged with
+        // `MALFORMED_SPAWN_PROPOSAL_PREFIX` is LLM-recoverable — the
+        // model just needs to re-emit the proposal with the missing
+        // role / goal. Map it to `LoopSignal::Continue` so the next
+        // DECIDE turn sees the rejection in `step_history` and can
+        // correct. The consecutive-malformed-spawn counter in
+        // `loop_runner` enforces a bounded retry cap so a
+        // permanently-broken model can't burn the whole iteration
+        // budget against the gate.
         ActionStatus::Failed { reason } => {
-            if result.proposal.action_type == ActionType::InvokeTool
-                && !reason.starts_with(UNRECOVERABLE_INTERNAL_PREFIX)
-            {
+            // Two LLM-recoverable carve-outs map to Continue; everything
+            // else terminates. Collapsing the two conditions with `||`
+            // keeps the branch count at one for clippy's
+            // `if_same_then_else` lint and matches the rustdoc above
+            // (both prefixes signal "LLM-recoverable", differentiated
+            // only by which proposal variant the prefix lives on).
+            let recoverable_invoke_tool_error = result.proposal.action_type
+                == ActionType::InvokeTool
+                && !reason.starts_with(UNRECOVERABLE_INTERNAL_PREFIX);
+            let recoverable_malformed_spawn = result.proposal.action_type
+                == ActionType::SpawnSubagent
+                && reason.starts_with(MALFORMED_SPAWN_PROPOSAL_PREFIX);
+            if recoverable_invoke_tool_error || recoverable_malformed_spawn {
                 LoopSignal::Continue
             } else {
                 LoopSignal::Failed {
@@ -2021,6 +2084,75 @@ mod signal_aggregation_tests {
                 );
             }
             other => panic!("expected Failed on unrecoverable-internal tool error, got {other:?}"),
+        }
+    }
+
+    /// Helper for constructing a SpawnSubagent `ActionResult` — the
+    /// carve-out target for #689 R2-A.
+    fn spawn_result(status: ActionStatus) -> ActionResult {
+        ActionResult {
+            proposal: ActionProposal {
+                action_type: ActionType::SpawnSubagent,
+                description: "delegate research".to_owned(),
+                confidence: 0.8,
+                tool_name: Some("researcher".to_owned()),
+                tool_args: Some(serde_json::json!({})),
+                requires_approval: false,
+            },
+            status,
+            tool_output: None,
+            invocation_id: None,
+            duration_ms: 0,
+        }
+    }
+
+    /// #689 R2-A: a `SpawnSubagent` failure tagged with
+    /// `MALFORMED_SPAWN_PROPOSAL_PREFIX` must demote to
+    /// `LoopSignal::Continue` so the LLM can correct the proposal on
+    /// the next DECIDE turn. Pre-#689 this was
+    /// `LoopSignal::Failed` (all non-InvokeTool failures were
+    /// terminal), which killed the whole run on a single bad LLM
+    /// emission — the dogfood R2 Finding A repro.
+    #[test]
+    fn derive_signal_demotes_malformed_spawn_to_continue() {
+        let failed = spawn_result(ActionStatus::Failed {
+            reason: format!(
+                "{}spawn_subagent: tool_args[\"goal\"] is required",
+                super::MALFORMED_SPAWN_PROPOSAL_PREFIX
+            ),
+        });
+        let got = derive_signal(&failed, &LoopSignal::Continue);
+        assert!(
+            matches!(got, LoopSignal::Continue),
+            "expected Continue on malformed spawn_subagent so the LLM gets \
+             a retry via step_history, got {got:?}"
+        );
+    }
+
+    /// Safety: only the `MALFORMED_SPAWN_PROPOSAL_PREFIX`-tagged
+    /// `SpawnSubagent` failure demotes to Continue. A non-tagged
+    /// `SpawnSubagent` failure (e.g. the `TaskService::spawn_subagent`
+    /// service hit an infrastructure error) is NOT LLM-recoverable
+    /// and must still terminate the run as before. If the carve-out
+    /// widened to all SpawnSubagent failures, infrastructure errors
+    /// would silently retry and burn the iteration budget.
+    #[test]
+    fn derive_signal_keeps_non_prefixed_spawn_failure_terminal() {
+        let failed = spawn_result(ActionStatus::Failed {
+            reason: "TaskService::spawn_subagent: database connection refused".to_owned(),
+        });
+        let got = derive_signal(&failed, &LoopSignal::Continue);
+        match got {
+            LoopSignal::Failed { reason } => {
+                assert!(
+                    reason.contains("database connection refused"),
+                    "non-malformed SpawnSubagent failure must propagate to Failed; got {reason:?}"
+                );
+            }
+            other => panic!(
+                "expected Failed on non-prefixed SpawnSubagent failure — the \
+                 carve-out must ONLY fire on the malformed prefix; got {other:?}"
+            ),
         }
     }
 }

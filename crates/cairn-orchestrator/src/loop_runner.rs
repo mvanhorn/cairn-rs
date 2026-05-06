@@ -728,6 +728,18 @@ where
         // budget. Gated by `config.orchestrator_strict_completion_gate`.
         let mut completion_gate_rejections: u32 = 0;
 
+        // Issue #689 R2-A: consecutive malformed `spawn_subagent`
+        // proposals. A single malformed proposal no longer fails the
+        // run (see `MALFORMED_SPAWN_PROPOSAL_PREFIX` in `execute_impl`);
+        // instead the LLM sees the rejection in `step_history` and can
+        // re-emit. The counter increments on every iteration whose
+        // execute outcome contains a malformed-spawn rejection and
+        // resets on any iteration that completes without one. Reaching
+        // `MAX_CONSECUTIVE_MALFORMED_SPAWNS` terminates the run so a
+        // permanently-broken model can't ping-pong against the gate
+        // until `max_iterations` exhausts the budget.
+        let mut consecutive_malformed_spawns: u32 = 0;
+
         tracing::info!(
             run_id    = %ctx.run_id,
             goal      = %ctx.goal,
@@ -1594,6 +1606,106 @@ where
                 verification_acc.observe(r);
             }
 
+            // Issue #689 R2-A: bounded retry for malformed spawn_subagent
+            // proposals. The execute phase demotes malformed spawns from
+            // terminal failure to `LoopSignal::Continue` (see
+            // `MALFORMED_SPAWN_PROPOSAL_PREFIX` in `execute_impl`) so the
+            // LLM gets a retry via `step_history`. This cap prevents a
+            // permanently-broken model from ping-ponging the rejection
+            // until `max_iterations`.
+            //
+            // Reset-on-any-non-malformed-result so transient flakes don't
+            // accumulate across an otherwise-healthy run: if the LLM
+            // emits one bad spawn, then a valid tool call, then another
+            // bad spawn, the counter resets on the tool call.
+            //
+            // Single-pass scan over `execute_outcome.results` captures all
+            // three signals (malformed-spawn flag, non-malformed-result
+            // flag, and first malformed reason for the cap-hit diagnostic)
+            // so we walk the vec once instead of three times.
+            //
+            // A "non-malformed result" is any result that is NOT a
+            // malformed-spawn rejection. Successes count (they move the
+            // run forward); non-spawn failures count (InvokeTool errors
+            // are LLM feedback but still prove the LLM emitted a
+            // well-formed proposal). Only the malformed-spawn flag itself
+            // is suppressed here.
+            let mut iteration_had_malformed_spawn = false;
+            let mut iteration_had_non_malformed_result = false;
+            let mut first_malformed_reason: Option<String> = None;
+            for r in &execute_outcome.results {
+                let is_malformed_spawn = r.proposal.action_type
+                    == cairn_domain::ActionType::SpawnSubagent
+                    && matches!(
+                        &r.status,
+                        ActionStatus::Failed { reason }
+                            if reason.starts_with(
+                                crate::execute_impl::MALFORMED_SPAWN_PROPOSAL_PREFIX,
+                            )
+                    );
+                if is_malformed_spawn {
+                    iteration_had_malformed_spawn = true;
+                    if first_malformed_reason.is_none() {
+                        if let ActionStatus::Failed { reason } = &r.status {
+                            first_malformed_reason = Some(reason.clone());
+                        }
+                    }
+                } else {
+                    iteration_had_non_malformed_result = true;
+                }
+            }
+            if iteration_had_malformed_spawn {
+                consecutive_malformed_spawns = consecutive_malformed_spawns.saturating_add(1);
+                tracing::warn!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    rejection_num = consecutive_malformed_spawns,
+                    "#689 R2-A malformed spawn_subagent rejected — \
+                     LLM may retry on next DECIDE turn"
+                );
+                if consecutive_malformed_spawns >= crate::context::MAX_CONSECUTIVE_MALFORMED_SPAWNS
+                {
+                    // Cap hit. Use the first malformed-spawn reason
+                    // captured during the single-pass scan above so the
+                    // operator-facing termination carries concrete
+                    // diagnostics rather than just the cap count. The
+                    // `malformed_spawn_proposal:` prefix is the wire
+                    // contract with `classify_failed_reason` in the HTTP
+                    // handler — keep it literal.
+                    let first_reason = first_malformed_reason.unwrap_or_else(|| {
+                        format!(
+                            "{}malformed spawn_subagent proposal",
+                            crate::execute_impl::MALFORMED_SPAWN_PROPOSAL_PREFIX,
+                        )
+                    });
+                    let reason = format!(
+                        "{first_reason} — cap of {} consecutive malformed \
+                         spawn_subagent proposals hit; the LLM did not \
+                         correct the proposal after repeated rejections",
+                        crate::context::MAX_CONSECUTIVE_MALFORMED_SPAWNS,
+                    );
+                    tracing::warn!(
+                        run_id    = %ctx.run_id,
+                        iteration = ctx.iteration,
+                        %reason,
+                        "#689 R2-A malformed-spawn cap hit — failing run"
+                    );
+                    return Ok(LoopTermination::Failed { reason });
+                }
+            } else if iteration_had_non_malformed_result {
+                // Reset on any non-malformed result so we only count
+                // *consecutive* malformed spawns.
+                if consecutive_malformed_spawns > 0 {
+                    tracing::debug!(
+                        run_id    = %ctx.run_id,
+                        iteration = ctx.iteration,
+                        "#689 R2-A malformed-spawn counter reset — \
+                         non-malformed action observed"
+                    );
+                }
+                consecutive_malformed_spawns = 0;
+            }
+
             let succeeded_count = execute_outcome
                 .results
                 .iter()
@@ -2074,29 +2186,48 @@ fn build_step_summary(
     // `result.proposal` as the source of truth.
     let mut summary = description;
     for result in execute.results.iter() {
-        if result.proposal.action_type != cairn_domain::ActionType::InvokeTool {
-            continue;
-        }
-        let tool_name = result.proposal.tool_name.as_deref().unwrap_or("<unknown>");
-        match &result.status {
-            ActionStatus::Failed { reason } => {
-                let preview = truncate_for_summary(reason, 400);
-                summary.push_str(&format!("\n  tool_result[{tool_name}] ERROR: {preview}"));
-            }
-            ActionStatus::Succeeded => {
-                if let Some(output) = result.tool_output.as_ref() {
-                    // F54: tool-aware preview. For bash tools this
-                    // prepends `exit_code:` and keeps the tail of
-                    // stdout/stderr so the LLM can see the trailing
-                    // `warning:` / `error:` / success banner that
-                    // previously was clipped by the head+tail 400-char
-                    // cap on the serialized JSON blob.
-                    let preview = render_tool_output_preview(tool_name, output);
-                    summary.push_str(&format!("\n  tool_result[{tool_name}] ok: {preview}"));
+        match result.proposal.action_type {
+            cairn_domain::ActionType::InvokeTool => {
+                let tool_name = result.proposal.tool_name.as_deref().unwrap_or("<unknown>");
+                match &result.status {
+                    ActionStatus::Failed { reason } => {
+                        let preview = truncate_for_summary(reason, 400);
+                        summary.push_str(&format!("\n  tool_result[{tool_name}] ERROR: {preview}"));
+                    }
+                    ActionStatus::Succeeded => {
+                        if let Some(output) = result.tool_output.as_ref() {
+                            // F54: tool-aware preview. For bash tools this
+                            // prepends `exit_code:` and keeps the tail of
+                            // stdout/stderr so the LLM can see the trailing
+                            // `warning:` / `error:` / success banner that
+                            // previously was clipped by the head+tail 400-char
+                            // cap on the serialized JSON blob.
+                            let preview = render_tool_output_preview(tool_name, output);
+                            summary
+                                .push_str(&format!("\n  tool_result[{tool_name}] ok: {preview}"));
+                        }
+                    }
+                    // AwaitingApproval / SubagentSpawned have their own dedicated
+                    // step-kinds — no inline note needed.
+                    _ => {}
                 }
             }
-            // AwaitingApproval / SubagentSpawned have their own dedicated
-            // step-kinds — no inline note needed.
+            // #689 R2-A: surface a malformed-spawn rejection so the
+            // next DECIDE turn sees the validation error in
+            // `step_history` and can re-emit a valid proposal. Without
+            // this line the LLM would read a bare "spawn_subagent:
+            // delegate research" description and re-emit the same
+            // malformed shape. The summary line mirrors the InvokeTool
+            // error grammar so `decide_impl::build_user_message` renders
+            // it consistently with recoverable tool failures.
+            cairn_domain::ActionType::SpawnSubagent => {
+                if let ActionStatus::Failed { reason } = &result.status {
+                    if reason.starts_with(crate::execute_impl::MALFORMED_SPAWN_PROPOSAL_PREFIX) {
+                        let preview = truncate_for_summary(reason, 400);
+                        summary.push_str(&format!("\n  spawn_rejected: {preview}"));
+                    }
+                }
+            }
             _ => {}
         }
     }
