@@ -1012,12 +1012,13 @@ pub const OPENAPI_JSON: &str = r##"{
       "post": {
         "tags": ["Approvals"],
         "summary": "Approve an approval (kind-aware)",
-        "description": "For plan approvals the body is ignored. For tool-call approvals `scope` is required: `{type:\"once\"}` resolves this call only; `{type:\"session\", match_policy?}` widens to matching calls in the same session (omitted `match_policy` inherits the proposal's). `approved_tool_args` overrides any prior amendment. `operator_id` in the body must match the authenticated principal when present (else 400 `identity_mismatch`).",
+        "description": "For plan approvals the body is ignored. For tool-call approvals `scope` is required: `{type:\"once\"}` resolves this call only; `{type:\"session\", match_policy?}` widens to matching calls in the same session (omitted `match_policy` inherits the proposal's). A bare-string shorthand `\"once\"` / `\"session\"` is also accepted for curl ergonomics — equivalent to `{type:\"once\"}` / `{type:\"session\"}` with inherited match policy. `approved_tool_args` overrides any prior amendment. `operator_id` in the body must match the authenticated principal when present (else 400 `identity_mismatch`).",
         "operationId": "approveApproval",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
         "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "properties": {
           "operator_id": { "type": "string" },
-          "scope": { "type": "object", "oneOf": [
+          "scope": { "oneOf": [
+            { "type": "string", "enum": ["once", "session"], "description": "Shorthand form — `once` and `session` (match_policy inherited from the proposal)." },
             { "type": "object", "properties": { "type": { "type": "string", "enum": ["once"] } }, "required": ["type"] },
             { "type": "object", "properties": { "type": { "type": "string", "enum": ["session"] }, "match_policy": { "type": "object" } }, "required": ["type"] }
           ] },

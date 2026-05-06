@@ -266,17 +266,93 @@ pub(crate) struct AmendBody {
     pub new_tool_args: Value,
 }
 
-/// Operator-facing scope DTO. Same shape as the pre-F45 tool-call
-/// handler; `match_policy` is optional on `session` and inherited from
-/// the proposal when omitted.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Operator-facing scope DTO. `match_policy` is optional on `session`
+/// and inherited from the proposal when omitted.
+///
+/// Wire shapes accepted by the deserializer (issue #689 R2-C — operator
+/// UX polish):
+///
+/// 1. Object form (canonical, OpenAPI-documented):
+///    - `{"type":"once"}`
+///    - `{"type":"session"}` — `match_policy` inherited from proposal
+///    - `{"type":"session","match_policy":{"kind":"exact"}}`
+/// 2. Bare-string shorthand (operator-friendly, `curl`-ergonomic):
+///    - `"once"` → `Once`
+///    - `"session"` → `Session { match_policy: None }` (inherit from proposal)
+///
+/// The bare-string form is provided so a naive `{"scope":"once"}` body
+/// succeeds on first attempt — operators typing JSON by hand reach for
+/// that shape before the tagged-enum form. Session with a custom
+/// `match_policy` must still use the object form because that field has
+/// no shorthand.
+#[derive(Clone, Debug)]
 pub(crate) enum ApproveScope {
     Once,
     Session {
-        #[serde(default)]
         match_policy: Option<ApprovalMatchPolicy>,
     },
+}
+
+impl<'de> Deserialize<'de> for ApproveScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Route on the incoming JSON token kind: strings take the
+        // shorthand path; objects are parsed as the tagged enum. Any
+        // other shape (number, array, bool, null) yields a clear
+        // deserialize error that names both accepted forms.
+        let raw = Value::deserialize(deserializer)?;
+        match raw {
+            Value::String(s) => match s.as_str() {
+                "once" => Ok(ApproveScope::Once),
+                "session" => Ok(ApproveScope::Session { match_policy: None }),
+                other => Err(serde::de::Error::custom(format!(
+                    "invalid scope shorthand {other:?}; \
+                     expected \"once\" or \"session\", \
+                     or the object form {{\"type\":\"once\"}} / \
+                     {{\"type\":\"session\",\"match_policy\":{{...}}}}"
+                ))),
+            },
+            Value::Object(_) => {
+                // Parse the tagged-enum form via a private helper that
+                // owns the `#[serde(tag = "type")]` derive; keeps the
+                // wire shape of the object path byte-identical to the
+                // pre-#689 behaviour (no behavioural drift for existing
+                // clients).
+                #[derive(Deserialize)]
+                #[serde(tag = "type", rename_all = "snake_case")]
+                enum ObjForm {
+                    Once,
+                    Session {
+                        #[serde(default)]
+                        match_policy: Option<ApprovalMatchPolicy>,
+                    },
+                }
+                ObjForm::deserialize(raw)
+                    .map(|o| match o {
+                        ObjForm::Once => ApproveScope::Once,
+                        ObjForm::Session { match_policy } => ApproveScope::Session { match_policy },
+                    })
+                    .map_err(serde::de::Error::custom)
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "invalid scope shape: expected \"once\" / \"session\" \
+                 or {{\"type\":\"once\"}} / \
+                 {{\"type\":\"session\",\"match_policy\":{{...}}}}, \
+                 got {}",
+                match other {
+                    Value::Null => "null",
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                    Value::Array(_) => "array",
+                    // Object/String handled above; kept exhaustive to
+                    // survive future serde_json::Value additions.
+                    _ => "unsupported value",
+                }
+            ))),
+        }
+    }
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
@@ -617,12 +693,19 @@ pub(crate) async fn approve_approval_handler(
             let scope_body = match body.scope {
                 Some(s) => s,
                 None => {
+                    // Issue #689 R2-C: naming the required shape in the
+                    // error body so an operator hitting this endpoint
+                    // with curl gets the correct request-body example
+                    // without a round-trip to the OpenAPI spec.
                     return AppApiError::new(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         "validation_error",
-                        "tool-call approval requires `scope` (once | session)",
+                        "tool-call approval requires `scope`: use \
+                         {\"type\":\"once\"} or \
+                         {\"type\":\"session\",\"match_policy\":{...}} \
+                         (string shorthand \"once\"/\"session\" also accepted)",
                     )
-                    .into_response()
+                    .into_response();
                 }
             };
             approve_tool_call(
