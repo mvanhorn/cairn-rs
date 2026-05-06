@@ -20,6 +20,7 @@
 pub mod approval_policy;
 pub(crate) mod breakers;
 pub mod completion_verification;
+pub mod content_tool_scan;
 pub mod context;
 pub mod decide;
 pub mod decide_impl;

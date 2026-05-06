@@ -21,6 +21,11 @@ cairn-tools    = { path = "../cairn-tools" }
 cairn-harness-tools = { path = "../cairn-harness-tools" }
 async-trait    = "0.1"
 futures        = "0.3"
+# #697 R5-B: regex-based pseudo-XML tool-call extractor
+# (`crates/cairn-orchestrator/src/content_tool_scan.rs`). Default
+# features kept because the detector uses `(?s)` multiline + standard
+# char classes only — no perf-mode surface needed.
+regex          = "1"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }

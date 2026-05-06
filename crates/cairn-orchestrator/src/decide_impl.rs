@@ -410,12 +410,36 @@ impl DecidePhase for LlmDecidePhase {
         let mut effective_response_text: String = resp.text.clone();
         let mut effective_tool_calls: Vec<serde_json::Value> = resp.tool_calls.clone();
 
+        // ── #697 R5-B: content-scan fallback for pseudo-XML tool calls ───────
+        // When the provider populated native tool_calls[], trust them and
+        // skip the scan — the native shape is authoritative. But when
+        // tool_calls is empty AND the content field contains recognisable
+        // pseudo-XML (Nemotron <function=NAME>, Hermes <tool_call>, Llama
+        // <|python_tag|>), promote the scanned entries into
+        // effective_tool_calls so the native path below can consume them
+        // unchanged. The synthetic entries match the OpenAI shape exactly;
+        // tool_calls_to_proposals doesn't care how they got there.
+        //
+        // Dogfood R5 evidence: nvidia/nemotron-3-super-120b emits
+        // <function=NAME> pseudo-XML into content when handed the old
+        // prose-described spawn_subagent meta-verb (pre-R5-A). R5-A's
+        // native tool_def mitigates the happy path, but Hermes/Qwen with
+        // thinking-mode and Llama-3.2 small variants still leak to
+        // content occasionally. This scan is the defensive backstop.
+        let _ = promote_content_scan_into_tool_calls(
+            &mut effective_tool_calls,
+            &resp.text,
+            &resolved_model_id,
+            "first_call",
+        );
+
         // ── Native tool call path ────────────────────────────────────────────
-        // If the model returned structured tool_calls (via native tool calling),
-        // convert them directly to ActionProposals. This is the preferred path —
-        // no JSON text parsing needed.
-        let mut proposals = if !resp.tool_calls.is_empty() {
-            tool_calls_to_proposals(&resp.tool_calls, &tool_descs)
+        // If the model returned structured tool_calls (via native tool calling
+        // OR via R5-B content-scan promotion above), convert them directly
+        // to ActionProposals. This is the preferred path — no JSON text
+        // parsing needed.
+        let mut proposals = if !effective_tool_calls.is_empty() {
+            tool_calls_to_proposals(&effective_tool_calls, &tool_descs)
         } else {
             // ── Legacy text-parsing path ─────────────────────────────────────
             // Parse the raw text response as a JSON array of action objects.
@@ -445,8 +469,21 @@ impl DecidePhase for LlmDecidePhase {
                 {
                     Ok(ok2) => {
                         let r2 = ok2.response;
-                        let retry_accepted = if !r2.tool_calls.is_empty() {
-                            parsed = tool_calls_to_proposals(&r2.tool_calls, &tool_descs);
+                        // #697 R5-B: apply the same content-scan promotion
+                        // on the retry response before falling through to
+                        // text parsing. Same rationale: if the retry
+                        // emitted pseudo-XML in content, promote it so
+                        // the native path handles it uniformly.
+                        let mut retry_effective_tool_calls = r2.tool_calls.clone();
+                        let _ = promote_content_scan_into_tool_calls(
+                            &mut retry_effective_tool_calls,
+                            &r2.text,
+                            &resolved_model_id,
+                            "retry",
+                        );
+                        let retry_accepted = if !retry_effective_tool_calls.is_empty() {
+                            parsed =
+                                tool_calls_to_proposals(&retry_effective_tool_calls, &tool_descs);
                             true
                         } else {
                             let second = parse_proposals(&r2.text);
@@ -468,7 +505,7 @@ impl DecidePhase for LlmDecidePhase {
                             // proposals they're staring at.
                             effective_messages = retry_messages;
                             effective_response_text = r2.text.clone();
-                            effective_tool_calls = r2.tool_calls.clone();
+                            effective_tool_calls = retry_effective_tool_calls;
                         }
                     }
                     Err(_) => {
@@ -1289,6 +1326,43 @@ pub(crate) fn stuck_nudge_suffix() -> &'static str {
         "other than `complete_run` on this turn will be treated as a ",
         "violation of the run contract."
     )
+}
+
+/// #697 R5-B helper: promote pseudo-XML tool-calls embedded in
+/// `content` into the given `tool_calls` slot when the provider didn't
+/// populate the native `tool_calls[]` array.
+///
+/// Returns `true` if a promotion happened so the caller can skip the
+/// text-parsing fallback path. Logs at INFO with the resolved model id
+/// so operators can spot models that regress to content-leak mode.
+///
+/// This is deliberately local (file-private, no Cargo re-export)
+/// because it's a one-component concern — the content-scan is only
+/// valid in the DECIDE-phase happy/retry paths where the provider
+/// response shape is OpenAI-compat. YAGNI says don't widen the
+/// surface until a second caller appears.
+fn promote_content_scan_into_tool_calls(
+    tool_calls: &mut Vec<serde_json::Value>,
+    response_text: &str,
+    resolved_model_id: &str,
+    origin: &'static str,
+) -> bool {
+    if !tool_calls.is_empty() || response_text.is_empty() {
+        return false;
+    }
+    let scanned = crate::content_tool_scan::scan_content_for_tool_calls(response_text);
+    if scanned.is_empty() {
+        return false;
+    }
+    tracing::info!(
+        model_id = %resolved_model_id,
+        scanned_count = scanned.len(),
+        origin = origin,
+        "#697 R5-B: promoted content-embedded tool_calls from pseudo-XML — \
+         model emitted tool_call as prose instead of native tool_calls[]",
+    );
+    *tool_calls = scanned;
+    true
 }
 
 /// Convert native tool_calls from the provider response into `ActionProposal` values.
