@@ -3578,18 +3578,26 @@ impl SqliteSyncProjection {
                 // Issue #668: persist the LLM round-trip body. Keyed
                 // on `trace_id` (UNIQUE); re-application is a no-op
                 // via ON CONFLICT DO NOTHING.
+                //
+                // Dogfood R7 follow-up: `tool_defs_json` is the
+                // tools[] array shipped TO the model at decision time.
+                // Added in the sqlite schema with DEFAULT '[]'. The
+                // domain event's `#[serde(default = ...)]` normalises
+                // missing fields on legacy events to `"[]"` (valid
+                // JSON) rather than `""`, so the bind is always a
+                // valid JSON array.
                 sqlx::query(
                     "INSERT INTO llm_completions
                          (trace_id, tenant_id, workspace_id, project_id,
                           session_id, run_id, model_id,
                           system_prompt, messages_json,
-                          response_text, tool_calls_json,
+                          response_text, tool_calls_json, tool_defs_json,
                           recorded_at_ms, created_at)
                      VALUES
                          (?, ?, ?, ?,
                           ?, ?, ?,
                           ?, ?,
-                          ?, ?,
+                          ?, ?, ?,
                           ?, ?)
                      ON CONFLICT(trace_id) DO NOTHING",
                 )
@@ -3604,6 +3612,7 @@ impl SqliteSyncProjection {
                 .bind(e.messages_json.as_str())
                 .bind(e.response_text.as_str())
                 .bind(e.tool_calls_json.as_str())
+                .bind(e.tool_defs_json.as_str())
                 .bind(e.recorded_at_ms as i64)
                 .bind(now)
                 .execute(&mut **tx)

@@ -620,6 +620,7 @@ mod tests {
             system_prompt: String::new(),
             messages_json: "[]".to_owned(),
             tool_calls_json: "[]".to_owned(),
+            tool_defs_json: "[]".to_owned(),
         }
     }
 

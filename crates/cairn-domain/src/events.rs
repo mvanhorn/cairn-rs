@@ -1967,6 +1967,31 @@ pub struct LlmCompletionRecorded {
     /// Empty JSON array for legacy text-parsing responses. Structured
     /// tool calls are the preferred surface.
     pub tool_calls_json: String,
+    /// JSON-serialised `Vec<ToolDef>` the orchestrator shipped TO the
+    /// provider in the `tools[]` array of the chat-completion request.
+    /// Post-redaction. Empty JSON array when no native tools were
+    /// advertised (legacy text-only path).
+    ///
+    /// **Why this field exists.** Dogfood R7 (2026-05-06) hit a
+    /// diagnostic wall: the parent run emitted the same
+    /// `spawn_subagent` call five times in a row, and the operator
+    /// trace surfaced `tool_calls_json` (what the model emitted) and
+    /// `messages_json` (what it saw) but NOT the `tools[]` array the
+    /// request shipped with. Debugging "did the model have
+    /// `complete_run` available when it chose to spawn again?"
+    /// required re-reading the orchestrator source rather than
+    /// checking the trace. Persisting the exact `tools[]` array
+    /// closes that observability gap.
+    ///
+    /// Back-compat: `#[serde(default = "default_empty_json_array")]`
+    /// makes pre-fix events (replayed from the log) deserialise with
+    /// `"[]"` — a valid JSON array — instead of `""`. This keeps the
+    /// API contract stable (consumers can always `JSON.parse` the
+    /// field) and matches the SQL column `DEFAULT '[]'` so the
+    /// projection applier can bind the field verbatim without a
+    /// branch on empty strings.
+    #[serde(default = "default_empty_json_array")]
+    pub tool_defs_json: String,
     /// Unix epoch ms when the body was recorded.
     pub recorded_at_ms: u64,
 }
@@ -2631,6 +2656,16 @@ pub struct RoutePolicyCreated {
 
 fn default_true() -> bool {
     true
+}
+
+/// Serde default for `LlmCompletionRecorded.tool_defs_json` — pre-fix
+/// events replayed from the log deserialise with `"[]"` (a valid
+/// JSON array) rather than `""` (invalid JSON). Keeps the API
+/// contract stable for legacy traces and matches the SQL column
+/// `DEFAULT '[]'` so the projection appliers don't need a
+/// normalisation branch.
+fn default_empty_json_array() -> String {
+    "[]".to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3553,6 +3588,52 @@ mod tests {
         assert!(
             json.contains("\"event\":\"tool_call_proposed\""),
             "expected snake_case event discriminator, got {json}"
+        );
+    }
+
+    #[test]
+    fn llm_completion_recorded_legacy_event_deserializes_tool_defs_as_valid_json_array() {
+        // Pre-fix events on the event log don't carry `tool_defs_json`.
+        // Gemini review on #703 caught that a naked `#[serde(default)]`
+        // would resolve to `String::default()` == "" — which is NOT
+        // valid JSON and contradicts both the SQL column `DEFAULT '[]'`
+        // and the API-consumer expectation that `tool_defs_json` can
+        // always be `JSON.parse`d.
+        //
+        // The fix: `#[serde(default = "default_empty_json_array")]`
+        // returns `"[]"` so legacy events replay with a valid JSON
+        // array. This test locks that in.
+        let legacy_json = r#"{
+            "project": {
+                "tenant_id": "t",
+                "workspace_id": "w",
+                "project_id": "p"
+            },
+            "trace_id": "trace_legacy",
+            "session_id": "sess_legacy",
+            "run_id": null,
+            "model_id": "claude-sonnet-4-5",
+            "system_prompt": "",
+            "messages_json": "[]",
+            "response_text": "",
+            "tool_calls_json": "[]",
+            "recorded_at_ms": 0
+        }"#;
+
+        let parsed: super::LlmCompletionRecorded =
+            serde_json::from_str(legacy_json).expect("legacy event must deserialize");
+        assert_eq!(
+            parsed.tool_defs_json, "[]",
+            "missing tool_defs_json must default to the valid-JSON-array string `[]`, \
+             not the invalid `\"\"`; got {:?}",
+            parsed.tool_defs_json,
+        );
+        // Paranoia: confirm it parses as an empty JSON array.
+        let parsed_array: serde_json::Value = serde_json::from_str(&parsed.tool_defs_json)
+            .expect("tool_defs_json default must parse as JSON");
+        assert!(
+            parsed_array.as_array().is_some_and(|a| a.is_empty()),
+            "default tool_defs_json must parse as an empty JSON array; got {parsed_array:?}",
         );
     }
 }

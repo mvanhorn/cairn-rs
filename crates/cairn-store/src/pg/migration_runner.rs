@@ -449,6 +449,27 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "runs_descendants_counter",
         include_str!("migrations/V069__runs_descendants_counter.sql"),
     ),
+    // #670 G5: partial index on `subagent_spawns.child_run_id` for
+    // the parent-auto-resume terminal-hook lookup. The SQL file has
+    // existed on disk since G5 shipped; it was not wired into the
+    // runner registry, meaning fresh pg boots did not apply the
+    // index and the terminal-hook lookup degraded to a full-scan
+    // once `subagent_spawns` grew. Picking it up here alongside
+    // V071 — CREATE INDEX IF NOT EXISTS is idempotent so operators
+    // who manually applied V070 out-of-band are unaffected.
+    (
+        70,
+        "subagent_spawns_child_run_id_index",
+        include_str!("migrations/V070__subagent_spawns_child_run_id_index.sql"),
+    ),
+    // Dogfood R7 observability: `tool_defs_json` column on
+    // `llm_completions`. See the migration file for the full
+    // motivation + back-compat contract.
+    (
+        71,
+        "add_tool_defs_to_llm_completions",
+        include_str!("migrations/V071__add_tool_defs_to_llm_completions.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

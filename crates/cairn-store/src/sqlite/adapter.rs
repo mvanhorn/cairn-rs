@@ -5029,6 +5029,7 @@ struct SqliteLlmCompletionBodyRow {
     messages_json: String,
     response_text: String,
     tool_calls_json: String,
+    tool_defs_json: String,
     recorded_at_ms: i64,
 }
 
@@ -5048,6 +5049,7 @@ impl SqliteLlmCompletionBodyRow {
             messages_json: self.messages_json,
             response_text: self.response_text,
             tool_calls_json: self.tool_calls_json,
+            tool_defs_json: self.tool_defs_json,
             recorded_at_ms: self.recorded_at_ms.max(0) as u64,
         }
     }
@@ -5057,7 +5059,7 @@ const LLM_COMPLETION_BODY_SELECT_COLS_SQLITE: &str =
     "trace_id, tenant_id, workspace_id, project_id, \
      session_id, run_id, model_id, \
      system_prompt, messages_json, \
-     response_text, tool_calls_json, recorded_at_ms";
+     response_text, tool_calls_json, tool_defs_json, recorded_at_ms";
 
 #[async_trait]
 impl crate::projections::LlmCompletionBodyReadModel for SqliteAdapter {

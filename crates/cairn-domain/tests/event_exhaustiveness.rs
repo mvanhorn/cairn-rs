@@ -1167,6 +1167,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             messages_json: "[]".to_owned(),
             response_text: "ok".to_owned(),
             tool_calls_json: "[]".to_owned(),
+            tool_defs_json: "[]".to_owned(),
             recorded_at_ms: ts,
         }),
         RuntimeEvent::SoulPatchProposed(SoulPatchProposed {

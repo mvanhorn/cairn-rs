@@ -184,6 +184,15 @@ pub struct DecideOutput {
     /// via native tool calling, or `[]` if the model went through the
     /// legacy JSON-array text path. Pre-redaction.
     pub tool_calls_json: String,
+    /// Dogfood R7 follow-up: JSON-serialised `Vec<ToolDef>` the
+    /// orchestrator shipped TO the provider in the `tools[]` array
+    /// of the chat-completion request. This is the complete tool
+    /// surface the model had available at decision time — persisting
+    /// it closes the diagnostic gap that blocked #702 ("did the
+    /// model have `complete_run` available when it chose to re-spawn
+    /// the same subagent?"). Pre-redaction. Empty JSON array when
+    /// no native tools were advertised.
+    pub tool_defs_json: String,
 }
 
 impl DecideOutput {
@@ -613,6 +622,7 @@ mod tests {
             system_prompt: String::new(),
             messages_json: "[]".to_owned(),
             tool_calls_json: "[]".to_owned(),
+            tool_defs_json: "[]".to_owned(),
         }
     }
 

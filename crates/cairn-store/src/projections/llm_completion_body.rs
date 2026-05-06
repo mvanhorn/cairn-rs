@@ -54,6 +54,11 @@ pub struct LlmCompletionBodyRecord {
     pub response_text: String,
     /// JSON-serialised `Vec<ToolCall>` the LLM proposed, post-redaction.
     pub tool_calls_json: String,
+    /// JSON-serialised `Vec<ToolDef>` the orchestrator shipped TO the
+    /// provider in the `tools[]` array of the chat-completion request.
+    /// Post-redaction. See the sibling docstring on
+    /// `LlmCompletionRecorded.tool_defs_json` for the full rationale.
+    pub tool_defs_json: String,
     pub recorded_at_ms: u64,
 }
 

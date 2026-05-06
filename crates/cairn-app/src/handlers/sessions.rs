@@ -522,6 +522,10 @@ pub(crate) async fn get_session_llm_trace_body_handler(
                     "messages_json":   row.messages_json,
                     "response_text":   row.response_text,
                     "tool_calls_json": row.tool_calls_json,
+                    // Dogfood R7 observability: the tools[] array
+                    // the request shipped with. Empty "[]" for
+                    // pre-fix traces replayed from the event log.
+                    "tool_defs_json":  row.tool_defs_json,
                     "recorded_at_ms":  row.recorded_at_ms,
                 })),
             )

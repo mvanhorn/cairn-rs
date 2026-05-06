@@ -172,6 +172,7 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
         system_prompt: String::new(),
         messages_json: "[]".to_owned(),
         tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     };
 
     let sink: Arc<dyn TaskFrameSink> = Arc::new(claimed);

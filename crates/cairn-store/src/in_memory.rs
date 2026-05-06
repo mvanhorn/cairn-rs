@@ -2792,6 +2792,7 @@ impl InMemoryStore {
                     messages_json: e.messages_json.clone(),
                     response_text: e.response_text.clone(),
                     tool_calls_json: e.tool_calls_json.clone(),
+                    tool_defs_json: e.tool_defs_json.clone(),
                     recorded_at_ms: e.recorded_at_ms,
                 };
                 let is_replace = state

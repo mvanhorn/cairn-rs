@@ -127,6 +127,12 @@ pub(crate) async fn record_decide_trace(
         let messages_json = redact_and_cap(&d.messages_json, max_field_bytes);
         let response_text = redact_and_cap(&d.raw_response, max_field_bytes);
         let tool_calls_json = redact_and_cap(&d.tool_calls_json, max_field_bytes);
+        // Dogfood R7 observability: persist the tools[] array shipped
+        // TO the model alongside the response. Same redaction + cap
+        // pipeline as the other body fields — tool_defs may embed
+        // docstring snippets or schema examples that the redactor
+        // should scrub and the cap should bound.
+        let tool_defs_json = redact_and_cap(&d.tool_defs_json, max_field_bytes);
         Some(EventEnvelope::for_runtime_event(
             EventId::new(format!("evt_body_{call_id}")),
             EventSource::Runtime,
@@ -140,6 +146,7 @@ pub(crate) async fn record_decide_trace(
                 messages_json,
                 response_text,
                 tool_calls_json,
+                tool_defs_json,
                 recorded_at_ms: now,
             }),
         ))

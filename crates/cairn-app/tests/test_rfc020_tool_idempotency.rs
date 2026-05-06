@@ -170,6 +170,7 @@ fn decide_with(proposal: ActionProposal) -> DecideOutput {
         system_prompt: String::new(),
         messages_json: "[]".to_owned(),
         tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     }
 }
 
@@ -298,6 +299,7 @@ async fn parallel_calls_of_same_tool_get_distinct_ids() {
         system_prompt: String::new(),
         messages_json: "[]".to_owned(),
         tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     };
     execute.execute(&ctx, &decide).await.expect("dispatch");
 

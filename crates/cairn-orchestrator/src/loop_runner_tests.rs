@@ -123,6 +123,7 @@ fn decide_done() -> DecideOutput {
         system_prompt: String::new(),
         messages_json: "[]".to_owned(),
         tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     }
 }
 
@@ -162,6 +163,7 @@ fn decide_tool(tool: &str) -> DecideOutput {
         system_prompt: String::new(),
         messages_json: "[]".to_owned(),
         tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     }
 }
 
@@ -566,6 +568,7 @@ async fn requires_approval_suspends_immediately() {
         system_prompt: String::new(),
         messages_json: "[]".to_owned(),
         tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     };
 
     let lp = OrchestratorLoop::new(
@@ -755,6 +758,7 @@ async fn build_step_summary_handles_flattened_results_without_misalignment() {
         system_prompt: String::new(),
         messages_json: "[]".to_owned(),
         tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     };
 
     // Only the InvokeTool result was recorded; the CompleteRun
@@ -1126,6 +1130,7 @@ async fn loop_runner_carries_discovered_tools_to_next_iteration() {
                 system_prompt: String::new(),
                 messages_json: "[]".to_owned(),
                 tool_calls_json: "[]".to_owned(),
+                tool_defs_json: "[]".to_owned(),
             })
         }
     }
@@ -1877,6 +1882,7 @@ async fn rejected_drain_dedups_across_iterations() {
                     system_prompt: String::new(),
                     messages_json: "[]".to_owned(),
                     tool_calls_json: "[]".to_owned(),
+                    tool_defs_json: "[]".to_owned(),
                 })
             } else {
                 Ok(decide_done())
@@ -2297,6 +2303,7 @@ mod gate_fixtures {
                     system_prompt: String::new(),
                     messages_json: "[]".to_owned(),
                     tool_calls_json: "[]".to_owned(),
+                    tool_defs_json: "[]".to_owned(),
                 });
             }
             Ok(DecideOutput {
@@ -2318,6 +2325,7 @@ mod gate_fixtures {
                 system_prompt: String::new(),
                 messages_json: "[]".to_owned(),
                 tool_calls_json: "[]".to_owned(),
+                tool_defs_json: "[]".to_owned(),
             })
         }
     }
@@ -2579,6 +2587,7 @@ async fn echo_via_bash_detector_fires_on_second_consecutive_echo_turn() {
                     system_prompt: String::new(),
                     messages_json: "[]".to_owned(),
                     tool_calls_json: "[]".to_owned(),
+                    tool_defs_json: "[]".to_owned(),
                 })
             } else {
                 Ok(decide_done())
@@ -2859,6 +2868,7 @@ mod malformed_spawn_fixtures {
             system_prompt: String::new(),
             messages_json: "[]".to_owned(),
             tool_calls_json: "[]".to_owned(),
+            tool_defs_json: "[]".to_owned(),
         }
     }
 
@@ -2882,6 +2892,7 @@ mod malformed_spawn_fixtures {
             system_prompt: String::new(),
             messages_json: "[]".to_owned(),
             tool_calls_json: "[]".to_owned(),
+            tool_defs_json: "[]".to_owned(),
         }
     }
 }

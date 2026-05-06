@@ -554,6 +554,13 @@ impl DecidePhase for LlmDecidePhase {
         } else {
             serde_json::to_string(&effective_tool_calls).unwrap_or_else(|_| "[]".to_owned())
         };
+        // Dogfood R7 observability: persist the exact `tools[]` array
+        // the request shipped with so operators can see what tool
+        // surface the model had at decision time. Both the first call
+        // and the retry (if it fired) use the same `tool_defs` slice
+        // so this reflects what was in front of the model regardless
+        // of which call produced the effective response.
+        let tool_defs_json = serde_json::to_string(&tool_defs).unwrap_or_else(|_| "[]".to_owned());
 
         Ok(DecideOutput {
             raw_response: effective_response_text,
@@ -570,6 +577,7 @@ impl DecidePhase for LlmDecidePhase {
             system_prompt: system,
             messages_json,
             tool_calls_json,
+            tool_defs_json,
         })
     }
 }

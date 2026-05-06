@@ -1238,6 +1238,8 @@ CREATE TABLE IF NOT EXISTS llm_completions (
     messages_json    TEXT    NOT NULL DEFAULT '[]',
     response_text    TEXT    NOT NULL DEFAULT '',
     tool_calls_json  TEXT    NOT NULL DEFAULT '[]',
+    -- Dogfood R7 observability: tools[] array shipped TO the model.
+    tool_defs_json   TEXT    NOT NULL DEFAULT '[]',
     recorded_at_ms   INTEGER NOT NULL,
     created_at       INTEGER NOT NULL
 );

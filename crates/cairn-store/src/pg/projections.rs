@@ -3952,19 +3952,28 @@ impl PgSyncProjection {
                 // `trace_id` (UNIQUE); re-applying the same event on
                 // replay or dual-write retry is a no-op via
                 // ON CONFLICT DO NOTHING.
+                //
+                // Dogfood R7 follow-up: `tool_defs_json` joins the
+                // persisted fields — the tools[] array the request
+                // shipped with, captured for DECIDE debugging. The
+                // domain event carries a `#[serde(default = ...)]`
+                // that replaces the missing field on legacy events
+                // with `"[]"` (not `""`), so binding the value
+                // verbatim lands a valid JSON array for every row —
+                // matching the column `DEFAULT '[]'` in V071.
                 sqlx::query(
                     "INSERT INTO llm_completions
                          (trace_id, tenant_id, workspace_id, project_id,
                           session_id, run_id, model_id,
                           system_prompt, messages_json,
-                          response_text, tool_calls_json,
+                          response_text, tool_calls_json, tool_defs_json,
                           recorded_at_ms, created_at)
                      VALUES
                          ($1, $2, $3, $4,
                           $5, $6, $7,
                           $8, $9,
-                          $10, $11,
-                          $12, $13)
+                          $10, $11, $12,
+                          $13, $14)
                      ON CONFLICT (trace_id) DO NOTHING",
                 )
                 .bind(e.trace_id.as_str())
@@ -3978,6 +3987,7 @@ impl PgSyncProjection {
                 .bind(e.messages_json.as_str())
                 .bind(e.response_text.as_str())
                 .bind(e.tool_calls_json.as_str())
+                .bind(e.tool_defs_json.as_str())
                 .bind(e.recorded_at_ms as i64)
                 .bind(now)
                 .execute(&mut **tx)
