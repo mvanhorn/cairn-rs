@@ -279,6 +279,12 @@ impl DecidePhase for LlmDecidePhase {
         // regression.
         let mut tool_defs: Vec<serde_json::Value> = Vec::with_capacity(tool_descs.len() + 1);
         tool_defs.push(complete_run_tool_def());
+        // #697 R5-A: spawn_subagent is a native tool def now. Models
+        // emit reliable structured JSON against the flat `{role, goal}`
+        // schema; the legacy prose-described meta-verb shape produced
+        // 3-way malformed emissions under real-LLM dogfood (see R5
+        // findings + probe evidence).
+        tool_defs.push(spawn_subagent_tool_def());
         tool_defs.extend(tool_descs.iter().map(descriptor_to_tool_def));
 
         // When we pass native tool definitions to the provider (OpenAI-style
@@ -1126,6 +1132,47 @@ pub(crate) fn complete_run_tool_def() -> serde_json::Value {
     })
 }
 
+/// Native tool schema for `spawn_subagent` — the subagent-delegation
+/// meta-verb. Publishing this as a native tool definition instead of a
+/// prose-only meta-verb is #697 R5-A: dogfood R5 showed that
+/// minimax-m2.5 / nemotron-3-super / gemma-4-31b all confuse the
+/// nested `{tool_name, tool_args: {goal}}` envelope documented in the
+/// legacy JSON-action prose. When handed a proper flat `{role, goal}`
+/// schema the same models emit perfect JSON reliably.
+///
+/// Flat args match the standard operator mental model ("spawn a
+/// researcher with goal X") and the domain-level contract
+/// (`TaskService::spawn_subagent(..., role: String)` +
+/// `FabricRunService::start_with_role(..., agent_role_id)` — both
+/// take `role` at the top level). The legacy nested shape was an
+/// artifact of the pre-native-tools JSON-action schema; `parse_one`
+/// still accepts the nested form for backward compat with runs that
+/// rely on the JSON-action envelope.
+pub(crate) fn spawn_subagent_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "spawn_subagent",
+            "description": "Delegate a concrete task to a sub-agent and wait for its result. The current run SUSPENDS until the sub-agent terminates; when it resumes, the sub-agent's completion summary is surfaced in the step_history under action_kind=\"subagent_complete\". Use this when the current run's goal decomposes into a self-contained sub-task that another role (researcher, executor, reviewer) is better suited to handle.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "The sub-agent role. Known roles: `researcher` (reads, cites, summarises), `executor` (writes code, runs tools), `reviewer` (audits work). Unknown roles fall through to the `orchestrator` default prompt at the sub-agent side, which is usually not what you want — stick to the known set."
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "REQUIRED. One-sentence concrete goal for the sub-agent. Be specific: 'Find 3 best practices for X' is good; 'research X' is too vague. The sub-agent's summary quality depends heavily on goal specificity."
+                    }
+                },
+                "required": ["role", "goal"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 // ── F38 stuck-loop nudge ─────────────────────────────────────────────────────
 
 /// Iteration index at which we start injecting the "you are stuck" nudge.
@@ -1277,19 +1324,37 @@ fn tool_calls_to_proposals(
             // registered in the tool catalogue. When we see that envelope
             // we produce a `SpawnSubagent` proposal directly so the loop
             // dispatches it correctly.
-            let is_spawn_envelope = raw_name == "spawn_subagent";
-            let (name, args) = unwrap_meta_envelope(&raw_name, raw_args);
-
-            if is_spawn_envelope {
+            //
+            // #697 R5-A: two shapes accepted for spawn_subagent tool_calls:
+            //
+            //  1. NATIVE (preferred): flat `{"role": ..., "goal": ...}`
+            //     emitted against the tool_def published in
+            //     `spawn_subagent_tool_def()`. This is what reliable
+            //     structured-output providers (OpenAI, Anthropic, and
+            //     the nemotron/gemma/minimax free-tier models verified
+            //     in R5 probes) produce.
+            //  2. LEGACY: nested `{"tool_name": ..., "tool_args": {"goal": ...}}`
+            //     — the pre-R5-A meta-verb shape. Kept for JSON-action
+            //     envelope compat and for any runs mid-flight against
+            //     old system prompts.
+            //
+            // Priority: check flat shape first (it's the new default
+            // and the more common wire shape after #697 ships). Only
+            // fall back to the legacy unwrap if top-level `role` is
+            // absent. This ordering preserves pre-#697 behaviour
+            // byte-identically on the legacy path.
+            if raw_name == "spawn_subagent" {
+                let (role, goal) = parse_spawn_subagent_args(&raw_args);
                 return Some(ActionProposal {
                     action_type: ActionType::SpawnSubagent,
-                    description: format!("spawn {name}"),
+                    description: format!("spawn {role}"),
                     confidence: 0.9,
-                    tool_name: Some(name),
-                    tool_args: Some(args),
+                    tool_name: Some(role),
+                    tool_args: Some(serde_json::json!({ "goal": goal })),
                     requires_approval: false,
                 });
             }
+            let (name, args) = unwrap_meta_envelope(&raw_name, raw_args);
 
             // F36: native `complete_run` tool call → terminal CompleteRun
             // proposal. The `final_answer` argument becomes the proposal
@@ -1388,6 +1453,55 @@ fn tool_calls_to_proposals(
 /// match (missing `tool_name`, non-object args, etc.), the original
 /// `(name, args)` tuple is returned unchanged so downstream error
 /// handling can surface a clear "unknown tool" diagnostic.
+/// #697 R5-A: extract `(role, goal)` from a `spawn_subagent` tool_call's
+/// `arguments`, accepting both the native flat shape and the legacy
+/// nested `{tool_name, tool_args}` shape.
+///
+/// Return values are best-effort strings — the caller builds the
+/// proposal with `tool_name: Some(role)` and
+/// `tool_args: Some({"goal": goal})`, and downstream validation in
+/// `TaskService::spawn_subagent`'s adapter enforces the non-empty
+/// `goal` contract (surfacing via R2-A's retry-with-feedback when the
+/// LLM still dropped the field).
+///
+/// Precedence (most-recent-shape first):
+///   1. Flat: `args.role` + `args.goal`
+///   2. Legacy nested: `args.tool_name` + `args.tool_args.goal`
+///
+/// Missing fields return empty strings — the validator rejects those
+/// and the retry loop gives the LLM a chance to correct.
+fn parse_spawn_subagent_args(args: &serde_json::Value) -> (String, String) {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return (String::new(), String::new()),
+    };
+
+    // Shape 1: native flat `{role, goal}`.
+    if let Some(role) = obj.get("role").and_then(|v| v.as_str()) {
+        let goal = obj
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        return (role.to_owned(), goal);
+    }
+
+    // Shape 2: legacy nested `{tool_name, tool_args: {goal}}`.
+    let role = obj
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let goal = obj
+        .get("tool_args")
+        .and_then(|v| v.as_object())
+        .and_then(|inner| inner.get("goal"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    (role, goal)
+}
+
 fn unwrap_meta_envelope(name: &str, args: serde_json::Value) -> (String, serde_json::Value) {
     if name != "invoke_tool" && name != "spawn_subagent" {
         return (name.to_owned(), args);
@@ -1811,6 +1925,9 @@ mod tests {
 
     #[test]
     fn tool_calls_unwrap_spawn_subagent_envelope() {
+        // Legacy nested shape: `{tool_name, tool_args: {goal}}`.
+        // Kept for backward compat with JSON-action-envelope emissions
+        // and with any system prompts mid-flight after R5-A ships.
         let tool_calls = vec![serde_json::json!({
             "type": "function",
             "function": {
@@ -1828,6 +1945,97 @@ mod tests {
         assert_eq!(
             proposals[0].tool_args.as_ref().and_then(|a| a.get("goal")),
             Some(&serde_json::Value::String("summarise RFCs".to_owned())),
+        );
+    }
+
+    #[test]
+    fn tool_calls_accept_flat_spawn_subagent_shape() {
+        // #697 R5-A: native flat shape `{role, goal}` — what the native
+        // tool_def schema elicits from well-behaved providers (OpenAI,
+        // Anthropic, Nemotron/Gemma/Minimax with native tools
+        // enabled per R5 probe evidence).
+        let tool_calls = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "spawn_subagent",
+                "arguments": {
+                    "role": "researcher",
+                    "goal": "Identify 3 Rust circuit breaker best practices"
+                }
+            }
+        })];
+        let proposals = tool_calls_to_proposals(&tool_calls, &[]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].action_type, ActionType::SpawnSubagent);
+        assert_eq!(proposals[0].tool_name.as_deref(), Some("researcher"));
+        assert_eq!(
+            proposals[0].tool_args.as_ref().and_then(|a| a.get("goal")),
+            Some(&serde_json::Value::String(
+                "Identify 3 Rust circuit breaker best practices".to_owned()
+            )),
+        );
+    }
+
+    #[test]
+    fn tool_calls_spawn_subagent_missing_goal_surfaces_empty_string() {
+        // Defense in depth: if the LLM emits `{role, ...}` but drops
+        // `goal`, we surface an empty goal string. The downstream
+        // `TaskService::spawn_subagent` validator then rejects via
+        // R2-A's retry-with-feedback path — the LLM sees "goal is
+        // required" on the next turn and corrects. We do NOT drop the
+        // proposal here: that would make the failure invisible to the
+        // retry loop.
+        let tool_calls = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "spawn_subagent",
+                "arguments": { "role": "researcher" }
+            }
+        })];
+        let proposals = tool_calls_to_proposals(&tool_calls, &[]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].tool_name.as_deref(), Some("researcher"));
+        assert_eq!(
+            proposals[0].tool_args.as_ref().and_then(|a| a.get("goal")),
+            Some(&serde_json::Value::String(String::new())),
+            "empty-goal case surfaces to R2-A retry loop, not silently dropped",
+        );
+    }
+
+    #[test]
+    fn spawn_subagent_tool_def_schema_is_flat_with_required_fields() {
+        // #697 R5-A contract test: the published tool_def must have
+        // `{role, goal}` both required at the top level of parameters.
+        // Production bug if this regresses — e.g. someone swaps to a
+        // nested schema hoping to carry more structured args. The
+        // R5 dogfood probe evidence is clear that nested args confuse
+        // free-tier models; flat is the reliable shape.
+        let def = spawn_subagent_tool_def();
+        let params = def
+            .pointer("/function/parameters")
+            .expect("tool def has parameters");
+        assert_eq!(params.get("type").and_then(|v| v.as_str()), Some("object"),);
+        let required = params
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required present");
+        let required_set: std::collections::HashSet<&str> =
+            required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_set.contains("role"), "role must be required");
+        assert!(required_set.contains("goal"), "goal must be required");
+        // Both fields exist at the flat top level of `properties`.
+        let props = params
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties present");
+        assert!(props.contains_key("role"), "role in properties");
+        assert!(props.contains_key("goal"), "goal in properties");
+        // additionalProperties:false is the industry-standard constrained-
+        // decoding hint (per multi-provider-tool-call-quirks research).
+        assert_eq!(
+            params.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false),
+            "additionalProperties:false enables strict-mode enforcement",
         );
     }
 
@@ -2622,11 +2830,13 @@ mod tests {
                 tools: &[serde_json::Value],
             ) -> Result<GenerationResponse, ProviderAdapterError> {
                 // Verify tools were sent. F38 injects `complete_run` at
-                // index 0, so `grep` (the only registered tool here) sits
-                // at index 1.
+                // index 0 and #697 R5-A injects `spawn_subagent` at index
+                // 1, so `grep` (the only registered tool here) sits at
+                // index 2.
                 assert!(!tools.is_empty(), "tools should be passed to generate");
                 assert_eq!(tools[0]["function"]["name"], "complete_run");
-                assert_eq!(tools[1]["function"]["name"], "grep");
+                assert_eq!(tools[1]["function"]["name"], "spawn_subagent");
+                assert_eq!(tools[2]["function"]["name"], "grep");
 
                 Ok(GenerationResponse {
                     text: String::new(), // no text — only tool_calls
