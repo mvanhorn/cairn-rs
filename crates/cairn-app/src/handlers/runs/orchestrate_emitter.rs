@@ -237,6 +237,23 @@ impl cairn_orchestrator::OrchestratorEventEmitter for TracingEmitter {
         }
         crate::metrics::record_breaker_threshold_warn(self.metrics.as_ref(), which);
     }
+    async fn on_prose_playing_detected(
+        &self,
+        ctx: &cairn_orchestrator::OrchestrationContext,
+        consecutive_count: u32,
+    ) {
+        // Issue #689 R2-B: bump the process-lifetime counter so
+        // operator dashboards can track how often free-tier LLMs
+        // role-play actions. The inner SSE emitter default no-ops
+        // on this callback today — if we ever wire an SSE frame for
+        // prose-playing, add it here before the counter bump so the
+        // dashboard gets the event and the metric increments in
+        // lockstep.
+        self.inner
+            .on_prose_playing_detected(ctx, consecutive_count)
+            .await;
+        crate::metrics::record_prose_playing_detected(self.metrics.as_ref());
+    }
     async fn on_finished(
         &self,
         ctx: &cairn_orchestrator::OrchestrationContext,

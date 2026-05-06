@@ -354,11 +354,21 @@ pub(crate) async fn get_run_telemetry_handler(
         _ => 0,
     };
 
+    // Issue #689 R2-B: live-aggregated "prose-playing" signal.
+    // Walks the ordered tool_invocations list for this run and looks
+    // for >= 2 consecutive `bash`-target invocations whose `command`
+    // JSON field matches the bare-`echo` heuristic. This derives
+    // from persisted state rather than the orchestrator loop's
+    // in-memory counter so it survives cairn-app restarts and
+    // matches whatever the operator actually sees in the event log.
+    let prose_playing_detected = detect_prose_playing_in_invocations(&tool_invocations);
+
     let body = serde_json::json!({
         "run_id": run.run_id.to_string(),
         "state": run.state,
         "stuck": stuck,
         "stuck_since_ms": stuck_since_ms,
+        "prose_playing_detected": prose_playing_detected,
         "provider_calls": provider_rows,
         "tool_invocations": tool_rows,
         "totals": {
@@ -375,6 +385,73 @@ pub(crate) async fn get_run_telemetry_handler(
     });
 
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Issue #689 R2-B: scan an ordered list of tool invocations for the
+/// "echo-via-bash prose-playing" pattern.
+///
+/// Returns `true` when at least `ECHO_BASH_DETECTION_THRESHOLD`
+/// consecutive bash invocations match the bare-echo heuristic. The
+/// invocations list is expected in store order (most recently
+/// persisted first OR oldest first — either works, since the
+/// detector only looks at consecutive runs).
+///
+/// Implementation reuses the pure classifier from
+/// `cairn_orchestrator::echo_detector` so there's exactly one
+/// source of truth for the heuristic. If the orchestrator
+/// classifier evolves (e.g. adds shell-prefix forms), telemetry
+/// picks up the improvement automatically.
+fn detect_prose_playing_in_invocations(
+    invocations: &[cairn_domain::tool_invocation::ToolInvocationRecord],
+) -> bool {
+    use cairn_domain::tool_invocation::ToolInvocationTarget;
+    let mut consecutive = 0u32;
+    for inv in invocations {
+        let is_bash = matches!(
+            &inv.target,
+            ToolInvocationTarget::Builtin { tool_name } if tool_name.as_str() == "bash"
+        );
+        if !is_bash {
+            consecutive = 0;
+            continue;
+        }
+        let command_is_bare_echo = inv
+            .args_json
+            .as_ref()
+            .and_then(|v| v.get("command"))
+            .and_then(|v| v.as_str())
+            .map(is_bare_echo_command_for_telemetry)
+            .unwrap_or(false);
+        if command_is_bare_echo {
+            consecutive = consecutive.saturating_add(1);
+            if consecutive >= cairn_orchestrator::ECHO_BASH_DETECTION_THRESHOLD {
+                return true;
+            }
+        } else {
+            consecutive = 0;
+        }
+    }
+    false
+}
+
+/// Thin wrapper around the orchestrator's pure classifier to keep
+/// the import site shallow. The check is identical to what the
+/// loop runner's `EchoDetectorState` applies live, so telemetry and
+/// the in-process detector agree on what counts as prose-play.
+fn is_bare_echo_command_for_telemetry(cmd: &str) -> bool {
+    // Build a minimal ActionProposal to reuse the orchestrator's
+    // canonical classifier. This is a few bytes of transient allocation
+    // per bash invocation scanned — negligible vs the 1000-row query
+    // bound already in place for `list_by_run`.
+    use cairn_domain::ActionProposal;
+    let proposal = ActionProposal::invoke_tool(
+        "bash",
+        serde_json::json!({ "command": cmd }),
+        "telemetry-classify",
+        0.0,
+        false,
+    );
+    cairn_orchestrator::is_echo_bash_proposal(&proposal)
 }
 
 pub(crate) async fn list_escalated_runs_handler(

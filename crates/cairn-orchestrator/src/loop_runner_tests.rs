@@ -2510,6 +2510,115 @@ async fn completion_gate_force_fails_after_three_rejections() {
     );
 }
 
+// ── #689 R2-B: echo-via-bash prose-playing detector ──────────────────────
+
+/// Issue #689 Finding R2-B: a loop-level integration test proving the
+/// detector hook actually fires through to the emitter callback.
+/// Two consecutive bash-echo turns must trigger exactly one
+/// `on_prose_playing_detected` callback on the second turn (not the
+/// first), and the run keeps going — the detector is observational,
+/// not an enforcer.
+///
+/// The pure detector unit tests (test A–E in `echo_detector::tests`)
+/// cover the heuristic. This test pins the wiring: if someone
+/// detaches the detector from the loop or forgets to call the
+/// emitter callback, this breaks.
+#[tokio::test]
+async fn echo_via_bash_detector_fires_on_second_consecutive_echo_turn() {
+    #[derive(Default)]
+    struct RecordingEmitter {
+        detected_counts: std::sync::Mutex<Vec<u32>>,
+    }
+    #[async_trait]
+    impl crate::emitter::OrchestratorEventEmitter for RecordingEmitter {
+        async fn on_prose_playing_detected(
+            &self,
+            _ctx: &OrchestrationContext,
+            consecutive_count: u32,
+        ) {
+            self.detected_counts.lock().unwrap().push(consecutive_count);
+        }
+    }
+
+    // Stub decide that emits bash-echo on the first two iterations
+    // then complete_run so the loop terminates cleanly.
+    struct EchoThenDone {
+        calls: std::sync::Mutex<u32>,
+    }
+    #[async_trait]
+    impl DecidePhase for EchoThenDone {
+        async fn decide(
+            &self,
+            _: &OrchestrationContext,
+            _: &GatherOutput,
+        ) -> Result<DecideOutput, OrchestratorError> {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            if *n <= 2 {
+                let bash_proposal = ActionProposal::invoke_tool(
+                    "bash",
+                    serde_json::json!({
+                        "command": format!(
+                            "echo 'narration turn {}: thinking about next step'",
+                            *n
+                        ),
+                    }),
+                    "echo narration",
+                    0.8,
+                    true,
+                );
+                Ok(DecideOutput {
+                    raw_response: String::new(),
+                    proposals: vec![bash_proposal],
+                    calibrated_confidence: 0.8,
+                    requires_approval: true,
+                    model_id: "stub".into(),
+                    latency_ms: 1,
+                    input_tokens: None,
+                    output_tokens: None,
+                    system_prompt: String::new(),
+                    messages_json: "[]".to_owned(),
+                    tool_calls_json: "[]".to_owned(),
+                })
+            } else {
+                Ok(decide_done())
+            }
+        }
+    }
+
+    let emitter = std::sync::Arc::new(RecordingEmitter::default());
+    let config = LoopConfig {
+        max_iterations: 5,
+        breakers: permissive_breakers(),
+        ..Default::default()
+    };
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        EchoThenDone {
+            calls: std::sync::Mutex::new(0),
+        },
+        ScriptedExecute {
+            signal: LoopSignal::Continue,
+        },
+        config,
+    )
+    .with_emitter(emitter.clone());
+
+    // Run to termination — the complete_run on iter 3 ends it.
+    let _ = lp.run(ctx()).await;
+
+    let counts = emitter.detected_counts.lock().unwrap().clone();
+    // Iteration 0 (first bash-echo): counter = 1, below threshold → no callback.
+    // Iteration 1 (second bash-echo): counter = 2, at threshold → one callback.
+    // Iteration 2 (complete_run): non-echo → counter reset, no callback.
+    assert_eq!(
+        counts,
+        vec![2],
+        "detector must fire exactly once at the threshold crossing (consecutive_count=2); \
+         first echo turn below threshold, third turn is complete_run"
+    );
+}
+
 /// #660 (4): gate OFF + errors + CompleteRun → run completes normally
 /// (legacy behaviour). Proves the flag is load-bearing; operators who
 /// opt out of the gate see the pre-fix flow.

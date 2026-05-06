@@ -206,6 +206,14 @@ pub struct AppMetrics {
     /// produce `cairn_orchestrator_inline_run_ratio`. Fixed-capacity
     /// so a noisy tenant can't unbounded-grow the gauge series.
     inline_run_window: Mutex<InlineRunWindow>,
+
+    // ── Issue #689 R2-B: echo-via-bash prose-playing detector ─────
+    /// Total `on_prose_playing_detected` callbacks observed since
+    /// process start. Monotonic; each DECIDE turn classified as
+    /// consecutive echo-via-bash (past the threshold) increments
+    /// once. Useful for operators to track how often free-tier
+    /// models role-play actions instead of dispatching them.
+    prose_playing_detected_total: AtomicU64,
 }
 
 /// F65 PR-3: per-kind breaker-trip distribution sample. Distinct from
@@ -435,6 +443,19 @@ pub(crate) fn record_breaker_threshold_warn(
 /// the event log (`SubagentSpawned` + parent/child run lineage).
 pub(crate) fn record_subagent_spawn(metrics: &AppMetrics) {
     metrics.subagent_spawn_total.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Issue #689 Finding R2-B: bump the
+/// `cairn_orchestrator_prose_playing_detected_total` counter. Called
+/// once per DECIDE turn classified as "echo-via-bash prose-playing"
+/// after the consecutive-turn threshold is reached. See
+/// `cairn_orchestrator::echo_detector` for the heuristic — this
+/// counter is the operator-facing observability signal; the loop
+/// itself does not auto-fail or cancel on detection.
+pub(crate) fn record_prose_playing_detected(metrics: &AppMetrics) {
+    metrics
+        .prose_playing_detected_total
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// #661: observe a terminal run's final iteration count. Populates
@@ -1102,6 +1123,21 @@ impl AppMetrics {
         lines.push(format!(
             "cairn_orchestrator_inline_run_ratio_samples {}",
             window.len()
+        ));
+
+        // ── #689 R2-B: prose-playing detector counter ──
+        // Rendered alongside the subagent-spawn counter because both
+        // surface "is the LLM doing real work?" at a run-local scale.
+        // A visible `0` is the healthy signal; non-zero means at
+        // least one run reached >= 2 consecutive bash-echo turns.
+        lines.push(
+            "# HELP cairn_orchestrator_prose_playing_detected_total Total DECIDE turns classified as echo-via-bash prose-playing since process start. Fires on every consecutive turn past the detection threshold (see `cairn_orchestrator::echo_detector`). Non-terminal — runs continue after detection; the counter is observability only."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_prose_playing_detected_total counter".to_owned());
+        lines.push(format!(
+            "cairn_orchestrator_prose_playing_detected_total {}",
+            self.prose_playing_detected_total.load(Ordering::Relaxed)
         ));
     }
 
@@ -2121,6 +2157,31 @@ mod tests {
         assert!(
             rendered.contains("cairn_orchestrator_subagent_spawn_total 3"),
             "counter should read 3 after 3 increments;\n\ngot:\n{rendered}"
+        );
+    }
+
+    // ── #689 R2-B: prose-playing detector counter ───────────────────
+
+    #[test]
+    fn prose_playing_counter_renders_zero_on_empty() {
+        let metrics = AppMetrics::default();
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_prose_playing_detected_total 0"),
+            "counter must render as 0 when never incremented — a \
+             visible zero is the healthy signal;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn prose_playing_counter_tracks_monotonic_increments() {
+        let metrics = AppMetrics::default();
+        record_prose_playing_detected(&metrics);
+        record_prose_playing_detected(&metrics);
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_prose_playing_detected_total 2"),
+            "counter should read 2 after 2 increments;\n\ngot:\n{rendered}"
         );
     }
 

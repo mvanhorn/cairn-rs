@@ -23,6 +23,7 @@ pub mod completion_verification;
 pub mod context;
 pub mod decide;
 pub mod decide_impl;
+pub mod echo_detector;
 pub mod emitter;
 pub mod error;
 pub mod execute;
@@ -41,6 +42,10 @@ pub use context::{
 };
 pub use decide::DecidePhase;
 pub use decide_impl::{estimate_tokens, LlmDecidePhase, TokenBudget};
+pub use echo_detector::{
+    is_echo_bash_proposal, is_echo_bash_turn, EchoDetectorCheck, EchoDetectorState,
+    ECHO_BASH_DETECTION_THRESHOLD,
+};
 pub use emitter::{ChannelEmitter, NoOpEmitter, OrchestratorEvent, OrchestratorEventEmitter};
 pub use error::OrchestratorError;
 // Re-export the runtime's chain/routing types so existing call sites

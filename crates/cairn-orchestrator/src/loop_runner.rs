@@ -705,6 +705,14 @@ where
         // HTTP handler via the 3-layer RuntimeConfig fallback plus per-run
         // overrides.
         let mut breaker_state = crate::breakers::BreakerState::new(self.config.breakers.clone());
+        // Issue #689 Finding R2-B: per-run state tracking consecutive
+        // `bash` + bare-`echo` prose-playing turns. Observational only —
+        // the loop continues even when the detector fires; the
+        // emitter-side metric + WARN log surfaces the signal to
+        // operators without auto-failing the run. See
+        // `crate::echo_detector` rustdoc for the heuristic + scope
+        // guardrails.
+        let mut echo_detector_state = crate::echo_detector::EchoDetectorState::new();
         // Warn-once latch: fired when a DECIDE response lacks both input
         // and output token counts so token-cap accounting silently
         // under-counts. Set on first occurrence and never cleared; rare
@@ -1094,6 +1102,34 @@ where
                 .await
             {
                 return Ok(term);
+            }
+
+            // ── (3a'') Issue #689 R2-B: echo-via-bash prose-playing ──────────
+            // Non-terminal detector. When the LLM emits consecutive
+            // `bash` + bare-`echo` proposals (no redirects / pipes /
+            // operators), it's narrating its intentions instead of
+            // dispatching the action. WARN-log + emitter hook, then
+            // continue — the operator decides what to do. No run
+            // modification, no breaker trip, no cancel.
+            use crate::echo_detector::EchoDetectorCheck;
+            match echo_detector_state.on_decide(&decide_output) {
+                EchoDetectorCheck::Detected { consecutive_count } => {
+                    tracing::warn!(
+                        run_id             = %ctx.run_id,
+                        iteration          = ctx.iteration,
+                        model              = %decide_output.model_id,
+                        consecutive_count  = consecutive_count,
+                        pattern            = "echo_via_bash",
+                        "issue #689 R2-B: LLM appears to be prose-playing — emitting \
+                         consecutive `bash` + bare-`echo` proposals instead of the \
+                         correct ActionType. Operator visibility only; the run \
+                         continues."
+                    );
+                    self.emitter
+                        .on_prose_playing_detected(ctx, consecutive_count)
+                        .await;
+                }
+                EchoDetectorCheck::Continue => {}
             }
 
             // ── (3a') Emitter fatal-error check ──────────────────────────────

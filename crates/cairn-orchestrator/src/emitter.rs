@@ -250,6 +250,28 @@ pub trait OrchestratorEventEmitter: Send + Sync {
     ) {
     }
 
+    /// Issue #689 Finding R2-B: called once per DECIDE turn once the
+    /// "echo-via-bash prose-playing" detector reaches its
+    /// consecutive-turn threshold. Fires on every turn from the
+    /// threshold onwards while the model keeps prose-playing —
+    /// dashboards count each fire, but the loop's WARN log is
+    /// rate-limited by the monotonic counter (same count never
+    /// re-observed).
+    ///
+    /// **Non-terminal**: the loop keeps running. The detector is
+    /// an operator-visible signal, not an enforcer. See the task
+    /// brief on `issue #689` for the scope rationale.
+    ///
+    /// `consecutive_count` is the total consecutive echo-bash turns
+    /// observed (>= `ECHO_BASH_DETECTION_THRESHOLD`); operators can
+    /// plot it to see how long the run has been stuck.
+    async fn on_prose_playing_detected(
+        &self,
+        _ctx: &OrchestrationContext,
+        _consecutive_count: u32,
+    ) {
+    }
+
     /// Called once after the loop terminates (terminal or suspended).
     async fn on_finished(&self, _ctx: &OrchestrationContext, _termination: &LoopTermination) {}
 
