@@ -2118,6 +2118,52 @@ impl TaskService for FabricTaskServiceAdapter {
             .await
             .map_err(fabric_err_to_runtime)?;
 
+        // #700: persist the spawn goal onto the child run's defaults so
+        // `ChildRunDriver` + F49 auto-resume both read the real goal
+        // through `resolve_run_string_default(... "goal")` instead of
+        // falling through to the `"Execute the run objective."`
+        // placeholder.
+        //
+        // The HTTP `/orchestrate` path already does this write when an
+        // operator POSTs with `{ "goal": "..." }` (see
+        // `handlers/runs/orchestrate.rs` — #651). A subagent has no
+        // prior operator POST; the spawn adapter is the only place
+        // that knows both the goal and the child run id, so the write
+        // must land here.
+        //
+        // Key format `run:<child_run_id>:goal` matches
+        // `helpers::run_default_key(run_id, "goal")` so the HTTP
+        // resolver finds it on the next orchestrate call.
+        //
+        // Best-effort: a defaults write failure logs at WARN and the
+        // spawn still succeeds. The child's first iteration would
+        // then see the fallback goal — no worse than pre-#700 and
+        // the warn is operator-visible.
+        {
+            use cairn_runtime::services::DefaultsServiceImpl;
+            use cairn_runtime::DefaultsService;
+            let defaults = DefaultsServiceImpl::new(self.store.clone());
+            let key = format!("run:{}:goal", child_run_id.as_str());
+            if let Err(err) = defaults
+                .set(
+                    cairn_domain::tenancy::Scope::Project,
+                    parent_project.project_id.to_string(),
+                    key,
+                    serde_json::Value::String(goal.clone()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %err,
+                    parent_run_id = %parent_run_id,
+                    child_run_id = %child_run_id,
+                    "#700: failed to persist child run goal default; child's \
+                     first iteration will fall back to `Execute the run objective.` \
+                     placeholder and the subagent may produce empty output",
+                );
+            }
+        }
+
         // #670 G4 / RFC 027 §79-99: descendant-counter fan-out gate.
         // After Phase-1 lands the child row (with its `root_run_id`
         // inherited from parent), we issue the atomic compare-and-
