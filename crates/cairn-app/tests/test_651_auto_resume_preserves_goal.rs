@@ -256,6 +256,26 @@ async fn auto_resume_replays_operator_goal_not_fallback_string() {
         .expect("session reaches server");
     assert_eq!(r.status().as_u16(), 201);
 
+    // Under the #702 follow-up the default orchestrator role has an
+    // observational-only bash verb policy that rejects output
+    // redirects (`>`) like the one this test uses to plant its
+    // marker file. This test's goal is to verify goal-preservation
+    // across auto-resume — orthogonal to the orchestrator role's
+    // doctrine. Pin the run's agent_role to `executor` via the
+    // per-project settings defaults so the bash policy doesn't fire.
+    let r = h
+        .client()
+        .put(format!(
+            "{}/v1/settings/defaults/project/{project}/run:{run_id}:agent_role",
+            h.base_url
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({ "value": "executor" }))
+        .send()
+        .await
+        .expect("set agent_role default");
+    assert_eq!(r.status().as_u16(), 200);
+
     let r = h
         .client()
         .post(format!("{}/v1/runs", h.base_url))

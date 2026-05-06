@@ -232,6 +232,28 @@ impl ToolContext {
             .and_then(|v| std::sync::Arc::clone(v).downcast::<T>().ok())
     }
 
+    /// #702 follow-up: record the run's `agent_role_id` so tools that
+    /// need role-scoped policy (e.g. the orchestrator-only bash verb
+    /// allowlist) can look it up without a new public field on this
+    /// struct. Stored via the typed-extension map so the struct's
+    /// wire shape stays stable.
+    ///
+    /// Call this once per run from the orchestrator's tool-invocation
+    /// layer after resolving the run's role; every subsequent
+    /// `ToolHandler::execute_with_context` call on the same context
+    /// sees the same role.
+    pub fn set_agent_role_id(&self, role_id: impl Into<String>) {
+        self.insert_extension(AgentRoleIdExt(role_id.into()));
+    }
+
+    /// Read the `agent_role_id` previously recorded via
+    /// `set_agent_role_id`. Returns `None` when the run has no role
+    /// set (back-compat: pre-#702 callers never populate this).
+    pub fn agent_role_id(&self) -> Option<String> {
+        self.get_extension::<AgentRoleIdExt>()
+            .map(|arc| arc.0.clone())
+    }
+
     /// Buffer a runtime event for the caller to append alongside tool completion.
     pub fn buffer_event(&mut self, event: RuntimeEvent) {
         self.buffered_events.push(event);
@@ -253,6 +275,15 @@ impl std::fmt::Debug for ToolContext {
             .finish()
     }
 }
+
+/// Typed extension carrying the run's `agent_role_id` through
+/// `ToolContext::extensions`. See `ToolContext::set_agent_role_id` /
+/// `ToolContext::agent_role_id` for the public accessors.
+///
+/// Not publicly constructible on purpose — callers go through the
+/// `ToolContext` helpers so there's exactly one place that writes
+/// this extension (makes future changes localised).
+struct AgentRoleIdExt(String);
 
 // ── ToolError ─────────────────────────────────────────────────────────────────
 

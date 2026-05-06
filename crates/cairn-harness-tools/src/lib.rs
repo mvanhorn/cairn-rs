@@ -34,12 +34,14 @@ pub mod adapter;
 pub mod error;
 pub mod hook;
 pub mod sensitive;
+pub mod shell_policy;
 #[doc(hidden)]
 pub mod tools;
 
 pub use adapter::{HarnessBuiltin, HarnessTool};
 pub use hook::build_cairn_hook;
 pub use sensitive::default_sensitive_patterns;
+pub use shell_policy::{ShellPolicy, ShellVerdict};
 pub use tools::{
     HarnessBash, HarnessBashKill, HarnessBashOutput, HarnessEdit, HarnessGlob, HarnessGrep,
     HarnessLsp, HarnessMultiEdit, HarnessRead, HarnessWebFetch, HarnessWrite,

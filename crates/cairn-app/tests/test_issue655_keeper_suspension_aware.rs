@@ -310,6 +310,22 @@ async fn provision_session_and_run(h: &LiveHarness, suffix: &str) -> (String, St
         .expect("session reaches server");
     assert_eq!(r.status().as_u16(), 201);
 
+    // #702 follow-up: pin the run's agent_role to `executor` via
+    // project defaults so the orchestrator shell policy does not fire
+    // on this test's stand-in bash calls (which predate the policy).
+    let r_role = h
+        .client()
+        .put(format!(
+            "{}/v1/settings/defaults/project/{project}/run:{run_id}:agent_role",
+            h.base_url
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&serde_json::json!({ "value": "executor" }))
+        .send()
+        .await
+        .expect("set agent_role default");
+    assert_eq!(r_role.status().as_u16(), 200);
+
     let r = h
         .client()
         .post(format!("{}/v1/runs", h.base_url))

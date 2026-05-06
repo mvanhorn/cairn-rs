@@ -492,8 +492,58 @@ the error-type to return, zero suggestions.";
 /// invariants are pinned by the tests in this module.
 pub fn default_roles() -> Vec<AgentRole> {
     vec![
+        // Orchestrator's specialty is managing the run — not executing it.
+        // It reads state, inspects artifacts (read/grep/glob), runs
+        // read-only verification shell commands (cargo test, pytest,
+        // git status, etc.), spawns sub-agents, synthesises their output,
+        // and calls complete_run. It does NOT fetch external URLs,
+        // mutate files, or run inline retrievals that belong to an
+        // `executor` / `researcher` sub-agent.
+        //
+        // The #702 / R9 failure mode was precisely the inverse: with no
+        // tool-surface restriction the orchestrator saw webfetch in its
+        // toolbox and called it three times inline instead of spawning
+        // a researcher. The allowlist below makes the doctrine
+        // structural — the LLM cannot pick a mutating or externally-
+        // fetching tool because the schema is never advertised to it.
+        //
+        // Shell (bash / bash_output / bash_kill) is further constrained
+        // at the harness-tools permission layer to inspection + test-
+        // runner verbs only; mutation verbs (rm / cp / mv / sed / write-
+        // redirects / state-changing git / package-install) are
+        // rejected at invocation time.
         AgentRole::new("orchestrator", "Orchestrator", AgentRoleTier::Orchestrator)
             .with_system_prompt(ORCHESTRATOR_PROMPT)
+            .with_tools([
+                // Observational — filesystem + code
+                "read",
+                "grep",
+                "glob",
+                "lsp",
+                // Observational — shell (constrained at the harness
+                // permission layer; see orchestrator bash policy)
+                "bash",
+                "bash_output",
+                "bash_kill",
+                // Observational — fleet state
+                "get_run",
+                "list_runs",
+                "get_task",
+                "get_approvals",
+                "search_events",
+                "wait_for_task",
+                // Observational — memory (read + scratch only)
+                "memory_search",
+                "memory_store",
+                "scratch_pad",
+                // Directive — delegation, synthesis, escalation
+                "spawn_subagent",
+                "complete_run",
+                "escalate_to_operator",
+                "notify_operator",
+                "cancel_task",
+                "tool_search",
+            ])
             .with_max_context_tokens(200_000),
         AgentRole::new("researcher", "Researcher", AgentRoleTier::Research)
             .with_system_prompt(RESEARCHER_PROMPT)

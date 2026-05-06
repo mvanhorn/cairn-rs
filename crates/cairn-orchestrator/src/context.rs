@@ -99,6 +99,14 @@ impl OrchestrationContext {
         tool_ctx.session_id = Some(self.session_id.to_string());
         tool_ctx.run_id = Some(self.run_id.to_string());
         tool_ctx.working_dir = self.working_dir.clone();
+        // #702 follow-up: record the run's agent role on the context so
+        // role-scoped tool policies (e.g. the orchestrator bash verb
+        // allowlist in `cairn-harness-tools::ShellPolicy`) can look it
+        // up. `agent_type` is the orchestration-loop's role handle —
+        // it matches `AgentRole::role_id` for registered roles.
+        if !self.agent_type.is_empty() {
+            tool_ctx.set_agent_role_id(self.agent_type.clone());
+        }
         tool_ctx
     }
 }

@@ -248,6 +248,41 @@ impl DecidePhase for LlmDecidePhase {
             });
         }
 
+        // #702 follow-up: enforce the role's `allowed_tools` allowlist so
+        // the tool surface the LLM sees matches the role's contract.
+        //
+        // Before this filter, `AgentRole::allowed_tools` was declared in
+        // the domain model but never consulted by DECIDE — every role
+        // saw the full builtin-tool catalogue. Dogfood R9 (session
+        // sess_r9, traces orch_run_r9_i0..i3) proved the orchestrator
+        // role ignored its specialty and called `webfetch` three times
+        // inline to scrape Google/crates.io/GitHub instead of
+        // delegating. That happened because webfetch was in the tool
+        // surface it received.
+        //
+        // The orchestrator is a status-and-delegation role: it reads
+        // state, inspects artifacts (`read`/`grep`/`glob`), runs
+        // read-only verification shell commands, spawns sub-agents,
+        // synthesises their output, and calls `complete_run`. It does
+        // NOT fetch external URLs, mutate files, or do inline work
+        // that belongs to an `executor` / `researcher` sub-agent. The
+        // allowlist makes that contract structural, not just prompt-
+        // enforced.
+        //
+        // Empty `allowed_tools` means "no role restriction" — every
+        // tool the registry returned stays available. This is the
+        // pre-fix behaviour for roles (like `executor`) that don't
+        // declare a list; preserves back-compat.
+        let all_roles = default_roles();
+        let role_allowlist: Option<Vec<String>> = all_roles
+            .iter()
+            .find(|r| r.role_id == ctx.agent_type)
+            .map(|r| r.allowed_tools.clone())
+            .filter(|list| !list.is_empty());
+        if let Some(allowed) = role_allowlist {
+            tool_descs.retain(|d| allowed.iter().any(|a| a == d.name.as_str()));
+        }
+
         // F36 (2026-04-24): inject a synthetic `complete_run` tool descriptor
         // so the LLM sees it alongside real tools as a first-class schema entry.
         //
@@ -2640,9 +2675,14 @@ mod tests {
         )
         .with_tools(registry);
 
-        // Plan mode context
+        // Plan mode context. Use a neutral role id so the #702
+        // orchestrator tool-surface allowlist does not apply here —
+        // this test exercises the RFC-018 Plan-mode ToolEffect
+        // filter specifically, which is orthogonal to the
+        // orchestrator role policy.
         let mut plan_ctx = ctx();
         plan_ctx.run_mode = RunMode::Plan;
+        plan_ctx.agent_type = "plan-mode-smoke".to_owned();
 
         let _ = phase.decide(&plan_ctx, &empty_gather()).await.unwrap();
         let prompt = captured_prompt.lock().unwrap().clone();
@@ -2707,6 +2747,10 @@ mod tests {
         )));
         let mut ctx_a = ctx();
         ctx_a.project = cairn_domain::ProjectKey::new("tenant", "workspace", "project-a");
+        // Use a neutral role so the #702 orchestrator tool-surface
+        // allowlist doesn't apply — this test exercises plugin-tool
+        // project-scoping, orthogonal to the orchestrator role.
+        ctx_a.agent_type = "plugin-visibility-smoke".to_owned();
         phase_a.decide(&ctx_a, &empty_gather()).await.unwrap();
 
         let prompt_b = Arc::new(std::sync::Mutex::new(String::new()));
@@ -2723,6 +2767,7 @@ mod tests {
         )));
         let mut ctx_b = ctx();
         ctx_b.project = cairn_domain::ProjectKey::new("tenant", "workspace", "project-b");
+        ctx_b.agent_type = "plugin-visibility-smoke".to_owned();
         phase_b.decide(&ctx_b, &empty_gather()).await.unwrap();
 
         assert!(
@@ -2978,5 +3023,194 @@ mod tests {
 
         assert_eq!(out.proposals.len(), 1);
         assert_eq!(out.proposals[0].action_type, ActionType::CompleteRun);
+    }
+
+    /// #702 regression guard: when the run's role is `orchestrator`,
+    /// the tool surface shipped to the provider MUST be filtered by
+    /// the role's `allowed_tools` allowlist. A banned tool like
+    /// `webfetch` must NOT appear in the tools[] array — that was
+    /// the structural enabler of R9's inline-retrieval failure mode.
+    #[tokio::test]
+    async fn orchestrator_role_filters_tool_surface_to_allowlist() {
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct ToolsCaptureProvider {
+            captured: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        #[async_trait]
+        impl GenerationProvider for ToolsCaptureProvider {
+            async fn generate(
+                &self,
+                _model: &str,
+                _messages: Vec<serde_json::Value>,
+                _settings: &ProviderBindingSettings,
+                tools: &[serde_json::Value],
+            ) -> Result<GenerationResponse, ProviderAdapterError> {
+                *self.captured.lock().unwrap() = tools.to_vec();
+                // Return a harmless complete_run so DECIDE terminates.
+                Ok(GenerationResponse {
+                    text: String::new(),
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    model_id: "test-model".to_owned(),
+                    tool_calls: vec![serde_json::json!({
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "complete_run",
+                            "arguments": "{\"final_answer\": \"done\"}"
+                        }
+                    })],
+                    finish_reason: Some("tool_calls".to_owned()),
+                })
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ToolsCaptureProvider {
+            captured: captured.clone(),
+        });
+
+        // Register two harness tools: `grep` (on the orchestrator
+        // allowlist) and `webfetch` (NOT on it). Post-fix the
+        // provider should see grep + not see webfetch. Pre-fix (no
+        // filter applied) webfetch was in the array — that's the
+        // bug R9 exposed.
+        let registry = Arc::new(
+            BuiltinToolRegistry::new()
+                .register(Arc::new(cairn_harness_tools::HarnessBuiltin::<
+                    cairn_harness_tools::HarnessGrep,
+                >::new()))
+                .register(Arc::new(cairn_harness_tools::HarnessBuiltin::<
+                    cairn_harness_tools::HarnessWebFetch,
+                >::new())),
+        );
+        let phase = LlmDecidePhase::new(provider, "test-model").with_tools(registry);
+
+        let _ = phase.decide(&ctx(), &empty_gather()).await.unwrap();
+
+        let tools = captured.lock().unwrap().clone();
+        let names: Vec<String> = tools
+            .iter()
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "grep"),
+            "grep is on the orchestrator allowlist and must be in the \
+             tool surface; got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "complete_run"),
+            "complete_run must always be advertised; got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "spawn_subagent"),
+            "spawn_subagent is on the orchestrator allowlist; got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "webfetch"),
+            "#702 regression: webfetch must NOT be advertised to the \
+             orchestrator role. R9 proved that with webfetch in the \
+             tool surface the model calls it inline instead of \
+             delegating. names={names:?}"
+        );
+    }
+
+    /// Non-orchestrator roles keep the full tool surface (no role
+    /// filter applied). Pins back-compat for roles like `executor`
+    /// that don't declare an allowlist.
+    #[tokio::test]
+    async fn non_orchestrator_role_sees_full_tool_surface() {
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct ToolsCaptureProvider {
+            captured: Arc<Mutex<Vec<serde_json::Value>>>,
+        }
+
+        #[async_trait]
+        impl GenerationProvider for ToolsCaptureProvider {
+            async fn generate(
+                &self,
+                _model: &str,
+                _messages: Vec<serde_json::Value>,
+                _settings: &ProviderBindingSettings,
+                tools: &[serde_json::Value],
+            ) -> Result<GenerationResponse, ProviderAdapterError> {
+                *self.captured.lock().unwrap() = tools.to_vec();
+                Ok(GenerationResponse {
+                    text: String::new(),
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    model_id: "test-model".to_owned(),
+                    tool_calls: vec![serde_json::json!({
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "complete_run",
+                            "arguments": "{\"final_answer\": \"done\"}"
+                        }
+                    })],
+                    finish_reason: Some("tool_calls".to_owned()),
+                })
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ToolsCaptureProvider {
+            captured: captured.clone(),
+        });
+
+        let registry = Arc::new(
+            BuiltinToolRegistry::new()
+                .register(Arc::new(cairn_harness_tools::HarnessBuiltin::<
+                    cairn_harness_tools::HarnessGrep,
+                >::new()))
+                .register(Arc::new(cairn_harness_tools::HarnessBuiltin::<
+                    cairn_harness_tools::HarnessWebFetch,
+                >::new())),
+        );
+        let phase = LlmDecidePhase::new(provider, "test-model").with_tools(registry);
+
+        // Executor role has no allowed_tools on this test setup —
+        // the default_roles `executor` declares cairn.runCommand /
+        // cairn.readFile placeholders, but they're not registered
+        // names, so the filter would accidentally strip the real
+        // tools if applied. We test with an unknown role id
+        // ("custom-role-not-in-defaults") to simulate the
+        // "no-role-restriction" back-compat path: filter is a no-op.
+        let mut ctx = ctx();
+        ctx.agent_type = "custom-role-not-in-defaults".to_owned();
+
+        let _ = phase.decide(&ctx, &empty_gather()).await.unwrap();
+
+        let tools = captured.lock().unwrap().clone();
+        let names: Vec<String> = tools
+            .iter()
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "webfetch"),
+            "non-orchestrator role must see webfetch (no allowlist \
+             filter applies); names={names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "grep"),
+            "non-orchestrator role must see grep; names={names:?}"
+        );
     }
 }

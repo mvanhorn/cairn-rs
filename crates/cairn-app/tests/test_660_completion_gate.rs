@@ -248,6 +248,25 @@ async fn provision_run(h: &LiveHarness, mock_url: &str) -> (String, String, Stri
         .expect("session");
     assert_eq!(r.status().as_u16(), 201);
 
+    // #702 follow-up: this test's stub LLM emits a bash call with
+    // `printf` (a mutation-adjacent verb not on the orchestrator
+    // allowlist). The test's semantic is the #660 completion gate,
+    // orthogonal to orchestrator doctrine. Pin the run's role to
+    // `executor` via project defaults so the orchestrator bash
+    // policy doesn't fire.
+    let r = h
+        .client()
+        .put(format!(
+            "{}/v1/settings/defaults/project/{project}/run:{run_id}:agent_role",
+            h.base_url
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({ "value": "executor" }))
+        .send()
+        .await
+        .expect("set agent_role default");
+    assert_eq!(r.status().as_u16(), 200);
+
     let r = h
         .client()
         .post(format!("{}/v1/runs", h.base_url))

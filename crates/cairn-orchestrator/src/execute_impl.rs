@@ -616,10 +616,10 @@ impl RuntimeExecutePhase {
             }
         };
 
-        let mut tool_ctx = cairn_tools::builtins::ToolContext::default();
-        tool_ctx.session_id = Some(ctx.session_id.to_string());
-        tool_ctx.run_id = Some(ctx.run_id.to_string());
-        tool_ctx.working_dir = ctx.working_dir.clone();
+        // #702 follow-up: use `ctx.tool_context()` so `agent_role_id` is
+        // recorded on the ToolContext, enabling role-scoped tool
+        // policies (orchestrator bash verb allowlist etc.).
+        let mut tool_ctx = ctx.tool_context();
         let tool_args = tool_args_with_working_dir(
             &tool_name,
             &ctx.working_dir,
@@ -841,10 +841,10 @@ impl RuntimeExecutePhase {
                 }
 
                 // ── Tool dispatch: registry first, stub fallback ────────────
-                let mut tool_ctx = cairn_tools::builtins::ToolContext::default();
-                tool_ctx.session_id = Some(ctx.session_id.to_string());
-                tool_ctx.run_id = Some(ctx.run_id.to_string());
-                tool_ctx.working_dir = ctx.working_dir.clone();
+                // #702 follow-up: use `ctx.tool_context()` so
+                // `agent_role_id` is recorded for role-scoped tool
+                // policies (orchestrator bash verb allowlist etc.).
+                let mut tool_ctx = ctx.tool_context();
                 let tool_args = tool_args_with_working_dir(
                     &tool_name,
                     &ctx.working_dir,

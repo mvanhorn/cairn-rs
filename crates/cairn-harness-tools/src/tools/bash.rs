@@ -100,6 +100,48 @@ impl HarnessTool for HarnessBash {
         build_bash_session(ctx, hook)
     }
 
+    /// #702 follow-up: enforce the orchestrator's observational-only
+    /// shell-verb policy at the tool boundary.
+    ///
+    /// When the run's `agent_role_id` is `orchestrator`, parse the
+    /// command's leading verb and reject if it's not on the policy's
+    /// allowlist (mutation verbs, state-changing git, output
+    /// redirects, pipe-to-shell). Other roles pass through unchanged
+    /// — their own prompts + tool allowlists carry their contracts.
+    ///
+    /// Rejection surfaces as `ToolError::Permanent` so the model sees
+    /// a structured no-retry rejection on the next DECIDE turn and
+    /// can pivot (typically to `spawn_subagent` with an executor
+    /// role, which is the whole point of the orchestrator's
+    /// doctrine).
+    fn pre_call_check(
+        ctx: &ToolContext,
+        _project: &ProjectKey,
+        args: &Value,
+    ) -> Result<(), ToolError> {
+        let Some(role) = ctx.agent_role_id() else {
+            // No role recorded on the context → pre-#702 caller, or
+            // a non-run tool invocation. Stay permissive — this
+            // policy is orchestrator-specific, not a global shell
+            // gate.
+            return Ok(());
+        };
+        if role != "orchestrator" {
+            return Ok(());
+        }
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let policy = crate::shell_policy::ShellPolicy::orchestrator();
+        match policy.check(command) {
+            crate::shell_policy::ShellVerdict::Allow => Ok(()),
+            crate::shell_policy::ShellVerdict::Reject { reason } => {
+                Err(ToolError::Permanent(reason))
+            }
+        }
+    }
+
     async fn call(args: Value, session: &Self::Session) -> Self::Result {
         bash(normalize_bash_args(args), session).await
     }
