@@ -106,7 +106,7 @@ pub enum ToolEffect {
     /// store, planning notes, sandbox filesystem inside the run's sandbox —
     /// but never touches a system outside cairn's boundary.
     /// Examples: scratch_pad, memory_store, file_write (into the run's
-    /// sandbox), create_task (cairn's own task queue).
+    /// sandbox).
     Internal,
 
     /// External action. Touches a system outside cairn. Any outbound API
@@ -470,7 +470,6 @@ Before Plan mode ships, the following tools **must** be wired into the orchestra
 | `memory_store` | builtins/memory_store.rs (already wired) |
 | `scratch_pad` | builtins/scratch_pad.rs |
 | `file_write` | builtins/file_write.rs (sandbox-scoped) |
-| `create_task` | builtins/create_task.rs |
 | `cancel_task` | builtins/cancel_task.rs |
 | `summarize_text` | builtins/summarize_text.rs |
 | `delete_memory` | builtins/delete_memory.rs |

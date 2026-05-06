@@ -17,7 +17,6 @@
 // were removed in favor of cairn-harness-tools.
 pub mod calculate;
 pub mod cancel_task;
-pub mod create_task;
 pub mod eval_score;
 pub mod get_approvals;
 pub mod get_run;
@@ -51,7 +50,6 @@ use serde_json::Value;
 
 pub use calculate::CalculateTool;
 pub use cancel_task::CancelTaskTool;
-pub use create_task::CreateTaskTool;
 pub use eval_score::EvalScoreTool;
 pub use get_approvals::GetApprovalsTool;
 pub use get_run::GetRunTool;

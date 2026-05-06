@@ -399,8 +399,8 @@ pub(crate) async fn drive_run_iteration(
     // design note in
     // `crates/cairn-orchestrator/src/decide_impl.rs::build_system_prompt`.
     use cairn_tools::{
-        BuiltinToolRegistry, CalculateTool, CancelTaskTool, CreateTaskTool, GetApprovalsTool,
-        GetRunTool, GetTaskTool, GraphQueryTool, HttpRequestTool, JsonExtractTool, ListRunsTool,
+        BuiltinToolRegistry, CalculateTool, CancelTaskTool, GetApprovalsTool, GetRunTool,
+        GetTaskTool, GraphQueryTool, HttpRequestTool, JsonExtractTool, ListRunsTool,
         MemorySearchTool, MemoryStoreTool, NotificationSink, NotifyOperatorTool,
         ResolveApprovalTool, ScheduleTaskTool, ScratchPadTool, SearchEventsTool, SummarizeTextTool,
         ToolSearchTool, WaitForTaskTool,
@@ -1172,8 +1172,6 @@ pub(crate) async fn drive_run_iteration(
             std::sync::Arc::new(HarnessBuiltin::<HarnessEdit>::new());
         let multi_edit_tool: std::sync::Arc<dyn cairn_tools::ToolHandler> =
             std::sync::Arc::new(HarnessBuiltin::<HarnessMultiEdit>::new());
-        let create_task: std::sync::Arc<dyn cairn_tools::ToolHandler> =
-            std::sync::Arc::new(CreateTaskTool::new(task_svc.clone()));
         let cancel_task: std::sync::Arc<dyn cairn_tools::ToolHandler> =
             std::sync::Arc::new(CancelTaskTool::new(task_svc));
         let summarize_text: std::sync::Arc<dyn cairn_tools::ToolHandler> =
@@ -1222,7 +1220,6 @@ pub(crate) async fn drive_run_iteration(
                 .register(file_write.clone())
                 .register(edit_tool.clone())
                 .register(multi_edit_tool.clone())
-                .register(create_task.clone())
                 .register(cancel_task.clone())
                 .register(summarize_text.clone())
                 // External
