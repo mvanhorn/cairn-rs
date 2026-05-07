@@ -1044,8 +1044,69 @@ fn validate_setting_value(
     Ok(())
 }
 
+/// Tenant-scope gate for the `/v1/settings/defaults/:scope/:scope_id/:key`
+/// CRUD surface (GET/PUT/DELETE) and resolve.
+///
+/// Returns `Some(error_response)` when the caller lacks access for the
+/// requested scope; `None` when the call should proceed.
+///
+/// Policy (mirrors codex's read-side fix from PR #733, applied uniformly
+/// across the surface so the same access rule governs disclosure AND
+/// tampering):
+///
+/// * `is_admin` — passes through unconditionally.
+/// * `Scope::System` — non-admin → 403 `forbidden`. System defaults
+///   are operator-controlled (model IDs, budget caps); not visible or
+///   mutable per-tenant.
+/// * `Scope::Tenant` — non-admin → only when `scope_id` matches the
+///   caller's `tenant_id`. Mismatch returns 404 (not 403) so the
+///   handler does not leak whether the tenant exists.
+/// * `Scope::Workspace` / `Scope::Project` — non-admin → 403. The
+///   compound `scope_id` (`tenant/workspace/project`) format does not
+///   carry the tenant prefix on `Workspace` so a per-tenant check
+///   would race against caller-supplied scope_id parsing; admin-only
+///   is the safer posture and matches codex's read fix.
+fn require_default_scope_access(
+    tenant_scope: &crate::extractors::TenantScope,
+    scope: cairn_domain::Scope,
+    scope_id: &str,
+) -> Option<axum::response::Response> {
+    if tenant_scope.is_admin {
+        return None;
+    }
+    match scope {
+        cairn_domain::Scope::System => Some(
+            AppApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "system scope requires admin",
+            )
+            .into_response(),
+        ),
+        cairn_domain::Scope::Tenant => {
+            if scope_id == tenant_scope.tenant_id().as_str() {
+                None
+            } else {
+                Some(
+                    AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found")
+                        .into_response(),
+                )
+            }
+        }
+        cairn_domain::Scope::Workspace | cairn_domain::Scope::Project => Some(
+            AppApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "workspace/project defaults require admin",
+            )
+            .into_response(),
+        ),
+    }
+}
+
 pub(crate) async fn set_default_setting_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: crate::extractors::TenantScope,
     Path((scope_name, scope_id, key)): Path<(String, String, String)>,
     Json(body): Json<SetDefaultSettingRequest>,
 ) -> impl IntoResponse {
@@ -1063,6 +1124,17 @@ pub(crate) async fn set_default_setting_handler(
         );
         return validation_error_response("invalid scope");
     };
+
+    // Mirror the read-side gate from `get_default_setting_handler`:
+    // non-admin callers can only write to their own tenant's
+    // tenant-scoped defaults. System / workspace / project writes
+    // require admin. Without this, any authenticated caller could
+    // overwrite ANY tenant's persisted run goals / model defaults /
+    // budget overrides — a strictly worse vulnerability than the
+    // disclosure path codex's PR closed on the GET handler.
+    if let Some(err) = require_default_scope_access(&tenant_scope, scope, &scope_id) {
+        return err;
+    }
 
     // Per-key validation (closes #228). Empty / oversized / non-numeric
     // values for numeric keys now 422 instead of silently persisting.
@@ -1114,6 +1186,7 @@ pub(crate) async fn set_default_setting_handler(
 /// resolution use `GET /v1/settings/defaults/resolve/:key?project=…`).
 pub(crate) async fn get_default_setting_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: crate::extractors::TenantScope,
     Path((scope, scope_id, key)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
     use cairn_store::projections::DefaultsReadModel;
@@ -1121,6 +1194,10 @@ pub(crate) async fn get_default_setting_handler(
     let Some(scope_enum) = parse_scope_name(&scope) else {
         return validation_error_response("invalid scope");
     };
+
+    if let Some(err) = require_default_scope_access(&tenant_scope, scope_enum, &scope_id) {
+        return err;
+    }
 
     match DefaultsReadModel::get(state.runtime.store.as_ref(), scope_enum, &scope_id, &key).await {
         Ok(Some(setting)) => (
@@ -1146,24 +1223,50 @@ pub(crate) async fn get_default_setting_handler(
 
 pub(crate) async fn clear_default_setting_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: crate::extractors::TenantScope,
     Path((scope, scope_id, key)): Path<(String, String, String)>,
 ) -> impl IntoResponse {
-    let Some(scope) = parse_scope_name(&scope) else {
+    let Some(scope_enum) = parse_scope_name(&scope) else {
         return validation_error_response("invalid scope");
     };
 
-    match state.runtime.defaults.clear(scope, scope_id, key).await {
+    // Same access rule as PUT/GET: non-admin can only act on its own
+    // tenant's tenant-scoped defaults. Without the gate, any caller
+    // could clear another tenant's persisted defaults — silent
+    // tampering, not just disclosure.
+    if let Some(err) = require_default_scope_access(&tenant_scope, scope_enum, &scope_id) {
+        return err;
+    }
+
+    match state
+        .runtime
+        .defaults
+        .clear(scope_enum, scope_id, key)
+        .await
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(err) => runtime_error_response(err),
     }
 }
 
-/// `GET /v1/settings/defaults/all` — flat list of every stored default setting.
+/// `GET /v1/settings/defaults/all` — flat list of stored default settings
+/// scoped to the caller's authorization.
 ///
-/// Returns all settings across all scopes (System, Tenant, Workspace, Project)
-/// that have been explicitly set via `PUT /v1/settings/defaults/…`. Unset keys
-/// are not included — call the `resolve/:key` endpoint with a project context
-/// for the effective value of a specific key including env-var / hardcoded fallbacks.
+/// **Admin callers**: receive every setting across all four scopes
+/// (System, Tenant, Workspace, Project). This is the "operator
+/// dashboard" view — admins see everything they can manage.
+///
+/// **Non-admin (tenant) callers**: receive ONLY tenant-scoped
+/// settings whose `scope_id` matches the caller's `tenant_id`.
+/// System / workspace / project rows are excluded entirely (matches
+/// the per-key GET handler's policy: those scopes are admin-only).
+/// Other tenants' rows are excluded — exposing them was the
+/// vulnerability codex's PR #733 closed on the per-key route; this
+/// closes the equivalent disclosure on the bulk-list route.
+///
+/// Unset keys are omitted. For the effective value of a specific
+/// key with fallback resolution, use
+/// `GET /v1/settings/defaults/resolve/{key}?project=...`.
 ///
 /// Response shape:
 /// ```json
@@ -1177,56 +1280,75 @@ pub(crate) async fn clear_default_setting_handler(
 /// ```
 pub(crate) async fn list_all_defaults_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: crate::extractors::TenantScope,
 ) -> impl IntoResponse {
     use cairn_domain::Scope;
     use cairn_store::projections::DefaultsReadModel;
 
     let store = state.runtime.store.as_ref();
-
-    // Collect settings at Scope::System ("system") — always queried.
     let mut all_settings: Vec<serde_json::Value> = Vec::new();
 
-    if let Ok(sys_settings) = DefaultsReadModel::list_by_scope(store, Scope::System, "system").await
-    {
-        for s in sys_settings {
-            all_settings.push(serde_json::json!({
-                "scope":    "system",
-                "scope_id": "system",
-                "key":      s.key,
-                "value":    s.value,
-            }));
+    if tenant_scope.is_admin {
+        // Admin: return every setting across all four scopes.
+        if let Ok(sys_settings) =
+            DefaultsReadModel::list_by_scope(store, Scope::System, "system").await
+        {
+            for s in sys_settings {
+                all_settings.push(serde_json::json!({
+                    "scope":    "system",
+                    "scope_id": "system",
+                    "key":      s.key,
+                    "value":    s.value,
+                }));
+            }
         }
-    }
 
-    // Collect tenant-scoped settings for each known tenant.
-    if let Ok(tenants) = cairn_store::projections::TenantReadModel::list(store, 200, 0).await {
-        for tenant in &tenants {
-            let tid = tenant.tenant_id.as_str();
-            if let Ok(settings) = DefaultsReadModel::list_by_scope(store, Scope::Tenant, tid).await
-            {
-                for s in settings {
-                    all_settings.push(serde_json::json!({
-                        "scope":    "tenant",
-                        "scope_id": tid,
-                        "key":      s.key,
-                        "value":    s.value,
-                    }));
+        if let Ok(tenants) = cairn_store::projections::TenantReadModel::list(store, 200, 0).await {
+            for tenant in &tenants {
+                let tid = tenant.tenant_id.as_str();
+                if let Ok(settings) =
+                    DefaultsReadModel::list_by_scope(store, Scope::Tenant, tid).await
+                {
+                    for s in settings {
+                        all_settings.push(serde_json::json!({
+                            "scope":    "tenant",
+                            "scope_id": tid,
+                            "key":      s.key,
+                            "value":    s.value,
+                        }));
+                    }
                 }
             }
         }
-    }
 
-    // Collect workspace-scoped settings for the default workspace.
-    // (Full multi-workspace iteration would require a list_all method on WorkspaceReadModel.)
-    if let Ok(settings) = DefaultsReadModel::list_by_scope(store, Scope::Workspace, "default").await
-    {
-        for s in settings {
-            all_settings.push(serde_json::json!({
-                "scope":    "workspace",
-                "scope_id": "default",
-                "key":      s.key,
-                "value":    s.value,
-            }));
+        // Default-workspace settings — full multi-workspace iteration
+        // would need a `list_all` method on WorkspaceReadModel.
+        if let Ok(settings) =
+            DefaultsReadModel::list_by_scope(store, Scope::Workspace, "default").await
+        {
+            for s in settings {
+                all_settings.push(serde_json::json!({
+                    "scope":    "workspace",
+                    "scope_id": "default",
+                    "key":      s.key,
+                    "value":    s.value,
+                }));
+            }
+        }
+    } else {
+        // Non-admin: only the caller's own tenant rows. Mirrors the
+        // per-key GET handler's `Scope::Tenant` + `scope_id == caller.tenant_id`
+        // gate. System/workspace/project rows are admin-only there too.
+        let tid = tenant_scope.tenant_id().as_str();
+        if let Ok(settings) = DefaultsReadModel::list_by_scope(store, Scope::Tenant, tid).await {
+            for s in settings {
+                all_settings.push(serde_json::json!({
+                    "scope":    "tenant",
+                    "scope_id": tid,
+                    "key":      s.key,
+                    "value":    s.value,
+                }));
+            }
         }
     }
 
@@ -1242,12 +1364,18 @@ pub(crate) async fn list_all_defaults_handler(
 
 pub(crate) async fn resolve_default_setting_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: crate::extractors::TenantScope,
     Path(key): Path<String>,
     Query(query): Query<ResolveDefaultQuery>,
 ) -> impl IntoResponse {
     let Some((tenant_id, workspace_id, project_id)) = parse_project_scope(&query.project) else {
         return validation_error_response("project must use tenant/workspace/project");
     };
+    if !tenant_scope.is_admin && tenant_scope.tenant_id().as_str() != tenant_id {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "project not found")
+            .into_response();
+    }
+
     let project = ProjectKey::new(tenant_id, workspace_id, project_id);
 
     match state.runtime.defaults.resolve(&project, &key).await {
