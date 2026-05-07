@@ -17,7 +17,8 @@ use utoipa::ToSchema;
 use cairn_api::http::{ApiError, ListResponse};
 use cairn_domain::policy::{GuardrailRule, GuardrailSubjectType};
 use cairn_domain::providers::{
-    OperationKind, ProviderBudget, ProviderBudgetPeriod, ProviderHealthRecord, RoutePolicyRule,
+    OperationKind, ProviderBudget, ProviderBudgetPeriod, ProviderConnectionRecord,
+    ProviderHealthRecord, RoutePolicyRule,
 };
 use cairn_domain::{
     ProjectKey, ProviderBindingId, ProviderConnectionId, ProviderModelId, TenantId,
@@ -275,6 +276,60 @@ fn adapter_requires_credential(adapter_type: &str) -> bool {
     )
 }
 
+/// Load a provider connection and assert the caller's [`TenantScope`]
+/// owns it (or the caller is admin).
+///
+/// Returns **404 not_found** when the id does not exist OR exists but
+/// belongs to a different tenant. The response body is identical in
+/// both cases — Gemini SEC-007 (PR #717): a 403
+/// "wrong tenant" leaks the existence of another tenant's connection
+/// id, letting an operator probe for valid IDs across the keyspace.
+/// We collapse both into the same 404 so a non-admin caller cannot
+/// distinguish "doesn't exist anywhere" from "exists but not yours".
+///
+/// Returns the [`ProviderConnectionRecord`] on the success path so
+/// callers don't need to re-fetch (avoids the redundant `get` Gemini
+/// flagged on the update handler).
+///
+/// # Failure-shape contract
+/// The error path returns a fully-built `axum::response::Response` so
+/// every handler renders the same envelope without each having to
+/// import [`AppApiError`]. Returning `Result<_, Response>` lets
+/// handlers `?`-propagate or `match`-translate at the call site.
+pub(crate) async fn load_connection_owned_by_scope(
+    state: &AppState,
+    conn_id: &ProviderConnectionId,
+    scope: &TenantScope,
+) -> Result<ProviderConnectionRecord, axum::response::Response> {
+    match state.runtime.provider_connections.get(conn_id).await {
+        Ok(Some(record)) => {
+            // Compare typed `TenantId` values directly — a previous
+            // iteration of this check coerced to `&str` via `as_str()`
+            // (Gemini review on #717), which both fails to type-check
+            // (`TenantId: PartialEq<TenantId>` only) and bypasses
+            // `TenantId`'s Eq contract if it ever grows beyond a
+            // newtype around String.
+            if !scope.is_admin && record.tenant_id != *scope.tenant_id() {
+                Err(AppApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "provider connection not found",
+                )
+                .into_response())
+            } else {
+                Ok(record)
+            }
+        }
+        Ok(None) => Err(AppApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "provider connection not found",
+        )
+        .into_response()),
+        Err(err) => Err(runtime_error_response(err)),
+    }
+}
+
 // ── Handlers ────────────────────────────────────────────────────────────────
 
 pub(crate) async fn list_provider_health_handler(
@@ -380,14 +435,19 @@ pub(crate) async fn manual_provider_health_check_handler(
 
 pub(crate) async fn recover_provider_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(connection_id): Path<String>,
 ) -> impl IntoResponse {
-    match state
-        .runtime
-        .provider_health
-        .mark_recovered(&ProviderConnectionId::new(connection_id))
-        .await
-    {
+    // SEC #717: previously unauthenticated against the URL-path id —
+    // any operator could mark another tenant's connection "recovered",
+    // forcing health flaps and re-enabling provider bindings on a
+    // foreign tenant's behalf. Cross-tenant hits collapse to 404 (not
+    // 403) so an attacker can't enumerate connection ids.
+    let conn_id = ProviderConnectionId::new(connection_id);
+    if let Err(resp) = load_connection_owned_by_scope(&state, &conn_id, &tenant_scope).await {
+        return resp;
+    }
+    match state.runtime.provider_health.mark_recovered(&conn_id).await {
         Ok(record) => (StatusCode::OK, Json(record)).into_response(),
         Err(err) => runtime_error_response(err),
     }
@@ -395,13 +455,23 @@ pub(crate) async fn recover_provider_handler(
 
 pub(crate) async fn set_provider_health_schedule_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(connection_id): Path<String>,
     Json(body): Json<SetProviderHealthScheduleRequest>,
 ) -> impl IntoResponse {
+    // SEC #717: tenant-scope the schedule mutation. Previously
+    // unauthenticated against the URL-path id — a foreign operator
+    // could schedule arbitrary-cadence probes on another tenant's
+    // connection, both noisy upstream and a vector for tampering with
+    // the shared provider-health record.
+    let conn_id = ProviderConnectionId::new(connection_id);
+    if let Err(resp) = load_connection_owned_by_scope(&state, &conn_id, &tenant_scope).await {
+        return resp;
+    }
     match state
         .runtime
         .provider_health
-        .schedule_health_check(&ProviderConnectionId::new(connection_id), body.interval_ms)
+        .schedule_health_check(&conn_id, body.interval_ms)
         .await
     {
         Ok(schedule) => (StatusCode::OK, Json(schedule)).into_response(),
@@ -439,9 +509,20 @@ pub(crate) async fn set_provider_retry_policy_handler(
     Json(body): Json<SetProviderRetryPolicyRequest>,
 ) -> impl IntoResponse {
     use cairn_domain::{providers::RetryPolicy, ProviderRetryPolicySet, RuntimeEvent};
+    // SEC #717: the existing handler took `TenantScope` but trusted it
+    // blindly — it stamped the caller's tenant_id onto the event
+    // envelope without verifying the conn_id belonged to that tenant.
+    // Cross-tenant operators could pollute the event log with phantom
+    // retry-policy events targeting another tenant's connection. Pin
+    // the conn_id to the caller's tenant via the helper; cross-tenant
+    // hits 404 so the conn_id space stays opaque.
+    let conn_id = ProviderConnectionId::new(connection_id);
+    if let Err(resp) = load_connection_owned_by_scope(&state, &conn_id, &tenant_scope).await {
+        return resp;
+    }
     let event = cairn_runtime::make_envelope(RuntimeEvent::ProviderRetryPolicySet(
         ProviderRetryPolicySet {
-            connection_id: ProviderConnectionId::new(connection_id),
+            connection_id: conn_id,
             tenant_id: tenant_scope.tenant_id().clone(),
             policy: RetryPolicy {
                 max_attempts: body.max_attempts,
@@ -783,21 +864,19 @@ pub(crate) async fn create_provider_connection_handler(
 
 pub(crate) async fn resolve_provider_key_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(connection_id): Path<String>,
 ) -> impl IntoResponse {
+    // SEC #717: this handler was previously unauthenticated against
+    // the conn_id — a foreign operator could probe whether another
+    // tenant has a credential bound to a given connection (the
+    // distinct 200/404/410 status codes leak the bind state). With
+    // the scope check in place, every cross-tenant probe collapses
+    // into the same 404 the helper produces for non-existent ids.
     let conn_id = ProviderConnectionId::new(&connection_id);
-    let _connection = match state.runtime.provider_connections.get(&conn_id).await {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            return AppApiError::new(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "provider connection not found",
-            )
-            .into_response();
-        }
-        Err(err) => return runtime_error_response(err),
-    };
+    if let Err(resp) = load_connection_owned_by_scope(&state, &conn_id, &tenant_scope).await {
+        return resp;
+    }
 
     let credential_id_str = connection_id.as_str();
     let cred_key = format!("provider_credential_{credential_id_str}");
@@ -839,13 +918,28 @@ pub(crate) async fn resolve_provider_key_handler(
 
 pub(crate) async fn update_provider_connection_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
     Json(body): Json<UpdateProviderConnectionRequest>,
 ) -> impl IntoResponse {
     use cairn_runtime::ProviderConnectionConfig;
 
+    // SEC #717: route through `load_connection_owned_by_scope` so the
+    // 6-handler sweep behaves identically. Gemini SEC-007: the prior
+    // PR returned 403 on cross-tenant — that leaks existence of the
+    // foreign id. Collapse to 404. Helper also fixes the typed
+    // `TenantId` comparison Gemini called out (the prior code
+    // compared `TenantId != &str` and didn't compile against
+    // `cairn-domain` HEAD; only sibling-PR drift kept the workspace
+    // green up to this point). The redundant `get` Gemini noted is
+    // gone too — the helper returns the loaded record so the handler
+    // doesn't fetch twice.
     let conn_id = ProviderConnectionId::new(&id);
     let before = crate::handlers::sse::current_event_head(&state).await;
+    let _existing = match load_connection_owned_by_scope(&state, &conn_id, &tenant_scope).await {
+        Ok(record) => record,
+        Err(resp) => return resp,
+    };
 
     let config = ProviderConnectionConfig {
         provider_family: body.provider_family,
@@ -964,6 +1058,7 @@ async fn validate_credential_belongs_to_tenant(
 
 pub(crate) async fn delete_provider_connection_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // F40: Previously this handler appended a `ProviderConnectionRegistered`
@@ -973,7 +1068,16 @@ pub(crate) async fn delete_provider_connection_handler(
     // We now emit a real `ProviderConnectionDeleted` event; the projection
     // hard-removes the row so the ID is free to re-use. The full history
     // (Registered -> Deleted -> Registered) remains in the event log.
+    //
+    // SEC #717: the original delete handler had no auth at all against
+    // the URL-path id — any operator could wipe another tenant's
+    // provider connection. Cross-tenant hits collapse to 404 via the
+    // shared helper (Gemini SEC-007 enumeration safety) instead of a
+    // distinct 403 that would let an attacker probe valid ids.
     let conn_id = ProviderConnectionId::new(&id);
+    if let Err(resp) = load_connection_owned_by_scope(&state, &conn_id, &tenant_scope).await {
+        return resp;
+    }
     let before = crate::handlers::sse::current_event_head(&state).await;
     match state.runtime.provider_connections.delete(&conn_id).await {
         Ok(()) => {

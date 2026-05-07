@@ -487,8 +487,19 @@ pub(crate) async fn discover_models_preview_handler(
 /// - `openai_compat` → `GET {base_url}/models`
 ///
 /// Use `?endpoint_url=` for ad-hoc queries before registering the connection.
+///
+/// Tenancy: when the conn_id resolves to a stored connection, the
+/// caller must own it (or be admin); cross-tenant hits collapse to
+/// **404** to avoid id enumeration (Gemini SEC-007 on #717). Without
+/// this fence, a foreign operator could supply another tenant's
+/// conn_id plus an attacker-controlled `?endpoint_url=` and steer
+/// `resolve_connection_probe_material` into proxying the foreign
+/// tenant's stored API key out to `endpoint_url`. The bare ad-hoc
+/// path (no stored conn) still works — it carries no
+/// tenant-attributable secret material.
 pub(crate) async fn discover_models_handler(
     State(state): State<AppState>,
+    tenant_scope: cairn_app::extractors::TenantScope,
     Path(connection_id): Path<String>,
     Query(query): Query<DiscoverModelsQuery>,
 ) -> impl IntoResponse {
@@ -496,23 +507,55 @@ pub(crate) async fn discover_models_handler(
     use cairn_store::projections::ProviderConnectionReadModel;
 
     let conn_id = ProviderConnectionId::new(connection_id.clone());
-    let adapter_type =
-        match ProviderConnectionReadModel::get(state.runtime.store.as_ref(), &conn_id).await {
-            Ok(Some(rec)) => rec.adapter_type.to_lowercase(),
-            Ok(None) => {
-                if query.endpoint_url.is_none() {
-                    return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({
-                    "error": format!("provider connection '{connection_id}' not found"),
-                    "hint": "pass ?endpoint_url=... to discover without a registered connection",
-                }))).into_response();
-                }
-                query
-                    .adapter_type
-                    .clone()
-                    .unwrap_or_else(|| "openai_compat".to_owned())
+    // Two-pass lookup:
+    //   1. Read the connection. Cross-tenant ⇒ 404 (same envelope as
+    //      `not found`) so an attacker can't probe valid ids.
+    //   2. If the id genuinely doesn't exist, the ad-hoc
+    //      `?endpoint_url=` path remains open — the caller is supplying
+    //      their own endpoint, so there's no foreign tenant data at
+    //      stake.
+    let stored_record = match ProviderConnectionReadModel::get(
+        state.runtime.store.as_ref(),
+        &conn_id,
+    )
+    .await
+    {
+        Ok(Some(rec)) => {
+            if !tenant_scope.is_admin && rec.tenant_id != *tenant_scope.tenant_id() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({
+                        "error": format!("provider connection '{connection_id}' not found"),
+                        "hint": "pass ?endpoint_url=... to discover without a registered connection",
+                    })),
+                )
+                    .into_response();
             }
-            Err(e) => return internal_error(format!("store error: {e}")).into_response(),
-        };
+            Some(rec)
+        }
+        Ok(None) => None,
+        Err(e) => return internal_error(format!("store error: {e}")).into_response(),
+    };
+
+    let adapter_type = match &stored_record {
+        Some(rec) => rec.adapter_type.to_lowercase(),
+        None => {
+            if query.endpoint_url.is_none() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({
+                        "error": format!("provider connection '{connection_id}' not found"),
+                        "hint": "pass ?endpoint_url=... to discover without a registered connection",
+                    })),
+                )
+                    .into_response();
+            }
+            query
+                .adapter_type
+                .clone()
+                .unwrap_or_else(|| "openai_compat".to_owned())
+        }
+    };
     // Allow query param to override stored adapter_type.
     let adapter_type = query
         .adapter_type
@@ -520,8 +563,12 @@ pub(crate) async fn discover_models_handler(
         .unwrap_or(&adapter_type)
         .to_lowercase();
 
+    // Only consult stored probe material when the connection actually
+    // resolved for THIS caller. The earlier scope check guarantees
+    // `stored_record.is_some()` ⇒ "owned by caller (or admin)", so
+    // there's no path here that proxies a foreign tenant's credential.
     let (stored_endpoint, stored_api_key) =
-        if query.endpoint_url.is_none() && query.api_key.is_none() {
+        if stored_record.is_some() && query.endpoint_url.is_none() && query.api_key.is_none() {
             resolve_connection_probe_material(&state, &connection_id).await
         } else {
             (None, None)

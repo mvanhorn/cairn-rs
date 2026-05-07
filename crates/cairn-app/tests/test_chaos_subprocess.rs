@@ -195,6 +195,41 @@ async fn fail_next_append_surfaces_cleanly() {
         "subprocess not ready pre-arming",
     );
 
+    // Seed the provider connection BEFORE arming the failure hook.
+    // PR #717's tenant-ownership sweep made every retry-policy PUT
+    // pre-load the connection record (404 if missing), so a PUT
+    // against a non-existent id no longer reaches the append path
+    // — it short-circuits to 404 and the failure hook never fires.
+    // We need a real connection in place so the PUT actually
+    // attempts to write the `ProviderRetryPolicySet` event, which
+    // is the append path the chaos hook is meant to intercept.
+    //
+    // Use `default_tenant` (seeded by the harness boot) rather than
+    // `h.tenant` (per-uuid scope only used for sessions/runs/tasks);
+    // tenants must exist before connections can register against them
+    // and we don't want to add a tenant-create+ append before SIGUSR1
+    // (it would consume the failure budget).
+    let create_resp = h
+        .client()
+        .post(format!("{}/v1/providers/connections", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": "default_tenant",
+            "provider_connection_id": "conn_chaos_b",
+            "provider_family": "openai_compat",
+            "adapter_type": "ollama",
+            "supported_models": ["llama3"],
+        }))
+        .send()
+        .await
+        .expect("seed connection request");
+    assert_eq!(
+        create_resp.status().as_u16(),
+        201,
+        "seed connection: {}",
+        create_resp.text().await.unwrap_or_default(),
+    );
+
     // Arm one injected failure on the next append. The signal handler
     // is installed just before `axum::serve`, so readiness=200 implies
     // the handler is live.
