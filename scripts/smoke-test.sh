@@ -303,7 +303,7 @@ chk "POST /v1/events/append (ApprovalRequested)" 201 POST /v1/events/append \
 # Poll until the ApprovalRequested event surfaces through the
 # /v1/approvals/pending projection (replaces bare sleep 0.4 — #399).
 wait_until "GET /v1/approvals/pending (approval projected)" \
-  "/v1/approvals/pending" \
+  "/v1/approvals/pending?tenant_id=default&workspace_id=default&project_id=default" \
   "$APPR_ID" 3000 \
   && log_ok "GET /v1/approvals/pending (HTTP $_HTTP, approval $APPR_ID visible)" \
   || true

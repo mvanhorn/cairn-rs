@@ -645,45 +645,45 @@ pub(crate) async fn batch_cancel_tasks_handler(
 
 // ── Approval handlers ─────────────────────────────────────────────────────────
 
-/// `GET /v1/approvals/pending` — list pending approvals.
+/// `GET /v1/approvals/pending` — list pending approvals for an
+/// explicit project scope.
+///
+/// Pre-#719 this route fell through to a global cross-tenant scan
+/// when the scope was not supplied; that is now rejected with 400.
+/// The unified `/v1/approvals` handler (handlers/approvals.rs) is
+/// the way to drive cross-tenant admin inboxes via TenantScope.
 pub(crate) async fn list_pending_approvals_handler(
     State(state): State<AppState>,
     Query(q): Query<ProjectQuery>,
 ) -> impl axum::response::IntoResponse {
-    // Use total approval count (all states) as the pagination denominator.
-    let total = state.runtime.store.count_all_approvals();
-    let hdrs = pagination_headers("/v1/approvals/pending", total, q.offset, q.limit);
-    if let Some(project) = q.project_key() {
-        match ApprovalReadModel::list_pending(
-            state.runtime.store.as_ref(),
-            &project,
-            q.limit,
-            q.offset,
-        )
-        .await
-        {
-            Ok(records) => Ok((hdrs, Json(records))),
-            Err(e) => Err(internal_error(e.to_string())),
-        }
-    } else {
-        match list_all_pending(&state, q.limit, q.offset).await {
-            Ok(records) => Ok((hdrs, Json(records))),
-            Err(e) => Err(internal_error(e.to_string())),
-        }
-    }
-}
-
-/// Scan the full approval store for pending (undecided) records across all
-/// projects.  Uses a direct store method instead of filtering by project key.
-pub(crate) async fn list_all_pending(
-    state: &AppState,
-    limit: usize,
-    offset: usize,
-) -> Result<Vec<cairn_store::projections::ApprovalRecord>, cairn_store::StoreError> {
-    Ok(state
+    // Scope check FIRST: without this guard, an unauthenticated /
+    // misconfigured caller would still trigger a full-table scan via
+    // `count_all_approvals` and the response would expose that count
+    // through `Link` headers — Gemini SEC-007 finding (information
+    // leak via pagination metadata).
+    let Some(project) = q.project_key() else {
+        return Err(bad_request(
+            "tenant_id, workspace_id, and project_id are required",
+        ));
+    };
+    // Project-scoped pagination denominator. We can't easily count
+    // "pending approvals for THIS project" cheaply across backends,
+    // and the deprecated route's pagination contract is best-effort,
+    // so use the project's tenant as the denominator scope. That keeps
+    // the count honest within the caller's tenant, never leaks the
+    // global total.
+    let total = state
         .runtime
         .store
-        .list_all_pending_approvals(limit, offset))
+        .count_pending_approvals_for_tenant(&project.tenant_id)
+        .await as usize;
+    let hdrs = pagination_headers("/v1/approvals/pending", total, q.offset, q.limit);
+    match ApprovalReadModel::list_pending(state.runtime.store.as_ref(), &project, q.limit, q.offset)
+        .await
+    {
+        Ok(records) => Ok((hdrs, Json(records))),
+        Err(e) => Err(internal_error(e.to_string())),
+    }
 }
 
 #[derive(Deserialize)]
@@ -705,8 +705,15 @@ pub(crate) struct ResolveApprovalResponse {
 }
 
 /// `POST /v1/approvals/:id/resolve` — approve or reject a pending approval.
+///
+/// Tenancy: a non-admin caller may only resolve approvals owned by
+/// their own tenant. Cross-tenant resolution attempts return 404
+/// (per Gemini SEC-007 — same shape as the unknown-id 404 so the
+/// endpoint cannot be used to enumerate approval ids belonging to
+/// other tenants). Admin tokens bypass.
 pub(crate) async fn resolve_approval_handler(
     State(state): State<AppState>,
+    tenant_scope: cairn_app::extractors::TenantScope,
     Path(id): Path<String>,
     Json(body): Json<ResolveApprovalBody>,
 ) -> impl axum::response::IntoResponse {
@@ -728,6 +735,32 @@ pub(crate) async fn resolve_approval_handler(
             )));
         }
     };
+
+    // Tenant ownership pre-check: load the approval record and
+    // refuse cross-tenant resolution. Without this, an operator who
+    // knows or guesses an approval_id can resolve another tenant's
+    // approvals and either rubber-stamp privileged tool calls or
+    // deny tools the legitimate operator was about to authorise.
+    match state.runtime.approvals.get(&approval_id).await {
+        Ok(Some(record)) => {
+            if !tenant_scope.is_admin && record.project.tenant_id != *tenant_scope.tenant_id() {
+                // 404 (not 403) so the endpoint can't be used to
+                // probe approval-id existence in foreign tenants.
+                return Err(not_found(format!(
+                    "approval {} not found",
+                    approval_id.as_str()
+                )));
+            }
+        }
+        Ok(None) => {
+            return Err(not_found(format!(
+                "approval {} not found",
+                approval_id.as_str()
+            )));
+        }
+        Err(e) => return Err(internal_error(e.to_string())),
+    }
+
     match state
         .runtime
         .approvals

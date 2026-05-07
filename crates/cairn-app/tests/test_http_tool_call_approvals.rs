@@ -141,6 +141,11 @@ async fn get_returns_404_for_unknown_id() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+// /v1/approvals/pending behaviour is covered by
+// `test_719_pending_route_scope.rs` against a real LiveHarness
+// subprocess — that endpoint only lives in `bin_router`, not in the
+// catalog router used by `build_test_router_fake_fabric`.
+
 #[tokio::test]
 async fn approve_once_transitions_to_approved() {
     let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;

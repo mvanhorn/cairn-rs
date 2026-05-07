@@ -990,9 +990,20 @@ pub const OPENAPI_JSON: &str = r##"{
     "/v1/approvals/pending": {
       "get": {
         "tags": ["Approvals"],
-        "summary": "List pending plan approvals",
+        "summary": "List pending plan approvals (scope-required)",
+        "description": "Returns pending plan approvals for an explicit `(tenant_id, workspace_id, project_id)` triple. The pre-#719 behaviour of falling back to a global cross-tenant scan when the triple was not supplied has been removed; missing scope now returns 400 `bad_request`. Cross-tenant admin inboxes are served by `GET /v1/approvals` (with admin token).",
         "operationId": "listPendingApprovals",
-        "responses": { "200": { "description": "Pending plan approvals" } }
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "project_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
+          { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0 } }
+        ],
+        "responses": {
+          "200": { "description": "Pending plan approvals for this project" },
+          "400": { "description": "Missing one of `tenant_id`, `workspace_id`, `project_id`" }
+        }
       }
     },
     "/v1/approvals/{id}": {
