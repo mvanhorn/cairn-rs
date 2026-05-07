@@ -506,13 +506,29 @@ pub(crate) fn proposal_matches_rule(proposal: &ToolCallProposal, rule: &AllowRul
             let Some(candidate) = extract_path_arg(&proposal.tool_args) else {
                 return false;
             };
-            canonicalise(candidate) == canonicalise(path)
+            // Mirror the `ProjectScopedPath` defence below: a
+            // relative or empty `path` canonicalises to a non-
+            // absolute (or empty) `PathBuf` and would match
+            // cwd-blindly. The domain doc on `ApprovalMatchPolicy`
+            // already requires absolute paths; enforce it at the
+            // matcher so a hostile event-log replay can't rebuild
+            // a cwd-blind rule. PR #723 originally only fixed
+            // `ProjectScopedPath`; this branch had the same shape.
+            let canonical_path = canonicalise(path);
+            if !canonical_path.is_absolute() {
+                return false;
+            }
+            canonicalise(candidate) == canonical_path
         }
         ApprovalMatchPolicy::ProjectScopedPath { project_root } => {
             let Some(candidate) = extract_path_arg(&proposal.tool_args) else {
                 return false;
             };
-            is_under(&canonicalise(candidate), &canonicalise(project_root))
+            let canonical_root = canonicalise(project_root);
+            if !canonical_root.is_absolute() {
+                return false;
+            }
+            is_under(&canonicalise(candidate), &canonical_root)
         }
     }
 }
@@ -625,6 +641,91 @@ mod tests {
             !proposal_matches_rule(&p, &r),
             "string-prefix bug: /workspaces/cairn2 must not match root /workspaces/cairn"
         );
+    }
+
+    /// PR #723 — table-driven coverage for the
+    /// non-absolute-root rejection on `ProjectScopedPath`.
+    ///
+    /// Pre-fix, every one of these `project_root` values
+    /// canonicalised to either an empty `PathBuf` or a CWD-relative
+    /// path; `is_under(candidate, empty)` returned true for any
+    /// candidate, so a single such rule auto-approved every
+    /// subsequent tool call in the session — defeating the entire
+    /// approvals fence. Each entry below is a distinct way an
+    /// operator could supply a non-absolute root either via the
+    /// approve handler body or via a hostile event-log replay.
+    #[test]
+    fn project_scoped_rejects_non_absolute_roots() {
+        const NON_ABSOLUTE_ROOTS: &[&str] = &[
+            "",          // empty → empty PathBuf
+            ".",         // current dir → empty after canonicalise
+            "..",        // parent → empty after canonicalise (root-locked)
+            "./bar",     // CWD-relative
+            "foo/..",    // canonicalises to empty
+            "foo/bar",   // plain relative subtree
+            "../escape", // relative-up
+        ];
+        for root in NON_ABSOLUTE_ROOTS {
+            let p = proposal("read", serde_json::json!({ "path": "/etc/passwd" }));
+            let r = AllowRule {
+                tool_name: "read".into(),
+                tool_args: Value::Null,
+                policy: ApprovalMatchPolicy::ProjectScopedPath {
+                    project_root: (*root).to_owned(),
+                },
+            };
+            assert!(
+                !proposal_matches_rule(&p, &r),
+                "non-absolute project_root {root:?} must not match any candidate path; \
+                 the matcher is the last line of defence against operator-supplied \
+                 cwd-blind rules"
+            );
+        }
+    }
+
+    /// PR #723 expansion — same domain invariant on the `ExactPath`
+    /// arm. Without this guard, an `ExactPath { path: "" }` rule
+    /// would silently match any candidate that canonicalises to
+    /// empty (e.g. `"."` or `"foo/.."` passed through the same
+    /// `canonicalise()`); an `ExactPath { path: "src/foo" }` rule
+    /// would match `"src/foo"` cwd-blindly. Domain doc on
+    /// `ApprovalMatchPolicy` already requires absolute paths.
+    #[test]
+    fn exact_path_rejects_non_absolute_paths() {
+        const NON_ABSOLUTE_PATHS: &[&str] =
+            &["", ".", "..", "./bar", "foo/..", "foo/bar", "../escape"];
+        for path in NON_ABSOLUTE_PATHS {
+            let p = proposal("read", serde_json::json!({ "path": "/etc/passwd" }));
+            let r = AllowRule {
+                tool_name: "read".into(),
+                tool_args: Value::Null,
+                policy: ApprovalMatchPolicy::ExactPath {
+                    path: (*path).to_owned(),
+                },
+            };
+            assert!(
+                !proposal_matches_rule(&p, &r),
+                "non-absolute exact path {path:?} must be rejected by the matcher"
+            );
+        }
+    }
+
+    /// Counter-test: an absolute `ExactPath` rule still matches
+    /// when the candidate canonicalises to the same absolute path.
+    /// Without this assertion, a future tightening could break
+    /// legitimate exact-path approvals and the suite wouldn't
+    /// catch it.
+    #[test]
+    fn exact_path_still_matches_absolute_path() {
+        let p = proposal("read", serde_json::json!({ "path": "/etc/passwd" }));
+        let r = AllowRule {
+            tool_name: "read".into(),
+            tool_args: Value::Null,
+            policy: ApprovalMatchPolicy::ExactPath {
+                path: "/etc/passwd".into(),
+            },
+        };
+        assert!(proposal_matches_rule(&p, &r));
     }
 
     #[test]
