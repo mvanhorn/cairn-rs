@@ -82,9 +82,10 @@ pub use control_plane_types::{
     CancelFlowInput, CancelRunInput, ClaimGrantOutcome, CompleteRunInput, CreateFlowInput,
     CreateRunExecutionInput, DeliverApprovalSignalInput, EligibilityResult, ExecutionCreated,
     ExecutionLeaseContext, ExpiredLease, FailExecutionOutcome, FailRunInput, FlowCancelOutcome,
-    IssueGrantAndClaimInput, QuotaAdmission, RenewLeaseInput, ResumeRunInput, RotationFailure,
-    RotationOutcome, StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
-    WorkerRegistration, WorkerSummary,
+    IssueGrantAndClaimInput, IssueReclaimGrantInput, IssueReclaimGrantOutcome, QuotaAdmission,
+    ReclaimExecutionInput, ReclaimExecutionOutcome, ReclaimGrantHandle, RenewLeaseInput,
+    ResumeRunInput, RotationFailure, RotationOutcome, StageDependencyEdgeInput,
+    StageDependencyOutcome, SubmitTaskInput, WorkerRegistration, WorkerSummary,
 };
 // Re-export the FF contracts + state-vector types the `Engine` trait's
 // `read_execution_info` surface depends on, plus the typed id surface

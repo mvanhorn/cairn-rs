@@ -48,9 +48,10 @@ use super::control_plane_types::{
     AddExecutionToFlowInput, ApplyDependencyToChildInput, BudgetSpendOutcome, BudgetStatusSnapshot,
     CancelFlowInput, CancelRunInput, ClaimGrantOutcome, CompleteRunInput, CreateFlowInput,
     CreateRunExecutionInput, DeliverApprovalSignalInput, EligibilityResult, ExecutionCreated,
-    FailExecutionOutcome, FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput, QuotaAdmission,
-    RenewLeaseInput, ResumeRunInput, RotationOutcome, StageDependencyEdgeInput,
-    StageDependencyOutcome, SubmitTaskInput,
+    FailExecutionOutcome, FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput,
+    IssueReclaimGrantInput, IssueReclaimGrantOutcome, QuotaAdmission, ReclaimExecutionInput,
+    ReclaimExecutionOutcome, RenewLeaseInput, ResumeRunInput, RotationOutcome,
+    StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
 };
 
 /// Cairn-side FCALL backend for budget, quota, and rotation
@@ -237,6 +238,54 @@ pub trait ControlPlaneBackend: Send + Sync {
         &self,
         input: IssueGrantAndClaimInput,
     ) -> Result<ClaimGrantOutcome, FabricError>;
+
+    // ── #710: FF 0.15 reclaim-grant path ────────────────────────────────
+    //
+    // Default impls return `EngineUnavailable("<op>")` so backends that
+    // don't ship the reclaim primitive (pre-FF-0.15, in-memory stubs,
+    // test fakes) surface a clean "not supported on this backend"
+    // error rather than silently failing. The Valkey + PG + SQLite
+    // real backends override with actual bodies in follow-up PRs —
+    // this PR only adds the trait surface + cairn-side types.
+
+    /// Issue a reclaim grant for an execution whose lease expired
+    /// mid-terminal-FCALL. RFC-024 §3.2.
+    ///
+    /// Admits `lease_expired_reclaimable` / `lease_revoked`
+    /// executions into the reclaim path. Returned grant is handed
+    /// to [`Self::reclaim_execution`] to mint a fresh attempt.
+    ///
+    /// See the `ControlPlaneBackend` module docstring for the
+    /// control-plane vs worker-path rationale.
+    async fn issue_reclaim_grant(
+        &self,
+        _input: IssueReclaimGrantInput,
+    ) -> Result<IssueReclaimGrantOutcome, FabricError> {
+        Err(FabricError::Engine(Box::new(
+            flowfabric::core::engine_error::EngineError::Unavailable {
+                op: "issue_reclaim_grant",
+            },
+        )))
+    }
+
+    /// Consume a `ReclaimGrantHandle` (from [`Self::issue_reclaim_grant`])
+    /// to mint a fresh attempt on a previously lease-expired
+    /// execution. RFC-024 §3.2.
+    ///
+    /// The new attempt's `HandleKind::Reclaimed` signals to downstream
+    /// observability that the recovery path fired. Cairn emits
+    /// `BridgeEvent::TerminalWriteRecovered` when the grant+reclaim
+    /// pair succeeds.
+    async fn reclaim_execution(
+        &self,
+        _input: ReclaimExecutionInput,
+    ) -> Result<ReclaimExecutionOutcome, FabricError> {
+        Err(FabricError::Engine(Box::new(
+            flowfabric::core::engine_error::EngineError::Unavailable {
+                op: "reclaim_execution",
+            },
+        )))
+    }
 
     // ── Task lifecycle (Phase D PR 2b) ──────────────────────────────────
     //

@@ -382,6 +382,156 @@ pub struct IssueGrantAndClaimInput {
     pub lease_duration_ms: u64,
 }
 
+// ── #710: FF 0.15 reclaim-grant path ─────────────────────────────────────
+//
+// The R11/R12 dogfood exposed that cairn's F62/F64 terminal-write
+// recovery loop walks the pre-FF-0.15 `issue_grant_and_claim` path
+// that FF#371 documented as unrecoverable when the execution's
+// lifecycle_phase drifted to post-tool / pre-next-claim.
+//
+// FF 0.15 shipped the RFC-024 §3.2 reclaim-grant primitive as a new
+// pair of EngineBackend methods (ff-core 0.15 `engine_backend.rs:354`
+// + `:371`):
+//
+//   - `issue_reclaim_grant(args) -> IssueReclaimGrantOutcome`
+//   - `reclaim_execution(args)   -> ReclaimExecutionOutcome`
+//
+// Admits `lease_expired_reclaimable` / `lease_revoked` executions
+// into a fresh attempt with a new lease, bypassing the
+// `execution_not_eligible` wall the old path hit.
+//
+// These cairn-level input/output structs wrap the FF args so the
+// `ControlPlaneBackend` trait stays ff-agnostic in its signature
+// shape (cairn never exports ff-core types through its public
+// surface — see the established pattern for `IssueGrantAndClaimInput`
+// + `ClaimGrantOutcome`). The backend impl translates into the
+// `ff_core::contracts::*` types at the trait boundary.
+
+/// Input to `issue_reclaim_grant`.
+///
+/// Worker identity is cairn-supplied. Control-plane callers pass
+/// a synthetic worker identity (`"cairn-control-plane"` + per-process
+/// instance id) so FF's worker-identity validation accepts the
+/// reclaim without cairn having to become a durable worker. This is
+/// the control-plane carve-out RFC-024 §4.4 anticipates ("consumer
+/// flow" — the consumer need not be a worker provided the identity
+/// is stable across the grant + reclaim pair).
+#[derive(Clone, Debug)]
+pub struct IssueReclaimGrantInput {
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub lane_id: flowfabric::core::types::LaneId,
+    pub worker_id: flowfabric::core::types::WorkerId,
+    pub worker_instance_id: flowfabric::core::types::WorkerInstanceId,
+    /// Grant TTL in milliseconds — how long the returned grant
+    /// stays valid before the consumer must use it. Short values
+    /// (1-5 s) are appropriate for the F64 recovery loop because
+    /// the grant-then-reclaim pair runs in one atomic sequence.
+    pub grant_ttl_ms: u64,
+    /// Optional capability-hash token, stored verbatim on the
+    /// grant for audit. `None` leaves empty.
+    pub capability_hash: Option<String>,
+}
+
+/// Outcome of `issue_reclaim_grant` — cairn-level wrapper over
+/// `ff_core::contracts::IssueReclaimGrantOutcome`.
+///
+/// Construction surface: backends produce variants, consumers match.
+/// The `Granted` variant's body is intentionally opaque (carries the
+/// backend's typed `ReclaimGrant` via `ReclaimGrantHandle`) — cairn
+/// does not persist or inspect grant internals; it hands the handle
+/// straight back to `reclaim_execution`.
+///
+/// Derives match `ClaimGrantOutcome` / `ReclaimExecutionOutcome` in
+/// this file — `Clone + PartialEq + Eq` enables structural
+/// comparison in tests and lets contains-this-outcome types stay
+/// symmetric.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssueReclaimGrantOutcome {
+    /// Grant issued. Hand the carried handle to
+    /// `ControlPlaneBackend::reclaim_execution` to mint a fresh
+    /// attempt.
+    Granted(ReclaimGrantHandle),
+    /// Execution is not in a reclaimable state (not
+    /// `lease_expired_reclaimable` / `lease_revoked`). Typically
+    /// means the deadlock cleared between the lease-expired
+    /// rejection and the grant attempt — cairn should re-try the
+    /// original terminal FCALL without a reclaim.
+    NotReclaimable { detail: String },
+    /// `max_reclaim_count` exceeded. FF transitioned the execution
+    /// to terminal_failed. Cairn surfaces this to the operator —
+    /// no more reclaim attempts possible.
+    ReclaimCapExceeded { reclaim_count: u32 },
+}
+
+/// Opaque wrapper over `ff_core::contracts::ReclaimGrant`. Kept opaque
+/// at the cairn trait boundary so cairn code never handles ff-core
+/// contract types directly.
+///
+/// `inner` is `pub(crate)` because the backend impls in follow-up PRs
+/// unwrap it to build `ff_core::contracts::ReclaimExecutionArgs`. The
+/// dead-code allow is intentional: the scaffold PR lands the type so
+/// the trait signatures compile, with no consumers until the Valkey
+/// backend body lands in the follow-up.
+///
+/// Derives (`Clone`, `PartialEq`, `Eq`) match the containing
+/// outcome/input types so the wrappers can stay symmetric with the
+/// rest of this file. Safe: `ff_core::contracts::ReclaimGrant`
+/// derives the same set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimGrantHandle {
+    #[allow(dead_code)]
+    pub(crate) inner: flowfabric::core::contracts::ReclaimGrant,
+}
+
+/// Input to `reclaim_execution`.
+///
+/// Consumes a `ReclaimGrantHandle` (issued by `issue_reclaim_grant`)
+/// and the fresh-lease parameters. Cairn supplies the same
+/// worker identity pair it used on the grant (FF validates
+/// `grant.worker_id == args.worker_id`, RFC-024 §4.4) plus the
+/// cairn-minted `attempt_id` and fresh `lease_id` / TTL for the
+/// reclaim attempt.
+///
+/// `Clone` added for consistency with every other `*Input` struct in
+/// this file — callers that build an input once and retry into the
+/// same trait method shouldn't need to reconstruct it.
+#[derive(Clone, Debug)]
+pub struct ReclaimExecutionInput {
+    pub grant: ReclaimGrantHandle,
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub lane_id: flowfabric::core::types::LaneId,
+    pub worker_id: flowfabric::core::types::WorkerId,
+    pub worker_instance_id: flowfabric::core::types::WorkerInstanceId,
+    pub old_worker_instance_id: flowfabric::core::types::WorkerInstanceId,
+    pub attempt_id: flowfabric::core::types::AttemptId,
+    pub current_attempt_index: flowfabric::core::types::AttemptIndex,
+    pub lease_id: flowfabric::core::types::LeaseId,
+    pub lease_ttl_ms: u64,
+    /// JSON-encoded attempt policy. Empty string → backend applies
+    /// its default.
+    pub attempt_policy_json: String,
+    /// Optional cap override. `None` → FF applies its Rust-surface
+    /// default of 1000 (RFC-024 §4.6).
+    pub max_reclaim_count: Option<u32>,
+    pub capability_hash: Option<String>,
+}
+
+/// Outcome of `reclaim_execution` — cairn-level wrapper over
+/// `ff_core::contracts::ReclaimExecutionOutcome`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimExecutionOutcome {
+    /// Fresh attempt minted with a new lease. The recovery loop can
+    /// now retry the terminal FCALL on this lease.
+    Claimed(ClaimGrantOutcome),
+    /// Execution is not in a reclaimable state. Same semantics as
+    /// `IssueReclaimGrantOutcome::NotReclaimable` — treat as
+    /// "retry the original terminal FCALL without a reclaim".
+    NotReclaimable { detail: String },
+    /// Reclaim cap exceeded. FF transitioned execution to
+    /// terminal_failed.
+    ReclaimCapExceeded { reclaim_count: u32 },
+}
+
 // ── Phase D PR 2b: task lifecycle mirrors ───────────────────────────────
 
 /// Input to `submit_task_execution`.
