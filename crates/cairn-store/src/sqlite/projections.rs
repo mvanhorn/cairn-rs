@@ -133,13 +133,50 @@ impl SqliteSyncProjection {
             RuntimeEvent::RunStateChanged(e) => {
                 let state_str = enum_to_str(&e.transition.to)?;
                 let failure = e.failure_class.as_ref().map(enum_to_str).transpose()?;
+                // Cross-tenant tampering guard (#732 expansion):
+                // see PG projections for the detailed rationale.
+                // Three cases on a `RunStateChanged`:
+                //  (1) Row exists with matching project → run all
+                //      three sub-ops.
+                //  (2) Row exists with DIFFERENT project → forged;
+                //      silent no-op.
+                //  (3) Row missing (orphan replay) → fall through;
+                //      pause_schedules write proceeds. PG/SQLite
+                //      share schema, so SQLite reuses PG's three-
+                //      case logic verbatim.
+                let scope_check: Option<(String, String, String)> = sqlx::query_as(
+                    "SELECT tenant_id, workspace_id, project_id FROM runs WHERE run_id = ?",
+                )
+                .bind(e.run_id.as_str())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+                let row_belongs_to_other_tenant = match &scope_check {
+                    Some((tid, wid, pid)) => {
+                        tid != e.project.tenant_id.as_str()
+                            || wid != e.project.workspace_id.as_str()
+                            || pid != e.project.project_id.as_str()
+                    }
+                    None => false,
+                };
+                if row_belongs_to_other_tenant {
+                    return Ok(());
+                }
+
                 sqlx::query(
-                    "UPDATE runs SET state = ?, failure_class = ?, version = version + 1, updated_at = ? WHERE run_id = ?",
+                    "UPDATE runs SET state = ?, failure_class = ?, version = version + 1, updated_at = ? \
+                       WHERE run_id = ? \
+                         AND tenant_id = ? \
+                         AND workspace_id = ? \
+                         AND project_id = ?",
                 )
                 .bind(state_str)
                 .bind(failure)
                 .bind(now)
                 .bind(e.run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -3159,13 +3196,21 @@ impl SqliteSyncProjection {
                             completion_annotated_at_ms      = ?,
                             version                         = version + 1,
                             updated_at                      = ?
-                      WHERE run_id = ?",
+                      WHERE run_id = ?
+                        AND tenant_id = ?
+                        AND workspace_id = ?
+                        AND project_id = ?
+                        AND session_id = ?",
                 )
                 .bind(&e.summary)
                 .bind(verification_json)
                 .bind(annotated_at)
                 .bind(now)
                 .bind(e.run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.session_id.as_str())
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
@@ -3181,16 +3226,29 @@ impl SqliteSyncProjection {
                 };
                 let json = serde_json::to_string(&record)
                     .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                // Cross-tenant tampering guard (#732 expansion):
+                // gate on `project` match. NOTE: this event's
+                // payload does not carry `session_id` (unlike
+                // `RunCompletionAnnotated` / `RunStateChanged`), so
+                // the WHERE clause is project-only here. The run
+                // row's project is set at `RunCreated` time and
+                // must match for any legitimate emit.
                 sqlx::query(
                     "UPDATE runs
                         SET terminal_write_recovery_json = ?,
                             version                     = version + 1,
                             updated_at                   = ?
-                      WHERE run_id = ?",
+                      WHERE run_id = ?
+                        AND tenant_id = ?
+                        AND workspace_id = ?
+                        AND project_id = ?",
                 )
                 .bind(json)
                 .bind(now)
                 .bind(e.run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;

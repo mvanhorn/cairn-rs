@@ -674,47 +674,75 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::RunStateChanged(e) => {
-                // #670 G4 / RFC 027 §97: on terminal transition of a
-                // non-root descendant, decrement the root's
-                // `in_flight_descendants` counter. The root id is
-                // captured at spawn time into the terminating child's
-                // `root_run_id` — no parent-chain traversal at
-                // terminal time. `root_run_id = None` is a no-op
-                // (pre-V069 / legacy-chain case).
-                let terminal_decrement_target: Option<RunId> = if e.transition.to.is_terminal() {
-                    state
-                        .runs
-                        .get(e.run_id.as_str())
-                        .filter(|rec| rec.parent_run_id.is_some())
-                        .and_then(|rec| rec.root_run_id.clone())
-                } else {
-                    None
-                };
-                if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
-                    rec.state = e.transition.to;
-                    rec.failure_class = e.failure_class;
-                    rec.pause_reason = e.pause_reason.clone();
-                    rec.resume_trigger = e.resume_trigger;
-                    rec.version += 1;
-                    rec.updated_at = now;
-                }
-                if let Some(root_id) = terminal_decrement_target {
-                    if let Some(root_rec) = state.runs.get_mut(root_id.as_str()) {
-                        // Unchecked subtract is deliberate — RFC 027
-                        // §93 specifies `i64` typing so underflow
-                        // surfaces as a negative value that the
-                        // adapter layer surfaces on its
-                        // `child_run_driver_descendant_underflow_total`
-                        // metric. Panicking (or clamping at 0) would
-                        // hide the auditable signal.
-                        root_rec.in_flight_descendants =
-                            root_rec.in_flight_descendants.wrapping_sub(1);
-                        root_rec.version = root_rec.version.saturating_add(1);
-                        root_rec.updated_at = now;
+                // Cross-tenant tampering guard (#732 expansion):
+                // mirror the `RunCompletionAnnotated` gate. A forged
+                // `RunStateChanged` with a victim tenant's `run_id`
+                // but the attacker's `project` could otherwise flip
+                // another tenant's run state (terminal/failed/
+                // paused) by appending a single event. NOTE: this
+                // event's payload does not carry `session_id`
+                // (unlike `RunCompletionAnnotated`), so the gate is
+                // `project`-only here — sufficient because the run
+                // row's project is fixed at `RunCreated` time and
+                // any legitimate emit must match it.
+                //
+                // The guard wraps the entire block — row update,
+                // descendant decrement, and pause_schedules write —
+                // because all three would otherwise leak across
+                // tenants. Missing-row → fall through (orphan
+                // replay is a legitimate path the existing
+                // `pause_schedule_list_due_filters_by_tenant_and_respects_limit`
+                // test exercises: state-change event arriving
+                // before the projection sees its `RunCreated`).
+                // Forged-event-against-existing-row → block.
+                let row_belongs_to_other_tenant = state
+                    .runs
+                    .get(e.run_id.as_str())
+                    .map(|rec| rec.project != e.project)
+                    .unwrap_or(false);
+                if !row_belongs_to_other_tenant {
+                    // #670 G4 / RFC 027 §97: on terminal transition of a
+                    // non-root descendant, decrement the root's
+                    // `in_flight_descendants` counter. The root id is
+                    // captured at spawn time into the terminating child's
+                    // `root_run_id` — no parent-chain traversal at
+                    // terminal time. `root_run_id = None` is a no-op
+                    // (pre-V069 / legacy-chain case).
+                    let terminal_decrement_target: Option<RunId> =
+                        if e.transition.to.is_terminal() {
+                            state
+                                .runs
+                                .get(e.run_id.as_str())
+                                .filter(|rec| rec.parent_run_id.is_some())
+                                .and_then(|rec| rec.root_run_id.clone())
+                        } else {
+                            None
+                        };
+                    if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
+                        rec.state = e.transition.to;
+                        rec.failure_class = e.failure_class;
+                        rec.pause_reason = e.pause_reason.clone();
+                        rec.resume_trigger = e.resume_trigger;
+                        rec.version += 1;
+                        rec.updated_at = now;
                     }
-                }
+                    if let Some(root_id) = terminal_decrement_target {
+                        if let Some(root_rec) = state.runs.get_mut(root_id.as_str()) {
+                            // Unchecked subtract is deliberate — RFC 027
+                            // §93 specifies `i64` typing so underflow
+                            // surfaces as a negative value that the
+                            // adapter layer surfaces on its
+                            // `child_run_driver_descendant_underflow_total`
+                            // metric. Panicking (or clamping at 0) would
+                            // hide the auditable signal.
+                            root_rec.in_flight_descendants =
+                                root_rec.in_flight_descendants.wrapping_sub(1);
+                            root_rec.version = root_rec.version.saturating_add(1);
+                            root_rec.updated_at = now;
+                        }
+                    }
 
-                // Issue #592: pause_schedules projection — evict-on-resume.
+                    // Issue #592: pause_schedules projection — evict-on-resume.
                 // Mirrors pg/sqlite: INSERT on Paused with
                 // `resume_after_ms=Some`, DELETE on any transition
                 // away from Paused. Parity harness asserts stable
@@ -726,25 +754,26 @@ impl InMemoryStore {
                 // through `apply_async`), so a rebuild replays
                 // scheduled resumes at their original wall-clock
                 // instead of shifting them to the rebuild wall-clock.
-                match e.transition.to {
-                    cairn_domain::RunState::Paused => {
-                        if let Some(reason) = &e.pause_reason {
-                            if let Some(resume_after_ms) = reason.resume_after_ms {
-                                let resume_at_ms = now.saturating_add(resume_after_ms);
-                                state.pause_schedules.insert(
-                                    e.run_id.as_str().to_owned(),
-                                    crate::projections::PauseScheduledRecord {
-                                        run_id: e.run_id.clone(),
-                                        project: e.project.clone(),
-                                        resume_at_ms,
-                                        created_at_ms: now,
-                                    },
-                                );
+                    match e.transition.to {
+                        cairn_domain::RunState::Paused => {
+                            if let Some(reason) = &e.pause_reason {
+                                if let Some(resume_after_ms) = reason.resume_after_ms {
+                                    let resume_at_ms = now.saturating_add(resume_after_ms);
+                                    state.pause_schedules.insert(
+                                        e.run_id.as_str().to_owned(),
+                                        crate::projections::PauseScheduledRecord {
+                                            run_id: e.run_id.clone(),
+                                            project: e.project.clone(),
+                                            resume_at_ms,
+                                            created_at_ms: now,
+                                        },
+                                    );
+                                }
                             }
                         }
-                    }
-                    _ => {
-                        state.pause_schedules.remove(e.run_id.as_str());
+                        _ => {
+                            state.pause_schedules.remove(e.run_id.as_str());
+                        }
                     }
                 }
             }
@@ -3197,11 +3226,13 @@ impl InMemoryStore {
             // pattern used by RunStateChanged above.
             RuntimeEvent::RunCompletionAnnotated(e) => {
                 if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
-                    rec.completion_summary = Some(e.summary.clone());
-                    rec.completion_verification = Some(e.verification.clone());
-                    rec.completion_annotated_at_ms = Some(e.occurred_at_ms);
-                    rec.version += 1;
-                    rec.updated_at = now;
+                    if rec.project == e.project && rec.session_id == e.session_id {
+                        rec.completion_summary = Some(e.summary.clone());
+                        rec.completion_verification = Some(e.verification.clone());
+                        rec.completion_annotated_at_ms = Some(e.occurred_at_ms);
+                        rec.version += 1;
+                        rec.updated_at = now;
+                    }
                 }
             }
             // F64: record the terminal-write recovery attempt on the run
@@ -3211,16 +3242,30 @@ impl InMemoryStore {
             // projection error.
             RuntimeEvent::TerminalRecoveryAttempted(e) => {
                 if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
-                    rec.terminal_write_recovery =
-                        Some(crate::projections::TerminalRecoveryRecord {
-                            fcall: e.fcall.clone(),
-                            attempts: e.attempts,
-                            wall_time_ms: e.wall_time_ms,
-                            outcome: e.outcome.clone(),
-                            occurred_at_ms: e.occurred_at_ms,
-                        });
-                    rec.version += 1;
-                    rec.updated_at = now;
+                    // Cross-tenant tampering guard (#732 expansion):
+                    // gate on `project` match. A forged
+                    // `TerminalRecoveryAttempted` could otherwise
+                    // stamp false recovery metadata onto another
+                    // tenant's run row. NOTE: this event's payload
+                    // does not carry `session_id` (unlike
+                    // `RunCompletionAnnotated` /
+                    // `RunStateChanged`), so the gate is
+                    // `project`-only here. The `project` check is
+                    // sufficient: the run row's `project` is set at
+                    // `RunCreated` time and the event's `project`
+                    // must match for any legitimate emit.
+                    if rec.project == e.project {
+                        rec.terminal_write_recovery =
+                            Some(crate::projections::TerminalRecoveryRecord {
+                                fcall: e.fcall.clone(),
+                                attempts: e.attempts,
+                                wall_time_ms: e.wall_time_ms,
+                                outcome: e.outcome.clone(),
+                                occurred_at_ms: e.occurred_at_ms,
+                            });
+                        rec.version += 1;
+                        rec.updated_at = now;
+                    }
                 }
             }
             // ── F65 PR-2: orchestrator session redesign projections ────────

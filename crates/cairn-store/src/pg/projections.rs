@@ -113,13 +113,61 @@ impl PgSyncProjection {
             RuntimeEvent::RunStateChanged(e) => {
                 let state_str = enum_to_str(&e.transition.to)?;
                 let failure = e.failure_class.as_ref().map(enum_to_str).transpose()?;
+                // Cross-tenant tampering guard (#732 expansion):
+                // distinguish three cases on a `RunStateChanged`:
+                //
+                //  (1) Run row exists with matching project → run
+                //      all three sub-ops (UPDATE, descendant
+                //      decrement, pause_schedules INSERT/DELETE).
+                //  (2) Run row exists with a DIFFERENT project
+                //      → forged event targeting another tenant's
+                //      run; silent no-op on all three sub-ops.
+                //  (3) Run row does not exist (orphan replay before
+                //      `RunCreated` lands in this projection) →
+                //      fall through. The UPDATE is naturally a
+                //      no-op (no matching row); pause_schedules
+                //      INSERT/DELETE proceeds because legitimate
+                //      replay paths depend on it (existing
+                //      `pause_schedule_list_due_filters_by_tenant_and_respects_limit`
+                //      test in `crates/cairn-store/src/in_memory.rs`).
+                //
+                // NOTE: this event's payload does not carry
+                // `session_id` (verified in
+                // `crates/cairn-domain/src/events.rs::RunStateChanged`),
+                // so the gate is project-only.
+                let scope_check: Option<(String, String, String)> = sqlx::query_as(
+                    "SELECT tenant_id, workspace_id, project_id FROM runs WHERE run_id = $1",
+                )
+                .bind(e.run_id.as_str())
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+                let row_belongs_to_other_tenant = match &scope_check {
+                    Some((tid, wid, pid)) => {
+                        tid != e.project.tenant_id.as_str()
+                            || wid != e.project.workspace_id.as_str()
+                            || pid != e.project.project_id.as_str()
+                    }
+                    None => false, // missing row → orphan replay, allowed
+                };
+                if row_belongs_to_other_tenant {
+                    return Ok(());
+                }
+
                 sqlx::query(
-                    "UPDATE runs SET state = $1, failure_class = $2, version = version + 1, updated_at = $3 WHERE run_id = $4",
+                    "UPDATE runs SET state = $1, failure_class = $2, version = version + 1, updated_at = $3 \
+                       WHERE run_id = $4 \
+                         AND tenant_id = $5 \
+                         AND workspace_id = $6 \
+                         AND project_id = $7",
                 )
                 .bind(state_str)
                 .bind(failure)
                 .bind(now)
                 .bind(e.run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
                 .execute(&mut **tx)
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
@@ -3884,13 +3932,21 @@ impl PgSyncProjection {
                             completion_annotated_at_ms      = $3,
                             version                         = version + 1,
                             updated_at                      = $4
-                      WHERE run_id = $5",
+                      WHERE run_id = $5
+                        AND tenant_id = $6
+                        AND workspace_id = $7
+                        AND project_id = $8
+                        AND session_id = $9",
                 )
                 .bind(&e.summary)
                 .bind(verification_json)
                 .bind(annotated_at)
                 .bind(now)
                 .bind(e.run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.session_id.as_str())
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
@@ -3909,16 +3965,29 @@ impl PgSyncProjection {
                 };
                 let json = serde_json::to_string(&record)
                     .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                // Cross-tenant tampering guard (#732 expansion):
+                // gate on `project` match. NOTE: this event's
+                // payload does not carry `session_id` (unlike
+                // `RunCompletionAnnotated` / `RunStateChanged`), so
+                // the WHERE clause is project-only here. The run
+                // row's project is set at `RunCreated` time and
+                // must match for any legitimate emit.
                 sqlx::query(
                     "UPDATE runs
                         SET terminal_write_recovery_json = $1,
                             version                     = version + 1,
                             updated_at                   = $2
-                      WHERE run_id = $3",
+                      WHERE run_id = $3
+                        AND tenant_id = $4
+                        AND workspace_id = $5
+                        AND project_id = $6",
                 )
                 .bind(json)
                 .bind(now)
                 .bind(e.run_id.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
