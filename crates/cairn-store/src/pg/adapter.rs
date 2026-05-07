@@ -5785,21 +5785,17 @@ impl crate::projections::RunCostReadModel for PgAdapter {
 
     async fn list_by_session(
         &self,
-        _session_id: &cairn_domain::SessionId,
+        session_id: &cairn_domain::SessionId,
     ) -> Result<Vec<cairn_domain::providers::RunCostRecord>, StoreError> {
-        // Matches SqliteAdapter + in-memory: `run_costs` is not indexed
-        // by `session_id`; the in-memory impl returns every row and
-        // lets the caller filter. Pg mirrors that contract so cross-
-        // backend parity holds. Returning an empty list here would
-        // diverge from both peer backends and silently hide session
-        // cost breakdowns if callers dispatched through PgAdapter
-        // directly.
         let rows: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(
-            "SELECT run_id, total_cost_micros, total_tokens_in, total_tokens_out,
-                    provider_calls, updated_at_ms
-             FROM run_costs
-             ORDER BY updated_at_ms DESC, run_id ASC",
+            "SELECT rc.run_id, rc.total_cost_micros, rc.total_tokens_in, rc.total_tokens_out,
+                    rc.provider_calls, rc.updated_at_ms
+             FROM run_costs rc
+             INNER JOIN runs r ON r.run_id = rc.run_id
+             WHERE r.session_id = $1
+             ORDER BY rc.updated_at_ms DESC, rc.run_id ASC",
         )
+        .bind(session_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;

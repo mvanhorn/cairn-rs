@@ -5369,11 +5369,52 @@ impl crate::projections::RunCostReadModel for InMemoryStore {
 
     async fn list_by_session(
         &self,
-        _session_id: &cairn_domain::SessionId,
+        session_id: &cairn_domain::SessionId,
     ) -> Result<Vec<cairn_domain::providers::RunCostRecord>, StoreError> {
-        // In-memory store does not index run_costs by session; return all for now.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state.run_costs.values().cloned().collect())
+
+        // Per Gemini PR #727 review: pre-build a `run_id -> session_id`
+        // map from the event log in one pass so the per-cost-row check
+        // is O(1) instead of O(events). The lookup is two-tier:
+        //
+        //   1. Authoritative path — if `state.runs` knows the run, use
+        //      its `session_id` directly. This is the fast happy path
+        //      when `RunCreated` has been projected.
+        //   2. Event-log fallback — for runs whose `RunCreated`
+        //      projection has not landed yet (e.g. orphan replay,
+        //      cross-projection ordering races), scan the
+        //      `RunCostUpdated` events for the run_id and use the
+        //      event's `session_id` if present. We build this index
+        //      ONCE per call rather than per-cost-row, dropping the
+        //      original O(N*M) shape to O(N+M).
+        let cost_run_to_event_session: std::collections::HashMap<String, cairn_domain::SessionId> =
+            state
+                .events
+                .iter()
+                .rev()
+                .filter_map(|evt| match &evt.envelope.payload {
+                    cairn_domain::RuntimeEvent::RunCostUpdated(e) => e
+                        .session_id
+                        .clone()
+                        .map(|sid| (e.run_id.as_str().to_owned(), sid)),
+                    _ => None,
+                })
+                .collect();
+
+        let mut out = Vec::new();
+        for cost in state.run_costs.values() {
+            let run_matches = state
+                .runs
+                .get(cost.run_id.as_str())
+                .map(|run| run.session_id == *session_id)
+                .unwrap_or(false);
+            let event_matches = !run_matches
+                && cost_run_to_event_session.get(cost.run_id.as_str()) == Some(session_id);
+            if run_matches || event_matches {
+                out.push(cost.clone());
+            }
+        }
+        Ok(out)
     }
 }
 

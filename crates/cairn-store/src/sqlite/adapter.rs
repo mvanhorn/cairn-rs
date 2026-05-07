@@ -6165,28 +6165,17 @@ impl crate::projections::RunCostReadModel for SqliteAdapter {
 
     async fn list_by_session(
         &self,
-        _session_id: &cairn_domain::SessionId,
+        session_id: &cairn_domain::SessionId,
     ) -> Result<Vec<cairn_domain::providers::RunCostRecord>, StoreError> {
-        // The `run_costs` row does not carry `session_id` — the event
-        // body does (`RunCostUpdated.session_id` as an Option) but the
-        // projection does not index on it (one run-id is always scoped
-        // to a single session). Matches the in-memory applier, which
-        // returns every run_cost row (it does not index by
-        // session_id either — see `run_cost_impl.rs`'s
-        // `list_by_session` at
-        // `state.run_costs.values().cloned().collect()`), and the new
-        // PgAdapter impl which mirrors this shape. Callers that need a
-        // session filter apply it client-side. Copilot PR #596 review:
-        // the earlier empty-list return diverged from the in-memory
-        // contract and would have silently hidden session-cost
-        // breakdowns if a caller ever dispatched through SqliteAdapter
-        // directly.
         let rows: Vec<(String, i64, i64, i64, i64, i64)> = sqlx::query_as(
-            "SELECT run_id, total_cost_micros, total_tokens_in, total_tokens_out,
-                    provider_calls, updated_at_ms
-             FROM run_costs
-             ORDER BY updated_at_ms DESC, run_id ASC",
+            "SELECT rc.run_id, rc.total_cost_micros, rc.total_tokens_in, rc.total_tokens_out,
+                    rc.provider_calls, rc.updated_at_ms
+             FROM run_costs rc
+             INNER JOIN runs r ON r.run_id = rc.run_id
+             WHERE r.session_id = ?
+             ORDER BY rc.updated_at_ms DESC, rc.run_id ASC",
         )
+        .bind(session_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StoreError::Internal(e.to_string()))?;
