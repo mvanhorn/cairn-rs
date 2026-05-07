@@ -92,7 +92,16 @@ services:
       CAIRN_FABRIC_WAITPOINT_HMAC_SECRET: "${CAIRN_FABRIC_WAITPOINT_HMAC_SECRET:-00000000000000000000000000000000000000000000000000000000000000aa}"
 
       # ── Auth ───────────────────────────────────────────────────────────────
-      CAIRN_ADMIN_TOKEN: "${CAIRN_ADMIN_TOKEN:-dev-admin-token}"
+      # Required: bearer token for the admin account. The compose stack
+      # boots in `team` mode by default, where cairn-app fail-closes if
+      # `CAIRN_ADMIN_TOKEN` is missing. Removing the dev-admin-token
+      # default here prevents docker-compose users from accidentally
+      # shipping an instance with the public test credential — same
+      # rationale as the Dockerfile change in this PR.
+      #
+      # Generate with: `openssl rand -hex 32` and store in `.env`:
+      #   echo "CAIRN_ADMIN_TOKEN=$(openssl rand -hex 32)" >> .env
+      CAIRN_ADMIN_TOKEN: "${CAIRN_ADMIN_TOKEN:?set in .env (openssl rand -hex 32)}"
       CAIRN_MODE: "${CAIRN_MODE:-team}"
 
       # ── LLM Providers (all optional — configure via env or dashboard) ──────
