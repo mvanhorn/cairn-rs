@@ -8,15 +8,12 @@
 //!
 //! Strategy (Layer A — authoritative):
 //!
-//! - Scan `workspace_members` for every row where
-//!   `role ∈ {Admin, Owner}`. Map workspace → tenant via the `workspaces`
-//!   read model, then for each `(tenant, operator)` pair emit a real
-//!   `TenantRoleGranted` event with `role = TenantRole::Admin` and
-//!   `granted_by = "upgrade-backfill"`.
-//! - For operators with a workspace_members row that is NOT Admin/Owner
-//!   on a tenant where they hold no Admin/Owner anywhere, emit
-//!   `TenantRoleGranted` with `role = TenantRole::Member` — preserves
-//!   presence without escalating.
+//! - Scan `workspace_members` rows and map workspace → tenant via the
+//!   `workspaces` read model, then emit one `TenantRoleGranted` event per
+//!   `(tenant, operator)` pair with `role = TenantRole::Member`.
+//! - The backfill intentionally does not infer tenant-admin authority
+//!   from workspace-scoped roles. Tenant-wide admin grants must be
+//!   explicit and auditable as operator-authored actions.
 //! - Idempotent: rows already present in `operator_tenant_roles` are
 //!   skipped, so re-running the backfill at every boot is a no-op on
 //!   steady-state deployments.
@@ -29,7 +26,7 @@
 //! backends, and the audit trail lives in the same place every other
 //! tenant-role grant lives.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use cairn_domain::tenancy::TenantRole;
 use cairn_domain::OperatorId;
@@ -94,9 +91,9 @@ where
         for tenant in &tenants {
             let tenant_id = tenant.tenant_id.clone();
 
-            // Per-tenant: walk every workspace's members and pick the
-            // highest role each operator holds on this tenant. A
-            // BTreeMap gives us deterministic iteration for the WARN
+            // Per-tenant: walk every workspace's members and collect
+            // the unique set of operators with any membership. A
+            // BTreeSet gives us deterministic iteration for the WARN
             // log + test assertions.
             //
             // Paginate workspaces so a tenant with >page_size workspaces
@@ -125,9 +122,7 @@ where
                 }
             }
 
-            let mut best_role: BTreeMap<String, TenantRole> = BTreeMap::new();
-            let mut seen: BTreeSet<String> = BTreeSet::new();
-
+            let mut operators: BTreeSet<String> = BTreeSet::new();
             for workspace in &workspaces {
                 let members = WorkspaceMembershipReadModel::list_workspace_members(
                     store,
@@ -135,34 +130,22 @@ where
                 )
                 .await
                 .map_err(RuntimeError::from)?;
-
                 for member in &members {
-                    let op = member.operator_id.clone();
-                    seen.insert(op.clone());
-                    // Admin or Owner on any workspace → tenant-Admin.
-                    let mapped = match member.role {
-                        cairn_domain::tenancy::WorkspaceRole::Admin
-                        | cairn_domain::tenancy::WorkspaceRole::Owner => TenantRole::Admin,
-                        _ => TenantRole::Member,
-                    };
-                    // Keep the strictest role the operator holds —
-                    // Admin wins over Member. A future Owner variant
-                    // above Admin can slot in without rewriting this
-                    // because the comparison is monotonic via
-                    // `is_admin`.
-                    let next = match best_role.get(&op) {
-                        Some(existing) if existing.is_admin() => *existing,
-                        _ => mapped,
-                    };
-                    best_role.insert(op, next);
+                    // Backfill preserves tenant presence only. It does
+                    // NOT promote workspace-scoped authority to
+                    // tenant-scoped Admin — every operator with any
+                    // workspace membership lands as `Member` and any
+                    // tenant-admin grant must be an explicit, audited
+                    // operator-authored action.
+                    operators.insert(member.operator_id.clone());
                 }
             }
 
-            // Emit one event per operator. Skip pairs that already
-            // have a row in `operator_tenant_roles` — covers re-boot
-            // idempotency + cases where a PR-A0-deployed tenant
-            // already has live grants.
-            for (op_str, role) in best_role {
+            // Emit one Member grant per operator. Skip pairs that
+            // already have a row in `operator_tenant_roles` — covers
+            // re-boot idempotency + cases where a PR-A0-deployed
+            // tenant already has live grants.
+            for op_str in operators {
                 let operator_id = OperatorId::new(op_str.clone());
                 let existing = OperatorTenantRoleReadModel::get(store, &tenant_id, &operator_id)
                     .await
@@ -175,20 +158,14 @@ where
                     .grant(
                         tenant_id.clone(),
                         operator_id,
-                        role,
+                        TenantRole::Member,
                         "upgrade-backfill".to_owned(),
                     )
                     .await?;
                 report
                     .granted
-                    .push((tenant_id.as_str().to_owned(), op_str, role));
+                    .push((tenant_id.as_str().to_owned(), op_str, TenantRole::Member));
             }
-
-            // Silence the unused-var warning for `seen`. Kept so a
-            // future refinement (e.g. also seeding ReadOnly for
-            // Viewer rows) has the full operator set available
-            // without another scan.
-            let _ = seen;
         }
 
         offset += page_len;
@@ -222,7 +199,7 @@ mod tests {
     /// pre-A0 deployment, then asserts the backfill emits one grant
     /// per operator with the correct role.
     #[tokio::test]
-    async fn backfill_maps_workspace_admins_to_tenant_admin() {
+    async fn backfill_maps_workspace_memberships_to_tenant_member() {
         let store = Arc::new(InMemoryStore::new());
         let tenants = TenantServiceImpl::new(store.clone());
         let workspaces = WorkspaceServiceImpl::new(store.clone());
@@ -255,7 +232,7 @@ mod tests {
             .await
             .unwrap();
 
-        // op_admin: Admin on ws_a (tenant t_alpha) → expect TenantRole::Admin on t_alpha.
+        // op_admin: Admin on ws_a (tenant t_alpha) still maps to Member at tenant scope.
         memberships
             .add_member(
                 cairn_domain::tenancy::WorkspaceKey::new("t_alpha", "ws_a"),
@@ -287,7 +264,7 @@ mod tests {
         assert!(granted.contains(&(
             "t_alpha".into(),
             "op_admin".into(),
-            cairn_domain::tenancy::TenantRole::Admin
+            cairn_domain::tenancy::TenantRole::Member
         )));
         assert!(granted.contains(&(
             "t_beta".into(),
@@ -339,10 +316,9 @@ mod tests {
         assert_eq!(second.skipped_already_present, 1);
     }
 
-    /// Admin across multiple workspaces on the same tenant collapses
-    /// to a single Admin grant (not multiple, not Member).
+    /// Multiple memberships on the same tenant collapse to one Member grant.
     #[tokio::test]
-    async fn multiple_admin_memberships_yield_single_admin_grant() {
+    async fn multiple_memberships_yield_single_member_grant() {
         let store = Arc::new(InMemoryStore::new());
         let tenants = TenantServiceImpl::new(store.clone());
         let workspaces = WorkspaceServiceImpl::new(store.clone());
@@ -375,10 +351,10 @@ mod tests {
         let report = run_tenant_role_backfill(store.as_ref(), &roles, 100)
             .await
             .unwrap();
-        assert_eq!(report.granted.len(), 1, "single Admin grant per tenant");
+        assert_eq!(report.granted.len(), 1, "single Member grant per tenant");
         assert_eq!(
             report.granted[0].2,
-            cairn_domain::tenancy::TenantRole::Admin
+            cairn_domain::tenancy::TenantRole::Member
         );
     }
 }
