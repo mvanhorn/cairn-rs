@@ -579,33 +579,104 @@ pub fn default_roles() -> Vec<AgentRole> {
                 "tool_search",
             ])
             .with_max_context_tokens(200_000),
+        // #707: researcher needs REAL registered tool names to actually
+        // research. The prior `cairn.*` placeholders (cairn.search /
+        // cairn.retrieve / cairn.webSearch / cairn.fetchUrl) are NOT
+        // registered in the builtin tool registry, so the researcher
+        // got an empty effective surface and fell back to training-data
+        // answers with honest disclaimers ("Due to tool limitations...
+        // unable to provide citations"). Researcher's job per its
+        // prompt is citation-backed retrieval — these tools let it do
+        // that.
         AgentRole::new("researcher", "Researcher", AgentRoleTier::Research)
             .with_system_prompt(RESEARCHER_PROMPT)
             .with_tools([
-                "cairn.search",
-                "cairn.retrieve",
-                "cairn.readFile",
-                "cairn.listFiles",
-                "cairn.webSearch",
-                "cairn.fetchUrl",
+                // Filesystem / codebase retrieval
+                "read",
+                "grep",
+                "glob",
+                "lsp",
+                // Memory + graph retrieval (prior project context)
+                "memory_search",
+                "graph_query",
+                // External retrieval (web docs, http APIs)
+                "webfetch",
+                "http_request",
+                // Utility — structured data extraction + quick math
+                // + one-shot summarisation during synthesis
+                "json_extract",
+                "calculate",
+                "summarize_text",
+                // Scratchpad for intermediate synthesis
+                "scratch_pad",
+                // Termination + escalation
+                "complete_run",
+                "escalate_to_operator",
+                // Tool discovery when the listed set is insufficient
+                "tool_search",
             ])
             .with_max_context_tokens(128_000),
+        // #707: executor needs REAL registered tool names. Previously
+        // listed `cairn.runCommand` / `cairn.writeFile` etc. (not
+        // registered). Executor's job is focused code changes — it
+        // needs the full read-write-verify toolkit.
         AgentRole::new("executor", "Executor", AgentRoleTier::Standard)
             .with_system_prompt(EXECUTOR_PROMPT)
             .with_tools([
-                "cairn.runCommand",
-                "cairn.readFile",
-                "cairn.writeFile",
-                "cairn.listFiles",
-                "cairn.search",
+                // Inspection before editing (Phase 2 Locate in executor prompt)
+                "read",
+                "grep",
+                "glob",
+                "lsp",
+                // Context-retrieval during Locate — previously-learned
+                // project patterns + entity relationships (callers /
+                // callees) inform surgical code changes
+                "memory_search",
+                "graph_query",
+                // Mutation (Phase 3 Implement)
+                "write",
+                "edit",
+                "multiedit",
+                // Verification (Phase 4 Verify — run build/tests)
+                "bash",
+                "bash_output",
+                "bash_kill",
+                // Utility — parsing JSON from build/test output
+                "json_extract",
+                // Scratchpad for intermediate state
+                "scratch_pad",
+                // Termination + escalation
+                "complete_run",
+                "escalate_to_operator",
+                // Tool discovery when the listed set is insufficient
+                "tool_search",
             ]),
+        // #707: reviewer is READ-ONLY. No write / edit / bash. Prior
+        // test (`reviewer_is_read_only_tools` in this file) already
+        // pinned the contract with the old placeholder names; update
+        // to real registered names while preserving the read-only
+        // invariant.
         AgentRole::new("reviewer", "Reviewer", AgentRoleTier::Standard)
             .with_system_prompt(REVIEWER_PROMPT)
             .with_tools([
-                "cairn.readFile",
-                "cairn.listFiles",
-                "cairn.search",
-                "cairn.retrieve",
+                // Read-only inspection
+                "read",
+                "grep",
+                "glob",
+                "lsp",
+                // Retrieval for cross-referencing prior project context
+                "memory_search",
+                "graph_query",
+                // Scratchpad for structured findings before delivery
+                "scratch_pad",
+                // Termination + escalation
+                "complete_run",
+                "escalate_to_operator",
+                // Tool discovery for specialised read-only audit tools
+                // that may not be in the default set (e.g., custom
+                // plugin linters). Review discipline in the prompt
+                // prevents misuse toward mutation.
+                "tool_search",
             ]),
     ]
 }
@@ -906,5 +977,120 @@ mod tests {
             lower.contains("read-only"),
             "reviewer prompt must explicitly state the read-only contract"
         );
+    }
+
+    /// #707 regression guard: every role with a non-empty
+    /// `allowed_tools` must reference REAL registered tool names, not
+    /// `cairn.*` placeholders that don't exist in the builtin
+    /// registry.
+    ///
+    /// R11 dogfood proved the placeholder surface silently broke
+    /// specialists: with no effective tools, they fell back to
+    /// training-data answers with honest disclaimers ("Due to tool
+    /// limitations in this environment, I am unable to provide
+    /// specific citations"). The orchestrator correctly refused those
+    /// outputs, but the specialists were structurally unable to do
+    /// their jobs.
+    ///
+    /// This test pins the contract: every tool name declared in any
+    /// built-in role's `allowed_tools` must match either a real
+    /// harness tool name or a registered cairn-tools builtin. The
+    /// `cairn.*` pseudo-namespace is forbidden because no such
+    /// prefix exists in the registry.
+    ///
+    /// Covers ALL four built-in roles (orchestrator, researcher,
+    /// executor, reviewer) — #705 added a hardcoded tool list to the
+    /// orchestrator too, so it shares the same regression surface.
+    #[test]
+    fn role_allowlists_reference_only_registered_tool_names() {
+        // Known-registered names as of the #708 Gemini review.
+        // Source of truth:
+        //   - harness-tools: BASH_TOOL_NAME / READ_TOOL_NAME / etc.
+        //     constants in the upstream harness-* crates.
+        //   - cairn-tools builtins: `fn name()` impls in
+        //     crates/cairn-tools/src/builtins/*.rs.
+        //
+        // Excluded from this list (Gemini review on #708):
+        //   - `web_fetch` — only registered as a `#[cfg(test)]` stub
+        //     in tool_search.rs; the real tool is `webfetch` (harness).
+        //   - `web_search` — only present as a rustdoc example name in
+        //     tool_search.rs; not a production tool.
+        //   - `echo` — test-only registration.
+        //
+        // If a future PR adds a new tool, extend this set.
+        let known_registered: &[&str] = &[
+            // Harness tools
+            "bash",
+            "bash_output",
+            "bash_kill",
+            "read",
+            "grep",
+            "glob",
+            "write",
+            "edit",
+            "multiedit",
+            "lsp",
+            "webfetch",
+            // Cairn-tools builtins (production, not test stubs)
+            "calculate",
+            "cancel_task",
+            "delete_memory",
+            "eval_score",
+            "get_approvals",
+            "get_run",
+            "get_task",
+            "graph_query",
+            "http_request",
+            "json_extract",
+            "list_runs",
+            "memory_search",
+            "memory_store",
+            "notify_operator",
+            "plugin_tool",
+            "resolve_approval",
+            "schedule_task",
+            "scratch_pad",
+            "search_events",
+            "summarize_text",
+            "tool_search",
+            "update_memory",
+            "wait_for_task",
+            // Meta-actions (not tools proper but accepted names from
+            // decide_impl's synthetic tool_defs — spawn_subagent /
+            // complete_run / escalate_to_operator).
+            "spawn_subagent",
+            "complete_run",
+            "escalate_to_operator",
+        ];
+
+        let roles = default_roles();
+        for role in roles.iter() {
+            if role.allowed_tools.is_empty() {
+                // Roles that legitimately declare no allowlist receive
+                // the full registered surface (back-compat path).
+                // Skip — there's no surface to validate.
+                continue;
+            }
+            for tool in &role.allowed_tools {
+                assert!(
+                    !tool.starts_with("cairn."),
+                    "#707 regression: role {role_id:?} allowed_tools \
+                     contains `cairn.*` placeholder {tool:?}. These are \
+                     NOT registered in the builtin tool registry and \
+                     leave the role with an empty effective surface, \
+                     forcing training-data fallback.",
+                    role_id = role.role_id,
+                );
+                assert!(
+                    known_registered.contains(&tool.as_str()),
+                    "#707 regression: role {role_id:?} allowed_tools \
+                     references unregistered tool name {tool:?}. Known \
+                     registered names: {known_registered:?}. If this is \
+                     a legitimately new tool, add it to the \
+                     `known_registered` set in this test.",
+                    role_id = role.role_id,
+                );
+            }
+        }
     }
 }
