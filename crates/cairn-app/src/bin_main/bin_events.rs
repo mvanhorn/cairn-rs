@@ -133,6 +133,36 @@ pub(crate) async fn append_events_handler(
                     )));
                 }
             }
+
+            let payload_project = envelope.payload.project();
+            if payload_project.tenant_id != caller_tenant {
+                return Err(forbidden(format!(
+                    "event {} payload project outside caller tenant",
+                    envelope.event_id.as_str(),
+                )));
+            }
+
+            let ownership_matches_payload = match &envelope.ownership {
+                cairn_domain::tenancy::OwnershipKey::System => false,
+                cairn_domain::tenancy::OwnershipKey::Tenant(k) => {
+                    k.tenant_id == payload_project.tenant_id
+                }
+                cairn_domain::tenancy::OwnershipKey::Workspace(k) => {
+                    k.tenant_id == payload_project.tenant_id
+                        && k.workspace_id == payload_project.workspace_id
+                }
+                cairn_domain::tenancy::OwnershipKey::Project(k) => {
+                    k.tenant_id == payload_project.tenant_id
+                        && k.workspace_id == payload_project.workspace_id
+                        && k.project_id == payload_project.project_id
+                }
+            };
+            if !ownership_matches_payload {
+                return Err(forbidden(format!(
+                    "event {} ownership does not match payload project scope",
+                    envelope.event_id.as_str(),
+                )));
+            }
         }
     }
 
