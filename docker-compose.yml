@@ -36,9 +36,7 @@ services:
     environment:
       POSTGRES_DB: cairn
       POSTGRES_USER: cairn
-      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-cairn-dev-password}"
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -75,7 +73,7 @@ services:
       - "3000:3000"
     environment:
       # ── Database ───────────────────────────────────────────────────────────
-      DATABASE_URL: "postgres://cairn:${POSTGRES_PASSWORD:-cairn-dev-password}@postgres:5432/cairn"
+      DATABASE_URL: "postgres://cairn:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/cairn"
 
       # ── FlowFabric (Valkey) ────────────────────────────────────────────────
       # `CAIRN_FABRIC_URL` is the single knob for backend connection.
