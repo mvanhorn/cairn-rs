@@ -83,8 +83,8 @@ pub use control_plane_types::{
     CreateRunExecutionInput, DeliverApprovalSignalInput, EligibilityResult, ExecutionCreated,
     ExecutionLeaseContext, ExpiredLease, FailExecutionOutcome, FailRunInput, FlowCancelOutcome,
     IssueGrantAndClaimInput, IssueReclaimGrantInput, IssueReclaimGrantOutcome, QuotaAdmission,
-    ReclaimExecutionInput, ReclaimExecutionOutcome, ReclaimGrantHandle, RenewLeaseInput,
-    ResumeRunInput, RotationFailure, RotationOutcome, StageDependencyEdgeInput,
+    ReclaimExecutionInput, ReclaimExecutionOutcome, ReclaimGrantHandle, ReclaimedHandle,
+    RenewLeaseInput, ResumeRunInput, RotationFailure, RotationOutcome, StageDependencyEdgeInput,
     StageDependencyOutcome, SubmitTaskInput, WorkerRegistration, WorkerSummary,
 };
 // Re-export the FF contracts + state-vector types the `Engine` trait's

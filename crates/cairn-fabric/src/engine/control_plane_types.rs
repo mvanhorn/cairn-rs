@@ -516,13 +516,43 @@ pub struct ReclaimExecutionInput {
     pub capability_hash: Option<String>,
 }
 
+/// Opaque wrapper over `ff_core::backend::Handle` returned by
+/// `reclaim_execution`. Mirrors how [`ReclaimGrantHandle`] wraps
+/// `ff_core::contracts::ReclaimGrant` — cairn code never handles
+/// ff-core's `Handle` directly.
+///
+/// FF returns the new attempt's lease triple as opaque
+/// `HandleOpaque` bytes; the canonical lease identity for cairn's
+/// recovery loop comes from re-reading `exec_core` via
+/// [`super::Engine::describe_execution`] before the next terminal
+/// FCALL (see [`ExecutionLeaseContext`] doc + the `f64_terminal_recovery_loop`
+/// rewrite in #710 PR-5). This type is therefore intentionally
+/// opaque: it carries the freshness signal ("you have a new
+/// attempt") without committing cairn to a specific cache shape.
+///
+/// `inner` is `pub(crate)` so the Valkey/PG/SQLite backend impls
+/// can produce one; consumers match on the enclosing variant only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimedHandle {
+    #[allow(dead_code)]
+    pub(crate) inner: flowfabric::core::backend::Handle,
+}
+
 /// Outcome of `reclaim_execution` — cairn-level wrapper over
 /// `ff_core::contracts::ReclaimExecutionOutcome`.
+///
+/// Mirrors all four FF variants. `GrantNotFound` is the
+/// grant-TTL-elapsed / grant-already-consumed case — the F64
+/// recovery loop will hit this in real outages because grant TTLs
+/// are intentionally short (1-5s) and a slow Valkey can absolutely
+/// drop the grant between `issue_reclaim_grant` and
+/// `reclaim_execution`. Caller's response: re-issue the grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReclaimExecutionOutcome {
     /// Fresh attempt minted with a new lease. The recovery loop can
-    /// now retry the terminal FCALL on this lease.
-    Claimed(ClaimGrantOutcome),
+    /// now retry the terminal FCALL — it re-reads the lease triple
+    /// from `exec_core` rather than reading it off the handle.
+    Claimed(ReclaimedHandle),
     /// Execution is not in a reclaimable state. Same semantics as
     /// `IssueReclaimGrantOutcome::NotReclaimable` — treat as
     /// "retry the original terminal FCALL without a reclaim".
@@ -530,6 +560,10 @@ pub enum ReclaimExecutionOutcome {
     /// Reclaim cap exceeded. FF transitioned execution to
     /// terminal_failed.
     ReclaimCapExceeded { reclaim_count: u32 },
+    /// Grant was not found / already consumed / expired between
+    /// `issue_reclaim_grant` and `reclaim_execution`. Caller's
+    /// response: re-issue the grant via `issue_reclaim_grant`.
+    GrantNotFound,
 }
 
 // ── Phase D PR 2b: task lifecycle mirrors ───────────────────────────────

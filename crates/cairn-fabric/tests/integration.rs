@@ -37,6 +37,7 @@ mod integration {
     pub mod test_instance_tag_filter;
     pub mod test_lease_history_subscriber;
     pub mod test_orchestrator_stream;
+    pub mod test_reclaim_grant;
     pub mod test_run_lifecycle;
     pub mod test_scanner_filter_perf;
     pub mod test_scanner_filter_upstream;
