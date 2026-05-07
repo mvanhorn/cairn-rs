@@ -50,8 +50,10 @@ use cairn_fabric::engine::control_plane_types::{
     AddExecutionToFlowInput, ApplyDependencyToChildInput, BudgetSpendOutcome, CancelFlowInput,
     CancelRunInput, CompleteRunInput, CreateFlowInput, CreateRunExecutionInput,
     DeliverApprovalSignalInput, EligibilityResult, ExecutionLeaseContext, FailExecutionOutcome,
-    FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput, QuotaAdmission, RenewLeaseInput,
-    ResumeRunInput, StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
+    FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput, IssueReclaimGrantInput,
+    IssueReclaimGrantOutcome, QuotaAdmission, ReclaimExecutionInput, ReclaimExecutionOutcome,
+    RenewLeaseInput, ResumeRunInput, StageDependencyEdgeInput, StageDependencyOutcome,
+    SubmitTaskInput,
 };
 use cairn_fabric::engine::{ControlPlaneBackend, Engine, PostgresControlPlane};
 use cairn_fabric::FabricError;
@@ -113,12 +115,14 @@ async fn shared_pg() -> Arc<SharedPg> {
                 .expect("container port unavailable");
             let url = format!("postgres://cairn:cairn@{host}:{port}/cairn_test");
 
-            // Build a pool for direct asserts. Small pool — the
-            // test binary doesn't need many concurrent connections
-            // against it and the test container boots with the
-            // default `max_connections` (100) so we stay under the
-            // ceiling when the FF backend's own pool shares the
-            // container.
+            // One-shot pool used solely for `apply_migrations` at boot.
+            // Per-test sqlx work uses `per_test_seed_pool(...)` so each
+            // `#[tokio::test]` runtime owns its own pool's lifetime —
+            // sharing this pool across runtimes manifests as
+            // `"A Tokio 1.x context was found, but it is being shutdown"`
+            // transport errors when one test's runtime ends while
+            // another is mid-await. 4 connections is plenty for the
+            // single migration pass.
             let pool = PgPoolOptions::new()
                 .max_connections(4)
                 .connect(&url)
@@ -144,6 +148,16 @@ async fn shared_pg() -> Arc<SharedPg> {
 /// container. One stub per test so each test gets its own backend
 /// handle (mirrors the per-test `FabricServices::start` shape the
 /// Valkey harness uses).
+///
+/// Each test gets its OWN sqlx pool via `PostgresBackend::connect` —
+/// not a clone of the shared one — because cross-runtime pool sharing
+/// breaks tokio's runtime model: `#[tokio::test]` spins up a fresh
+/// runtime per test, and a `PgPool` carries connection-keepalive
+/// background tasks bound to whichever runtime first touched the
+/// pool. Sharing manifests as
+/// `"A Tokio 1.x context was found, but it is being shutdown"`
+/// transport errors when one test's runtime drops while another is
+/// still using the shared pool.
 async fn control_plane() -> Arc<PostgresControlPlane> {
     let pg = shared_pg().await;
     let cfg = flowfabric::core::backend::BackendConfig::postgres(pg.url.clone());
@@ -1741,4 +1755,404 @@ async fn pg_read_budget_usage_and_limits_returns_unavailable() {
              If FF added a PG body, wire cairn's budget-read path through it."
         ),
     }
+}
+
+// ── #710 PR-3: FF 0.15 reclaim-grant path ─────────────────────────────────
+//
+// Mirror of the Valkey-side `tests/integration/test_reclaim_grant.rs` —
+// proves the cairn translation layer between cairn's mirror types and
+// `ff_core::contracts::*` round-trips correctly across all four
+// `ReclaimExecutionOutcome` variants the recovery loop will hit in
+// production.
+//
+// Setup follows FF's own `ff-backend-postgres-0.15.0/tests/rfc024_reclaim.rs`
+// pattern: direct sqlx INSERT into `ff_exec_core` + `ff_attempt` to
+// land an execution row in the `ownership_state = "lease_expired_reclaimable"`
+// state. PG's scheduler is async (background reconciler), so there's
+// no synchronous public API to drive an execution into the reclaimable
+// state — direct seeding is the deterministic path FF uses for its own
+// PR-D backend tests, and we mirror it here. Cairn's other PG tests
+// don't use raw sqlx; this file is the exception because the reclaim
+// tests have no other way to deterministically provoke FF's
+// reclaim-eligibility gate.
+
+/// Build a per-test sqlx pool against the shared container's URL.
+/// Per-test pools — not a clone of the OnceCell's shared pool —
+/// because `#[tokio::test]` runtimes are short-lived and each pool's
+/// keepalive tasks are bound to the runtime that touched it first.
+/// Sharing across runtimes manifests as
+/// `"A Tokio 1.x context was found, but it is being shutdown"` errors
+/// when one test ends while another is still using the pool. Per-test
+/// pools cost a TCP handshake per test (~ms-scale on localhost) but
+/// keep the runtime/pool lifetimes 1:1.
+///
+/// Pool sized at 4 — each test makes at most 6 sqlx writes back-to-
+/// back through a single owner; concurrency higher than 4 is
+/// unnecessary and would spike PG connections under parallel test
+/// load.
+async fn per_test_seed_pool(pg: &Arc<SharedPg>) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&pg.url)
+        .await
+        .expect("per-test sqlx pool connect failed")
+}
+
+/// Seed a waitpoint HMAC kid into the keystore. PG's
+/// `issue_reclaim_grant_impl` stamps each grant with a signed
+/// waitpoint token, and the call fails fast with
+/// `Unavailable { op: "issue_reclaim_grant: ff_waitpoint_hmac keystore empty" }`
+/// when the keystore has no rows. The seed is idempotent across
+/// parallel tests via `ON CONFLICT (kid) DO NOTHING`. Mirrors FF's own
+/// `rfc024_reclaim.rs::setup_or_skip` keystore-seed step.
+async fn seed_waitpoint_hmac_kid(pool: &PgPool) {
+    let now_ms: i64 = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis(),
+    )
+    .expect("now_ms fits in i64 until 2262");
+    sqlx::query(
+        r#"
+        INSERT INTO ff_waitpoint_hmac (kid, secret, rotated_at_ms, active)
+        VALUES ('cairn-pr3-test', decode('0102030405060708', 'hex'), $1, true)
+        ON CONFLICT (kid) DO NOTHING
+        "#,
+    )
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .expect("seed ff_waitpoint_hmac");
+}
+
+/// Seed an execution row + first-attempt row directly in PG with caller-
+/// chosen state. Mirrors FF's own `seed_exec` test helper from
+/// `ff-backend-postgres-0.15.0/tests/rfc024_reclaim.rs` so the cairn
+/// reclaim tests can drive the state machine deterministically — PG's
+/// scheduler is async, and there is no synchronous public API to land
+/// an execution in `lease_expired_reclaimable` / `leased` / etc.
+///
+/// Returns `(partition_key, exec_uuid, lane_id)` so the caller can build
+/// a matching `ExecutionId` via [`exec_id_from_seed`].
+///
+/// `lease_expires_at_ms = NULL` keeps the seeded attempt OUT of the
+/// partial index `ix_ff_attempt_lease_expiry` (FF migration 0001:
+/// `WHERE lease_expires_at_ms IS NOT NULL`), so sibling tests that
+/// scan `list_expired_leases` won't see these synthetic reclaimable
+/// rows. The reclaim primitives don't read this column for the
+/// lease-expired-reclaimable path; they branch on `ownership_state`,
+/// set explicitly via the `ownership_state` argument.
+async fn seed_exec(
+    pool: &PgPool,
+    lane_seed: &str,
+    ownership_state: &str,
+    lifecycle_phase: &str,
+    lease_reclaim_count: i32,
+) -> (i16, uuid::Uuid, LaneId) {
+    seed_waitpoint_hmac_kid(pool).await;
+
+    let part: i16 = 0;
+    let exec_uuid = uuid::Uuid::new_v4();
+    let lane_str = format!("cairn-pr3-{lane_seed}-{}", uuid::Uuid::new_v4());
+    let now_ms: i64 = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis(),
+    )
+    .expect("now_ms fits in i64 until 2262");
+
+    sqlx::query(
+        r#"
+        INSERT INTO ff_exec_core (
+            partition_key, execution_id, flow_id, lane_id,
+            required_capabilities, attempt_index,
+            lifecycle_phase, ownership_state, eligibility_state,
+            public_state, attempt_state,
+            priority, created_at_ms, lease_reclaim_count
+        ) VALUES (
+            $1, $2, NULL, $3,
+            '{}', 0,
+            $5, $4, 'not_applicable',
+            'running', 'running_attempt',
+            0, $6, $7
+        )
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(&lane_str)
+    .bind(ownership_state)
+    .bind(lifecycle_phase)
+    .bind(now_ms)
+    .bind(lease_reclaim_count)
+    .execute(pool)
+    .await
+    .expect("seed ff_exec_core");
+
+    sqlx::query(
+        r#"
+        INSERT INTO ff_attempt (
+            partition_key, execution_id, attempt_index,
+            worker_id, worker_instance_id,
+            lease_epoch, lease_expires_at_ms, started_at_ms
+        ) VALUES ($1, $2, 0, 'w-orig', 'w-orig-1', 1, NULL, $3)
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .expect("seed ff_attempt");
+
+    (part, exec_uuid, LaneId::new(lane_str))
+}
+
+/// Thin wrapper: most reclaim tests seed
+/// `(ownership_state="lease_expired_reclaimable", lifecycle_phase="active", lease_reclaim_count=0)`.
+async fn seed_lease_expired_reclaimable(
+    pool: &PgPool,
+    lane_seed: &str,
+) -> (i16, uuid::Uuid, LaneId) {
+    seed_exec(pool, lane_seed, "lease_expired_reclaimable", "active", 0).await
+}
+
+fn exec_id_from_seed(part: i16, exec_uuid: uuid::Uuid) -> ExecutionId {
+    ExecutionId::parse(&format!("{{fp:{part}}}:{exec_uuid}"))
+        .expect("ExecutionId::parse must accept the FF wire format")
+}
+
+/// Issue-grant input shaped for the cairn synthetic `cairn-control-plane`
+/// worker identity per RFC-024 §4.4. `worker_inst` is execution-bound
+/// to keep parallel tests isolated on FF's `ff_claim_grant` table.
+fn pg_issue_input(
+    eid: ExecutionId,
+    lane_id: LaneId,
+    worker_inst: WorkerInstanceId,
+) -> IssueReclaimGrantInput {
+    IssueReclaimGrantInput {
+        execution_id: eid,
+        lane_id,
+        worker_id: WorkerId::new("cairn-control-plane"),
+        worker_instance_id: worker_inst,
+        grant_ttl_ms: 60_000,
+        capability_hash: None,
+    }
+}
+
+/// Reclaim input that consumes a previously-issued grant. The `old_*`
+/// fields point at the seeded attempt row's worker identity ("w-orig-1")
+/// so FF's reclaim path finds the existing attempt to supersede.
+fn pg_reclaim_input(
+    eid: ExecutionId,
+    lane_id: LaneId,
+    worker_inst: WorkerInstanceId,
+    grant_carrier: &IssueReclaimGrantOutcome,
+) -> ReclaimExecutionInput {
+    let IssueReclaimGrantOutcome::Granted(grant) = grant_carrier else {
+        panic!("pg_reclaim_input requires a Granted outcome to thread the handle");
+    };
+    ReclaimExecutionInput {
+        grant: grant.clone(),
+        execution_id: eid,
+        lane_id,
+        worker_id: WorkerId::new("cairn-control-plane"),
+        worker_instance_id: worker_inst,
+        old_worker_instance_id: WorkerInstanceId::new("w-orig-1"),
+        attempt_id: AttemptId::new(),
+        current_attempt_index: AttemptIndex::new(0),
+        lease_id: LeaseId::new(),
+        lease_ttl_ms: 30_000,
+        attempt_policy_json: String::new(),
+        max_reclaim_count: None,
+        capability_hash: None,
+    }
+}
+
+/// Maps to FF's `IssueReclaimGrantOutcome::Granted` →
+/// `ReclaimExecutionOutcome::Claimed(ReclaimedHandle)` on the PG path.
+/// Proves the cairn impl forwards args, threads the grant handle, and
+/// unwraps `Claimed` into the cairn mirror.
+#[tokio::test]
+async fn pg_cairn_trait_grant_then_reclaim_mints_fresh_attempt() {
+    let pg = shared_pg().await;
+    let pool = per_test_seed_pool(&pg).await;
+    let cp = control_plane().await;
+    let (part, exec_uuid, lane_id) =
+        seed_lease_expired_reclaimable(&pool, "grant-then-reclaim").await;
+    let eid = exec_id_from_seed(part, exec_uuid);
+    let worker_inst = WorkerInstanceId::new(format!("cairn-cp-{exec_uuid}"));
+
+    let granted = cp
+        .issue_reclaim_grant(pg_issue_input(
+            eid.clone(),
+            lane_id.clone(),
+            worker_inst.clone(),
+        ))
+        .await
+        .expect("issue_reclaim_grant must succeed on lease_expired_reclaimable execution");
+
+    assert!(
+        matches!(granted, IssueReclaimGrantOutcome::Granted(_)),
+        "expected Granted, got {granted:?}",
+    );
+
+    let claimed = cp
+        .reclaim_execution(pg_reclaim_input(eid, lane_id, worker_inst, &granted))
+        .await
+        .expect("reclaim_execution must succeed on a granted handle");
+
+    assert!(
+        matches!(claimed, ReclaimExecutionOutcome::Claimed(_)),
+        "expected Claimed(ReclaimedHandle), got {claimed:?}",
+    );
+}
+
+/// Maps to FF's `IssueReclaimGrantOutcome::NotReclaimable` on PG.
+///
+/// A row in `ownership_state = "leased"` (not `lease_expired_reclaimable`
+/// or `lease_revoked`) is NOT eligible for reclaim. Cairn's recovery
+/// loop must treat this as "deadlock cleared, retry the original FCALL"
+/// — this test proves the variant lands cleanly with a non-empty
+/// diagnostic detail.
+#[tokio::test]
+async fn pg_cairn_trait_issue_grant_on_leased_returns_not_reclaimable() {
+    let pg = shared_pg().await;
+    let pool = per_test_seed_pool(&pg).await;
+    let cp = control_plane().await;
+
+    // Seed an execution in `leased` state (not reclaim-eligible).
+    // Mirrors FF's own `wrong_phase_not_reclaimable` test fixture.
+    let (part, exec_uuid, lane_id) = seed_exec(&pool, "leased", "leased", "runnable", 0).await;
+    let eid = exec_id_from_seed(part, exec_uuid);
+    let worker_inst = WorkerInstanceId::new(format!("cairn-cp-{exec_uuid}"));
+
+    let outcome = cp
+        .issue_reclaim_grant(pg_issue_input(eid, lane_id, worker_inst))
+        .await
+        .expect("issue_reclaim_grant must surface NotReclaimable, not error");
+
+    match outcome {
+        IssueReclaimGrantOutcome::NotReclaimable { detail } => {
+            assert!(
+                !detail.is_empty(),
+                "NotReclaimable must carry a non-empty detail for diagnostics; \
+                 got empty string",
+            );
+        }
+        other => panic!("expected NotReclaimable on leased exec, got {other:?}"),
+    }
+}
+
+/// Maps to FF's `IssueReclaimGrantOutcome::ReclaimCapExceeded`.
+///
+/// PG's `issue_reclaim_grant_impl` (cap-exceeded branch) compares the
+/// execution's `lease_reclaim_count` against `max_reclaim_count`
+/// (RFC-024 §4.6 default 1000). When the count has already reached
+/// the cap, FF transitions the execution to `terminal_failed` and
+/// returns `ReclaimCapExceeded { reclaim_count }`. Cairn's recovery
+/// loop (PR-5) surfaces this to the operator — no more reclaim
+/// attempts possible. Without this test, a regression in the
+/// translation `reclaim_count` field mapping would be invisible
+/// until the live recovery loop hits it in production.
+///
+/// Mirrors FF's own `issue_reclaim_grant_cap_exceeded` test:
+/// seed an execution at `lease_reclaim_count = 1000` (the default
+/// cap), call `issue_reclaim_grant` with the default `max`
+/// (resolves to 1000 inside FF), assert `ReclaimCapExceeded
+/// { reclaim_count: 1000 }`.
+#[tokio::test]
+async fn pg_cairn_trait_issue_grant_cap_exceeded() {
+    let pg = shared_pg().await;
+    let pool = per_test_seed_pool(&pg).await;
+    let cp = control_plane().await;
+
+    let (part, exec_uuid, lane_id) = seed_exec(
+        &pool,
+        "cap-exceeded",
+        "lease_expired_reclaimable",
+        "active",
+        1000,
+    )
+    .await;
+    let eid = exec_id_from_seed(part, exec_uuid);
+    let worker_inst = WorkerInstanceId::new(format!("cairn-cp-{exec_uuid}"));
+
+    let outcome = cp
+        .issue_reclaim_grant(pg_issue_input(eid, lane_id, worker_inst))
+        .await
+        .expect("issue_reclaim_grant must surface ReclaimCapExceeded, not error");
+
+    match outcome {
+        IssueReclaimGrantOutcome::ReclaimCapExceeded { reclaim_count } => {
+            // FF's cap-exceeded path returns the post-policy-resolved
+            // cap. With no per-execution policy override the default
+            // is 1000 (RFC-024 §4.6 + cairn's
+            // `IssueReclaimGrantInput::capability_hash = None` →
+            // FF resolves max_reclaim_count to its 1000 default).
+            assert_eq!(
+                reclaim_count, 1000,
+                "expected reclaim_count=1000 (RFC-024 §4.6 default cap); got {reclaim_count}",
+            );
+        }
+        other => panic!("expected ReclaimCapExceeded, got {other:?}"),
+    }
+}
+
+/// Cross-validation: `reclaim_execution` MUST reject a grant whose
+/// `execution_id` does not match the input's `execution_id`. Same
+/// contract as the Valkey-side test — defense-in-depth against a
+/// caller threading a stale handle from a previous run. Cairn surfaces
+/// it as `FabricError::Validation` before the FCALL fires.
+#[tokio::test]
+async fn pg_cairn_trait_reclaim_rejects_grant_execution_id_mismatch() {
+    let pg = shared_pg().await;
+    let pool = per_test_seed_pool(&pg).await;
+    let cp = control_plane().await;
+
+    let (part_a, uuid_a, lane_a) = seed_lease_expired_reclaimable(&pool, "mismatch-a").await;
+    let (part_b, uuid_b, lane_b) = seed_lease_expired_reclaimable(&pool, "mismatch-b").await;
+    let eid_a = exec_id_from_seed(part_a, uuid_a);
+    let eid_b = exec_id_from_seed(part_b, uuid_b);
+    let worker_inst_a = WorkerInstanceId::new(format!("cairn-cp-{uuid_a}"));
+    let worker_inst_b = WorkerInstanceId::new(format!("cairn-cp-{uuid_b}"));
+
+    let granted_a = cp
+        .issue_reclaim_grant(pg_issue_input(eid_a.clone(), lane_a, worker_inst_a))
+        .await
+        .expect("issue_reclaim_grant on execution A must succeed");
+
+    // Build a reclaim input that threads execution A's grant handle but
+    // points at execution B. cairn must reject pre-FCALL.
+    let mismatched = ReclaimExecutionInput {
+        grant: match &granted_a {
+            IssueReclaimGrantOutcome::Granted(handle) => handle.clone(),
+            _ => unreachable!("checked: issue_reclaim_grant returned Granted on a freshly-seeded reclaimable execution"),
+        },
+        execution_id: eid_b, // ← wrong
+        lane_id: lane_b,
+        worker_id: WorkerId::new("cairn-control-plane"),
+        worker_instance_id: worker_inst_b.clone(),
+        old_worker_instance_id: worker_inst_b,
+        attempt_id: AttemptId::new(),
+        current_attempt_index: AttemptIndex::new(0),
+        lease_id: LeaseId::new(),
+        lease_ttl_ms: 30_000,
+        attempt_policy_json: String::new(),
+        max_reclaim_count: None,
+        capability_hash: None,
+    };
+
+    let err = cp.reclaim_execution(mismatched).await.expect_err(
+        "reclaim_execution must reject a grant whose execution_id does not \
+             match input.execution_id",
+    );
+
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("does not match"),
+        "expected validation error mentioning 'does not match'; got: {msg}",
+    );
 }

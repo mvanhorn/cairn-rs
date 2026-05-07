@@ -51,8 +51,10 @@ use super::control_plane_types::{
     CancelFlowInput, CancelRunInput, ClaimGrantOutcome, CompleteRunInput, CreateFlowInput,
     CreateRunExecutionInput, DeliverApprovalSignalInput, EligibilityResult, ExecutionCreated,
     ExpiredLease, FailExecutionOutcome, FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput,
-    QuotaAdmission, RenewLeaseInput, ResumeRunInput, RotationOutcome, StageDependencyEdgeInput,
-    StageDependencyOutcome, SubmitTaskInput, WorkerRegistration, WorkerSummary,
+    IssueReclaimGrantInput, IssueReclaimGrantOutcome, QuotaAdmission, ReclaimExecutionInput,
+    ReclaimExecutionOutcome, ReclaimGrantHandle, ReclaimedHandle, RenewLeaseInput, ResumeRunInput,
+    RotationOutcome, StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
+    WorkerRegistration, WorkerSummary,
 };
 use super::snapshots::{EdgeSnapshot, ExecutionSnapshot, FlowSnapshot};
 use super::Engine;
@@ -77,9 +79,12 @@ impl PostgresControlPlane {
     /// `Arc<dyn EngineBackend>`.
     /// [`crate::postgres_boot::PostgresFabricRuntime::start`] calls
     /// [`ff_backend_postgres::PostgresBackend::connect`] and passes
-    /// the result here; tests may construct a backend directly from a
-    /// shared sqlx pool via
-    /// [`ff_backend_postgres::PostgresBackend::from_pool`].
+    /// the result here; integration tests do the same per-test
+    /// (see `tests/postgres_control_plane_live.rs::control_plane`)
+    /// because cross-runtime sharing of a single `PgPool` across
+    /// `#[tokio::test]` invocations breaks tokio's runtime model.
+    /// [`ff_backend_postgres::PostgresBackend::from_pool`] is also
+    /// available for callers that own pool lifetime themselves.
     pub fn new(backend: Arc<dyn EngineBackend + Send + Sync>) -> Self {
         Self { backend }
     }
@@ -1126,6 +1131,157 @@ impl ControlPlaneBackend for PostgresControlPlane {
             .await
             .map_err(|e| FabricError::Engine(Box::new(e)))?;
         Ok(())
+    }
+
+    // ── #710: FF 0.15 reclaim-grant path ─────────────────────────────────
+    //
+    // Mirror of the Valkey impl in `valkey_control_plane_impl.rs` — same
+    // translation shape, different backend handle. FF 0.15's PG backend
+    // (`ff-backend-postgres-0.15.0::claim_grant::{issue_reclaim_grant_impl,
+    // reclaim_execution_impl}`) ships a sqlx-transactional version of the
+    // reclaim primitives that mirrors the Valkey FCALLs' invariants.
+    //
+    // RFC-024 §3.2 — admit `lease_expired_reclaimable` / `lease_revoked`
+    // executions into a fresh attempt. Replaces the unrecoverable
+    // `execution_not_eligible` wall the pre-FF-0.15 path hit when the
+    // F62/F64 terminal-write recovery loop fired.
+    //
+    // Worker identity is caller-supplied (cairn's recovery loop in PR-5
+    // will pass the synthetic `cairn-control-plane` worker per RFC-024
+    // §4.4 control-plane carve-out). This layer is identity-agnostic.
+
+    async fn issue_reclaim_grant(
+        &self,
+        input: IssueReclaimGrantInput,
+    ) -> Result<IssueReclaimGrantOutcome, FabricError> {
+        // FF's `IssueReclaimGrantArgs::new` takes ten params — populate
+        // every one rather than relying on `Default` (the struct is
+        // `#[non_exhaustive]` and has no Default). cairn never sets
+        // route_snapshot_json or admission_summary on the recovery
+        // path; worker_capabilities stays empty.
+        //
+        // `input` is consumed by-value, so move its owned fields into
+        // the FF args constructor — cloning would allocate fresh
+        // `String` / `Option<String>` / id wrappers on a hot path the
+        // recovery loop will hit repeatedly.
+        let args = flowfabric::core::contracts::IssueReclaimGrantArgs::new(
+            input.execution_id,
+            input.worker_id,
+            input.worker_instance_id,
+            input.lane_id,
+            input.capability_hash,
+            input.grant_ttl_ms,
+            None,                              // route_snapshot_json
+            None,                              // admission_summary
+            std::collections::BTreeSet::new(), // worker_capabilities
+            flowfabric::core::types::TimestampMs::now(),
+        );
+
+        let outcome = self
+            .backend
+            .issue_reclaim_grant(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+
+        match outcome {
+            flowfabric::core::contracts::IssueReclaimGrantOutcome::Granted(grant) => {
+                Ok(IssueReclaimGrantOutcome::Granted(ReclaimGrantHandle {
+                    inner: grant,
+                }))
+            }
+            flowfabric::core::contracts::IssueReclaimGrantOutcome::NotReclaimable {
+                detail,
+                ..
+            } => Ok(IssueReclaimGrantOutcome::NotReclaimable { detail }),
+            flowfabric::core::contracts::IssueReclaimGrantOutcome::ReclaimCapExceeded {
+                reclaim_count,
+                ..
+            } => Ok(IssueReclaimGrantOutcome::ReclaimCapExceeded { reclaim_count }),
+            // FF's enum is `#[non_exhaustive]`; surface any future
+            // variant we don't know how to interpret as a typed
+            // FabricError rather than silently coercing it to
+            // `NotReclaimable`. The recovery loop must NOT advance
+            // past an unknown outcome.
+            other => Err(FabricError::Internal(format!(
+                "ff_issue_reclaim_grant returned unknown variant: {other:?}"
+            ))),
+        }
+    }
+
+    async fn reclaim_execution(
+        &self,
+        input: ReclaimExecutionInput,
+    ) -> Result<ReclaimExecutionOutcome, FabricError> {
+        // Cross-validate the supplied grant against the input's
+        // `execution_id` before invoking FF. The PG backend's
+        // `reclaim_execution_impl` matches the grant by
+        // `(execution_id, worker_id, worker_instance_id)` triple, so
+        // a caller mismatching the grant's exec_id with the
+        // execution_id arg would return GrantNotFound on the *correct*
+        // execution while the *grant from a different execution* was
+        // meant. That's a caller bug — surface it as a typed
+        // Validation error instead of letting it manifest as a wrong
+        // outcome variant. Compile-time the type-system already forces
+        // callers to obtain a `ReclaimGrantHandle` (its `inner` is
+        // `pub(crate)` — only the backend impl can construct one), but
+        // cross-checking the `execution_id` field defends against a
+        // caller threading a stale handle from a previous run. Cheap
+        // and turns the otherwise-passive grant parameter into a
+        // load-bearing safety check. Mirrors the Valkey impl.
+        if input.grant.inner.execution_id != input.execution_id {
+            return Err(FabricError::Validation {
+                reason: format!(
+                    "reclaim_execution: grant.execution_id ({}) does not match input.execution_id ({})",
+                    input.grant.inner.execution_id, input.execution_id,
+                ),
+            });
+        }
+
+        // `input` consumed by-value — move fields into the FF args.
+        let args = flowfabric::core::contracts::ReclaimExecutionArgs::new(
+            input.execution_id,
+            input.worker_id,
+            input.worker_instance_id,
+            input.lane_id,
+            input.capability_hash,
+            input.lease_id,
+            input.lease_ttl_ms,
+            input.attempt_id,
+            input.attempt_policy_json,
+            input.max_reclaim_count,
+            input.old_worker_instance_id,
+            input.current_attempt_index,
+        );
+
+        let outcome = self
+            .backend
+            .reclaim_execution(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+
+        match outcome {
+            flowfabric::core::contracts::ReclaimExecutionOutcome::Claimed(handle) => {
+                Ok(ReclaimExecutionOutcome::Claimed(ReclaimedHandle {
+                    inner: handle,
+                }))
+            }
+            flowfabric::core::contracts::ReclaimExecutionOutcome::NotReclaimable {
+                detail, ..
+            } => Ok(ReclaimExecutionOutcome::NotReclaimable { detail }),
+            flowfabric::core::contracts::ReclaimExecutionOutcome::ReclaimCapExceeded {
+                reclaim_count,
+                ..
+            } => Ok(ReclaimExecutionOutcome::ReclaimCapExceeded { reclaim_count }),
+            flowfabric::core::contracts::ReclaimExecutionOutcome::GrantNotFound { .. } => {
+                Ok(ReclaimExecutionOutcome::GrantNotFound)
+            }
+            // Same rationale as `issue_reclaim_grant`: surface unknown
+            // future FF variants as an error rather than silently
+            // coercing.
+            other => Err(FabricError::Internal(format!(
+                "ff_reclaim_execution returned unknown variant: {other:?}"
+            ))),
+        }
     }
 }
 

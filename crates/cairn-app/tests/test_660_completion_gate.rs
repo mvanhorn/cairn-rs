@@ -288,16 +288,47 @@ async fn provision_run(h: &LiveHarness, mock_url: &str) -> (String, String, Stri
 
 /// Read back the run record so tests can assert the terminal
 /// `state` + `failure_class` honestly reflects what the gate did.
-async fn fetch_run_state(h: &LiveHarness, run_id: &str) -> Value {
-    let r = h
-        .client()
-        .get(format!("{}/v1/runs/{}", h.base_url, run_id))
-        .bearer_auth(&h.admin_token)
-        .send()
-        .await
-        .expect("get run");
-    assert_eq!(r.status().as_u16(), 200, "get run: {run_id}");
-    r.json::<Value>().await.expect("run json")
+///
+/// Polls the read-model up to 2s waiting for `state == expected_state`
+/// (or for the deadline). The orchestrate handler returns its
+/// terminal response *before* the run-state projection has applied
+/// the terminal event — there's an in-process channel-drain hop
+/// between `complete_run` / `finalize_run_failure` writing
+/// `RunStateChanged` and `RunReadModel` projecting it. CI runners
+/// sometimes lose the race; local-dev usually wins it. Same
+/// read-after-write pattern as `wait_for_session_projection`
+/// in `crates/cairn-app/src/fabric_adapter.rs:104`.
+///
+/// On timeout, returns the last-read body so the caller's assertion
+/// fires with diagnostic context (rather than a generic "timeout"
+/// error obscuring the actual state mismatch).
+async fn fetch_run_state(h: &LiveHarness, run_id: &str, expected_state: &str) -> Value {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut backoff_us: u64 = 100;
+    loop {
+        let r = h
+            .client()
+            .get(format!("{}/v1/runs/{}", h.base_url, run_id))
+            .bearer_auth(&h.admin_token)
+            .send()
+            .await
+            .expect("get run");
+        assert_eq!(r.status().as_u16(), 200, "get run: {run_id}");
+        let body: Value = r.json().await.expect("run json");
+        let state = body
+            .get("run")
+            .and_then(|r| r.get("state"))
+            .and_then(Value::as_str)
+            .or_else(|| body.get("state").and_then(Value::as_str))
+            .unwrap_or("<missing>");
+        if state == expected_state || Instant::now() >= deadline {
+            return body;
+        }
+        tokio::time::sleep(Duration::from_micros(backoff_us)).await;
+        // Cap at 5ms — same shape as `wait_for_session_projection`.
+        backoff_us = (backoff_us * 2).min(5_000);
+    }
 }
 
 /// #660 (1) — strict gate ON (default). The LLM's `complete_run` MUST
@@ -369,7 +400,7 @@ async fn strict_gate_blocks_complete_run_and_fails_after_three_rejects() {
     // The run projection must reflect the terminal failure with the new
     // `VerificationRejected` class so operator dashboards and filter
     // queries don't have to re-parse the reason string.
-    let run = fetch_run_state(&h, &run_id).await;
+    let run = fetch_run_state(&h, &run_id, "failed").await;
     let state = run
         .get("run")
         .and_then(|r| r.get("state"))
@@ -472,7 +503,7 @@ async fn strict_gate_disabled_per_run_accepts_complete_run_with_errors() {
     // The run projection must match. The dogfood R4 bug surfaced as
     // `state=completed` + failing build; the inverse test deliberately
     // reproduces that shape to prove the flag actually flips behaviour.
-    let run = fetch_run_state(&h, &run_id).await;
+    let run = fetch_run_state(&h, &run_id, "completed").await;
     let state = run
         .get("run")
         .and_then(|r| r.get("state"))
