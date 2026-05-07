@@ -418,6 +418,31 @@ async fn add_github_repo(
     (StatusCode::OK, Json(response)).into_response()
 }
 
+/// Cache the canonicalised `CAIRN_LOCAL_FS_BASE` for the process
+/// lifetime. The env var is a deployment-time configuration knob;
+/// once cairn-app has booted it does not change at runtime, so a
+/// repeated `std::env::var` + `canonicalize` per request is wasted
+/// work. The cached value is the canonical `PathBuf` on success or
+/// a static error tag on misconfiguration. Empty / whitespace-only
+/// values resolve to `Err` so they surface as
+/// `feature_unavailable` instead of silently canonicalising to the
+/// process CWD.
+fn resolve_local_fs_base() -> Result<std::path::PathBuf, &'static str> {
+    static CACHED: std::sync::OnceLock<Result<std::path::PathBuf, &'static str>> =
+        std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let raw = std::env::var("CAIRN_LOCAL_FS_BASE").map_err(|_| "env_unset")?;
+            if raw.trim().is_empty() {
+                return Err("env_empty");
+            }
+            std::path::PathBuf::from(&raw)
+                .canonicalize()
+                .map_err(|_| "base_path_not_canonicalisable")
+        })
+        .clone()
+}
+
 fn add_local_fs_path(
     state: Arc<AppState>,
     ctx: &RepoAccessContext,
@@ -453,37 +478,60 @@ fn add_local_fs_path(
     if !p.is_dir() {
         return bad_request_response(format!("local_fs path is not a directory: {trimmed}"));
     }
-    // Optional base-directory fence: when `CAIRN_LOCAL_FS_BASE` is set,
-    // refuse any path that doesn't canonicalise under that prefix.
-    // This is the single lever a deploying operator has to stop other
-    // workspace operators from pointing cairn at sensitive dirs like
-    // `/etc` or `/var/log`. When unset, we fall back to the existing
-    // tenant-scope guard which at least blocks cross-tenant access.
-    if let Ok(base) = std::env::var("CAIRN_LOCAL_FS_BASE") {
-        let base = std::path::PathBuf::from(base);
-        match (p.canonicalize(), base.canonicalize()) {
-            (Ok(canon), Ok(base_canon)) if canon.starts_with(&base_canon) => {
-                // ok
-            }
-            (Ok(_), Ok(_)) => {
-                return bad_request_response(
-                    "local_fs path is outside the configured CAIRN_LOCAL_FS_BASE",
-                );
-            }
-            _ => {
-                return bad_request_response(
-                    "local_fs path could not be canonicalised for base-dir check",
-                );
-            }
+    // Mandatory base-directory fence: local_fs access is only enabled
+    // when deployments explicitly pin a safe subtree. Server-side
+    // misconfiguration (env var unset, empty, or pointing at a path
+    // that can't canonicalise) is a 503 — the operator's request is
+    // well-formed; the deployment isn't ready to serve it. Per
+    // SEC-007, the public envelope says "feature_unavailable" without
+    // naming internal config knobs; the cause is logged at WARN for
+    // operators tailing the server log.
+    let base_canon = match resolve_local_fs_base() {
+        Ok(canon) => canon,
+        Err(err) => {
+            tracing::warn!(
+                target: "cairn_app::local_fs",
+                reason = err,
+                "local_fs attach refused: server-side base-dir fence is not configured correctly",
+            );
+            return crate::errors::AppApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "feature_unavailable",
+                "local_fs repo attach is not available on this deployment",
+            )
+            .into_response();
         }
-    }
+    };
+    let canon = match p.canonicalize() {
+        Ok(canon) if canon.starts_with(&base_canon) => canon,
+        Ok(_) => {
+            // Caller path resolved but lives outside the fence — a
+            // 400 with a message naming the policy (without leaking
+            // the actual base path) is appropriate.
+            return bad_request_response("local_fs path is outside the configured policy boundary");
+        }
+        Err(_) => {
+            return bad_request_response(
+                "local_fs path could not be canonicalised for policy check",
+            );
+        }
+    };
 
-    let already = state.project_local_paths.contains(&ctx.project, trimmed);
-    state.project_local_paths.allow(&ctx.project, trimmed);
+    // Persist the canonicalised path, NOT the user-supplied `trimmed`
+    // (TOCTOU defence): if the operator hands us a symlink that
+    // currently points inside the fence, we resolved its real target
+    // for the fence check and we must store *that* same target on the
+    // allowlist. Storing `trimmed` would let an attacker repoint the
+    // symlink at `/etc` later and have downstream consumers walk the
+    // new target, since `project_local_paths::contains` is a string
+    // membership test, not a re-canonicalise.
+    let canon_str = canon.to_string_lossy().into_owned();
+    let already = state.project_local_paths.contains(&ctx.project, &canon_str);
+    state.project_local_paths.allow(&ctx.project, &canon_str);
 
     let response = RepoMutationResponse {
         project,
-        repo_id: trimmed.to_owned(),
+        repo_id: canon_str,
         allowlisted: true,
         clone_status: "local".to_owned(),
         clone_created: !already,
@@ -557,7 +605,22 @@ pub async fn delete_project_local_path_handler(
     if trimmed.is_empty() {
         return bad_request_response("path must be non-empty");
     }
-    let removed = state.project_local_paths.revoke(&ctx.project, trimmed);
+    // The POST handler persists the canonicalised path (TOCTOU
+    // defence). Try the same canonicalisation on DELETE so an
+    // operator who attached `/tmp/foo` (a symlink) and reads it back
+    // as `/private/var/.../foo` from a `GET /repos` response can
+    // still send either form to detach. If canonicalisation fails
+    // (e.g. the directory was already removed off-disk), fall back
+    // to a literal match.
+    let canonical = std::path::Path::new(trimmed)
+        .canonicalize()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let removed = state.project_local_paths.revoke(&ctx.project, trimmed)
+        || canonical
+            .as_deref()
+            .map(|c| c != trimmed && state.project_local_paths.revoke(&ctx.project, c))
+            .unwrap_or(false);
     if removed {
         StatusCode::NO_CONTENT.into_response()
     } else {

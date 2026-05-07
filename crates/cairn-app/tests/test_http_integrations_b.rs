@@ -134,12 +134,19 @@ async fn verify_github_installation_rejects_garbage_pem() {
 
 #[tokio::test]
 async fn local_fs_integration_registers_and_lists() {
-    let h = LiveHarness::setup().await;
+    // The integrations registration entry point shares the same
+    // `CAIRN_LOCAL_FS_BASE` jail as the per-project allowlist (see
+    // `LocalFsPlugin::new` and PR #721 expansion: the registration
+    // path was the sibling site codex's first patch missed).
+    let base = tempfile::tempdir().expect("base tempdir");
+    let base_dir = base.path().to_string_lossy().into_owned();
+    let h = LiveHarness::setup_with_env(&[("CAIRN_LOCAL_FS_BASE", base_dir.as_str())]).await;
 
-    // Create a real directory on disk so the plugin's path check
-    // passes. tempfile gives us one that auto-cleans.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().to_string_lossy().into_owned();
+    // Create a real directory on disk inside the fence so the
+    // plugin's path check passes. tempfile gives us one that
+    // auto-cleans.
+    let inside = tempfile::tempdir_in(base.path()).expect("inside tempdir");
+    let path = inside.path().to_string_lossy().into_owned();
 
     let res = h
         .client()
@@ -185,14 +192,79 @@ async fn local_fs_integration_registers_and_lists() {
     assert_eq!(body.get("configured").and_then(|v| v.as_bool()), Some(true));
 }
 
+/// Regression test for PR #721 expansion: the integrations entry
+/// point (`POST /v1/integrations` with `type=local_fs`) must reject
+/// path attachments outside `CAIRN_LOCAL_FS_BASE`. Codex's first cut
+/// only covered the per-project allowlist endpoint; without this
+/// test, an attacker could use the integrations API to register
+/// `/etc` and bypass the fence entirely.
+#[tokio::test]
+async fn local_fs_integration_rejects_path_outside_base() {
+    let base = tempfile::tempdir().expect("base tempdir");
+    let base_dir = base.path().to_string_lossy().into_owned();
+    let h = LiveHarness::setup_with_env(&[("CAIRN_LOCAL_FS_BASE", base_dir.as_str())]).await;
+
+    // Path outside the fence — sibling temp dir, not under `base`.
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let outside_path = outside.path().to_string_lossy().into_owned();
+
+    let res = h
+        .client()
+        .post(format!("{}/v1/integrations", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "id": "local-fs-escape",
+            "type": "local_fs",
+            "config": {
+                "path": outside_path,
+                "display_name": "should not register",
+            },
+        }))
+        .send()
+        .await
+        .expect("register reaches server");
+
+    let status = res.status().as_u16();
+    let body = res.text().await.unwrap_or_default();
+    assert!(
+        (400..500).contains(&status),
+        "expected 4xx for path outside fence, got {status}: {body}"
+    );
+    assert!(
+        body.to_lowercase().contains("local_fs"),
+        "error must mention local_fs in {body}"
+    );
+}
+
+// The "registers when CAIRN_LOCAL_FS_BASE is unset" path is covered by
+// the unit test `rejects_when_base_env_unset` in
+// `cairn-integrations::local_fs::tests`. We deliberately don't add an
+// integration variant: `LiveHarness::setup_with_env` only supports
+// adding env vars, not removing them, so we can't deterministically
+// guarantee the subprocess sees an unset `CAIRN_LOCAL_FS_BASE` (any
+// CI runner with the var pre-set would mask the regression).
+
 #[tokio::test]
 async fn local_fs_project_repo_attach_and_list() {
-    let h = LiveHarness::setup().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base_dir = tmp.path().to_string_lossy().into_owned();
+    let h = LiveHarness::setup_with_env(&[("CAIRN_LOCAL_FS_BASE", base_dir.as_str())]).await;
     let p = project_path(&h);
     let base = &h.base_url;
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().to_string_lossy().into_owned();
+    let repo = tempfile::tempdir_in(tmp.path()).expect("repo tempdir");
+    // The handler persists the canonicalised path (TOCTOU defence:
+    // a symlink resolved at attach-time stays pinned to its real
+    // target). Mirror that here so the response and list-row
+    // `repo_id` assertions below compare canonical-vs-canonical
+    // — `tempdir_in` returns a path that may already canonicalise
+    // to a different prefix (e.g. macOS `/var` → `/private/var`).
+    let path = repo
+        .path()
+        .canonicalize()
+        .expect("canonicalise repo path")
+        .to_string_lossy()
+        .into_owned();
 
     // Attach the local path as a local_fs repo.
     let res = h
@@ -329,6 +401,9 @@ async fn orchestrate_uses_local_fs_path_from_project_allowlist() {
     let tmp_log = tempfile::tempdir().expect("log tempdir");
     let log_dir_path = tmp_log.path().to_string_lossy().into_owned();
 
+    let tmp_repo_base = tempfile::tempdir().expect("repo base tempdir");
+    let local_fs_base = tmp_repo_base.path().to_string_lossy().into_owned();
+
     let h = LiveHarness::setup_with_env(&[
         // `extra_env` is applied AFTER the harness's own `env(...)`
         // calls, so this overrides the default `env_remove` on the
@@ -343,6 +418,7 @@ async fn orchestrate_uses_local_fs_path_from_project_allowlist() {
         // `cairn_app=debug` is required to make the negative
         // "ephemeral fallback did NOT fire" assertion meaningful.
         ("RUST_LOG", "warn,cairn_app=debug"),
+        ("CAIRN_LOCAL_FS_BASE", local_fs_base.as_str()),
     ])
     .await;
     let p = project_path(&h);
@@ -351,8 +427,19 @@ async fn orchestrate_uses_local_fs_path_from_project_allowlist() {
     // Real directory the operator "attached" — tempfile keeps it
     // alive for the whole test, so the resolver's existence check
     // passes.
-    let tmp_repo = tempfile::tempdir().expect("repo tempdir");
-    let repo_path = tmp_repo.path().to_string_lossy().into_owned();
+    let tmp_repo = tempfile::tempdir_in(tmp_repo_base.path()).expect("repo tempdir");
+    // Use the canonicalised path so the resolver's log line (which
+    // emits the canonical form persisted by the attach handler) and
+    // this test's `contains(&repo_path)` assertion agree on every
+    // platform. Without this, `tempdir_in` on macOS or any path
+    // accessed through a `/tmp` symlink would fail the assertion
+    // even when the resolver did the right thing.
+    let repo_path = tmp_repo
+        .path()
+        .canonicalize()
+        .expect("canonicalise repo path")
+        .to_string_lossy()
+        .into_owned();
 
     // 1. Attach local_fs path via the same endpoint the dogfood
     //    operator used.
