@@ -508,7 +508,6 @@ impl SqliteSyncProjection {
                         last_heartbeat_ms, is_alive, active_task_count, current_task_id
                      ) VALUES (?, ?, ?, 'active', ?, ?, 0, 0, 0, NULL)
                      ON CONFLICT (worker_id) DO UPDATE SET
-                        tenant_id         = excluded.tenant_id,
                         display_name      = excluded.display_name,
                         status            = excluded.status,
                         registered_at     = excluded.registered_at,
@@ -516,7 +515,8 @@ impl SqliteSyncProjection {
                         last_heartbeat_ms = 0,
                         is_alive          = 0,
                         active_task_count = 0,
-                        current_task_id   = NULL",
+                        current_task_id   = NULL
+                     WHERE external_workers.tenant_id = excluded.tenant_id",
                 )
                 .bind(e.worker_id.as_str())
                 .bind(e.tenant_id.as_str())

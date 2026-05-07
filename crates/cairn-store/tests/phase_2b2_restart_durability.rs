@@ -238,3 +238,60 @@ async fn external_worker_tenant_isolation_survives_restart() {
     assert!(b_workers.iter().all(|w| w.tenant_id.as_str() == "t_iso_b"));
     assert_eq!(b_workers[0].worker_id.as_str(), "w_iso_b_1");
 }
+
+/// Cross-tenant registration collision must not reassign an existing
+/// worker row to the attacker tenant.
+#[tokio::test]
+async fn external_worker_collision_cannot_move_tenant() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_path_buf();
+
+    let victim = TenantId::new("t_victim");
+    let attacker = TenantId::new("t_attacker");
+    let worker_id = WorkerId::new("shared_worker");
+
+    let (adapter, log) = open_store(&path).await;
+    log.append(&[
+        evt(
+            "evt_victim_reg",
+            RuntimeEvent::ExternalWorkerRegistered(ExternalWorkerRegistered {
+                sentinel_project: sentinel("t_victim"),
+                worker_id: worker_id.clone(),
+                tenant_id: victim.clone(),
+                display_name: "Victim Worker".to_owned(),
+                registered_at: 1_700_000_200_000,
+            }),
+        ),
+        evt(
+            "evt_attacker_reg",
+            RuntimeEvent::ExternalWorkerRegistered(ExternalWorkerRegistered {
+                sentinel_project: sentinel("t_attacker"),
+                worker_id: worker_id.clone(),
+                tenant_id: attacker.clone(),
+                display_name: "Attacker Worker".to_owned(),
+                registered_at: 1_700_000_201_000,
+            }),
+        ),
+    ])
+    .await
+    .expect("append collision events");
+
+    let record = ExternalWorkerReadModel::get(adapter.as_ref(), &worker_id)
+        .await
+        .unwrap()
+        .expect("worker row must exist");
+    assert_eq!(record.tenant_id, victim, "owner tenant must not change");
+    assert_eq!(
+        record.display_name, "Victim Worker",
+        "cross-tenant collision must not update owner row"
+    );
+
+    let victim_rows = ExternalWorkerReadModel::list_by_tenant(adapter.as_ref(), &victim, 10, 0)
+        .await
+        .unwrap();
+    let attacker_rows = ExternalWorkerReadModel::list_by_tenant(adapter.as_ref(), &attacker, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(victim_rows.len(), 1);
+    assert!(attacker_rows.is_empty());
+}

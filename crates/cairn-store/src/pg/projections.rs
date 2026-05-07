@@ -519,7 +519,6 @@ impl PgSyncProjection {
                         last_heartbeat_ms, is_alive, active_task_count, current_task_id
                      ) VALUES ($1, $2, $3, 'active', $4, $5, 0, FALSE, 0, NULL)
                      ON CONFLICT (worker_id) DO UPDATE SET
-                        tenant_id         = EXCLUDED.tenant_id,
                         display_name      = EXCLUDED.display_name,
                         status            = EXCLUDED.status,
                         registered_at     = EXCLUDED.registered_at,
@@ -527,7 +526,8 @@ impl PgSyncProjection {
                         last_heartbeat_ms = 0,
                         is_alive          = FALSE,
                         active_task_count = 0,
-                        current_task_id   = NULL",
+                        current_task_id   = NULL
+                     WHERE external_workers.tenant_id = EXCLUDED.tenant_id",
                 )
                 .bind(e.worker_id.as_str())
                 .bind(e.tenant_id.as_str())

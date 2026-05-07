@@ -996,19 +996,41 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::ExternalWorkerRegistered(e) => {
-                state.external_workers.insert(
-                    e.worker_id.as_str().to_owned(),
-                    cairn_domain::workers::ExternalWorkerRecord {
-                        worker_id: e.worker_id.clone(),
-                        tenant_id: e.tenant_id.clone(),
-                        display_name: e.display_name.clone(),
-                        status: "active".to_owned(),
-                        registered_at: e.registered_at,
-                        updated_at: now,
-                        health: cairn_domain::workers::WorkerHealth::default(),
-                        current_task_id: None,
-                    },
-                );
+                // PR #729 — cross-tenant takeover defence. Mirrors the
+                // pg/sqlite `ON CONFLICT (worker_id) DO UPDATE …
+                // WHERE external_workers.tenant_id = EXCLUDED.tenant_id`
+                // semantic: a colliding `worker_id` submitted from a
+                // *different* tenant is a no-op (NOT a tenant rewrite).
+                // A SAME-tenant re-register is treated as a fresh
+                // registration — full reset of status / health /
+                // current_task_id back to zero values, matching the
+                // pg/sqlite contract pinned by
+                // `external_worker_re_registration_resets_health_across_backends`
+                // in projection_parity.rs. Critical because RFC-025
+                // Phase 4 keeps InMemoryStore as the production read
+                // path — missing this gate here lets the takeover
+                // succeed even with the durable backends fixed.
+                let key = e.worker_id.as_str().to_owned();
+                let cross_tenant_collision = state
+                    .external_workers
+                    .get(&key)
+                    .map(|rec| rec.tenant_id != e.tenant_id)
+                    .unwrap_or(false);
+                if !cross_tenant_collision {
+                    state.external_workers.insert(
+                        key,
+                        cairn_domain::workers::ExternalWorkerRecord {
+                            worker_id: e.worker_id.clone(),
+                            tenant_id: e.tenant_id.clone(),
+                            display_name: e.display_name.clone(),
+                            status: "active".to_owned(),
+                            registered_at: e.registered_at,
+                            updated_at: now,
+                            health: cairn_domain::workers::WorkerHealth::default(),
+                            current_task_id: None,
+                        },
+                    );
+                }
             }
             RuntimeEvent::ExternalWorkerSuspended(e) => {
                 if let Some(rec) = state.external_workers.get_mut(e.worker_id.as_str()) {
