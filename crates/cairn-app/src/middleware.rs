@@ -25,6 +25,7 @@ use cairn_runtime::WorkspaceService;
 use cairn_store::projections::{
     OperatorTenantRoleReadModel, PromptReleaseReadModel, WorkspaceMembershipReadModel,
 };
+use percent_encoding::percent_decode_str;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -873,7 +874,7 @@ fn extract_target_tenant_id(path: &str) -> Option<TenantId> {
         && segments[2] == "tenants"
         && !segments[3].is_empty()
     {
-        return Some(TenantId::new(segments[3]));
+        return decode_tenant_segment(segments[3]);
     }
     // `/v1/admin/operators/:operator_id/tenant-roles/:tenant_id[/...]`
     if segments.len() >= 6
@@ -883,9 +884,44 @@ fn extract_target_tenant_id(path: &str) -> Option<TenantId> {
         && segments[4] == "tenant-roles"
         && !segments[5].is_empty()
     {
-        return Some(TenantId::new(segments[5]));
+        return decode_tenant_segment(segments[5]);
     }
     None
+}
+
+fn decode_tenant_segment(segment: &str) -> Option<TenantId> {
+    let decoded = percent_decode_str(segment).decode_utf8().ok()?;
+    // Defense-in-depth: reject not just `/` (the documented bypass)
+    // but the full set of path / string-injection vectors a TenantId
+    // should never legitimately contain. Each branch corresponds to
+    // a separate attack class:
+    //
+    //   * `/` — encoded path separator; the documented bypass
+    //     vector (`/v1/admin/tenants/victim%2Fother`).
+    //   * `\` — Windows / proxy path separator; some intermediate
+    //     proxies and downstream components treat `\` as a separator.
+    //   * `\0` — string truncation in C-based libraries / drivers
+    //     (sqlx binds tolerate it but logging / metrics labels may
+    //     truncate at the null byte).
+    //   * `.` and `..` — directory components if the tenant id is
+    //     ever used as a path element (snapshot/restore paths,
+    //     filesystem-backed audit logs).
+    //
+    // None of these are exploitable on the current code paths —
+    // the existing routes consume `TenantId` as opaque strings —
+    // but the cost of these checks is one branch each, and they
+    // prevent foot-guns when future routes add filesystem or
+    // OS-call interactions. Per Gemini PR #724 review.
+    if decoded.is_empty()
+        || decoded.contains('/')
+        || decoded.contains('\\')
+        || decoded.contains('\0')
+        || decoded == "."
+        || decoded == ".."
+    {
+        return None;
+    }
+    Some(TenantId::new(decoded.into_owned()))
 }
 
 pub(crate) async fn ensure_workspace_role_for_project(
@@ -1188,6 +1224,40 @@ mod tests {
     fn bearer_none_for_empty_query_token() {
         let req = make_request("/v1/stream?token=", None);
         assert_eq!(bearer_token(&req), None);
+    }
+
+    #[test]
+    fn tenant_target_is_percent_decoded() {
+        let path = "/v1/admin/tenants/%76ictim/snapshot";
+        let tenant = extract_target_tenant_id(path).expect("tenant should decode");
+        assert_eq!(tenant.as_str(), "victim");
+    }
+
+    #[test]
+    fn tenant_target_rejects_encoded_slash() {
+        let path = "/v1/admin/tenants/victim%2Fother/snapshot";
+        assert_eq!(extract_target_tenant_id(path), None);
+    }
+
+    /// Defense-in-depth checks added per Gemini PR #724 review.
+    /// One row per attack class; each entry must be rejected even
+    /// though the current routes don't expose an exploitation path.
+    #[test]
+    fn tenant_target_rejects_dangerous_sequences() {
+        for path in &[
+            // Encoded backslash (Windows / proxy separator)
+            "/v1/admin/tenants/victim%5Cother/snapshot",
+            // Encoded null byte (C-string truncation)
+            "/v1/admin/tenants/victim%00other/snapshot",
+            // Encoded directory components (path traversal)
+            "/v1/admin/tenants/%2e/snapshot",
+            "/v1/admin/tenants/%2e%2e/snapshot",
+            // Same checks on the operators / tenant-roles route shape
+            "/v1/admin/operators/op-1/tenant-roles/victim%5Cother",
+            "/v1/admin/operators/op-1/tenant-roles/%2e%2e",
+        ] {
+            assert_eq!(extract_target_tenant_id(path), None, "should reject {path}");
+        }
     }
 
     // #491: `?token=` query-string fallback must be GET-only.
