@@ -114,6 +114,26 @@ async fn send_post_json(
         .unwrap()
 }
 
+async fn send_put_json(
+    app: &axum::Router,
+    uri: &str,
+    token: &str,
+    body: serde_json::Value,
+) -> Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 async fn response_json(response: Response) -> serde_json::Value {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&body).unwrap()
@@ -235,6 +255,239 @@ async fn store_credential_error_response_does_not_include_plaintext() {
         !body_str.contains(secret),
         "response body must not include the plaintext secret; got: {body_str}"
     );
+}
+
+#[tokio::test]
+async fn create_provider_connection_rejects_foreign_tenant_credential() {
+    let (app, state) = support::build_test_router_fake_fabric(team_config_with_env_key()).await;
+    register_admin_and_operators(&state).await;
+
+    let create_cred = send_post_json(
+        &app,
+        "/v1/admin/tenants/tenant_a/credentials",
+        ADMIN_TOKEN,
+        serde_json::json!({
+            "provider_id": "openai",
+            "plaintext_value": "sk-tenant-a-secret",
+            "key_id": "key-a",
+        }),
+    )
+    .await;
+    assert_eq!(create_cred.status(), StatusCode::CREATED);
+    let credential_id = response_json(create_cred).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let create_conn = send_post_json(
+        &app,
+        "/v1/providers/connections",
+        OPERATOR_B_TOKEN,
+        serde_json::json!({
+            "tenant_id": "tenant_b",
+            "provider_connection_id": "conn-tenant-b",
+            "provider_family": "openai_compat",
+            "adapter_type": "openai_compat",
+            "credential_id": credential_id,
+            "endpoint_url": "http://localhost:11434"
+        }),
+    )
+    .await;
+    assert_eq!(create_conn.status(), StatusCode::FORBIDDEN);
+    let body = response_json(create_conn).await;
+    assert_eq!(body["code"], "credential_tenant_mismatch");
+}
+
+/// QA-of-#722: the same-tenant honest case (operator B in tenant_b
+/// linking a tenant_b credential to a tenant_b connection) MUST
+/// still succeed. Without this positive assertion, a future
+/// over-strict tightening could lock everyone out and the test
+/// suite wouldn't catch it.
+#[tokio::test]
+async fn create_provider_connection_accepts_same_tenant_credential() {
+    let (app, state) = support::build_test_router_fake_fabric(team_config_with_env_key()).await;
+    register_admin_and_operators(&state).await;
+
+    let create_cred = send_post_json(
+        &app,
+        "/v1/admin/tenants/tenant_b/credentials",
+        ADMIN_TOKEN,
+        serde_json::json!({
+            "provider_id": "openai",
+            "plaintext_value": "sk-tenant-b-secret",
+            "key_id": "key-b",
+        }),
+    )
+    .await;
+    assert_eq!(create_cred.status(), StatusCode::CREATED);
+    let credential_id = response_json(create_cred).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let create_conn = send_post_json(
+        &app,
+        "/v1/providers/connections",
+        OPERATOR_B_TOKEN,
+        serde_json::json!({
+            "tenant_id": "tenant_b",
+            "provider_connection_id": "conn-tenant-b-same",
+            "provider_family": "openai_compat",
+            "adapter_type": "openai_compat",
+            "credential_id": credential_id,
+            "endpoint_url": "http://localhost:11434"
+        }),
+    )
+    .await;
+    assert_eq!(
+        create_conn.status(),
+        StatusCode::CREATED,
+        "honest same-tenant link must still succeed"
+    );
+}
+
+/// QA-of-#722: the residual exploit codex's first cut left open.
+/// Operator B authenticates as tenant_b but passes
+/// `body.tenant_id = "tenant_a"` and a tenant_a credential id.
+/// `validate_credential_belongs_to_tenant` is happy
+/// (tenant-id-as-claimed matches tenant-id-on-credential), so
+/// without an auth-derived scope check the link is accepted and
+/// the /test probe later exfiltrates tenant_a's plaintext. The new
+/// `tenant_scope_mismatch` 403 closes the hole.
+#[tokio::test]
+async fn create_provider_connection_rejects_body_tenant_spoof() {
+    let (app, state) = support::build_test_router_fake_fabric(team_config_with_env_key()).await;
+    register_admin_and_operators(&state).await;
+
+    let create_cred = send_post_json(
+        &app,
+        "/v1/admin/tenants/tenant_a/credentials",
+        ADMIN_TOKEN,
+        serde_json::json!({
+            "provider_id": "openai",
+            "plaintext_value": "sk-tenant-a-secret",
+            "key_id": "key-a",
+        }),
+    )
+    .await;
+    assert_eq!(create_cred.status(), StatusCode::CREATED);
+    let credential_id = response_json(create_cred).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Operator B (tenant_b) lies about the tenant in the body and
+    // tries to link tenant_a's credential.
+    let create_conn = send_post_json(
+        &app,
+        "/v1/providers/connections",
+        OPERATOR_B_TOKEN,
+        serde_json::json!({
+            "tenant_id": "tenant_a",
+            "provider_connection_id": "conn-spoofed",
+            "provider_family": "openai_compat",
+            "adapter_type": "openai_compat",
+            "credential_id": credential_id,
+            "endpoint_url": "http://attacker.example/probe"
+        }),
+    )
+    .await;
+    assert_eq!(create_conn.status(), StatusCode::FORBIDDEN);
+    let body = response_json(create_conn).await;
+    assert_eq!(body["code"], "tenant_scope_mismatch");
+}
+
+/// QA-of-#722: codex's PR also added validation to the update path
+/// but the regression test only covered create. Lock down the
+/// update path with the same scenario shape.
+#[tokio::test]
+async fn update_provider_connection_rejects_foreign_tenant_credential() {
+    let (app, state) = support::build_test_router_fake_fabric(team_config_with_env_key()).await;
+    register_admin_and_operators(&state).await;
+
+    // Create a clean tenant_b connection with a tenant_b credential.
+    let cred_b = send_post_json(
+        &app,
+        "/v1/admin/tenants/tenant_b/credentials",
+        ADMIN_TOKEN,
+        serde_json::json!({
+            "provider_id": "openai",
+            "plaintext_value": "sk-tenant-b",
+            "key_id": "key-b",
+        }),
+    )
+    .await;
+    assert_eq!(cred_b.status(), StatusCode::CREATED);
+    let credential_b = response_json(cred_b).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let create_conn = send_post_json(
+        &app,
+        "/v1/providers/connections",
+        OPERATOR_B_TOKEN,
+        serde_json::json!({
+            "tenant_id": "tenant_b",
+            "provider_connection_id": "conn-update-target",
+            "provider_family": "openai_compat",
+            "adapter_type": "openai_compat",
+            "credential_id": credential_b,
+            "endpoint_url": "http://localhost:11434"
+        }),
+    )
+    .await;
+    let create_status = create_conn.status();
+    let create_body = response_json(create_conn).await;
+    assert_eq!(
+        create_status,
+        StatusCode::CREATED,
+        "create failed with body {create_body}"
+    );
+
+    // tenant_a credential the attacker is trying to relink onto
+    // tenant_b's connection.
+    let cred_a = send_post_json(
+        &app,
+        "/v1/admin/tenants/tenant_a/credentials",
+        ADMIN_TOKEN,
+        serde_json::json!({
+            "provider_id": "openai",
+            "plaintext_value": "sk-tenant-a",
+            "key_id": "key-a",
+        }),
+    )
+    .await;
+    assert_eq!(cred_a.status(), StatusCode::CREATED);
+    let credential_a = response_json(cred_a).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // PUT with tenant_a's credential id should be rejected because
+    // the connection itself is owned by tenant_b. The request body
+    // for PUT requires the full config; only `credential_id` is
+    // changing for the attack scenario.
+    let update = send_put_json(
+        &app,
+        "/v1/providers/connections/conn-update-target",
+        OPERATOR_B_TOKEN,
+        serde_json::json!({
+            "provider_family": "openai_compat",
+            "adapter_type": "openai_compat",
+            "supported_models": [],
+            "credential_id": credential_a,
+        }),
+    )
+    .await;
+    let update_status = update.status();
+    let update_body = response_json(update).await;
+    assert_eq!(
+        update_status,
+        StatusCode::FORBIDDEN,
+        "expected 403, got {update_status} with body {update_body}"
+    );
+    assert_eq!(update_body["code"], "credential_tenant_mismatch");
 }
 
 /// Also assert the plaintext does not end up in the request-log ring

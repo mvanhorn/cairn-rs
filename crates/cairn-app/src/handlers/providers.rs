@@ -647,6 +647,7 @@ pub(crate) fn static_provider_registry_catalog() -> Vec<serde_json::Value> {
 )]
 pub(crate) async fn create_provider_connection_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: crate::extractors::TenantScope,
     Json(body): Json<CreateProviderConnectionRequest>,
 ) -> impl IntoResponse {
     use cairn_domain::MULTI_PROVIDER;
@@ -654,6 +655,27 @@ pub(crate) async fn create_provider_connection_handler(
 
     if let Some(denied) = require_feature(&state.config, MULTI_PROVIDER) {
         return denied;
+    }
+
+    // Tenant boundary: a non-admin caller MUST register the connection
+    // under their own tenant — `body.tenant_id` is operator-supplied
+    // and cannot be trusted on its own. Without this check, operator B
+    // could pass `body.tenant_id="tenant_a"` + a tenant-A credential
+    // and the credential-ownership validator below would happily
+    // accept the link (matching tenant-id-as-claimed against
+    // tenant-id-on-credential), giving operator B a backdoor to
+    // exfiltrate tenant A's API key via the /test probe.
+    //
+    // Admin tokens bypass: cross-tenant provider provisioning is a
+    // legitimate admin workflow, so the operator-claim check only
+    // applies to non-admin scopes.
+    if !tenant_scope.is_admin && body.tenant_id != tenant_scope.tenant_id().as_str() {
+        return AppApiError::new(
+            StatusCode::FORBIDDEN,
+            "tenant_scope_mismatch",
+            "tenant_id in request body must match the caller's tenant scope",
+        )
+        .into_response();
     }
 
     // #634: refuse credential-less registration for adapters that require
@@ -699,12 +721,20 @@ pub(crate) async fn create_provider_connection_handler(
     let conn_id = body.provider_connection_id.clone();
     let credential_id = body.credential_id.clone();
     let endpoint_url = body.endpoint_url.clone();
+    let tenant_id = TenantId::new(body.tenant_id.clone());
+
+    if let Some(err) =
+        validate_credential_belongs_to_tenant(state.as_ref(), &tenant_id, credential_id.as_deref())
+            .await
+    {
+        return err;
+    }
 
     match state
         .runtime
         .provider_connections
         .create(
-            TenantId::new(body.tenant_id),
+            tenant_id,
             ProviderConnectionId::new(body.provider_connection_id),
             ProviderConnectionConfig {
                 provider_family: body.provider_family,
@@ -822,6 +852,34 @@ pub(crate) async fn update_provider_connection_handler(
         adapter_type: body.adapter_type,
         supported_models: body.supported_models,
     };
+    if let Some(cred_id) = body.credential_id.as_deref() {
+        // Pre-fetch the existing record so the credential validator
+        // can compare ownership against the connection's *real*
+        // tenant (not body-supplied data — body has no tenant field
+        // on update). This is a small redundancy with the read
+        // inside `provider_connections.update` below, but in the hot
+        // path both reads hit the in-memory projection rather than a
+        // store roundtrip; the cost is dominated by the credential
+        // ownership check itself. Map both error branches through
+        // `runtime_error_response` so a missing connection produces
+        // the same 404 envelope shape as a missing connection on the
+        // update call below (Gemini consistency feedback).
+        let tenant_id = match state.runtime.provider_connections.get(&conn_id).await {
+            Ok(Some(record)) => record.tenant_id,
+            Ok(None) => {
+                return runtime_error_response(cairn_runtime::RuntimeError::NotFound {
+                    entity: "provider_connection",
+                    id: conn_id.to_string(),
+                });
+            }
+            Err(err) => return runtime_error_response(err),
+        };
+        if let Some(err) =
+            validate_credential_belongs_to_tenant(state.as_ref(), &tenant_id, Some(cred_id)).await
+        {
+            return err;
+        }
+    }
 
     match state
         .runtime
@@ -862,6 +920,46 @@ pub(crate) async fn update_provider_connection_handler(
         Err(err) => AppApiError::new(StatusCode::BAD_REQUEST, "bad_request", err.to_string())
             .into_response(),
     }
+}
+
+async fn validate_credential_belongs_to_tenant(
+    state: &AppState,
+    tenant_id: &TenantId,
+    credential_id: Option<&str>,
+) -> Option<axum::response::Response> {
+    let credential_id = credential_id?;
+    let credential = match state
+        .runtime
+        .credentials
+        .get(&cairn_domain::CredentialId::new(credential_id))
+        .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return Some(
+                AppApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "credential_not_found",
+                    "credential not found",
+                )
+                .into_response(),
+            );
+        }
+        Err(err) => return Some(runtime_error_response(err)),
+    };
+
+    if credential.tenant_id != *tenant_id {
+        return Some(
+            AppApiError::new(
+                StatusCode::FORBIDDEN,
+                "credential_tenant_mismatch",
+                "credential must belong to the same tenant as the provider connection",
+            )
+            .into_response(),
+        );
+    }
+
+    None
 }
 
 pub(crate) async fn delete_provider_connection_handler(
