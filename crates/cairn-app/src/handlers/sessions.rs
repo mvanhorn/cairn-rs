@@ -682,15 +682,10 @@ pub(crate) async fn create_session_handler(
     // Reject duplicates with 409 instead of silently returning 201
     // (closes #229). Mirrors `CredentialServiceImpl::store`.
     //
-    // Scoped get (#439, Gemini review on #554): use the project-scoped
-    // service method rather than `lookup_any_admin`. A session that
-    // exists in a different tenant MUST NOT surface as a 409 here — a
-    // cross-tenant 409 would leak the existence of foreign session
-    // ids to unauthenticated probers (SEC-007 pattern). The scoped
-    // `get` returns `None` for foreign ids so the create path
-    // proceeds, FabricSessionService then fails atomically if the
-    // fabric-side id really collides.
-    match state.runtime.sessions.get(&project, &session_id).await {
+    // Security guard: until session projections/read-models are fully
+    // project-scoped, session_id must remain globally unique to avoid
+    // cross-tenant overwrite/read confusion in shared projections.
+    match state.runtime.sessions.lookup_any_admin(&session_id).await {
         Ok(Some(_)) => {
             return AppApiError::new(
                 StatusCode::CONFLICT,

@@ -69,6 +69,21 @@ pub trait SessionService: Send + Sync {
     /// `AdminRoleGuard` or `TenantScope::is_admin` gate in
     /// cairn-app). Non-admin handlers MUST use `get(&project, …)`
     /// and accept a `None` for ids outside their scope.
+    ///
+    /// **One legitimate non-admin call site (#730 carve-out):**
+    /// `create_session_handler` uses this method for cross-tenant
+    /// collision detection on POST `/v1/sessions`. Until the
+    /// session-projection schema is migrated to `(tenant_id,
+    /// session_id)` composite keys, the existing
+    /// `sessions.session_id TEXT PRIMARY KEY` enforces global
+    /// uniqueness in the read-model — a same-id POST from a
+    /// different tenant would overwrite the row in InMemory or
+    /// fail unpredictably on PG/SQLite. The handler returns a
+    /// generic `409 conflict` without naming the other tenant, so
+    /// the existence-leak surface is bounded to "this id is taken
+    /// somewhere" rather than "this id is taken in tenant X". The
+    /// alternative (silent cross-tenant projection-row overwrite)
+    /// is strictly worse than that bounded existence leak.
     async fn lookup_any_admin(
         &self,
         session_id: &SessionId,

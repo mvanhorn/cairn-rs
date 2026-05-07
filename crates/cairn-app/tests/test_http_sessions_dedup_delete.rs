@@ -55,6 +55,42 @@ async fn duplicate_session_id_returns_409() {
 }
 
 #[tokio::test]
+async fn duplicate_session_id_across_tenants_returns_409() {
+    let h = LiveHarness::setup().await;
+    let session_id = format!("sess-{}", uuid::Uuid::new_v4().simple());
+
+    let r = h
+        .client()
+        .post(format!("{}/v1/sessions", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&create_payload(&h, &session_id))
+        .send()
+        .await
+        .expect("first create");
+    assert_eq!(r.status().as_u16(), 201, "first create should 201");
+
+    let r = h
+        .client()
+        .post(format!("{}/v1/sessions", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": "tenant-other",
+            "workspace_id": "workspace-other",
+            "project_id": "project-other",
+            "session_id": session_id,
+        }))
+        .send()
+        .await
+        .expect("cross-tenant duplicate create");
+    assert_eq!(
+        r.status().as_u16(),
+        409,
+        "cross-tenant duplicate must 409: body={}",
+        r.text().await.unwrap_or_default(),
+    );
+}
+
+#[tokio::test]
 async fn empty_session_id_returns_422() {
     let h = LiveHarness::setup().await;
     let r = h
