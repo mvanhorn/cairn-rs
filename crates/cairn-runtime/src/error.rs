@@ -196,18 +196,34 @@ impl RuntimeError {
     }
 }
 
-/// Upstream FF tracker for the `terminal_write_deadlock` wedged state.
+/// Cairn-side tracker for the `terminal_write_deadlock` wedged state.
+///
+/// Previously pointed at FlowFabric issue #371. FF#371 was closed as
+/// COMPLETED on 2026-04-28 by FF PR #407, which shipped the
+/// `issue_reclaim_grant` + `claim_from_reclaim_grant` admin/worker
+/// surface in FF 0.15.0 (released 2026-05-03). Cairn depends on FF
+/// 0.15.0 today but has NOT migrated its F62/F64 recovery loop to
+/// call the new APIs — the loop still walks the pre-FF-0.15
+/// `issue_grant_and_claim` path that FF#371 documented as broken.
+/// R12 dogfood (2026-05-07) reproduced the deadlock on a long
+/// researcher-subagent run.
+///
+/// The actionable work is the cairn-side consumer migration, tracked
+/// at issue #710. Operators reading this error message should land
+/// on the migration plan, not on a closed upstream issue that would
+/// suggest "wait for FF to fix it" when the fix is already shipped.
 ///
 /// The URL lives as a `macro_rules!` literal (rather than a `const`)
-/// because the hint message body is built with `concat!`, and `concat!`
-/// only accepts literal-string inputs — not `const` references. When
-/// the FF tracker resolves or renumbers the issue, update the literal
-/// on the single line below and every grep hit (the hint body + any
-/// tests that assert the URL) picks up the new value automatically via
-/// the macro expansion. See issue #489.
+/// because the hint message body is built with `concat!`, and
+/// `concat!` only accepts literal-string inputs — not `const`
+/// references. When the cairn-rs tracker resolves or renumbers the
+/// issue, update the literal on the single line below and every
+/// grep hit (the hint body + any tests that assert the URL) picks
+/// up the new value automatically via the macro expansion. See
+/// issue #489.
 macro_rules! upstream_ff_terminal_write_deadlock_url {
     () => {
-        "https://github.com/avifenesh/FlowFabric/issues/371"
+        "https://github.com/avifenesh/cairn-rs/issues/710"
     };
 }
 

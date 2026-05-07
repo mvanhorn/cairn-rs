@@ -289,8 +289,13 @@ async fn happy_path_still_completes_when_lease_does_not_fully_expire() {
         Some("completed"),
         "F59 happy path must still complete; body={body_str}"
     );
+    // #710: banner URL retargeted from the (now-closed) FF#371 to
+    // cairn's own consumer-migration tracker, since the remaining
+    // actionable work is the cairn-side F64 recovery loop adoption
+    // of FF 0.15's `issue_reclaim_grant`. The happy path must not
+    // leak the banner regardless of which URL it cites.
     assert!(
-        !body_str.contains("FlowFabric/issues/371"),
+        !body_str.contains("cairn-rs/issues/710") && !body_str.contains("FlowFabric/issues/371"),
         "F62 deadlock banner must NOT leak into the happy path; body={body_str}"
     );
     assert!(
@@ -381,16 +386,24 @@ async fn deadlock_response_points_operator_at_artifacts_and_upstream_issue() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // #710: deadlock sentinel URL retargeted from (closed) FF#371
+    // to cairn's own consumer-migration issue. Accept either URL
+    // here so the test tolerates environments that haven't picked
+    // up the #710 rename yet, while the positive assertion below
+    // is tightened to the new URL.
     let deadlock_hit = failure_class == "terminal_write_deadlock"
         || body_str.contains("terminal_write_deadlock")
+        || body_str.contains("cairn-rs/issues/710")
         || body_str.contains("FlowFabric/issues/371");
 
     if deadlock_hit {
         // F62 deadlock path: both invariants apply.
         assert!(
-            body_str.contains("FlowFabric/issues/371"),
-            "F62: deadlock response must link the upstream FF issue for \
-             operator correlation; body={body_str}"
+            body_str.contains("cairn-rs/issues/710"),
+            "F62: deadlock response must link the cairn-side tracking \
+             issue #710 for operator correlation (previously pointed \
+             at FF#371, which is now closed as of 2026-04-28); \
+             body={body_str}"
         );
         assert!(
             body_str.contains("artifact") || body_str.contains("filesystem"),
@@ -422,8 +435,11 @@ async fn deadlock_response_points_operator_at_artifacts_and_upstream_issue() {
              failure_class={failure_class}, body={body_str}"
         );
         // And the response must not leak the pre-F62 raw `lease_expired`
-        // prose without the operator-actionable wrapping.
+        // prose without the operator-actionable wrapping. #710: also
+        // accept the prior FF#371 URL on the wrapping side so this
+        // leak-check remains valid across the URL migration.
         let leaks_raw_lease_expired = body_str.contains("lease expired before cairn could write")
+            && !body_str.contains("cairn-rs/issues/710")
             && !body_str.contains("FlowFabric/issues/371");
         assert!(
             !leaks_raw_lease_expired,

@@ -943,16 +943,31 @@ where
     }
 
     // Backoff schedule exhausted — F62 TerminalWriteDeadlock fallback.
+    // #710: URL retargeted from the (now-closed) FF#371 to cairn's
+    // own consumer-migration tracker. FF#371 closed 2026-04-28 (PR
+    // 407 in FF 0.15.0 shipped `issue_reclaim_grant` / `claim_from_reclaim_grant`);
+    // the remaining actionable work is the cairn-side consumer
+    // migration from the pre-0.15 `issue_grant_and_claim` recovery
+    // path to the new reclaim-grant APIs. See #710 for the
+    // migration plan.
+    //
+    // The tracing field name stays `upstream_issue` to preserve
+    // log-aggregation filters + alerts that depend on the key. Only
+    // the URL value flips. "Upstream" is used loosely here — this
+    // run is blocked by a pre-FF-0.15 consumer path we control, not
+    // by FF itself — but the field identity is the public contract.
     let wall_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::warn!(
         run_id = %run_id,
         fcall,
         attempts,
         wall_time_ms = wall_ms,
-        upstream_issue = "https://github.com/avifenesh/FlowFabric/issues/371",
+        upstream_issue = "https://github.com/avifenesh/cairn-rs/issues/710",
         last_error = %last_err,
         "F62/F64: recovery loop exhausted — dual-door deadlock. Flipping \
-         run to Failed(TerminalWriteDeadlock) with upstream link"
+         run to Failed(TerminalWriteDeadlock). Cairn's pre-FF-0.15 \
+         recovery path cannot clear this; migration to FF 0.15 \
+         issue_reclaim_grant tracked at cairn-rs#710"
     );
     let prev_state = match RunReadModel::get(store.as_ref(), run_id).await {
         Ok(Some(record)) => Some(record.state),
