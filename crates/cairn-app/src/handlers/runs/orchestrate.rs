@@ -329,9 +329,89 @@ async fn orchestrate_run_handler_inner(
         }
         Err(response) => return response,
     };
-    match drive_run_iteration(state, run, body).await {
-        Ok(response) => response,
-        Err(response) => response,
+
+    // #765: spawn the orchestrator loop into a detached `tokio::spawn`
+    // task and AWAIT its JoinHandle from the request handler. This
+    // preserves the canonical synchronous response shape for every
+    // existing caller — the request still returns whatever
+    // `drive_run_iteration` produces — but if the client disconnects
+    // mid-loop, the cancellation only drops the request task and the
+    // JoinHandle; the spawned task continues running independently
+    // until terminal. `finalize_run_failure` and every termination
+    // arm always fire, regardless of whether the HTTP caller is
+    // still listening.
+    //
+    // Pre-fix evidence (R17c dogfood, /tmp/r17c-server.log):
+    //   8 × "routed_generation: dispatch attempt"
+    //   0 × "routed_generation: success"
+    //   0 × "routed_generation: per-call timeout fired"
+    //   0 × "OrchestratorLoop::run returned"
+    // 8 root POSTs from the dogfood manager (curl -m 5) — axum
+    // cancelled every request task at the 5s mark; every
+    // `tokio::time::timeout` and every `provider.generate(...)` was
+    // dropped mid-await. Runs stuck in state=running with no resume
+    // path.
+    //
+    // The dispatch-attempt log is synchronous (emitted before the
+    // await), which is why it survived task cancellation. Everything
+    // after a `.await` did not. With this fix, the spawned task is
+    // shielded from request-task cancellation by tokio's runtime
+    // (spawned tasks are NOT structurally tied to their parent),
+    // so the same cancellation only severs the response delivery —
+    // the loop runs to completion.
+    //
+    // `drive_run_iteration` is `'static` (takes `Arc<AppState>` and
+    // owned `RunRecord` + `OrchestrateRequest`).
+    let bg_state = state.clone();
+    // Two clones of run_id: one is moved into the spawn body for its
+    // own logging; one stays in this scope for the post-await
+    // JoinError-on-panic log path.
+    let inner_run_id = run.run_id.clone();
+    let outer_run_id = run.run_id.clone();
+    let inner_session_id = run.session_id.clone();
+    let join_handle = tokio::spawn(async move {
+        let outcome = drive_run_iteration(bg_state, run, body).await;
+        // Both Result arms carry an `axum::response::Response`; collapse
+        // with the | pattern to read `.status()` once (Gemini review).
+        let (Ok(r) | Err(r)) = &outcome;
+        tracing::info!(
+            run_id = %inner_run_id,
+            session_id = %inner_session_id,
+            status = %r.status(),
+            "#765: detached orchestrator-loop task returned"
+        );
+        outcome
+    });
+
+    // Await the spawned task's result for back-compat — the response
+    // shape is unchanged for every existing caller. If the client
+    // disconnects (axum cancels THIS request task), `join_handle` is
+    // dropped, but the spawned task itself keeps running because
+    // `tokio::spawn` detaches the task from its caller's scope. The
+    // loop reaches terminal and finalizes the run regardless.
+    //
+    // `.await` on a JoinHandle propagates the inner result; on
+    // task panic it returns `Err(JoinError)`.  Pre-loop early returns
+    // already use `Result<Response, Response>` to encode "early-OK"
+    // vs "early-error" — both carry a real Response so we collapse
+    // them with `unwrap_or_else(|r| r)` (Gemini review). The
+    // JoinError-on-panic path is the only one that synthesises a
+    // sanitised 500 here at the HTTP boundary.
+    match join_handle.await {
+        Ok(outcome) => outcome.unwrap_or_else(|response| response),
+        Err(join_err) => {
+            tracing::error!(
+                run_id = %outer_run_id,
+                error = %join_err,
+                "#765: detached orchestrator-loop task panicked"
+            );
+            AppApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "orchestration_error",
+                "orchestration task failed unexpectedly — see server logs",
+            )
+            .into_response()
+        }
     }
 }
 

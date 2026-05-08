@@ -170,6 +170,20 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`POST /v1/runs/:id/orchestrate` now survives HTTP client disconnect**
+  **(closes #765).** Axum cancels the request task when a client disconnects
+  mid-request (e.g., a `curl -m 5` timeout, a gateway 504, a load-balancer
+  teardown). Before this fix, the orchestrator loop future was owned by the
+  request task, so cancellation dropped every in-flight `tokio::time::timeout`
+  and `provider.generate(...)` before they could return; `finalize_run_failure`
+  never fired; affected runs were permanently stuck at `state=running` with no
+  resume path (R17c dogfood: 8 orphaned runs). Fix: the loop is now launched
+  via `tokio::spawn`, which detaches it from the request task's scope. Client
+  disconnect only severs response delivery — the loop runs to terminal state
+  regardless. The synchronous response shape for connected callers is
+  unchanged (the handler awaits the JoinHandle). Regression test
+  (`test_765_orchestrate_survives_client_disconnect`) uses a 4s mock LLM
+  and 300ms client timeout to deterministically reproduce and prove the fix.
 - **`cairn_http_*` Prometheus counters now advance with live traffic
   (closes #243).** The binary-side `metrics_prometheus_handler` was
   reading from a binary-local `AppMetrics` struct that no middleware
