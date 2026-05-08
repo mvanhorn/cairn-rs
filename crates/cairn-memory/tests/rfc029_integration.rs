@@ -105,6 +105,7 @@ impl RetrievalService for EchoRetrieval {
                 stages_used: vec![],
                 scoring_dimensions_used: vec![],
                 effective_policy: Some(self.label.clone()),
+                family: None,
             },
         })
     }

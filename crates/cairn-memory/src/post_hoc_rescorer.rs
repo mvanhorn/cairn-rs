@@ -1,29 +1,42 @@
-//! RFC 029 PR-B2: runtime post-hoc rescorer.
+//! RFC 029 PR-B2 + RFC 030 PR-F: runtime post-hoc rescorer.
 //!
-//! Every `KnowledgeQueryResult` flowing through `MultiProviderRetrieval`
-//! is passed through a rescorer before reaching the agent. The rescorer
-//! replaces the three runtime-owned scoring dimensions —
-//! `graph_proximity`, `source_credibility`, `corroboration` — with
-//! values cairn computes itself, then recomputes the final `score` per
-//! the project's `ScoringPolicy`.
+//! Every `RetrievalResponse` flowing through `MultiProviderRetrieval`
+//! (knowledge family) or `MultiProviderMemory` (memory family) is passed
+//! through a rescorer before reaching the agent. The rescorer replaces
+//! the three runtime-owned scoring dimensions — `graph_proximity`,
+//! `source_credibility`, `corroboration` — with values cairn computes
+//! itself, then recomputes the final `score` per the project's
+//! `ScoringPolicy`.
+//!
+//! **RFC 030 family split**: the rescorer is parameterised by
+//! `CapabilityFamily`. Memory-family instances skip the batched
+//! `multi_neighbors` graph lookup (memory is episodic — there is no
+//! provenance graph to traverse; `graph_proximity` stays at 0.0 for
+//! every memory-family result). The `SourceCredibilityLookup` trait
+//! also takes a family argument so per-family credibility projections
+//! can return different scores for the same `source_id` if needed.
 //!
 //! Invariants:
 //!
 //! 1. Runtime-owned dimensions carried by the provider response are
 //!    ALWAYS overwritten. A buggy or malicious plugin populating those
 //!    fields has no influence on the final score (compliance test 6).
-//! 2. Graph neighbor data is fetched in a single batched
+//! 2. Knowledge-family graph neighbor data is fetched in a single batched
 //!    `GraphQueryService::multi_neighbors` call — N chunks cost one
-//!    round-trip, not N (compliance test 7).
+//!    round-trip, not N (compliance test 7). Memory-family skips this
+//!    call entirely (RFC 030 §Scoring Policy Validation Delta).
 //! 3. `source_credibility` comes from the credibility projection
 //!    batched by `source_id`; unknown sources get the default
 //!    `source_credibility = chunk.credibility_score.unwrap_or(0.0)`.
 //! 4. `corroboration` is intra-response: per chunk, the fraction of
 //!    other chunks in the response sharing at least one entity with
 //!    it. This is deliberately cheap — cross-query / per-project
-//!    history is a follow-up.
+//!    history is a follow-up. Applies to both families.
 //! 5. Final score uses `compute_final_score` with the supplied
 //!    `ScoringPolicy`. When no policy is supplied the default is used.
+//! 6. RFC 030: `diagnostics.family` is set to the rescorer's family tag
+//!    on the return path. The runtime overwrites whatever the provider
+//!    supplied so the tag can't be spoofed by a malicious plugin.
 //!
 //! `computed_by` markers on diagnostics indicate which dimensions came
 //! from the runtime vs. the provider — appended to
@@ -32,6 +45,7 @@
 
 use async_trait::async_trait;
 use cairn_graph::GraphQueryService;
+use cairn_plugin_proto::CapabilityFamily;
 
 use crate::multi_provider::ResponseHook;
 use crate::retrieval::{compute_final_score, RetrievalError, RetrievalResponse, ScoringPolicy};
@@ -42,6 +56,12 @@ use crate::retrieval::{compute_final_score, RetrievalError, RetrievalResponse, S
 /// projection holds `source_quality` / `credibility_score` rows (today
 /// cairn-memory's `InMemoryDiagnostics`; a pg-backed projection lands
 /// with the memory follow-on).
+///
+/// RFC 030: `family` is threaded through so implementations can return
+/// different credibility scores for the same `source_id` depending on
+/// whether the caller is on the memory or knowledge path — episodic
+/// memory and curated knowledge can legitimately disagree about how
+/// credible a given source is.
 #[async_trait]
 pub trait SourceCredibilityLookup: Send + Sync {
     /// Given a list of source ids, return the credibility score per
@@ -49,7 +69,11 @@ pub trait SourceCredibilityLookup: Send + Sync {
     /// are omitted — the rescorer treats absence as "no signal" and
     /// falls back to the per-chunk `credibility_score` on the
     /// `ChunkRecord` itself.
-    async fn lookup(&self, source_ids: &[String]) -> Result<Vec<(String, f64)>, RescorerError>;
+    async fn lookup(
+        &self,
+        family: CapabilityFamily,
+        source_ids: &[String],
+    ) -> Result<Vec<(String, f64)>, RescorerError>;
 }
 
 /// Errors from the rescorer path.
@@ -75,14 +99,50 @@ impl std::error::Error for RescorerError {}
 /// Runtime-owned rescorer. Generic over a `GraphQueryService` (for
 /// `multi_neighbors`) and a `SourceCredibilityLookup` so app-layer
 /// wiring can pick concrete impls; tests drop in fakes.
+///
+/// RFC 030: the rescorer is parameterised by `CapabilityFamily` — the
+/// host constructs one instance per family with the family-specific
+/// credibility projection. Memory-family instances skip the
+/// `multi_neighbors` path entirely (memory is episodic; there is no
+/// graph to traverse). Knowledge-family behaviour is identical to the
+/// RFC 029 baseline.
 pub struct PostHocRescorer<G, C> {
+    family: CapabilityFamily,
     graph: G,
     credibility: C,
 }
 
 impl<G, C> PostHocRescorer<G, C> {
+    /// Construct a knowledge-family rescorer. Kept for call-site
+    /// compatibility with the pre-RFC-030 shape; prefer
+    /// [`Self::with_family`] to make the family explicit.
     pub fn new(graph: G, credibility: C) -> Self {
-        Self { graph, credibility }
+        Self {
+            family: CapabilityFamily::KnowledgeProvider,
+            graph,
+            credibility,
+        }
+    }
+
+    /// Explicit-family constructor. `family` **must** be either
+    /// `KnowledgeProvider` or `MemoryProvider` — the rescorer only
+    /// meaningfully runs for the two provider families. Other values
+    /// pass through the type but produce knowledge-family behaviour
+    /// (multi_neighbors call, full dimension set) because there's no
+    /// non-provider family path in the codebase that reaches this
+    /// code. The handshake validator (RFC 030 PR-A) catches the
+    /// misconfiguration before a plugin could trigger this path.
+    pub fn with_family(family: CapabilityFamily, graph: G, credibility: C) -> Self {
+        Self {
+            family,
+            graph,
+            credibility,
+        }
+    }
+
+    /// Capability family this rescorer was constructed for.
+    pub fn family(&self) -> CapabilityFamily {
+        self.family
     }
 }
 
@@ -102,6 +162,9 @@ where
         policy: Option<&ScoringPolicy>,
     ) -> Result<RetrievalResponse, RescorerError> {
         if response.results.is_empty() {
+            // Even on the empty path, tag the family so operator
+            // observability sees the rescorer ran.
+            stamp_family(&mut response, self.family);
             return Ok(response);
         }
 
@@ -116,39 +179,55 @@ where
         }
 
         // Step 2: batched graph neighbor lookup — one round-trip for
-        // every chunk in the response.
-        let doc_ids: Vec<String> = response
-            .results
-            .iter()
-            .map(|r| r.chunk.document_id.as_str().to_owned())
-            .collect();
-        let neighbor_rows = self
-            .graph
-            .multi_neighbors(&doc_ids)
-            .await
-            .map_err(|e| RescorerError::Graph(e.to_string()))?;
+        // every chunk in the response. Skipped for memory-family
+        // responses (RFC 030): memory is episodic, there is no
+        // provenance graph to traverse, so `graph_proximity` stays at
+        // zero for every chunk. Knowledge-family behaviour is
+        // unchanged from the RFC 029 baseline.
+        if self.family == CapabilityFamily::MemoryProvider {
+            // graph_proximity already set to 0.0 in Step 1; skip the
+            // round-trip entirely. `compute_final_score` treats a
+            // zero weight × zero dimension as zero contribution, so
+            // the memory policy's `graph_proximity_weight` simply has
+            // no effect regardless of what operators configure.
+        } else {
+            let doc_ids: Vec<String> = response
+                .results
+                .iter()
+                .map(|r| r.chunk.document_id.as_str().to_owned())
+                .collect();
+            let neighbor_rows = self
+                .graph
+                .multi_neighbors(&doc_ids)
+                .await
+                .map_err(|e| RescorerError::Graph(e.to_string()))?;
 
-        let max_neighbors = neighbor_rows
-            .iter()
-            .map(|(_, edges)| edges.len())
-            .max()
-            .unwrap_or(0);
+            let max_neighbors = neighbor_rows
+                .iter()
+                .map(|(_, edges)| edges.len())
+                .max()
+                .unwrap_or(0);
 
-        // Step 3: compute graph_proximity per chunk. Simple normalized
-        // neighbor-count: chunks with more graph connections are more
-        // central to the tenant's knowledge graph, which correlates
-        // with being a better retrieval hit. Divide by the batch max
-        // so the range stays in [0, 1]. Deliberately cheap — more
-        // sophisticated graph-proximity (PageRank-style) is a
-        // follow-up that keeps the same invariant (runtime-computed).
-        if max_neighbors > 0 {
-            for (r, (_id, edges)) in response.results.iter_mut().zip(neighbor_rows.iter()) {
-                r.breakdown.graph_proximity = (edges.len() as f64) / (max_neighbors as f64);
+            // Step 3: compute graph_proximity per chunk. Simple
+            // normalized neighbor-count: chunks with more graph
+            // connections are more central to the tenant's knowledge
+            // graph, which correlates with being a better retrieval
+            // hit. Divide by the batch max so the range stays in
+            // [0, 1]. Deliberately cheap — more sophisticated
+            // graph-proximity (PageRank-style) is a follow-up that
+            // keeps the same invariant (runtime-computed).
+            if max_neighbors > 0 {
+                for (r, (_id, edges)) in response.results.iter_mut().zip(neighbor_rows.iter()) {
+                    r.breakdown.graph_proximity = (edges.len() as f64) / (max_neighbors as f64);
+                }
             }
         }
 
         // Step 4: batched source-credibility lookup. One round-trip
-        // keyed on the unique source_ids across the response.
+        // keyed on the unique source_ids across the response. Passes
+        // the rescorer's family so the projection can return
+        // family-specific credibility (memory backend might trust a
+        // session source differently than the knowledge corpus does).
         let source_ids: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
             response
@@ -160,7 +239,7 @@ where
         };
         let credibility_scores: std::collections::HashMap<String, f64> = self
             .credibility
-            .lookup(&source_ids)
+            .lookup(self.family, &source_ids)
             .await
             .map_err(|e| RescorerError::Credibility(e.to_string()))?
             .into_iter()
@@ -225,23 +304,48 @@ where
         // Diagnostics: mark which runtime-owned dimensions the runtime
         // actually populated on this response. `computed_by =
         // runtime_post_hoc` markers let operator UI show per-dimension
-        // provenance.
-        append_runtime_computed_markers(&mut response.diagnostics.scoring_dimensions_used);
+        // provenance. Memory-family rescorers skip `graph_proximity`
+        // since step 2 was a no-op — marking it would be a lie.
+        append_runtime_computed_markers(
+            &mut response.diagnostics.scoring_dimensions_used,
+            self.family,
+        );
+        stamp_family(&mut response, self.family);
 
         Ok(response)
     }
 }
 
-fn append_runtime_computed_markers(dims: &mut Vec<String>) {
-    for dim in [
-        "graph_proximity:runtime_post_hoc",
-        "source_credibility:runtime_post_hoc",
-        "corroboration:runtime_post_hoc",
-    ] {
+fn append_runtime_computed_markers(dims: &mut Vec<String>, family: CapabilityFamily) {
+    // `graph_proximity` is skipped for memory-family responses — the
+    // rescorer did not touch it (step 2 was a no-op), so marking it as
+    // runtime-computed would misrepresent the provenance.
+    let markers: &[&str] = if family == CapabilityFamily::MemoryProvider {
+        &[
+            "source_credibility:runtime_post_hoc",
+            "corroboration:runtime_post_hoc",
+        ]
+    } else {
+        &[
+            "graph_proximity:runtime_post_hoc",
+            "source_credibility:runtime_post_hoc",
+            "corroboration:runtime_post_hoc",
+        ]
+    };
+    for &dim in markers {
         if !dims.iter().any(|d| d == dim) {
             dims.push(dim.to_owned());
         }
     }
+}
+
+/// Stamp the rescorer's family onto the response diagnostics.
+/// RFC 030 §Audit: the host owns this field so a malicious plugin can't
+/// falsely tag a memory response as knowledge-family (or vice versa).
+/// The runtime unconditionally overwrites whatever the provider
+/// supplied — see `RetrievalDiagnostics::family`.
+fn stamp_family(response: &mut RetrievalResponse, family: CapabilityFamily) {
+    response.diagnostics.family = Some(family.as_str().to_owned());
 }
 
 #[async_trait]
@@ -271,7 +375,11 @@ pub struct NoOpCredibilityLookup;
 
 #[async_trait]
 impl SourceCredibilityLookup for NoOpCredibilityLookup {
-    async fn lookup(&self, _source_ids: &[String]) -> Result<Vec<(String, f64)>, RescorerError> {
+    async fn lookup(
+        &self,
+        _family: CapabilityFamily,
+        _source_ids: &[String],
+    ) -> Result<Vec<(String, f64)>, RescorerError> {
         Ok(Vec::new())
     }
 }
@@ -349,6 +457,7 @@ mod tests {
                 stages_used: vec![],
                 scoring_dimensions_used: vec!["semantic_relevance".to_owned()],
                 effective_policy: None,
+                family: None,
             },
         }
     }
@@ -567,18 +676,30 @@ mod tests {
                 stages_used: vec![],
                 scoring_dimensions_used: vec![],
                 effective_policy: None,
+                family: None,
             },
         };
         let out = rescorer.rescore(response, None).await.unwrap();
         assert!(out.results.is_empty());
         assert_eq!(*count.lock().unwrap(), 0, "no call on empty input");
+        // RFC 030: empty-response path still stamps the family tag so
+        // operator observability sees the rescorer executed.
+        assert_eq!(
+            out.diagnostics.family.as_deref(),
+            Some("knowledge_provider")
+        );
     }
 
+    #[derive(Clone)]
     struct FakeCredibility(Vec<(String, f64)>);
 
     #[async_trait]
     impl SourceCredibilityLookup for FakeCredibility {
-        async fn lookup(&self, source_ids: &[String]) -> Result<Vec<(String, f64)>, RescorerError> {
+        async fn lookup(
+            &self,
+            _family: CapabilityFamily,
+            source_ids: &[String],
+        ) -> Result<Vec<(String, f64)>, RescorerError> {
             let wanted: std::collections::HashSet<&str> =
                 source_ids.iter().map(String::as_str).collect();
             Ok(self
@@ -588,6 +709,149 @@ mod tests {
                 .cloned()
                 .collect())
         }
+    }
+
+    // ─── RFC 030 PR-F memory-family tests ─────────────────────────────
+
+    #[tokio::test]
+    async fn memory_family_rescorer_skips_multi_neighbors() {
+        // Memory is episodic — no provenance graph to traverse.
+        // Even with 10 chunks in the response the rescorer must issue
+        // zero `multi_neighbors` round-trips.
+        let g = build_graph().await;
+        let count = Arc::new(std::sync::Mutex::new(0));
+        let rescorer = PostHocRescorer::with_family(
+            CapabilityFamily::MemoryProvider,
+            CountingGraph(g, count.clone()),
+            NoOpCredibilityLookup,
+        );
+        let chunks: Vec<_> = (0..10)
+            .map(|i| chunk(&format!("d_{i}"), &format!("s_{i}"), vec!["acme"]))
+            .collect();
+        let response = sample_response(chunks);
+        let rescored = rescorer.rescore(response, None).await.unwrap();
+        assert_eq!(
+            *count.lock().unwrap(),
+            0,
+            "memory family must not call multi_neighbors"
+        );
+        // graph_proximity stays 0.0 on every result — step 1 zeroed it
+        // and step 2 was skipped.
+        for r in &rescored.results {
+            assert_eq!(
+                r.breakdown.graph_proximity, 0.0,
+                "memory family result must have zero graph_proximity"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_family_diagnostics_omit_graph_proximity_marker() {
+        let g = build_graph().await;
+        let count = Arc::new(std::sync::Mutex::new(0));
+        let rescorer = PostHocRescorer::with_family(
+            CapabilityFamily::MemoryProvider,
+            CountingGraph(g, count.clone()),
+            NoOpCredibilityLookup,
+        );
+        let response = sample_response(vec![chunk("d1", "s1", vec!["acme"])]);
+        let rescored = rescorer.rescore(response, None).await.unwrap();
+        let dims = &rescored.diagnostics.scoring_dimensions_used;
+        // source_credibility + corroboration markers present (the
+        // rescorer did compute both); graph_proximity marker absent.
+        assert!(dims
+            .iter()
+            .any(|d| d == "source_credibility:runtime_post_hoc"));
+        assert!(dims.iter().any(|d| d == "corroboration:runtime_post_hoc"));
+        assert!(
+            !dims.iter().any(|d| d == "graph_proximity:runtime_post_hoc"),
+            "memory-family rescorer must not claim to have computed graph_proximity"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_family_field_is_stamped_by_rescorer() {
+        let g = build_graph().await;
+        let count = Arc::new(std::sync::Mutex::new(0));
+        // Knowledge-family rescorer stamps `knowledge_provider`.
+        let rescorer_k = PostHocRescorer::with_family(
+            CapabilityFamily::KnowledgeProvider,
+            CountingGraph(g.clone(), count.clone()),
+            NoOpCredibilityLookup,
+        );
+        let r1 = rescorer_k
+            .rescore(sample_response(vec![chunk("d1", "s1", vec![])]), None)
+            .await
+            .unwrap();
+        assert_eq!(r1.diagnostics.family.as_deref(), Some("knowledge_provider"));
+
+        // Memory-family rescorer stamps `memory_provider`.
+        let rescorer_m = PostHocRescorer::with_family(
+            CapabilityFamily::MemoryProvider,
+            CountingGraph(g, count),
+            NoOpCredibilityLookup,
+        );
+        let r2 = rescorer_m
+            .rescore(sample_response(vec![chunk("d1", "s1", vec![])]), None)
+            .await
+            .unwrap();
+        assert_eq!(r2.diagnostics.family.as_deref(), Some("memory_provider"));
+    }
+
+    #[tokio::test]
+    async fn host_overwrites_provider_supplied_family_tag() {
+        // Regression guard for the audit invariant: a plugin that
+        // stamps a fake family on diagnostics before returning to the
+        // host must have its value overwritten unconditionally.
+        let g = build_graph().await;
+        let count = Arc::new(std::sync::Mutex::new(0));
+        let rescorer = PostHocRescorer::with_family(
+            CapabilityFamily::MemoryProvider,
+            CountingGraph(g, count),
+            NoOpCredibilityLookup,
+        );
+        let mut response = sample_response(vec![chunk("d1", "s1", vec![])]);
+        // Plugin tries to spoof the family tag:
+        response.diagnostics.family = Some("knowledge_provider".into());
+        let rescored = rescorer.rescore(response, None).await.unwrap();
+        assert_eq!(
+            rescored.diagnostics.family.as_deref(),
+            Some("memory_provider"),
+            "host must overwrite provider-supplied family tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn credibility_lookup_receives_rescorer_family() {
+        // RFC 030: the `SourceCredibilityLookup::lookup` call must
+        // carry the rescorer's family so per-family projections can
+        // return different scores for the same source.
+        struct FamilyRecordingCredibility(Arc<std::sync::Mutex<Vec<CapabilityFamily>>>);
+        #[async_trait]
+        impl SourceCredibilityLookup for FamilyRecordingCredibility {
+            async fn lookup(
+                &self,
+                family: CapabilityFamily,
+                _source_ids: &[String],
+            ) -> Result<Vec<(String, f64)>, RescorerError> {
+                self.0.lock().unwrap().push(family);
+                Ok(vec![])
+            }
+        }
+        let g = build_graph().await;
+        let count = Arc::new(std::sync::Mutex::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rescorer = PostHocRescorer::with_family(
+            CapabilityFamily::MemoryProvider,
+            CountingGraph(g, count),
+            FamilyRecordingCredibility(seen.clone()),
+        );
+        let response = sample_response(vec![chunk("d1", "s1", vec![])]);
+        rescorer.rescore(response, None).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![CapabilityFamily::MemoryProvider]
+        );
     }
 
     #[tokio::test]

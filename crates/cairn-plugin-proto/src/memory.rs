@@ -300,6 +300,172 @@ pub struct MemorySourcesChangedParams {
     pub project: Option<ProjectKey>,
 }
 
+// ─── Direct conversions to/from the knowledge-family wire twins ──────────
+//
+// RFC 030 keeps memory/knowledge wire types structurally identical (both
+// map through `RetrievalModeWire`, `ScoringBreakdownWire`,
+// `MetadataFilterWire`, `SourceTypeWire`, etc.). These `From` impls let
+// the RFC 030 PR-G memory-dispatcher bridge convert a memory payload
+// into its knowledge twin (and back) without paying serde_json
+// round-trip overhead — a handful of field moves, no heap allocs beyond
+// what the payload already owns.
+//
+// The conversions are intentionally lossless on both sides. Use them
+// only to bridge between the memory dispatcher and the knowledge stdio
+// host until PR-G ships a dedicated memory dispatcher that talks the
+// `memory.*` methods directly.
+
+use crate::knowledge::{
+    ChunkRecordWire, KnowledgeIngestAck, KnowledgeIngestParams, KnowledgeIngestStatus,
+    KnowledgeIngestStatusParams, KnowledgeIngestStatusResult, KnowledgeQueryDiagnostics,
+    KnowledgeQueryParams, KnowledgeQueryResult, RetrievalResultWire,
+};
+
+impl From<MemoryQueryParams> for KnowledgeQueryParams {
+    fn from(p: MemoryQueryParams) -> Self {
+        Self {
+            project: p.project,
+            query_text: p.query_text,
+            mode: p.mode,
+            limit: p.limit,
+            metadata_filters: p.metadata_filters,
+        }
+    }
+}
+
+impl From<KnowledgeQueryResult> for MemoryQueryResult {
+    fn from(r: KnowledgeQueryResult) -> Self {
+        Self {
+            results: r
+                .results
+                .into_iter()
+                .map(|rr| MemoryRetrievalResultWire {
+                    chunk: MemoryChunkRecordWire {
+                        chunk_id: rr.chunk.chunk_id,
+                        document_id: rr.chunk.document_id,
+                        source_id: rr.chunk.source_id,
+                        source_type: rr.chunk.source_type,
+                        project: rr.chunk.project,
+                        text: rr.chunk.text,
+                        position: rr.chunk.position,
+                        created_at: rr.chunk.created_at,
+                        updated_at: rr.chunk.updated_at,
+                        provenance_metadata: rr.chunk.provenance_metadata,
+                        credibility_score: rr.chunk.credibility_score,
+                        graph_linkage: rr.chunk.graph_linkage,
+                        content_hash: rr.chunk.content_hash,
+                        entities: rr.chunk.entities,
+                    },
+                    score: rr.score,
+                    breakdown: rr.breakdown,
+                })
+                .collect(),
+            diagnostics: MemoryQueryDiagnostics {
+                mode_used: r.diagnostics.mode_used,
+                stages_used: r.diagnostics.stages_used,
+                reranker_used: r.diagnostics.reranker_used,
+                scoring_dimensions_used: r.diagnostics.scoring_dimensions_used,
+                results_returned: r.diagnostics.results_returned,
+                latency_ms: r.diagnostics.latency_ms,
+            },
+        }
+    }
+}
+
+impl From<MemoryQueryResult> for KnowledgeQueryResult {
+    fn from(r: MemoryQueryResult) -> Self {
+        Self {
+            results: r
+                .results
+                .into_iter()
+                .map(|rr| RetrievalResultWire {
+                    chunk: ChunkRecordWire {
+                        chunk_id: rr.chunk.chunk_id,
+                        document_id: rr.chunk.document_id,
+                        source_id: rr.chunk.source_id,
+                        source_type: rr.chunk.source_type,
+                        project: rr.chunk.project,
+                        text: rr.chunk.text,
+                        position: rr.chunk.position,
+                        created_at: rr.chunk.created_at,
+                        updated_at: rr.chunk.updated_at,
+                        provenance_metadata: rr.chunk.provenance_metadata,
+                        credibility_score: rr.chunk.credibility_score,
+                        graph_linkage: rr.chunk.graph_linkage,
+                        content_hash: rr.chunk.content_hash,
+                        entities: rr.chunk.entities,
+                    },
+                    score: rr.score,
+                    breakdown: rr.breakdown,
+                })
+                .collect(),
+            diagnostics: KnowledgeQueryDiagnostics {
+                mode_used: r.diagnostics.mode_used,
+                stages_used: r.diagnostics.stages_used,
+                reranker_used: r.diagnostics.reranker_used,
+                scoring_dimensions_used: r.diagnostics.scoring_dimensions_used,
+                results_returned: r.diagnostics.results_returned,
+                latency_ms: r.diagnostics.latency_ms,
+            },
+        }
+    }
+}
+
+impl From<MemoryIngestParams> for KnowledgeIngestParams {
+    fn from(p: MemoryIngestParams) -> Self {
+        Self {
+            document_id: p.document_id,
+            source_id: p.source_id,
+            source_type: p.source_type,
+            project: p.project,
+            content: p.content,
+            import_id: p.import_id,
+            corpus_id: p.corpus_id,
+            tags: p.tags,
+        }
+    }
+}
+
+impl From<KnowledgeIngestAck> for MemoryIngestAck {
+    fn from(a: KnowledgeIngestAck) -> Self {
+        Self {
+            document_id: a.document_id,
+            accepted: a.accepted,
+            reason: a.reason,
+        }
+    }
+}
+
+impl From<MemoryIngestStatusParams> for KnowledgeIngestStatusParams {
+    fn from(p: MemoryIngestStatusParams) -> Self {
+        Self {
+            document_id: p.document_id,
+        }
+    }
+}
+
+impl From<KnowledgeIngestStatusResult> for MemoryIngestStatusResult {
+    fn from(r: KnowledgeIngestStatusResult) -> Self {
+        Self {
+            status: r.status.map(Into::into),
+        }
+    }
+}
+
+impl From<KnowledgeIngestStatus> for MemoryIngestStatus {
+    fn from(s: KnowledgeIngestStatus) -> Self {
+        match s {
+            KnowledgeIngestStatus::Pending => Self::Pending,
+            KnowledgeIngestStatus::Parsing => Self::Parsing,
+            KnowledgeIngestStatus::Chunking => Self::Chunking,
+            KnowledgeIngestStatus::Embedding => Self::Embedding,
+            KnowledgeIngestStatus::Indexing => Self::Indexing,
+            KnowledgeIngestStatus::Completed => Self::Completed,
+            KnowledgeIngestStatus::Failed => Self::Failed,
+        }
+    }
+}
+
 // ─── Canonical method names ────────────────────────────────────────────────
 
 /// Canonical JSON-RPC method names for the `memory_provider` family.

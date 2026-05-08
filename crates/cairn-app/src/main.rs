@@ -1285,8 +1285,27 @@ async fn real_main() {
         use cairn_memory::multi_provider::{MultiProviderIngest, MultiProviderRetrieval};
         use cairn_memory::post_hoc_rescorer::{NoOpCredibilityLookup, PostHocRescorer};
         use cairn_memory::{retrieval::RetrievalService, IngestService};
+        use cairn_plugin_proto::CapabilityFamily;
         let store = lib_state.runtime.store.clone();
-        let rescorer = PostHocRescorer::new(lib_state.graph.clone(), NoOpCredibilityLookup);
+        // RFC 030 PR-F: the knowledge-family rescorer runs the full
+        // pipeline (multi_neighbors + credibility + corroboration). The
+        // memory-family twin is constructed below with
+        // `with_family(CapabilityFamily::MemoryProvider)` — that
+        // instance skips `multi_neighbors` entirely. Both share the same
+        // graph service + credibility lookup because the in-tree
+        // cairn-default backend serves both families today; PR-G
+        // supplies family-specific credibility projections once the
+        // memory-family resolver lands.
+        let rescorer = PostHocRescorer::with_family(
+            CapabilityFamily::KnowledgeProvider,
+            lib_state.graph.clone(),
+            NoOpCredibilityLookup,
+        );
+        let memory_rescorer = PostHocRescorer::with_family(
+            CapabilityFamily::MemoryProvider,
+            lib_state.graph.clone(),
+            NoOpCredibilityLookup,
+        );
         // Reuse the single StdioKnowledgeDispatcher built during
         // AppState construction so the JSON-RPC request-id counter
         // is shared across the agent-memory path and the deep-search
@@ -1306,14 +1325,71 @@ async fn real_main() {
             EventLogProviderResolver::new(store),
             dispatcher,
         )) as Arc<dyn IngestService>;
-        // RFC 030 rollout window: the memory-family dispatcher + resolver
-        // land in PR-G. Until then point `memory_search` + `memory_store`
-        // at the same `MultiProviderRetrieval` / `MultiProviderIngest` the
-        // knowledge tool uses (single cairn-default backend serving both
-        // families per RFC 030 §"cairn-default TODO"). `auto_extract`
-        // defaults to `NeverAutoExtract` — the only wired backend today
-        // is cairn-default which is explicit-ingest.
-        let memory_retrieval = knowledge_retrieval.clone();
+        // RFC 030 PR-F: dedicated `MultiProviderMemory` retrieval +
+        // memory rescorer so the memory-family path has the right
+        // family tag on every response and skips `multi_neighbors`.
+        // The dispatcher slot is the same stdio host for today — PR-G
+        // wires a family-aware resolver; until then both families
+        // route through `cairn-default`.
+        use cairn_memory::multi_provider_memory::{
+            MemoryPluginDispatcher, MemoryPluginError, MultiProviderMemory,
+        };
+
+        // Bridge the single stdio knowledge dispatcher into the memory
+        // trait so PR-F doesn't reach into plugin-host internals. PR-G
+        // replaces this with a real mem0 adapter. Conversions go through
+        // dedicated `From` impls on the wire types (cairn-plugin-proto)
+        // + `From<KnowledgePluginError> for MemoryPluginError` (cairn-
+        // memory) — no serde_json round-trip, one field-move per struct,
+        // error arms centralised.
+        struct KnowledgeDispatcherAsMemory<T>(T);
+        #[async_trait::async_trait]
+        impl<T: cairn_memory::multi_provider::KnowledgePluginDispatcher + Send + Sync>
+            MemoryPluginDispatcher for KnowledgeDispatcherAsMemory<T>
+        {
+            async fn query(
+                &self,
+                plugin_id: &str,
+                params: cairn_plugin_proto::memory::MemoryQueryParams,
+            ) -> Result<cairn_plugin_proto::memory::MemoryQueryResult, MemoryPluginError>
+            {
+                let k_res = self.0.query(plugin_id, params.into()).await?;
+                Ok(k_res.into())
+            }
+            async fn ingest(
+                &self,
+                plugin_id: &str,
+                params: cairn_plugin_proto::memory::MemoryIngestParams,
+            ) -> Result<cairn_plugin_proto::memory::MemoryIngestAck, MemoryPluginError>
+            {
+                let ack = self.0.ingest(plugin_id, params.into()).await?;
+                Ok(ack.into())
+            }
+            async fn ingest_status(
+                &self,
+                plugin_id: &str,
+                params: cairn_plugin_proto::memory::MemoryIngestStatusParams,
+            ) -> Result<cairn_plugin_proto::memory::MemoryIngestStatusResult, MemoryPluginError>
+            {
+                let res = self.0.ingest_status(plugin_id, params.into()).await?;
+                Ok(res.into())
+            }
+        }
+
+        let memory_dispatcher = Arc::new(KnowledgeDispatcherAsMemory(
+            lib_state.knowledge_dispatcher.clone(),
+        ));
+        let memory_retrieval = Arc::new(
+            MultiProviderMemory::new(
+                lib_state.retrieval.clone(),
+                EventLogProviderResolver::new(lib_state.runtime.store.clone()),
+                memory_dispatcher,
+            )
+            .with_response_hook(memory_rescorer),
+        ) as Arc<dyn RetrievalService>;
+        // Ingest stays on the knowledge pipeline for cairn-default today;
+        // PR-G lands the MultiProviderMemoryIngest wiring once the
+        // memory-family resolver projects memory-slot state.
         let memory_ingest = ingest.clone();
         let auto_extract_resolver: std::sync::Arc<
             dyn cairn_app::tool_impls::MemoryAutoExtractResolver,

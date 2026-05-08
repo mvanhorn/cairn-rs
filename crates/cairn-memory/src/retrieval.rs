@@ -148,6 +148,14 @@ pub struct RetrievalDiagnostics {
     pub stages_used: Vec<CandidateStage>,
     pub scoring_dimensions_used: Vec<String>,
     pub effective_policy: Option<String>,
+    /// RFC 030: capability family that served this response. Set by
+    /// `PostHocRescorer` on the return path — the runtime owns this
+    /// field so a malicious provider can't falsely tag a response. The
+    /// value mirrors `CapabilityFamily::as_str()` (`"memory_provider"`
+    /// or `"knowledge_provider"`). Pre-RFC-030 payloads lack the field
+    /// and deserialize as `None` via `#[serde(default)]`.
+    #[serde(default)]
+    pub family: Option<String>,
 }
 
 /// A retrieval response including results and diagnostics.

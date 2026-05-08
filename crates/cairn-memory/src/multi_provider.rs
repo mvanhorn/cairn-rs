@@ -543,6 +543,7 @@ mod tests {
                         stages_used: vec![CandidateStage::Lexical],
                         scoring_dimensions_used: vec![],
                         effective_policy: None,
+                        family: None,
                     },
                 });
             Ok(resp)

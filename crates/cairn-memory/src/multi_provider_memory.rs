@@ -115,6 +115,20 @@ impl std::fmt::Display for MemoryPluginError {
 
 impl std::error::Error for MemoryPluginError {}
 
+/// RFC 030 PR-F rollout: lets bridge adapters that invoke the
+/// knowledge-family dispatcher on behalf of a memory-family call
+/// propagate errors without hand-rolling a match on every site.
+impl From<crate::multi_provider::KnowledgePluginError> for MemoryPluginError {
+    fn from(e: crate::multi_provider::KnowledgePluginError) -> Self {
+        use crate::multi_provider::KnowledgePluginError as K;
+        match e {
+            K::Unavailable(m) => Self::Unavailable(m),
+            K::PluginError(m) => Self::PluginError(m),
+            K::Internal(m) => Self::Internal(m),
+        }
+    }
+}
+
 // ─── Wire conversions (memory family) ─────────────────────────────────────
 //
 // Structural twins of the knowledge-family `From` impls in
@@ -554,6 +568,7 @@ mod tests {
                     stages_used: vec![CandidateStage::Lexical],
                     scoring_dimensions_used: vec![],
                     effective_policy: None,
+                    family: None,
                 },
             })
         }

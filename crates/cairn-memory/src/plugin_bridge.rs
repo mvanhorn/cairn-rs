@@ -313,6 +313,10 @@ impl From<KnowledgeQueryResult> for RetrievalResponse {
                 stages_used,
                 scoring_dimensions_used,
                 effective_policy,
+                // RFC 030: the rescorer stamps the correct family on
+                // the return path; leave `None` here since the wire
+                // bridge is family-neutral.
+                family: None,
             },
         }
     }

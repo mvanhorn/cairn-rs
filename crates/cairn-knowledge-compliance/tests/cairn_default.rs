@@ -221,6 +221,7 @@ impl RetrievalService for SentinelRetrieval {
                 stages_used: vec![],
                 scoring_dimensions_used: vec!["semantic_relevance".to_owned()],
                 effective_policy: None,
+                family: None,
             },
         })
     }

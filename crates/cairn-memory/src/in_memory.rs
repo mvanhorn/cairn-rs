@@ -945,6 +945,12 @@ impl RetrievalService for InMemoryRetrieval {
                     policy.staleness_threshold_days,
                     if policy.recency_enabled { "on" } else { "off" },
                 )),
+                // RFC 030: the host-side rescorer stamps the correct
+                // family on the return path; `InMemoryRetrieval` is
+                // called from both knowledge + memory family dispatchers
+                // in the cairn-default rollout, so leave it `None` here
+                // and let the rescorer overwrite.
+                family: None,
             },
             results,
         })
