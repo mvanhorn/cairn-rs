@@ -718,6 +718,7 @@ dependencies = [
  "cairn-api-contracts",
  "cairn-domain",
  "cairn-graph",
+ "cairn-plugin-proto",
  "cairn-signal",
  "cairn-store",
  "chrono",

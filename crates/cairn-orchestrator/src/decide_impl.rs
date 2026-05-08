@@ -212,14 +212,17 @@ impl DecidePhase for LlmDecidePhase {
         gather: &GatherOutput,
     ) -> Result<DecideOutput, OrchestratorError> {
         // Build the tool catalogue for this iteration:
-        // 1. Core + Registered tools (always included)
+        // 1. Core + Registered tools (always included; visibility-filtered
+        //    per RFC 029 when the run carries a VisibilityContext)
         // 2. Deferred tools discovered via tool_search in prior iterations
         //    (ctx.discovered_tool_names carries them across the loop boundary)
-        let mut tool_descs: Vec<BuiltinToolDescriptor> = self
-            .tools
-            .as_ref()
-            .map(|r| r.prompt_tools())
-            .unwrap_or_default();
+        let mut tool_descs: Vec<BuiltinToolDescriptor> = match (&self.tools, &ctx.visibility) {
+            (Some(r), Some(vis)) => r.prompt_tools_filtered(|name| {
+                cairn_runtime::services::is_tool_visible(vis, None, name)
+            }),
+            (Some(r), None) => r.prompt_tools(),
+            (None, _) => Vec::new(),
+        };
 
         if !ctx.discovered_tool_names.is_empty() {
             if let Some(ref registry) = self.tools {
@@ -1812,6 +1815,7 @@ mod tests {
             step_history: vec![],
             is_recovery: false,
             approval_timeout: None,
+            visibility: None,
         }
     }
 

@@ -20,6 +20,10 @@ cairn-domain = { path = "../cairn-domain" }
 cairn-api-contracts = { path = "../cairn-api-contracts" }
 cairn-graph = { path = "../cairn-graph" }
 cairn-store = { path = "../cairn-store" }
+# RFC 029: bridges between plugin wire types and in-process retrieval/ingest
+# types live in `src/plugin_bridge.rs`. plugin-proto only depends on
+# cairn-domain, so adding it here does not invert store → memory layering.
+cairn-plugin-proto = { path = "../cairn-plugin-proto" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"

@@ -75,6 +75,7 @@ fn ctx(run_id: &str, session_id: &str) -> OrchestrationContext {
         step_history: vec![],
         is_recovery: false,
         approval_timeout: None,
+        visibility: None,
     }
 }
 

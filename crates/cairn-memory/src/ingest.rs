@@ -123,6 +123,20 @@ pub enum IngestError {
     EmbeddingFailed(String),
     StorageError(String),
     Internal(String),
+    /// RFC 029: the resolved provider declined ingest before dispatch
+    /// (most commonly because it advertised `ingest_capable = false` at
+    /// handshake). Runtime emits `KnowledgeIngestRejected` alongside
+    /// returning this error.
+    ProviderRejected {
+        provider: String,
+        reason: String,
+    },
+    /// RFC 029: same unavailability semantics as
+    /// `RetrievalError::ProviderUnavailable`.
+    ProviderUnavailable {
+        provider: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for IngestError {
@@ -133,6 +147,12 @@ impl std::fmt::Display for IngestError {
             IngestError::EmbeddingFailed(msg) => write!(f, "embedding failed: {msg}"),
             IngestError::StorageError(msg) => write!(f, "storage error: {msg}"),
             IngestError::Internal(msg) => write!(f, "internal ingest error: {msg}"),
+            IngestError::ProviderRejected { provider, reason } => {
+                write!(f, "knowledge provider {provider} rejected ingest: {reason}")
+            }
+            IngestError::ProviderUnavailable { provider, reason } => {
+                write!(f, "knowledge provider {provider} unavailable: {reason}")
+            }
         }
     }
 }

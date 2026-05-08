@@ -1542,4 +1542,41 @@ CREATE TABLE IF NOT EXISTS operator_tenant_roles (
 
 CREATE INDEX IF NOT EXISTS idx_operator_tenant_roles_operator
     ON operator_tenant_roles (operator_id);
+
+-- RFC 029 pluggable knowledge providers. Mirrors pg migration V018.
+-- See `migrations/V018__create_knowledge_providers.sql` for the pg definition
+-- and rationale.
+CREATE TABLE IF NOT EXISTS project_knowledge_providers (
+    tenant_id             TEXT    NOT NULL,
+    workspace_id          TEXT    NOT NULL,
+    project_id            TEXT    NOT NULL,
+    provider_ref          TEXT    NOT NULL,
+    kind                  TEXT    NOT NULL,
+    at_ms                 INTEGER NOT NULL,
+    configured_by         TEXT,
+    reason                TEXT,
+    prior_snapshot_json   TEXT,
+    current_snapshot_json TEXT,
+    PRIMARY KEY (tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_knowledge_providers_project
+    ON project_knowledge_providers (tenant_id, workspace_id, project_id, at_ms);
+
+CREATE TABLE IF NOT EXISTS knowledge_ingest_jobs (
+    tenant_id        TEXT    NOT NULL,
+    workspace_id     TEXT    NOT NULL,
+    project_id       TEXT    NOT NULL,
+    document_id      TEXT    NOT NULL,
+    provider_ref     TEXT    NOT NULL,
+    status           TEXT    NOT NULL,
+    source_type      TEXT,
+    reason           TEXT,
+    submitted_at_ms  INTEGER NOT NULL,
+    updated_at_ms    INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, workspace_id, project_id, document_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_jobs_status
+    ON knowledge_ingest_jobs (tenant_id, workspace_id, project_id, status);
 "#;

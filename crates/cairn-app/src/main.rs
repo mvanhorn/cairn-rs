@@ -1266,12 +1266,30 @@ async fn real_main() {
     }
 
     // ── Wire built-in tool registry into lib_state ───────────────────────────
-    // Build with the real RetrievalService + IngestPipeline so the orchestrator
-    // can actually search and store memory during execution.
+    // RFC 029 PR-B1: memory tools dispatch through MultiProviderRetrieval /
+    // MultiProviderIngest. For projects on cairn-default (the project
+    // creation default, and the only provider with wired in-tree retrieval
+    // right now) this is byte-identical to calling InMemoryRetrieval
+    // directly. Plugin providers (`plugin:<id>`) surface as
+    // `ProviderUnavailable` until the adapter binaries productise the
+    // dispatcher; there is no silent fallback.
     {
+        use cairn_memory::event_log_resolver::{
+            EventLogProviderResolver, UnavailablePluginDispatcher,
+        };
+        use cairn_memory::multi_provider::{MultiProviderIngest, MultiProviderRetrieval};
         use cairn_memory::{retrieval::RetrievalService, IngestService};
-        let retrieval = lib_state.retrieval.clone() as Arc<dyn RetrievalService>;
-        let ingest = lib_state.ingest.clone() as Arc<dyn IngestService>;
+        let store = lib_state.runtime.store.clone();
+        let retrieval = Arc::new(MultiProviderRetrieval::new(
+            lib_state.retrieval.clone(),
+            EventLogProviderResolver::new(store.clone()),
+            UnavailablePluginDispatcher,
+        )) as Arc<dyn RetrievalService>;
+        let ingest = Arc::new(MultiProviderIngest::new(
+            lib_state.ingest.clone(),
+            EventLogProviderResolver::new(store),
+            UnavailablePluginDispatcher,
+        )) as Arc<dyn IngestService>;
         let registry = cairn_app::tool_impls::build_tool_registry(
             retrieval,
             ingest,

@@ -4,6 +4,7 @@
 //! so that downstream crates (`cairn-tools`, `cairn-workspace`, `cairn-runtime`) can
 //! import exactly the projection they need without pulling in plugin internals.
 
+use crate::events::ResolvedProviderSnapshot;
 use crate::ids::RunId;
 use crate::tenancy::ProjectKey;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,14 @@ pub struct VisibilityContext {
     /// Key = plugin_id.  Value = `Some(tool_names)` if the project restricts
     /// which tools are visible, `None` if all of the plugin's tools are allowed.
     pub allowlisted_tools: HashMap<String, Option<HashSet<String>>>,
+    /// RFC 029: snapshot of the project's resolved knowledge provider, used
+    /// to gate `memory_store` visibility (hidden when
+    /// `ingest_capable = false`) and to render per-project provider detail
+    /// in operator UI. `None` when the project has not yet been
+    /// configured — the amended RFC 015 filter treats `None` as equivalent
+    /// to cairn-default for tool visibility.
+    #[serde(default)]
+    pub resolved_knowledge_provider: Option<ResolvedProviderSnapshot>,
 }
 
 // ── Repo Access (RFC 016 §"Access Layer") ────────────────────────────────
@@ -105,11 +114,26 @@ mod tests {
             run_id: Some(RunId::new("run-1")),
             enabled_plugins: enabled,
             allowlisted_tools: allowed,
+            resolved_knowledge_provider: None,
         };
 
         let json = serde_json::to_string(&ctx).unwrap();
         let back: VisibilityContext = serde_json::from_str(&json).unwrap();
         assert_eq!(ctx, back);
+    }
+
+    #[test]
+    fn visibility_context_serde_back_compat_for_missing_provider_field() {
+        // Legacy payload written before RFC 029 added the field deserializes
+        // with `resolved_knowledge_provider = None` thanks to `#[serde(default)]`.
+        let legacy = r#"{
+            "project": {"tenant_id": "t1", "workspace_id": "w1", "project_id": "p1"},
+            "run_id": null,
+            "enabled_plugins": [],
+            "allowlisted_tools": {}
+        }"#;
+        let ctx: VisibilityContext = serde_json::from_str(legacy).unwrap();
+        assert!(ctx.resolved_knowledge_provider.is_none());
     }
 
     #[test]
@@ -119,6 +143,7 @@ mod tests {
             run_id: Some(RunId::new("run-1")),
             enabled_plugins: HashSet::new(),
             allowlisted_tools: HashMap::new(),
+            resolved_knowledge_provider: None,
         };
 
         let access: RepoAccessContext = RepoAccessContext::from(&ctx);

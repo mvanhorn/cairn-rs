@@ -103,8 +103,8 @@ async fn hybrid_query_returns_scored_results_with_diagnostics() {
             "lexical_relevance should be positive for matching chunks"
         );
         assert!(
-            result.breakdown.freshness > 0.0,
-            "freshness should be positive for recently-created chunks"
+            result.breakdown.freshness_decay > 0.0,
+            "freshness_decay should be positive for recently-created chunks"
         );
         assert!(
             result.score > 0.0,
@@ -129,8 +129,8 @@ async fn hybrid_query_returns_scored_results_with_diagnostics() {
     );
     assert!(
         diag.scoring_dimensions_used
-            .contains(&"freshness".to_owned()),
-        "freshness must be in scoring_dimensions_used"
+            .contains(&"freshness_decay".to_owned()),
+        "freshness_decay must be in scoring_dimensions_used"
     );
     assert!(
         diag.effective_policy.is_some(),

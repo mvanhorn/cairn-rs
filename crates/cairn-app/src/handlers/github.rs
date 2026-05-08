@@ -339,6 +339,7 @@ pub(crate) async fn webhook_trigger_orchestration(
         step_history: vec![],
         is_recovery: false,
         approval_timeout: None,
+        visibility: None,
     };
 
     let model_id = {

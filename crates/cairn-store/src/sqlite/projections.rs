@@ -3677,6 +3677,153 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|e| StoreError::Internal(e.to_string()))?;
             }
+            // ── RFC 029 pluggable knowledge providers ──
+            RuntimeEvent::KnowledgeProviderConfigured(e) => {
+                sqlx::query(
+                    "INSERT INTO project_knowledge_providers
+                         (tenant_id, workspace_id, project_id, provider_ref,
+                          kind, at_ms, configured_by)
+                     VALUES (?, ?, ?, ?, 'configured', ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
+                     DO UPDATE SET configured_by = excluded.configured_by",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.provider_ref.as_str())
+                .bind(e.at_ms as i64)
+                .bind(e.configured_by.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::KnowledgeProviderUnavailable(e) => {
+                sqlx::query(
+                    "INSERT INTO project_knowledge_providers
+                         (tenant_id, workspace_id, project_id, provider_ref,
+                          kind, at_ms, reason)
+                     VALUES (?, ?, ?, ?, 'unavailable', ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
+                     DO NOTHING",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.provider_ref.as_str())
+                .bind(e.at_ms as i64)
+                .bind(&e.reason)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::KnowledgeProviderCapabilityChanged(e) => {
+                let prior_json = serde_json::to_string(&e.prior)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let current_json = serde_json::to_string(&e.current)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO project_knowledge_providers
+                         (tenant_id, workspace_id, project_id, provider_ref,
+                          kind, at_ms, prior_snapshot_json, current_snapshot_json)
+                     VALUES (?, ?, ?, ?, 'capability_changed', ?, ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
+                     DO NOTHING",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.provider_ref.as_str())
+                .bind(e.at_ms as i64)
+                .bind(&prior_json)
+                .bind(&current_json)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::KnowledgeIngestSubmitted(e) => {
+                sqlx::query(
+                    "INSERT INTO knowledge_ingest_jobs
+                         (tenant_id, workspace_id, project_id, document_id,
+                          provider_ref, status, source_type,
+                          submitted_at_ms, updated_at_ms)
+                     VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, document_id)
+                     DO UPDATE SET
+                         provider_ref    = excluded.provider_ref,
+                         status          = 'submitted',
+                         source_type     = excluded.source_type,
+                         submitted_at_ms = excluded.submitted_at_ms,
+                         updated_at_ms   = excluded.updated_at_ms,
+                         reason          = NULL",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.document_id.as_str())
+                .bind(e.provider_ref.as_str())
+                .bind(&e.source_type)
+                .bind(e.at_ms as i64)
+                .bind(e.at_ms as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::KnowledgeIngestRejected(e) => {
+                // See pg mirror: synthetic `document_id` includes the
+                // envelope's event_id (globally unique) so two rejections
+                // within the same ms don't collide. Cross-tenant
+                // collisions are already precluded by the
+                // `(tenant_id, workspace_id, project_id, _)` prefix of
+                // the PK.
+                sqlx::query(
+                    "INSERT INTO knowledge_ingest_jobs
+                         (tenant_id, workspace_id, project_id, document_id,
+                          provider_ref, status, reason,
+                          submitted_at_ms, updated_at_ms)
+                     VALUES (?, ?, ?, ?, ?, 'rejected', ?, ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, document_id)
+                     DO UPDATE SET
+                         provider_ref  = excluded.provider_ref,
+                         status        = 'rejected',
+                         reason        = excluded.reason,
+                         updated_at_ms = excluded.updated_at_ms",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(format!(
+                    "rejected:{}:{}",
+                    e.provider_ref.as_str(),
+                    envelope.event_id.as_str()
+                ))
+                .bind(e.provider_ref.as_str())
+                .bind(&e.reason)
+                .bind(e.at_ms as i64)
+                .bind(e.at_ms as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::KnowledgeIngestStatusUpdated(e) => {
+                sqlx::query(
+                    "UPDATE knowledge_ingest_jobs
+                        SET status        = ?,
+                            updated_at_ms = ?
+                      WHERE tenant_id    = ?
+                        AND workspace_id = ?
+                        AND project_id   = ?
+                        AND document_id  = ?",
+                )
+                .bind(&e.status)
+                .bind(e.at_ms as i64)
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.document_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
         }
 
         Ok(())

@@ -151,6 +151,7 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
         step_history: Vec::new(),
         is_recovery: false,
         approval_timeout: None,
+        visibility: None,
     };
 
     let decide_output = DecideOutput {

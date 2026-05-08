@@ -14,6 +14,7 @@ pub mod fabric_adapter;
 pub mod handlers;
 pub mod helpers;
 pub mod idempotency;
+pub mod knowledge_provider_routes;
 pub mod lease_keeper;
 pub mod marketplace_routes;
 pub mod metrics;

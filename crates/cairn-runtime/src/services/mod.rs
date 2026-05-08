@@ -46,6 +46,7 @@ pub mod budget_impl;
 pub mod channel_impl;
 pub mod guardrail_impl;
 pub mod ingest_job_impl;
+pub mod knowledge_provider_impl;
 pub mod license_impl;
 pub mod notification_impl;
 pub mod operator_profile_impl;
@@ -102,6 +103,9 @@ pub use eval_run_impl::EvalRunServiceImpl;
 pub use event_helpers::make_envelope;
 pub use external_worker_impl::{parse_outcome, ExternalWorkerService, ExternalWorkerServiceImpl};
 pub use ingest_job_impl::IngestJobServiceImpl;
+pub use knowledge_provider_impl::{
+    handle_configure_knowledge_provider, KnowledgeProviderService, KnowledgeProviderServiceImpl,
+};
 pub use mailbox_impl::MailboxServiceImpl;
 pub use observability_impl::LlmObservabilityServiceImpl;
 pub use project_impl::ProjectServiceImpl;
@@ -166,11 +170,11 @@ pub use provider_health_tracker::ProviderHealthTracker;
 // ── Skill & plugin (marketplace + trigger + plugin host) ─────────────────
 pub mod marketplace_service;
 pub use marketplace_service::{
-    catalog_entry_to_descriptor, is_plugin_tool_visible, is_signal_allowed, resolve_capture_policy,
-    CredentialKind, CredentialScopeHint, CredentialScopeKey, CredentialSpec, CredentialValue,
-    DescriptorSource, GraphNodeId, HealthCheckSpec, MarketplaceCommand, MarketplaceError,
-    MarketplaceEvent, MarketplaceRecord, MarketplaceService, MarketplaceState, PluginDescriptor,
-    PluginEnablement, ResolvedCapturePolicy,
+    catalog_entry_to_descriptor, is_plugin_tool_visible, is_signal_allowed, is_tool_visible,
+    resolve_capture_policy, CredentialKind, CredentialScopeHint, CredentialScopeKey,
+    CredentialSpec, CredentialValue, DescriptorSource, GraphNodeId, HealthCheckSpec,
+    MarketplaceCommand, MarketplaceError, MarketplaceEvent, MarketplaceRecord, MarketplaceService,
+    MarketplaceState, PluginDescriptor, PluginEnablement, ResolvedCapturePolicy, GATABLE_BUILTINS,
 };
 
 pub mod trigger_service;

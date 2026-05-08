@@ -521,7 +521,35 @@ impl<S> MarketplaceService<S> {
             run_id,
             enabled_plugins,
             allowlisted_tools,
+            // RFC 029: populated by `build_visibility_context_for_run` at
+            // run-start time, once the resolved knowledge provider is known.
+            // The legacy entry point used by project-level queries leaves
+            // this `None`; callers that need `is_tool_visible` gating on
+            // `memory_store` must go through the *_for_run helper.
+            resolved_knowledge_provider: None,
         }
+    }
+
+    /// RFC 029: run-scoped variant of [`build_visibility_context`] that
+    /// also resolves the project's knowledge-provider snapshot. The caller
+    /// supplies the snapshot — typically derived from the latest
+    /// `KnowledgeProviderConfigured` event plus the plugin host's cached
+    /// handshake for a `plugin:<id>` ref — because the marketplace service
+    /// has no visibility into the plugin host.
+    ///
+    /// When `None` is passed, behaviour matches [`build_visibility_context`]
+    /// (every built-in stays visible). Use this variant on the run-start
+    /// path so `memory_store` is hidden from the prompt for projects on a
+    /// read-only knowledge provider.
+    pub fn build_visibility_context_for_run(
+        &self,
+        project: &ProjectKey,
+        run_id: RunId,
+        resolved_knowledge_provider: Option<cairn_domain::events::ResolvedProviderSnapshot>,
+    ) -> VisibilityContext {
+        let mut ctx = self.build_visibility_context(project, Some(run_id));
+        ctx.resolved_knowledge_provider = resolved_knowledge_provider;
+        ctx
     }
 
     // ── Command Handlers ─────────────────────────────────────────────────
@@ -829,6 +857,44 @@ pub fn catalog_entry_to_descriptor(entry: CatalogEntry) -> PluginDescriptor {
 
 // ── Visibility Filtering (RFC 015 §"Per-Run Tool Visibility") ────────────────
 
+/// RFC 029 amends RFC 015: a small set of built-in tools may now be hidden
+/// from the agent prompt depending on visibility context. The set is
+/// compile-time closed on purpose — arbitrary built-ins don't become
+/// gate-able at a distance.
+///
+/// `memory_store` is gated by the resolved knowledge provider:
+/// `VisibilityContext.resolved_knowledge_provider.ingest_capable == false`
+/// hides it. Operators running a retrieval-only provider (e.g. Bedrock KB)
+/// see no dangling ingest affordance in the agent's prompt.
+pub const GATABLE_BUILTINS: &[&str] = &["memory_store"];
+
+/// Unified visibility check for any tool (plugin-provided or built-in).
+///
+/// - For a plugin-provided tool (`plugin_id = Some(id)`) the legacy RFC 015
+///   allowlist rules apply — plugin enabled + tool on allowlist.
+/// - For a built-in tool (`plugin_id = None`) the default is visible; the
+///   exception is entries in [`GATABLE_BUILTINS`], which consult the
+///   resolved knowledge provider snapshot.
+pub fn is_tool_visible(ctx: &VisibilityContext, plugin_id: Option<&str>, tool_name: &str) -> bool {
+    match plugin_id {
+        Some(pid) => is_plugin_tool_visible(ctx, pid, tool_name),
+        None => {
+            if GATABLE_BUILTINS.contains(&tool_name) {
+                match (tool_name, &ctx.resolved_knowledge_provider) {
+                    ("memory_store", Some(snap)) => snap.ingest_capable,
+                    // No provider resolved yet → default to visible, matching
+                    // the pre-RFC-029 behaviour and cairn-default's
+                    // ingest_capable = true posture.
+                    ("memory_store", None) => true,
+                    _ => true,
+                }
+            } else {
+                true
+            }
+        }
+    }
+}
+
 /// Check whether a plugin tool is visible in the given VisibilityContext.
 ///
 /// A tool is visible if:
@@ -836,8 +902,9 @@ pub fn catalog_entry_to_descriptor(entry: CatalogEntry) -> PluginDescriptor {
 /// 2. Either the plugin has no tool allowlist (None = all tools visible)
 ///    or the tool name is in the allowlist
 ///
-/// Built-in cairn tools (not from plugins) are always visible — this function
-/// only gates plugin-provided tools.
+/// Built-in cairn tools (not from plugins) are not gated by this function —
+/// see [`is_tool_visible`] for the unified check that also covers the
+/// `GATABLE_BUILTINS` set.
 pub fn is_plugin_tool_visible(ctx: &VisibilityContext, plugin_id: &str, tool_name: &str) -> bool {
     if !ctx.enabled_plugins.contains(plugin_id) {
         return false;
@@ -1453,6 +1520,71 @@ mod tests {
         ));
         // Tool from a non-enabled plugin is not visible
         assert!(!is_plugin_tool_visible(&ctx, "slack", "slack.send_message"));
+    }
+
+    #[test]
+    fn is_tool_visible_gates_memory_store_on_resolved_provider() {
+        use cairn_domain::events::ResolvedProviderSnapshot;
+
+        let mut ctx = VisibilityContext {
+            project: project_p1(),
+            run_id: None,
+            enabled_plugins: HashSet::new(),
+            allowlisted_tools: HashMap::new(),
+            resolved_knowledge_provider: None,
+        };
+
+        // No resolver yet → memory_store is visible (parity with pre-RFC-029).
+        assert!(is_tool_visible(&ctx, None, "memory_store"));
+
+        // Provider reports ingest_capable = true → still visible.
+        ctx.resolved_knowledge_provider = Some(ResolvedProviderSnapshot {
+            provider_id: "cairn-default".into(),
+            ingest_capable: true,
+            retrieval_modes: vec!["hybrid".into()],
+            scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+        });
+        assert!(is_tool_visible(&ctx, None, "memory_store"));
+
+        // Provider reports ingest_capable = false → hidden.
+        ctx.resolved_knowledge_provider = Some(ResolvedProviderSnapshot {
+            provider_id: "plugin:bedrock-kb".into(),
+            ingest_capable: false,
+            retrieval_modes: vec!["hybrid".into()],
+            scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+        });
+        assert!(!is_tool_visible(&ctx, None, "memory_store"));
+
+        // Other built-ins stay visible regardless.
+        assert!(is_tool_visible(&ctx, None, "memory_search"));
+    }
+
+    #[test]
+    fn is_tool_visible_delegates_plugin_tools_to_plugin_check() {
+        let mut svc = MarketplaceService::new(test_store());
+        svc.list_plugin(github_descriptor());
+        svc.handle_command(MarketplaceCommand::InstallPlugin {
+            plugin_id: "github".into(),
+            initiated_by: operator(),
+        })
+        .unwrap();
+        svc.handle_command(MarketplaceCommand::EnablePluginForProject {
+            plugin_id: "github".into(),
+            project: project_p1(),
+            tool_allowlist: Some(vec!["github.get_issue".into()]),
+            signal_allowlist: None,
+            signal_capture_override: None,
+            enabled_by: operator(),
+        })
+        .unwrap();
+
+        let ctx = svc.build_visibility_context(&project_p1(), None);
+        assert!(is_tool_visible(&ctx, Some("github"), "github.get_issue"));
+        assert!(!is_tool_visible(
+            &ctx,
+            Some("github"),
+            "github.create_pull_request"
+        ));
     }
 
     #[test]

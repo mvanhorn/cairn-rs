@@ -83,6 +83,11 @@ define_id!(OperatorId);
 define_id!(OutcomeId);
 define_id!(PolicyId);
 define_id!(ProjectId);
+// RFC 029: reference to a configured knowledge provider. Format is either
+// "cairn-default" for the in-process reference implementation, or
+// "plugin:<plugin_id>" for an external provider plugin registered via
+// RFC 007. Stored on `project_knowledge_providers`.
+define_id!(ProviderRef);
 define_id!(PromptAssetId);
 define_id!(PromptReleaseId);
 define_id!(PromptVersionId);

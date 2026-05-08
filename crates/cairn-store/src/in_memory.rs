@@ -3451,6 +3451,19 @@ impl InMemoryStore {
             // No projection row — operator alerts via SSE + metrics; the
             // event log itself is the audit trail.
             RuntimeEvent::SandboxCrashRecovered(_) => {}
+            // ── RFC 029 pluggable knowledge providers ──
+            // The durable backends (pg/sqlite) own the read model for
+            // `project_knowledge_providers` / `knowledge_ingest_jobs`.
+            // InMemory does not carry dedicated projection state for
+            // these yet — MultiProviderRetrieval (cairn-memory) will add
+            // in-memory read-model rows if it queries them at runtime.
+            // For now the event log itself is the authoritative record.
+            RuntimeEvent::KnowledgeProviderConfigured(_)
+            | RuntimeEvent::KnowledgeProviderUnavailable(_)
+            | RuntimeEvent::KnowledgeProviderCapabilityChanged(_)
+            | RuntimeEvent::KnowledgeIngestSubmitted(_)
+            | RuntimeEvent::KnowledgeIngestRejected(_)
+            | RuntimeEvent::KnowledgeIngestStatusUpdated(_) => {}
         }
     }
 }

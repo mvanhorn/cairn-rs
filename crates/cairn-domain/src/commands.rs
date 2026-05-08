@@ -119,6 +119,8 @@ pub enum RuntimeCommand {
     CreateWorkspace(CreateWorkspace),
     CreateProject(CreateProject),
     CreateScheduledTask(CreateScheduledTask),
+    /// RFC 029: configure the knowledge provider for a project.
+    ConfigureKnowledgeProvider(ConfigureKnowledgeProvider),
 }
 
 impl RuntimeCommand {
@@ -164,6 +166,7 @@ impl RuntimeCommand {
             RuntimeCommand::CreateWorkspace(command) => &command.project,
             RuntimeCommand::CreateProject(command) => &command.project,
             RuntimeCommand::CreateScheduledTask(command) => &command.project,
+            RuntimeCommand::ConfigureKnowledgeProvider(command) => &command.project,
         }
     }
 
@@ -296,6 +299,7 @@ impl RuntimeCommand {
             RuntimeCommand::CreateWorkspace(_) => None,
             RuntimeCommand::CreateProject(_) => None,
             RuntimeCommand::CreateScheduledTask(_) => None,
+            RuntimeCommand::ConfigureKnowledgeProvider(_) => None,
         }
     }
 }
@@ -644,6 +648,16 @@ pub struct CreateScheduledTask {
     /// When this task should first fire (Unix ms). `None` means unscheduled
     /// until a cron evaluator computes it.
     pub next_run_at: Option<u64>,
+}
+
+/// RFC 029: configure or change the knowledge provider for a project.
+/// Emits `KnowledgeProviderConfigured` and upserts the current-configuration
+/// row on `project_knowledge_providers`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureKnowledgeProvider {
+    pub project: ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub actor: crate::ids::OperatorId,
 }
 
 #[cfg(test)]

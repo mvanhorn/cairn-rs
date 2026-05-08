@@ -1444,6 +1444,14 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::SummarizerFallback(_) => "summarizer_fallback",
         RuntimeEvent::WorkspaceBackendDegraded(_) => "workspace_backend_degraded",
         RuntimeEvent::SandboxCrashRecovered(_) => "sandbox_crash_recovered",
+        RuntimeEvent::KnowledgeProviderConfigured(_) => "knowledge_provider_configured",
+        RuntimeEvent::KnowledgeProviderUnavailable(_) => "knowledge_provider_unavailable",
+        RuntimeEvent::KnowledgeProviderCapabilityChanged(_) => {
+            "knowledge_provider_capability_changed"
+        }
+        RuntimeEvent::KnowledgeIngestSubmitted(_) => "knowledge_ingest_submitted",
+        RuntimeEvent::KnowledgeIngestRejected(_) => "knowledge_ingest_rejected",
+        RuntimeEvent::KnowledgeIngestStatusUpdated(_) => "knowledge_ingest_status_updated",
     }
 }
 
@@ -2121,6 +2129,36 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         RuntimeEvent::SandboxCrashRecovered(e) => format!(
             "Crash-recovery unmounted dangling overlay for session {} (run {})",
             e.session_id, e.run_id
+        ),
+        RuntimeEvent::KnowledgeProviderConfigured(e) => format!(
+            "Knowledge provider {} configured for project {}",
+            e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::KnowledgeProviderUnavailable(e) => format!(
+            "Knowledge provider {} unavailable for project {} ({})",
+            e.provider_ref,
+            e.project.project_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::KnowledgeProviderCapabilityChanged(e) => format!(
+            "Knowledge provider {} capability changed for project {}",
+            e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::KnowledgeIngestSubmitted(e) => format!(
+            "Knowledge ingest submitted: document {} via {} for project {}",
+            e.document_id, e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::KnowledgeIngestRejected(e) => format!(
+            "Knowledge ingest rejected by {} for project {} ({})",
+            e.provider_ref,
+            e.project.project_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::KnowledgeIngestStatusUpdated(e) => format!(
+            "Knowledge ingest {} → {} for project {}",
+            e.document_id,
+            sanitize_for_event_message(&e.status),
+            e.project.project_id
         ),
     }
 }

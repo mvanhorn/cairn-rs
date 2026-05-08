@@ -697,6 +697,23 @@ impl BuiltinToolRegistry {
         tools
     }
 
+    /// Visibility-filtered variant of [`prompt_tools`]. RFC 029 amends
+    /// RFC 015: a small set of built-ins may be hidden from the agent
+    /// prompt based on the resolved knowledge provider snapshot. The
+    /// filter predicate is injected by the caller to keep this crate
+    /// independent of `cairn-runtime` / `cairn-domain::contexts` — the
+    /// orchestrator wraps the unified `is_tool_visible` check in a
+    /// closure and passes it in.
+    pub fn prompt_tools_filtered(
+        &self,
+        mut visible: impl FnMut(&str) -> bool,
+    ) -> Vec<BuiltinToolDescriptor> {
+        self.prompt_tools()
+            .into_iter()
+            .filter(|d| visible(&d.name))
+            .collect()
+    }
+
     /// Descriptors for Deferred tools matching the given capability query.
     /// Used by the `tool_search` built-in to surface on-demand tools.
     pub fn search_deferred(&self, query: &str) -> Vec<BuiltinToolDescriptor> {
@@ -951,6 +968,20 @@ mod tests {
         assert!(
             !names.contains(&"plugin_tool"),
             "Deferred must NOT be in prompt tools"
+        );
+    }
+
+    #[test]
+    fn prompt_tools_filtered_hides_by_predicate() {
+        // RFC 029: the orchestrator wraps `is_tool_visible` in a closure
+        // and passes it in. Simulate that here by hiding `echo` only.
+        let reg = make_registry();
+        let filtered = reg.prompt_tools_filtered(|name| name != "echo");
+        let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
+        assert!(!names.contains(&"echo"), "echo must be filtered out");
+        assert!(
+            names.contains(&"web_search"),
+            "other registered tools must stay"
         );
     }
 

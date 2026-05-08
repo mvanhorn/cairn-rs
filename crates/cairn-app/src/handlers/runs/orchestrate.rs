@@ -823,6 +823,33 @@ pub(crate) async fn drive_run_iteration(
     )
     .await;
 
+    // RFC 029 PR-B1: resolve the project's configured knowledge provider
+    // and attach a VisibilityContext so prompt building can hide
+    // `memory_store` when the provider declares ingest_capable = false.
+    // Best-effort: a resolver error leaves visibility `None`, and the
+    // decide phase falls back to the pre-RFC-029 "everything visible"
+    // behaviour. Worst case is a surfaced memory_store tool that
+    // errors at dispatch time — no silent data-loss risk.
+    let visibility = {
+        use cairn_memory::event_log_resolver::{
+            snapshot_for_provider_ref, EventLogProviderResolver,
+        };
+        use cairn_memory::multi_provider::ProviderResolver;
+        let resolver = EventLogProviderResolver::new(state.runtime.store.clone());
+        match resolver.resolve(&run.project).await {
+            Ok(pref) => {
+                let snapshot = snapshot_for_provider_ref(&pref);
+                let marketplace = state.marketplace.lock().unwrap_or_else(|e| e.into_inner());
+                Some(marketplace.build_visibility_context_for_run(
+                    &run.project,
+                    run.run_id.clone(),
+                    snapshot,
+                ))
+            }
+            Err(_) => None,
+        }
+    };
+
     let ctx = OrchestrationContext {
         project: run.project.clone(),
         session_id: run.session_id.clone(),
@@ -844,6 +871,7 @@ pub(crate) async fn drive_run_iteration(
         approval_timeout: body
             .approval_timeout_ms
             .map(std::time::Duration::from_millis),
+        visibility,
     };
 
     // #651: persist the resolved `goal` into the run's per-run defaults

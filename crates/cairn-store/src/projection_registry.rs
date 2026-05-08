@@ -134,7 +134,7 @@ impl std::error::Error for RegistryError {}
 /// Phase 2a/2b close the pg stub gap and, as a side effect, the sqlite
 /// gap.
 pub const REGISTRY: &[ProjectionEntry] = &[
-    // ── Projected (48) ────────────────────────────────────────────────────
+    // ── Projected (54) ────────────────────────────────────────────────────
     ProjectionEntry {
         variant: "ApprovalRequested",
         status: ProjectionStatus::Projected {
@@ -474,6 +474,48 @@ pub const REGISTRY: &[ProjectionEntry] = &[
         variant: "WorkspaceSnapshotReaped",
         status: ProjectionStatus::Projected {
             table: Some("workspace_snapshots"),
+        },
+    },
+    // ── RFC 029 pluggable knowledge providers ───────────────────────────
+    // Configuration lifecycle + audit on `project_knowledge_providers`
+    // (discriminated by a `kind` column: "configured" upserts,
+    // "unavailable"/"capability_changed" are audit-insert rows).
+    ProjectionEntry {
+        variant: "KnowledgeProviderConfigured",
+        status: ProjectionStatus::Projected {
+            table: Some("project_knowledge_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "KnowledgeProviderUnavailable",
+        status: ProjectionStatus::Projected {
+            table: Some("project_knowledge_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "KnowledgeProviderCapabilityChanged",
+        status: ProjectionStatus::Projected {
+            table: Some("project_knowledge_providers"),
+        },
+    },
+    // Ingest lifecycle on `knowledge_ingest_jobs` (Submitted/Rejected inserts,
+    // StatusUpdated updates the existing row).
+    ProjectionEntry {
+        variant: "KnowledgeIngestSubmitted",
+        status: ProjectionStatus::Projected {
+            table: Some("knowledge_ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "KnowledgeIngestRejected",
+        status: ProjectionStatus::Projected {
+            table: Some("knowledge_ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "KnowledgeIngestStatusUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("knowledge_ingest_jobs"),
         },
     },
     // ── Ephemeral (31) ────────────────────────────────────────────────────
@@ -1513,8 +1555,18 @@ mod tests {
         //     post-redaction prompt + response body so operators can audit
         //     chain-of-thought, not just metadata. Net: +1 Projected →
         //     129 / 33 / 0.
+        //   * RFC 029 PR-B1: six knowledge-provider lifecycle events
+        //     (`KnowledgeProviderConfigured`, `KnowledgeProviderUnavailable`,
+        //     `KnowledgeProviderCapabilityChanged`, `KnowledgeIngestSubmitted`,
+        //     `KnowledgeIngestRejected`, `KnowledgeIngestStatusUpdated`)
+        //     added as Projected with backing tables
+        //     `project_knowledge_providers` (4× events keyed on
+        //     `(project, provider_ref, kind)`) and `knowledge_ingest_jobs`
+        //     (3× events keyed on `(project, document_id)`). Pg V018
+        //     + sqlite schema.rs + pg/sqlite appliers. Net: +6 Projected
+        //     → 135 / 33 / 0.
         assert_eq!(
-            projected, 129,
+            projected, 135,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
@@ -1522,7 +1574,7 @@ mod tests {
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 162);
+        assert_eq!(projected + ephemeral + stubbed, 168);
     }
 
     #[test]

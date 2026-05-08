@@ -124,7 +124,7 @@ fn record_to_response(record: &MarketplaceRecord) -> CatalogEntryResponse {
     }
 }
 
-fn operator_id_from_principal(
+pub(crate) fn operator_id_from_principal(
     principal: &cairn_api::auth::AuthPrincipal,
 ) -> cairn_domain::ids::OperatorId {
     // T6b-C5: derive the operator id from the authenticated principal
@@ -150,7 +150,9 @@ fn validate_project_segment(value: &str, field: &'static str) -> Result<(), Stri
     }
 }
 
-fn project_key_from_path(project: &str) -> Result<cairn_domain::tenancy::ProjectKey, String> {
+pub(crate) fn project_key_from_path(
+    project: &str,
+) -> Result<cairn_domain::tenancy::ProjectKey, String> {
     if let Some((tenant_id, workspace_id, project_id)) = crate::parse_project_scope(project) {
         validate_project_segment(tenant_id, "tenant_id")?;
         validate_project_segment(workspace_id, "workspace_id")?;

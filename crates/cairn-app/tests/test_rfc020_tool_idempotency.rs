@@ -74,6 +74,7 @@ fn base_ctx(run_id: &str, is_recovery: bool) -> OrchestrationContext {
         step_history: vec![],
         is_recovery,
         approval_timeout: None,
+        visibility: None,
     }
 }
 

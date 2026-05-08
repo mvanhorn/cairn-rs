@@ -461,6 +461,7 @@ POST	/v1/workers/register	preserve	-	-
 PUT	/v1/admin/models/:id	preserve	-	-
 PUT	/v1/config/:key	preserve	path param: key, body: value	{ ok }
 PUT	/v1/integrations/:integration_id/overrides	preserve	-	-
+PUT	/v1/projects/:project/knowledge-provider	preserve	-	-
 PUT	/v1/providers/connections/:id	preserve	-	-
 PUT	/v1/providers/connections/:id/retry-policy	preserve	-	-
 PUT	/v1/settings/defaults/:scope/:scope_id/:key	preserve	-	-

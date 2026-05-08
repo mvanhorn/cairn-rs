@@ -698,7 +698,7 @@ impl RetrievalService for InMemoryRetrieval {
                 let breakdown = ScoringBreakdown {
                     semantic_relevance: semantic_score,
                     lexical_relevance: lexical_score,
-                    freshness: fresh,
+                    freshness_decay: fresh,
                     staleness_penalty: stale,
                     source_credibility: credibility,
                     corroboration: 0.0,
@@ -858,8 +858,8 @@ impl RetrievalService for InMemoryRetrieval {
         {
             scoring_dims.push("semantic_relevance".to_owned());
         }
-        if results.iter().any(|r| r.breakdown.freshness != 0.0) {
-            scoring_dims.push("freshness".to_owned());
+        if results.iter().any(|r| r.breakdown.freshness_decay != 0.0) {
+            scoring_dims.push("freshness_decay".to_owned());
         }
         if results.iter().any(|r| r.breakdown.staleness_penalty != 0.0) {
             scoring_dims.push("staleness_penalty".to_owned());
@@ -1457,8 +1457,8 @@ mod tests {
         );
         assert!(
             diag.scoring_dimensions_used
-                .contains(&"freshness".to_owned()),
-            "freshness should be listed for recently-created chunks"
+                .contains(&"freshness_decay".to_owned()),
+            "freshness_decay should be listed for recently-created chunks"
         );
 
         // Effective policy is described.
@@ -1479,7 +1479,7 @@ mod tests {
         // Per-result scoring breakdown is populated.
         for result in &response.results {
             assert!(result.breakdown.lexical_relevance > 0.0);
-            assert!(result.breakdown.freshness > 0.0);
+            assert!(result.breakdown.freshness_decay > 0.0);
             assert!(result.score > 0.0);
         }
     }

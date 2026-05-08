@@ -342,6 +342,27 @@ pub enum RuntimeEvent {
     /// F65 PR-5 (#359): crash-recovery sweep successfully unmounted a
     /// dangling overlay mount the previous cairn-app process left behind.
     SandboxCrashRecovered(SandboxCrashRecovered),
+
+    // ── RFC 029 pluggable knowledge providers ──
+    /// Project configured or re-configured its knowledge provider.
+    /// Upserts a row on `project_knowledge_providers` with `kind = "configured"`.
+    KnowledgeProviderConfigured(KnowledgeProviderConfigured),
+    /// Query-time failure: the configured provider is not reachable /
+    /// spawned / authorized. Audit row on `project_knowledge_providers`
+    /// (`kind = "unavailable"`), never overwrites the `configured` row.
+    KnowledgeProviderUnavailable(KnowledgeProviderUnavailable),
+    /// Plugin restart produced a handshake snapshot that differs from the
+    /// previous spawn. Audit row (`kind = "capability_changed"`).
+    KnowledgeProviderCapabilityChanged(KnowledgeProviderCapabilityChanged),
+    /// Knowledge-document ingest kicked off (cairn-default or plugin).
+    /// Row on `knowledge_ingest_jobs`.
+    KnowledgeIngestSubmitted(KnowledgeIngestSubmitted),
+    /// Ingest refused before dispatch (e.g., read-only provider).
+    /// Row on `knowledge_ingest_jobs`.
+    KnowledgeIngestRejected(KnowledgeIngestRejected),
+    /// Ingest status transition reported by the provider.
+    /// Updates the row on `knowledge_ingest_jobs`.
+    KnowledgeIngestStatusUpdated(KnowledgeIngestStatusUpdated),
 }
 
 impl RuntimeEvent {
@@ -428,6 +449,12 @@ impl RuntimeEvent {
             RuntimeEvent::SummarizerFallback(event) => &event.project,
             RuntimeEvent::WorkspaceBackendDegraded(event) => &event.project,
             RuntimeEvent::SandboxCrashRecovered(event) => &event.project,
+            RuntimeEvent::KnowledgeProviderConfigured(event) => &event.project,
+            RuntimeEvent::KnowledgeProviderUnavailable(event) => &event.project,
+            RuntimeEvent::KnowledgeProviderCapabilityChanged(event) => &event.project,
+            RuntimeEvent::KnowledgeIngestSubmitted(event) => &event.project,
+            RuntimeEvent::KnowledgeIngestRejected(event) => &event.project,
+            RuntimeEvent::KnowledgeIngestStatusUpdated(event) => &event.project,
             RuntimeEvent::TriggerCreated(event) => &event.project,
             RuntimeEvent::TriggerEnabled(event) => &event.project,
             RuntimeEvent::TriggerDisabled(event) => &event.project,
@@ -832,6 +859,19 @@ impl RuntimeEvent {
             RuntimeEvent::SandboxCrashRecovered(event) => Some(RuntimeEntityRef::Session {
                 session_id: event.session_id.clone(),
             }),
+            // RFC 029: knowledge-provider lifecycle events are keyed by
+            // (project, provider_ref) — not any existing `RuntimeEntityRef`
+            // variant. Ingest events COULD map to `IngestJob` but the
+            // plugin ingest path doesn't produce an `IngestJobId`; they
+            // carry a `KnowledgeDocumentId` instead. Returning `None` is
+            // correct — operator UI joins these events via their own
+            // projection tables rather than the entity-ref index.
+            RuntimeEvent::KnowledgeProviderConfigured(_) => None,
+            RuntimeEvent::KnowledgeProviderUnavailable(_) => None,
+            RuntimeEvent::KnowledgeProviderCapabilityChanged(_) => None,
+            RuntimeEvent::KnowledgeIngestSubmitted(_) => None,
+            RuntimeEvent::KnowledgeIngestRejected(_) => None,
+            RuntimeEvent::KnowledgeIngestStatusUpdated(_) => None,
         }
     }
 }
@@ -3258,6 +3298,105 @@ pub struct SandboxCrashRecovered {
     pub project: crate::tenancy::ProjectKey,
     pub session_id: crate::ids::SessionId,
     pub run_id: crate::ids::RunId,
+    pub at_ms: u64,
+}
+
+// ── RFC 029 pluggable knowledge providers ──────────────────────────────────
+
+/// Snapshot of the effective-capability data a plugin returned at its most
+/// recent `initialize` handshake, stored per-project for visibility decisions
+/// and capability-change audit. Intentionally minimal — full capability data
+/// lives in the plugin host's process-state, not in the event log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedProviderSnapshot {
+    /// Plugin-declared id, or `"cairn-default"` for the in-process default.
+    pub provider_id: String,
+    /// Whether the provider can accept `knowledge.ingest` calls right now.
+    pub ingest_capable: bool,
+    /// Retrieval modes the provider currently supports (subset of
+    /// `{"lexical_only", "vector_only", "hybrid"}`).
+    pub retrieval_modes: Vec<String>,
+    /// Provider-required scoring dimensions the provider surfaces right now.
+    /// Values from `{"semantic_relevance", "lexical_relevance",
+    /// "freshness_decay", "staleness_penalty", "recency_of_use"}`. Runtime-
+    /// owned dimensions (graph_proximity, source_credibility, corroboration)
+    /// are never included — the runtime always computes those post-hoc.
+    pub scoring_dimensions_surfaced: Vec<String>,
+}
+
+/// Project configured or re-configured its knowledge provider. Upserts the
+/// current-configuration row on `project_knowledge_providers`
+/// (`kind = "configured"`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeProviderConfigured {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub configured_by: crate::ids::OperatorId,
+    pub at_ms: u64,
+}
+
+/// Query-time failure: the configured provider is unreachable, failed its
+/// handshake, or has no credentials. Audit row on
+/// `project_knowledge_providers` (`kind = "unavailable"`). Never upserts over
+/// the `configured` row — pure insert for operator audit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeProviderUnavailable {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    /// Free-form short reason string for operator UI.
+    pub reason: String,
+    pub at_ms: u64,
+}
+
+/// Plugin restart produced a handshake snapshot that differs from the
+/// previous spawn (e.g., credentials changed → `ingest_capable` flipped, or
+/// a scoring dimension moved between `surfaced` and `not_supported`). Audit
+/// row on `project_knowledge_providers` (`kind = "capability_changed"`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeProviderCapabilityChanged {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub prior: ResolvedProviderSnapshot,
+    pub current: ResolvedProviderSnapshot,
+    pub at_ms: u64,
+}
+
+/// Knowledge-document ingest kicked off. Insert on `knowledge_ingest_jobs`
+/// with `status = "submitted"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeIngestSubmitted {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub document_id: crate::ids::KnowledgeDocumentId,
+    /// Mirrors `cairn_memory::ingest::SourceType`; stored as the lowercase
+    /// snake_case serde representation (e.g. `"markdown"`, `"plain_text"`).
+    pub source_type: String,
+    pub at_ms: u64,
+}
+
+/// Ingest refused before dispatch (typically because the resolved provider
+/// declared `ingest_capable = false`). Insert on `knowledge_ingest_jobs`
+/// with `status = "rejected"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeIngestRejected {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    /// Free-form short reason string for operator UI.
+    pub reason: String,
+    pub at_ms: u64,
+}
+
+/// Ingest status transition reported by the provider (or generated by
+/// cairn-default as it passes through its pipeline). Updates the row on
+/// `knowledge_ingest_jobs` keyed by `(project, document_id)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeIngestStatusUpdated {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub document_id: crate::ids::KnowledgeDocumentId,
+    /// Mirrors `cairn_memory::ingest::IngestStatus`; stored as the
+    /// snake_case serde representation (e.g. `"completed"`, `"failed"`).
+    pub status: String,
     pub at_ms: u64,
 }
 

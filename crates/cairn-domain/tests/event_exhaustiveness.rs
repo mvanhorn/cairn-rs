@@ -16,6 +16,12 @@ use cairn_domain::audit::AuditOutcome;
 use cairn_domain::commercial::ProductTier;
 use cairn_domain::errors::RuntimeEntityRef;
 use cairn_domain::events::StateTransition;
+use cairn_domain::events::{
+    KnowledgeIngestRejected, KnowledgeIngestStatusUpdated, KnowledgeIngestSubmitted,
+    KnowledgeProviderCapabilityChanged, KnowledgeProviderConfigured, KnowledgeProviderUnavailable,
+    ResolvedProviderSnapshot,
+};
+use cairn_domain::ids::{KnowledgeDocumentId, ProviderRef};
 use cairn_domain::lifecycle::{RunState, SessionState, TaskState};
 use cairn_domain::policy::{ApprovalRequirement, GuardrailDecisionKind, GuardrailSubjectType};
 use cairn_domain::providers::{
@@ -687,6 +693,18 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::SandboxCrashRecovered(_) => {
             assert_ne!(proj.tenant_id.as_str(), "_system");
             assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        // RFC 029 knowledge-provider lifecycle events are project-scoped
+        // (config / audit on `project_knowledge_providers`) with no
+        // session/run entity attached.
+        RuntimeEvent::KnowledgeProviderConfigured(_)
+        | RuntimeEvent::KnowledgeProviderUnavailable(_)
+        | RuntimeEvent::KnowledgeProviderCapabilityChanged(_)
+        | RuntimeEvent::KnowledgeIngestSubmitted(_)
+        | RuntimeEvent::KnowledgeIngestRejected(_)
+        | RuntimeEvent::KnowledgeIngestStatusUpdated(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
         }
     }
 }
@@ -1989,6 +2007,56 @@ fn all_variants() -> Vec<RuntimeEvent> {
             run_id: run(),
             at_ms: ts,
         }),
+        // RFC 029 knowledge-provider lifecycle events.
+        RuntimeEvent::KnowledgeProviderConfigured(KnowledgeProviderConfigured {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            configured_by: OperatorId::new("op_exh"),
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeProviderUnavailable(KnowledgeProviderUnavailable {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            reason: "handshake timeout".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeProviderCapabilityChanged(KnowledgeProviderCapabilityChanged {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            prior: ResolvedProviderSnapshot {
+                provider_id: "mem0".to_owned(),
+                ingest_capable: true,
+                retrieval_modes: vec!["vector_only".to_owned()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".to_owned()],
+            },
+            current: ResolvedProviderSnapshot {
+                provider_id: "mem0".to_owned(),
+                ingest_capable: false,
+                retrieval_modes: vec!["vector_only".to_owned()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".to_owned()],
+            },
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeIngestSubmitted(KnowledgeIngestSubmitted {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            document_id: KnowledgeDocumentId::new("doc_exh"),
+            source_type: "markdown".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeIngestRejected(KnowledgeIngestRejected {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:bedrock-kb"),
+            reason: "provider ingest_capable = false".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeIngestStatusUpdated(KnowledgeIngestStatusUpdated {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            document_id: KnowledgeDocumentId::new("doc_exh"),
+            status: "completed".to_owned(),
+            at_ms: ts,
+        }),
     ]
 }
 
@@ -1997,13 +2065,12 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 162 variants in the RuntimeEvent enum (158 baseline + RFC 026 PR-A0
-    // TenantRoleGranted + TenantRoleRevoked + RFC 026 PR-A2
-    // TenantUpdated + issue #668 LlmCompletionRecorded).
+    // 168 variants in the RuntimeEvent enum (162 prior + RFC 029 6 new
+    // knowledge-provider lifecycle events).
     assert_eq!(
         variants.len(),
-        162,
-        "all_variants() must construct exactly 162 RuntimeEvent instances"
+        168,
+        "all_variants() must construct exactly 168 RuntimeEvent instances"
     );
 }
 

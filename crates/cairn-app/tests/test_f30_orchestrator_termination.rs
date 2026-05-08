@@ -475,6 +475,7 @@ async fn system_prompt_does_not_gate_complete_run_behind_forced_action() {
         step_history: vec![],
         is_recovery: false,
         approval_timeout: None,
+        visibility: None,
     };
     // Empty gather: exercises the "no memory retrieved" footer branch.
     // With memory, the only difference is the `memory_hint` prefix —

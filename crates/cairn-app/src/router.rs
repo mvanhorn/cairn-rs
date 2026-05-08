@@ -30,6 +30,7 @@ use tower_http::cors::{Any, CorsLayer};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::bootstrap::shutdown_signal;
+use crate::knowledge_provider_routes;
 use crate::marketplace_routes;
 use crate::repo_routes;
 use crate::state::AppState;
@@ -1755,6 +1756,11 @@ impl AppBootstrap {
                 "/v1/projects/:proj/plugins/:id",
                 post(marketplace_routes::enable_plugin_handler)
                     .delete(marketplace_routes::disable_plugin_handler),
+            )
+            // RFC 029: configure the project's knowledge provider.
+            .route(
+                "/v1/projects/:project/knowledge-provider",
+                put(knowledge_provider_routes::configure_knowledge_provider_handler),
             )
             .route(
                 "/v1/projects/:project/repos",

@@ -96,6 +96,7 @@ fn ctx() -> OrchestrationContext {
         step_history: vec![],
         is_recovery: false,
         approval_timeout: None,
+        visibility: None,
     }
 }
 

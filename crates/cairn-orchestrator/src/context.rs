@@ -6,8 +6,9 @@
 use std::path::PathBuf;
 
 use cairn_domain::{
-    decisions::RunMode, session_orchestration::CircuitBreakerTrip, ActionProposal, ApprovalId,
-    CompletionVerification, DefaultSetting, ProjectKey, RunId, SessionId, TaskId, ToolInvocationId,
+    contexts::VisibilityContext, decisions::RunMode, session_orchestration::CircuitBreakerTrip,
+    ActionProposal, ApprovalId, CompletionVerification, DefaultSetting, ProjectKey, RunId,
+    SessionId, TaskId, ToolInvocationId,
 };
 use cairn_graph::GraphNode;
 use cairn_memory::retrieval::RetrievalResult;
@@ -80,6 +81,14 @@ pub struct OrchestrationContext {
     /// field `Option<Duration>` so `Default` / `Clone`-constructed contexts
     /// continue to work without having to pick a sentinel value here.
     pub approval_timeout: Option<std::time::Duration>,
+
+    /// RFC 029 PR-B1: resolved tool-visibility snapshot for this run.
+    ///
+    /// Populated by `build_visibility_context_for_run` at run start time
+    /// so the decide phase can filter the prompt-tool list. `None` on
+    /// legacy / test-construction paths; treated as "cairn-default and
+    /// no plugin overrides" — every built-in stays visible.
+    pub visibility: Option<VisibilityContext>,
 }
 
 impl OrchestrationContext {

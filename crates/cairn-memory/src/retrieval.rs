@@ -95,7 +95,10 @@ pub enum CandidateStage {
 pub struct ScoringBreakdown {
     pub semantic_relevance: f64,
     pub lexical_relevance: f64,
-    pub freshness: f64,
+    /// RFC 029: renamed from `freshness` to match the plugin-proto wire
+    /// dimension name (`freshnessDecay`). Same semantics: an exponential
+    /// decay from 1.0 as content ages.
+    pub freshness_decay: f64,
     pub staleness_penalty: f64,
     pub source_credibility: f64,
     pub corroboration: f64,
@@ -217,7 +220,7 @@ pub fn compute_final_score(breakdown: &ScoringBreakdown, weights: &ScoringWeight
     let mut score = 0.0;
     score += breakdown.semantic_relevance * weights.semantic_weight;
     score += breakdown.lexical_relevance * weights.lexical_weight;
-    score += breakdown.freshness * weights.freshness_weight;
+    score += breakdown.freshness_decay * weights.freshness_weight;
     score -= breakdown.staleness_penalty * weights.staleness_weight;
     score += breakdown.source_credibility * weights.credibility_weight;
     score += breakdown.corroboration * weights.corroboration_weight;
@@ -246,6 +249,15 @@ pub enum RetrievalError {
     EmbeddingFailed(String),
     StorageError(String),
     Internal(String),
+    /// RFC 029: the project is configured with a provider that cannot serve
+    /// the query right now (plugin not spawned, handshake failed, missing
+    /// credentials, transport error). Runtime emits
+    /// `KnowledgeProviderUnavailable` alongside returning this error. There
+    /// is no silent fallback to cairn-default — callers see the error.
+    ProviderUnavailable {
+        provider: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for RetrievalError {
@@ -254,6 +266,9 @@ impl std::fmt::Display for RetrievalError {
             RetrievalError::EmbeddingFailed(msg) => write!(f, "embedding failed: {msg}"),
             RetrievalError::StorageError(msg) => write!(f, "storage error: {msg}"),
             RetrievalError::Internal(msg) => write!(f, "internal retrieval error: {msg}"),
+            RetrievalError::ProviderUnavailable { provider, reason } => {
+                write!(f, "knowledge provider {provider} unavailable: {reason}")
+            }
         }
     }
 }
@@ -366,7 +381,7 @@ mod tests {
         let breakdown = ScoringBreakdown {
             semantic_relevance: 0.0,
             lexical_relevance: 1.0,
-            freshness: 0.8,
+            freshness_decay: 0.8,
             staleness_penalty: 0.0,
             source_credibility: 0.0,
             corroboration: 0.0,
@@ -376,7 +391,7 @@ mod tests {
         let weights = ScoringWeights::default();
 
         let score = compute_final_score(&breakdown, &weights);
-        // lexical: 1.0 * 0.3 = 0.3, freshness: 0.8 * 0.1 = 0.08 → 0.38
+        // lexical: 1.0 * 0.3 = 0.3, freshness_decay: 0.8 * 0.1 = 0.08 → 0.38
         assert!((score - 0.38).abs() < 0.001, "score was {score}");
     }
 
@@ -385,7 +400,7 @@ mod tests {
         let breakdown = ScoringBreakdown {
             semantic_relevance: 0.0,
             lexical_relevance: 1.0,
-            freshness: 0.0,
+            freshness_decay: 0.0,
             staleness_penalty: 1.0,
             source_credibility: 0.0,
             corroboration: 0.0,

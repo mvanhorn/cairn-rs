@@ -511,6 +511,18 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::SummarizerFallback(_)
             | RuntimeEvent::WorkspaceBackendDegraded(_)
             | RuntimeEvent::SandboxCrashRecovered(_)
+            // RFC 029: knowledge-provider lifecycle and ingest-job events
+            // land in their own projection tables
+            // (`project_knowledge_providers` / `knowledge_ingest_jobs`).
+            // The provenance graph does not model provider configuration
+            // as nodes or edges — document-level provenance for ingested
+            // content is added by cairn-memory when chunks land, not here.
+            | RuntimeEvent::KnowledgeProviderConfigured(_)
+            | RuntimeEvent::KnowledgeProviderUnavailable(_)
+            | RuntimeEvent::KnowledgeProviderCapabilityChanged(_)
+            | RuntimeEvent::KnowledgeIngestSubmitted(_)
+            | RuntimeEvent::KnowledgeIngestRejected(_)
+            | RuntimeEvent::KnowledgeIngestStatusUpdated(_)
             // RFC-025 Phase 1: eval scoring events are projection-only
             // (they update the `eval_runs` read-model metrics columns in
             // milestones 3/4/5). The graph projector does not need to

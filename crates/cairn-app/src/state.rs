@@ -38,12 +38,14 @@ use cairn_memory::api_impl::MemoryApiImpl;
 use cairn_memory::deep_search_impl::{IterativeDeepSearch, KeywordDecomposer};
 use cairn_memory::diagnostics::DiagnosticsService;
 use cairn_memory::diagnostics_impl::InMemoryDiagnostics;
+use cairn_memory::event_log_resolver::{EventLogProviderResolver, UnavailablePluginDispatcher};
 use cairn_memory::export_service_impl::InMemoryExportService;
 use cairn_memory::feed_impl::FeedStore;
 use cairn_memory::graph_expansion::GraphBackedExpansion;
 use cairn_memory::import_service_impl::InMemoryImportService;
 use cairn_memory::in_memory::{InMemoryDocumentStore, InMemoryRetrieval};
 use cairn_memory::ingest::SourceType;
+use cairn_memory::multi_provider::MultiProviderRetrieval;
 use cairn_memory::pipeline::{IngestPipeline, ParagraphChunker};
 
 use cairn_runtime::startup::ReadinessState;
@@ -70,8 +72,20 @@ pub const DEFAULT_PROJECT_ID: &str = "default_project";
 
 // ── Type aliases ─────────────────────────────────────────────────────────────
 
+/// RFC 029 PR-B1: deep-search dispatches retrieval through the
+/// MultiProvider layer so each hop respects the project's configured
+/// knowledge provider. `cairn_store::InMemoryStore` is the event-log
+/// backend hold the resolver reads from; the placeholder dispatcher
+/// surfaces `ProviderUnavailable` for `plugin:<id>` routes until the
+/// adapter binaries productise plugin retrieval.
+pub(crate) type AppDeepRetrieval = MultiProviderRetrieval<
+    Arc<InMemoryRetrieval>,
+    EventLogProviderResolver<cairn_store::InMemoryStore>,
+    UnavailablePluginDispatcher,
+>;
+
 pub(crate) type AppDeepSearch = IterativeDeepSearch<
-    InMemoryRetrieval,
+    AppDeepRetrieval,
     KeywordDecomposer,
     GraphBackedExpansion<Arc<InMemoryGraphStore>>,
 >;
@@ -727,9 +741,17 @@ impl AppState {
             InMemoryRetrieval::with_diagnostics(document_store.clone(), diagnostics.clone())
                 .with_graph(graph.clone()),
         );
+        // RFC 029 PR-B1: wrap the inner retrieval in MultiProviderRetrieval
+        // so every deep-search hop dispatches through the same provider
+        // resolver as the agent's memory_search tool.
+        let deep_search_inner = Arc::new(InMemoryRetrieval::new(document_store.clone()));
         let deep_search = Arc::new(
-            IterativeDeepSearch::new(InMemoryRetrieval::new(document_store.clone()))
-                .with_graph_hook(GraphBackedExpansion::new(graph.clone())),
+            IterativeDeepSearch::new(MultiProviderRetrieval::new(
+                deep_search_inner,
+                EventLogProviderResolver::new(runtime.store.clone()),
+                UnavailablePluginDispatcher,
+            ))
+            .with_graph_hook(GraphBackedExpansion::new(graph.clone())),
         );
         let ingest = Arc::new(IngestPipeline::new(
             document_store.clone(),
