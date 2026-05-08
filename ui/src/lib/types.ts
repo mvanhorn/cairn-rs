@@ -534,7 +534,18 @@ export type FailureClass =
    * rows that leaked because cairn-app crashed between the two
    * phases.
    */
-  | "orphan_child";
+  | "orphan_child"
+  /**
+   * #750: child subagent run terminated because every binding × model
+   * in the routed provider chain failed with fallback-eligible errors.
+   * Distinguishes child-run providers-exhausted terminations from
+   * generic `execution_error`. Top-level (operator-initiated) runs
+   * still suspend in `WaitingApproval` with an `escalate_to_operator`
+   * approval card per #693 R3-B; this class is reserved for child
+   * runs which short-circuit to terminal so G5's `child_completed`
+   * signal fires and the parent's auto-resume can decide what to do.
+   */
+  | "all_providers_exhausted";
 
 /** GET /v1/runs — array of RunRecord */
 export interface RunRecord {

@@ -1895,47 +1895,89 @@ pub(crate) async fn drive_run_iteration(
                         let summary = cairn_providers::redact_secrets(
                             &cairn_orchestrator::format_attempt_summary(attempts),
                         );
-                        // Best-effort: if the approval submission itself fails
-                        // (store-append error, cache issue) we still return 502
-                        // with the inline summary, but we MUST log the drop so
-                        // operators have a trace that no card appeared in the
-                        // tool-call-approvals UI. Never silently discard a
-                        // `store.append`-backed Result.
-                        let proposal_submitted = match super::orchestrate_exhaustion::submit_all_providers_exhausted_proposal(
+                        // #750: child runs (parent_run_id.is_some()) must NOT
+                        // suspend in WaitingApproval — no operator is watching
+                        // their dashboard, the parent is the one waiting on
+                        // them, and the parent's only waitpoint shape is
+                        // `child_completed:<task_id>` which fires from G5's
+                        // terminal hook. Suspending in WaitingApproval leaves
+                        // the parent stuck in waiting_dependency forever (R14b
+                        // dogfood reproducer). Per the #702 doctrine,
+                        // subagents fail loudly upward and the parent's
+                        // resumed iteration decides what to do next (retry,
+                        // escalate, give up).
+                        //
+                        // Skip the approval-card submission for child runs
+                        // too: the card is operator-actionable on a
+                        // suspended run, but we're terminating the child
+                        // here, so the card would attach to a `Failed`
+                        // run and mislead operators about which runs are
+                        // live-actionable. The redacted `summary` is still
+                        // logged at WARN below + folded into the HTTP 502
+                        // body, so operators correlating via run_id keep
+                        // full diagnostic context.
+                        let is_child_run = run.parent_run_id.is_some();
+                        if is_child_run {
+                            tracing::warn!(
+                                run_id = %run.run_id,
+                                parent_run_id = ?run.parent_run_id,
+                                "#750: child run hit providers-exhausted; flipping to terminal Failed (no waiting_approval card) so G5 fires child_completed signal with success=false and the parent can resume"
+                            );
+                            finalize_run_failure(
                                 state.as_ref(),
-                                &run,
-                                &model_id,
-                                attempts,
-                                &summary,
-                            )
-                            .await
-                        {
-                            Ok(()) => true,
-                            Err(err) => {
-                                tracing::error!(
-                                    run_id = %run.run_id,
-                                    error = %err,
-                                    "failed to submit providers-exhausted tool-call approval; operator will not see the card in the UI (HTTP 502 body still carries the summary)"
-                                );
-                                false
-                            }
-                        };
-                        // #693 R3-B: once the escalate_to_operator card is
-                        // durably persisted, flip the run to `WaitingApproval`
-                        // so `GET /v1/runs/:id` reflects the real state
-                        // ("blocked on human to resolve the exhaustion card")
-                        // rather than the misleading `Running`. Only attempt
-                        // when the proposal actually landed — otherwise
-                        // suspending the run would leave it parked on a
-                        // waitpoint with no card for the operator to
-                        // approve/reject, which is worse than the stale
-                        // `running` that the card-less path already produces.
-                        if proposal_submitted {
-                            super::orchestrate_exhaustion::suspend_run_for_providers_exhausted(
-                                state.as_ref(),
-                                &run,
+                                &run.session_id,
+                                &run.run_id,
+                                cairn_domain::FailureClass::AllProvidersExhausted,
                             )
                             .await;
+                        } else {
+                            // Top-level (operator-initiated) run: keep the
+                            // #693 R3-B suspend-in-waiting_approval shape so
+                            // operators see a card in the UI and can rotate
+                            // credentials / top up budget / abort.
+                            //
+                            // Best-effort: if the approval submission itself fails
+                            // (store-append error, cache issue) we still return 502
+                            // with the inline summary, but we MUST log the drop so
+                            // operators have a trace that no card appeared in the
+                            // tool-call-approvals UI. Never silently discard a
+                            // `store.append`-backed Result.
+                            let proposal_submitted = match super::orchestrate_exhaustion::submit_all_providers_exhausted_proposal(
+                                    state.as_ref(),
+                                    &run,
+                                    &model_id,
+                                    attempts,
+                                    &summary,
+                                )
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(err) => {
+                                    tracing::error!(
+                                        run_id = %run.run_id,
+                                        error = %err,
+                                        "failed to submit providers-exhausted tool-call approval; operator will not see the card in the UI (HTTP 502 body still carries the summary)"
+                                    );
+                                    false
+                                }
+                            };
+                            // #693 R3-B: once the escalate_to_operator card is
+                            // durably persisted, flip the run to `WaitingApproval`
+                            // so `GET /v1/runs/:id` reflects the real state
+                            // ("blocked on human to resolve the exhaustion card")
+                            // rather than the misleading `Running`. Only attempt
+                            // when the proposal actually landed — otherwise
+                            // suspending the run would leave it parked on a
+                            // waitpoint with no card for the operator to
+                            // approve/reject, which is worse than the stale
+                            // `running` that the card-less path already produces.
+                            if proposal_submitted {
+                                super::orchestrate_exhaustion::suspend_run_for_providers_exhausted(
+                                    state.as_ref(),
+                                    &run,
+                                )
+                                .await;
+                            }
                         }
                         // SEC-007: `summary` + `a.error_message` are built from
                         // `ProviderAdapterError::to_string()` which for
@@ -1958,9 +2000,26 @@ pub(crate) async fn drive_run_iteration(
                         // `details`. SDK parsers keyed on `code`/`message`
                         // previously saw `null` because the outer object used
                         // `error_code`/`remediation` as peer fields.
-                        let remediation = "One or more of: rotate credentials, top up provider credits, add a provider connection via POST /v1/providers/connections, update system defaults via PUT /v1/settings/defaults/system/brain_model (or generate_model), or edit a connection's `supported_models`. Full per-model failure summary is available in the tool-call-approvals UI.";
+                        //
+                        // #750: child-run remediation differs from top-level
+                        // because no `escalate_to_operator` card is created
+                        // (the child is already terminal `Failed`, so a
+                        // pending card would be misleading). Pointing the
+                        // operator at a UI card that doesn't exist would be
+                        // a worse UX bug than the original
+                        // waiting_dependency hang. Child remediation
+                        // surfaces the parent-resume contract instead so
+                        // operators inspecting the 502 know the child has
+                        // already been recorded as Failed and the parent's
+                        // step_history is the next place to look.
+                        let remediation = if is_child_run {
+                            "Child subagent run terminated with failure_class=all_providers_exhausted. The parent run is auto-resumed and will observe the failure in its step_history; the parent decides whether to retry, escalate, or finish. To investigate provider availability: rotate credentials, top up provider credits, add a provider connection via POST /v1/providers/connections, update system defaults via PUT /v1/settings/defaults/system/brain_model (or generate_model), or edit a connection's `supported_models`. Per-model failure summary is in the server log keyed on run_id."
+                        } else {
+                            "One or more of: rotate credentials, top up provider credits, add a provider connection via POST /v1/providers/connections, update system defaults via PUT /v1/settings/defaults/system/brain_model (or generate_model), or edit a connection's `supported_models`. Full per-model failure summary is available in the tool-call-approvals UI."
+                        };
                         let details = serde_json::json!({
                             "termination": "providers_exhausted",
+                            "is_child_run": is_child_run,
                             "attempts": attempts.iter().map(|a| serde_json::json!({
                                 "model_id": a.model_id,
                                 "reason_code": a.reason_code,

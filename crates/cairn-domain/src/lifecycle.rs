@@ -96,6 +96,20 @@ pub enum FailureClass {
     /// descendant-counter decrement path, releasing the cap slot on
     /// the captured `root_run_id`.
     OrphanChild,
+    /// #750: every provider binding × model in the routed chain failed
+    /// with fallback-eligible errors during a child subagent run. The
+    /// child terminates `Failed` (rather than suspending in
+    /// `WaitingApproval` per #693 R3-B) so G5's `child_completed`
+    /// signal fires with `success=false` and the parent run's
+    /// `drive_run_iteration` resumes with the failure visible in
+    /// `step_history`. Top-level (operator-initiated) runs continue to
+    /// suspend in `WaitingApproval` with an `escalate_to_operator`
+    /// approval card so the operator can rotate credentials, add
+    /// providers, or abort — only child runs short-circuit to terminal
+    /// because no operator is watching their dashboard. See #693
+    /// R3-B for the original waiting_approval transition and #750 for
+    /// the parent-stuck-in-waiting_dependency bug this resolves.
+    AllProvidersExhausted,
 }
 
 /// Canonical pause reasons in v1.

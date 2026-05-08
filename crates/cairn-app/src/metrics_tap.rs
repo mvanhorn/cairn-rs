@@ -362,6 +362,7 @@ fn failure_label(fc: cairn_domain::lifecycle::FailureClass) -> &'static str {
         FailureClass::TerminalWriteDeadlock => "terminal_write_deadlock",
         FailureClass::VerificationRejected => "verification_rejected",
         FailureClass::OrphanChild => "orphan_child",
+        FailureClass::AllProvidersExhausted => "all_providers_exhausted",
     }
 }
 

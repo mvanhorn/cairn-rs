@@ -76,6 +76,11 @@ pub fn failure_class_category(failure_class: FailureClass) -> &'static str {
         // operator may be the one transitioning the leaked `Pending`
         // row to `Failed` via the cancel-orphan endpoint.
         FailureClass::OrphanChild => "execution",
+        // #750: child run terminated because the routed provider chain
+        // ran out of fallback options. Bucketed as `execution` because
+        // the failure is upstream provider availability, not a policy
+        // decision or operator action.
+        FailureClass::AllProvidersExhausted => "execution",
     }
 }
 
@@ -97,6 +102,7 @@ pub fn failure_class_reason(failure_class: FailureClass) -> &'static str {
         FailureClass::TerminalWriteDeadlock => "terminal_write_deadlock",
         FailureClass::VerificationRejected => "verification_rejected",
         FailureClass::OrphanChild => "orphan_child",
+        FailureClass::AllProvidersExhausted => "all_providers_exhausted",
     }
 }
 

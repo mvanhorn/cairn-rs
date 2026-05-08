@@ -42,6 +42,7 @@ export const FAILURE_CLASS_VALUES = [
   "terminal_write_deadlock",
   "verification_rejected",
   "orphan_child",
+  "all_providers_exhausted",
 ] as const satisfies readonly FailureClass[];
 
 // ── Compile-time coverage ────────────────────────────────────────────────────
