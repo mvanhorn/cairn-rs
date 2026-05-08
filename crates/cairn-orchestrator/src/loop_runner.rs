@@ -434,8 +434,44 @@ where
         &self,
         mut ctx: OrchestrationContext,
     ) -> Result<LoopTermination, OrchestratorError> {
+        let started_iteration = ctx.iteration;
         self.emitter.on_started(&ctx).await;
         let result = self.run_inner(&mut ctx).await;
+        // #744 instrumentation: record exactly which `LoopTermination`
+        // variant the loop returned (or which `OrchestratorError` it
+        // propagated), with the start + end iteration counter. Without
+        // this, R13 dogfood evidence on #744 (parent stuck in
+        // state=running after G5 auto-resume) can't distinguish
+        // \"loop returned Continue indefinitely\" from \"loop returned
+        // a terminal that didn't drive the run to terminal\". Logged at
+        // INFO so it shows up on the standard production log level.
+        let kind: &'static str = match &result {
+            Ok(LoopTermination::Completed { .. }) => "completed",
+            Ok(LoopTermination::Failed { .. }) => "failed",
+            Ok(LoopTermination::MaxIterationsReached) => "max_iterations_reached",
+            Ok(LoopTermination::TimedOut) => "timed_out",
+            Ok(LoopTermination::WaitingApproval { .. }) => "waiting_approval",
+            Ok(LoopTermination::WaitingSubagent { .. }) => "waiting_subagent",
+            Ok(LoopTermination::PlanProposed { .. }) => "plan_proposed",
+            Ok(LoopTermination::BreakerTripped { .. }) => "breaker_tripped",
+            Err(_) => "error",
+        };
+        // Log start + end iteration without a derived `iterations_run`.
+        // `ctx.iteration` is only bumped on `Continue`; on terminating
+        // signals (`Completed`, `WaitingSubagent`, etc.) the counter
+        // is the index of the iteration that produced the terminating
+        // action. On `MaxIterationsReached` it's already past the cap.
+        // The two indices are unambiguous in isolation; a synthesised
+        // \"iterations_run\" derived from them would be off-by-one
+        // depending on which terminator fired (Gemini review).
+        tracing::info!(
+            run_id = %ctx.run_id,
+            session_id = %ctx.session_id,
+            kind,
+            started_iteration,
+            ended_iteration = ctx.iteration,
+            "OrchestratorLoop::run returned"
+        );
         // Emit on_finished for every terminal outcome. For the Err branch
         // propagate the underlying OrchestratorError's Display string so
         // dashboards see the real cause (e.g. "decide: model 404",

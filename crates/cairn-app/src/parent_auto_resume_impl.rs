@@ -75,21 +75,35 @@ impl ParentAutoResume for AppStateParentAutoResume {
         // Drive with the parent's persisted defaults (goal,
         // max_iterations, etc.). An empty OrchestrateRequest falls
         // through to those defaults in the helper.
+        //
+        // #744 instrumentation: log at INFO with the resolved HTTP
+        // status from the helper's Response. Pre-fix R13 dogfood
+        // showed the parent stuck in `state=running` after the resume
+        // fired with no observable explanation — these logs let R14
+        // dogfood (or any future operator hitting the same scenario)
+        // distinguish:
+        //   * Ok(200 / 202) — drive_run_iteration ran the loop and
+        //     returned a normal HTTP response. The
+        //     OrchestratorLoop::run log line written by the loop
+        //     itself records the LoopTermination kind.
+        //   * Err(...) — pre-loop early-return (lease expired,
+        //     credentials missing, etc.). The helper's own ERROR /
+        //     WARN logs already explain why; this line adds the
+        //     run-id correlation operators look up first.
         let body = OrchestrateRequest::default();
         match drive_run_iteration(state.clone(), run, body).await {
-            Ok(_response) => {
-                tracing::debug!(
+            Ok(response) => {
+                tracing::info!(
                     run_id = %run_id,
-                    "G5 parent auto-resume: drive_run_iteration completed",
+                    status = %response.status(),
+                    "G5 parent auto-resume: drive_run_iteration returned Ok"
                 );
             }
-            Err(_response) => {
-                // Pre-loop early-return from the helper (lease,
-                // credentials, etc.). Logged by the helper itself;
-                // nothing to do here.
-                tracing::debug!(
+            Err(response) => {
+                tracing::info!(
                     run_id = %run_id,
-                    "G5 parent auto-resume: drive_run_iteration returned pre-loop error",
+                    status = %response.status(),
+                    "G5 parent auto-resume: drive_run_iteration returned pre-loop early-return"
                 );
             }
         }
