@@ -484,3 +484,134 @@ async fn aggressive_heal_env_does_not_regress_happy_path() {
     );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
+
+/// #710 PR-6 regression test: the R12 dogfood scenario.
+///
+/// Pre-PR-5, this scenario (lease starvation + slow terminal FCALL
+/// → execution drifts to `lease_expired_reclaimable`) would land in
+/// the FF#371 "execution_not_eligible" deadlock 5 times in a row
+/// before the loop exhausted and flipped the run to
+/// `Failed(TerminalWriteDeadlock)`. The cairn-side
+/// `f64_terminal_recovery_loop` re-claim path called
+/// `fabric.runs.claim` → `issue_grant_and_claim`, which FF
+/// documented as unrecoverable on that phase.
+///
+/// Post-PR-5 the loop calls
+/// `fabric.runs.reclaim_for_terminal_write` (PR-4 helper) which
+/// composes FF 0.15's `issue_reclaim_grant` +
+/// `reclaim_execution`. Those primitives are explicitly designed
+/// for this phase. The recovery now succeeds: the run reaches
+/// `completed`, the `terminal_write_recovery` annotation carries
+/// `outcome="recovered"`, and the `failure_class` field is
+/// absent.
+///
+/// Why this is a separate test from
+/// `recovery_loop_annotates_run_under_aggressive_lease_starvation`:
+/// that test asserts a disjunction (`recovered` OR `deadlocked`)
+/// because pre-PR-5 the deadlock outcome was the documented
+/// behaviour on FF deployments where the eligibility gate stayed
+/// strict. This test asserts the strict outcome — once PR-5 is
+/// shipped, the deadlock branch is no longer reachable, so any
+/// future regression that re-introduces it lands here as a
+/// failed test, not in the existing test's "either-or" softness.
+#[tokio::test]
+async fn issue_710_aggressive_starvation_now_recovers_via_reclaim_grant() {
+    let h = LiveHarness::setup_with_env(&[("CAIRN_FABRIC_LEASE_TTL_MS", "2000")]).await;
+    let (mock_url, hits) = spawn_mock(3_000).await;
+
+    let suffix = h.project.clone();
+    provision_provider(&h, &suffix, &mock_url).await;
+    let (_session_id, run_id) = provision_session_and_run(&h, &suffix).await;
+
+    let (status, body) = orchestrate(&h, &run_id, "Answer the prompt.").await;
+    let body_str = body.to_string();
+    // Strict guard: post-PR-5, the orchestrate response status is
+    // 200 every time. The existing
+    // `recovery_loop_annotates_run_under_aggressive_lease_starvation`
+    // test allows 409 because pre-PR-5 the deadlock branch could
+    // race the response and produce an idempotency conflict shape;
+    // the reclaim-grant migration removes that branch, so we
+    // assert the strict 200. A future regression that re-introduces
+    // a non-200 response under starvation lands here as a failed
+    // assertion (Gemini SEC: "allowing 409 is too lenient for a
+    // strict regression guard").
+    assert_eq!(
+        status, 200,
+        "#710 PR-6: post-reclaim-grant migration, orchestrate must \
+         return 200 deterministically; got {status}: {body_str}",
+    );
+    assert_eq!(
+        body.get("termination").and_then(|v| v.as_str()),
+        Some("completed"),
+        "#710 PR-6: orchestrate response must signal `completed` \
+         termination; body={body_str}",
+    );
+
+    let run_body = read_run(&h, &run_id).await;
+    let run_body_str = run_body.to_string();
+    let run_field = run_body.get("run").unwrap_or(&run_body);
+    let state = run_field
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // The post-PR-5 contract: the run reaches `completed`. A
+    // `failed` state with `terminal_write_deadlock` would mean
+    // either (a) the reclaim-grant path was reverted, or (b) FF
+    // 0.15's reclaim primitives stopped clearing the
+    // `lease_expired_reclaimable` phase. Either is a regression
+    // worth a loud test failure.
+    assert_eq!(
+        state, "completed",
+        "#710 PR-6: post-reclaim-grant migration, the recovery loop \
+         must clear `lease_expired_reclaimable` deterministically. \
+         Got state={state}; body={run_body_str}"
+    );
+
+    let failure_class = run_field
+        .get("failure_class")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        failure_class.is_empty(),
+        "#710 PR-6: completed run must NOT carry a failure_class; \
+         got failure_class={failure_class}, body={run_body_str}"
+    );
+
+    // If the recovery loop fired (the more interesting branch — a
+    // sufficiently fast machine might dodge starvation entirely
+    // and never enter the loop), the annotation must record the
+    // `recovered` outcome. This is the structural counter-test to
+    // `recovery_loop_annotates_run_under_aggressive_lease_starvation`'s
+    // `deadlocked` branch.
+    if let Some(recovery) = run_field.get("terminal_write_recovery") {
+        let outcome = recovery
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            outcome, "recovered",
+            "#710 PR-6: when the loop fires, outcome MUST be \
+             `recovered`; the `deadlocked` outcome is no longer \
+             reachable post-FF-0.15-reclaim-grant migration. \
+             body={run_body_str}"
+        );
+        let attempts = recovery
+            .get("attempts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert!(
+            attempts >= 1,
+            "#710 PR-6: when the loop fires, attempts must be >= 1; \
+             body={run_body_str}"
+        );
+    }
+
+    // Mock provider was hit at least once. (Fast hosts might serve
+    // a second hit if the loop kicked in; either is valid.)
+    let hit_count = hits.load(Ordering::SeqCst);
+    assert!(
+        hit_count >= 1,
+        "#710 PR-6: provider must have been hit at least once; got {hit_count}",
+    );
+}
