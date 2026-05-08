@@ -28,6 +28,7 @@ use cairn_domain::{
     SessionId, TaskId, TaskResumeTarget, TaskState,
 };
 use cairn_fabric::event_bridge::BridgeEvent;
+use cairn_fabric::services::ReclaimForTerminalWriteOutcome;
 use cairn_fabric::{FabricError, FabricServices};
 use cairn_runtime::error::RuntimeError;
 use cairn_runtime::runs::RunService;
@@ -817,27 +818,58 @@ where
 
     for (step, backoff_ms) in F64_BACKOFF_MS.iter().enumerate() {
         attempts = attempts.saturating_add(1);
+        // Log the attempt BEFORE the backoff sleep so an operator
+        // tailing the log sees the loop progressing even if the
+        // subprocess is SIGKILL'd mid-sleep — without this, the
+        // audit trail jumps from the entry warn straight to the
+        // exhaustion warn with no per-iter breadcrumbs.
+        tracing::info!(
+            run_id = %run_id,
+            fcall,
+            attempt = attempts,
+            step = step + 1,
+            backoff_ms,
+            "F64: starting reclaim attempt after backoff"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(*backoff_ms)).await;
 
-        // Re-claim after backoff. On transient phase conflict, keep
-        // looping; FF may clear the not-eligible phase on the NEXT
-        // scanner cycle. On any other error, short-circuit.
-        match fabric
+        // Reclaim via FF 0.15 issue_reclaim_grant + reclaim_execution
+        // (#710). Three outcomes — Reclaimed (retry FCALL),
+        // NotReclaimable (phase moved on; continue backoff),
+        // CapExceeded (terminal_failed; no recovery).
+        let reclaim_start = std::time::Instant::now();
+        let reclaim_result = fabric
             .runs
-            .claim(project, session_id, run_id)
-            .await
-            .map_err(fabric_err_to_runtime)
-        {
-            Ok(_) => {
-                // Re-claim succeeded; FF minted a fresh lease. Retry
-                // the terminal FCALL.
+            .reclaim_for_terminal_write(project, session_id, run_id)
+            .await;
+        let reclaim_ms = u64::try_from(reclaim_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let outcome_label: &'static str = match &reclaim_result {
+            Ok(ReclaimForTerminalWriteOutcome::Reclaimed(_)) => "reclaimed",
+            Ok(ReclaimForTerminalWriteOutcome::NotReclaimable { .. }) => "not_reclaimable",
+            Ok(ReclaimForTerminalWriteOutcome::CapExceeded { .. }) => "cap_exceeded",
+            Err(_) => "error",
+        };
+        tracing::debug!(
+            run_id = %run_id,
+            fcall,
+            attempt = attempts,
+            outcome = outcome_label,
+            reclaim_ms,
+            "F64: reclaim_for_terminal_write returned"
+        );
+
+        match reclaim_result {
+            Ok(ReclaimForTerminalWriteOutcome::Reclaimed(_record)) => {
+                // Fresh attempt minted; retry the terminal FCALL.
                 tracing::info!(
                     run_id = %run_id,
                     fcall,
                     attempt = attempts,
                     step = step + 1,
                     backoff_ms,
-                    "F64: re-claim succeeded after backoff; retrying terminal FCALL"
+                    reclaim_ms,
+                    "F64: reclaim succeeded; retrying terminal FCALL"
                 );
                 match attempt_fcall().await {
                     Ok(record) => {
@@ -848,7 +880,7 @@ where
                             fcall,
                             attempts,
                             wall_time_ms = wall_ms,
-                            "F64: terminal FCALL recovered after backoff retry"
+                            "F64: terminal FCALL recovered after reclaim"
                         );
                         emit_recovery_attempt(
                             fabric,
@@ -898,30 +930,88 @@ where
                     }
                 }
             }
-            Err(rc_err) if rc_err.is_transient_phase_conflict() => {
+            Ok(ReclaimForTerminalWriteOutcome::NotReclaimable { detail }) => {
+                // Execution moved out of `lease_expired_reclaimable`
+                // between cairn's lease-expired detection and the
+                // grant attempt. Per the helper doc, the right
+                // response is "retry the original FCALL without
+                // reclaim" — but the FCALL already failed once
+                // with lease_expired, so the lease likely is still
+                // gone. Fold this into the existing transient-
+                // phase-conflict path: keep looping; FF may clear
+                // the not-eligible phase on the next scanner cycle.
                 tracing::info!(
                     run_id = %run_id,
                     fcall,
                     attempt = attempts,
                     step = step + 1,
                     backoff_ms,
-                    error = %rc_err,
-                    "F64: re-claim still rejected with transient phase conflict; \
-                     continuing backoff"
+                    detail = %detail,
+                    "F64: reclaim returned NotReclaimable; continuing backoff"
                 );
-                last_err = rc_err;
+                // Preserve the "phase still transient" failure
+                // class on `last_err` so the exhaustion path
+                // surfaces an accurate cause. Reusing
+                // `original_err`'s shape (lease_expired) keeps the
+                // log filter on `last_error` predictable.
+                last_err = clone_runtime_error(original_err);
                 continue;
             }
-            Err(rc_err) => {
-                // Non-transient re-claim error — operator sees the
-                // accurate failure class. Emit recovery-attempted so
-                // the incident is auditable.
+            Ok(ReclaimForTerminalWriteOutcome::CapExceeded { reclaim_count }) => {
+                // FF moved the execution to terminal_failed —
+                // `max_reclaim_count` was hit. No further reclaims
+                // are possible; surface to the operator with a
+                // concrete failure class so the incident is
+                // visible.
                 tracing::error!(
                     run_id = %run_id,
                     fcall,
                     attempt = attempts,
-                    error = %rc_err,
-                    "F64: re-claim failed with non-transient error; exiting loop"
+                    reclaim_count,
+                    "F64: reclaim cap exceeded; execution moved to terminal_failed; \
+                     exiting loop"
+                );
+                let wall_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                emit_recovery_attempt(
+                    fabric,
+                    project,
+                    run_id,
+                    fcall,
+                    attempts,
+                    wall_ms,
+                    "reclaim_cap_exceeded",
+                )
+                .await;
+                return Err(shape_terminal_retry_error(
+                    clone_runtime_error(original_err),
+                    to,
+                ));
+            }
+            Err(rc_err) => {
+                let rc_err_runtime = fabric_err_to_runtime(rc_err);
+                if rc_err_runtime.is_transient_phase_conflict() {
+                    tracing::info!(
+                        run_id = %run_id,
+                        fcall,
+                        attempt = attempts,
+                        step = step + 1,
+                        backoff_ms,
+                        error = %rc_err_runtime,
+                        "F64: reclaim still rejected with transient phase conflict; \
+                         continuing backoff"
+                    );
+                    last_err = rc_err_runtime;
+                    continue;
+                }
+                // Non-transient reclaim error — operator sees the
+                // accurate failure class. Emit recovery-attempted
+                // so the incident is auditable.
+                tracing::error!(
+                    run_id = %run_id,
+                    fcall,
+                    attempt = attempts,
+                    error = %rc_err_runtime,
+                    "F64: reclaim failed with non-transient error; exiting loop"
                 );
                 let wall_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                 emit_recovery_attempt(
@@ -934,10 +1024,7 @@ where
                     "non_transient_reclaim_error",
                 )
                 .await;
-                // Single SEC-007 / F37 shaping path shared with the
-                // retry-side non-transient branch — never leak an
-                // Internal variant's message into the HTTP response.
-                return Err(shape_terminal_retry_error(rc_err, to));
+                return Err(shape_terminal_retry_error(rc_err_runtime, to));
             }
         }
     }
