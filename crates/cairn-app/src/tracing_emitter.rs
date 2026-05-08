@@ -23,15 +23,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cairn_domain::{
     events::{LlmCompletionRecorded, ProviderCallCompleted, RouteDecisionMade},
     providers::{OperationKind, ProviderCallStatus, RouteDecisionStatus},
-    EventEnvelope, EventId, EventSource, LlmCallTrace, ProviderBindingId, ProviderCallId,
-    ProviderConnectionId, ProviderModelId, RouteAttemptId, RouteDecisionId, RuntimeEvent, TaskId,
+    EventEnvelope, EventId, EventSource, ProviderBindingId, ProviderCallId, ProviderConnectionId,
+    ProviderModelId, RouteAttemptId, RouteDecisionId, RuntimeEvent, TaskId,
 };
 use cairn_orchestrator::{DecideOutput, OrchestrationContext};
 use cairn_runtime::telemetry::OtlpExporter;
-use cairn_store::{projections::LlmCallTraceReadModel, EventLog, InMemoryStore};
+use cairn_store::{EventLog, InMemoryStore};
 
-/// Append RouteDecisionMade + ProviderCallCompleted telemetry, export
-/// the provider span via OTLP, and insert an `LlmCallTrace` row.
+/// Append RouteDecisionMade + ProviderCallCompleted telemetry and
+/// export the provider span via OTLP. The downstream
+/// `LlmCallTrace` row is produced by the InMemoryStore's
+/// projection applier (`apply_projection` for
+/// `RuntimeEvent::ProviderCallCompleted`) — this fn does NOT call
+/// `insert_trace` directly to avoid the duplicate-write bug
+/// closed by #741.
 ///
 /// # FK ordering invariant
 ///
@@ -225,20 +230,7 @@ pub(crate) async fn record_decide_trace(
     }
 
     let _ = exporter.export_event(&provider_payload).await;
-
-    let trace = LlmCallTrace {
-        trace_id: call_id,
-        model_id: d.model_id.clone(),
-        prompt_tokens: input_tokens_u,
-        completion_tokens: output_tokens_u,
-        latency_ms: d.latency_ms,
-        cost_micros,
-        session_id: Some(ctx.session_id.clone()),
-        run_id: Some(ctx.run_id.clone()),
-        created_at_ms: now,
-        is_error: false,
-    };
-    let _ = store.insert_trace(trace).await;
+    // No explicit `insert_trace` here — see the function docstring.
 }
 
 /// Issue #668: operator opt-out for chain-of-thought body persistence.
