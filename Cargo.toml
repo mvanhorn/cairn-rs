@@ -23,6 +23,7 @@ members = [
     "crates/cairn-github",
     "crates/cairn-integrations",
     "crates/cairn-fabric",
+    "crates/cairn-knowledge-compliance",
 ]
 resolver = "2"
 
