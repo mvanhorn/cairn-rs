@@ -3340,11 +3340,18 @@ pub struct SandboxCrashRecovered {
 /// recent `initialize` handshake, stored per-project for visibility decisions
 /// and capability-change audit. Intentionally minimal — full capability data
 /// lives in the plugin host's process-state, not in the event log.
+///
+/// RFC 030 reuses this shape for both capability families. `auto_extract`
+/// is meaningful only on memory-family snapshots (maps to
+/// `MemoryProviderCapability.auto_extract`); knowledge-family snapshots
+/// serialize `None`. Handled via `#[serde(default)]` so pre-RFC-030
+/// payloads — all knowledge-family — replay unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedProviderSnapshot {
     /// Plugin-declared id, or `"cairn-default"` for the in-process default.
     pub provider_id: String,
-    /// Whether the provider can accept `knowledge.ingest` calls right now.
+    /// Whether the provider can accept `knowledge.ingest` / `memory.ingest`
+    /// calls right now.
     pub ingest_capable: bool,
     /// Retrieval modes the provider currently supports (subset of
     /// `{"lexical_only", "vector_only", "hybrid"}`).
@@ -3355,6 +3362,14 @@ pub struct ResolvedProviderSnapshot {
     /// owned dimensions (graph_proximity, source_credibility, corroboration)
     /// are never included — the runtime always computes those post-hoc.
     pub scoring_dimensions_surfaced: Vec<String>,
+    /// RFC 030: set to `Some(true)` for memory-family providers that
+    /// auto-extract memories from conversation turns (mem0 post-turn-hook
+    /// style). When true, the runtime suppresses the `memory_store` tool
+    /// from the agent prompt — the agent does not call `memory.ingest`
+    /// explicitly; the provider picks up context on its own. `None` on
+    /// knowledge-family snapshots and on pre-RFC-030 payloads.
+    #[serde(default)]
+    pub auto_extract: Option<bool>,
 }
 
 /// Project configured or re-configured its knowledge provider. Upserts the

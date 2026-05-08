@@ -31,13 +31,33 @@ pub struct VisibilityContext {
     /// which tools are visible, `None` if all of the plugin's tools are allowed.
     pub allowlisted_tools: HashMap<String, Option<HashSet<String>>>,
     /// RFC 029: snapshot of the project's resolved knowledge provider, used
-    /// to gate `memory_store` visibility (hidden when
-    /// `ingest_capable = false`) and to render per-project provider detail
-    /// in operator UI. `None` when the project has not yet been
+    /// for `knowledge_search` routing + per-project provider detail in
+    /// operator UI. `None` when the project has not yet been
     /// configured — the amended RFC 015 filter treats `None` as equivalent
     /// to cairn-default for tool visibility.
+    ///
+    /// Under RFC 030 this slot *only* covers the knowledge family. The
+    /// memory family is a separate slot (`resolved_memory_provider`).
+    /// `memory_store` visibility is now driven by the memory snapshot, not
+    /// this one — see [`crate::events::ResolvedProviderSnapshot::auto_extract`].
     #[serde(default)]
     pub resolved_knowledge_provider: Option<ResolvedProviderSnapshot>,
+    /// RFC 030: snapshot of the project's resolved memory provider. Used
+    /// to gate the `memory_store` built-in (hidden when the backend is
+    /// auto-extract — `auto_extract = Some(true)` — because the provider
+    /// picks up context from conversation turns itself; also hidden when
+    /// `ingest_capable = false` for memory backends that don't accept
+    /// explicit stores). `None` when the project has not been
+    /// configured — treated as equivalent to cairn-default for tool
+    /// visibility.
+    ///
+    /// Serde default: `None`. Pre-RFC-030 payloads lack this field and
+    /// deserialize cleanly — the tool-visibility filter falls back to the
+    /// knowledge-snapshot-based rule when the memory slot is missing, so
+    /// legacy runs see the same `memory_store` visibility they did before
+    /// the split. PR-G lands the producer side (projection → snapshot).
+    #[serde(default)]
+    pub resolved_memory_provider: Option<ResolvedProviderSnapshot>,
 }
 
 // ── Repo Access (RFC 016 §"Access Layer") ────────────────────────────────
@@ -115,6 +135,7 @@ mod tests {
             enabled_plugins: enabled,
             allowlisted_tools: allowed,
             resolved_knowledge_provider: None,
+            resolved_memory_provider: None,
         };
 
         let json = serde_json::to_string(&ctx).unwrap();
@@ -124,8 +145,9 @@ mod tests {
 
     #[test]
     fn visibility_context_serde_back_compat_for_missing_provider_field() {
-        // Legacy payload written before RFC 029 added the field deserializes
-        // with `resolved_knowledge_provider = None` thanks to `#[serde(default)]`.
+        // Legacy payload written before RFC 029 or RFC 030 added their
+        // provider-snapshot fields deserializes with both slots `None`
+        // thanks to `#[serde(default)]`.
         let legacy = r#"{
             "project": {"tenant_id": "t1", "workspace_id": "w1", "project_id": "p1"},
             "run_id": null,
@@ -134,6 +156,29 @@ mod tests {
         }"#;
         let ctx: VisibilityContext = serde_json::from_str(legacy).unwrap();
         assert!(ctx.resolved_knowledge_provider.is_none());
+        assert!(ctx.resolved_memory_provider.is_none());
+    }
+
+    #[test]
+    fn visibility_context_serde_back_compat_for_rfc029_only_payload() {
+        // A run that was in-flight during the RFC-030 rollout may have a
+        // visibility context serialized with the RFC 029 field but without
+        // the RFC 030 memory slot. It must still deserialize.
+        let partial = r#"{
+            "project": {"tenant_id": "t1", "workspace_id": "w1", "project_id": "p1"},
+            "run_id": null,
+            "enabled_plugins": [],
+            "allowlisted_tools": {},
+            "resolved_knowledge_provider": {
+                "provider_id": "cairn-default",
+                "ingest_capable": true,
+                "retrieval_modes": ["hybrid"],
+                "scoring_dimensions_surfaced": ["semantic_relevance"]
+            }
+        }"#;
+        let ctx: VisibilityContext = serde_json::from_str(partial).unwrap();
+        assert!(ctx.resolved_knowledge_provider.is_some());
+        assert!(ctx.resolved_memory_provider.is_none());
     }
 
     #[test]
@@ -144,6 +189,7 @@ mod tests {
             enabled_plugins: HashSet::new(),
             allowlisted_tools: HashMap::new(),
             resolved_knowledge_provider: None,
+            resolved_memory_provider: None,
         };
 
         let access: RepoAccessContext = RepoAccessContext::from(&ctx);

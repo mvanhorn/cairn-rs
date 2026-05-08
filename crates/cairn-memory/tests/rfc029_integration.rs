@@ -392,6 +392,9 @@ fn visibility_context_carries_read_only_snapshot() {
         ingest_capable: false,
         retrieval_modes: vec!["hybrid".into()],
         scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+        // Knowledge-family snapshot — auto_extract only applies to memory
+        // family per RFC 030.
+        auto_extract: None,
     };
     let ctx = VisibilityContext {
         project: proj("a"),
@@ -399,6 +402,7 @@ fn visibility_context_carries_read_only_snapshot() {
         enabled_plugins: HashSet::new(),
         allowlisted_tools: HashMap::new(),
         resolved_knowledge_provider: Some(snap.clone()),
+        resolved_memory_provider: None,
     };
     let got = ctx
         .resolved_knowledge_provider

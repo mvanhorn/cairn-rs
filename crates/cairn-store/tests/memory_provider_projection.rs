@@ -161,12 +161,14 @@ async fn memory_provider_capability_changed_writes_prior_and_current_json() {
         ingest_capable: true,
         retrieval_modes: vec!["vector_only".into()],
         scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+        auto_extract: Some(true),
     };
     let current = ResolvedProviderSnapshot {
         provider_id: "mem0".into(),
         ingest_capable: false,
         retrieval_modes: vec!["vector_only".into()],
         scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+        auto_extract: Some(true),
     };
     log.append(&[evt(
         "e1",

@@ -150,6 +150,10 @@ pub fn snapshot_for_provider_ref(pref: &ProviderRef) -> Option<ResolvedProviderS
                 "staleness_penalty".to_owned(),
                 "recency_of_use".to_owned(),
             ],
+            // RFC 030: cairn-default is the knowledge-family snapshot here —
+            // auto_extract is a memory-family concept. PR-G introduces a
+            // parallel memory-family snapshot for the memory slot.
+            auto_extract: None,
         })
     } else {
         None

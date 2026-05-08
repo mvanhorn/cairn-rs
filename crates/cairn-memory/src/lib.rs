@@ -24,6 +24,7 @@ pub mod import_service_impl;
 pub mod in_memory;
 pub mod ingest;
 pub mod multi_provider;
+pub mod multi_provider_memory;
 #[cfg(feature = "postgres")]
 pub mod pg;
 pub mod pipeline;

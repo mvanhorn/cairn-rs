@@ -337,5 +337,6 @@ fn cairn_default_snapshot_surfaces_expected_dims() {
         ingest_capable: snap.ingest_capable,
         retrieval_modes: snap.retrieval_modes.clone(),
         scoring_dimensions_surfaced: snap.scoring_dimensions_surfaced.clone(),
+        auto_extract: snap.auto_extract,
     };
 }
