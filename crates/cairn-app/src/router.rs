@@ -33,6 +33,7 @@ use crate::bootstrap::shutdown_signal;
 use crate::knowledge_provider_routes;
 use crate::marketplace_routes;
 use crate::repo_routes;
+use crate::scoring_policy_routes;
 use crate::state::AppState;
 use crate::telemetry_routes;
 use crate::trigger_routes;
@@ -1761,6 +1762,11 @@ impl AppBootstrap {
             .route(
                 "/v1/projects/:project/knowledge-provider",
                 put(knowledge_provider_routes::configure_knowledge_provider_handler),
+            )
+            // RFC 029 PR-B2: configure the project's scoring policy.
+            .route(
+                "/v1/projects/:project/scoring-policy",
+                put(scoring_policy_routes::configure_scoring_policy_handler),
             )
             .route(
                 "/v1/projects/:project/repos",

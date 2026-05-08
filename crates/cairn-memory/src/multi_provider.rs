@@ -181,38 +181,96 @@ pub enum ProviderRoute<'a> {
 
 // ─── MultiProviderRetrieval ───────────────────────────────────────────────
 
+/// Hook called after a query response is materialized but before it
+/// reaches the caller. RFC 029 PR-B2 uses this to inject the post-hoc
+/// rescorer (overwriting runtime-owned scoring dimensions + recomputing
+/// the final score). Left as a trait rather than a concrete type so
+/// test sites and future B3+ hooks (e.g. cross-query corroboration)
+/// can compose without reshaping MultiProviderRetrieval.
+#[async_trait]
+pub trait ResponseHook: Send + Sync {
+    async fn apply(&self, response: RetrievalResponse)
+        -> Result<RetrievalResponse, RetrievalError>;
+}
+
+#[async_trait]
+impl<T: ResponseHook + ?Sized> ResponseHook for std::sync::Arc<T> {
+    async fn apply(
+        &self,
+        response: RetrievalResponse,
+    ) -> Result<RetrievalResponse, RetrievalError> {
+        (**self).apply(response).await
+    }
+}
+
+/// No-op hook — leaves the response unchanged. Default for
+/// `MultiProviderRetrieval::new`; callers wire a real hook via
+/// [`MultiProviderRetrieval::with_response_hook`].
+pub struct NoOpResponseHook;
+
+#[async_trait]
+impl ResponseHook for NoOpResponseHook {
+    async fn apply(
+        &self,
+        response: RetrievalResponse,
+    ) -> Result<RetrievalResponse, RetrievalError> {
+        Ok(response)
+    }
+}
+
 /// Dispatching [`RetrievalService`] that routes each query to the project's
 /// configured provider.
 ///
 /// Generic over the in-process default implementation type (`R`) where `R:
 /// Deref<Target: RetrievalService>`, the resolver (`P: ProviderResolver`),
-/// and the dispatcher (`D: KnowledgePluginDispatcher`). The Deref bound
-/// accepts both `Arc<ConcreteRetrieval>` and `Arc<dyn RetrievalService>`
-/// directly without an extra indirection — call sites pass the same
-/// `Arc<…>` they already hold.
-pub struct MultiProviderRetrieval<R, P, D> {
+/// the dispatcher (`D: KnowledgePluginDispatcher`), and an optional
+/// response hook (`H: ResponseHook`). The Deref bound accepts both
+/// `Arc<ConcreteRetrieval>` and `Arc<dyn RetrievalService>` directly
+/// without an extra indirection — call sites pass the same `Arc<…>` they
+/// already hold.
+pub struct MultiProviderRetrieval<R, P, D, H = NoOpResponseHook> {
     default: R,
     resolver: P,
     dispatcher: D,
+    hook: H,
 }
 
-impl<R, P, D> MultiProviderRetrieval<R, P, D> {
+impl<R, P, D> MultiProviderRetrieval<R, P, D, NoOpResponseHook> {
     pub fn new(default: R, resolver: P, dispatcher: D) -> Self {
         Self {
             default,
             resolver,
             dispatcher,
+            hook: NoOpResponseHook,
+        }
+    }
+}
+
+impl<R, P, D, H> MultiProviderRetrieval<R, P, D, H> {
+    /// RFC 029 PR-B2: wire the post-hoc rescorer (or any other
+    /// response-shaping hook) so every response — cairn-default or
+    /// plugin — flows through it before reaching the caller. The
+    /// runtime-owned dimension contract depends on this being applied
+    /// unconditionally to every route; there is no "skip the rescorer
+    /// on cairn-default" path.
+    pub fn with_response_hook<H2>(self, hook: H2) -> MultiProviderRetrieval<R, P, D, H2> {
+        MultiProviderRetrieval {
+            default: self.default,
+            resolver: self.resolver,
+            dispatcher: self.dispatcher,
+            hook,
         }
     }
 }
 
 #[async_trait]
-impl<R, P, D> RetrievalService for MultiProviderRetrieval<R, P, D>
+impl<R, P, D, H> RetrievalService for MultiProviderRetrieval<R, P, D, H>
 where
     R: std::ops::Deref + Send + Sync,
     R::Target: RetrievalService,
     P: ProviderResolver,
     D: KnowledgePluginDispatcher,
+    H: ResponseHook,
 {
     async fn query(&self, query: RetrievalQuery) -> Result<RetrievalResponse, RetrievalError> {
         let pref = self
@@ -221,8 +279,8 @@ where
             .await
             .map_err(|e| RetrievalError::Internal(e.to_string()))?;
 
-        match parse_provider_ref(&pref) {
-            ProviderRoute::CairnDefault => self.default.query(query).await,
+        let response = match parse_provider_ref(&pref) {
+            ProviderRoute::CairnDefault => self.default.query(query).await?,
             ProviderRoute::Plugin(plugin_id) => {
                 let plugin_id_owned = plugin_id.to_owned();
                 let params: KnowledgeQueryParams = query.into();
@@ -240,13 +298,17 @@ where
                         KnowledgePluginError::PluginError(msg) => RetrievalError::Internal(msg),
                         KnowledgePluginError::Internal(msg) => RetrievalError::Internal(msg),
                     })?;
-                Ok(wire_result.into())
+                wire_result.into()
             }
-            ProviderRoute::Unknown(raw) => Err(RetrievalError::ProviderUnavailable {
-                provider: raw.to_owned(),
-                reason: "unrecognised provider_ref shape".to_owned(),
-            }),
-        }
+            ProviderRoute::Unknown(raw) => {
+                return Err(RetrievalError::ProviderUnavailable {
+                    provider: raw.to_owned(),
+                    reason: "unrecognised provider_ref shape".to_owned(),
+                });
+            }
+        };
+
+        self.hook.apply(response).await
     }
 }
 

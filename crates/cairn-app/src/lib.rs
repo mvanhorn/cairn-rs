@@ -29,6 +29,7 @@ pub mod repo_routes;
 pub mod router;
 pub mod sandbox;
 pub mod sandbox_f65_bridges;
+pub mod scoring_policy_routes;
 pub mod sse_hooks;
 pub mod state;
 pub mod subagent_steps;

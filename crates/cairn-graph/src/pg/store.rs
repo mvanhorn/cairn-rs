@@ -362,6 +362,62 @@ impl GraphQueryService for PgGraphStore {
 
         Ok(None)
     }
+
+    /// RFC 029 PR-B2: batched neighbor lookup. One `WHERE source_node_id
+    /// = ANY($1) OR target_node_id = ANY($1)` query returns every
+    /// adjacent edge for the entire input batch in a single round-trip;
+    /// results are then regrouped per input id so the caller sees the
+    /// same `(id, Vec<GraphEdge>)` shape the default impl provides.
+    /// Self-loops appear once in the owning bucket (the default impl
+    /// elsewhere preserves this invariant).
+    async fn multi_neighbors(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, Vec<GraphEdge>)>, GraphQueryError> {
+        use std::collections::{HashMap, HashSet};
+
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<EdgeRow> = sqlx::query_as(
+            "SELECT source_node_id, target_node_id, kind, created_at
+               FROM graph_edges
+              WHERE source_node_id = ANY($1) OR target_node_id = ANY($1)",
+        )
+        .bind(node_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| GraphQueryError::StorageError(e.to_string()))?;
+
+        let wanted: HashSet<&str> = node_ids.iter().map(String::as_str).collect();
+        let mut per_id: HashMap<String, Vec<GraphEdge>> =
+            node_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
+
+        for row in rows {
+            let edge = row.into_graph_edge();
+            let src_wanted = wanted.contains(edge.source_node_id.as_str());
+            let tgt_wanted = wanted.contains(edge.target_node_id.as_str());
+            if src_wanted {
+                if let Some(bucket) = per_id.get_mut(&edge.source_node_id) {
+                    bucket.push(edge.clone());
+                }
+            }
+            if tgt_wanted && edge.source_node_id != edge.target_node_id {
+                if let Some(bucket) = per_id.get_mut(&edge.target_node_id) {
+                    bucket.push(edge.clone());
+                }
+            }
+        }
+
+        // `.get().cloned()` rather than `.remove()` so duplicate input
+        // ids still map to the same edge list (remove would return
+        // `None` on the second occurrence).
+        Ok(node_ids
+            .iter()
+            .map(|id| (id.clone(), per_id.get(id).cloned().unwrap_or_default()))
+            .collect())
+    }
 }
 
 impl PgGraphStore {

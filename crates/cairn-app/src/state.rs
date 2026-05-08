@@ -47,6 +47,7 @@ use cairn_memory::in_memory::{InMemoryDocumentStore, InMemoryRetrieval};
 use cairn_memory::ingest::SourceType;
 use cairn_memory::multi_provider::MultiProviderRetrieval;
 use cairn_memory::pipeline::{IngestPipeline, ParagraphChunker};
+use cairn_memory::post_hoc_rescorer::{NoOpCredibilityLookup, PostHocRescorer};
 
 use cairn_runtime::startup::ReadinessState;
 use cairn_runtime::{
@@ -78,10 +79,16 @@ pub const DEFAULT_PROJECT_ID: &str = "default_project";
 /// backend hold the resolver reads from; the placeholder dispatcher
 /// surfaces `ProviderUnavailable` for `plugin:<id>` routes until the
 /// adapter binaries productise plugin retrieval.
+///
+/// RFC 029 PR-B2: every hop goes through `PostHocRescorer` so the
+/// quality gate sees runtime-owned scoring dimensions (not the
+/// provider's), matching the contract the agent-level memory tool
+/// sees through the same rescorer.
 pub(crate) type AppDeepRetrieval = MultiProviderRetrieval<
     Arc<InMemoryRetrieval>,
     EventLogProviderResolver<cairn_store::InMemoryStore>,
     UnavailablePluginDispatcher,
+    PostHocRescorer<Arc<InMemoryGraphStore>, NoOpCredibilityLookup>,
 >;
 
 pub(crate) type AppDeepSearch = IterativeDeepSearch<
@@ -744,13 +751,20 @@ impl AppState {
         // RFC 029 PR-B1: wrap the inner retrieval in MultiProviderRetrieval
         // so every deep-search hop dispatches through the same provider
         // resolver as the agent's memory_search tool.
+        // RFC 029 PR-B2: attach PostHocRescorer so hops see runtime-owned
+        // scoring dimensions; the deep-search quality gate's threshold
+        // compares the rescored `score`, not the provider's raw score.
         let deep_search_inner = Arc::new(InMemoryRetrieval::new(document_store.clone()));
+        let deep_search_rescorer = PostHocRescorer::new(graph.clone(), NoOpCredibilityLookup);
         let deep_search = Arc::new(
-            IterativeDeepSearch::new(MultiProviderRetrieval::new(
-                deep_search_inner,
-                EventLogProviderResolver::new(runtime.store.clone()),
-                UnavailablePluginDispatcher,
-            ))
+            IterativeDeepSearch::new(
+                MultiProviderRetrieval::new(
+                    deep_search_inner,
+                    EventLogProviderResolver::new(runtime.store.clone()),
+                    UnavailablePluginDispatcher,
+                )
+                .with_response_hook(deep_search_rescorer),
+            )
             .with_graph_hook(GraphBackedExpansion::new(graph.clone())),
         );
         let ingest = Arc::new(IngestPipeline::new(

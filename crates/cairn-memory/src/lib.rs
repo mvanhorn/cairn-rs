@@ -28,8 +28,10 @@ pub mod multi_provider;
 pub mod pg;
 pub mod pipeline;
 pub mod plugin_bridge;
+pub mod post_hoc_rescorer;
 pub mod reranking;
 pub mod retrieval;
+pub mod scoring_policy_validator;
 pub mod services;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;

@@ -1273,18 +1273,30 @@ async fn real_main() {
     // directly. Plugin providers (`plugin:<id>`) surface as
     // `ProviderUnavailable` until the adapter binaries productise the
     // dispatcher; there is no silent fallback.
+    //
+    // RFC 029 PR-B2: every response flows through `PostHocRescorer` so
+    // runtime-owned scoring dimensions come from cairn regardless of
+    // provider. The rescorer uses `multi_neighbors` for batched graph
+    // lookups and `NoOpCredibilityLookup` as the credibility source
+    // (threading `InMemoryDiagnostics` is deferred until that read
+    // model exposes a batched `list_by_source_ids` surface).
     {
         use cairn_memory::event_log_resolver::{
             EventLogProviderResolver, UnavailablePluginDispatcher,
         };
         use cairn_memory::multi_provider::{MultiProviderIngest, MultiProviderRetrieval};
+        use cairn_memory::post_hoc_rescorer::{NoOpCredibilityLookup, PostHocRescorer};
         use cairn_memory::{retrieval::RetrievalService, IngestService};
         let store = lib_state.runtime.store.clone();
-        let retrieval = Arc::new(MultiProviderRetrieval::new(
-            lib_state.retrieval.clone(),
-            EventLogProviderResolver::new(store.clone()),
-            UnavailablePluginDispatcher,
-        )) as Arc<dyn RetrievalService>;
+        let rescorer = PostHocRescorer::new(lib_state.graph.clone(), NoOpCredibilityLookup);
+        let retrieval = Arc::new(
+            MultiProviderRetrieval::new(
+                lib_state.retrieval.clone(),
+                EventLogProviderResolver::new(store.clone()),
+                UnavailablePluginDispatcher,
+            )
+            .with_response_hook(rescorer),
+        ) as Arc<dyn RetrievalService>;
         let ingest = Arc::new(MultiProviderIngest::new(
             lib_state.ingest.clone(),
             EventLogProviderResolver::new(store),

@@ -365,6 +365,47 @@ impl GraphQueryService for InMemoryGraphStore {
             edge_filter,
         ))
     }
+
+    /// RFC 029 PR-B2: single-pass batched neighbor lookup. Walks the
+    /// edge list once and indexes matches by node id using a HashSet of
+    /// requested ids. O(|edges| + |node_ids|) total instead of
+    /// O(|edges| * |node_ids|) the default `neighbors`-per-id loop.
+    async fn multi_neighbors(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, Vec<GraphEdge>)>, GraphQueryError> {
+        use std::collections::{HashMap, HashSet};
+        let wanted: HashSet<&str> = node_ids.iter().map(|s| s.as_str()).collect();
+        let mut per_id: HashMap<String, Vec<GraphEdge>> =
+            node_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
+        let edges = self.edges.lock().unwrap();
+        for edge in edges.iter() {
+            if wanted.contains(edge.source_node_id.as_str()) {
+                if let Some(bucket) = per_id.get_mut(&edge.source_node_id) {
+                    bucket.push(edge.clone());
+                }
+            }
+            // Only append to the target bucket when source != target to
+            // avoid double-counting self-loops.
+            if edge.source_node_id != edge.target_node_id
+                && wanted.contains(edge.target_node_id.as_str())
+            {
+                if let Some(bucket) = per_id.get_mut(&edge.target_node_id) {
+                    bucket.push(edge.clone());
+                }
+            }
+        }
+        // `.get().cloned()` rather than `.remove()` so duplicate input
+        // ids still map to the same edge list (remove would return
+        // `None` on the second occurrence and drop edges silently).
+        Ok(node_ids
+            .iter()
+            .map(|id| {
+                let edges = per_id.get(id).cloned().unwrap_or_default();
+                (id.clone(), edges)
+            })
+            .collect())
+    }
 }
 
 /// BFS bidirectional: follow edges in both directions from root, optionally filtered by edge kind.
@@ -733,6 +774,13 @@ impl GraphQueryService for std::sync::Arc<InMemoryGraphStore> {
         )
         .await
     }
+
+    async fn multi_neighbors(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, Vec<crate::projections::GraphEdge>)>, GraphQueryError> {
+        GraphQueryService::multi_neighbors(self.as_ref(), node_ids).await
+    }
 }
 
 #[cfg(test)]
@@ -1007,6 +1055,59 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].target_node_id, "b");
         assert_eq!(edges[0].kind, EdgeKind::Triggered);
+    }
+
+    #[tokio::test]
+    async fn multi_neighbors_batches_lookups_and_preserves_input_order() {
+        // RFC 029 PR-B2: the chain graph has `a→b→c→d`. Looking up
+        // `[b, a, d, missing]` should return:
+        //   b: incoming (a→b) + outgoing (b→c)
+        //   a: outgoing (a→b)
+        //   d: incoming (c→d)
+        //   missing: empty
+        // In that exact order.
+        let store = build_chain_graph().await;
+        let ids = vec![
+            "b".to_owned(),
+            "a".to_owned(),
+            "d".to_owned(),
+            "missing".to_owned(),
+        ];
+        let out = store.multi_neighbors(&ids).await.unwrap();
+        assert_eq!(out.len(), 4);
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["b", "a", "d", "missing"]);
+
+        let by_id: std::collections::HashMap<String, Vec<GraphEdge>> = out.into_iter().collect();
+        let b_edges = &by_id["b"];
+        assert_eq!(b_edges.len(), 2, "b has one in (a→b) and one out (b→c)");
+        let a_edges = &by_id["a"];
+        assert_eq!(a_edges.len(), 1);
+        assert_eq!(a_edges[0].target_node_id, "b");
+        let d_edges = &by_id["d"];
+        assert_eq!(d_edges.len(), 1);
+        assert_eq!(d_edges[0].source_node_id, "c");
+        assert!(by_id["missing"].is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_neighbors_empty_input_returns_empty_output() {
+        let store = Arc::new(InMemoryGraphStore::new());
+        let out = store.multi_neighbors(&[]).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_neighbors_duplicate_input_ids_keep_edges_for_both_slots() {
+        // Defensive shape: a caller that passes `["b", "b"]` must see
+        // `b`'s edges appear in both output slots, not in the first
+        // only (which `.remove()` would have produced).
+        let store = build_chain_graph().await;
+        let ids = vec!["b".to_owned(), "b".to_owned()];
+        let out = store.multi_neighbors(&ids).await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].1.len(), 2);
+        assert_eq!(out[1].1.len(), 2, "duplicate id must not lose edges");
     }
 
     #[tokio::test]
