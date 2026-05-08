@@ -209,11 +209,28 @@ impl FabricConfig {
                         .collect()
                 })
                 .unwrap_or_default();
-        // HMAC secret: hex-encoded 32-byte key. No default — operators must
-        // opt in explicitly. Validation enforces shape in `validate()`.
-        let waitpoint_hmac_secret = std::env::var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET")
-            .ok()
-            .filter(|s| !s.is_empty());
+        // HMAC secret: 32-byte key. No default — operators must opt
+        // in explicitly. Accepts either 64-char lowercase hex OR a
+        // STANDARD-alphabet base64 string that decodes to 32 bytes
+        // (typically 44 chars with padding) — matching the shape
+        // accepted by `CAIRN_CREDENTIAL_KEY` (#742). The decoded
+        // bytes are re-encoded to hex here so the rest of the
+        // pipeline (validate, boot, FF `seed_waitpoint_hmac_secret`)
+        // continues to see only the hex form FF persists.
+        let waitpoint_hmac_secret = match std::env::var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET") {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(parse_32_byte_secret_to_hex(
+                        trimmed,
+                        "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET",
+                    )?)
+                }
+            }
+            Err(_) => None,
+        };
         let waitpoint_hmac_kid = std::env::var("CAIRN_FABRIC_WAITPOINT_HMAC_KID")
             .ok()
             .filter(|s| !s.is_empty());
@@ -415,14 +432,21 @@ impl FabricConfig {
                     .into(),
             ));
         }
-        // HMAC secret: if supplied, MUST be exactly 64 hex chars (256-bit
-        // key). Fail loud — a truncated or mis-encoded secret produces an
-        // opaque HMAC failure at runtime that's painful to diagnose.
+        // HMAC secret: if supplied, MUST be exactly 64 hex chars
+        // (32 raw bytes) at this layer. `FabricConfig::from_env`
+        // accepts hex OR base64 and normalises base64 to hex before
+        // populating this field (#742); a caller constructing
+        // FabricConfig directly (e.g. tests) MUST supply hex. Fail
+        // loud — a truncated or mis-encoded secret produces an
+        // opaque HMAC failure at runtime that's painful to
+        // diagnose.
         if let Some(secret) = &self.waitpoint_hmac_secret {
             if secret.len() != 64 {
                 return Err(FabricError::Config(format!(
                     "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET must be 64 hex chars (32 bytes), got {}. \
-                     Generate a fresh secret with `openssl rand -hex 32`.",
+                     Generate a fresh secret with `openssl rand -hex 32` (or any 32-byte \
+                     base64 — `from_env` normalises). Direct FabricConfig construction \
+                     requires hex.",
                     secret.len()
                 )));
             }
@@ -666,6 +690,62 @@ fn redact_url_for_error(url: &url::Url) -> String {
 }
 
 const INSTANCE_ID_FILE: &str = "/tmp/cairn-fabric-instance-id";
+
+/// #742: parse a 32-byte secret env value as either hex or base64
+/// and return the canonical lowercase-hex form.
+///
+/// Mirrors the shape `MasterKey::decode_material` in cairn-runtime
+/// already accepts for `CAIRN_CREDENTIAL_KEY`. The two adjacent
+/// secret env vars now share an identical input contract:
+///
+///   * 64-char lowercase hex  →  32 bytes
+///   * STANDARD-alphabet base64 (typically 44 chars with padding) →  32 bytes
+///
+/// Returns the lowercase hex form so callers downstream (FF
+/// `seed_waitpoint_hmac_secret`, validate(), etc.) keep seeing the
+/// canonical hex shape they already expect.
+fn parse_32_byte_secret_to_hex(value: &str, var_name: &str) -> Result<String, FabricError> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+
+    // Hex path: 64 lowercase hex chars. Match the case-insensitive
+    // hex test from `decode_material` so an operator who pasted an
+    // uppercase-hex secret isn't bounced to the (correct but
+    // confusing) base64 branch.
+    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Re-encode lowercase to canonicalise. `hex::decode` already
+        // accepts both cases; the only normalising work is the
+        // lowercase form FF expects.
+        let bytes = hex::decode(value).map_err(|_| {
+            FabricError::Config(format!(
+                "{var_name}: 64-char hex value failed to decode (non-hex digit). \
+                 Generate a fresh secret with `openssl rand -hex 32`.",
+            ))
+        })?;
+        return Ok(hex::encode(bytes));
+    }
+
+    // Base64 path. STANDARD alphabet, padding required.
+    if let Ok(decoded) = STANDARD.decode(value) {
+        if decoded.len() == 32 {
+            return Ok(hex::encode(decoded));
+        }
+        return Err(FabricError::Config(format!(
+            "{var_name}: base64 decoded to {} bytes, expected 32. \
+             Generate a fresh secret with `openssl rand -base64 32` \
+             or `openssl rand -hex 32`.",
+            decoded.len(),
+        )));
+    }
+
+    Err(FabricError::Config(format!(
+        "{var_name}: expected 32 raw bytes — either 64-char lowercase hex or a \
+         STANDARD-alphabet base64 string that decodes to 32 bytes (typically 44 \
+         chars with padding). Got {} characters that match neither form. \
+         Generate a fresh secret with `openssl rand -hex 32` or `openssl rand -base64 32`.",
+        value.len(),
+    )))
+}
 
 fn load_or_generate_instance_id() -> String {
     if let Ok(id) = std::fs::read_to_string(INSTANCE_ID_FILE) {
@@ -1466,6 +1546,118 @@ mod tests {
             err.contains("openssl rand -hex 32"),
             "expected remediation hint naming the openssl command, got {err}"
         );
+    }
+
+    // ── #742: from_env normalises hex OR base64 secrets to canonical hex ───
+
+    /// Hex 64-char goes through unchanged (canonical lowercase form).
+    #[test]
+    fn from_env_accepts_hex_hmac_secret() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://localhost:6379");
+        // Clearly-fake repeating-nibble pattern so secret scanners
+        // (GitGuardian, etc.) don't false-positive on this test
+        // fixture. The validator only cares about length + hex
+        // charset shape, not entropy.
+        let hex_secret = "deadbeef".repeat(8);
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET", &hex_secret);
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "k1");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(
+            config.waitpoint_hmac_secret.as_deref(),
+            Some(hex_secret.as_str()),
+            "valid hex passes through unchanged"
+        );
+        assert!(config.validate().is_ok());
+
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET");
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID");
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    /// #742: base64 32-byte secret gets normalised to hex so the rest
+    /// of the pipeline (validate, FF seed) sees the canonical form.
+    #[test]
+    fn from_env_normalises_base64_hmac_secret_to_hex() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://localhost:6379");
+        // 32 zero bytes → predictable hex output for the assertion.
+        let base64_secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET", base64_secret);
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "k1");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(
+            config.waitpoint_hmac_secret.as_deref(),
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            "base64-decoded 32 zero bytes re-encoded as lowercase hex",
+        );
+        assert!(
+            config.validate().is_ok(),
+            "normalised hex passes the existing validate() shape check"
+        );
+
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET");
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID");
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    /// #742: a base64 string that decodes to the WRONG number of
+    /// bytes is rejected with a clear, actionable error message.
+    #[test]
+    fn from_env_rejects_base64_decoding_to_wrong_byte_count() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://localhost:6379");
+        // 16 zero bytes → 24-char base64. Decodes valid, wrong size.
+        std::env::set_var(
+            "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET",
+            "AAAAAAAAAAAAAAAAAAAAAA==",
+        );
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "k1");
+
+        let err = FabricConfig::from_env().unwrap_err().to_string();
+        assert!(
+            err.contains("base64 decoded to 16 bytes, expected 32"),
+            "error must name the actual byte count from the decode; got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand"),
+            "error must include a remediation hint; got: {err}"
+        );
+
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET");
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID");
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    /// #742: a value that's neither hex nor valid base64 is rejected
+    /// with an error that names BOTH accepted shapes.
+    #[test]
+    fn from_env_rejects_secret_that_is_neither_hex_nor_base64() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://localhost:6379");
+        // 33 chars that aren't valid base64 (contains spaces) and
+        // don't match the 64-char hex shape.
+        std::env::set_var(
+            "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET",
+            "this is definitely not a secret  ",
+        );
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "k1");
+
+        let err = FabricConfig::from_env().unwrap_err().to_string();
+        assert!(
+            err.contains("hex") && err.contains("base64"),
+            "error must name BOTH accepted shapes; got: {err}"
+        );
+
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET");
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID");
+        std::env::remove_var("CAIRN_FABRIC_URL");
     }
 
     // ── Issue #631 regression tests: every validate() error names the

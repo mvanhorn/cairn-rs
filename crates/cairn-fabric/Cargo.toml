@@ -138,6 +138,14 @@ testcontainers-modules = { version = "0.11", features = ["postgres"], optional =
 # cairn does NOT opt into `url`'s `serde` feature (verified via
 # `cargo tree -p cairn-fabric -e features | grep url`).
 url = "2"
+# #742: secret-shape converger. `CAIRN_FABRIC_WAITPOINT_HMAC_SECRET`
+# now accepts hex OR base64 (matching `CAIRN_CREDENTIAL_KEY` in
+# cairn-runtime), normalising to hex internally before passing to
+# FF's `seed_waitpoint_hmac_secret`. Both crates already pull these
+# transitively (via FF / sqlx); making them direct deps keeps the
+# import path unconditional and explicit.
+base64 = "0.22"
+hex = "0.4"
 
 [dev-dependencies]
 # `cairn-fabric` self dev-dep REMOVED intentionally. Previously this
