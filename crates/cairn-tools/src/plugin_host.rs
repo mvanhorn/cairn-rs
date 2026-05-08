@@ -136,6 +136,20 @@ impl StdioPluginHost {
             )));
         }
 
+        // RFC 030: reject plugins that straddle both provider families
+        // (`memory_provider` + `knowledge_provider`) in the same
+        // `capabilities[]` array. The two families have divergent semantics
+        // (episodic vs curated, auto-extract vs explicit ingest, different
+        // post-hoc rescorer paths) and the runtime routes on family, so a
+        // single plugin cannot be both. Failing here keeps misconfigured
+        // adapters from silently registering in the wrong slot downstream.
+        if let Err(msg) =
+            crate::handshake_validator::reject_dual_provider_families(&result.capabilities)
+        {
+            managed.state = PluginState::Failed;
+            return Err(PluginHostError::HandshakeFailed(msg));
+        }
+
         // RFC 007: warn if any capability declared in the manifest is absent from
         // the initialize response. This is non-fatal — the plugin is still marked
         // Ready, but the mismatch is surfaced for operator visibility.

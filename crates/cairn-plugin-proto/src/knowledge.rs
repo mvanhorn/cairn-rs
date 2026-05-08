@@ -102,14 +102,19 @@ pub enum RetrievalModeWire {
 
 /// Supported source type on the wire. Mirrors
 /// `cairn_memory::ingest::SourceType` with matching serde.
+///
+/// RFC 030 collapsed the earlier `JsonStructured` duplicate variant into
+/// [`SourceTypeWire::StructuredJson`]; the `"json_structured"` wire alias is
+/// still accepted on deserialisation via serde alias for back-compat with
+/// messages emitted by pre-RFC-030 adapters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceTypeWire {
     PlainText,
     Markdown,
     Html,
+    #[serde(alias = "json_structured")]
     StructuredJson,
-    JsonStructured,
     KnowledgePack,
 }
 

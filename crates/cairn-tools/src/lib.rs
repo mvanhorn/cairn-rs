@@ -5,6 +5,7 @@ pub mod builtins;
 pub mod execution_class;
 pub mod executor;
 pub mod graph_events;
+pub mod handshake_validator;
 pub mod hooks;
 pub mod invocation;
 pub mod knowledge_dispatcher;

@@ -65,8 +65,14 @@ impl From<SourceType> for SourceTypeWire {
             SourceType::PlainText => Self::PlainText,
             SourceType::Markdown => Self::Markdown,
             SourceType::Html => Self::Html,
-            SourceType::StructuredJson => Self::StructuredJson,
-            SourceType::JsonStructured => Self::JsonStructured,
+            // RFC 030 collapsed the wire-side duplicate; the in-process
+            // `SourceType::JsonStructured` and `::StructuredJson` both map
+            // to the single `SourceTypeWire::StructuredJson`. The distinction
+            // between them is a parser-stage detail that never needed to cross
+            // the plugin boundary. Back-compat: wire messages carrying
+            // `"json_structured"` deserialise via serde alias (see
+            // `SourceTypeWire` in cairn-plugin-proto).
+            SourceType::StructuredJson | SourceType::JsonStructured => Self::StructuredJson,
             SourceType::KnowledgePack => Self::KnowledgePack,
         }
     }
@@ -79,7 +85,6 @@ impl From<SourceTypeWire> for SourceType {
             SourceTypeWire::Markdown => Self::Markdown,
             SourceTypeWire::Html => Self::Html,
             SourceTypeWire::StructuredJson => Self::StructuredJson,
-            SourceTypeWire::JsonStructured => Self::JsonStructured,
             SourceTypeWire::KnowledgePack => Self::KnowledgePack,
         }
     }
@@ -381,13 +386,30 @@ mod tests {
             SourceType::Markdown,
             SourceType::Html,
             SourceType::StructuredJson,
-            SourceType::JsonStructured,
             SourceType::KnowledgePack,
         ] {
             let wire: SourceTypeWire = t.into();
             let back: SourceType = wire.into();
             assert_eq!(t, back);
         }
+    }
+
+    #[test]
+    fn json_structured_collapses_into_structured_json_on_the_wire() {
+        // RFC 030: `SourceType::JsonStructured` (in-process parser stage) and
+        // `SourceType::StructuredJson` both serialize to
+        // `SourceTypeWire::StructuredJson`. The distinction is a parser-stage
+        // detail that never needed to cross the plugin boundary.
+        let wire: SourceTypeWire = SourceType::JsonStructured.into();
+        assert_eq!(wire, SourceTypeWire::StructuredJson);
+    }
+
+    #[test]
+    fn legacy_json_structured_wire_literal_still_deserialises() {
+        // Back-compat: pre-RFC-030 adapters that emit `"json_structured"`
+        // on the wire must still deserialize cleanly via serde alias.
+        let v: SourceTypeWire = serde_json::from_str("\"json_structured\"").unwrap();
+        assert_eq!(v, SourceTypeWire::StructuredJson);
     }
 
     #[test]

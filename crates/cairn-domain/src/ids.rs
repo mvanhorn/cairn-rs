@@ -76,7 +76,11 @@ define_id!(DecisionId);
 define_id!(EvalRunId);
 define_id!(EventId);
 define_id!(IngestJobId);
-define_id!(KnowledgeDocumentId);
+// RFC 030: family-neutral document ID used across memory and knowledge wire
+// types. `KnowledgeDocumentId` is retained as a back-compat alias so event
+// variants + persisted types continue to compile and serialize identically.
+define_id!(DocumentId);
+pub type KnowledgeDocumentId = DocumentId;
 define_id!(KnowledgePackId);
 define_id!(MailboxMessageId);
 define_id!(OperatorId);
