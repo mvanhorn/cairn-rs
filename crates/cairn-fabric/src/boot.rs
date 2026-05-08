@@ -195,7 +195,7 @@ impl FabricRuntime {
         let seed_outcome = backend
             .seed_waitpoint_hmac_secret(SeedWaitpointHmacSecretArgs::new(kid, secret))
             .await
-            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+            .map_err(|e| reshape_seed_error(e, kid))?;
         tracing::info!(kid = %kid, outcome = ?seed_outcome, "waitpoint HMAC secret seeded (FF#280)");
 
         // FF 0.10 (FF#277 flat reshape): snapshot the backend's
@@ -371,5 +371,148 @@ impl crate::runtime_handle::FabricRuntimeHandle for FabricRuntime {
         // arg verification + the `fcall_timeout_ms` timeout both
         // fire exactly once.
         FabricRuntime::fcall(self, function, keys, args).await
+    }
+}
+
+/// #743: reshape FF's seed_waitpoint_hmac_secret kid-mismatch error
+/// into operator-actionable guidance.
+///
+/// Stock FF error: `validation: InvalidInput: seed_waitpoint_hmac_secret:
+/// stored current_kid \"x\" differs from supplied kid \"y\"; use
+/// rotate_waitpoint_hmac_secret_all to change kid`.
+///
+/// That tells an operator (a) the wrong env var is set OR (b) the
+/// Valkey state was carried over from a prior boot — but the only
+/// recovery hint is an FF-internal FCALL name. Cairn surfaces it as
+/// a `FabricError::Config` with the actual kid + remediation.
+///
+/// Other FF errors pass through unchanged as `FabricError::Engine`.
+fn reshape_seed_error(
+    err: flowfabric::core::engine_error::EngineError,
+    supplied_kid: &str,
+) -> crate::error::FabricError {
+    use flowfabric::core::engine_error::{EngineError, ValidationKind};
+
+    if let EngineError::Validation {
+        kind: ValidationKind::InvalidInput,
+        detail,
+    } = &err
+    {
+        if detail.contains("differs from supplied kid") {
+            // Try to pull the stored kid out of the FF detail string.
+            // Format: `... stored current_kid "X" differs from ...`
+            // Match on the surrounding literal so cairn's wrapper
+            // stays robust to incidental wording changes; if the
+            // exact `"X"` extraction fails, we still surface a useful
+            // message naming the supplied kid.
+            let stored = detail
+                .split("stored current_kid ")
+                .nth(1)
+                .and_then(|s| s.split(" differs").next())
+                .unwrap_or("<unknown>")
+                .trim_matches('"');
+            return crate::error::FabricError::Config(format!(
+                "waitpoint HMAC kid mismatch on boot: Valkey has \
+                 current_kid={stored:?}, env supplies CAIRN_FABRIC_WAITPOINT_HMAC_KID={supplied_kid:?}.\n\
+                 \n\
+                 This typically happens after one of:\n\
+                 \n\
+                 (a) the kid env var was rotated but Valkey was not flushed,\n\
+                 (b) Valkey state was restored from a snapshot keyed under \
+                     a different kid, or\n\
+                 (c) two cairn deployments are sharing the same Valkey but \
+                     advertising different kids.\n\
+                 \n\
+                 To resolve:\n\
+                 \n\
+                 - Set CAIRN_FABRIC_WAITPOINT_HMAC_KID={stored} (matching the \
+                   stored kid) AND supply the original secret bytes to keep \
+                   existing waitpoint tokens valid, OR\n\
+                 - Operator-pace a rotate via the FF \
+                   `rotate_waitpoint_hmac_secret_all` admin path (drains live \
+                   tokens with a grace window), OR\n\
+                 - For a destructive reset (acceptable on dev / fresh deploys \
+                   only), FLUSHDB the Valkey backend and restart cairn-app."
+            ));
+        }
+    }
+    crate::error::FabricError::Engine(Box::new(err))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowfabric::core::engine_error::{EngineError, ValidationKind};
+
+    #[test]
+    fn reshape_seed_error_translates_kid_mismatch_to_actionable_config_error() {
+        let err = EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "seed_waitpoint_hmac_secret: stored current_kid \"dogfood-r6\" \
+                     differs from supplied kid \"k1\"; use \
+                     rotate_waitpoint_hmac_secret_all to change kid"
+                .to_owned(),
+        };
+        let reshaped = reshape_seed_error(err, "k1");
+        let msg = reshaped.to_string();
+        // Names BOTH kid values so the operator can do something
+        // about it without re-grepping FF source.
+        assert!(msg.contains("dogfood-r6"), "must surface stored kid: {msg}");
+        assert!(msg.contains("\"k1\""), "must surface supplied kid: {msg}");
+        // Names the env var the operator must touch — not the
+        // FF-internal FCALL name.
+        assert!(
+            msg.contains("CAIRN_FABRIC_WAITPOINT_HMAC_KID"),
+            "must name env var: {msg}"
+        );
+        // Lists at least one concrete recovery action.
+        assert!(
+            msg.contains("FLUSHDB") || msg.contains("rotate") || msg.contains("matching"),
+            "must include remediation: {msg}"
+        );
+    }
+
+    #[test]
+    fn reshape_seed_error_passes_other_validation_errors_through_unchanged() {
+        let err = EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "some unrelated validation error".to_owned(),
+        };
+        let reshaped = reshape_seed_error(err, "k1");
+        // Pass-through wraps in FabricError::Engine, NOT
+        // FabricError::Config.
+        match reshaped {
+            crate::error::FabricError::Engine(_) => {}
+            other => panic!("expected Engine pass-through, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reshape_seed_error_passes_non_validation_errors_through_unchanged() {
+        let err = EngineError::Unavailable {
+            op: "seed_waitpoint_hmac_secret",
+        };
+        let reshaped = reshape_seed_error(err, "k1");
+        match reshaped {
+            crate::error::FabricError::Engine(_) => {}
+            other => panic!("expected Engine pass-through, got {other:?}"),
+        }
+    }
+
+    /// Defensive: even if FF subtly changes the detail wording so
+    /// the kid-extraction regex misses, the catch-all still surfaces
+    /// a usable message naming the supplied kid + env var.
+    #[test]
+    fn reshape_seed_error_handles_unparseable_detail_gracefully() {
+        let err = EngineError::Validation {
+            kind: ValidationKind::InvalidInput,
+            detail: "differs from supplied kid (no quotes)".to_owned(),
+        };
+        let reshaped = reshape_seed_error(err, "k1");
+        let msg = reshaped.to_string();
+        assert!(
+            msg.contains("CAIRN_FABRIC_WAITPOINT_HMAC_KID"),
+            "must still name env var even when FF detail wording changes: {msg}"
+        );
     }
 }
