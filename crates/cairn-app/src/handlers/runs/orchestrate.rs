@@ -1863,6 +1863,56 @@ pub(crate) async fn drive_run_iteration(
                 // body. User-caused errors (NotFound, InvalidTransition)
                 // still surface a friendly code + short message.
                 tracing::warn!(run_id = %run_id, error = %e, "orchestration failed");
+                // #744: ANY OrchestratorError that bubbles out of the loop
+                // means the run is wedged at `Running` — no terminal FCALL
+                // ever fired (AllProvidersExhausted is the carve-out: it
+                // has its own card + suspend / child-finalize path below).
+                // Pre-fix the catch-all returned 5xx without flipping
+                // run.state, so `GET /v1/runs/:id` reported `running`
+                // forever. Classify the error → FailureClass, finalize
+                // here BEFORE building the HTTP response. NotFound /
+                // InvalidTransition skip finalize: NotFound means the
+                // run row is gone, InvalidTransition means the run is
+                // already at a different (likely terminal) state and
+                // re-flipping would race with whatever path already
+                // finalized it.
+                let finalize_class: Option<cairn_domain::FailureClass> = match &e {
+                    cairn_orchestrator::OrchestratorError::Runtime(
+                        cairn_runtime::error::RuntimeError::NotFound { .. }
+                        | cairn_runtime::error::RuntimeError::InvalidTransition { .. },
+                    ) => None,
+                    cairn_orchestrator::OrchestratorError::AllProvidersExhausted { .. } => {
+                        // Handled in its own arm below: top-level runs go
+                        // to WaitingApproval (#693 R3-B), child runs flip
+                        // to Failed(AllProvidersExhausted) (#750). Skip
+                        // the generic finalize so we don't double-flip.
+                        None
+                    }
+                    cairn_orchestrator::OrchestratorError::ApprovalDenied { .. } => {
+                        Some(cairn_domain::FailureClass::ApprovalRejected)
+                    }
+                    cairn_orchestrator::OrchestratorError::DependencyFailed { .. } => {
+                        Some(cairn_domain::FailureClass::DependencyFailed)
+                    }
+                    cairn_orchestrator::OrchestratorError::Timeout => {
+                        Some(cairn_domain::FailureClass::TimedOut)
+                    }
+                    cairn_orchestrator::OrchestratorError::Runtime(
+                        cairn_runtime::error::RuntimeError::LeaseExpired { .. },
+                    ) => Some(cairn_domain::FailureClass::LeaseExpired),
+                    // Everything else — Gather / Decide / Execute /
+                    // FrameSink / Memory / Graph / Store / Runtime(other) /
+                    // ProviderAuthFailed / ProviderInvalidRequest /
+                    // MaxIterations (rare; loop normally returns it as Ok)
+                    // — bucketed as ExecutionError. The HTTP body still
+                    // carries the canonical error code (provider_auth_failed
+                    // etc.); failure_class is the projection-side
+                    // classification for dashboards / metrics.
+                    _ => Some(cairn_domain::FailureClass::ExecutionError),
+                };
+                if let Some(class) = finalize_class {
+                    finalize_run_failure(state.as_ref(), &run.session_id, &run.run_id, class).await;
+                }
                 let (status, code, msg): (_, &'static str, String) = match &e {
                     cairn_orchestrator::OrchestratorError::Runtime(
                         cairn_runtime::error::RuntimeError::NotFound { .. },
