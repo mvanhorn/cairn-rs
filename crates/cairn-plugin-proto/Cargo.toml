@@ -9,6 +9,9 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+# RFC 029: cairn-plugin-proto depends on cairn-domain for shared ID types
+# (ProjectKey, SourceId, KnowledgeDocumentId, ChunkId). The common cairn pattern.
+cairn-domain = { path = "../cairn-domain" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

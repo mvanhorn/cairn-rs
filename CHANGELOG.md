@@ -92,6 +92,31 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 029 PR A: KnowledgeProvider capability family + wire types**
+  (`cairn-plugin-proto`, `cairn-tools`). First implementation PR from
+  [RFC 029](./docs/design/rfcs/029-pluggable-knowledge-providers.md).
+  Adds `CapabilityFamily::KnowledgeProvider`, the full
+  `knowledge.{query,ingest,ingest_status,list_sources}` wire-type
+  surface in the new `cairn-plugin-proto::knowledge` module, and the
+  `KnowledgeProviderCapability` handshake snapshot type used at
+  `initialize` (Layer 2 of RFC 007's three-layer declaration model)
+  because knowledge providers' effective capability detail depends on
+  runtime state (credentials, backend reachability) unavailable at
+  manifest-parse time. Adds `PluginCapability::KnowledgeProvider`
+  (empty variant; detail is at handshake) plus `PluginManifest::validate()`
+  enforcing the RFC 029 co-occurrence rule: manifests declaring both
+  `knowledge_provider` and `signal_source` are rejected with
+  `CapabilityConflict` (preserves RFC 015's lazy-spawn invariant for
+  tool-only plugins, which knowledge providers rely on). `cairn-plugin-proto`
+  gains a `cairn-domain` dep for shared ID types per RFC 029's locked
+  decision. Scope deferred to PR B1: `From`/`TryFrom` bridges between
+  wire types and in-process `cairn-memory::{retrieval, ingest}` types
+  + in-process `ScoringBreakdown.freshness → freshness_decay` rename
+  (both require touching `cairn-memory` which is B1's home crate).
+  Tests: 10 new in `cairn-plugin-proto::knowledge`, 5 new in
+  `cairn-tools::plugins`; round-trip + tri-state scoring-dimension
+  rejection + capability-conflict rejection all covered.
+
 - **`DELETE /v1/admin/tenants/:t/sessions/:s` admin soft-delete (closes
   #229).** Previously there was no way to remove a session short of
   wiping the event log — stray / mistyped session ids accumulated in

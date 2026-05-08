@@ -1,14 +1,25 @@
 //! Language-neutral plugin protocol boundaries and shared types.
 //!
 //! Defines the JSON-RPC 2.0 wire format, manifest schema, and capability
-//! declarations per RFC 007. This crate is intentionally free of host-side
-//! runtime dependencies — it describes what goes on the wire.
+//! declarations per RFC 007. The crate describes what goes on the wire; it
+//! depends on `cairn-domain` only for shared ID newtypes (`ProjectKey`,
+//! `ChunkId`, `KnowledgeDocumentId`, `SourceId`) that are intentionally
+//! stable across the plugin boundary (RFC 029 Decided list).
 
 pub mod capabilities;
+pub mod knowledge;
 pub mod manifest;
 pub mod wire;
 
 pub use capabilities::{CapabilityFamily, InvocationStatus};
+pub use knowledge::{
+    ChunkRecordWire, DimensionSupport, KnowledgeIngestAck, KnowledgeIngestParams,
+    KnowledgeIngestStatus, KnowledgeIngestStatusParams, KnowledgeIngestStatusResult,
+    KnowledgeListSourcesParams, KnowledgeListSourcesResult, KnowledgeProviderCapability,
+    KnowledgeQueryParams, KnowledgeQueryResult, KnowledgeSource, KnowledgeSourcesChangedParams,
+    MetadataFilterWire, RetrievalModeWire, RetrievalResultWire, ScoringBreakdownWire,
+    ScoringDimensionSet, SourceTypeWire,
+};
 pub use manifest::{CapabilityWire, LimitsWire, PluginManifestWire};
 pub use wire::{
     ActorWire, CancelParams, CancelResult, ChannelsDeliverParams, ChannelsDeliverResult,
