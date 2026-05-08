@@ -4,7 +4,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cairn_app::tool_impls::{build_tool_registry, ConcreteRegisterRepoTool};
+use cairn_app::tool_impls::{build_tool_registry, ConcreteRegisterRepoTool, NeverAutoExtract};
 use cairn_domain::{policy::ExecutionClass, ProjectKey, RepoAccessContext};
 use cairn_memory::{
     in_memory::{InMemoryDocumentStore, InMemoryRetrieval},
@@ -133,11 +133,14 @@ async fn register_repo_rejects_invalid_repo_shape() {
 async fn registry_exposes_register_repo_with_sensitive_metadata() {
     let temp_dir = TestDir::new("registry");
     let (_, pipeline) = make_ingest();
+    let retrieval = Arc::new(InMemoryRetrieval::new(Arc::new(
+        InMemoryDocumentStore::new(),
+    ))) as Arc<dyn RetrievalService>;
     let registry = build_tool_registry(
-        Arc::new(InMemoryRetrieval::new(Arc::new(
-            InMemoryDocumentStore::new(),
-        ))) as Arc<dyn RetrievalService>,
+        retrieval.clone(),
         pipeline as Arc<dyn IngestService>,
+        retrieval,
+        Arc::new(NeverAutoExtract),
         Arc::new(ProjectRepoAccessService::new()),
         Arc::new(RepoCloneCache::new(&temp_dir.path)),
     );

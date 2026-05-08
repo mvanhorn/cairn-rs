@@ -1293,7 +1293,7 @@ async fn real_main() {
         // path (preventing id collisions on concurrent in-flight
         // requests against the same plugin process).
         let dispatcher = lib_state.knowledge_dispatcher.clone();
-        let retrieval = Arc::new(
+        let knowledge_retrieval = Arc::new(
             MultiProviderRetrieval::new(
                 lib_state.retrieval.clone(),
                 EventLogProviderResolver::new(store.clone()),
@@ -1306,9 +1306,23 @@ async fn real_main() {
             EventLogProviderResolver::new(store),
             dispatcher,
         )) as Arc<dyn IngestService>;
+        // RFC 030 rollout window: the memory-family dispatcher + resolver
+        // land in PR-G. Until then point `memory_search` + `memory_store`
+        // at the same `MultiProviderRetrieval` / `MultiProviderIngest` the
+        // knowledge tool uses (single cairn-default backend serving both
+        // families per RFC 030 §"cairn-default TODO"). `auto_extract`
+        // defaults to `NeverAutoExtract` — the only wired backend today
+        // is cairn-default which is explicit-ingest.
+        let memory_retrieval = knowledge_retrieval.clone();
+        let memory_ingest = ingest.clone();
+        let auto_extract_resolver: std::sync::Arc<
+            dyn cairn_app::tool_impls::MemoryAutoExtractResolver,
+        > = std::sync::Arc::new(cairn_app::tool_impls::NeverAutoExtract);
         let registry = cairn_app::tool_impls::build_tool_registry(
-            retrieval,
-            ingest,
+            memory_retrieval,
+            memory_ingest,
+            knowledge_retrieval,
+            auto_extract_resolver,
             lib_state.project_repo_access.clone(),
             lib_state.repo_clone_cache.clone(),
         );
