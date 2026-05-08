@@ -457,3 +457,138 @@ async fn cairn_trait_reclaim_rejects_grant_execution_id_mismatch() {
 
     h.teardown().await;
 }
+
+// ── PR-4: FabricRunService::reclaim_for_terminal_write helper ────────────
+
+/// PR-4 happy path: drive a real cairn run to `lease_expired_reclaimable`
+/// via `runs.start` → `runs.claim` → backdated lease + FCALL
+/// `ff_mark_lease_expired_if_due`, then call the new helper. Asserts
+/// the helper composes `issue_reclaim_grant` + `reclaim_execution`
+/// end-to-end and returns `Reclaimed(record)` with a fresh lease.
+///
+/// This is the test surface for the `f64_terminal_recovery_loop`
+/// rewrite landing in PR-5 — once the loop calls
+/// `reclaim_for_terminal_write`, this test pins the contract that
+/// the helper unwraps the full FF post-0.15 reclaim flow into a
+/// single call site.
+#[tokio::test]
+async fn helper_reclaim_for_terminal_write_happy_path() {
+    use cairn_fabric::services::run_service::ReclaimForTerminalWriteOutcome;
+    use ferriskey::Value as FsValue;
+
+    let h = TestHarness::setup().await;
+    let session_id = h.unique_session_id();
+    let run_id = h.unique_run_id();
+
+    h.fabric
+        .runs
+        .start(&h.project, &session_id, run_id.clone(), None)
+        .await
+        .expect("start failed");
+    h.fabric
+        .runs
+        .claim(&h.project, &session_id, &run_id)
+        .await
+        .expect("first claim must succeed — run is runnable");
+
+    // Force lease expiry. Cairn-managed runs don't expose a
+    // direct mark-expired API (production semantics), so we use
+    // the same FCALL pair as `setup_lease_expired_reclaimable`:
+    // backdate the lease in `exec_core`, then ask FF to flip the
+    // lifecycle phase to `lease_expired_reclaimable`.
+    let eid = cairn_fabric::id_map::session_run_to_execution_id(
+        &h.project,
+        &session_id,
+        &run_id,
+        h.partition_config(),
+    );
+    let partition = execution_partition(&eid, h.partition_config());
+    let ctx = ExecKeyContext::new(&partition, &eid);
+
+    let _: FsValue = h
+        .valkey_runtime()
+        .client
+        .cmd("HSET")
+        .arg(ctx.core())
+        .arg("lease_expires_at")
+        .arg("0")
+        .execute()
+        .await
+        .expect("HSET lease_expires_at = 0");
+
+    fcall_mark_lease_expired(&h, &eid).await;
+
+    // Drive the helper. With the execution in
+    // `lease_expired_reclaimable`, the issue → reclaim pair must
+    // succeed and the helper must surface `Reclaimed(record)`.
+    let outcome = h
+        .fabric
+        .runs
+        .reclaim_for_terminal_write(&h.project, &session_id, &run_id)
+        .await
+        .expect("reclaim_for_terminal_write must succeed on lease_expired_reclaimable");
+
+    let record = match outcome {
+        ReclaimForTerminalWriteOutcome::Reclaimed(record) => *record,
+        ReclaimForTerminalWriteOutcome::NotReclaimable { detail } => {
+            panic!("expected Reclaimed on a freshly-expired lease, got NotReclaimable: {detail}",)
+        }
+        ReclaimForTerminalWriteOutcome::CapExceeded { reclaim_count } => panic!(
+            "expected Reclaimed on a freshly-expired lease, got CapExceeded({reclaim_count})",
+        ),
+    };
+
+    assert_eq!(
+        record.run_id, run_id,
+        "helper must return the freshly-read RunRecord for the same run_id",
+    );
+
+    h.teardown().await;
+}
+
+/// PR-4 NotReclaimable path: an execution that never had its lease
+/// expire is in `active` (post-claim), not
+/// `lease_expired_reclaimable`. FF rejects the reclaim grant on
+/// that phase, and the helper must surface `NotReclaimable` (NOT a
+/// FabricError — the recovery loop's response is "retry the
+/// terminal FCALL without reclaim", so a clean enum variant is the
+/// right shape).
+#[tokio::test]
+async fn helper_reclaim_for_terminal_write_active_returns_not_reclaimable() {
+    use cairn_fabric::services::run_service::ReclaimForTerminalWriteOutcome;
+
+    let h = TestHarness::setup().await;
+    let session_id = h.unique_session_id();
+    let run_id = h.unique_run_id();
+
+    h.fabric
+        .runs
+        .start(&h.project, &session_id, run_id.clone(), None)
+        .await
+        .expect("start failed");
+    h.fabric
+        .runs
+        .claim(&h.project, &session_id, &run_id)
+        .await
+        .expect("claim must succeed");
+    // Note: NO lease expiry. Execution stays in `active`.
+
+    let outcome = h
+        .fabric
+        .runs
+        .reclaim_for_terminal_write(&h.project, &session_id, &run_id)
+        .await
+        .expect("helper must return Ok with NotReclaimable, not error");
+
+    match outcome {
+        ReclaimForTerminalWriteOutcome::NotReclaimable { detail } => {
+            assert!(
+                !detail.is_empty(),
+                "NotReclaimable should carry a non-empty reason from FF",
+            );
+        }
+        other => panic!("expected NotReclaimable on an active execution, got {other:?}",),
+    }
+
+    h.teardown().await;
+}

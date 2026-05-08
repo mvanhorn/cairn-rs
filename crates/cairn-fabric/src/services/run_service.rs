@@ -5,18 +5,51 @@ use cairn_domain::*;
 use cairn_store::projections::RunRecord;
 
 use crate::error::FabricError;
-use flowfabric::core::types::{ExecutionId, LaneId, Namespace};
+use flowfabric::core::types::{
+    AttemptId, AttemptIndex, ExecutionId, LaneId, LeaseId, Namespace, WorkerId, WorkerInstanceId,
+};
 
 use crate::engine::{
     CancelRunInput, CompleteRunInput, ControlPlaneBackend, CreateRunExecutionInput,
     DeliverApprovalSignalInput, Engine, ExecutionLeaseContext, ExecutionSnapshot,
-    FailExecutionOutcome, FailRunInput, ResumeRunInput,
+    FailExecutionOutcome, FailRunInput, IssueReclaimGrantInput, IssueReclaimGrantOutcome,
+    ReclaimExecutionInput, ReclaimExecutionOutcome, ResumeRunInput,
 };
 use crate::event_bridge::{BridgeEvent, EventBridge};
 use crate::helpers::{now_ms, try_parse_project_key};
 use crate::id_map;
 use crate::runtime_handle::FabricRuntimeHandle;
 use crate::state_map;
+
+/// Outcome of [`FabricRunService::reclaim_for_terminal_write`].
+///
+/// Three variants matching the issue body's PR-4 spec; the
+/// underlying FF surface has six (three from `issue_reclaim_grant`,
+/// four from `reclaim_execution`, with `Claimed` mapping to
+/// `Reclaimed` here and `GrantNotFound` handled internally via a
+/// bounded retry).
+///
+/// `RunRecord` on the `Reclaimed` variant is boxed so the enum's
+/// stack footprint stays close to the smaller variants (clippy's
+/// `large_enum_variant` lint — `RunRecord` is ~700 B vs ~24 B for
+/// the others).
+#[derive(Clone, Debug)]
+pub enum ReclaimForTerminalWriteOutcome {
+    /// Fresh attempt minted. Caller retries the original terminal
+    /// FCALL with the post-reclaim lease triple read off the
+    /// embedded record.
+    Reclaimed(Box<RunRecord>),
+    /// Execution moved out of the reclaimable phase between the
+    /// lease-expired rejection and the grant attempt. Caller's
+    /// response: retry the original FCALL **without** reclaim —
+    /// the underlying lease may be valid again on the next loop
+    /// tick.
+    NotReclaimable { detail: String },
+    /// `max_reclaim_count` exceeded. FF transitioned to
+    /// `terminal_failed`. Caller breaks the recovery loop and
+    /// escalates to the operator.
+    CapExceeded { reclaim_count: u32 },
+}
 
 pub struct FabricRunService {
     // PR-C4c: backend-agnostic runtime handle. Reads only
@@ -433,6 +466,194 @@ impl FabricRunService {
     /// Approval gates (`enter_waiting_approval` → `resolve_approval`)
     /// therefore need an explicit claim first.
     ///
+    /// Run cairn's F62/F64 terminal-write recovery loop's
+    /// reclaim-grant pair on a single execution.
+    ///
+    /// RFC-024 §3.2 / FF#371 / cairn #710: the pre-FF-0.15 path
+    /// (`issue_grant_and_claim`) is unrecoverable when an execution
+    /// is in `lease_expired_reclaimable` / `lease_revoked` —
+    /// terminal FCALLs deadlock against `execution_not_eligible`.
+    /// FF 0.15 introduced
+    /// [`ControlPlaneBackend::issue_reclaim_grant`] +
+    /// [`ControlPlaneBackend::reclaim_execution`] as the new
+    /// recovery surface. This helper composes the pair so the
+    /// `f64_terminal_recovery_loop` stays a single-call site.
+    ///
+    /// **Worker identity (RFC-024 §4.4 control-plane carve-out).**
+    /// Cairn is not a durable FF worker. The grant + reclaim pair
+    /// MUST share the same `(WorkerId, WorkerInstanceId)` so FF's
+    /// identity validator accepts the consume. We mint
+    /// `WorkerId = "cairn-control-plane"` and
+    /// `WorkerInstanceId = "cairn-cp-{execution_id}"` so a single
+    /// recovery attempt is fully self-contained — no per-process
+    /// cairn worker state, no fixture in FF's worker registry.
+    ///
+    /// **Three success outcomes** matching the issue body's PR-4
+    /// spec (mapped from FF's six-way variant cross-product):
+    ///
+    /// 1. `Reclaimed(record)` — fresh attempt minted; caller
+    ///    retries the original terminal FCALL with
+    ///    `record.lease_*` = the post-reclaim values.
+    /// 2. `NotReclaimable { detail }` — execution moved out of the
+    ///    reclaimable phase between the lease-expired rejection
+    ///    and the grant attempt. Caller's response: retry the
+    ///    original FCALL **without** reclaim (the underlying lease
+    ///    may be valid again on the next loop tick).
+    /// 3. `CapExceeded { reclaim_count }` — FF transitioned to
+    ///    `terminal_failed`. Caller breaks the recovery loop and
+    ///    surfaces an operator-visible incident.
+    ///
+    /// **`GrantNotFound` is handled internally.** Grant TTLs are
+    /// short by design (we use 5 s) and a slow Valkey can drop the
+    /// grant between the two FCALLs. The helper retries the issue
+    /// → reclaim pair once; a second `GrantNotFound` indicates a
+    /// real problem and surfaces as a `FabricError` so the loop
+    /// short-circuits with an honest failure class.
+    pub async fn reclaim_for_terminal_write(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<ReclaimForTerminalWriteOutcome, FabricError> {
+        let eid = self.execution_id(project, session_id, run_id);
+
+        // Re-issue the grant once on `GrantNotFound` (short
+        // grant_ttl_ms + slow Valkey is the documented case in
+        // FF#407). One retry is enough — if the second grant also
+        // disappears before the reclaim, the recovery surface is
+        // not the bottleneck and the loop should escalate.
+        const MAX_GRANT_RETRIES: u32 = 1;
+        let mut grant_retries: u32 = 0;
+        loop {
+            let snapshot = self.engine.describe_execution(&eid).await?.ok_or_else(|| {
+                FabricError::NotFound {
+                    entity: "run",
+                    id: run_id.to_string(),
+                }
+            })?;
+
+            let lane_id = if snapshot.lane_id.as_str().is_empty() {
+                self.lane_id(project)
+            } else {
+                snapshot.lane_id.clone()
+            };
+
+            // Synthetic worker identity scoped to this single
+            // recovery attempt (eid keeps two concurrent recovery
+            // attempts from colliding on FF's identity table; the
+            // `cairn-cp-` prefix matches the integration tests'
+            // convention).
+            let worker_id = WorkerId::new("cairn-control-plane");
+            let worker_instance_id = WorkerInstanceId::new(format!("cairn-cp-{eid}"));
+
+            // Prior lease's owner — FF needs this to clean up the
+            // `worker_leases:{old_worker_instance_id}` index entry
+            // for the displaced lease (RFC-024 §3.2 +
+            // `ReclaimExecutionArgs::old_worker_instance_id` doc).
+            // Source it from the snapshot's `current_lease`; if no
+            // lease is present (defensive — `lease_expired_reclaimable`
+            // implies a prior lease, but the snapshot read may race
+            // a state cleanup), fall back to the new synthetic id
+            // so the reclaim args still validate. FF treats the
+            // index cleanup as best-effort, so a missing entry is a
+            // no-op rather than a hard rejection.
+            let old_worker_instance_id = snapshot
+                .current_lease
+                .as_ref()
+                .map(|l| l.worker_instance_id.clone())
+                .unwrap_or_else(|| worker_instance_id.clone());
+
+            // Grant phase. 5 000 ms TTL is the same value the
+            // Valkey/PG integration tests use — long enough that a
+            // healthy fabric clears the reclaim before expiry, short
+            // enough that a stalled fabric doesn't pin a stale grant
+            // when the recovery loop bails.
+            let grant_outcome = self
+                .control_plane
+                .issue_reclaim_grant(IssueReclaimGrantInput {
+                    execution_id: eid.clone(),
+                    lane_id: lane_id.clone(),
+                    worker_id: worker_id.clone(),
+                    worker_instance_id: worker_instance_id.clone(),
+                    grant_ttl_ms: 5_000,
+                    capability_hash: None,
+                })
+                .await?;
+
+            let grant = match grant_outcome {
+                IssueReclaimGrantOutcome::Granted(handle) => handle,
+                IssueReclaimGrantOutcome::NotReclaimable { detail } => {
+                    return Ok(ReclaimForTerminalWriteOutcome::NotReclaimable { detail });
+                }
+                IssueReclaimGrantOutcome::ReclaimCapExceeded { reclaim_count } => {
+                    return Ok(ReclaimForTerminalWriteOutcome::CapExceeded { reclaim_count });
+                }
+            };
+
+            // Reclaim phase. Same identity pair as the grant.
+            // `current_attempt_index` defaults to 0 if no attempt
+            // has ever been issued — defensive only; the
+            // `lease_expired_reclaimable` precondition already
+            // implies a prior attempt.
+            let current_attempt_index = snapshot
+                .current_attempt
+                .as_ref()
+                .map(|a| a.index)
+                .unwrap_or_else(|| AttemptIndex::new(0));
+
+            let reclaim_outcome = self
+                .control_plane
+                .reclaim_execution(ReclaimExecutionInput {
+                    grant,
+                    execution_id: eid.clone(),
+                    lane_id: lane_id.clone(),
+                    worker_id,
+                    worker_instance_id,
+                    old_worker_instance_id,
+                    attempt_id: AttemptId::new(),
+                    current_attempt_index,
+                    lease_id: LeaseId::new(),
+                    lease_ttl_ms: self.runtime.lease_ttl_ms(),
+                    attempt_policy_json: String::new(),
+                    max_reclaim_count: None,
+                    capability_hash: None,
+                })
+                .await?;
+
+            match reclaim_outcome {
+                ReclaimExecutionOutcome::Claimed(_handle) => {
+                    // Fresh attempt minted. Re-read the run record
+                    // so the caller sees the post-reclaim lease
+                    // triple via the regular projection path.
+                    let record = self.read_run_record(project, session_id, run_id).await?;
+                    return Ok(ReclaimForTerminalWriteOutcome::Reclaimed(Box::new(record)));
+                }
+                ReclaimExecutionOutcome::NotReclaimable { detail } => {
+                    return Ok(ReclaimForTerminalWriteOutcome::NotReclaimable { detail });
+                }
+                ReclaimExecutionOutcome::ReclaimCapExceeded { reclaim_count } => {
+                    return Ok(ReclaimForTerminalWriteOutcome::CapExceeded { reclaim_count });
+                }
+                ReclaimExecutionOutcome::GrantNotFound => {
+                    // Grant disappeared between issue and consume.
+                    // Retry the pair once before surfacing as an
+                    // error — the recovery loop's outer backoff is
+                    // already running, so internal retries here
+                    // stay tight.
+                    if grant_retries >= MAX_GRANT_RETRIES {
+                        return Err(FabricError::Engine(Box::new(
+                            flowfabric::core::engine_error::EngineError::Unavailable {
+                                op: "reclaim_execution_grant_lost",
+                            },
+                        )));
+                    }
+                    grant_retries = grant_retries.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+    }
+
     /// This is the run-side mirror of [`FabricTaskService::claim`]. Both
     /// delegate to [`ControlPlaneBackend::issue_grant_and_claim`]; neither
     /// caches lease state — downstream FCALLs re-read the lease triple
