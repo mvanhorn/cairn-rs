@@ -24,6 +24,8 @@ members = [
     "crates/cairn-integrations",
     "crates/cairn-fabric",
     "crates/cairn-knowledge-compliance",
+    "crates/cairn-memory-compliance",
+    "crates/cairn-provider-compliance-core",
 ]
 resolver = "2"
 

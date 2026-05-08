@@ -337,20 +337,33 @@ pub fn check_runtime_owned_overwritten(
     response: &RetrievalResponse,
     provider_sentinel: f64,
 ) -> ComplianceResult {
+    // 1e-9 tolerance — tighter than any legitimate rescorer transform,
+    // looser than spurious rounding around non-unity values.
+    // `f64::EPSILON` (~2.22e-16) is too tight for arithmetic around
+    // zero. Also handles `NaN` sentinels via `is_nan()` because
+    // `NAN - NAN = NAN` and `NAN.abs() < _` is always false.
+    const TOL: f64 = 1e-9;
+    let hits = |x: f64, s: f64| -> bool {
+        if s.is_nan() {
+            x.is_nan()
+        } else {
+            (x - s).abs() < TOL
+        }
+    };
     for (i, r) in response.results.iter().enumerate() {
-        if (r.breakdown.graph_proximity - provider_sentinel).abs() < f64::EPSILON {
+        if hits(r.breakdown.graph_proximity, provider_sentinel) {
             return Err(fail(format!(
                 "result[{i}].breakdown.graph_proximity still carries the provider sentinel \
                  ({provider_sentinel}) — runtime must have overwritten it"
             )));
         }
-        if (r.breakdown.source_credibility - provider_sentinel).abs() < f64::EPSILON {
+        if hits(r.breakdown.source_credibility, provider_sentinel) {
             return Err(fail(format!(
                 "result[{i}].breakdown.source_credibility still carries the provider sentinel \
                  ({provider_sentinel}) — runtime must have overwritten it"
             )));
         }
-        if (r.breakdown.corroboration - provider_sentinel).abs() < f64::EPSILON {
+        if hits(r.breakdown.corroboration, provider_sentinel) {
             return Err(fail(format!(
                 "result[{i}].breakdown.corroboration still carries the provider sentinel \
                  ({provider_sentinel}) — runtime must have overwritten it"

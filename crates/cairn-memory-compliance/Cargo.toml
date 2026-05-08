@@ -1,0 +1,39 @@
+[package]
+name = "cairn-memory-compliance"
+version = "0.1.0"
+edition = "2021"
+license = "BSL-1.1"
+publish = false
+
+# RFC 030 PR-H: shape-only compliance suite for the `memory_provider`
+# plugin contract. Runs against any `MemoryPluginDispatcher` + any
+# in-process `RetrievalService` that round-trips the memory wire types.
+#
+# Mirror of `cairn-knowledge-compliance` (RFC 029 PR-C). Each check
+# speaks in the memory-family wire types (`MemoryQueryResult`,
+# `MemoryProviderCapability` with its `auto_extract` flag, etc.) so
+# failures name the family explicitly and a misconfigured dual-family
+# plugin is rejected at `check_no_dual_family_capabilities` rather
+# than confusing later checks.
+#
+# Not a production dependency — test-only. Family-neutral checks
+# (error shape stability, dual-family rejection) live in
+# `cairn-provider-compliance-core` and are re-exported here for
+# call-site brevity.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cairn-domain = { path = "../cairn-domain" }
+cairn-memory = { path = "../cairn-memory" }
+cairn-plugin-proto = { path = "../cairn-plugin-proto" }
+cairn-provider-compliance-core = { path = "../cairn-provider-compliance-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+cairn-graph = { path = "../cairn-graph" }
+cairn-store = { path = "../cairn-store" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+async-trait = "0.1"
