@@ -92,6 +92,26 @@ pub struct FabricConfig {
     /// when `waitpoint_hmac_secret` is `Some`. Arbitrary operator-chosen
     /// string; FF uses it only as a lookup key in its secrets hash.
     pub waitpoint_hmac_kid: Option<String>,
+    /// #743 Part B: opt-in boot-time waitpoint HMAC kid rotation.
+    ///
+    /// When `true`, [`crate::FabricServices::start`] calls
+    /// `ControlPlaneBackend::rotate_waitpoint_hmac` on the operator-
+    /// supplied `(kid, secret)` pair BEFORE the seed step. This is the
+    /// in-process recovery path for the reboot landmine where Valkey
+    /// carries a `current_kid` from a prior run that doesn't match the
+    /// env-supplied one.
+    ///
+    /// **When to set**: only after an operator has read the Part A
+    /// actionable error message (kid mismatch on boot) and decided to
+    /// rotate rather than match the persisted kid. Default-off because
+    /// rotation drains the prior kid's grace window — operators should
+    /// opt in deliberately, not by accident on every boot.
+    ///
+    /// Parsed from `CAIRN_FABRIC_WAITPOINT_HMAC_BOOTSTRAP_KID_RESET` by
+    /// [`Self::from_env`]. The accept-set matches the
+    /// `CAIRN_CHILD_RUN_DRIVER_ENABLED` opt-in convention (`"1"`,
+    /// `"true"`, `"yes"`, `"on"` — case-insensitive).
+    pub waitpoint_hmac_bootstrap_kid_reset: bool,
     /// Which storage backend the FabricServices aggregate should bring
     /// up. Parsed from the `CAIRN_FABRIC_BACKEND` env var by
     /// [`Self::from_env`] (default: [`BackendKind::Valkey`]).
@@ -235,6 +255,20 @@ impl FabricConfig {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // #743 Part B: opt-in boot-time kid rotation. Match the
+        // truthy-value accept-set the rest of cairn uses for opt-ins
+        // (CAIRN_CHILD_RUN_DRIVER_ENABLED etc.) so operators reaching
+        // for whichever truthy value feels natural land on the same
+        // result.
+        let waitpoint_hmac_bootstrap_kid_reset =
+            std::env::var("CAIRN_FABRIC_WAITPOINT_HMAC_BOOTSTRAP_KID_RESET")
+                .ok()
+                .map(|raw| {
+                    let trimmed = raw.trim().to_ascii_lowercase();
+                    matches!(trimmed.as_str(), "1" | "true" | "yes" | "on")
+                })
+                .unwrap_or(false);
+
         // `CAIRN_FABRIC_BACKEND` (optional). Default to Valkey for
         // backwards compat with every deployment predating PR-C3.
         // Whitespace trimmed, ASCII-lowercased, then parsed.
@@ -264,6 +298,7 @@ impl FabricConfig {
             worker_capabilities,
             waitpoint_hmac_secret,
             waitpoint_hmac_kid,
+            waitpoint_hmac_bootstrap_kid_reset,
             backend_kind,
         };
         config.validate()?;
@@ -1274,6 +1309,7 @@ mod tests {
             worker_capabilities: BTreeSet::new(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
+            waitpoint_hmac_bootstrap_kid_reset: false,
             backend_kind: BackendKind::Valkey,
         }
     }
@@ -1354,6 +1390,7 @@ mod tests {
             worker_capabilities: BTreeSet::new(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
+            waitpoint_hmac_bootstrap_kid_reset: false,
             backend_kind: BackendKind::Valkey,
         };
         config.validate()?;

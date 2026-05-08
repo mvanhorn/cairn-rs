@@ -240,6 +240,17 @@ jobs:
         # module signature) trips CI before merge.
         run: cargo test -p cairn-fabric --test backend_agnostic
         timeout-minutes: 5
+      - name: cargo test --test waitpoint_hmac_kid_reset_boot (#743 Part B)
+        # Standalone test binary deliberately separated from the
+        # parallel `--test integration` suite above: this test
+        # rotates FF's `waitpoint_hmac_secrets:{p:N}` partition state
+        # globally per-Valkey-instance, which would race with sibling
+        # tests that boot under a different kid. Cargo runs each
+        # `tests/<file>.rs` in its own process — that gives this test
+        # a dedicated Valkey container and natural isolation. See the
+        # module docstring for the full rationale.
+        run: cargo test -p cairn-fabric --test waitpoint_hmac_kid_reset_boot --features test-harness
+        timeout-minutes: 5
       # HTTP-lifecycle integration tests: launch the real cairn-app
       # binary per harness on an ephemeral port, drive via reqwest,
       # share the Valkey testcontainer. Same runtime constraints as

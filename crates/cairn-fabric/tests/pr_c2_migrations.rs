@@ -82,6 +82,7 @@ impl PrC2Harness {
                 "00000000000000000000000000000000000000000000000000000000000000aa".into(),
             ),
             waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+            waitpoint_hmac_bootstrap_kid_reset: false,
         };
 
         let event_log = Arc::new(InMemoryStore::default());

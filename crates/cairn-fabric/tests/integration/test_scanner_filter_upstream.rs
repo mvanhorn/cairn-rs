@@ -242,6 +242,7 @@ async fn engine_config_scanner_filter_is_wired() {
             "00000000000000000000000000000000000000000000000000000000000000aa".into(),
         ),
         waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+        waitpoint_hmac_bootstrap_kid_reset: false,
         backend_kind: cairn_fabric::config::BackendKind::Valkey,
     };
 

@@ -328,6 +328,7 @@ mod tests {
             worker_capabilities: caps.clone(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
+            waitpoint_hmac_bootstrap_kid_reset: false,
             backend_kind: crate::config::BackendKind::Valkey,
         };
 

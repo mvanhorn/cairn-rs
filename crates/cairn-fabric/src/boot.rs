@@ -4,7 +4,7 @@ use ferriskey::Client;
 use flowfabric::core::backend::ScannerFilter;
 use flowfabric::core::capability::Capabilities;
 use flowfabric::core::completion_backend::CompletionBackend;
-use flowfabric::core::contracts::SeedWaitpointHmacSecretArgs;
+use flowfabric::core::contracts::{RotateWaitpointHmacSecretAllArgs, SeedWaitpointHmacSecretArgs};
 use flowfabric::core::engine_backend::EngineBackend;
 use flowfabric::core::partition::PartitionConfig;
 use flowfabric::engine::{Engine, EngineConfig};
@@ -192,6 +192,38 @@ impl FabricRuntime {
                 ));
             }
         };
+
+        // #743 Part B: rotate before seed when the opt-in flag is set.
+        // 60s grace matches the FF admin-path default; rationale + UX
+        // is in the PR description and the field rustdoc on
+        // `FabricConfig::waitpoint_hmac_bootstrap_kid_reset`.
+        if config.waitpoint_hmac_bootstrap_kid_reset {
+            const BOOT_ROTATION_GRACE_MS: u64 = 60_000;
+            let rotation_outcome = backend
+                .rotate_waitpoint_hmac_secret_all(RotateWaitpointHmacSecretAllArgs::new(
+                    kid,
+                    secret,
+                    BOOT_ROTATION_GRACE_MS,
+                ))
+                .await
+                .map_err(|e| {
+                    FabricError::Config(format!(
+                        "CAIRN_FABRIC_WAITPOINT_HMAC_BOOTSTRAP_KID_RESET=1 was set but \
+                         the boot-time kid rotation failed: {e}. The persisted Valkey \
+                         state is unchanged; rerun without the variable set, or \
+                         resolve the underlying transport error and retry."
+                    ))
+                })?;
+            tracing::warn!(
+                kid = %kid,
+                grace_ms = BOOT_ROTATION_GRACE_MS,
+                outcome = ?rotation_outcome,
+                "#743 Part B: waitpoint HMAC kid rotated at boot via \
+                 CAIRN_FABRIC_WAITPOINT_HMAC_BOOTSTRAP_KID_RESET — tokens signed by \
+                 the previous kid are valid for the grace window only"
+            );
+        }
+
         let seed_outcome = backend
             .seed_waitpoint_hmac_secret(SeedWaitpointHmacSecretArgs::new(kid, secret))
             .await
@@ -428,6 +460,12 @@ fn reshape_seed_error(
                  - Set CAIRN_FABRIC_WAITPOINT_HMAC_KID={stored} (matching the \
                    stored kid) AND supply the original secret bytes to keep \
                    existing waitpoint tokens valid, OR\n\
+                 - Set CAIRN_FABRIC_WAITPOINT_HMAC_BOOTSTRAP_KID_RESET=1 to \
+                   rotate to the supplied kid on boot (#743 Part B). \
+                   Tokens signed under the previous kid remain valid for the \
+                   60s grace window only — acceptable for a boot-time \
+                   recovery where cairn-app wasn't running anyway, but NOT \
+                   for hot rotation of a live deployment, OR\n\
                  - Operator-pace a rotate via the FF \
                    `rotate_waitpoint_hmac_secret_all` admin path (drains live \
                    tokens with a grace window), OR\n\

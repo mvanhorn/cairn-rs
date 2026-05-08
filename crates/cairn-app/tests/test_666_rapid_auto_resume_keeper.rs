@@ -180,6 +180,7 @@ async fn keeper_skips_renew_in_runnable_unclaimed_phase() {
             "00000000000000000000000000000000000000000000000000000000000000aa".into(),
         ),
         waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+        waitpoint_hmac_bootstrap_kid_reset: false,
         backend_kind: cairn_fabric::config::BackendKind::Valkey,
     };
 
@@ -416,6 +417,7 @@ async fn runnable_unclaimed_is_classified_as_non_renewable() {
             "00000000000000000000000000000000000000000000000000000000000000aa".into(),
         ),
         waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+        waitpoint_hmac_bootstrap_kid_reset: false,
         backend_kind: cairn_fabric::config::BackendKind::Valkey,
     };
 
