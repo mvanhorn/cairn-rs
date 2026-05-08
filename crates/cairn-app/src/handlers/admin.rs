@@ -1149,6 +1149,7 @@ pub(crate) async fn create_project_handler(
 
 pub(crate) async fn list_projects_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(workspace_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
@@ -1161,6 +1162,16 @@ pub(crate) async fn list_projects_handler(
         }
         Err(err) => return runtime_error_response(err),
     };
+    // #734: tenant-scope check mirrors `list_workspaces_handler`.
+    // A non-admin operator may only enumerate projects in a
+    // workspace belonging to their own tenant — without this guard,
+    // any authenticated caller could enumerate every project in
+    // every workspace via a 1-step traversal of the workspace id
+    // space.
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &workspace.tenant_id {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "workspace not found")
+            .into_response();
+    }
 
     // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
     let limit = query.limit();
@@ -1210,6 +1221,7 @@ pub(crate) async fn add_workspace_member_handler(
 
 pub(crate) async fn list_workspace_members_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(workspace_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
@@ -1217,6 +1229,15 @@ pub(crate) async fn list_workspace_members_handler(
         Ok(workspace_key) => workspace_key,
         Err(err) => return runtime_error_response(err),
     };
+    // #734: tenant-scope check mirrors `list_workspaces_handler` —
+    // a non-admin operator may only enumerate the membership of a
+    // workspace belonging to their own tenant. Foreign-tenant
+    // operators get a 404 (rather than an enumeration oracle); admin
+    // tokens bypass for cross-tenant inspection.
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &workspace_key.tenant_id {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "workspace not found")
+            .into_response();
+    }
 
     // #422: the service returns every member in one shot. Membership
     // per workspace is bounded (typically <100), so pagination happens
@@ -1241,8 +1262,14 @@ pub(crate) async fn list_workspace_members_handler(
 
 pub(crate) async fn remove_workspace_member_handler(
     State(state): State<Arc<AppState>>,
+    _role: AdminRoleGuard,
     Path((workspace_id, member_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // #734: prior to this guard, any authenticated bearer token was
+    // sufficient to remove a member from any workspace. The
+    // `add_workspace_member_handler` and `create_workspace_share_handler`
+    // siblings already had `AdminRoleGuard`; the remove path was
+    // inconsistent and exploitable. Mirror the sibling guard.
     let workspace_key = match workspace_key_for_id(&state, &WorkspaceId::new(workspace_id)).await {
         Ok(workspace_key) => workspace_key,
         Err(err) => return runtime_error_response(err),
@@ -1289,10 +1316,35 @@ pub(crate) async fn create_workspace_share_handler(
 
 pub(crate) async fn list_workspace_shares_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(workspace_id): Path<String>,
     Query(query): Query<TenantScopedQuery>,
 ) -> impl IntoResponse {
     use cairn_runtime::ResourceSharingService;
+    // #734: prior to this guard, any authenticated bearer token
+    // could enumerate shares in any workspace by passing the
+    // workspace's tenant_id in the query. Two checks now apply:
+    //   1. The query-supplied tenant_id MUST match the caller's
+    //      auth-derived `TenantScope` (admin tokens bypass) —
+    //      otherwise an operator in tenant A could pass
+    //      `tenant_id=tenant_b` to list tenant_b's shares.
+    //   2. The workspace itself must belong to that same tenant —
+    //      `workspace_key_for_id` confirms the binding.
+    let target_tenant = TenantId::new(query.tenant_id.clone());
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target_tenant {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "workspace not found")
+            .into_response();
+    }
+    let workspace_key =
+        match workspace_key_for_id(&state, &WorkspaceId::new(workspace_id.clone())).await {
+            Ok(workspace_key) => workspace_key,
+            Err(err) => return runtime_error_response(err),
+        };
+    if workspace_key.tenant_id != target_tenant {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "workspace not found")
+            .into_response();
+    }
+
     // #422: shares per workspace are bounded (admin-curated), but the
     // service returns the full list. Apply limit/offset in-memory and
     // compute `has_more` against the filtered total.
@@ -1301,10 +1353,7 @@ pub(crate) async fn list_workspace_shares_handler(
     match state
         .runtime
         .resource_sharing
-        .list_shares(
-            &TenantId::new(query.tenant_id),
-            &WorkspaceId::new(workspace_id),
-        )
+        .list_shares(&target_tenant, &WorkspaceId::new(workspace_id))
         .await
     {
         Ok(all) => {

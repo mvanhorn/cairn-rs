@@ -170,6 +170,15 @@ const MATRIX: &[Row] = &[
         path: "/v1/admin/tenants/default_tenant/sessions/sess_does_not_exist",
         label: "DELETE /v1/admin/tenants/:t/sessions/:session_id",
     },
+    // #734: workspace member removal. Pre-fix this handler had no
+    // role guard at all — any authenticated bearer token could
+    // delete a member from any workspace. Now gated by
+    // `AdminRoleGuard`.
+    Row {
+        method: M::Delete,
+        path: "/v1/admin/workspaces/ws_does_not_exist/members/op_does_not_exist",
+        label: "DELETE /v1/admin/workspaces/:id/members/:member_id (#734)",
+    },
 ];
 
 #[tokio::test]
