@@ -48,6 +48,7 @@ pub mod guardrail_impl;
 pub mod ingest_job_impl;
 pub mod knowledge_provider_impl;
 pub mod license_impl;
+pub mod memory_provider_impl;
 pub mod notification_impl;
 pub mod operator_profile_impl;
 pub mod quota_impl;
@@ -107,6 +108,9 @@ pub use knowledge_provider_impl::{
     handle_configure_knowledge_provider, KnowledgeProviderService, KnowledgeProviderServiceImpl,
 };
 pub use mailbox_impl::MailboxServiceImpl;
+pub use memory_provider_impl::{
+    handle_configure_memory_provider, MemoryProviderService, MemoryProviderServiceImpl,
+};
 pub use observability_impl::LlmObservabilityServiceImpl;
 pub use project_impl::ProjectServiceImpl;
 pub use prompt_asset_impl::PromptAssetServiceImpl;

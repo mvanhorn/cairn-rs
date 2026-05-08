@@ -157,6 +157,12 @@ GET	/v1/plugins/:id/tools	preserve	-	-
 GET	/v1/plugins/catalog	preserve	-	-
 GET	/v1/plugins/tools/search	preserve	-	-
 GET	/v1/policies/decisions	preserve	query: limit?	{ items }
+GET	/v1/projects/:project/ingest-jobs	preserve	-	-
+GET	/v1/projects/:project/knowledge-scoring-policy	preserve	-	-
+GET	/v1/projects/:project/knowledge-scoring-policy/valid-dimensions	preserve	-	-
+GET	/v1/projects/:project/memory-scoring-policy	preserve	-	-
+GET	/v1/projects/:project/memory-scoring-policy/valid-dimensions	preserve	-	-
+GET	/v1/projects/:project/providers	preserve	-	-
 GET	/v1/projects/:project/repos	preserve	-	-
 GET	/v1/projects/:project/repos/:owner/:repo	preserve	-	-
 GET	/v1/projects/:project/run-templates	preserve	-	-
@@ -462,6 +468,9 @@ PUT	/v1/admin/models/:id	preserve	-	-
 PUT	/v1/config/:key	preserve	path param: key, body: value	{ ok }
 PUT	/v1/integrations/:integration_id/overrides	preserve	-	-
 PUT	/v1/projects/:project/knowledge-provider	preserve	-	-
+PUT	/v1/projects/:project/knowledge-scoring-policy	preserve	-	-
+PUT	/v1/projects/:project/memory-provider	preserve	-	-
+PUT	/v1/projects/:project/memory-scoring-policy	preserve	-	-
 PUT	/v1/projects/:project/scoring-policy	preserve	-	-
 PUT	/v1/providers/connections/:id	preserve	-	-
 PUT	/v1/providers/connections/:id/retry-policy	preserve	-	-

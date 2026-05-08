@@ -1,4 +1,9 @@
-//! RFC 029 PR-B2: PUT /v1/projects/:project/scoring-policy HTTP contract.
+//! RFC 029 PR-B2 / RFC 030 PR-E: HTTP contract for the scoring-policy
+//! endpoints. Under RFC 030 the original `PUT /v1/projects/:project/
+//! scoring-policy` was split into knowledge- and memory-family variants;
+//! these tests exercise the knowledge variant. The legacy endpoint now
+//! 308-redirects to the knowledge variant (see
+//! `test_http_memory_provider::legacy_scoring_policy_returns_308_redirect`).
 
 mod support;
 
@@ -38,7 +43,7 @@ async fn configure_scoring_policy_accepts_default_on_cairn_default_provider() {
 
     let res = h
         .client()
-        .put(format!("{base}/v1/projects/{p}/scoring-policy"))
+        .put(format!("{base}/v1/projects/{p}/knowledge-scoring-policy"))
         .bearer_auth(&h.admin_token)
         .json(&policy)
         .send()
@@ -88,7 +93,7 @@ async fn configure_scoring_policy_rejects_zero_weight_on_runtime_owned_stays_fin
 
     let res = h
         .client()
-        .put(format!("{base}/v1/projects/{p}/scoring-policy"))
+        .put(format!("{base}/v1/projects/{p}/knowledge-scoring-policy"))
         .bearer_auth(&h.admin_token)
         .json(&policy)
         .send()

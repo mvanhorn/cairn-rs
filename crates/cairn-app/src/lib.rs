@@ -17,6 +17,7 @@ pub mod idempotency;
 pub mod knowledge_provider_routes;
 pub mod lease_keeper;
 pub mod marketplace_routes;
+pub mod memory_provider_routes;
 pub mod metrics;
 #[cfg(feature = "metrics-otel")]
 pub mod metrics_otel;
@@ -25,6 +26,7 @@ pub mod metrics_tap;
 pub mod middleware;
 pub mod openapi_spec;
 pub mod parent_auto_resume_impl;
+pub mod providers_routes;
 pub mod repo_routes;
 pub mod router;
 pub mod sandbox;

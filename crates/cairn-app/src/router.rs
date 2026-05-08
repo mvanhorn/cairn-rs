@@ -1763,10 +1763,51 @@ impl AppBootstrap {
                 "/v1/projects/:project/knowledge-provider",
                 put(knowledge_provider_routes::configure_knowledge_provider_handler),
             )
-            // RFC 029 PR-B2: configure the project's scoring policy.
+            // RFC 030 PR-E: configure the project's memory provider.
+            .route(
+                "/v1/projects/:project/memory-provider",
+                put(memory_provider_routes::configure_memory_provider_handler),
+            )
+            // RFC 030 PR-E: atomic read of both provider slots +
+            // resolved snapshots.
+            .route(
+                "/v1/projects/:project/providers",
+                get(providers_routes::get_providers_handler),
+            )
+            // RFC 030 PR-E: cross-family ingest-job listing backed by
+            // the `{Memory,Knowledge}Ingest*` event stream, optionally
+            // filtered by family=memory|knowledge|all.
+            .route(
+                "/v1/projects/:project/ingest-jobs",
+                get(providers_routes::get_ingest_jobs_handler),
+            )
+            // RFC 030 PR-E: legacy scoring-policy endpoint → 308 redirect
+            // to the knowledge variant. Preserves request method + body so
+            // operator CLIs from the pre-PR-E world still work without
+            // breaking in-flight automation.
             .route(
                 "/v1/projects/:project/scoring-policy",
-                put(scoring_policy_routes::configure_scoring_policy_handler),
+                put(scoring_policy_routes::legacy_scoring_policy_redirect_handler),
+            )
+            // RFC 030 PR-E: per-family scoring-policy PUT + GET +
+            // valid-dimensions.
+            .route(
+                "/v1/projects/:project/memory-scoring-policy",
+                get(scoring_policy_routes::get_memory_scoring_policy_handler)
+                    .put(scoring_policy_routes::configure_memory_scoring_policy_handler),
+            )
+            .route(
+                "/v1/projects/:project/knowledge-scoring-policy",
+                get(scoring_policy_routes::get_knowledge_scoring_policy_handler)
+                    .put(scoring_policy_routes::configure_knowledge_scoring_policy_handler),
+            )
+            .route(
+                "/v1/projects/:project/memory-scoring-policy/valid-dimensions",
+                get(scoring_policy_routes::get_memory_valid_dimensions_handler),
+            )
+            .route(
+                "/v1/projects/:project/knowledge-scoring-policy/valid-dimensions",
+                get(scoring_policy_routes::get_knowledge_valid_dimensions_handler),
             )
             .route(
                 "/v1/projects/:project/repos",

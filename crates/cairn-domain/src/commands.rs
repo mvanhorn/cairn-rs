@@ -121,6 +121,8 @@ pub enum RuntimeCommand {
     CreateScheduledTask(CreateScheduledTask),
     /// RFC 029: configure the knowledge provider for a project.
     ConfigureKnowledgeProvider(ConfigureKnowledgeProvider),
+    /// RFC 030: configure the memory provider for a project.
+    ConfigureMemoryProvider(ConfigureMemoryProvider),
 }
 
 impl RuntimeCommand {
@@ -167,6 +169,7 @@ impl RuntimeCommand {
             RuntimeCommand::CreateProject(command) => &command.project,
             RuntimeCommand::CreateScheduledTask(command) => &command.project,
             RuntimeCommand::ConfigureKnowledgeProvider(command) => &command.project,
+            RuntimeCommand::ConfigureMemoryProvider(command) => &command.project,
         }
     }
 
@@ -300,6 +303,7 @@ impl RuntimeCommand {
             RuntimeCommand::CreateProject(_) => None,
             RuntimeCommand::CreateScheduledTask(_) => None,
             RuntimeCommand::ConfigureKnowledgeProvider(_) => None,
+            RuntimeCommand::ConfigureMemoryProvider(_) => None,
         }
     }
 }
@@ -655,6 +659,20 @@ pub struct CreateScheduledTask {
 /// row on `project_knowledge_providers`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigureKnowledgeProvider {
+    pub project: ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub actor: crate::ids::OperatorId,
+}
+
+/// RFC 030: configure or change the memory provider for a project.
+/// Emits `MemoryProviderConfigured` and upserts the current-configuration
+/// row on `project_memory_providers`.
+///
+/// Symmetric to [`ConfigureKnowledgeProvider`] but routed to the memory
+/// family's event/projection path — the two families are mutually
+/// exclusive slots per project per RFC 030 §Decisions D1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigureMemoryProvider {
     pub project: ProjectKey,
     pub provider_ref: crate::ids::ProviderRef,
     pub actor: crate::ids::OperatorId,
