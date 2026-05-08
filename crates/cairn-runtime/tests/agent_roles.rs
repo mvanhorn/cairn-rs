@@ -8,21 +8,23 @@
 //! it requires thread-safe shared state (Arc<RwLock<...>>). The domain types
 //! (AgentRole, AgentRoleTier, default_roles) are in cairn-domain.
 //!
-//! Default roles (4 total):
+//! Default roles (5 total — #775 added `generic`):
 //!   orchestrator  AgentRoleTier::Orchestrator  max_ctx=200k  all tools
 //!   researcher    AgentRoleTier::Research       max_ctx=128k  read tools
 //!   executor      AgentRoleTier::Standard       max_ctx=None  write tools
 //!   reviewer      AgentRoleTier::Standard       max_ctx=None  read-only tools
+//!   generic       AgentRoleTier::Generic        max_ctx=None  universal-purpose
 
 use cairn_domain::agent_roles::{AgentRole, AgentRoleTier};
 use cairn_runtime::agent_roles::AgentRoleRegistry;
 
-// ── 1. Create registry with 4 default roles ───────────────────────────────────
+// ── 1. Create registry with 5 default roles ───────────────────────────────────
 
 #[test]
-fn with_defaults_has_exactly_four_roles() {
+fn with_defaults_has_exactly_five_roles() {
+    // #775: added `generic` alongside the original four.
     let reg = AgentRoleRegistry::with_defaults();
-    assert_eq!(reg.len(), 4, "must have exactly 4 default roles");
+    assert_eq!(reg.len(), 5, "must have exactly 5 default roles");
     assert!(!reg.is_empty());
 }
 
@@ -37,16 +39,18 @@ fn empty_registry_has_no_roles() {
     );
 }
 
-// ── 2. list_all returns all 4, sorted by role_id ─────────────────────────────
+// ── 2. list_all returns all 5, sorted by role_id ─────────────────────────────
 
 #[test]
-fn list_all_returns_four_sorted_by_role_id() {
+fn list_all_returns_five_sorted_by_role_id() {
     let reg = AgentRoleRegistry::with_defaults();
     let all = reg.list_all();
 
-    assert_eq!(all.len(), 4);
+    // #775: 5 default roles after adding `generic`.
+    assert_eq!(all.len(), 5);
 
-    // Verify sorted order (executor < orchestrator < researcher < reviewer).
+    // Verify sorted order
+    // (executor < generic < orchestrator < researcher < reviewer).
     for window in all.windows(2) {
         assert!(
             window[0].role_id <= window[1].role_id,
@@ -59,6 +63,7 @@ fn list_all_returns_four_sorted_by_role_id() {
     assert!(ids.contains(&"researcher"));
     assert!(ids.contains(&"executor"));
     assert!(ids.contains(&"reviewer"));
+    assert!(ids.contains(&"generic"));
 }
 
 // ── 3. get_by_name for each of the 4 default roles ───────────────────────────
@@ -146,12 +151,13 @@ fn get_unknown_role_returns_none() {
     assert!(reg.get("").is_none());
 }
 
-// ── 4. Register custom role → list_all returns 5 ─────────────────────────────
+// ── 4. Register custom role → list_all grows by one ─────────────────────────
 
 #[test]
-fn register_custom_role_grows_registry_to_five() {
+fn register_custom_role_grows_registry_by_one() {
+    // #775: 5 defaults + 1 new = 6.
     let reg = AgentRoleRegistry::with_defaults();
-    assert_eq!(reg.len(), 4);
+    assert_eq!(reg.len(), 5);
 
     let custom = AgentRole::new("analyst", "Data Analyst", AgentRoleTier::Research)
         .with_system_prompt("You are a data analyst. Interpret metrics and surface insights.")
@@ -160,9 +166,9 @@ fn register_custom_role_grows_registry_to_five() {
 
     reg.register(custom);
 
-    assert_eq!(reg.len(), 5, "custom role added to registry");
+    assert_eq!(reg.len(), 6, "custom role added to registry");
     let all = reg.list_all();
-    assert_eq!(all.len(), 5);
+    assert_eq!(all.len(), 6);
 
     let ids: Vec<_> = all.iter().map(|r| r.role_id.as_str()).collect();
     assert!(ids.contains(&"analyst"), "analyst must be in list_all");
@@ -315,7 +321,8 @@ fn default_role_available_after_custom_registration() {
 #[test]
 fn register_same_id_replaces_without_duplicate() {
     let reg = AgentRoleRegistry::with_defaults();
-    assert_eq!(reg.len(), 4);
+    // #775: 5 default roles.
+    assert_eq!(reg.len(), 5);
 
     // Override orchestrator with a restricted version.
     let restricted_orch = AgentRole::new(
@@ -326,7 +333,7 @@ fn register_same_id_replaces_without_duplicate() {
     .with_max_context_tokens(32_000);
     reg.register(restricted_orch);
 
-    assert_eq!(reg.len(), 4, "override must not duplicate the entry");
+    assert_eq!(reg.len(), 5, "override must not duplicate the entry");
     let orch = reg.get("orchestrator").unwrap();
     assert_eq!(orch.display_name, "Restricted Orchestrator");
     assert_eq!(orch.max_context_tokens, Some(32_000));
@@ -346,9 +353,10 @@ fn cloned_registry_shares_underlying_state() {
         AgentRoleTier::Standard,
     ));
 
+    // #775: 5 defaults + 1 shared-role registration = 6.
     assert_eq!(
         reg.len(),
-        5,
+        6,
         "clone shares Arc — registration is visible in original"
     );
     assert!(reg.get("shared-role").is_some());

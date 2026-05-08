@@ -9,6 +9,48 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **AgentRole architecture refactor (#775).** The four built-in role
+  prompts no longer duplicate scaffolding inline; sub-agent identity,
+  autonomous-completion mandate, and meta-rules now live in a shared
+  `BASE_SUBAGENT_PROMPT` constant pre-pended to each role's specialty
+  overlay (executor / researcher / reviewer / generic). The
+  orchestrator's prompt remains standalone — it is the parent, not a
+  sub-agent. New `AgentRole.description` field carries a short
+  orchestrator-facing summary for future `list_agents` /
+  `agent_description` tools (#776). New `AgentRole.response_shape`
+  enum (DirectAnswer | ProceduralArtifact) lets future per-iteration
+  footer logic (#774) pick the right nudge per role. New `Generic`
+  tier + `generic` role for goals that do not fit a registered
+  specialty cleanly — content-neutral prompt skeleton, parent owns
+  the workflow design entirely via the goal text. Use
+  `assembled_prompt_for(role_id)` to render any role's full prompt;
+  reading `AgentRole.system_prompt` directly returns only the
+  specialty overlay (or full text for the orchestrator).
+
+- **Optional `parent_context` field on spawn_subagent (#775).** The
+  parent orchestrator can now thread a freeform context string into a
+  sub-agent's first DECIDE prompt — typically a previous-attempt
+  mistake to avoid, or workspace context the child should know up
+  front. Schema: `spawn_subagent(role, goal, parent_context?)`.
+  Threaded through `BridgeEvent::SubagentSpawned`,
+  `RuntimeEvent::SubagentSpawned`, persisted on the child run's
+  defaults at `run:<child_run_id>:parent_context` (same pattern as
+  `goal`), resolved into `OrchestrationContext.parent_context` on
+  the child's first orchestrate iteration, and rendered in the
+  user message as `## Parent context` between `## Goal` and
+  `## Run state`. `SubagentSpawned.parent_context` is
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` so
+  pre-#775 events replay cleanly as `None`.
+
+- **Unknown `agent_type` falls back to `generic` (#775).** Pre-#775
+  an unknown role id resolved to a 3-line generic system prompt
+  that did not satisfy any of the role-prompt structural anchors
+  (Phase 1, Phase 5, completion gate, …). Now it falls back to the
+  generic role's full assembled prompt — structurally complete,
+  contract-satisfying, parent owns the workflow.
+
 ### Security (breaking pre-release)
 
 - **Credential encryption cluster (META #461; closes #447, #448, #449, #450,

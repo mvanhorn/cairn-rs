@@ -718,6 +718,7 @@ async fn plan_mode_never_receives_stuck_nudge() {
         is_recovery: false,
         approval_timeout: None,
         visibility: None,
+        parent_context: None,
     };
     let gather = GatherOutput {
         step_history: ctx.step_history.clone(),

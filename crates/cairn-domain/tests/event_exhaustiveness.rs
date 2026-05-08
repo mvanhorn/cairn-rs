@@ -976,6 +976,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             child_run_id: None,
             goal: "exhaustiveness-sample-goal".to_owned(),
             role: "executor".to_owned(),
+            parent_context: None,
         }),
         RuntimeEvent::RecoveryAttempted(RecoveryAttempted {
             project: p(),

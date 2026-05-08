@@ -75,6 +75,7 @@ fn base_ctx(run_id: &str, is_recovery: bool) -> OrchestrationContext {
         is_recovery,
         approval_timeout: None,
         visibility: None,
+        parent_context: None,
     }
 }
 

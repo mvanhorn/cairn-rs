@@ -3167,6 +3167,7 @@ mod in_memory_vs_sqlite {
             child_run_id: Some(RunId::new("run_child_sub_1")),
             goal: "parity-sub-goal".to_owned(),
             role: "researcher".to_owned(),
+            parent_context: None,
         }))];
         append_both(&mem, &sqlite_log, &events).await;
 
@@ -3228,6 +3229,7 @@ mod in_memory_vs_sqlite {
                 child_run_id: None,
                 goal: "dup-sub-goal-a".to_owned(),
                 role: "executor".to_owned(),
+                parent_context: None,
             })),
             // Bogus second spawn with same child_task_id but different
             // parent — idempotent: first write wins.
@@ -3240,6 +3242,7 @@ mod in_memory_vs_sqlite {
                 child_run_id: None,
                 goal: "dup-sub-goal-b".to_owned(),
                 role: "executor".to_owned(),
+                parent_context: None,
             })),
         ];
         append_both(&mem, &sqlite_log, &events).await;

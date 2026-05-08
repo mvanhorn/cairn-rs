@@ -44,6 +44,7 @@ fn ctx() -> OrchestrationContext {
         is_recovery: false,
         approval_timeout: None,
         visibility: None,
+        parent_context: None,
     }
 }
 

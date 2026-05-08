@@ -199,6 +199,11 @@ pub enum BridgeEvent {
         /// `ActionProposal.tool_name` string (pre-validated against the
         /// known-role allow-list by the execute layer).
         role: String,
+        /// #775: optional freeform context the parent threaded into
+        /// the spawn (typically a previous-attempt mistake to avoid).
+        /// `None` when the parent did not provide one. Surfaced in
+        /// the child's first DECIDE prompt under `## Parent context`.
+        parent_context: Option<String>,
     },
 }
 
@@ -680,6 +685,7 @@ fn bridge_event_to_runtime_event(event: &BridgeEvent) -> RuntimeEvent {
             project,
             goal,
             role,
+            parent_context,
         } => RuntimeEvent::SubagentSpawned(cairn_domain::events::SubagentSpawned {
             project: project.clone(),
             parent_run_id: parent_run_id.clone(),
@@ -689,6 +695,7 @@ fn bridge_event_to_runtime_event(event: &BridgeEvent) -> RuntimeEvent {
             child_run_id: child_run_id.clone(),
             goal: goal.clone(),
             role: role.clone(),
+            parent_context: parent_context.clone(),
         }),
     }
 }

@@ -1177,7 +1177,13 @@ impl RuntimeExecutePhase {
                 // The prompt mentions three roles; any other string is
                 // a behaviour regression we want visible in
                 // `ActionStatus::Failed.reason`.
-                const VALID_ROLES: &[&str] = &["executor", "researcher", "reviewer"];
+                // #775: `generic` is a registered role — orchestrator's
+                // escape hatch when no specialty cleanly fits the goal.
+                // Validated here against `default_roles()` indirectly via
+                // this list; if the registry ever grows, this list needs
+                // to grow with it (or be derived from default_roles()
+                // directly — done as a follow-up in #776).
+                const VALID_ROLES: &[&str] = &["executor", "researcher", "reviewer", "generic"];
                 let role = match proposal.tool_name.as_deref() {
                     Some(r) if VALID_ROLES.contains(&r) => r.to_owned(),
                     Some(other) => {
@@ -1256,6 +1262,21 @@ impl RuntimeExecutePhase {
                     }
                 };
 
+                // #775: optional freeform parent_context. Trimmed empty
+                // → None (don't surface a `## Parent context` section
+                // for whitespace). Non-string values are silently
+                // ignored — the schema declares `string` so any other
+                // shape is malformed and the child is better off without
+                // garbage context than with it.
+                let parent_context: Option<String> = proposal
+                    .tool_args
+                    .as_ref()
+                    .and_then(|args| args.get("parent_context"))
+                    .and_then(|c| c.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+
                 let child_task_id = TaskId::new(new_id("child_task"));
                 // #670 G1+G2: scope the child task to the parent's
                 // session. The `TaskService::spawn_subagent` rustdoc
@@ -1298,6 +1319,9 @@ impl RuntimeExecutePhase {
                         // `subagent_spawns` projection row.
                         goal,
                         role,
+                        // #775: optional parent freeform context for
+                        // the child's first DECIDE prompt.
+                        parent_context,
                     )
                     .await
                 {

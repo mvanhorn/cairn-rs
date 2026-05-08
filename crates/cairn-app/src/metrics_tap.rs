@@ -470,6 +470,7 @@ mod tests {
             child_run_id: None,
             goal: "tap-test-goal".to_owned(),
             role: "executor".to_owned(),
+            parent_context: None,
         });
         process_event(&metrics, &tracker, &event);
 

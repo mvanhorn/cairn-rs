@@ -2159,6 +2159,7 @@ impl TaskService for FabricTaskServiceAdapter {
         child_run_id: Option<RunId>,
         goal: String,
         role: String,
+        parent_context: Option<String>,
     ) -> Result<TaskRecord, RuntimeError> {
         // #670 G4 PR-1a cross-tenant contract: derive the child's
         // project from the parent run row. No caller-supplied project
@@ -2263,6 +2264,37 @@ impl TaskService for FabricTaskServiceAdapter {
                      first iteration will fall back to `Execute the run objective.` \
                      placeholder and the subagent may produce empty output",
                 );
+            }
+
+            // #775: same persistence pattern for parent_context. Stored
+            // under `run:<child_run_id>:parent_context`; resolved on
+            // every child orchestrate iteration via
+            // `resolve_run_string_default(... "parent_context")` and
+            // populated into `OrchestrationContext.parent_context` so
+            // the `## Parent context` section renders in the child's
+            // user message. Skipped when the parent did not provide a
+            // context — None means no row, no fallback, no rendered
+            // section.
+            if let Some(ref pc) = parent_context {
+                let pc_key = format!("run:{}:parent_context", child_run_id.as_str());
+                if let Err(err) = defaults
+                    .set(
+                        cairn_domain::tenancy::Scope::Project,
+                        parent_project.project_id.to_string(),
+                        pc_key,
+                        serde_json::Value::String(pc.clone()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        parent_run_id = %parent_run_id,
+                        child_run_id = %child_run_id,
+                        "#775: failed to persist child run parent_context default; \
+                         child's first iteration will not see the `## Parent context` \
+                         section and the parent's binding direction is silently lost",
+                    );
+                }
             }
         }
 
@@ -2495,6 +2527,12 @@ impl TaskService for FabricTaskServiceAdapter {
                 project: parent_project,
                 goal,
                 role,
+                // #775: parent_context threading lands in step 3
+                // (spawn_subagent trait+impl signature change). For
+                // now keep parity with pre-#775 callers — None means
+                // "no parent context provided", which is the same
+                // default any pre-existing caller would have seen.
+                parent_context,
             })
             .await;
 

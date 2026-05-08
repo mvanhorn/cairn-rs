@@ -89,6 +89,16 @@ pub struct OrchestrationContext {
     /// legacy / test-construction paths; treated as "cairn-default and
     /// no plugin overrides" — every built-in stays visible.
     pub visibility: Option<VisibilityContext>,
+
+    /// #775: optional freeform context threaded from the parent run
+    /// at spawn time. Surfaced verbatim in the child's first DECIDE
+    /// user message under a `## Parent context` section, between the
+    /// `## Goal` and the per-iteration footer.
+    ///
+    /// Populated from `SubagentSpawned.parent_context` when the child
+    /// run is created. `None` on root runs and on legacy test-
+    /// construction paths.
+    pub parent_context: Option<String>,
 }
 
 impl OrchestrationContext {

@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use cairn_domain::{
-    agent_roles::{default_roles, AgentRole},
+    agent_roles::default_roles,
     providers::{GenerationProvider, ProviderBindingSettings},
     ActionProposal, ActionType,
 };
@@ -668,17 +668,14 @@ fn build_system_prompt(
     tools: &[BuiltinToolDescriptor],
     native_tools_enabled: bool,
 ) -> String {
-    // Role identity — use registered role prompt or a sensible default.
-    let role_prompt = default_roles()
-        .into_iter()
-        .find(|r: &AgentRole| r.role_id == agent_type)
-        .and_then(|r| r.system_prompt)
-        .unwrap_or_else(|| {
-            "You are an autonomous agent working on a task end-to-end. \
-             Use the available tools to understand the problem, take action, \
-             and deliver concrete results."
-                .to_owned()
-        });
+    // Role identity — use the registry's assembled prompt. For non-
+    // orchestrator roles this is `BASE_SUBAGENT_PROMPT + specialty
+    // overlay`; for the orchestrator it is the full prompt verbatim.
+    // Unknown roles fall back to the generic role's assembled prompt
+    // (#775) — the pre-#775 3-line fallback did not satisfy any
+    // contract anchors and left mis-spawned children without a
+    // workflow skeleton.
+    let role_prompt = cairn_domain::agent_roles::assembled_prompt_for(agent_type);
 
     // Build the tool list section. The phrasing differs between the two
     // model interfaces (native OpenAI `tool_calls` vs. JSON-array text).
@@ -931,6 +928,17 @@ fn build_user_message(
 ) -> String {
     // ── Fixed sections (never truncated) ─────────────────────────────────────
     let goal_part = format!("## Goal\n{}", ctx.goal);
+    // #775: optional parent-context section — surfaced verbatim from
+    // SubagentSpawned.parent_context. Rendered between Goal and Run
+    // state so the child sees the parent's binding direction
+    // immediately after the goal. Empty / whitespace-only contexts
+    // are filtered upstream (execute_impl extraction strips them);
+    // here we only check `is_some` because the field is already a
+    // typed Option<String> on the context.
+    let parent_context_part: Option<String> = ctx
+        .parent_context
+        .as_ref()
+        .map(|c| format!("## Parent context\n{c}"));
     let run_state_part = format!(
         "## Run state\nrun_id: {}\niteration: {}\nagent_type: {}",
         ctx.run_id.as_str(),
@@ -975,7 +983,12 @@ fn build_user_message(
     // ── Compute how many tokens are available for optional content ────────────
     // When no budget is set every section is included without limit.
     let optional_token_budget: Option<usize> = budget.map(|b| {
+        let parent_ctx_cost = parent_context_part
+            .as_deref()
+            .map(estimate_tokens)
+            .unwrap_or(0);
         let fixed_cost = estimate_tokens(&goal_part)
+            + parent_ctx_cost
             + estimate_tokens(&run_state_part)
             + estimate_tokens(&footer)
             + nudge_cost
@@ -1108,7 +1121,15 @@ fn build_user_message(
     };
 
     // ── Assemble ──────────────────────────────────────────────────────────────
-    let mut parts: Vec<String> = vec![goal_part, run_state_part];
+    // Order: Goal → Parent context (optional) → Run state → optional
+    // sections (memory, step history, …) → footer. Parent context
+    // sits adjacent to the goal so the child reads the parent's
+    // binding direction before any retrieved context.
+    let mut parts: Vec<String> = vec![goal_part];
+    if let Some(s) = parent_context_part {
+        parts.push(s);
+    }
+    parts.push(run_state_part);
     if let Some(s) = memory_section {
         parts.push(s);
     }
@@ -1236,17 +1257,21 @@ pub(crate) fn spawn_subagent_tool_def() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "spawn_subagent",
-            "description": "Delegate a concrete task to a sub-agent and wait for its result. The current run SUSPENDS until the sub-agent terminates; when it resumes, the sub-agent's completion summary is surfaced in the step_history under action_kind=\"subagent_complete\". Use this when the current run's goal decomposes into a self-contained sub-task that another role (researcher, executor, reviewer) is better suited to handle.",
+            "description": "Delegate a concrete task to a sub-agent and wait for its result. The current run SUSPENDS until the sub-agent terminates; when it resumes, the sub-agent's completion summary is surfaced in the step_history under action_kind=\"subagent_complete\". Use this when the current run's goal decomposes into a self-contained sub-task that another role (researcher, executor, reviewer, or generic) is better suited to handle.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "role": {
                         "type": "string",
-                        "description": "The sub-agent role. Known roles: `researcher` (reads, cites, summarises), `executor` (writes code, runs tools), `reviewer` (audits work). Unknown roles fall through to the `orchestrator` default prompt at the sub-agent side, which is usually not what you want — stick to the known set."
+                        "description": "The sub-agent role. Known roles: `researcher` (reads, cites, summarises), `executor` (writes code, runs tools), `reviewer` (audits work, read-only), `generic` (no specialty bias — workflow comes from the goal text). Pick `generic` when no specialty cleanly fits and the goal text fully describes the workflow. Unknown roles fall back to `generic` at the sub-agent side."
                     },
                     "goal": {
                         "type": "string",
                         "description": "REQUIRED. One-sentence concrete goal for the sub-agent. Be specific: 'Find 3 best practices for X' is good; 'research X' is too vague. The sub-agent's summary quality depends heavily on goal specificity."
+                    },
+                    "parent_context": {
+                        "type": "string",
+                        "description": "OPTIONAL. Freeform context the parent threads into the child's first DECIDE prompt under a `## Parent context` section. Useful on a re-spawn after a failed first attempt — e.g. 'previous attempt looped on `gh auth status`; do not call `gh auth status`, the workspace at /tmp/.../foo already has gh credentials'. Do NOT put the goal itself here — the goal goes in `goal`."
                     }
                 },
                 "required": ["role", "goal"],
@@ -1816,6 +1841,7 @@ mod tests {
             is_recovery: false,
             approval_timeout: None,
             visibility: None,
+            parent_context: None,
         }
     }
 
@@ -1974,14 +2000,29 @@ mod tests {
 
     #[test]
     fn system_prompt_fallback_for_unknown_role() {
+        // #775: unknown role ids no longer get the 3-line generic
+        // fallback. They render the `generic` role's full assembled
+        // prompt (BASE_SUBAGENT_PROMPT + GENERIC_PROMPT). The test
+        // pins the new contract: identity is sub-agent (from BASE),
+        // and the prompt is structurally complete (Phase 1 / Phase
+        // 5 / complete_run anchors all present).
         let sys = build_system_prompt("wizard", &[], false);
         assert!(
             sys.contains("JSON array"),
             "fallback must still instruct JSON return"
         );
         assert!(
-            sys.contains("autonomous agent"),
-            "fallback should use generic autonomous identity"
+            sys.contains("sub-agent"),
+            "fallback should adopt sub-agent identity from BASE_SUBAGENT_PROMPT"
+        );
+        assert!(
+            sys.contains("Phase 1"),
+            "fallback must contain Phase 1 (from generic specialty overlay)"
+        );
+        assert!(sys.contains("Phase 5"), "fallback must contain Phase 5");
+        assert!(
+            sys.contains("complete_run"),
+            "fallback must name complete_run as the terminator"
         );
     }
 
@@ -2157,12 +2198,69 @@ mod tests {
             .expect("properties present");
         assert!(props.contains_key("role"), "role in properties");
         assert!(props.contains_key("goal"), "goal in properties");
+        // #775: parent_context is OPTIONAL — present in properties
+        // but NOT in the required set.
+        assert!(
+            props.contains_key("parent_context"),
+            "parent_context in properties (optional, #775)"
+        );
+        assert!(
+            !required_set.contains("parent_context"),
+            "parent_context must NOT be required (it is optional freeform context)"
+        );
         // additionalProperties:false is the industry-standard constrained-
         // decoding hint (per multi-provider-tool-call-quirks research).
         assert_eq!(
             params.get("additionalProperties").and_then(|v| v.as_bool()),
             Some(false),
             "additionalProperties:false enables strict-mode enforcement",
+        );
+    }
+
+    #[test]
+    fn build_user_message_renders_parent_context_section() {
+        // #775: when ctx.parent_context is set, the user message must
+        // contain a `## Parent context` section with the verbatim
+        // text. Section appears BEFORE `## Run state` so the child
+        // sees the parent's binding direction immediately after the
+        // goal.
+        let mut c = ctx();
+        c.parent_context =
+            Some("previous attempt looped on `gh auth status`; do not call it".to_owned());
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            msg.contains("## Parent context"),
+            "user message must include `## Parent context` header when set"
+        );
+        assert!(
+            msg.contains("previous attempt looped on `gh auth status`"),
+            "parent_context body must appear verbatim"
+        );
+        // Goal comes before parent context, parent context before run
+        // state.
+        let goal_idx = msg.find("## Goal").expect("Goal section");
+        let pctx_idx = msg
+            .find("## Parent context")
+            .expect("Parent context section");
+        let runstate_idx = msg.find("## Run state").expect("Run state section");
+        assert!(goal_idx < pctx_idx, "Goal must precede Parent context");
+        assert!(
+            pctx_idx < runstate_idx,
+            "Parent context must precede Run state"
+        );
+    }
+
+    #[test]
+    fn build_user_message_omits_parent_context_section_when_absent() {
+        // Default ctx has parent_context=None — no header should
+        // render. This avoids cluttering root-run prompts and pre-
+        // #775 child prompts that legitimately have nothing to thread.
+        let c = ctx();
+        assert!(c.parent_context.is_none());
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            !msg.contains("## Parent context"),
+            "user message must NOT include `## Parent context` when ctx.parent_context is None"
         );
     }
 

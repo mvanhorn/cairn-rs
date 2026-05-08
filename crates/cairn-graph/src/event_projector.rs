@@ -735,6 +735,7 @@ mod tests {
                 child_run_id: Some(RunId::new("child_run")),
                 goal: String::new(),
                 role: String::new(),
+                parent_context: None,
             },
         ))];
 

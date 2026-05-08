@@ -1379,11 +1379,27 @@ pub struct SubagentSpawned {
     pub goal: String,
     /// Agent role the parent delegated to. Mirrors
     /// `ActionProposal.tool_name` when `action_type=SpawnSubagent`.
-    /// Typically one of `executor`, `researcher`, `reviewer`; the
-    /// execute layer validates against the known-role allow-list
-    /// before emitting. Empty for pre-G2 events.
+    /// Typically one of `executor`, `researcher`, `reviewer`,
+    /// `generic`; the execute layer validates against the known-role
+    /// allow-list before emitting. Empty for pre-G2 events.
     #[serde(default)]
     pub role: String,
+    /// Optional freeform context the parent threaded into the spawn.
+    ///
+    /// (#775) Used to carry parent-side learning into the child's
+    /// first DECIDE prompt — typically a previous-attempt mistake to
+    /// avoid, or a workspace path / credential the parent already
+    /// resolved. The orchestrator surfaces this verbatim under a
+    /// `## Parent context` section in the child's user message; it
+    /// is NOT meant to carry the goal itself (the goal goes in
+    /// `goal`).
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// keeps wire compatibility with pre-#775 events: replayed
+    /// events without this field deserialise as `None`, and new
+    /// spawns without parent context don't bloat the event row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_context: Option<String>,
 }
 
 /// Recovery attempt fact per RFC 002.

@@ -233,12 +233,19 @@ pub trait TaskService: Send + Sync {
     /// `goal` is the sub-goal the parent delegated — taken verbatim
     /// from the LLM's `ActionProposal.tool_args["goal"]` string. `role`
     /// is the agent role the parent delegated to (one of `executor`,
-    /// `researcher`, `reviewer`) — taken from
+    /// `researcher`, `reviewer`, `generic`) — taken from
     /// `ActionProposal.tool_name`. The execute layer validates both
     /// before calling this method (see `#670 G2`); impls MUST record
     /// them on the emitted `SubagentSpawned` event verbatim so the
     /// projection audit row carries the LLM's actual delegation
     /// context.
+    ///
+    /// `parent_context` is the optional freeform string the parent
+    /// LLM supplied (#775) — typically a previous-attempt mistake to
+    /// avoid, or workspace context the child should know up front.
+    /// Threaded into the child's first DECIDE prompt under a
+    /// `## Parent context` section. `None` when the parent did not
+    /// provide one. Impls MUST record on the emitted event verbatim.
     ///
     /// The default impl returns an error. `TaskService` has no
     /// built-in `RunService::get` to derive project from parent, so
@@ -255,6 +262,7 @@ pub trait TaskService: Send + Sync {
         _child_run_id: Option<RunId>,
         _goal: String,
         _role: String,
+        _parent_context: Option<String>,
     ) -> Result<TaskRecord, RuntimeError> {
         Err(RuntimeError::Internal(
             "TaskService::spawn_subagent default impl called — impls must \

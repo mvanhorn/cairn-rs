@@ -864,6 +864,15 @@ pub(crate) async fn drive_run_iteration(
         resolve_run_string_default(state.as_ref(), &run.project, &run.run_id, "goal").await;
     let default_agent_role =
         resolve_run_string_default(state.as_ref(), &run.project, &run.run_id, "agent_role").await;
+    // #775: resolve the freeform parent context the parent threaded
+    // into the spawn (persisted in fabric_adapter::spawn_subagent for
+    // child runs only — root runs always see None). Populated into
+    // OrchestrationContext.parent_context below; build_user_message
+    // renders it as a `## Parent context` section between Goal and
+    // Run state.
+    let default_parent_context =
+        resolve_run_string_default(state.as_ref(), &run.project, &run.run_id, "parent_context")
+            .await;
     let default_run_mode =
         resolve_run_mode_default(state.as_ref(), &run.project, &run.run_id).await;
     let default_max_iterations =
@@ -980,6 +989,14 @@ pub(crate) async fn drive_run_iteration(
             .approval_timeout_ms
             .map(std::time::Duration::from_millis),
         visibility,
+        // #775: thread the parent's freeform context into the child's
+        // first DECIDE prompt. Root runs always resolve None (no
+        // parent persisted one). Child runs read the value
+        // `fabric_adapter::spawn_subagent` persisted under
+        // `run:<child_run_id>:parent_context` at spawn time. The
+        // section renders in `build_user_message` between Goal and
+        // Run state when set.
+        parent_context: default_parent_context.clone(),
     };
 
     // #651: persist the resolved `goal` into the run's per-run defaults

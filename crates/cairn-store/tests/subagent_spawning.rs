@@ -89,6 +89,7 @@ async fn subagent_spawned_links_child_to_parent() {
                 child_run_id: Some(child_run()),
                 goal: "delegated sub-goal".to_owned(),
                 role: "executor".to_owned(),
+                parent_context: None,
             }),
         )])
         .await
@@ -160,6 +161,7 @@ async fn list_by_session_returns_parent_and_child_runs() {
                     child_run_id: Some(child_run()),
                     goal: "delegated sub-goal".to_owned(),
                     role: "executor".to_owned(),
+                    parent_context: None,
                 }),
             ),
             ev(
@@ -230,6 +232,7 @@ async fn child_run_state_is_independent_of_parent() {
                     child_run_id: Some(child_run()),
                     goal: "delegated sub-goal".to_owned(),
                     role: "executor".to_owned(),
+                    parent_context: None,
                 }),
             ),
             ev(
@@ -357,6 +360,7 @@ async fn subagent_tree_hierarchy_is_queryable() {
                     child_run_id: Some(child_run()),
                     goal: "delegated sub-goal".to_owned(),
                     role: "executor".to_owned(),
+                    parent_context: None,
                 }),
             ),
             ev(
@@ -388,6 +392,7 @@ async fn subagent_tree_hierarchy_is_queryable() {
                     child_run_id: Some(grandchild.clone()),
                     goal: "level-2 sub-goal".to_owned(),
                     role: "researcher".to_owned(),
+                    parent_context: None,
                 }),
             ),
             ev(
@@ -495,6 +500,7 @@ async fn multiple_subagents_from_same_parent() {
                         child_run_id: Some(child.clone()),
                         goal: format!("sub-goal for {}", child.as_str()),
                         role: "executor".to_owned(),
+                        parent_context: None,
                     }),
                 ),
                 ev(

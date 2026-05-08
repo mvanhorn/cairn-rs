@@ -119,9 +119,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_roles_registry_with_defaults_has_four_roles() {
+    fn agent_roles_registry_with_defaults_has_five_roles() {
+        // #775: added the `generic` role alongside the original four
+        // (orchestrator, executor, researcher, reviewer).
         let reg = AgentRoleRegistry::with_defaults();
-        assert_eq!(reg.len(), 4, "must have exactly 4 default roles");
+        assert_eq!(reg.len(), 5, "must have exactly 5 default roles");
     }
 
     #[test]
@@ -183,7 +185,9 @@ mod tests {
         )
         .with_max_context_tokens(999_999);
         reg.register(custom);
-        assert_eq!(reg.len(), 4, "override must not add a new entry");
+        // #775: 5 default roles (added `generic`); override must
+        // still not add a new entry.
+        assert_eq!(reg.len(), 5, "override must not add a new entry");
         assert_eq!(
             reg.get("orchestrator").unwrap().max_context_tokens,
             Some(999_999)
@@ -195,7 +199,8 @@ mod tests {
         let reg = AgentRoleRegistry::with_defaults();
         let custom = AgentRole::new("tester", "Test Agent", AgentRoleTier::Standard);
         reg.register(custom);
-        assert_eq!(reg.len(), 5);
+        // #775: 5 defaults + 1 new = 6.
+        assert_eq!(reg.len(), 6);
         assert!(reg.get("tester").is_some());
     }
 
