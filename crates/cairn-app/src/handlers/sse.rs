@@ -491,13 +491,26 @@ async fn try_kick_auto_resume(
         return;
     }
 
-    // 3. Run must exist and still be Running — auto-resume on a
-    // terminal or paused run would race with the state machine.
+    // 3. Run must be in a kickable state. `Running` covers the legacy
+    // pre-#756 path (when projection state didn't flip on tool-call
+    // approval suspension). `WaitingApproval` covers the post-#756
+    // path: the run is genuinely suspended, and now that all pending
+    // approvals are resolved (steps 1-2 above), the kick re-drives
+    // the loop. `drive_run_iteration` flips `WaitingApproval ->
+    // Running` on entry, matching the pre-existing `Pending ->
+    // Running` transition.
+    //
+    // Reject `Paused`, `WaitingDependency` (G5 owns parent resume),
+    // and the terminals — all are handled by other paths or are
+    // genuinely non-resumable.
     let run_rec = match RunReadModel::get(state.runtime.store.as_ref(), run_id).await {
         Ok(Some(r)) => r,
         _ => return,
     };
-    if run_rec.state != cairn_domain::RunState::Running {
+    if !matches!(
+        run_rec.state,
+        cairn_domain::RunState::Running | cairn_domain::RunState::WaitingApproval
+    ) {
         return;
     }
 

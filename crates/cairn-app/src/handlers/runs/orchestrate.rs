@@ -455,15 +455,26 @@ pub(crate) async fn drive_run_iteration(
             .into_response());
     }
 
-    // Transition run to Running if it's still Pending
-    if run.state == cairn_domain::RunState::Pending {
+    // Transition run to Running on entry from a resumable suspension.
+    // `Pending` is the first orchestrate POST after run creation.
+    // `WaitingApproval` is the post-#756 entry state when an
+    // approval-resolved auto-resume kick fires; F49's
+    // `try_kick_auto_resume` already verified all pending approvals
+    // are gone, so we can safely flip back to Running and let the
+    // loop continue.
+    let resume_from_state = match run.state {
+        cairn_domain::RunState::Pending => Some(cairn_domain::RunState::Pending),
+        cairn_domain::RunState::WaitingApproval => Some(cairn_domain::RunState::WaitingApproval),
+        _ => None,
+    };
+    if let Some(from_state) = resume_from_state {
         use cairn_domain::{RunState, RunStateChanged, RuntimeEvent, StateTransition};
         use cairn_runtime::make_envelope;
         let evt = make_envelope(RuntimeEvent::RunStateChanged(RunStateChanged {
             project: run.project.clone(),
             run_id: run.run_id.clone(),
             transition: StateTransition {
-                from: Some(RunState::Pending),
+                from: Some(from_state),
                 to: RunState::Running,
             },
             failure_class: None,
@@ -471,7 +482,12 @@ pub(crate) async fn drive_run_iteration(
             resume_trigger: None,
         }));
         if let Err(e) = state.runtime.store.append(&[evt]).await {
-            tracing::warn!("failed to transition run to running: {e}");
+            tracing::warn!(
+                run_id = %run.run_id,
+                from = ?from_state,
+                error = %e,
+                "failed to transition run to running on orchestrate entry"
+            );
         }
     }
 
@@ -1830,13 +1846,56 @@ pub(crate) async fn drive_run_iteration(
                 )
                     .into_response()
             }
-            Ok(LoopTermination::WaitingApproval { approval_id }) => (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "termination": "waiting_approval", "approval_id": approval_id.as_str(),
-                })),
-            )
-                .into_response(),
+            Ok(LoopTermination::WaitingApproval { approval_id }) => {
+                // #756: flip projection state to `WaitingApproval` so
+                // `GET /v1/runs/:id` reflects the real suspension.
+                //
+                // Why direct event-append rather than calling
+                // `runs.enter_waiting_approval`: the loop's F26 path
+                // already issued `ff_suspend_execution` via its
+                // approval-gate code path. Calling
+                // `enter_waiting_approval` here would issue a SECOND
+                // `ff_suspend_execution` against the already-suspended
+                // execution, which trips FF's phase guard. We only
+                // need the cairn-side projection-state flip here —
+                // the FF-side suspension is already in place.
+                //
+                // Same shape as the entry-time `Pending -> Running`
+                // transition further up: append a `RunStateChanged`
+                // event, let the projection appliers update the row.
+                // Best-effort; on store failure we log but still
+                // return HTTP 202 with the approval_id.
+                use cairn_domain::{RunState, RunStateChanged, RuntimeEvent, StateTransition};
+                use cairn_runtime::make_envelope;
+                let evt = make_envelope(RuntimeEvent::RunStateChanged(RunStateChanged {
+                    project: run.project.clone(),
+                    run_id: run.run_id.clone(),
+                    transition: StateTransition {
+                        from: Some(RunState::Running),
+                        to: RunState::WaitingApproval,
+                    },
+                    failure_class: None,
+                    pause_reason: None,
+                    resume_trigger: None,
+                }));
+                if let Err(e) = state.runtime.store.append(&[evt]).await {
+                    tracing::error!(
+                        run_id = %run.run_id,
+                        approval_id = %approval_id,
+                        error = %e,
+                        "#756: failed to flip run to waiting_approval after F26 \
+                         tool-call-approval suspension; GET /v1/runs/:id may report \
+                         stale state=running while the approval card is pending"
+                    );
+                }
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "termination": "waiting_approval", "approval_id": approval_id.as_str(),
+                    })),
+                )
+                    .into_response()
+            }
             Ok(LoopTermination::WaitingSubagent { child_task_id }) => (
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({
