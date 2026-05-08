@@ -470,6 +470,18 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "add_tool_defs_to_llm_completions",
         include_str!("migrations/V071__add_tool_defs_to_llm_completions.sql"),
     ),
+    // RFC 030 PR-B: memory-provider projection tables + retroactive
+    // knowledge-provider pg wiring + cross-family view + scoring-policy
+    // key rename. PR-B1 (RFC 029) shipped the sqlite knowledge schema
+    // inline but its top-level `migrations/V018__*.sql` file was never
+    // wired into this pg runner — V072 closes the gap defensively
+    // (CREATE TABLE IF NOT EXISTS is idempotent for operators who
+    // applied V018.sql manually).
+    (
+        72,
+        "create_provider_projections",
+        include_str!("migrations/V072__create_provider_projections.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

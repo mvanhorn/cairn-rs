@@ -363,6 +363,27 @@ pub enum RuntimeEvent {
     /// Ingest status transition reported by the provider.
     /// Updates the row on `knowledge_ingest_jobs`.
     KnowledgeIngestStatusUpdated(KnowledgeIngestStatusUpdated),
+
+    // ── RFC 030 pluggable memory providers ──
+    /// Project configured or re-configured its memory provider. Upserts a
+    /// row on `project_memory_providers` with `kind = "configured"`.
+    MemoryProviderConfigured(MemoryProviderConfigured),
+    /// Query-time failure: the configured memory provider is not reachable
+    /// / spawned / authorized. Audit row on `project_memory_providers`
+    /// (`kind = "unavailable"`), never overwrites the `configured` row.
+    MemoryProviderUnavailable(MemoryProviderUnavailable),
+    /// Plugin restart produced a handshake snapshot that differs from the
+    /// previous spawn. Audit row (`kind = "capability_changed"`).
+    MemoryProviderCapabilityChanged(MemoryProviderCapabilityChanged),
+    /// Memory-document ingest kicked off (cairn-default or plugin).
+    /// Row on `memory_ingest_jobs`.
+    MemoryIngestSubmitted(MemoryIngestSubmitted),
+    /// Ingest refused before dispatch (e.g., auto_extract provider).
+    /// Row on `memory_ingest_jobs`.
+    MemoryIngestRejected(MemoryIngestRejected),
+    /// Ingest status transition reported by the memory provider.
+    /// Updates the row on `memory_ingest_jobs`.
+    MemoryIngestStatusUpdated(MemoryIngestStatusUpdated),
 }
 
 impl RuntimeEvent {
@@ -455,6 +476,12 @@ impl RuntimeEvent {
             RuntimeEvent::KnowledgeIngestSubmitted(event) => &event.project,
             RuntimeEvent::KnowledgeIngestRejected(event) => &event.project,
             RuntimeEvent::KnowledgeIngestStatusUpdated(event) => &event.project,
+            RuntimeEvent::MemoryProviderConfigured(event) => &event.project,
+            RuntimeEvent::MemoryProviderUnavailable(event) => &event.project,
+            RuntimeEvent::MemoryProviderCapabilityChanged(event) => &event.project,
+            RuntimeEvent::MemoryIngestSubmitted(event) => &event.project,
+            RuntimeEvent::MemoryIngestRejected(event) => &event.project,
+            RuntimeEvent::MemoryIngestStatusUpdated(event) => &event.project,
             RuntimeEvent::TriggerCreated(event) => &event.project,
             RuntimeEvent::TriggerEnabled(event) => &event.project,
             RuntimeEvent::TriggerDisabled(event) => &event.project,
@@ -872,6 +899,12 @@ impl RuntimeEvent {
             RuntimeEvent::KnowledgeIngestSubmitted(_) => None,
             RuntimeEvent::KnowledgeIngestRejected(_) => None,
             RuntimeEvent::KnowledgeIngestStatusUpdated(_) => None,
+            RuntimeEvent::MemoryProviderConfigured(_) => None,
+            RuntimeEvent::MemoryProviderUnavailable(_) => None,
+            RuntimeEvent::MemoryProviderCapabilityChanged(_) => None,
+            RuntimeEvent::MemoryIngestSubmitted(_) => None,
+            RuntimeEvent::MemoryIngestRejected(_) => None,
+            RuntimeEvent::MemoryIngestStatusUpdated(_) => None,
         }
     }
 }
@@ -3327,11 +3360,23 @@ pub struct ResolvedProviderSnapshot {
 /// Project configured or re-configured its knowledge provider. Upserts the
 /// current-configuration row on `project_knowledge_providers`
 /// (`kind = "configured"`).
+///
+/// RFC 030 adds `is_bootstrap: bool` — set to `true` exactly once per
+/// project when `ProjectCreated` (or the V019 backfill sweep for pre-RFC-030
+/// projects) emits the initial cairn-default binding. Operator-driven
+/// re-configurations set it to `false`. Lets the operator UI + audit tooling
+/// distinguish "default, never touched" from "deliberately set to
+/// cairn-default after trying something else".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KnowledgeProviderConfigured {
     pub project: crate::tenancy::ProjectKey,
     pub provider_ref: crate::ids::ProviderRef,
     pub configured_by: crate::ids::OperatorId,
+    /// `true` iff this is the initial bootstrap binding (`ProjectCreated`
+    /// emission or V019 backfill). Default `false` on deserialisation so
+    /// pre-RFC-030 events replay unchanged. Added by RFC 030.
+    #[serde(default)]
+    pub is_bootstrap: bool,
     pub at_ms: u64,
 }
 
@@ -3396,6 +3441,100 @@ pub struct KnowledgeIngestStatusUpdated {
     pub document_id: crate::ids::KnowledgeDocumentId,
     /// Mirrors `cairn_memory::ingest::IngestStatus`; stored as the
     /// snake_case serde representation (e.g. `"completed"`, `"failed"`).
+    pub status: String,
+    pub at_ms: u64,
+}
+
+// ── RFC 030: memory-provider lifecycle events ────────────────────────────
+//
+// Structural twins of the RFC 029 knowledge events, projected to a parallel
+// pair of tables (`project_memory_providers`, `memory_ingest_jobs`). The
+// types are distinct so code routing on capability family cannot
+// accidentally feed a knowledge payload into a memory path and vice versa.
+// See RFC 030 §Event-Sourcing Delta.
+
+/// Project configured or re-configured its memory provider. Upserts the
+/// current-configuration row on `project_memory_providers`
+/// (`kind = "configured"`).
+///
+/// `is_bootstrap: bool` is set to `true` exactly once per project when
+/// `ProjectCreated` (or the V019 backfill) emits the initial cairn-default
+/// binding; operator-driven re-configurations set it to `false`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProviderConfigured {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub configured_by: crate::ids::OperatorId,
+    /// `true` iff this is the initial bootstrap binding. Default `false`
+    /// on deserialisation so the projection handler treats older payloads
+    /// (if any slip through the migration window) as operator-driven.
+    #[serde(default)]
+    pub is_bootstrap: bool,
+    pub at_ms: u64,
+}
+
+/// Query-time failure: the configured memory provider is unreachable,
+/// failed its handshake, or has no credentials. Audit row on
+/// `project_memory_providers` (`kind = "unavailable"`). Never upserts over
+/// the `configured` row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProviderUnavailable {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    /// Free-form short reason string for operator UI.
+    pub reason: String,
+    pub at_ms: u64,
+}
+
+/// Plugin restart produced a handshake snapshot that differs from the
+/// previous spawn (e.g., `auto_extract` flipped, `ingest_capable` flipped,
+/// a scoring dimension moved between `surfaced` and `not_supported`).
+/// Audit row on `project_memory_providers` (`kind = "capability_changed"`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProviderCapabilityChanged {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub prior: ResolvedProviderSnapshot,
+    pub current: ResolvedProviderSnapshot,
+    pub at_ms: u64,
+}
+
+/// Memory-document ingest kicked off (cairn-default or an explicit
+/// `memory_store` call when the backend declares `auto_extract = false`).
+/// Insert on `memory_ingest_jobs` with `status = "submitted"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryIngestSubmitted {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub document_id: crate::ids::DocumentId,
+    /// Mirrors `cairn_memory::ingest::SourceType` via its snake_case serde
+    /// repr (e.g. `"plain_text"`, `"structured_json"`).
+    pub source_type: String,
+    pub at_ms: u64,
+}
+
+/// Ingest refused before dispatch (typically because the resolved memory
+/// provider declared `auto_extract = true`, so `memory_store` was
+/// suppressed, or `ingest_capable = false`). Insert on `memory_ingest_jobs`
+/// with `status = "rejected"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryIngestRejected {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    /// Free-form short reason string for operator UI.
+    pub reason: String,
+    pub at_ms: u64,
+}
+
+/// Ingest status transition reported by the memory provider. Updates the
+/// row on `memory_ingest_jobs` keyed by `(project, document_id)`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryIngestStatusUpdated {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub document_id: crate::ids::DocumentId,
+    /// Mirrors `cairn_memory::ingest::IngestStatus` via its snake_case
+    /// serde repr (e.g. `"completed"`, `"failed"`).
     pub status: String,
     pub at_ms: u64,
 }

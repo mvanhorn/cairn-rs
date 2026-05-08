@@ -3682,10 +3682,12 @@ impl SqliteSyncProjection {
                 sqlx::query(
                     "INSERT INTO project_knowledge_providers
                          (tenant_id, workspace_id, project_id, provider_ref,
-                          kind, at_ms, configured_by)
-                     VALUES (?, ?, ?, ?, 'configured', ?, ?)
+                          kind, at_ms, configured_by, is_bootstrap)
+                     VALUES (?, ?, ?, ?, 'configured', ?, ?, ?)
                      ON CONFLICT(tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
-                     DO UPDATE SET configured_by = excluded.configured_by",
+                     DO UPDATE SET
+                         configured_by = excluded.configured_by,
+                         is_bootstrap  = excluded.is_bootstrap",
                 )
                 .bind(e.project.tenant_id.as_str())
                 .bind(e.project.workspace_id.as_str())
@@ -3693,6 +3695,7 @@ impl SqliteSyncProjection {
                 .bind(e.provider_ref.as_str())
                 .bind(e.at_ms as i64)
                 .bind(e.configured_by.as_str())
+                .bind(e.is_bootstrap as i64)
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
@@ -3807,6 +3810,158 @@ impl SqliteSyncProjection {
             RuntimeEvent::KnowledgeIngestStatusUpdated(e) => {
                 sqlx::query(
                     "UPDATE knowledge_ingest_jobs
+                        SET status        = ?,
+                            updated_at_ms = ?
+                      WHERE tenant_id    = ?
+                        AND workspace_id = ?
+                        AND project_id   = ?
+                        AND document_id  = ?",
+                )
+                .bind(&e.status)
+                .bind(e.at_ms as i64)
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.document_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // ── RFC 030 pluggable memory providers ──
+            // Mirror of the knowledge-family projections above, but targeted
+            // at the parallel `project_memory_providers` + `memory_ingest_jobs`
+            // tables. Keeping the SQL shape structurally identical makes
+            // operator queries + the `v_all_ingest_jobs` cross-family view
+            // straightforward.
+            RuntimeEvent::MemoryProviderConfigured(e) => {
+                sqlx::query(
+                    "INSERT INTO project_memory_providers
+                         (tenant_id, workspace_id, project_id, provider_ref,
+                          kind, at_ms, configured_by, is_bootstrap)
+                     VALUES (?, ?, ?, ?, 'configured', ?, ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
+                     DO UPDATE SET
+                         configured_by = excluded.configured_by,
+                         is_bootstrap  = excluded.is_bootstrap",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.provider_ref.as_str())
+                .bind(e.at_ms as i64)
+                .bind(e.configured_by.as_str())
+                .bind(e.is_bootstrap as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::MemoryProviderUnavailable(e) => {
+                sqlx::query(
+                    "INSERT INTO project_memory_providers
+                         (tenant_id, workspace_id, project_id, provider_ref,
+                          kind, at_ms, reason)
+                     VALUES (?, ?, ?, ?, 'unavailable', ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
+                     DO NOTHING",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.provider_ref.as_str())
+                .bind(e.at_ms as i64)
+                .bind(&e.reason)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::MemoryProviderCapabilityChanged(e) => {
+                let prior_json = serde_json::to_string(&e.prior)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                let current_json = serde_json::to_string(&e.current)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO project_memory_providers
+                         (tenant_id, workspace_id, project_id, provider_ref,
+                          kind, at_ms, prior_snapshot_json, current_snapshot_json)
+                     VALUES (?, ?, ?, ?, 'capability_changed', ?, ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
+                     DO NOTHING",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.provider_ref.as_str())
+                .bind(e.at_ms as i64)
+                .bind(&prior_json)
+                .bind(&current_json)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::MemoryIngestSubmitted(e) => {
+                sqlx::query(
+                    "INSERT INTO memory_ingest_jobs
+                         (tenant_id, workspace_id, project_id, document_id,
+                          provider_ref, status, source_type,
+                          submitted_at_ms, updated_at_ms)
+                     VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, document_id)
+                     DO UPDATE SET
+                         provider_ref    = excluded.provider_ref,
+                         status          = 'submitted',
+                         source_type     = excluded.source_type,
+                         submitted_at_ms = excluded.submitted_at_ms,
+                         updated_at_ms   = excluded.updated_at_ms,
+                         reason          = NULL",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.document_id.as_str())
+                .bind(e.provider_ref.as_str())
+                .bind(&e.source_type)
+                .bind(e.at_ms as i64)
+                .bind(e.at_ms as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::MemoryIngestRejected(e) => {
+                // Same collision-avoidance trick as the knowledge mirror:
+                // synthetic document_id includes the envelope's event_id
+                // so two rejections in the same ms don't collide.
+                sqlx::query(
+                    "INSERT INTO memory_ingest_jobs
+                         (tenant_id, workspace_id, project_id, document_id,
+                          provider_ref, status, reason,
+                          submitted_at_ms, updated_at_ms)
+                     VALUES (?, ?, ?, ?, ?, 'rejected', ?, ?, ?)
+                     ON CONFLICT(tenant_id, workspace_id, project_id, document_id)
+                     DO UPDATE SET
+                         provider_ref  = excluded.provider_ref,
+                         status        = 'rejected',
+                         reason        = excluded.reason,
+                         updated_at_ms = excluded.updated_at_ms",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(format!(
+                    "rejected:{}:{}",
+                    e.provider_ref.as_str(),
+                    envelope.event_id.as_str()
+                ))
+                .bind(e.provider_ref.as_str())
+                .bind(&e.reason)
+                .bind(e.at_ms as i64)
+                .bind(e.at_ms as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::MemoryIngestStatusUpdated(e) => {
+                sqlx::query(
+                    "UPDATE memory_ingest_jobs
                         SET status        = ?,
                             updated_at_ms = ?
                       WHERE tenant_id    = ?

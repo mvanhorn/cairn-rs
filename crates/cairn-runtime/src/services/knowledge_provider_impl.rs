@@ -63,6 +63,10 @@ where
                 project: project.clone(),
                 provider_ref: provider_ref.clone(),
                 configured_by: actor.clone(),
+                // RFC 030: operator-driven re-configuration is never a
+                // bootstrap binding; only `ProjectCreated` + the V019
+                // backfill sweep (PR-G) set `is_bootstrap = true`.
+                is_bootstrap: false,
                 at_ms: now_ms(),
             },
         ));

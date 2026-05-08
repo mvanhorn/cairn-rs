@@ -1546,6 +1546,10 @@ CREATE INDEX IF NOT EXISTS idx_operator_tenant_roles_operator
 -- RFC 029 pluggable knowledge providers. Mirrors pg migration V018.
 -- See `migrations/V018__create_knowledge_providers.sql` for the pg definition
 -- and rationale.
+-- RFC 030 added `is_bootstrap INTEGER NOT NULL DEFAULT 0` to match the pg
+-- V072 column; fresh sqlite databases get it inline. Pre-RFC-030 sqlite
+-- databases only exist in dev (we don't ship a sqlite migration runner
+-- today), so no `ALTER TABLE` recovery path is needed here.
 CREATE TABLE IF NOT EXISTS project_knowledge_providers (
     tenant_id             TEXT    NOT NULL,
     workspace_id          TEXT    NOT NULL,
@@ -1554,6 +1558,7 @@ CREATE TABLE IF NOT EXISTS project_knowledge_providers (
     kind                  TEXT    NOT NULL,
     at_ms                 INTEGER NOT NULL,
     configured_by         TEXT,
+    is_bootstrap          INTEGER NOT NULL DEFAULT 0,
     reason                TEXT,
     prior_snapshot_json   TEXT,
     current_snapshot_json TEXT,
@@ -1579,4 +1584,58 @@ CREATE TABLE IF NOT EXISTS knowledge_ingest_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_knowledge_ingest_jobs_status
     ON knowledge_ingest_jobs (tenant_id, workspace_id, project_id, status);
+
+-- RFC 030 pluggable memory providers. Mirrors pg migration V019.
+-- See `migrations/V019__create_memory_providers.sql` for the pg definition
+-- and rationale. `is_bootstrap INTEGER NOT NULL DEFAULT 0` — SQLite has no
+-- native BOOLEAN type; we use the 0/1 convention and the pg side stores
+-- it as BOOLEAN (the event projection binds the `bool` field either way).
+CREATE TABLE IF NOT EXISTS project_memory_providers (
+    tenant_id             TEXT    NOT NULL,
+    workspace_id          TEXT    NOT NULL,
+    project_id            TEXT    NOT NULL,
+    provider_ref          TEXT    NOT NULL,
+    kind                  TEXT    NOT NULL,
+    at_ms                 INTEGER NOT NULL,
+    configured_by         TEXT,
+    is_bootstrap          INTEGER NOT NULL DEFAULT 0,
+    reason                TEXT,
+    prior_snapshot_json   TEXT,
+    current_snapshot_json TEXT,
+    PRIMARY KEY (tenant_id, workspace_id, project_id, provider_ref, kind, at_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_memory_providers_project
+    ON project_memory_providers (tenant_id, workspace_id, project_id, at_ms);
+
+CREATE TABLE IF NOT EXISTS memory_ingest_jobs (
+    tenant_id        TEXT    NOT NULL,
+    workspace_id     TEXT    NOT NULL,
+    project_id       TEXT    NOT NULL,
+    document_id      TEXT    NOT NULL,
+    provider_ref     TEXT    NOT NULL,
+    status           TEXT    NOT NULL,
+    source_type      TEXT,
+    reason           TEXT,
+    submitted_at_ms  INTEGER NOT NULL,
+    updated_at_ms    INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, workspace_id, project_id, document_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_ingest_jobs_status
+    ON memory_ingest_jobs (tenant_id, workspace_id, project_id, status);
+
+-- Cross-family view unifying knowledge + memory ingest jobs, mirroring the
+-- pg V019 view. SQLite supports UNION ALL views; use CREATE VIEW IF NOT
+-- EXISTS so the schema bootstrap is idempotent.
+CREATE VIEW IF NOT EXISTS v_all_ingest_jobs AS
+    SELECT 'knowledge' AS family, tenant_id, workspace_id, project_id,
+           document_id, provider_ref, status, source_type, reason,
+           submitted_at_ms, updated_at_ms
+      FROM knowledge_ingest_jobs
+    UNION ALL
+    SELECT 'memory' AS family, tenant_id, workspace_id, project_id,
+           document_id, provider_ref, status, source_type, reason,
+           submitted_at_ms, updated_at_ms
+      FROM memory_ingest_jobs;
 "#;

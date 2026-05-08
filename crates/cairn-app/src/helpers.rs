@@ -1452,6 +1452,12 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::KnowledgeIngestSubmitted(_) => "knowledge_ingest_submitted",
         RuntimeEvent::KnowledgeIngestRejected(_) => "knowledge_ingest_rejected",
         RuntimeEvent::KnowledgeIngestStatusUpdated(_) => "knowledge_ingest_status_updated",
+        RuntimeEvent::MemoryProviderConfigured(_) => "memory_provider_configured",
+        RuntimeEvent::MemoryProviderUnavailable(_) => "memory_provider_unavailable",
+        RuntimeEvent::MemoryProviderCapabilityChanged(_) => "memory_provider_capability_changed",
+        RuntimeEvent::MemoryIngestSubmitted(_) => "memory_ingest_submitted",
+        RuntimeEvent::MemoryIngestRejected(_) => "memory_ingest_rejected",
+        RuntimeEvent::MemoryIngestStatusUpdated(_) => "memory_ingest_status_updated",
     }
 }
 
@@ -2156,6 +2162,38 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         ),
         RuntimeEvent::KnowledgeIngestStatusUpdated(e) => format!(
             "Knowledge ingest {} → {} for project {}",
+            e.document_id,
+            sanitize_for_event_message(&e.status),
+            e.project.project_id
+        ),
+        RuntimeEvent::MemoryProviderConfigured(e) => format!(
+            "Memory provider {} configured for project {}{}",
+            e.provider_ref,
+            e.project.project_id,
+            if e.is_bootstrap { " (bootstrap)" } else { "" }
+        ),
+        RuntimeEvent::MemoryProviderUnavailable(e) => format!(
+            "Memory provider {} unavailable for project {} ({})",
+            e.provider_ref,
+            e.project.project_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::MemoryProviderCapabilityChanged(e) => format!(
+            "Memory provider {} capability changed for project {}",
+            e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::MemoryIngestSubmitted(e) => format!(
+            "Memory ingest submitted: document {} via {} for project {}",
+            e.document_id, e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::MemoryIngestRejected(e) => format!(
+            "Memory ingest rejected by {} for project {} ({})",
+            e.provider_ref,
+            e.project.project_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::MemoryIngestStatusUpdated(e) => format!(
+            "Memory ingest {} → {} for project {}",
             e.document_id,
             sanitize_for_event_message(&e.status),
             e.project.project_id

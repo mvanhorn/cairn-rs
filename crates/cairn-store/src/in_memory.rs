@@ -3464,6 +3464,17 @@ impl InMemoryStore {
             | RuntimeEvent::KnowledgeIngestSubmitted(_)
             | RuntimeEvent::KnowledgeIngestRejected(_)
             | RuntimeEvent::KnowledgeIngestStatusUpdated(_) => {}
+            // ── RFC 030 pluggable memory providers ──
+            // Same story as the knowledge family above: the durable backends
+            // (pg/sqlite) own the read model for `project_memory_providers`
+            // / `memory_ingest_jobs`; InMemory defers to the event log and
+            // to MultiProviderMemory's in-memory state (added in PR-C).
+            RuntimeEvent::MemoryProviderConfigured(_)
+            | RuntimeEvent::MemoryProviderUnavailable(_)
+            | RuntimeEvent::MemoryProviderCapabilityChanged(_)
+            | RuntimeEvent::MemoryIngestSubmitted(_)
+            | RuntimeEvent::MemoryIngestRejected(_)
+            | RuntimeEvent::MemoryIngestStatusUpdated(_) => {}
         }
     }
 }

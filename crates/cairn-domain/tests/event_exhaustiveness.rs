@@ -19,9 +19,11 @@ use cairn_domain::events::StateTransition;
 use cairn_domain::events::{
     KnowledgeIngestRejected, KnowledgeIngestStatusUpdated, KnowledgeIngestSubmitted,
     KnowledgeProviderCapabilityChanged, KnowledgeProviderConfigured, KnowledgeProviderUnavailable,
+    MemoryIngestRejected, MemoryIngestStatusUpdated, MemoryIngestSubmitted,
+    MemoryProviderCapabilityChanged, MemoryProviderConfigured, MemoryProviderUnavailable,
     ResolvedProviderSnapshot,
 };
-use cairn_domain::ids::{KnowledgeDocumentId, ProviderRef};
+use cairn_domain::ids::{DocumentId, KnowledgeDocumentId, ProviderRef};
 use cairn_domain::lifecycle::{RunState, SessionState, TaskState};
 use cairn_domain::policy::{ApprovalRequirement, GuardrailDecisionKind, GuardrailSubjectType};
 use cairn_domain::providers::{
@@ -703,6 +705,19 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         | RuntimeEvent::KnowledgeIngestSubmitted(_)
         | RuntimeEvent::KnowledgeIngestRejected(_)
         | RuntimeEvent::KnowledgeIngestStatusUpdated(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        // RFC 030 memory-provider lifecycle events — same shape as the
+        // knowledge-family variants: project-scoped config/audit rows on
+        // `project_memory_providers` + `memory_ingest_jobs`, no session or
+        // run entity attached.
+        RuntimeEvent::MemoryProviderConfigured(_)
+        | RuntimeEvent::MemoryProviderUnavailable(_)
+        | RuntimeEvent::MemoryProviderCapabilityChanged(_)
+        | RuntimeEvent::MemoryIngestSubmitted(_)
+        | RuntimeEvent::MemoryIngestRejected(_)
+        | RuntimeEvent::MemoryIngestStatusUpdated(_) => {
             assert_ne!(proj.tenant_id.as_str(), "_system");
             assert!(eref.is_none());
         }
@@ -2012,6 +2027,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             project: p(),
             provider_ref: ProviderRef::new("cairn-default"),
             configured_by: OperatorId::new("op_exh"),
+            is_bootstrap: false,
             at_ms: ts,
         }),
         RuntimeEvent::KnowledgeProviderUnavailable(KnowledgeProviderUnavailable {
@@ -2057,6 +2073,57 @@ fn all_variants() -> Vec<RuntimeEvent> {
             status: "completed".to_owned(),
             at_ms: ts,
         }),
+        // RFC 030 memory-provider lifecycle events.
+        RuntimeEvent::MemoryProviderConfigured(MemoryProviderConfigured {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            configured_by: OperatorId::new("op_exh"),
+            is_bootstrap: true,
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryProviderUnavailable(MemoryProviderUnavailable {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            reason: "handshake timeout".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryProviderCapabilityChanged(MemoryProviderCapabilityChanged {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            prior: ResolvedProviderSnapshot {
+                provider_id: "mem0".to_owned(),
+                ingest_capable: true,
+                retrieval_modes: vec!["vector_only".to_owned()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".to_owned()],
+            },
+            current: ResolvedProviderSnapshot {
+                provider_id: "mem0".to_owned(),
+                ingest_capable: false,
+                retrieval_modes: vec!["vector_only".to_owned()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".to_owned()],
+            },
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryIngestSubmitted(MemoryIngestSubmitted {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            document_id: DocumentId::new("mem_exh"),
+            source_type: "plain_text".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryIngestRejected(MemoryIngestRejected {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            reason: "auto_extract provider — memory_store suppressed".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryIngestStatusUpdated(MemoryIngestStatusUpdated {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            document_id: DocumentId::new("mem_exh"),
+            status: "completed".to_owned(),
+            at_ms: ts,
+        }),
     ]
 }
 
@@ -2065,12 +2132,12 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 168 variants in the RuntimeEvent enum (162 prior + RFC 029 6 new
-    // knowledge-provider lifecycle events).
+    // 174 variants in the RuntimeEvent enum (168 prior + RFC 030 6 new
+    // memory-provider lifecycle events).
     assert_eq!(
         variants.len(),
-        168,
-        "all_variants() must construct exactly 168 RuntimeEvent instances"
+        174,
+        "all_variants() must construct exactly 174 RuntimeEvent instances"
     );
 }
 

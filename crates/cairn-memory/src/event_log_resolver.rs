@@ -241,6 +241,7 @@ mod tests {
                         project: proj("a"),
                         provider_ref: ProviderRef::new("plugin:bedrock-kb"),
                         configured_by: OperatorId::new("op"),
+                        is_bootstrap: false,
                         at_ms: 100,
                     },
                 )),
@@ -249,6 +250,7 @@ mod tests {
                         project: proj("a"),
                         provider_ref: ProviderRef::new("plugin:mem0"),
                         configured_by: OperatorId::new("op"),
+                        is_bootstrap: false,
                         at_ms: 200,
                     },
                 )),
@@ -270,6 +272,7 @@ mod tests {
                     project: proj("a"),
                     provider_ref: ProviderRef::new("plugin:mem0"),
                     configured_by: OperatorId::new("op"),
+                    is_bootstrap: false,
                     at_ms: 100,
                 },
             ))])

@@ -523,6 +523,15 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::KnowledgeIngestSubmitted(_)
             | RuntimeEvent::KnowledgeIngestRejected(_)
             | RuntimeEvent::KnowledgeIngestStatusUpdated(_)
+            // RFC 030: memory-provider lifecycle events share the same
+            // "not modelled in the provenance graph" treatment as the
+            // knowledge-family events above.
+            | RuntimeEvent::MemoryProviderConfigured(_)
+            | RuntimeEvent::MemoryProviderUnavailable(_)
+            | RuntimeEvent::MemoryProviderCapabilityChanged(_)
+            | RuntimeEvent::MemoryIngestSubmitted(_)
+            | RuntimeEvent::MemoryIngestRejected(_)
+            | RuntimeEvent::MemoryIngestStatusUpdated(_)
             // RFC-025 Phase 1: eval scoring events are projection-only
             // (they update the `eval_runs` read-model metrics columns in
             // milestones 3/4/5). The graph projector does not need to

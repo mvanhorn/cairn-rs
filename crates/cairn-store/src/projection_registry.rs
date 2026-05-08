@@ -518,6 +518,49 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             table: Some("knowledge_ingest_jobs"),
         },
     },
+    // ── RFC 030 pluggable memory providers ──────────────────────────────
+    // Parallel tables to the RFC 029 knowledge pair:
+    //   `project_memory_providers` (discriminated by `kind` column)
+    //   `memory_ingest_jobs`
+    // Kept distinct from the knowledge tables so the startup family-mismatch
+    // scan (RFC 030 §Rollout) can see the two slots side-by-side and so
+    // operator queries over either family stay on a single-table read.
+    ProjectionEntry {
+        variant: "MemoryProviderConfigured",
+        status: ProjectionStatus::Projected {
+            table: Some("project_memory_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryProviderUnavailable",
+        status: ProjectionStatus::Projected {
+            table: Some("project_memory_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryProviderCapabilityChanged",
+        status: ProjectionStatus::Projected {
+            table: Some("project_memory_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryIngestSubmitted",
+        status: ProjectionStatus::Projected {
+            table: Some("memory_ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryIngestRejected",
+        status: ProjectionStatus::Projected {
+            table: Some("memory_ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryIngestStatusUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("memory_ingest_jobs"),
+        },
+    },
     // ── Ephemeral (31) ────────────────────────────────────────────────────
     // Operator observability surfaces (SSE + metrics) with no durable read
     // model. The event log itself is the audit trail.
@@ -1565,8 +1608,18 @@ mod tests {
         //     (3× events keyed on `(project, document_id)`). Pg V018
         //     + sqlite schema.rs + pg/sqlite appliers. Net: +6 Projected
         //     → 135 / 33 / 0.
+        //   * RFC 030 PR-B: six memory-provider lifecycle events
+        //     (`MemoryProviderConfigured`, `MemoryProviderUnavailable`,
+        //     `MemoryProviderCapabilityChanged`, `MemoryIngestSubmitted`,
+        //     `MemoryIngestRejected`, `MemoryIngestStatusUpdated`) added as
+        //     Projected with backing tables `project_memory_providers` and
+        //     `memory_ingest_jobs`. Pg V019 + sqlite schema.rs mirror +
+        //     pg/sqlite appliers. Mirrors RFC 029 shape; the runtime routes
+        //     memory events to the memory tables + knowledge events to the
+        //     knowledge tables so a single-family read stays on one table.
+        //     Net: +6 Projected → 141 / 33 / 0.
         assert_eq!(
-            projected, 135,
+            projected, 141,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
@@ -1574,7 +1627,7 @@ mod tests {
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 168);
+        assert_eq!(projected + ephemeral + stubbed, 174);
     }
 
     #[test]
