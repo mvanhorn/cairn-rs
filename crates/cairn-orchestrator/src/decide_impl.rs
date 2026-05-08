@@ -2380,6 +2380,9 @@ mod tests {
             provider: Arc::new(FailingProvider),
             chain: cairn_runtime::ModelChain::single("gemma4")
                 .with_retry_budget(0, std::time::Duration::ZERO),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         };
         let routed = cairn_runtime::RoutedGenerationService::new(vec![binding]);
         let phase = LlmDecidePhase::from_routed(routed);

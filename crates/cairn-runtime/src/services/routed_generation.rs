@@ -40,6 +40,7 @@
 //! `LlmCallTrace` records via `LlmObservabilityServiceImpl`).
 
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use cairn_domain::providers::{
     GenerationProvider, GenerationResponse, ProviderAdapterError, ProviderBindingSettings,
@@ -66,6 +67,47 @@ pub struct RoutedBinding {
     pub provider: Arc<dyn GenerationProvider>,
     /// Models to try on this binding, in order.
     pub chain: ModelChain,
+    /// #762 mitigation: per-binding concurrency cap. The service acquires
+    /// one permit before `provider.generate` and holds it across the
+    /// entire chain attempt sequence (so a single chain run isn't
+    /// starved by parallel requests on the same binding). Defaults to
+    /// [`DEFAULT_BINDING_CONCURRENCY`] (4) — high enough that healthy
+    /// parallel orchestrate calls don't bottleneck, low enough that an
+    /// overloaded LLM endpoint gets backpressure rather than queueing
+    /// dozens of in-flight TLS streams.
+    ///
+    /// Operators with paid tiers and known-good concurrency budgets
+    /// can override via [`RoutedBinding::with_concurrency`] when
+    /// constructing the binding (or set higher per env var if a future
+    /// PR wires that in).
+    pub concurrency_limit: Arc<Semaphore>,
+}
+
+/// Default per-binding concurrency cap. See `RoutedBinding::concurrency_limit`.
+pub const DEFAULT_BINDING_CONCURRENCY: usize = 4;
+
+impl RoutedBinding {
+    /// Construct a binding with the default concurrency cap (4).
+    pub fn new(
+        binding_id: impl Into<String>,
+        provider: Arc<dyn GenerationProvider>,
+        chain: ModelChain,
+    ) -> Self {
+        Self {
+            binding_id: binding_id.into(),
+            provider,
+            chain,
+            concurrency_limit: Arc::new(Semaphore::new(DEFAULT_BINDING_CONCURRENCY)),
+        }
+    }
+
+    /// Override the concurrency cap. Tests and production setups with
+    /// paid LLM tiers may want a higher cap.
+    pub fn with_concurrency(mut self, limit: usize) -> Self {
+        let limit = limit.max(1);
+        self.concurrency_limit = Arc::new(Semaphore::new(limit));
+        self
+    }
 }
 
 /// Composed routing service. Walks cross-binding chain, then per-binding
@@ -182,6 +224,7 @@ impl RoutedGenerationService {
 
             let provider = binding.provider.clone();
             let binding_id = binding.binding_id.clone();
+            let concurrency_limit = binding.concurrency_limit.clone();
 
             let outcome: FallbackOutcome<GenerationResponse> = binding
                 .chain
@@ -191,39 +234,74 @@ impl RoutedGenerationService {
                     let messages = messages.clone();
                     let tools = tools.clone();
                     let binding_id = binding_id.clone();
+                    let concurrency_limit = concurrency_limit.clone();
                     let attempt_idx = attempt_counter
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     async move {
-                        tracing::info!(
-                            binding_id = %binding_id,
-                            model_id = %model_id,
-                            attempt_index = attempt_idx,
-                            tool_count = tools.len(),
-                            "routed_generation: dispatch attempt"
-                        );
-                        // Unavoidable clones into the trait signature.
+                        // Wrap BOTH the permit acquisition AND the dispatch
+                        // in `tokio::time::timeout`. Per Gemini review on
+                        // #764: if we only wrapped the dispatch, an
+                        // exhausted-permit case could queue indefinitely
+                        // at acquire_owned().await, bypassing the safety
+                        // bound. By wrapping the whole "queue + dispatch"
+                        // future, the per_call_timeout caps total time
+                        // regardless of where the call gets stuck.
                         //
-                        // Wrap the dispatch in `tokio::time::timeout` so a
-                        // misbehaving adapter (reqwest timeout bypass, a
-                        // hung futures-runtime select, etc.) can never
-                        // stall the whole fallback chain. The adapter
-                        // layer SHOULD also enforce its own timeout — this
-                        // is redundant on purpose. See `per_call_timeout`
-                        // on `RoutedGenerationService`.
-                        let dispatch = provider.generate(
-                            &model_id,
-                            (*messages).clone(),
-                            &settings,
-                            &tools,
-                        );
-                        let result = match tokio::time::timeout(per_call_timeout, dispatch).await {
+                        // Unavoidable clones into the trait signature.
+                        // Adapter layer should also enforce its own
+                        // timeout — this is redundant on purpose; see
+                        // `per_call_timeout` on `RoutedGenerationService`.
+                        let messages_clone = (*messages).clone();
+                        let tools_ref = tools.clone();
+                        let settings_ref = settings.clone();
+                        let provider_ref = provider.clone();
+                        let model_id_for_dispatch = model_id.clone();
+                        let binding_id_for_inner = binding_id.clone();
+                        let permit_and_dispatch = async move {
+                            let permit_wait_started = std::time::Instant::now();
+                            let _permit = concurrency_limit
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .expect("concurrency_limit semaphore is never closed");
+                            let permit_wait = permit_wait_started.elapsed();
+                            if permit_wait.as_millis() > 100 {
+                                tracing::info!(
+                                    binding_id = %binding_id_for_inner,
+                                    model_id = %model_id_for_dispatch,
+                                    queued_for_ms = permit_wait.as_millis() as u64,
+                                    "routed_generation: queued for binding concurrency permit (#762)"
+                                );
+                            }
+                            tracing::info!(
+                                binding_id = %binding_id_for_inner,
+                                model_id = %model_id_for_dispatch,
+                                attempt_index = attempt_idx,
+                                tool_count = tools_ref.len(),
+                                "routed_generation: dispatch attempt"
+                            );
+                            provider_ref
+                                .generate(
+                                    &model_id_for_dispatch,
+                                    messages_clone,
+                                    &settings_ref,
+                                    &tools_ref,
+                                )
+                                .await
+                        };
+                        let result = match tokio::time::timeout(
+                            per_call_timeout,
+                            permit_and_dispatch,
+                        )
+                        .await
+                        {
                             Ok(r) => r,
                             Err(_elapsed) => {
                                 tracing::warn!(
                                     binding_id = %binding_id,
                                     model_id = %model_id,
                                     timeout_ms = per_call_timeout.as_millis() as u64,
-                                    "routed_generation: per-call timeout fired (adapter did not honour its own deadline)"
+                                    "routed_generation: per-call timeout fired (adapter did not honour its own deadline OR semaphore queue exceeded the cap)"
                                 );
                                 Err(ProviderAdapterError::TimedOut)
                             }
@@ -424,11 +502,11 @@ pub fn single_model_service(
     provider: Arc<dyn GenerationProvider>,
     model_id: impl Into<String>,
 ) -> RoutedGenerationService {
-    RoutedGenerationService::new(vec![RoutedBinding {
-        binding_id: binding_id.into(),
+    RoutedGenerationService::new(vec![RoutedBinding::new(
+        binding_id,
         provider,
-        chain: ModelChain::single(model_id),
-    }])
+        ModelChain::single(model_id),
+    )])
 }
 
 /// Expose the default cooldown constant for callers that want to align
@@ -538,6 +616,9 @@ mod tests {
             binding_id: "b1".into(),
             provider: p.clone(),
             chain: ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         }]);
         let ok = svc.generate(vec![], &settings(), &tools()).await.unwrap();
         assert_eq!(ok.model_id, "m1");
@@ -561,6 +642,9 @@ mod tests {
             binding_id: "b1".into(),
             provider: p.clone(),
             chain: ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         }]);
         let ok = svc.generate(vec![], &settings(), &tools()).await.unwrap();
         assert_eq!(ok.model_id, "m2");
@@ -594,12 +678,18 @@ mod tests {
                 provider: p1,
                 chain: ModelChain::new(vec!["a1".to_owned(), "a2".to_owned()])
                     .with_retry_budget(0, std::time::Duration::ZERO),
+                concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+                )),
             },
             RoutedBinding {
                 binding_id: "binding-b".into(),
                 provider: p2,
                 chain: ModelChain::new(vec!["b1".to_owned()])
                     .with_retry_budget(0, std::time::Duration::ZERO),
+                concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+                )),
             },
         ]);
         let ok = svc.generate(vec![], &settings(), &tools()).await.unwrap();
@@ -622,11 +712,17 @@ mod tests {
                 binding_id: "b1".into(),
                 provider: p.clone(),
                 chain: ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]),
+                concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+                )),
             },
             RoutedBinding {
                 binding_id: "b2".into(),
                 provider: ScriptedProvider::new(vec![("z", vec![ScriptStep::Ok("no".into())])]),
                 chain: ModelChain::single("z"),
+                concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+                )),
             },
         ]);
         let err = svc
@@ -650,6 +746,9 @@ mod tests {
             binding_id: "b1".into(),
             provider: p.clone(),
             chain: ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()]),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         }]);
         let err = svc
             .generate(vec![], &settings(), &tools())
@@ -686,6 +785,9 @@ mod tests {
             provider: p,
             chain: ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()])
                 .with_retry_budget(0, std::time::Duration::ZERO),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         }]);
         let err = svc
             .generate(vec![], &settings(), &tools())
@@ -722,6 +824,9 @@ mod tests {
             chain: ModelChain::new(vec!["m1".to_owned(), "m2".to_owned()])
                 .with_rate_limit_cooldown(Duration::from_secs(60))
                 .with_cooldown(cooldown.clone()),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         }]);
 
         // First call: m1 rate-limits, m2 succeeds. m1 is now cooled down.
@@ -749,6 +854,9 @@ mod tests {
             binding_id: "b1".into(),
             provider: p.clone(),
             chain: ModelChain::single("m1"),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         }]);
         let tool_defs = vec![
             serde_json::json!({ "type": "function", "function": { "name": "read" } }),

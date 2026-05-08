@@ -91,11 +91,17 @@ async fn routed_generation_per_call_timeout_falls_back() {
             binding_id: "slow".into(),
             provider: hung,
             chain: ModelChain::single("hung-model").with_retry_budget(0, Duration::ZERO),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         },
         RoutedBinding {
             binding_id: "fast".into(),
             provider: quick,
             chain: ModelChain::single("ok-model").with_retry_budget(0, Duration::ZERO),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         },
     ])
     // 500ms ceiling — strictly less than the 30s sleep so the routing
@@ -139,11 +145,17 @@ async fn routed_generation_all_hang_exhausts_in_bounded_time() {
             binding_id: "b1".into(),
             provider: hung.clone(),
             chain: ModelChain::single("m1").with_retry_budget(0, Duration::ZERO),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         },
         RoutedBinding {
             binding_id: "b2".into(),
             provider: hung,
             chain: ModelChain::single("m2").with_retry_budget(0, Duration::ZERO),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         },
     ])
     .with_per_call_timeout(Duration::from_millis(300));

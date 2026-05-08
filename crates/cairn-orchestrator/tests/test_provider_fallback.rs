@@ -174,6 +174,9 @@ fn routed_single_binding(
         provider,
         chain: ModelChain::new(models.iter().map(|s| (*s).to_owned()))
             .with_retry_budget(0, std::time::Duration::ZERO),
+        concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+        )),
     }])
 }
 
@@ -301,11 +304,17 @@ async fn test_cross_binding_fallback() {
             binding_id: "binding-a".into(),
             provider: p1.clone(),
             chain: ModelChain::single("a1").with_retry_budget(0, std::time::Duration::ZERO),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         },
         RoutedBinding {
             binding_id: "binding-b".into(),
             provider: p2.clone(),
             chain: ModelChain::single("b1").with_retry_budget(0, std::time::Duration::ZERO),
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         },
     ]);
     let phase = LlmDecidePhase::from_routed(service);
@@ -332,6 +341,9 @@ async fn test_rate_limited_model_cooldown() {
             binding_id: "b1".into(),
             provider: provider.clone(),
             chain,
+            concurrency_limit: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY,
+            )),
         }]);
         LlmDecidePhase::from_routed(service)
     };

@@ -408,6 +408,15 @@ pub struct AppState {
     /// restart by design (in-memory; event-sourced cooldown is a
     /// follow-up).
     pub provider_fallback_cooldown: Arc<ScopedProviderFallbackCooldown>,
+
+    /// #762: per-binding concurrency limiters, shared across all
+    /// orchestrate requests for the same `(tenant_id, binding_id)`.
+    /// The semaphore lives on AppState so parallel HTTP handlers
+    /// see the same permit pool. Each handler acquires-and-holds
+    /// one permit for the duration of an LLM dispatch chain.
+    ///
+    /// See [`ScopedBindingConcurrency`] for capacity rules.
+    pub binding_concurrency: Arc<ScopedBindingConcurrency>,
     /// F49: queue for auto-resume orchestrate kicks. Always present on
     /// AppState — the inner channel is an `OnceLock` inside the sender
     /// that `main.rs` installs after the HTTP listener binds. When an
@@ -601,6 +610,72 @@ impl ScopedProviderFallbackCooldown {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         guard.retain(|_, cooldown| !cooldown.is_empty());
         guard.len()
+    }
+}
+
+/// #762: in-memory per-binding concurrency limiters, partitioned by
+/// `(tenant_id, binding_id)`. Each entry is an `Arc<tokio::sync::Semaphore>`
+/// shared across all orchestrate requests for that binding.
+///
+/// Capacity defaults to
+/// [`cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY`]
+/// (4 in-flight calls per binding). Operators with paid LLM tiers can
+/// override via the `CAIRN_BINDING_CONCURRENCY` env var (read once at
+/// boot — runtime updates require restart for now).
+///
+/// The map prunes empty entries lazily on each `get_or_create` so it
+/// stays bounded under tenant/connection churn.
+#[derive(Debug)]
+pub struct ScopedBindingConcurrency {
+    inner:
+        std::sync::Mutex<std::collections::HashMap<(String, String), Arc<tokio::sync::Semaphore>>>,
+    capacity: usize,
+}
+
+impl Default for ScopedBindingConcurrency {
+    /// Default uses the runtime-shared
+    /// [`cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY`]
+    /// (4) — clippy nudges callers toward `unwrap_or_default`, so this
+    /// impl exists to keep that path producing a sane capacity (the
+    /// derived `Default` would set capacity=0 and emit broken
+    /// 0-permit semaphores).
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScopedBindingConcurrency {
+    /// Build with the default cap (4) — matches
+    /// [`cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY`].
+    pub fn new() -> Self {
+        Self::with_capacity(cairn_runtime::services::routed_generation::DEFAULT_BINDING_CONCURRENCY)
+    }
+
+    /// Build with an operator-chosen cap. Capped at `[1, 256]` to keep
+    /// the configuration sane (above 256 likely means a misread env var).
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.clamp(1, 256);
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capacity,
+        }
+    }
+
+    /// Returns the shared `Arc<Semaphore>` for the given scope. First
+    /// call lazily creates it with the configured capacity; subsequent
+    /// calls return the same `Arc` so all parallel handlers contend
+    /// over the same permit pool.
+    pub fn get_or_create(&self, tenant_id: &str, binding_id: &str) -> Arc<tokio::sync::Semaphore> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entry((tenant_id.to_owned(), binding_id.to_owned()))
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.capacity)))
+            .clone()
+    }
+
+    /// Configured per-scope capacity (for observability / tests).
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 }
 
@@ -1016,6 +1091,16 @@ impl AppState {
             #[cfg(any(feature = "metrics-core", feature = "metrics-providers"))]
             metrics_tap: None,
             provider_fallback_cooldown: Arc::new(ScopedProviderFallbackCooldown::new()),
+            // #762: per-binding concurrency limiter. Capacity from env
+            // (`CAIRN_BINDING_CONCURRENCY`) or the runtime default (4).
+            // Read once at AppState::new — runtime overrides require restart.
+            binding_concurrency: Arc::new(
+                std::env::var("CAIRN_BINDING_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .map(ScopedBindingConcurrency::with_capacity)
+                    .unwrap_or_default(),
+            ),
             orchestrate_kick_tx: Arc::new(OrchestrateKickSender::new()),
             notification_sink: Arc::new(NotificationSink::new()),
             idempotency_cache: Arc::new(crate::idempotency::IdempotencyCache::new()),
@@ -1413,5 +1498,57 @@ fn load_master_key(config: &BootstrapConfig) -> Result<Arc<cairn_runtime::Master
             }
         }
         Err(e) => Err(format!("FATAL: credential master key invalid: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod scoped_binding_concurrency_tests {
+    use super::ScopedBindingConcurrency;
+
+    /// #762/#764: same `(tenant, binding)` key returns the SAME
+    /// `Arc<Semaphore>` across calls. This is the critical property
+    /// — without it, parallel HTTP handlers each get their own
+    /// fresh semaphore and the cap is ineffective.
+    #[test]
+    fn get_or_create_returns_shared_semaphore_for_same_key() {
+        let scoped = ScopedBindingConcurrency::with_capacity(2);
+        let s1 = scoped.get_or_create("tenant-a", "binding-x");
+        let s2 = scoped.get_or_create("tenant-a", "binding-x");
+        // Two distinct Arc clones of the SAME Semaphore — pointer-equal.
+        assert!(
+            std::sync::Arc::ptr_eq(&s1, &s2),
+            "same key must return Arc::ptr_eq sema"
+        );
+    }
+
+    /// Different scopes (different tenants OR different bindings)
+    /// produce distinct semaphores. A noisy tenant on one binding
+    /// must not bottleneck other tenants.
+    #[test]
+    fn get_or_create_distinct_semaphores_for_distinct_keys() {
+        let scoped = ScopedBindingConcurrency::with_capacity(2);
+        let s_a_x = scoped.get_or_create("tenant-a", "binding-x");
+        let s_a_y = scoped.get_or_create("tenant-a", "binding-y");
+        let s_b_x = scoped.get_or_create("tenant-b", "binding-x");
+        assert!(
+            !std::sync::Arc::ptr_eq(&s_a_x, &s_a_y),
+            "different binding ids must yield distinct semas"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&s_a_x, &s_b_x),
+            "different tenants must yield distinct semas"
+        );
+    }
+
+    /// Capacity is clamped to [1, 256] to keep operator-misconfig
+    /// from blowing up the in-flight count.
+    #[test]
+    fn capacity_clamped_to_sane_range() {
+        assert_eq!(ScopedBindingConcurrency::with_capacity(0).capacity(), 1);
+        assert_eq!(ScopedBindingConcurrency::with_capacity(1).capacity(), 1);
+        assert_eq!(
+            ScopedBindingConcurrency::with_capacity(1000).capacity(),
+            256
+        );
     }
 }

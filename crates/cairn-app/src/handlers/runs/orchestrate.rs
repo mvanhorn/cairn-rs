@@ -1440,10 +1440,19 @@ pub(crate) async fn drive_run_iteration(
             if Some(idx) == preferred_idx && preferred_connection_id.is_none() {
                 preferred_connection_id = Some(conn_id.clone());
             }
+            // #762: pull the shared per-binding semaphore from AppState
+            // so all parallel orchestrate handlers contend over the same
+            // permit pool. Without this share, each handler would build
+            // its own fresh semaphore and the cap would be ineffective
+            // (Gemini review on #764).
+            let concurrency_limit = state
+                .binding_concurrency
+                .get_or_create(&tenant_key, conn_id);
             bindings.push(cairn_runtime::RoutedBinding {
                 binding_id: conn_id.clone(),
                 provider: adapter,
                 chain: cairn_runtime::ModelChain::new(models).with_cooldown(cooldown),
+                concurrency_limit,
             });
         }
 
@@ -1459,10 +1468,17 @@ pub(crate) async fn drive_run_iteration(
         // error. The post-closure branch below returns 422 in that case.
         if bindings.is_empty() && credential_missing_connections.is_empty() {
             let cooldown = scoped_cooldowns.get_or_create(&tenant_key, "startup");
+            // #762: shared per-binding semaphore, scoped to the
+            // synthetic "startup" binding-id. Same-key reuse across
+            // requests in env-only mode.
+            let concurrency_limit = state
+                .binding_concurrency
+                .get_or_create(&tenant_key, "startup");
             bindings.push(cairn_runtime::RoutedBinding {
                 binding_id: "startup".to_owned(),
                 provider: brain.clone(),
                 chain: cairn_runtime::ModelChain::single(model_id.clone()).with_cooldown(cooldown),
+                concurrency_limit,
             });
         }
 
