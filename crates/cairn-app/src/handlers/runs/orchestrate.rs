@@ -919,35 +919,42 @@ pub(crate) async fn drive_run_iteration(
     )
     .await;
 
-    // RFC 029 / RFC 030: resolve the project's configured knowledge
-    // provider and attach a VisibilityContext so prompt building can hide
-    // `memory_store` when the relevant provider is auto-extract or
-    // read-only. Today the event-log resolver only projects the
-    // knowledge-family slot (the `ProviderConfigured` event stream pre-
-    // dates RFC 030's memory split); the memory snapshot is `None` until
-    // PR-G lands the dual-family resolver + `ProjectCreated` bootstrap
-    // path. The RFC 030 fallback rule in `is_tool_visible` routes
-    // `memory_store` through the knowledge snapshot when the memory slot
-    // is absent, so behaviour stays identical to RFC 029 during the
-    // rollout window.
+    // RFC 029 / RFC 030 PR-G: resolve both provider slots for this
+    // project and attach a VisibilityContext. Prompt building consults
+    // both snapshots — `memory_store` suppression routes through the
+    // memory slot first (auto_extract / ingest_capable), with a
+    // knowledge-slot fallback for pre-RFC-030 projects that have no
+    // memory binding yet. Best-effort: resolver errors leave visibility
+    // `None`, and the decide phase falls back to the pre-RFC-029
+    // "everything visible" behaviour.
     let visibility = {
         use cairn_memory::event_log_resolver::{
-            snapshot_for_provider_ref, EventLogProviderResolver,
+            memory_snapshot_for_provider_ref, snapshot_for_provider_ref,
+            EventLogMemoryProviderResolver, EventLogProviderResolver,
         };
         use cairn_memory::multi_provider::ProviderResolver;
-        let resolver = EventLogProviderResolver::new(state.runtime.store.clone());
-        match resolver.resolve(&run.project).await {
-            Ok(pref) => {
-                let knowledge_snapshot = snapshot_for_provider_ref(&pref);
-                let marketplace = state.marketplace.lock().unwrap_or_else(|e| e.into_inner());
-                Some(marketplace.build_visibility_context_for_run(
-                    &run.project,
-                    run.run_id.clone(),
-                    knowledge_snapshot,
-                    None, // memory-family snapshot — PR-G.
-                ))
-            }
-            Err(_) => None,
+        let k_resolver = EventLogProviderResolver::new(state.runtime.store.clone());
+        let m_resolver = EventLogMemoryProviderResolver::new(state.runtime.store.clone());
+        let k_snap = k_resolver
+            .resolve(&run.project)
+            .await
+            .ok()
+            .and_then(|p| snapshot_for_provider_ref(&p));
+        let m_snap = m_resolver
+            .resolve(&run.project)
+            .await
+            .ok()
+            .and_then(|p| memory_snapshot_for_provider_ref(&p));
+        if k_snap.is_some() || m_snap.is_some() {
+            let marketplace = state.marketplace.lock().unwrap_or_else(|e| e.into_inner());
+            Some(marketplace.build_visibility_context_for_run(
+                &run.project,
+                run.run_id.clone(),
+                k_snap,
+                m_snap,
+            ))
+        } else {
+            None
         }
     };
 

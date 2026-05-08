@@ -1379,17 +1379,24 @@ async fn real_main() {
         let memory_dispatcher = Arc::new(KnowledgeDispatcherAsMemory(
             lib_state.knowledge_dispatcher.clone(),
         ));
+        // RFC 030 PR-G: the memory-family resolver projects only
+        // `MemoryProviderConfigured` events, so the `cairn-default`
+        // bootstrap emitted by `ProjectCreated` routes correctly even
+        // when the knowledge slot has been changed.
+        use cairn_memory::event_log_resolver::EventLogMemoryProviderResolver;
         let memory_retrieval = Arc::new(
             MultiProviderMemory::new(
                 lib_state.retrieval.clone(),
-                EventLogProviderResolver::new(lib_state.runtime.store.clone()),
+                EventLogMemoryProviderResolver::new(lib_state.runtime.store.clone()),
                 memory_dispatcher,
             )
             .with_response_hook(memory_rescorer),
         ) as Arc<dyn RetrievalService>;
         // Ingest stays on the knowledge pipeline for cairn-default today;
-        // PR-G lands the MultiProviderMemoryIngest wiring once the
-        // memory-family resolver projects memory-slot state.
+        // a dedicated `MultiProviderMemoryIngest` wiring lands once mem0
+        // + other auto-extract adapters need an explicit memory-ingest
+        // path. Cairn-default accepts either family through the shared
+        // in-process pipeline.
         let memory_ingest = ingest.clone();
         let auto_extract_resolver: std::sync::Arc<
             dyn cairn_app::tool_impls::MemoryAutoExtractResolver,
