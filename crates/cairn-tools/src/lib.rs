@@ -7,6 +7,7 @@ pub mod executor;
 pub mod graph_events;
 pub mod hooks;
 pub mod invocation;
+pub mod knowledge_dispatcher;
 pub mod mcp_client;
 pub mod mcp_server;
 pub mod permission_events;

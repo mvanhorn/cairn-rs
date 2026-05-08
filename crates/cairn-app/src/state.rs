@@ -38,7 +38,7 @@ use cairn_memory::api_impl::MemoryApiImpl;
 use cairn_memory::deep_search_impl::{IterativeDeepSearch, KeywordDecomposer};
 use cairn_memory::diagnostics::DiagnosticsService;
 use cairn_memory::diagnostics_impl::InMemoryDiagnostics;
-use cairn_memory::event_log_resolver::{EventLogProviderResolver, UnavailablePluginDispatcher};
+use cairn_memory::event_log_resolver::EventLogProviderResolver;
 use cairn_memory::export_service_impl::InMemoryExportService;
 use cairn_memory::feed_impl::FeedStore;
 use cairn_memory::graph_expansion::GraphBackedExpansion;
@@ -55,7 +55,10 @@ use cairn_runtime::{
     TenantService, TriggerService, WorkspaceService,
 };
 
-use cairn_tools::{execute_eval_score, InMemoryPluginRegistry, StdioPluginHost};
+use cairn_tools::{
+    execute_eval_score, knowledge_dispatcher::StdioKnowledgeDispatcher, InMemoryPluginRegistry,
+    StdioPluginHost,
+};
 
 // ── crate-internal ───────────────────────────────────────────────────────────
 
@@ -87,7 +90,7 @@ pub const DEFAULT_PROJECT_ID: &str = "default_project";
 pub(crate) type AppDeepRetrieval = MultiProviderRetrieval<
     Arc<InMemoryRetrieval>,
     EventLogProviderResolver<cairn_store::InMemoryStore>,
-    UnavailablePluginDispatcher,
+    StdioKnowledgeDispatcher,
     PostHocRescorer<Arc<InMemoryGraphStore>, NoOpCredibilityLookup>,
 >;
 
@@ -265,6 +268,13 @@ pub struct AppState {
     pub operator_tokens: Arc<OperatorTokenStore>,
     pub plugin_registry: Arc<InMemoryPluginRegistry>,
     pub plugin_host: Arc<Mutex<StdioPluginHost>>,
+    /// RFC 029: shared knowledge-plugin dispatcher backing every
+    /// `plugin:<id>` retrieval / ingest call. Held here so the
+    /// agent-memory wiring in `main.rs` and the deep-search wiring
+    /// in this module both reuse the **same** dispatcher instance —
+    /// preserving the shared JSON-RPC request-id counter so ids stay
+    /// globally unique across every in-flight call.
+    pub knowledge_dispatcher: cairn_tools::knowledge_dispatcher::StdioKnowledgeDispatcher,
     /// RFC 015: plugin marketplace service -- manages discover/install/enable lifecycle.
     pub marketplace: Arc<Mutex<MarketplaceService<cairn_store::InMemoryStore>>>,
     /// RFC 022: trigger service -- manages triggers and run templates.
@@ -754,6 +764,15 @@ impl AppState {
         // RFC 029 PR-B2: attach PostHocRescorer so hops see runtime-owned
         // scoring dimensions; the deep-search quality gate's threshold
         // compares the rescored `score`, not the provider's raw score.
+        // Real plugin dispatcher: the StdioKnowledgeDispatcher shares
+        // the app-wide plugin host Mutex, reusing plugin processes
+        // spawned via the marketplace install flow. Cloning the
+        // dispatcher preserves the shared JSON-RPC request-id counter
+        // so ids stay globally unique across every in-flight call
+        // (main.rs memory tool path + deep-search path reuse the same
+        // Arc<AtomicU64> via dispatcher.clone()).
+        let plugin_host = Arc::new(Mutex::new(StdioPluginHost::new()));
+        let knowledge_dispatcher = StdioKnowledgeDispatcher::new(plugin_host.clone());
         let deep_search_inner = Arc::new(InMemoryRetrieval::new(document_store.clone()));
         let deep_search_rescorer = PostHocRescorer::new(graph.clone(), NoOpCredibilityLookup);
         let deep_search = Arc::new(
@@ -761,7 +780,7 @@ impl AppState {
                 MultiProviderRetrieval::new(
                     deep_search_inner,
                     EventLogProviderResolver::new(runtime.store.clone()),
-                    UnavailablePluginDispatcher,
+                    knowledge_dispatcher.clone(),
                 )
                 .with_response_hook(deep_search_rescorer),
             )
@@ -784,7 +803,9 @@ impl AppState {
         let pending_ingest_jobs = Arc::new(Mutex::new(HashMap::new()));
         let mailbox_messages = Arc::new(Mutex::new(HashMap::new()));
         let service_tokens = Arc::new(ServiceTokenRegistry::new());
-        let plugin_host = Arc::new(Mutex::new(StdioPluginHost::new()));
+        // plugin_host is constructed earlier (before deep_search) so the
+        // StdioKnowledgeDispatcher shares the same Arc<Mutex<…>> across
+        // the deep-search and agent-memory retrieval surfaces.
         let repo_clone_cache = Arc::new(cairn_workspace::RepoCloneCache::default());
         let project_repo_access = Arc::new(cairn_workspace::ProjectRepoAccessService::new());
         let project_local_paths = Arc::new(crate::repo_routes::ProjectLocalPaths::default());
@@ -944,6 +965,7 @@ impl AppState {
             operator_tokens: Arc::new(OperatorTokenStore::new()),
             plugin_registry,
             plugin_host,
+            knowledge_dispatcher,
             marketplace,
             triggers: Arc::new(TriggerService::new(runtime.store.clone())),
             repo_clone_cache,

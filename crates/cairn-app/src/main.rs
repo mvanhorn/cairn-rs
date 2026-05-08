@@ -1281,26 +1281,30 @@ async fn real_main() {
     // (threading `InMemoryDiagnostics` is deferred until that read
     // model exposes a batched `list_by_source_ids` surface).
     {
-        use cairn_memory::event_log_resolver::{
-            EventLogProviderResolver, UnavailablePluginDispatcher,
-        };
+        use cairn_memory::event_log_resolver::EventLogProviderResolver;
         use cairn_memory::multi_provider::{MultiProviderIngest, MultiProviderRetrieval};
         use cairn_memory::post_hoc_rescorer::{NoOpCredibilityLookup, PostHocRescorer};
         use cairn_memory::{retrieval::RetrievalService, IngestService};
         let store = lib_state.runtime.store.clone();
         let rescorer = PostHocRescorer::new(lib_state.graph.clone(), NoOpCredibilityLookup);
+        // Reuse the single StdioKnowledgeDispatcher built during
+        // AppState construction so the JSON-RPC request-id counter
+        // is shared across the agent-memory path and the deep-search
+        // path (preventing id collisions on concurrent in-flight
+        // requests against the same plugin process).
+        let dispatcher = lib_state.knowledge_dispatcher.clone();
         let retrieval = Arc::new(
             MultiProviderRetrieval::new(
                 lib_state.retrieval.clone(),
                 EventLogProviderResolver::new(store.clone()),
-                UnavailablePluginDispatcher,
+                dispatcher.clone(),
             )
             .with_response_hook(rescorer),
         ) as Arc<dyn RetrievalService>;
         let ingest = Arc::new(MultiProviderIngest::new(
             lib_state.ingest.clone(),
             EventLogProviderResolver::new(store),
-            UnavailablePluginDispatcher,
+            dispatcher,
         )) as Arc<dyn IngestService>;
         let registry = cairn_app::tool_impls::build_tool_registry(
             retrieval,
