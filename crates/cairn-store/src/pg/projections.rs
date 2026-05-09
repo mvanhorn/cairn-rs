@@ -154,23 +154,43 @@ impl PgSyncProjection {
                     return Ok(());
                 }
 
-                sqlx::query(
-                    "UPDATE runs SET state = $1, failure_class = $2, version = version + 1, updated_at = $3 \
+                // #791: increment iteration on every approval-resume
+                // boundary (waiting_approval → running). This is the
+                // projection-backed counter that orchestrate.rs reads
+                // directly to avoid scanning the event log on the hot
+                // path. The single UPDATE folds the increment into
+                // the same statement as the state change so they
+                // commit atomically.
+                let increment_iteration = e.transition.from
+                    == Some(cairn_domain::RunState::WaitingApproval)
+                    && e.transition.to == cairn_domain::RunState::Running;
+                let sql = if increment_iteration {
+                    "UPDATE runs SET state = $1, failure_class = $2, version = version + 1, \
+                                     updated_at = $3, iteration = iteration + 1 \
                        WHERE run_id = $4 \
                          AND tenant_id = $5 \
                          AND workspace_id = $6 \
-                         AND project_id = $7",
-                )
-                .bind(state_str)
-                .bind(failure)
-                .bind(now)
-                .bind(e.run_id.as_str())
-                .bind(e.project.tenant_id.as_str())
-                .bind(e.project.workspace_id.as_str())
-                .bind(e.project.project_id.as_str())
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
+                         AND project_id = $7"
+                } else {
+                    "UPDATE runs SET state = $1, failure_class = $2, version = version + 1, \
+                                     updated_at = $3 \
+                       WHERE run_id = $4 \
+                         AND tenant_id = $5 \
+                         AND workspace_id = $6 \
+                         AND project_id = $7"
+                };
+
+                sqlx::query(sql)
+                    .bind(state_str)
+                    .bind(failure)
+                    .bind(now)
+                    .bind(e.run_id.as_str())
+                    .bind(e.project.tenant_id.as_str())
+                    .bind(e.project.workspace_id.as_str())
+                    .bind(e.project.project_id.as_str())
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
 
                 // #670 G4 / RFC 027 §97: on terminal transition of a
                 // non-root descendant, decrement the root's counter.

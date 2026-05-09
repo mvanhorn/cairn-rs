@@ -144,7 +144,7 @@ const RUN_SELECT_COLS: &str =
     "run_id, session_id, parent_run_id, tenant_id, workspace_id, project_id, \
      state, failure_class, version, created_at, updated_at, \
      completion_summary, completion_verification_json, completion_annotated_at_ms, \
-     terminal_write_recovery_json, in_flight_descendants, root_run_id";
+     terminal_write_recovery_json, in_flight_descendants, root_run_id, iteration";
 
 #[async_trait]
 impl RunReadModel for PgAdapter {
@@ -1174,6 +1174,10 @@ struct RunRow {
     // stay NULL per the RFC 027 backfill spec).
     in_flight_descendants: i64,
     root_run_id: Option<String>,
+    // #791: prior-iteration counter incremented on every
+    // approval-resume boundary (waiting_approval → running). INTEGER
+    // NOT NULL DEFAULT 0 on the schema (V073).
+    iteration: i32,
 }
 
 impl RunRow {
@@ -1231,6 +1235,7 @@ impl RunRow {
                 .map_err(|e| StoreError::Serialization(e.to_string()))?,
             in_flight_descendants: self.in_flight_descendants,
             root_run_id: self.root_run_id.map(RunId::new),
+            iteration: u32::try_from(self.iteration).unwrap_or(0),
         })
     }
 }

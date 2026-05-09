@@ -244,6 +244,7 @@ mod tests {
             terminal_write_recovery: None,
             in_flight_descendants: 0,
             root_run_id: Some(RunId::new("parent")),
+            iteration: 0,
         }
     }
 

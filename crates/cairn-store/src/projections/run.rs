@@ -111,6 +111,30 @@ pub struct RunRecord {
     /// because pre-V069 spawns never incremented any counter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_run_id: Option<RunId>,
+    /// #791: prior-iteration count materialized from
+    /// `RunStateChanged { from: WaitingApproval, to: Running }`
+    /// projection-apply increments. Read on every `/orchestrate`
+    /// POST so `OrchestrationContext.iteration` survives
+    /// approval-resume boundaries (#788). Replaces the interim
+    /// hot-path event-log scan that PR #790 introduced.
+    ///
+    /// Initialized to 0 at `RunCreated` apply. Incremented exactly
+    /// once per resumed iteration (running→waiting_approval→running
+    /// is exactly one suspend/resume cycle). Runs that never
+    /// suspend keep iteration=0, which is the correct value the
+    /// in-process loop counter would have produced.
+    ///
+    /// `skip_serializing_if == 0`: runs that have never resumed
+    /// stay silent in the response body. Pre-V073 rows projected
+    /// without this column default to 0 via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub iteration: u32,
+}
+
+/// Helper for `#[serde(skip_serializing_if = ...)]` on `u32`
+/// fields that are silent-when-zero (e.g., `iteration`).
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Helper for `#[serde(skip_serializing_if = ...)]` on `i64` fields

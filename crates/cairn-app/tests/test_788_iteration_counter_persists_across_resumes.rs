@@ -286,6 +286,28 @@ async fn iteration_counter_survives_orchestrate_resume() {
         hits.load(Ordering::SeqCst),
     );
 
+    // Verify the projection-backed counter incremented. Query the run
+    // record directly — `iteration` should be at least 1 after one
+    // approval-resume cycle.
+    let r = h
+        .client()
+        .get(format!("{}/v1/runs/{}", h.base_url, run_id))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("get run reaches server");
+    assert_eq!(r.status().as_u16(), 200);
+    let body = r.json::<Value>().await.unwrap_or(Value::Null);
+    let projection_iteration = body
+        .get("run")
+        .and_then(|v| v.get("iteration"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        projection_iteration >= 1,
+        "#791: RunRecord.iteration should be >= 1 after {target_iters} approve-resume cycles; got {projection_iteration}",
+    );
+
     // Pull LLM traces for this session and find the most-recent one
     // for our run. The trace body's `system_prompt + messages_json`
     // user message renders the F25-drained step_history; pre-fix

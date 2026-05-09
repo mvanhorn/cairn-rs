@@ -95,6 +95,30 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Replace event-log iteration scan with projection-backed
+  `RunRecord.iteration` field (#791).** PR #790's #788 fix derived
+  prior-iteration count from a forward scan of
+  `RunStateChanged { from: WaitingApproval, to: Running }` events
+  on the hot path of every `/orchestrate` POST. Gemini correctly
+  flagged this as O(N) replay of the event log on a hot path, so
+  this PR materializes the counter as `iteration: u32` on
+  `RunRecord`, incremented in the projection apply on every
+  approval-resume transition, and reads it directly. Schema:
+  V073 PG migration adds `iteration INTEGER NOT NULL DEFAULT 0`;
+  SQLite schema gets the same column inline. All three backends
+  (in-memory, pg, sqlite) increment in their `RunStateChanged`
+  apply via a folded UPDATE that commits atomically with the
+  state change. `orchestrate.rs` re-reads the run record after
+  the entry-time `WaitingApproval → Running` transition (lines
+  ~550-572 of `drive_run_iteration`) so the counter reflects the
+  just-committed increment. PR #790's regression test
+  (`test_788_iteration_counter_persists_across_resumes`) now
+  exercises the new code path; a new `cairn-store` integration
+  test (`test_iteration_projection`) directly asserts the
+  projection apply increments correctly across all three
+  state-transition combinations. Pre/post test verified by
+  simulating regression with `let prior_iteration_count: u32 = 0`.
+
 - **`OrchestrationContext.iteration` now persists across
   `/orchestrate`-resume boundaries (#788).** Pre-fix,
   `crates/cairn-app/src/handlers/runs/orchestrate.rs:975` hardcoded

@@ -928,57 +928,33 @@ pub(crate) async fn drive_run_iteration(
     )
     .await;
 
-    // #788: derive prior-iteration count from the run's event log so
-    // the counter survives /orchestrate-resume boundaries. Without
-    // this, every re-orchestrate POST (including F49 auto-resume
-    // after tool-call approval) creates a fresh
-    // `OrchestrationContext` with `iteration: 0`, which (a) makes
-    // every step_history entry render as `[0]`, masking the loop
-    // pattern from the model, and (b) defeats
-    // `should_inject_stuck_nudge`'s iteration-threshold check.
+    // #791 / #788: prior-iteration count is materialized on the run
+    // projection, incremented in the RunStateChanged apply on every
+    // (waiting_approval → running) transition. Replaces PR #790's
+    // interim event-log scan — O(1) read of the run row instead of
+    // forward-scanning the event log on the hot path. Without
+    // surfacing this counter into `OrchestrationContext.iteration`,
+    // every re-orchestrate POST (including F49 auto-resume after
+    // tool-call approval) would render every `## Step history`
+    // entry as `[0]` and defeat `should_inject_stuck_nudge`.
     //
-    // Signal: `RunStateChanged` is the only run-indexed event that
-    // fires deterministically on every approval-resume boundary —
-    // each suspend/resume produces a `running→waiting_approval`
-    // transition and a `waiting_approval→running` transition. We
-    // count the resume-side transitions; that count == the number
-    // of completed prior iterations that suspended on approval.
+    // Re-read the run record here: the original `run` was loaded
+    // BEFORE the orchestrate-entry transition that flips
+    // `WaitingApproval → Running` (lines ~550-572 above), so its
+    // `iteration` field is one increment behind the projection.
+    // Re-reading after the transition picks up the fresh value.
     //
     // Runs that never suspend (1-shot complete) keep iteration=0
     // for their single in-process loop, which is the correct value
-    // anyway.
-    //
-    // INTERIM: this is a forward scan over the run's events on a
-    // hot path. The proper fix is to materialize an
-    // `iteration: u32` field on `RunRecord` and read it directly —
-    // tracked at #791. Limit is 1024 events, which is ~10× the
-    // highest iteration count observed in dogfood (R20 worst case:
-    // ~70 iterations = ~140 RunStateChanged events). The in-memory
-    // event log is already loaded; the scan is microseconds. Past
-    // the limit, saturating-cast is correct: once you're north of
-    // 1024 iterations the model is well past any threshold the
-    // footer cares about.
-    let prior_iteration_count: u32 = {
-        use cairn_store::EntityRef;
-        let events = state
-            .runtime
-            .store
-            .read_by_entity(&EntityRef::Run(run.run_id.clone()), None, 1024)
-            .await
-            .unwrap_or_default();
-        u32::try_from(
-            events
-                .iter()
-                .filter(|e| match &e.envelope.payload {
-                    cairn_domain::events::RuntimeEvent::RunStateChanged(rsc) => {
-                        rsc.transition.to == cairn_domain::RunState::Running
-                            && rsc.transition.from == Some(cairn_domain::RunState::WaitingApproval)
-                    }
-                    _ => false,
-                })
-                .count(),
-        )
-        .unwrap_or(u32::MAX)
+    // the loop counter would have produced.
+    let prior_iteration_count: u32 = match cairn_store::projections::RunReadModel::get(
+        state.runtime.store.as_ref(),
+        &run.run_id,
+    )
+    .await
+    {
+        Ok(Some(r)) => r.iteration,
+        _ => run.iteration,
     };
 
     // RFC 029 / RFC 030 PR-G: resolve both provider slots for this

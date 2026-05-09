@@ -79,7 +79,12 @@ CREATE TABLE IF NOT EXISTS runs (
     -- (underflow becomes a signed audit metric, not a wrapping
     -- catastrophe).
     in_flight_descendants        INTEGER NOT NULL DEFAULT 0,
-    root_run_id                  TEXT
+    root_run_id                  TEXT,
+    -- #791: prior-iteration counter incremented on every
+    -- waiting_approval → running transition in the RunStateChanged
+    -- projection apply. Read by orchestrate.rs to seed
+    -- OrchestrationContext.iteration on /orchestrate-resume.
+    iteration                    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tasks (

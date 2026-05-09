@@ -163,23 +163,41 @@ impl SqliteSyncProjection {
                     return Ok(());
                 }
 
-                sqlx::query(
-                    "UPDATE runs SET state = ?, failure_class = ?, version = version + 1, updated_at = ? \
+                // #791: increment iteration on every
+                // waiting_approval → running transition. Single UPDATE
+                // folds the increment into the same statement as the
+                // state change so they commit atomically. Mirrors the
+                // pg projection.
+                let increment_iteration = e.transition.from
+                    == Some(cairn_domain::RunState::WaitingApproval)
+                    && e.transition.to == cairn_domain::RunState::Running;
+                let sql = if increment_iteration {
+                    "UPDATE runs SET state = ?, failure_class = ?, version = version + 1, \
+                                     updated_at = ?, iteration = iteration + 1 \
                        WHERE run_id = ? \
                          AND tenant_id = ? \
                          AND workspace_id = ? \
-                         AND project_id = ?",
-                )
-                .bind(state_str)
-                .bind(failure)
-                .bind(now)
-                .bind(e.run_id.as_str())
-                .bind(e.project.tenant_id.as_str())
-                .bind(e.project.workspace_id.as_str())
-                .bind(e.project.project_id.as_str())
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| StoreError::Internal(e.to_string()))?;
+                         AND project_id = ?"
+                } else {
+                    "UPDATE runs SET state = ?, failure_class = ?, version = version + 1, \
+                                     updated_at = ? \
+                       WHERE run_id = ? \
+                         AND tenant_id = ? \
+                         AND workspace_id = ? \
+                         AND project_id = ?"
+                };
+
+                sqlx::query(sql)
+                    .bind(state_str)
+                    .bind(failure)
+                    .bind(now)
+                    .bind(e.run_id.as_str())
+                    .bind(e.project.tenant_id.as_str())
+                    .bind(e.project.workspace_id.as_str())
+                    .bind(e.project.project_id.as_str())
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| StoreError::Internal(e.to_string()))?;
 
                 // #670 G4 / RFC 027 §97: on terminal transition of a
                 // non-root descendant, decrement the root's counter.

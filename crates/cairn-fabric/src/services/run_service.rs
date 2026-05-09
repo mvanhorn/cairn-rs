@@ -1595,6 +1595,11 @@ fn build_run_record(
         // read from the RunReadModel projection.
         in_flight_descendants: 0,
         root_run_id: None,
+        // #791: fabric snapshots come from FF state, never from the
+        // cairn-store projection that carries the iteration counter.
+        // Always 0; callers who want the actual value read from the
+        // RunReadModel projection (which is what orchestrate.rs does).
+        iteration: 0,
     })
 }
 

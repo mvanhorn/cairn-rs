@@ -666,6 +666,10 @@ impl InMemoryStore {
                         terminal_write_recovery: None,
                         in_flight_descendants: 0,
                         root_run_id,
+                        // #791: iteration starts at 0 — incremented on
+                        // each waiting_approval → running transition
+                        // in the RunStateChanged apply below.
+                        iteration: 0,
                     },
                 );
                 // Update run quota counter
@@ -719,6 +723,18 @@ impl InMemoryStore {
                             None
                         };
                     if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
+                        // #791: increment iteration on every
+                        // approval-resume boundary (waiting_approval
+                        // → running). This is the projection-backed
+                        // counter that replaces PR #790's interim
+                        // event-log scan in
+                        // crates/cairn-app/src/handlers/runs/orchestrate.rs.
+                        if e.transition.from
+                            == Some(cairn_domain::RunState::WaitingApproval)
+                            && e.transition.to == cairn_domain::RunState::Running
+                        {
+                            rec.iteration = rec.iteration.saturating_add(1);
+                        }
                         rec.state = e.transition.to;
                         rec.failure_class = e.failure_class;
                         rec.pause_reason = e.pause_reason.clone();
