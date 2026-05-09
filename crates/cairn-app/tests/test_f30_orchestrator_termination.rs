@@ -477,6 +477,8 @@ async fn system_prompt_does_not_gate_complete_run_behind_forced_action() {
         approval_timeout: None,
         visibility: None,
         parent_context: None,
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     };
     // Empty gather: exercises the "no memory retrieved" footer branch.
     // With memory, the only difference is the `memory_hint` prefix —

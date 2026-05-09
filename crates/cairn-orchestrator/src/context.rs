@@ -99,9 +99,83 @@ pub struct OrchestrationContext {
     /// run is created. `None` on root runs and on legacy test-
     /// construction paths.
     pub parent_context: Option<String>,
+
+    /// RFC 031 §Runtime Resolution Delta: per-run dedup set for
+    /// `ToolDeclaredButMissing` emission at the allowlist-filter site
+    /// (PR-C site 1). The first time the orchestrator sees a
+    /// `(role_id, tool_id)` pair where the declared tool isn't
+    /// registered, it emits the advisory event and records the pair
+    /// here; subsequent DECIDE iterations in the same run skip
+    /// re-emit.
+    ///
+    /// Field is `Arc<Mutex<...>>` because:
+    /// 1. `OrchestrationContext` derives `Clone` (rebuilt per
+    ///    iteration on resume). A bare `Mutex` would break the derive
+    ///    (Mutex: !Clone) and — worse — per-iteration clones would
+    ///    get disconnected copies, defeating dedup across iterations.
+    /// 2. `Arc` lets clones share one backing set. Interior mutability
+    ///    via `Mutex` lets the execute/decide phase insert-if-absent
+    ///    without needing `&mut OrchestrationContext`.
+    ///
+    /// **Lock convention** (load-bearing for PR-C's emission site):
+    /// * Use `std::sync::Mutex` semantics — **NEVER hold the lock
+    ///   across an `.await`** (this is a sync `Mutex`, not
+    ///   `tokio::sync::Mutex`; holding across await would deadlock).
+    ///   The emission site must: acquire lock, check-and-insert, drop
+    ///   lock, THEN emit the event (event append is async).
+    /// * Recover from poison via
+    ///   `.lock().unwrap_or_else(|e| e.into_inner())` — matches the
+    ///   repo convention in `cairn-app/src/metrics_tap.rs` and
+    ///   `cairn-app/src/child_run_driver.rs`. A poisoned lock here
+    ///   means a previous thread panicked while holding it; the
+    ///   protected data (a HashSet of string pairs) is still safe to
+    ///   read/mutate, and losing dedup state would be worse than
+    ///   picking it up mid-state.
+    ///
+    /// PR-A: field added + default-initialised. Emission site lands in
+    /// PR-C (when the allowlist filter gains the advisory path).
+    pub declared_but_missing:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+
+    /// RFC 031 §D14 layer 2: per-run snapshot of the project's
+    /// spawnable role list. Filled on the first DECIDE by
+    /// `AgentRoleService::list`; reused for the rest of the run by
+    /// `spawn_subagent_tool_def` (PR-C site 5).
+    ///
+    /// `Arc<OnceCell<...>>` for the same reasons as
+    /// `declared_but_missing` above — `OnceCell` is `!Clone` and the
+    /// context derives Clone; `Arc` gives clones a shared backing
+    /// cell so "fill once" means "fill once per run" rather than
+    /// "fill once per iteration".
+    ///
+    /// PR-A: field added + default-initialised to an empty cell.
+    /// Fill site lands in PR-C (when `spawn_subagent_tool_def`
+    /// retires its process-lifetime `OnceLock` and threads the
+    /// project through).
+    pub agent_role_list_cache:
+        std::sync::Arc<tokio::sync::OnceCell<Vec<cairn_runtime::services::ResolvedRole>>>,
 }
 
 impl OrchestrationContext {
+    /// RFC 031 PR-A convenience: fresh empty dedup set for
+    /// `declared_but_missing`. Call-site ergonomics for the 15+
+    /// `OrchestrationContext { ... }` constructors scattered across
+    /// the workspace — they can write
+    /// `declared_but_missing: OrchestrationContext::empty_declared_but_missing()`
+    /// instead of inlining the full `Arc<Mutex<HashSet<...>>>` shape.
+    pub fn empty_declared_but_missing(
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    /// RFC 031 PR-A convenience: fresh empty role-list cache. See
+    /// [`OrchestrationContext::empty_declared_but_missing`] for the
+    /// call-site rationale.
+    pub fn empty_agent_role_list_cache(
+    ) -> std::sync::Arc<tokio::sync::OnceCell<Vec<cairn_runtime::services::ResolvedRole>>> {
+        std::sync::Arc::new(tokio::sync::OnceCell::new())
+    }
+
     /// Build a `ToolContext` from this orchestration context.
     ///
     /// Populates `session_id`, `run_id`, `working_dir`, and leaves the

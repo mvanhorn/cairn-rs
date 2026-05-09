@@ -14,16 +14,16 @@ use crate::services::resource_sharing_impl::ResourceSharingServiceImpl;
 use crate::services::tool_call_approval_impl::ToolCallApprovalServiceImpl;
 use crate::services::ToolInvocationServiceImpl;
 use crate::services::{
-    ApprovalPolicyServiceImpl, ApprovalServiceImpl, AuditServiceImpl, BudgetServiceImpl,
-    ChannelServiceImpl, CheckpointServiceImpl, CredentialServiceImpl, DefaultsServiceImpl,
-    EvalRunServiceImpl, ExternalWorkerServiceImpl, GuardrailServiceImpl, IngestJobServiceImpl,
-    LicenseServiceImpl, LlmObservabilityServiceImpl, MailboxServiceImpl, NotificationServiceImpl,
-    OperatorProfileServiceImpl, ProjectServiceImpl, PromptAssetServiceImpl,
-    PromptReleaseServiceImpl, PromptVersionServiceImpl, ProviderBindingServiceImpl,
-    ProviderConnectionPoolServiceImpl, ProviderConnectionServiceImpl, ProviderHealthServiceImpl,
-    QuotaServiceImpl, RetentionServiceImpl, RoutePolicyServiceImpl, RunCostAlertServiceImpl,
-    RunSlaServiceImpl, SignalRouterServiceImpl, SignalServiceImpl, TenantRoleServiceImpl,
-    TenantServiceImpl, WorkspaceMembershipServiceImpl, WorkspaceServiceImpl,
+    AgentRoleServiceImpl, ApprovalPolicyServiceImpl, ApprovalServiceImpl, AuditServiceImpl,
+    BudgetServiceImpl, ChannelServiceImpl, CheckpointServiceImpl, CredentialServiceImpl,
+    DefaultsServiceImpl, EvalRunServiceImpl, ExternalWorkerServiceImpl, GuardrailServiceImpl,
+    IngestJobServiceImpl, LicenseServiceImpl, LlmObservabilityServiceImpl, MailboxServiceImpl,
+    NotificationServiceImpl, OperatorProfileServiceImpl, ProjectServiceImpl,
+    PromptAssetServiceImpl, PromptReleaseServiceImpl, PromptVersionServiceImpl,
+    ProviderBindingServiceImpl, ProviderConnectionPoolServiceImpl, ProviderConnectionServiceImpl,
+    ProviderHealthServiceImpl, QuotaServiceImpl, RetentionServiceImpl, RoutePolicyServiceImpl,
+    RunCostAlertServiceImpl, RunSlaServiceImpl, SignalRouterServiceImpl, SignalServiceImpl,
+    TenantRoleServiceImpl, TenantServiceImpl, WorkspaceMembershipServiceImpl, WorkspaceServiceImpl,
 };
 use crate::sessions::SessionService;
 use crate::tasks::TaskService;
@@ -53,6 +53,15 @@ pub struct RuntimeServices {
     pub tenants: TenantServiceImpl<InMemoryStore>,
     pub workspaces: WorkspaceServiceImpl<InMemoryStore>,
     pub projects: ProjectServiceImpl<InMemoryStore>,
+
+    // ── Agent roles (RFC 031) ─────────────────────────────────────────────
+    /// Operator-defined per-project agent roles. PR-A skeleton: the
+    /// trait is wired, `define` / `retract` append `AgentRole*` events,
+    /// `resolve` / `list` currently fall through to
+    /// `default_roles()` (projection reader ships in PR-B alongside
+    /// the HTTP handlers). RFC 031 §D14 — no cross-node cache; the
+    /// per-run `list` snapshot lives on `OrchestrationContext`.
+    pub agent_roles: AgentRoleServiceImpl<InMemoryStore>,
 
     // ── Approvals & checkpoints ────────────────────────────────────────────
     pub approvals: ApprovalServiceImpl<InMemoryStore>,
@@ -208,6 +217,7 @@ impl RuntimeServices {
             tenants: TenantServiceImpl::new(store.clone()),
             workspaces: WorkspaceServiceImpl::new(store.clone()),
             projects: ProjectServiceImpl::new(store.clone()),
+            agent_roles: AgentRoleServiceImpl::new(store.clone()),
             approvals: ApprovalServiceImpl::new(store.clone()),
             approval_policies: ApprovalPolicyServiceImpl::new(store.clone()),
             checkpoints: CheckpointServiceImpl::new(store.clone()),

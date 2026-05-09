@@ -153,6 +153,8 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
         approval_timeout: None,
         visibility: None,
         parent_context: None,
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     };
 
     let decide_output = DecideOutput {

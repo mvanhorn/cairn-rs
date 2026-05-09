@@ -100,7 +100,7 @@ fn get_researcher_returns_correct_role() {
     );
     // Researcher must have retrieval tools.
     assert!(
-        role.allowed_tools
+        role.tools
             .iter()
             .any(|t| t.contains("retrieve") || t.contains("search")),
         "researcher must include retrieval/search tools"
@@ -117,7 +117,7 @@ fn get_executor_returns_correct_role() {
     assert!(role.system_prompt.is_some());
     // Executor can write.
     assert!(
-        role.allowed_tools.iter().any(|t| t.contains("write")
+        role.tools.iter().any(|t| t.contains("write")
             || t.contains("Write")
             || t.contains("run")
             || t.contains("Run")),
@@ -136,11 +136,11 @@ fn get_reviewer_returns_correct_role() {
     // Reviewer is read-only — must NOT have write tools.
     assert!(
         !role
-            .allowed_tools
+            .tools
             .iter()
             .any(|t| t.to_lowercase().contains("write")),
         "reviewer must not include write tools: {:?}",
-        role.allowed_tools
+        role.tools
     );
 }
 

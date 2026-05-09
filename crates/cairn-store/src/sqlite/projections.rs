@@ -4005,6 +4005,14 @@ impl SqliteSyncProjection {
             // #789: per-iteration reasoning step. In-memory only for
             // now; sqlite parity tracked as a follow-up issue.
             RuntimeEvent::RunReasoningStepRecorded(_) => {}
+            // RFC 031 PR-A: operator-defined agent roles. Durable
+            // `project_agent_roles` projection writers land in a
+            // follow-up; PR-A is the shape skeleton only (no HTTP,
+            // no writes, no UI). `ToolDeclaredButMissing` is
+            // Ephemeral regardless of backend.
+            RuntimeEvent::AgentRoleDefined(_)
+            | RuntimeEvent::AgentRoleRetracted(_)
+            | RuntimeEvent::ToolDeclaredButMissing(_) => {}
         }
 
         Ok(())

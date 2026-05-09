@@ -3551,6 +3551,18 @@ impl InMemoryStore {
             // visibility is via SSE + metrics.
             RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
             | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {}
+            // RFC 031 PR-A: operator-defined agent roles. The
+            // InMemory projection for `project_agent_roles` lands in
+            // a follow-up; PR-A treats all three variants as no-op
+            // at the InMemory projection layer (the event log is
+            // already populated — callers read via the future
+            // `AgentRoleService::resolve` which falls back to
+            // `default_roles()` until the projection ships).
+            // `ToolDeclaredButMissing` is Ephemeral — no projection
+            // state regardless of backend.
+            RuntimeEvent::AgentRoleDefined(_)
+            | RuntimeEvent::AgentRoleRetracted(_)
+            | RuntimeEvent::ToolDeclaredButMissing(_) => {}
         }
     }
 }

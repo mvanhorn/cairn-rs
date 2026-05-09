@@ -1461,6 +1461,9 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::MemoryIngestStatusUpdated(_) => "memory_ingest_status_updated",
         RuntimeEvent::KnowledgeProviderFamilyMismatch(_) => "knowledge_provider_family_mismatch",
         RuntimeEvent::MemoryProviderFamilyMismatch(_) => "memory_provider_family_mismatch",
+        RuntimeEvent::AgentRoleDefined(_) => "agent_role_defined",
+        RuntimeEvent::AgentRoleRetracted(_) => "agent_role_retracted",
+        RuntimeEvent::ToolDeclaredButMissing(_) => "tool_declared_but_missing",
     }
 }
 
@@ -2218,6 +2221,25 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
             e.provider_ref,
             sanitize_for_event_message(&e.observed_family),
             e.project.project_id
+        ),
+        // RFC 031 PR-A: operator-defined agent roles.
+        RuntimeEvent::AgentRoleDefined(e) => format!(
+            "Agent role {} defined on project {} by {}{}",
+            e.role.role_id,
+            e.project.project_id,
+            e.defined_by,
+            e.shadows_builtin
+                .as_deref()
+                .map(|b| format!(" (shadows built-in {b})"))
+                .unwrap_or_default(),
+        ),
+        RuntimeEvent::AgentRoleRetracted(e) => format!(
+            "Agent role {} retracted on project {} by {}",
+            e.role_id, e.project.project_id, e.retracted_by
+        ),
+        RuntimeEvent::ToolDeclaredButMissing(e) => format!(
+            "Role {} on run {} declared tool {} which is not registered (project {})",
+            e.role_id, e.run_id, e.tool_id, e.project.project_id
         ),
     }
 }

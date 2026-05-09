@@ -707,6 +707,8 @@ async fn plan_mode_never_receives_stuck_nudge() {
         approval_timeout: None,
         visibility: None,
         parent_context: None,
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     };
     let gather = GatherOutput {
         step_history: ctx.step_history.clone(),

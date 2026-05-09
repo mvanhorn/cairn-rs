@@ -14,11 +14,16 @@
 //!
 //! # What it returns
 //!
-//! `{ role_id, display_name, description, specialty_prompt,
-//!   allowed_tools, max_context_tokens, tier, response_shape }`.
+//! `{ role_id, display_name, description, specialty_prompt, tools,
+//!   forbid_all_tools, max_context_tokens, tier, response_shape }`.
 //! `specialty_prompt` is the role's `system_prompt` field —
 //! specialty overlay only for sub-agent roles, full prompt for
 //! orchestrator. Read-only.
+//!
+//! The `tools` key matches the domain field name (RFC 031 §D10
+//! renamed `allowed_tools` → `tools` on the struct; the LLM-visible
+//! JSON key renames in lockstep so the wire contract matches the
+//! struct contract).
 //!
 //! # Failure modes
 //!
@@ -106,12 +111,17 @@ impl ToolHandler for AgentDescriptionTool {
         // macro directly: their `Serialize` derives rename to
         // snake_case so no manual `to_value` is needed (Gemini
         // review on PR #784).
+        // RFC 031 §D10: `tools` is the field name; `allowed_tools`
+        // is accepted as a serde alias on deserialise for pre-rename
+        // event replay, but emitted events and LLM-facing tools use
+        // the new key.
         Ok(ToolResult::ok(serde_json::json!({
             "role_id":            role.role_id,
             "display_name":       role.display_name,
             "description":        role.description,
             "specialty_prompt":   role.system_prompt,
-            "allowed_tools":      role.allowed_tools,
+            "tools":              role.tools,
+            "forbid_all_tools":   role.forbid_all_tools,
             "max_context_tokens": role.max_context_tokens,
             "tier":               role.tier,
             "response_shape":     role.response_shape,
@@ -148,9 +158,14 @@ mod tests {
             "executor description must be non-empty"
         );
         let tools = out
-            .get("allowed_tools")
+            .get("tools")
             .and_then(|v| v.as_array())
-            .expect("allowed_tools array");
+            .expect("tools array");
+        // Guard against accidental regression to the legacy key.
+        assert!(
+            out.get("allowed_tools").is_none(),
+            "LLM-visible JSON must use the RFC 031 `tools` key, not legacy `allowed_tools`"
+        );
         // Executor must have write tools (its specialty).
         let names: Vec<&str> = tools.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"write"), "executor must include `write`");

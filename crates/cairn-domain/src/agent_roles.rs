@@ -79,8 +79,24 @@ pub struct AgentRole {
     /// Use [`assembled_prompt_for`] at consumption time — never read
     /// this field directly for prompt rendering.
     pub system_prompt: Option<String>,
-    /// Allowed tool IDs. Empty means all tools in the run's permission set.
-    pub allowed_tools: Vec<String>,
+    /// Allowed tool IDs. Empty AND `forbid_all_tools == false` means
+    /// no role restriction (every registered tool is available) —
+    /// this is the default and matches the pre-RFC-031 semantic for
+    /// roles that shipped without an allowlist. When
+    /// `forbid_all_tools == true` the field is ignored and the role
+    /// runs with an empty tool set. See RFC 031 §D3.
+    ///
+    /// Serialises as `"tools"` on the wire. `"allowed_tools"` is
+    /// accepted on deserialisation via serde alias so pre-rename
+    /// event-log entries and snapshots replay cleanly.
+    #[serde(rename = "tools", alias = "allowed_tools", default)]
+    pub tools: Vec<String>,
+    /// Explicit "forbid every tool" flag. When `true` the role runs
+    /// with an empty tool set regardless of `tools`. When `false`
+    /// (default), `tools` controls the allowlist per the rules above.
+    /// See RFC 031 §D3 for the interaction model.
+    #[serde(default)]
+    pub forbid_all_tools: bool,
     /// Hard context-window cap in tokens. `None` means use the model default.
     pub max_context_tokens: Option<u32>,
     pub tier: AgentRoleTier,
@@ -102,7 +118,8 @@ impl AgentRole {
             display_name: display_name.into(),
             description: String::new(),
             system_prompt: None,
-            allowed_tools: Vec::new(),
+            tools: Vec::new(),
+            forbid_all_tools: false,
             max_context_tokens: None,
             tier,
             response_shape: ResponseShape::default(),
@@ -120,7 +137,14 @@ impl AgentRole {
     }
 
     pub fn with_tools(mut self, tools: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.allowed_tools = tools.into_iter().map(|t| t.into()).collect();
+        self.tools = tools.into_iter().map(|t| t.into()).collect();
+        self
+    }
+
+    /// Set the `forbid_all_tools` flag. When `true`, the role runs
+    /// with an empty tool set regardless of `tools`. See RFC 031 §D3.
+    pub fn with_forbid_all_tools(mut self, forbid: bool) -> Self {
+        self.forbid_all_tools = forbid;
         self
     }
 
@@ -1090,7 +1114,7 @@ mod tests {
         assert_eq!(role.role_id, "custom");
         assert_eq!(role.tier, AgentRoleTier::Standard);
         assert_eq!(role.description, "A test role.");
-        assert_eq!(role.allowed_tools.len(), 2);
+        assert_eq!(role.tools.len(), 2);
         assert_eq!(role.max_context_tokens, Some(32_000));
         assert_eq!(role.response_shape, ResponseShape::DirectAnswer);
     }
@@ -1270,7 +1294,7 @@ mod tests {
         let rev = roles.iter().find(|r| r.role_id == "reviewer").unwrap();
         // Reviewer must NOT include write tools.
         assert!(!rev
-            .allowed_tools
+            .tools
             .iter()
             .any(|t| t.contains("write") || t.contains("Write")));
     }
@@ -1470,10 +1494,10 @@ mod tests {
 
     #[test]
     fn reviewer_prompt_is_read_only_in_text() {
-        // The reviewer's allowed_tools is already asserted read-only above.
+        // The reviewer's `tools` is already asserted read-only above.
         // This test pins the *prompt* text too: it must not tell the reviewer
         // to use mutating tools, because that would contradict the role
-        // contract and invite the model to ignore the `allowed_tools` gate.
+        // contract and invite the model to ignore the `tools` gate.
         let prompt = prompt_of("reviewer");
         let lower = prompt.to_lowercase();
         // Guard against common mutating-tool anchors. We check for tool-name-
@@ -1509,7 +1533,7 @@ mod tests {
     }
 
     /// #707 regression guard: every role with a non-empty
-    /// `allowed_tools` must reference REAL registered tool names, not
+    /// `tools` must reference REAL registered tool names, not
     /// `cairn.*` placeholders that don't exist in the builtin
     /// registry.
     ///
@@ -1522,10 +1546,10 @@ mod tests {
     /// their jobs.
     ///
     /// This test pins the contract: every tool name declared in any
-    /// built-in role's `allowed_tools` must match either a real
-    /// harness tool name or a registered cairn-tools builtin. The
-    /// `cairn.*` pseudo-namespace is forbidden because no such
-    /// prefix exists in the registry.
+    /// built-in role's `tools` must match either a real harness tool
+    /// name or a registered cairn-tools builtin. The `cairn.*`
+    /// pseudo-namespace is forbidden because no such prefix exists in
+    /// the registry.
     ///
     /// Covers ALL four built-in roles (orchestrator, researcher,
     /// executor, reviewer) — #705 added a hardcoded tool list to the
@@ -1598,32 +1622,90 @@ mod tests {
 
         let roles = default_roles();
         for role in roles.iter() {
-            if role.allowed_tools.is_empty() {
+            if role.tools.is_empty() {
                 // Roles that legitimately declare no allowlist receive
                 // the full registered surface (back-compat path).
                 // Skip — there's no surface to validate.
                 continue;
             }
-            for tool in &role.allowed_tools {
+            for tool in &role.tools {
                 assert!(
                     !tool.starts_with("cairn."),
-                    "#707 regression: role {role_id:?} allowed_tools \
-                     contains `cairn.*` placeholder {tool:?}. These are \
-                     NOT registered in the builtin tool registry and \
-                     leave the role with an empty effective surface, \
-                     forcing training-data fallback.",
+                    "#707 regression: role {role_id:?} tools contains \
+                     `cairn.*` placeholder {tool:?}. These are NOT \
+                     registered in the builtin tool registry and leave \
+                     the role with an empty effective surface, forcing \
+                     training-data fallback.",
                     role_id = role.role_id,
                 );
                 assert!(
                     known_registered.contains(&tool.as_str()),
-                    "#707 regression: role {role_id:?} allowed_tools \
-                     references unregistered tool name {tool:?}. Known \
-                     registered names: {known_registered:?}. If this is \
-                     a legitimately new tool, add it to the \
+                    "#707 regression: role {role_id:?} tools references \
+                     unregistered tool name {tool:?}. Known registered \
+                     names: {known_registered:?}. If this is a \
+                     legitimately new tool, add it to the \
                      `known_registered` set in this test.",
                     role_id = role.role_id,
                 );
             }
         }
+    }
+
+    // ── RFC 031 PR-A: serde alias round-trip for allowed_tools → tools ──
+
+    #[test]
+    fn role_deserialises_legacy_allowed_tools_alias() {
+        // Pre-RFC-031 event-log snapshots carry `"allowed_tools"` on
+        // the wire. The RFC 031 PR-A rename adds `#[serde(rename =
+        // "tools", alias = "allowed_tools")]` on the field so replay
+        // stays clean. This test pins that contract: a JSON blob with
+        // the legacy key deserialises into the `tools` field, and
+        // re-serialisation emits the new key.
+        let legacy = serde_json::json!({
+            "role_id": "custom",
+            "display_name": "Custom",
+            "description": "",
+            "system_prompt": null,
+            "allowed_tools": ["read", "grep"],
+            "max_context_tokens": null,
+            "tier": "standard",
+            "response_shape": "procedural_artifact"
+        });
+        let role: AgentRole = serde_json::from_value(legacy).expect("alias must deserialise");
+        assert_eq!(role.tools, vec!["read".to_owned(), "grep".to_owned()]);
+        assert!(!role.forbid_all_tools);
+
+        // Round-trip: re-serialisation emits `tools`, not `allowed_tools`.
+        let roundtripped = serde_json::to_value(&role).unwrap();
+        assert!(roundtripped.get("tools").is_some());
+        assert!(roundtripped.get("allowed_tools").is_none());
+    }
+
+    #[test]
+    fn role_forbid_all_tools_defaults_to_false() {
+        // Pre-RFC-031 snapshots have no `forbid_all_tools` key; the
+        // field's `#[serde(default)]` must fall through to `false`.
+        let legacy = serde_json::json!({
+            "role_id": "custom",
+            "display_name": "Custom",
+            "description": "",
+            "system_prompt": null,
+            "allowed_tools": [],
+            "max_context_tokens": null,
+            "tier": "standard",
+            "response_shape": "procedural_artifact"
+        });
+        let role: AgentRole = serde_json::from_value(legacy).unwrap();
+        assert!(!role.forbid_all_tools);
+    }
+
+    #[test]
+    fn role_serialises_forbid_all_tools_when_true() {
+        let role =
+            AgentRole::new("custom", "Custom", AgentRoleTier::Standard).with_forbid_all_tools(true);
+        let json = serde_json::to_value(&role).unwrap();
+        assert_eq!(json["forbid_all_tools"], true);
+        // Tools field still serialised under the new name.
+        assert_eq!(json["tools"], serde_json::json!([]));
     }
 }

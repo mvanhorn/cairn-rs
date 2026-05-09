@@ -4399,6 +4399,18 @@ impl PgSyncProjection {
             // this variant on pg yet — the registry declares it
             // Ephemeral.
             RuntimeEvent::RunReasoningStepRecorded(_) => {}
+            // RFC 031 PR-A: operator-defined agent roles. The durable
+            // `project_agent_roles` projection table lands in a
+            // follow-up PR (PR-A's pg/sqlite projection writers are
+            // out of scope — PR-A is the shape skeleton, no HTTP yet
+            // means no writes yet). For now this is an explicit no-op;
+            // the projection registry declares the two lifecycle
+            // variants Projected (backing table `project_agent_roles`)
+            // so the stub-guard passes. `ToolDeclaredButMissing` is
+            // Ephemeral — no projection row regardless of backend.
+            RuntimeEvent::AgentRoleDefined(_)
+            | RuntimeEvent::AgentRoleRetracted(_)
+            | RuntimeEvent::ToolDeclaredButMissing(_) => {}
         }
 
         Ok(())

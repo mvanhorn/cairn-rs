@@ -1026,6 +1026,8 @@ pub(crate) async fn drive_run_iteration(
         // section renders in `build_user_message` between Goal and
         // Run state when set.
         parent_context: default_parent_context.clone(),
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     };
 
     // #651: persist the resolved `goal` into the run's per-run defaults

@@ -552,7 +552,14 @@ impl<P: GraphProjection> EventProjector<P> {
             // (run, tool invocation, etc.) is already in the graph;
             // reasoning steps describe the model's internal thinking,
             // which doesn't add provenance edges.
-            | RuntimeEvent::RunReasoningStepRecorded(_) => {}
+            | RuntimeEvent::RunReasoningStepRecorded(_)
+            // RFC 031 PR-A: operator-defined agent roles. The
+            // provenance graph doesn't model role lifecycle or
+            // tool-availability advisories — both surface via their
+            // own projection table / event log.
+            | RuntimeEvent::AgentRoleDefined(_)
+            | RuntimeEvent::AgentRoleRetracted(_)
+            | RuntimeEvent::ToolDeclaredButMissing(_) => {}
 
             RuntimeEvent::EvalRunStarted(e) => {
                 self.add_node(

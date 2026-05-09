@@ -482,6 +482,10 @@ mod sse_orchestrator_tests {
             approval_timeout: None,
             visibility: None,
             parent_context: None,
+            declared_but_missing:
+                cairn_orchestrator::OrchestrationContext::empty_declared_but_missing(),
+            agent_role_list_cache:
+                cairn_orchestrator::OrchestrationContext::empty_agent_role_list_cache(),
         }
     }
 

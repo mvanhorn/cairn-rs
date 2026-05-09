@@ -593,6 +593,29 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             reason: "RFC 030 §Rollout: startup family-mismatch audit signal; SSE + metrics only, no read-model row needed",
         },
     },
+    // RFC 031 PR-A: operator-defined agent roles. `AgentRoleDefined` /
+    // `AgentRoleRetracted` upsert / retract rows on
+    // `project_agent_roles`; `ToolDeclaredButMissing` is an
+    // observability advisory with no projection row (deduped per
+    // `(run_id, role_id, tool_id)` on `OrchestrationContext`).
+    ProjectionEntry {
+        variant: "AgentRoleDefined",
+        status: ProjectionStatus::Projected {
+            table: Some("project_agent_roles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "AgentRoleRetracted",
+        status: ProjectionStatus::Projected {
+            table: Some("project_agent_roles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolDeclaredButMissing",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 031 §D3: run-time advisory when role.tools declares a tool not currently registered; deduped per (run_id, role_id, tool_id) on OrchestrationContext, not projected",
+        },
+    },
     // ── Ephemeral (31) ────────────────────────────────────────────────────
     // Operator observability surfaces (SSE + metrics) with no durable read
     // model. The event log itself is the audit trail.
@@ -1661,16 +1684,25 @@ mod tests {
         //     materialized only on InMemoryStore for now (per-run
         //     vec, capped at 200), pg/sqlite parity is a follow-up.
         //     Net: +1 Ephemeral → 141 / 36 / 0.
+        //   * RFC 031 PR-A: operator-defined agent roles —
+        //     `AgentRoleDefined` / `AgentRoleRetracted` added as
+        //     Projected (backing table `project_agent_roles`,
+        //     `(project_key, role_id)` PK, `retracted_at IS NULL`
+        //     unique constraint per §D6). `ToolDeclaredButMissing`
+        //     added as Ephemeral — DECIDE-time advisory with no
+        //     read-model row; dedup via `OrchestrationContext`
+        //     `Arc<Mutex<HashSet<...>>>`. Net: +2 Projected +1
+        //     Ephemeral → 143 / 37 / 0.
         assert_eq!(
-            projected, 141,
+            projected, 143,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
-            ephemeral, 36,
+            ephemeral, 37,
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 177);
+        assert_eq!(projected + ephemeral + stubbed, 180);
     }
 
     #[test]

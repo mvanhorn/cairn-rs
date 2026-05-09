@@ -280,7 +280,7 @@ impl DecidePhase for LlmDecidePhase {
         let role_allowlist: Option<Vec<String>> = all_roles
             .iter()
             .find(|r| r.role_id == ctx.agent_type)
-            .map(|r| r.allowed_tools.clone())
+            .map(|r| r.tools.clone())
             .filter(|list| !list.is_empty());
         if let Some(allowed) = role_allowlist {
             tool_descs.retain(|d| allowed.iter().any(|a| a == d.name.as_str()));
@@ -1942,6 +1942,8 @@ mod tests {
             approval_timeout: None,
             visibility: None,
             parent_context: None,
+            declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+            agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
         }
     }
 

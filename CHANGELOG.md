@@ -11,6 +11,41 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **RFC 031 PR-A: operator-defined agent roles — shape skeleton.**
+  Lands the domain and service skeleton for operator-defined per-project
+  agent roles (RFC 031 §Implementation Plan PR-A). Zero observable
+  behaviour change — resolve / list fall through to `default_roles()`
+  exactly as before; the HTTP handlers and projection readers that wire
+  custom roles into runtime decisions ship in PR-B/C.
+
+  Key changes:
+
+  - Three new `RuntimeEvent` variants: `AgentRoleDefined`,
+    `AgentRoleRetracted`, `ToolDeclaredButMissing` (Ephemeral, RFC 031
+    §D3). Projection registry updated: +2 Projected + 1 Ephemeral →
+    counters 143 / 37 / 0 / 180. Exhaustive-match arms added in all
+    four projectors as no-ops pending PR-B.
+
+  - `AgentRole.allowed_tools` → `tools` field rename with `#[serde(alias
+    = "allowed_tools")]` for event-log replay compatibility. New
+    `forbid_all_tools: bool` flag (§D3). LLM-visible JSON key in
+    `agent_description` / `list_agents` renames in lockstep.
+
+  - `AgentRoleService` trait + `AgentRoleServiceImpl` + `ResolvedRole` /
+    `RoleSource` / `SourceFilter` types. Wired into `RuntimeServices`
+    aggregate.
+
+  - `OrchestrationContext` gains `declared_but_missing: Arc<Mutex<HashSet<...>>>`
+    (per-run dedup for `ToolDeclaredButMissing` advisory) and
+    `agent_role_list_cache: Arc<OnceCell<Vec<ResolvedRole>>>` (§D14
+    layer-2 per-run snapshot). Both `Arc`-wrapped so `Clone` gives
+    iterations shared state.
+
+  16 new tests across three layers: 3 domain unit, 6 event log
+  round-trip (serde shape pins + append-without-error), 7 service
+  (define / retract / resolve / list + source-tagging).
+
+
 - **`cairn-providers` native Bedrock Converse tool calls.** The native
   `Bedrock` backend now translates cairn's `Tool` / `ToolCall` / `ChatMessage`
   types into the Converse `toolConfig` + content-block shape and parses

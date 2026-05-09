@@ -39,6 +39,7 @@ pub mod recovery_impl;
 pub mod tool_invocation_impl;
 
 // ── Governance & policy ──────────────────────────────────────────────────
+pub mod agent_roles_impl;
 pub mod approval_impl;
 pub mod approval_policy_impl;
 pub mod audit_impl;
@@ -96,6 +97,9 @@ pub mod run_sla_impl;
 
 // ── Re-exports (flat, kept stable; group banners above are
 //    navigational only — call sites `use services::Foo` unchanged) ──────
+pub use agent_roles_impl::{
+    AgentRoleService, AgentRoleServiceImpl, ResolvedRole, RoleSource, SourceFilter,
+};
 pub use approval_impl::ApprovalServiceImpl;
 pub use approval_policy_impl::ApprovalPolicyServiceImpl;
 pub use checkpoint_impl::CheckpointServiceImpl;

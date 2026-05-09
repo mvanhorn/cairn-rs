@@ -404,6 +404,23 @@ pub enum RuntimeEvent {
     KnowledgeProviderFamilyMismatch(KnowledgeProviderFamilyMismatch),
     /// Memory-slot twin of `KnowledgeProviderFamilyMismatch`.
     MemoryProviderFamilyMismatch(MemoryProviderFamilyMismatch),
+
+    // ── RFC 031 operator-defined agent roles ──
+    /// An operator defined or updated a per-project agent role.
+    /// Upserts a row on `project_agent_roles`; latest-wins per
+    /// `(project_key, role_id)`. See RFC 031 §D6.
+    AgentRoleDefined(AgentRoleDefined),
+    /// An operator retracted a per-project agent role. Sets
+    /// `retracted_at` on the `project_agent_roles` row; resolve
+    /// falls back to the built-in or generic. See RFC 031 §D7.
+    AgentRoleRetracted(AgentRoleRetracted),
+    /// Observability: the orchestrator's allowlist filter found a
+    /// tool id declared in `role.tools` that is not currently
+    /// registered. Ephemeral — not projected; deduped per
+    /// `(run_id, role_id, tool_id)` on the run's
+    /// `OrchestrationContext::declared_but_missing` HashSet. See
+    /// RFC 031 §D3 + §Runtime Resolution Delta.
+    ToolDeclaredButMissing(ToolDeclaredButMissing),
 }
 
 impl RuntimeEvent {
@@ -505,6 +522,10 @@ impl RuntimeEvent {
             RuntimeEvent::MemoryIngestStatusUpdated(event) => &event.project,
             RuntimeEvent::KnowledgeProviderFamilyMismatch(event) => &event.project,
             RuntimeEvent::MemoryProviderFamilyMismatch(event) => &event.project,
+            // RFC 031 operator-defined agent roles
+            RuntimeEvent::AgentRoleDefined(event) => &event.project,
+            RuntimeEvent::AgentRoleRetracted(event) => &event.project,
+            RuntimeEvent::ToolDeclaredButMissing(event) => &event.project,
             RuntimeEvent::TriggerCreated(event) => &event.project,
             RuntimeEvent::TriggerEnabled(event) => &event.project,
             RuntimeEvent::TriggerDisabled(event) => &event.project,
@@ -935,6 +956,15 @@ impl RuntimeEvent {
             RuntimeEvent::MemoryIngestStatusUpdated(_) => None,
             RuntimeEvent::KnowledgeProviderFamilyMismatch(_) => None,
             RuntimeEvent::MemoryProviderFamilyMismatch(_) => None,
+            // RFC 031: agent-role lifecycle events live on the
+            // project-agent-roles projection, not on any existing
+            // `RuntimeEntityRef` variant. `ToolDeclaredButMissing`
+            // points at the run whose DECIDE-filter emitted it.
+            RuntimeEvent::AgentRoleDefined(_) => None,
+            RuntimeEvent::AgentRoleRetracted(_) => None,
+            RuntimeEvent::ToolDeclaredButMissing(event) => Some(RuntimeEntityRef::Run {
+                run_id: event.run_id.clone(),
+            }),
         }
     }
 }
@@ -3760,6 +3790,61 @@ pub struct MemoryIngestStatusUpdated {
     /// Mirrors `cairn_memory::ingest::IngestStatus` via its snake_case
     /// serde repr (e.g. `"completed"`, `"failed"`).
     pub status: String,
+    pub at_ms: u64,
+}
+
+// ── RFC 031 operator-defined agent roles ─────────────────────────────
+
+/// An operator created or updated a per-project agent role. Upserts a
+/// row on `project_agent_roles`; §D6 latest-wins semantic.
+///
+/// `shadows_builtin` is `Some("reviewer")` etc. when the role id
+/// matches a built-in id (operator is shadowing the built-in per §D2);
+/// `None` when the id is novel. The UI uses this to render `source =
+/// custom_shadow` vs `custom`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRoleDefined {
+    pub project: crate::tenancy::ProjectKey,
+    pub role: crate::agent_roles::AgentRole,
+    #[serde(default)]
+    pub shadows_builtin: Option<String>,
+    pub defined_by: crate::ids::OperatorId,
+    pub at_ms: u64,
+}
+
+/// An operator retracted a per-project agent role. Sets
+/// `retracted_at` on the `project_agent_roles` row; subsequent
+/// `resolve(&project, role_id)` calls fall through to the built-in
+/// (if the id shadows one) or the generic role verbatim (§D7).
+///
+/// Running orchestrations are NOT interrupted (§D7) — they've
+/// already resolved their role for the run. New runs after the
+/// retract use the fallback.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRoleRetracted {
+    pub project: crate::tenancy::ProjectKey,
+    pub role_id: String,
+    pub retracted_by: crate::ids::OperatorId,
+    pub at_ms: u64,
+}
+
+/// Observability advisory: the orchestrator's DECIDE-phase allowlist
+/// filter found a tool id declared in `role.tools` that is not
+/// currently registered in the tool registry. Emitted once per
+/// `(run_id, role_id, tool_id)` per run; deduplication lives on the
+/// run's `OrchestrationContext::declared_but_missing` HashSet
+/// (`Arc<Mutex<...>>` so clones share state, per RFC 031 §Runtime
+/// Resolution Delta).
+///
+/// Ephemeral — not projected. The missing tool is silently absent
+/// from the tool set the LLM sees; this event is the operator-
+/// facing signal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDeclaredButMissing {
+    pub project: crate::tenancy::ProjectKey,
+    pub run_id: crate::ids::RunId,
+    pub role_id: String,
+    pub tool_id: String,
     pub at_ms: u64,
 }
 

@@ -733,6 +733,21 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
             assert_ne!(proj.tenant_id.as_str(), "_system");
             assert!(eref.is_none());
         }
+        // RFC 031 PR-A: operator-defined agent roles are project-
+        // scoped. `AgentRoleDefined` / `AgentRoleRetracted` are
+        // role-lifecycle events with no run/session anchor.
+        // `ToolDeclaredButMissing` is run-scoped (carries run_id).
+        RuntimeEvent::AgentRoleDefined(_) | RuntimeEvent::AgentRoleRetracted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::ToolDeclaredButMissing(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(
+                eref,
+                Some(cairn_domain::RuntimeEntityRef::Run { .. })
+            ));
+        }
     }
 }
 
@@ -2170,6 +2185,31 @@ fn all_variants() -> Vec<RuntimeEvent> {
             configured_slot: "memory_provider".to_owned(),
             at_ms: ts,
         }),
+        // RFC 031 PR-A: operator-defined agent role lifecycle.
+        RuntimeEvent::AgentRoleDefined(cairn_domain::AgentRoleDefined {
+            project: p(),
+            role: cairn_domain::agent_roles::AgentRole::new(
+                "pr-reviewer-exh",
+                "Exhaustiveness test role",
+                cairn_domain::agent_roles::AgentRoleTier::Standard,
+            ),
+            shadows_builtin: None,
+            defined_by: cairn_domain::OperatorId::new("op-exh"),
+            at_ms: ts,
+        }),
+        RuntimeEvent::AgentRoleRetracted(cairn_domain::AgentRoleRetracted {
+            project: p(),
+            role_id: "pr-reviewer-exh".to_owned(),
+            retracted_by: cairn_domain::OperatorId::new("op-exh"),
+            at_ms: ts,
+        }),
+        RuntimeEvent::ToolDeclaredButMissing(cairn_domain::ToolDeclaredButMissing {
+            project: p(),
+            run_id: cairn_domain::RunId::new("run_exh"),
+            role_id: "pr-reviewer-exh".to_owned(),
+            tool_id: "post_inline_commment".to_owned(),
+            at_ms: ts,
+        }),
     ]
 }
 
@@ -2178,12 +2218,14 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 177 variants in the RuntimeEvent enum (176 prior + #789:
-    // RunReasoningStepRecorded).
+    // 180 variants in the RuntimeEvent enum (176 prior +
+    // RunReasoningStepRecorded #789 = 177, + RFC 031 PR-A adds
+    // AgentRoleDefined / AgentRoleRetracted / ToolDeclaredButMissing
+    // = 180).
     assert_eq!(
         variants.len(),
-        177,
-        "all_variants() must construct exactly 177 RuntimeEvent instances"
+        180,
+        "all_variants() must construct exactly 180 RuntimeEvent instances"
     );
 }
 

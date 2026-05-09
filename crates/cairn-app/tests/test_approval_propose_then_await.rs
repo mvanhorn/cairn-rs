@@ -77,6 +77,8 @@ fn ctx(run_id: &str, session_id: &str) -> OrchestrationContext {
         approval_timeout: None,
         visibility: None,
         parent_context: None,
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     }
 }
 
