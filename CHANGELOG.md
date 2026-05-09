@@ -9,6 +9,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`cairn-github` PR-review surface.** `GitHubClient` gains 7 new methods
+  covering the full code-review lifecycle: `get_pull_request`,
+  `list_pull_request_files`, `list_pull_request_review_comments`,
+  `list_pull_request_reviews`, `list_pull_request_issue_comments`,
+  `create_pull_request_review`, and `create_pull_request_review_comment`.
+  Eight new wire types (`PullRequestDetail`, `PullRequestRef`,
+  `PullRequestRepoRef`, `PullRequestFile`, `PullRequestReviewComment`,
+  `PullRequestReview`, `CreatePullRequestReviewRequest`,
+  `ReviewCommentInput`) are added and re-exported from the crate root.
+  All types use `#[serde(default)]` on optional fields so partial GitHub
+  API responses (plan-gated fields, null repos) deserialize cleanly.
+  Integration tests use `httpmock` to verify HTTP verb, path, auth header,
+  and wire-type deserialization for all 7 methods; unit tests cover
+  serde round-trips for all 8 wire types.
+
 ### Security
 
 - **Boot-time scrub of operator-environment credential variables
@@ -52,7 +69,6 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Unknown role ids fall back to the generic role's shape
   (ProceduralArtifact), matching the assembled-prompt fallback wired
   in #775.
-
 ### Changed
 
 - **AgentRole architecture refactor (#775).** The four built-in role

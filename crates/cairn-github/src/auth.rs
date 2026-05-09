@@ -141,6 +141,28 @@ impl InstallationToken {
         }
     }
 
+    /// Create a token that always returns `token` without making any network
+    /// call. Used in integration tests to bypass GitHub App auth.
+    #[doc(hidden)]
+    pub fn with_static_token(token: impl Into<String>) -> Self {
+        use std::time::{Duration, SystemTime};
+        let static_token = token.into();
+        let credentials = AppCredentials {
+            app_id: 0,
+            encoding_key: jsonwebtoken::EncodingKey::from_secret(&[]),
+        };
+        let cache = Arc::new(RwLock::new(Some(CachedToken {
+            token: static_token,
+            expires_at: SystemTime::now() + Duration::from_secs(3600 * 24 * 365),
+        })));
+        Self {
+            credentials,
+            installation_id: 0,
+            token_cache: cache,
+            http: reqwest::Client::new(),
+        }
+    }
+
     /// Get a valid access token, refreshing if expired or missing.
     pub async fn get(&self) -> Result<String, GitHubError> {
         // Check cache first.
