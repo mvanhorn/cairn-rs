@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use cairn_domain::agent_roles::{default_roles, AgentRole};
 use cairn_domain::events::{AgentRoleDefined, AgentRoleRetracted};
 use cairn_domain::{OperatorId, ProjectKey, RuntimeEvent};
+use cairn_store::projections::{AgentRoleReadModel, AgentRoleRecord};
 use cairn_store::EventLog;
 use serde::Serialize;
 
@@ -118,22 +119,28 @@ pub trait AgentRoleService: Send + Sync {
     ) -> Result<Vec<ResolvedRole>, RuntimeError>;
 }
 
-/// PR-A skeleton implementation of `AgentRoleService`.
+/// Implementation of `AgentRoleService` backed by the `cairn-store`
+/// event log and the `project_agent_roles` projection.
 ///
-/// **Behaviour**: `define` / `retract` append the corresponding
-/// event to the event log (wire shape per §Event-Sourcing Delta).
-/// `resolve` / `list` read from `default_roles()` only — the
-/// `project_agent_roles` projection reader lands in PR-B alongside
-/// the HTTP handlers that write rows. PR-A ensures the event
-/// payloads are structurally sound and the service trait is wired
-/// into `RuntimeServices`; PR-B upgrades `resolve` / `list` to
-/// consult the projection first, with `default_roles()` as the
-/// fallback per §D14.
+/// `S` must implement both [`EventLog`] (for define / retract
+/// appends) and [`AgentRoleReadModel`] (for resolve / list reads).
+/// `InMemoryStore` satisfies both in PR-B; pg/sqlite parity is the
+/// PR-B2 follow-up.
 ///
-/// This means PR-A, merged alone, has zero observable behaviour
-/// change on the orchestrator: every `resolve(project, id)` call
-/// falls through to `default_roles()`, which is exactly what the
-/// pre-RFC code did directly.
+/// Behaviour:
+/// * `define` appends `AgentRoleDefined` and returns the
+///   freshly-projected row view. The projection is written
+///   synchronously by the store's `apply_projection`, so the event
+///   append and the row insert land in the same `.append` call.
+/// * `retract` appends `AgentRoleRetracted`; the projection row
+///   stays in place with `retracted_at = Some(_)`.
+/// * `resolve` reads the active projection row; falls back to
+///   `default_roles()` when no row exists for `(project, role_id)`;
+///   falls back to the generic role verbatim per §D7 when the
+///   requested id is unknown.
+/// * `list` merges the project's active custom rows (which may
+///   shadow built-ins) with the remaining built-ins, then applies
+///   the `SourceFilter`.
 pub struct AgentRoleServiceImpl<S> {
     store: Arc<S>,
 }
@@ -163,10 +170,26 @@ fn is_builtin_id(role_id: &str) -> bool {
     default_roles().iter().any(|r| r.role_id == role_id)
 }
 
+/// Convert a projection row into the service-layer envelope.
+fn record_to_resolved(row: AgentRoleRecord) -> ResolvedRole {
+    let source = if row.shadows_builtin.is_some() {
+        RoleSource::CustomShadow
+    } else {
+        RoleSource::Custom
+    };
+    ResolvedRole {
+        role: row.role,
+        source,
+        shadows_builtin: row.shadows_builtin,
+        defined_at: Some(row.defined_at),
+        defined_by: Some(row.defined_by),
+    }
+}
+
 #[async_trait]
 impl<S> AgentRoleService for AgentRoleServiceImpl<S>
 where
-    S: EventLog + 'static,
+    S: EventLog + AgentRoleReadModel + 'static,
 {
     async fn define(
         &self,
@@ -180,33 +203,31 @@ where
             None
         };
         let at_ms = now_ms();
+        let role_id = role.role_id.clone();
         let event = make_envelope(RuntimeEvent::AgentRoleDefined(AgentRoleDefined {
             project: project.clone(),
-            role: role.clone(),
-            shadows_builtin: shadows_builtin.clone(),
-            defined_by: actor.clone(),
+            role,
+            shadows_builtin,
+            defined_by: actor,
             at_ms,
         }));
         self.store.append(&[event]).await?;
 
-        // PR-A service does not yet maintain the
-        // `project_agent_roles` projection read model — that writer
-        // lands in PR-B alongside the HTTP handler. Return a
-        // synthesised `ResolvedRole` so PR-B's handler gets a view
-        // that matches the eventual projection row shape without
-        // needing to change return types when the projection
-        // writer ships.
-        let source = match shadows_builtin.as_deref() {
-            Some(_) => RoleSource::CustomShadow,
-            None => RoleSource::Custom,
-        };
-        Ok(ResolvedRole {
-            role,
-            source,
-            shadows_builtin,
-            defined_at: Some(at_ms),
-            defined_by: Some(actor),
-        })
+        // Read back the projection row we just wrote. `apply_projection`
+        // ran synchronously during `append`, so the row is present
+        // and active. `get_active` returning `None` here is an
+        // invariant violation; surface as `RuntimeError::Internal`.
+        let row = self
+            .store
+            .get_active(project, &role_id)
+            .await
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!(
+                    "AgentRoleDefined({role_id}) appended but projection row not found"
+                ))
+            })?;
+        Ok(record_to_resolved(row))
     }
 
     async fn retract(
@@ -227,37 +248,59 @@ where
 
     async fn resolve(
         &self,
-        _project: &ProjectKey,
+        project: &ProjectKey,
         role_id: &str,
     ) -> Result<AgentRole, RuntimeError> {
-        // PR-A: projection read is a follow-up. Today `resolve`
-        // always falls through to `default_roles()`; PR-B adds the
-        // project-scoped lookup ahead of this fallback.
+        // §D14 §D7: projection first → built-in → generic verbatim.
+        if let Some(row) = self
+            .store
+            .get_active(project, role_id)
+            .await
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?
+        {
+            return Ok(row.role);
+        }
         Ok(builtin_fallback(role_id))
     }
 
     async fn list(
         &self,
-        _project: &ProjectKey,
+        project: &ProjectKey,
         filter: SourceFilter,
     ) -> Result<Vec<ResolvedRole>, RuntimeError> {
-        // PR-A: merged view is built-ins only. Custom-role rows are
-        // pulled in by PR-B when the projection reader ships; the
-        // ordering (alphabetical by role_id) and the envelope shape
-        // stay stable.
-        let mut items: Vec<ResolvedRole> = default_roles()
-            .into_iter()
-            .map(|role| ResolvedRole {
-                role,
-                source: RoleSource::Builtin,
-                shadows_builtin: None,
-                defined_at: None,
-                defined_by: None,
-            })
-            .collect();
-        items.sort_by(|a, b| a.role.role_id.cmp(&b.role.role_id));
+        let custom_rows = self
+            .store
+            .list_active(project)
+            .await
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?;
 
-        let filtered: Vec<ResolvedRole> = items
+        // Which built-in ids are currently shadowed?
+        let shadowed: std::collections::HashSet<String> = custom_rows
+            .iter()
+            .filter_map(|r| r.shadows_builtin.clone())
+            .collect();
+
+        // Start with custom rows (custom + custom_shadow) — they win
+        // on any id they shadow.
+        let mut merged: Vec<ResolvedRole> =
+            custom_rows.into_iter().map(record_to_resolved).collect();
+
+        // Append built-ins that are NOT shadowed by an active custom row.
+        for role in default_roles() {
+            if !shadowed.contains(&role.role_id) {
+                merged.push(ResolvedRole {
+                    role,
+                    source: RoleSource::Builtin,
+                    shadows_builtin: None,
+                    defined_at: None,
+                    defined_by: None,
+                });
+            }
+        }
+
+        merged.sort_by(|a, b| a.role.role_id.cmp(&b.role.role_id));
+
+        let filtered: Vec<ResolvedRole> = merged
             .into_iter()
             .filter(|r| match filter {
                 SourceFilter::All => true,
@@ -374,14 +417,169 @@ mod tests {
     #[tokio::test]
     async fn retract_appends_retracted_event() {
         let service = svc();
-        // Retract is event-only in PR-A; the projection writer lands
-        // with the handler in PR-B. The service must not error on a
-        // retract for an id it doesn't recognise either — the HTTP
-        // layer translates absence into a 404 before calling the
-        // service (PR-B handler responsibility).
         service
             .retract(&project(), "pr-reviewer", OperatorId::new("op-a"))
             .await
             .expect("retract");
+    }
+
+    // ── PR-B: projection-aware behaviour ──────────────────────────
+
+    #[tokio::test]
+    async fn define_then_resolve_reads_custom_role() {
+        let service = svc();
+        let role = AgentRole::new("pr-reviewer", "PR Reviewer", AgentRoleTier::Standard)
+            .with_description("Reviews PRs.");
+        service
+            .define(&project(), role.clone(), OperatorId::new("op-a"))
+            .await
+            .unwrap();
+        let resolved = service.resolve(&project(), "pr-reviewer").await.unwrap();
+        assert_eq!(resolved.role_id, "pr-reviewer");
+        assert_eq!(resolved.description, "Reviews PRs.");
+    }
+
+    #[tokio::test]
+    async fn define_then_retract_falls_back_to_generic() {
+        let service = svc();
+        let role = AgentRole::new("pr-reviewer", "PR Reviewer", AgentRoleTier::Standard);
+        service
+            .define(&project(), role, OperatorId::new("op-a"))
+            .await
+            .unwrap();
+        service
+            .retract(&project(), "pr-reviewer", OperatorId::new("op-b"))
+            .await
+            .unwrap();
+        // §D7: unknown (now-retracted) id resolves to generic verbatim.
+        let resolved = service.resolve(&project(), "pr-reviewer").await.unwrap();
+        assert_eq!(resolved.role_id, "generic");
+    }
+
+    #[tokio::test]
+    async fn define_builtin_shadow_overrides_in_list_and_resolve() {
+        // Shadowing the built-in `reviewer`: custom row wins.
+        let service = svc();
+        let shadow = AgentRole::new("reviewer", "Lane Reviewer", AgentRoleTier::Standard)
+            .with_description("Lane-specific review.");
+        service
+            .define(&project(), shadow, OperatorId::new("op-a"))
+            .await
+            .unwrap();
+        // `resolve("reviewer")` returns the shadow.
+        let resolved = service.resolve(&project(), "reviewer").await.unwrap();
+        assert_eq!(resolved.display_name, "Lane Reviewer");
+        assert_eq!(resolved.description, "Lane-specific review.");
+
+        // `list` merges: 6 roles total (5 untouched built-ins + the shadow).
+        // The default_roles() set is [executor, generic, orchestrator,
+        // researcher, reviewer, status-checker]; shadowing reviewer replaces
+        // it with the custom_shadow row but the count stays 6.
+        let items = service.list(&project(), SourceFilter::All).await.unwrap();
+        assert_eq!(items.len(), 6);
+        let reviewer = items.iter().find(|r| r.role.role_id == "reviewer").unwrap();
+        assert_eq!(reviewer.source, RoleSource::CustomShadow);
+        assert_eq!(reviewer.shadows_builtin.as_deref(), Some("reviewer"));
+    }
+
+    #[tokio::test]
+    async fn define_retract_redefine_restores_active_row() {
+        // §D6: re-POST after retract returns 201 / upserts in place;
+        // the projection clears `retracted_at` back to None.
+        let service = svc();
+        let role = AgentRole::new("pr-reviewer", "V1", AgentRoleTier::Standard);
+        service
+            .define(&project(), role, OperatorId::new("op-a"))
+            .await
+            .unwrap();
+        service
+            .retract(&project(), "pr-reviewer", OperatorId::new("op-b"))
+            .await
+            .unwrap();
+        // After retract, resolve falls back (§D7 → generic for
+        // non-builtin id).
+        assert_eq!(
+            service
+                .resolve(&project(), "pr-reviewer")
+                .await
+                .unwrap()
+                .role_id,
+            "generic"
+        );
+        // Redefine — new display_name; projection re-activates.
+        let role_v2 = AgentRole::new("pr-reviewer", "V2", AgentRoleTier::Standard);
+        service
+            .define(&project(), role_v2, OperatorId::new("op-c"))
+            .await
+            .unwrap();
+        let active = service.resolve(&project(), "pr-reviewer").await.unwrap();
+        assert_eq!(active.display_name, "V2");
+    }
+
+    #[tokio::test]
+    async fn list_custom_filter_returns_only_custom_rows() {
+        let service = svc();
+        service
+            .define(
+                &project(),
+                AgentRole::new("alpha", "Alpha", AgentRoleTier::Standard),
+                OperatorId::new("op-a"),
+            )
+            .await
+            .unwrap();
+        service
+            .define(
+                &project(),
+                AgentRole::new("reviewer", "Shadow", AgentRoleTier::Standard),
+                OperatorId::new("op-a"),
+            )
+            .await
+            .unwrap();
+
+        let custom_only = service
+            .list(&project(), SourceFilter::Custom)
+            .await
+            .unwrap();
+        assert_eq!(custom_only.len(), 1);
+        assert_eq!(custom_only[0].role.role_id, "alpha");
+        assert_eq!(custom_only[0].source, RoleSource::Custom);
+
+        let shadows_only = service
+            .list(&project(), SourceFilter::CustomShadow)
+            .await
+            .unwrap();
+        assert_eq!(shadows_only.len(), 1);
+        assert_eq!(shadows_only[0].role.role_id, "reviewer");
+
+        let any_custom = service
+            .list(&project(), SourceFilter::AnyCustom)
+            .await
+            .unwrap();
+        assert_eq!(any_custom.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_scope_isolation_across_projects() {
+        // Roles defined in project A don't leak into project B.
+        let service = svc();
+        let proj_a = project();
+        let proj_b = ProjectKey {
+            tenant_id: TenantId::new("t"),
+            workspace_id: WorkspaceId::new("w"),
+            project_id: ProjectId::new("p_other"),
+        };
+        service
+            .define(
+                &proj_a,
+                AgentRole::new("a-only", "A", AgentRoleTier::Standard),
+                OperatorId::new("op-a"),
+            )
+            .await
+            .unwrap();
+        let b_items = service.list(&proj_b, SourceFilter::Custom).await.unwrap();
+        assert!(
+            b_items.is_empty(),
+            "project B must not see project A's custom roles"
+        );
     }
 }

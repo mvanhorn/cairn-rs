@@ -4,10 +4,15 @@ Project-scoped sub-resources: repos, run-templates, triggers (enable/disable/res
 
 Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes.tsv). Drift from this table against the live router is enforced by `cargo test -p cairn-api --test compat_catalog_sync`.
 
-**Routes: 30**
+**Routes: 35**
 
 | Method | Path | Classification | Notes |
 |---|---|---|---|
+| `GET` | `/v1/projects/:project/agent-roles` | Preserve | RFC 031: list project-scoped + built-in agent roles. `?source=builtin\|custom\|custom_shadow\|all` filters the merged set. |
+| `POST` | `/v1/projects/:project/agent-roles` | Preserve | RFC 031 §D6: create a role. Body cap 128 KiB (§D4). Active-id collision → 409. Retracted-id re-POST atomically clears `retracted_at` and returns 201. Admin-only; response carries `ETag: "<defined_at>"`. |
+| `GET` | `/v1/projects/:project/agent-roles/:role_id` | Preserve | RFC 031: single-role GET with `ETag` on active custom rows. Falls back to the built-in if the id is unknown in the projection. |
+| `PATCH` | `/v1/projects/:project/agent-roles/:role_id` | Preserve | RFC 031: JSON Merge Patch. `id`/`tier` immutable (422 `ImmutableField`). Optional `If-Match: "<etag>"` (stale → 412). Admin-only. |
+| `DELETE` | `/v1/projects/:project/agent-roles/:role_id` | Preserve | RFC 031 §D7: retract the role. Idempotent on already-retracted rows (returns original `retracted_at`). Admin-only. |
 | `DELETE` | `/v1/projects/:proj/plugins/:id` | Preserve |  |
 | `GET` | `/v1/projects/:tenant/:workspace/:project/costs` | Preserve | F29 CD-2: lifetime cost rollup (µUSD + tokens + provider calls). Zeros for never-billed projects. |
 | `POST` | `/v1/projects/:proj/plugins/:id` | Preserve |  |

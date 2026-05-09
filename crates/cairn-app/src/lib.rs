@@ -106,6 +106,8 @@ pub(crate) use cairn_tools::cancel_plugin_invocation;
 #[allow(unused_imports)]
 pub(crate) use handlers::admin::*;
 #[allow(unused_imports)]
+pub(crate) use handlers::agent_roles::*;
+#[allow(unused_imports)]
 pub(crate) use handlers::approvals::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::auth_tokens::*;

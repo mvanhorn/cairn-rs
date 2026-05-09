@@ -1,6 +1,7 @@
 //! Shared domain contracts for Cairn runtime, storage, and product services.
 
 pub mod agent_roles;
+pub mod agent_roles_validation;
 pub mod approvals;
 pub mod audit;
 pub mod bandit;

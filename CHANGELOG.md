@@ -46,6 +46,51 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (define / retract / resolve / list + source-tagging).
 
 
+- **RFC 031 PR-B: operator-defined agent roles — HTTP surface + projection + validator.**
+  Wires the five agent-role endpoints, the event-log projection reader/writer, and the
+  structural prompt validator (RFC 031 §Implementation Plan PR-B). With
+  `CAIRN_OPERATOR_DEFINED_ROLES=1` set, operators can create, read, update, and retract
+  custom agent roles per project via the HTTP surface; without the flag the projection
+  read-path is a no-op and behaviour is identical to pre-RFC.
+
+  Key changes:
+
+  - Five new routes under `/v1/projects/:project/agent-roles`: `GET` (list), `GET /:id`
+    (get one), `POST` (define/re-define), `PATCH /:id` (partial update with If-Match ETag
+    concurrency guard), `DELETE /:id` (retract). All project-scoped; writes require
+    `AdminRoleGuard`. Idempotent ETag-based PATCH; retract is idempotent (200 on
+    already-retracted ids).
+
+  - `AgentRoleProjection` + `AgentRoleWriter` in `cairn-store::projections::agent_role`.
+    Reads `AgentRoleDefined` / `AgentRoleRetracted` events into the in-memory projection
+    and dual-writes to the durable backend table. Projection-registry counters updated to
+    reflect the two Projected variants now fully wired (previously no-op arms).
+
+  - `agent_roles_validation::validate_prompt_structure` in `cairn-domain` — structural
+    validator that runs on every POST / PATCH body before the event is emitted. Checks:
+    required H2 section presence (`## Identity`, `## Capabilities`, `## Constraints`),
+    prohibited patterns (early-completion phrasing, ALL-CAPS stage markers,
+    subagent-identity shadowing), role-id namespace (`[a-z0-9][a-z0-9_-]*`, max 64 chars),
+    tier immutability on PATCH, reserved-tier guard, `response_shape` closed enum,
+    `max_context_tokens` bounds, prompt-size limit (128 KiB). Returns structured
+    `ValidationFailure` list; 413 for size, 422 for all other structural errors.
+
+  - Prompt normalisation applied exactly once in the handler before validation: BOM strip,
+    CRLF → LF, trailing whitespace per line. Event payload carries normalised bytes;
+    replay is pure passthrough.
+
+  - ETag / `If-Match` concurrency guard on PATCH: 412 on stale, 428 on missing header.
+    Shadowing a built-in emits a `warnings[]` advisory in the response body without
+    blocking the write.
+
+  - OpenAPI spec delta in `cairn-app::openapi_spec`: all five verbs, request/response
+    schemas, error bodies (400/401/403/404/409/412/413/422/428).
+
+  54 new tests: 20 HTTP integration (all status-code paths across all five verbs, ETag
+  concurrency, shadowing warning, re-POST-after-retract), 21 domain validation unit
+  (each validator rule has at least one pass + one fail case), 13 service unit (tests
+  already landed in PR-A; no net-new service tests in PR-B).
+
 - **`cairn-providers` native Bedrock Converse tool calls.** The native
   `Bedrock` backend now translates cairn's `Tool` / `ToolCall` / `ChatMessage`
   types into the Converse `toolConfig` + content-block shape and parses

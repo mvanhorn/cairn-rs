@@ -1832,6 +1832,25 @@ impl AppBootstrap {
                 "/v1/plugins/:id/uninstall",
                 delete(marketplace_routes::uninstall_plugin_handler),
             )
+            // ── Agent roles (RFC 031) ────────────────────────────────────────
+            // 128 KiB body cap on writes (§D4 total-body ceiling). Axum
+            // rejects oversized bodies with `PAYLOAD_TOO_LARGE` before
+            // they reach the handler; the handler layers additional
+            // per-field caps for nicer error messages when the body is
+            // small overall but one field blows a sub-limit.
+            .route(
+                "/v1/projects/:project/agent-roles",
+                get(list_agent_roles_handler)
+                    .post(create_agent_role_handler)
+                    .layer(DefaultBodyLimit::max(131_072)),
+            )
+            .route(
+                "/v1/projects/:project/agent-roles/:role_id",
+                get(get_agent_role_handler)
+                    .patch(patch_agent_role_handler)
+                    .delete(delete_agent_role_handler)
+                    .layer(DefaultBodyLimit::max(131_072)),
+            )
             // ── Triggers (RFC 022) ────────────────────────────────────────────
             .route(
                 "/v1/projects/:project/triggers",

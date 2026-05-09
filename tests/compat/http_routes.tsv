@@ -15,6 +15,7 @@ DELETE	/v1/mailbox/:id	preserve	-	-
 DELETE	/v1/plugins/:id	preserve	-	-
 DELETE	/v1/plugins/:id/uninstall	preserve	-	-
 DELETE	/v1/projects/:proj/plugins/:id	preserve	-	-
+DELETE	/v1/projects/:project/agent-roles/:role_id	preserve	-	-
 DELETE	/v1/projects/:project/local-paths	preserve	-	-
 DELETE	/v1/projects/:project/repos/:owner/:repo	preserve	-	-
 DELETE	/v1/projects/:project/run-templates/:template_id	preserve	-	-
@@ -158,6 +159,8 @@ GET	/v1/plugins/:id/tools	preserve	-	-
 GET	/v1/plugins/catalog	preserve	-	-
 GET	/v1/plugins/tools/search	preserve	-	-
 GET	/v1/policies/decisions	preserve	query: limit?	{ items }
+GET	/v1/projects/:project/agent-roles	preserve	-	-
+GET	/v1/projects/:project/agent-roles/:role_id	preserve	-	-
 GET	/v1/projects/:project/ingest-jobs	preserve	-	-
 GET	/v1/projects/:project/knowledge-scoring-policy	preserve	-	-
 GET	/v1/projects/:project/knowledge-scoring-policy/valid-dimensions	preserve	-	-
@@ -276,6 +279,7 @@ GET	/version	preserve	-	-
 PATCH	/v1/admin/tenants/:id	preserve	-	-
 PATCH	/v1/admin/tenants/:tenant_id/operator-profiles/:id	preserve	-	-
 PATCH	/v1/approvals/:id/amend	preserve	-	-
+PATCH	/v1/projects/:project/agent-roles/:role_id	preserve	-	-
 PATCH	/v1/sources/:id	preserve	-	-
 PATCH	/v1/tool-call-approvals/:call_id/amend	preserve	-	-
 POST	/v1/a2a/tasks	preserve	body: A2A task shape	A2A task submission
@@ -372,6 +376,7 @@ POST	/v1/policies	preserve	-	-
 POST	/v1/policies/evaluate	preserve	-	-
 POST	/v1/poll/run	preserve	-	{ ok }
 POST	/v1/projects/:proj/plugins/:id	preserve	-	-
+POST	/v1/projects/:project/agent-roles	preserve	-	-
 POST	/v1/projects/:project/repos	preserve	-	-
 POST	/v1/projects/:project/run-templates	preserve	-	-
 POST	/v1/projects/:project/triggers	preserve	-	-

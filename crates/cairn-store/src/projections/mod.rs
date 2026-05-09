@@ -11,6 +11,7 @@
 //! The `SyncProjection` trait in this module defines the write-side
 //! contract: applying stored events to update current state.
 
+pub mod agent_role;
 pub mod approval;
 pub mod approval_policy;
 pub mod audit;
@@ -66,6 +67,7 @@ pub mod trigger;
 pub mod user_message;
 pub mod workspace_membership;
 
+pub use agent_role::*;
 pub use approval::*;
 pub use approval_policy::*;
 pub use audit::*;

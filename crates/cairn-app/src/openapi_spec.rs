@@ -2783,6 +2783,96 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "204": { "description": "Revoked" }, "404": { "description": "Token not found" } }
       }
     },
+    "/v1/projects/{project}/agent-roles": {
+      "get": {
+        "tags": ["Agent roles"],
+        "summary": "List agent roles for a project (RFC 031)",
+        "description": "Returns the merged set of built-ins + operator-defined custom roles. `source` filter narrows by provenance. No pagination (bounded set per project).",
+        "operationId": "listAgentRoles",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "source", "in": "query", "required": false, "schema": { "type": "string", "enum": ["all", "builtin", "custom", "custom_shadow"] } }
+        ],
+        "responses": {
+          "200": { "description": "Agent role list" },
+          "400": { "description": "Invalid ?source filter" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Cross-tenant access refused" }
+        }
+      },
+      "post": {
+        "tags": ["Agent roles"],
+        "summary": "Create a project-scoped agent role (RFC 031 §D6)",
+        "description": "Create-only: POST with an active (`retracted_at IS NULL`) collision returns 409. POST with a retracted-id clears `retracted_at` atomically and returns 201. Body cap is 128 KiB; individual fields cap per RFC §D4. Response carries `ETag: \"<defined_at>\"`.",
+        "operationId": "createAgentRole",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": {
+          "201": { "description": "Agent role created" },
+          "400": { "description": "Malformed JSON" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Not admin / cross-tenant" },
+          "409": { "description": "Active row already exists for this id" },
+          "413": { "description": "Body or field exceeds §D4 cap" },
+          "422": { "description": "Structural / semantic validation failure" }
+        }
+      }
+    },
+    "/v1/projects/{project}/agent-roles/{role_id}": {
+      "get": {
+        "tags": ["Agent roles"],
+        "summary": "Get a single agent role (RFC 031)",
+        "operationId": "getAgentRole",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "role_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Agent role record; response carries `ETag: \"<defined_at>\"` for active rows" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Cross-tenant access refused" },
+          "404": { "description": "Role id not found for this project and not a built-in" }
+        }
+      },
+      "patch": {
+        "tags": ["Agent roles"],
+        "summary": "Update a project-scoped agent role (RFC 031)",
+        "description": "JSON Merge Patch over `AgentRole` fields. `id` and `tier` are immutable — present in the body returns 422 `ImmutableField`. Optional `If-Match: \"<etag>\"` for lost-update protection; mismatch returns 412.",
+        "operationId": "patchAgentRole",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "role_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "If-Match", "in": "header", "required": false, "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": {
+          "200": { "description": "Agent role updated; response carries refreshed ETag" },
+          "400": { "description": "Malformed JSON" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Not admin / cross-tenant" },
+          "404": { "description": "Role id not found for this project" },
+          "412": { "description": "Stale If-Match" },
+          "413": { "description": "Body or field exceeds §D4 cap" },
+          "422": { "description": "Immutable field / structural failure" }
+        }
+      },
+      "delete": {
+        "tags": ["Agent roles"],
+        "summary": "Retract a project-scoped agent role (RFC 031 §D7)",
+        "description": "Idempotent: repeat DELETE on an already-retracted role emits no new event and returns the stored `retracted_at`/`retracted_by` verbatim.",
+        "operationId": "deleteAgentRole",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "role_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Retracted (new or idempotent-repeat)" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Not admin / cross-tenant" },
+          "404": { "description": "Role id never defined for this project" }
+        }
+      }
+    },
     "/v1/projects/{project}/triggers": {
       "get": {
         "tags": ["Triggers"],

@@ -1,4 +1,5 @@
 pub(crate) mod admin;
+pub(crate) mod agent_roles;
 pub(crate) mod approvals;
 pub(crate) mod auth_tokens;
 pub(crate) mod bundles_handlers;

@@ -169,6 +169,13 @@ struct State {
     /// eviction. Written from `RunReasoningStepRecorded` events.
     reasoning_steps:
         HashMap<cairn_domain::RunId, Vec<crate::projections::reasoning_step::ReasoningStepRecord>>,
+    /// RFC 031 `project_agent_roles` projection. Keyed on
+    /// serialised `(tenant_id, workspace_id, project_id, role_id)`
+    /// so lookups are a single `HashMap::get`. Uniqueness on active
+    /// rows (§D6) is enforced at apply time: a retracted row stays
+    /// keyed the same; a subsequent `AgentRoleDefined` for the same
+    /// key upserts in place and clears `retracted_at`.
+    agent_roles: HashMap<(String, String, String, String), crate::projections::AgentRoleRecord>,
     operator_profiles: HashMap<String, crate::projections::OperatorProfileRecord>,
     full_operator_profiles: HashMap<String, cairn_domain::org::OperatorProfile>,
     /// RFC 026 PR-A0: operator → tenant-role mapping keyed on
@@ -424,6 +431,7 @@ impl InMemoryStore {
                 llm_traces: Vec::new(),
                 llm_completion_bodies: HashMap::new(),
                 reasoning_steps: HashMap::new(),
+                agent_roles: HashMap::new(),
                 operator_profiles: HashMap::new(),
                 full_operator_profiles: HashMap::new(),
                 operator_tenant_roles: HashMap::new(),
@@ -3551,18 +3559,53 @@ impl InMemoryStore {
             // visibility is via SSE + metrics.
             RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
             | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {}
-            // RFC 031 PR-A: operator-defined agent roles. The
-            // InMemory projection for `project_agent_roles` lands in
-            // a follow-up; PR-A treats all three variants as no-op
-            // at the InMemory projection layer (the event log is
-            // already populated — callers read via the future
-            // `AgentRoleService::resolve` which falls back to
-            // `default_roles()` until the projection ships).
+            // RFC 031 PR-B: `project_agent_roles` projection.
+            RuntimeEvent::AgentRoleDefined(e) => {
+                let key = (
+                    e.project.tenant_id.as_str().to_owned(),
+                    e.project.workspace_id.as_str().to_owned(),
+                    e.project.project_id.as_str().to_owned(),
+                    e.role.role_id.clone(),
+                );
+                // §D6: re-POST after retract upserts the same key AND
+                // clears `retracted_at` atomically. Latest-wins on
+                // `(project, role_id)` regardless of prior retraction
+                // state — the event log retains full history.
+                let record = crate::projections::AgentRoleRecord {
+                    project: e.project.clone(),
+                    role_id: e.role.role_id.clone(),
+                    role: e.role.clone(),
+                    shadows_builtin: e.shadows_builtin.clone(),
+                    defined_by: e.defined_by.clone(),
+                    defined_at: e.at_ms,
+                    retracted_at: None,
+                    retracted_by: None,
+                };
+                state.agent_roles.insert(key, record);
+            }
+            RuntimeEvent::AgentRoleRetracted(e) => {
+                let key = (
+                    e.project.tenant_id.as_str().to_owned(),
+                    e.project.workspace_id.as_str().to_owned(),
+                    e.project.project_id.as_str().to_owned(),
+                    e.role_id.clone(),
+                );
+                // §D7: set `retracted_at` on the existing row. If the
+                // row doesn't exist (retracting a never-defined id),
+                // this is a no-op — the HTTP handler translates that
+                // to a 404 before emitting the event, so in practice
+                // the row is always present at apply time on
+                // operator-initiated retracts. Replay of an orphan
+                // Retract event from a corrupted log tolerates the
+                // miss.
+                if let Some(row) = state.agent_roles.get_mut(&key) {
+                    row.retracted_at = Some(e.at_ms);
+                    row.retracted_by = Some(e.retracted_by.clone());
+                }
+            }
             // `ToolDeclaredButMissing` is Ephemeral — no projection
             // state regardless of backend.
-            RuntimeEvent::AgentRoleDefined(_)
-            | RuntimeEvent::AgentRoleRetracted(_)
-            | RuntimeEvent::ToolDeclaredButMissing(_) => {}
+            RuntimeEvent::ToolDeclaredButMissing(_) => {}
         }
     }
 }
@@ -3876,6 +3919,60 @@ impl SessionReadModel for InMemoryStore {
         results.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
         results.truncate(limit);
         Ok(results)
+    }
+}
+
+// -- AgentRoleReadModel (RFC 031 PR-B) --
+
+#[async_trait]
+impl crate::projections::AgentRoleReadModel for InMemoryStore {
+    async fn get_active(
+        &self,
+        project: &ProjectKey,
+        role_id: &str,
+    ) -> Result<Option<crate::projections::AgentRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (
+            project.tenant_id.as_str().to_owned(),
+            project.workspace_id.as_str().to_owned(),
+            project.project_id.as_str().to_owned(),
+            role_id.to_owned(),
+        );
+        Ok(state
+            .agent_roles
+            .get(&key)
+            .filter(|r| r.is_active())
+            .cloned())
+    }
+
+    async fn get_any(
+        &self,
+        project: &ProjectKey,
+        role_id: &str,
+    ) -> Result<Option<crate::projections::AgentRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (
+            project.tenant_id.as_str().to_owned(),
+            project.workspace_id.as_str().to_owned(),
+            project.project_id.as_str().to_owned(),
+            role_id.to_owned(),
+        );
+        Ok(state.agent_roles.get(&key).cloned())
+    }
+
+    async fn list_active(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::AgentRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::AgentRoleRecord> = state
+            .agent_roles
+            .values()
+            .filter(|r| r.project == *project && r.is_active())
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.role_id.cmp(&b.role_id));
+        Ok(rows)
     }
 }
 
