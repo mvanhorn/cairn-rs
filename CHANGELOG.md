@@ -163,6 +163,40 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`RunRecord.iteration` advances on every resume boundary, not
+  just `WaitingApproval → Running` (#795).** PR #792 (#791)
+  materialized the iteration counter and incremented on
+  `WaitingApproval → Running` transitions, but R21 dogfood
+  (2026-05-09) revealed two missed transitions: `WaitingDependency
+  → Running` (parent-resume-after-subagent-completion via G5
+  auto-resume) and `Paused → Running` (operator-paced resume).
+  Both are logically the same boundary — the loop is re-entering
+  Running from a suspension — and both must advance the counter so
+  the trajectory rendered to operators reflects how many times the
+  run has actually resumed. Fix extends the projection apply
+  match in all three backends (in-memory, pg, sqlite) to cover the
+  three resume sources. Test
+  `iteration_increments_on_resume_transition` extended to exercise
+  the full `pending → running → waiting_approval → running →
+  waiting_dependency → running → paused → running` sequence and
+  asserts `iteration == 3` at the end.
+
+- **Reasoning step projection apply dedups on `(run_id, iteration)`
+  (#796).** R21 dogfood saw double-emits of
+  `RunReasoningStepRecorded` for the same iteration value
+  (timestamps ~0.8-5s apart, audit trail showed two consecutive
+  `WaitingApproval` non-transitions). The naïve append-only apply
+  left operators staring at duplicate `iter=N` rows in
+  `/v1/runs/:id/trajectory`. The semantic invariant is "at most
+  one reasoning step per iteration" — fix makes the apply
+  last-write-wins on `(run_id, iteration)`. New unit test
+  `reasoning_step_apply_dedups_on_iteration_value` directly
+  asserts: two emits at iter=2 collapse to one entry with the
+  later payload. Doesn't address the upstream double-emit (still
+  worth investigating; the duplicate `WaitingApproval` transitions
+  in the audit trail are a separate signal), but the user-visible
+  trajectory shape is now clean regardless.
+
 - **Sub-agents stop self-bailing at low iteration counts (#797).**
   R21 dogfood (2026-05-09) surfaced the next layer of the
   iteration-counter pathology: even though `DEFAULT_MAX_ITERATIONS`

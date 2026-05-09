@@ -164,13 +164,13 @@ impl SqliteSyncProjection {
                 }
 
                 // #791: increment iteration on every
-                // waiting_approval → running transition. Single UPDATE
-                // folds the increment into the same statement as the
-                // state change so they commit atomically. Mirrors the
-                // pg projection.
-                let increment_iteration = e.transition.from
-                    == Some(cairn_domain::RunState::WaitingApproval)
-                    && e.transition.to == cairn_domain::RunState::Running;
+                // waiting_approval → running transition. #795 expanded
+                // this to also cover waiting_dependency → running
+                // (parent-resume-after-subagent-completion) and
+                // paused → running (operator-paced resume). Single
+                // UPDATE folds the increment into the same statement
+                // as the state change so they commit atomically.
+                let increment_iteration = e.transition.is_run_resume_boundary();
                 let sql = if increment_iteration {
                     "UPDATE runs SET state = ?, failure_class = ?, version = version + 1, \
                                      updated_at = ?, iteration = iteration + 1 \

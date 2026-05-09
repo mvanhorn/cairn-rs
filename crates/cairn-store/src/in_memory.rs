@@ -736,10 +736,18 @@ impl InMemoryStore {
                         // counter that replaces PR #790's interim
                         // event-log scan in
                         // crates/cairn-app/src/handlers/runs/orchestrate.rs.
-                        if e.transition.from
-                            == Some(cairn_domain::RunState::WaitingApproval)
-                            && e.transition.to == cairn_domain::RunState::Running
-                        {
+                        //
+                        // #795: also increment on the parent-resume
+                        // boundary (waiting_dependency → running),
+                        // which fires when a sub-agent reports back
+                        // and G5 auto-resumes the parent. R21 dogfood
+                        // showed this transition was being missed —
+                        // the parent's iteration counter stayed at 0
+                        // across multiple delegation cycles, masking
+                        // re-spawn loops in the rendered trajectory.
+                        // And on `paused → running` for operator-paced
+                        // resume — same logical boundary, same fix.
+                        if e.transition.is_run_resume_boundary() {
                             rec.iteration = rec.iteration.saturating_add(1);
                         }
                         rec.state = e.transition.to;
@@ -2899,11 +2907,16 @@ impl InMemoryStore {
             }
             // #789: per-iteration compacted reasoning step. Pushed
             // onto the per-run vec; capped at REASONING_STEP_CAP_PER_RUN
-            // via FIFO eviction of the oldest entry. Replay-safe — a
-            // re-applied event with an iteration we've already seen
-            // is appended (operators reading the trajectory will see
-            // the duplicate; the recorded_at_ms tells them which is
-            // newer).
+            // via FIFO eviction of the oldest entry.
+            //
+            // #796: dedup on (run_id, iteration). The semantic invariant
+            // is "at most one reasoning step per iteration" — if a
+            // second emit lands for the same iteration (R21 dogfood
+            // surfaced the pattern), replace the existing entry with
+            // the newer payload rather than appending. Last-write-wins
+            // matches `LlmCompletionBodyReadModel`'s convention and
+            // keeps trajectory readers from seeing duplicate `iter=N`
+            // entries that confuse the post-mortem story.
             RuntimeEvent::RunReasoningStepRecorded(e) => {
                 let record =
                     crate::projections::reasoning_step::ReasoningStepRecord::from_event(e);
@@ -2911,7 +2924,18 @@ impl InMemoryStore {
                     .reasoning_steps
                     .entry(e.run_id.clone())
                     .or_default();
-                entries.push(record);
+                // Search from the tail: appends are chronological, so a
+                // double-emit for the current iteration is the most-recently-
+                // pushed entry. Linear from the front would scan the whole
+                // 200-entry vec on a hot path; rev().find hits in O(1) for
+                // the realistic case (Gemini PR #801).
+                if let Some(existing) =
+                    entries.iter_mut().rev().find(|r| r.iteration == e.iteration)
+                {
+                    *existing = record;
+                } else {
+                    entries.push(record);
+                }
                 if entries.len()
                     > crate::projections::reasoning_step::REASONING_STEP_CAP_PER_RUN
                 {

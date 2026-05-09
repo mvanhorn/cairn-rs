@@ -161,9 +161,16 @@ impl PgSyncProjection {
                 // path. The single UPDATE folds the increment into
                 // the same statement as the state change so they
                 // commit atomically.
-                let increment_iteration = e.transition.from
-                    == Some(cairn_domain::RunState::WaitingApproval)
-                    && e.transition.to == cairn_domain::RunState::Running;
+                //
+                // #795: also increment on (waiting_dependency →
+                // running) and (paused → running) — both are resume
+                // boundaries the model returns through, so the
+                // counter must advance to keep the rendered
+                // trajectory + the projection-iteration in sync with
+                // the in-memory backend. R21 dogfood showed
+                // waiting_dependency was the missing case for
+                // parent-resume-after-subagent-completion.
+                let increment_iteration = e.transition.is_run_resume_boundary();
                 let sql = if increment_iteration {
                     "UPDATE runs SET state = $1, failure_class = $2, version = version + 1, \
                                      updated_at = $3, iteration = iteration + 1 \

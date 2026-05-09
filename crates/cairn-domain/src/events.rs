@@ -945,6 +945,24 @@ pub struct StateTransition<S> {
     pub to: S,
 }
 
+impl StateTransition<crate::RunState> {
+    /// True iff this transition crosses an orchestrator-resume boundary —
+    /// i.e. the run was paused (`WaitingApproval`, `WaitingDependency`,
+    /// `Paused`) and is now back in `Running`. Centralised here so the
+    /// three projection backends (in-memory, Postgres, SQLite) cannot
+    /// drift on which transitions count as a resume — #795 originally
+    /// landed in three sites, and Gemini called out the duplication on
+    /// PR #801.
+    pub fn is_run_resume_boundary(&self) -> bool {
+        matches!(
+            self.from,
+            Some(crate::RunState::WaitingApproval)
+                | Some(crate::RunState::WaitingDependency)
+                | Some(crate::RunState::Paused)
+        ) && self.to == crate::RunState::Running
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCreated {
     pub project: ProjectKey,
