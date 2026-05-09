@@ -26,6 +26,7 @@ pub mod embedding;
 pub mod error;
 pub mod models;
 pub mod redact;
+pub mod signer;
 pub mod wire;
 
 pub use builder::{Backend, ProviderBuilder};

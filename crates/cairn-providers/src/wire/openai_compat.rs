@@ -265,6 +265,12 @@ pub struct OpenAiCompat {
     pub embedding_dimensions: Option<u32>,
     pub normalize_response: bool,
     client: Client,
+    /// Optional request signer. When `Some`, every outbound request is
+    /// signed via this handle instead of the default Bearer-token path.
+    /// Used for backends that need AWS SigV4 (Bedrock OpenAI-compat
+    /// gateway) or any other header-based auth scheme that depends on
+    /// the request body.
+    signer: Option<std::sync::Arc<dyn crate::signer::RequestSigner>>,
 }
 
 impl OpenAiCompat {
@@ -317,7 +323,20 @@ impl OpenAiCompat {
             embedding_dimensions: None,
             client,
             config,
+            signer: None,
         })
+    }
+
+    /// Install a request signer — replaces the default Bearer-token
+    /// auth. Required for `BedrockCompat` on IAM-authenticated endpoints
+    /// where the operator does not have an API key.
+    ///
+    /// `api_key` is left intact so the struct remains valid for code
+    /// that inspects it for diagnostics, but the signer wins at the
+    /// request layer.
+    pub fn with_signer(mut self, signer: std::sync::Arc<dyn crate::signer::RequestSigner>) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -438,7 +457,9 @@ impl OpenAiCompat {
         &self,
         body: &WireRequest<'_>,
     ) -> Result<reqwest::Response, ProviderError> {
-        if self.api_key.is_empty() {
+        // Signer-less auth requires an API key. Signer-based auth
+        // (SigV4) ignores `api_key` entirely and can run with it empty.
+        if self.signer.is_none() && self.api_key.is_empty() {
             return Err(ProviderError::Auth(format!(
                 "missing {} API key",
                 self.config.name
@@ -448,7 +469,21 @@ impl OpenAiCompat {
             .base_url
             .join(self.config.chat_endpoint)
             .map_err(|e| ProviderError::Http(redact_secrets(&e.to_string())))?;
-        let mut req = self.client.post(url).bearer_auth(&self.api_key).json(body);
+        let url_string = url.as_str().to_owned();
+
+        // Serialize once so the SigV4 path hashes the exact bytes we
+        // send on the wire. `reqwest::RequestBuilder::json` re-encodes
+        // internally which would produce a signature mismatch.
+        let body_bytes: bytes::Bytes = serde_json::to_vec(body)
+            .map_err(|e| ProviderError::InvalidRequest(format!("encode chat request body: {e}")))?
+            .into();
+        let mut req = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            // `Bytes::clone` is cheap (ref-count bump) — no payload copy.
+            .body(body_bytes.clone());
+
         for (k, v) in &self.config.custom_headers {
             req = req.header(k, v);
         }
@@ -460,6 +495,14 @@ impl OpenAiCompat {
             .timeout_secs
             .unwrap_or(self.config.default_timeout_secs);
         req = req.timeout(std::time::Duration::from_secs(per_request_timeout));
+
+        // Auth: signer wins when set; otherwise fall back to Bearer.
+        let req = if let Some(signer) = self.signer.as_ref() {
+            signer.sign(req, "POST", &url_string, &body_bytes).await?
+        } else {
+            req.bearer_auth(&self.api_key)
+        };
+
         let resp = req.send().await?;
         if !resp.status().is_success() {
             let status = resp.status();

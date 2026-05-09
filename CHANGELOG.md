@@ -11,6 +11,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`cairn-providers` SigV4 signer for the Bedrock backends.** New
+  `signer` module exposing `RequestSigner` (trait), `BearerAuth`
+  (back-compat default), and `SigV4Signer` (AWS SigV4 via the default
+  credential chain: env → shared config → IMDS → container role → SSO).
+  The native `Bedrock` backend gains `with_bearer`, `with_sigv4`, and
+  `with_signer` constructors plus a `from_env_async` entry that prefers
+  a Bearer key when set and falls back to SigV4 otherwise. The
+  OpenAI-compat provider gains a `with_signer(...)` builder so the
+  `BedrockCompat` preset can plug in the same signer without duplicating
+  wire code. `cairn-app` boot now uses `from_env_async` so Bedrock works
+  on EC2/ECS/EKS via IMDS with no API key, and reports the negotiated
+  auth scheme (`bearer` / `sigv4`) at startup. 6 new signer unit tests
+  (canonical SigV4 vectors, static-creds path, STS session-token
+  handling) + 3 integration tests (openai-compat SigV4 header shape,
+  Bearer regression guard, empty-key-without-signer rejection).
+  Verified live against `us.anthropic.claude-opus-4-7` in `us-west-2`
+  from EC2 with instance-profile IMDS credentials.
+
 - **`cairn-github` PR-review surface.** `GitHubClient` gains 7 new methods
   covering the full code-review lifecycle: `get_pull_request`,
   `list_pull_request_files`, `list_pull_request_review_comments`,
