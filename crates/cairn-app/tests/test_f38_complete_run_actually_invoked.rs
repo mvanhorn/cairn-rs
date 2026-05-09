@@ -141,11 +141,13 @@ async fn spawn_mock() -> (
                 .push(user_content);
         }
 
-        // Turns 0..=2 (iterations 0, 1, 2): echo the dogfood-v5 failure
-        // by calling `memory_search`. The orchestrator loop will execute
-        // it, fail or succeed idempotently, and come back for the next
-        // iteration.
-        if turn <= 2 {
+        // Turns 0..=11 (iterations 0..11): echo the dogfood-v5 failure
+        // shape by calling `memory_search`. The orchestrator loop will
+        // execute it, succeed idempotently, and come back for the next
+        // iteration. #797 bumped STUCK_ITERATION_THRESHOLD from 3 to
+        // 12, so the mock has to keep this up for 12 iterations before
+        // the nudge fires on turn 12.
+        if turn <= 11 {
             return (
                 StatusCode::OK,
                 Json(json!({
@@ -178,9 +180,9 @@ async fn spawn_mock() -> (
             );
         }
 
-        // Turn 3 (iteration 3): the F38 directive must be present in the
-        // user message. If it is, we terminate via `complete_run`. If it
-        // isn't, the test assertion below catches it because the
+        // Turn 12 (iteration 12): the F38 directive must be present in
+        // the user message. If it is, we terminate via `complete_run`.
+        // If it isn't, the test assertion below catches it because the
         // captured user message won't contain the header.
         (
             StatusCode::OK,
@@ -360,22 +362,25 @@ async fn setup_and_orchestrate(
     (status, body)
 }
 
-/// F38 primary regression: after three introspection-only iterations
-/// the orchestrator breaks the loop by nudging the model onto
-/// `complete_run`, and the nudge carries the load-bearing directive.
+/// F38 primary regression: after STUCK_ITERATION_THRESHOLD
+/// introspection-only iterations the orchestrator breaks the loop by
+/// nudging the model onto `complete_run`, and the nudge carries the
+/// load-bearing directive. Threshold bumped from 3 → 12 in #797
+/// (R21 dogfood proved 3 was too aggressive against procedural
+/// goals); the test below now exercises the 12-iteration shape.
 #[tokio::test]
-async fn stuck_introspection_loop_recovers_on_iteration_three() {
+async fn stuck_introspection_loop_recovers_on_iteration_twelve() {
     let h = LiveHarness::setup().await;
     let (mock_url, hits, captured_tools, captured_user) = spawn_mock().await;
 
-    // Use the dogfood-v5 max_iterations so a regression surfaces as an
-    // 8-turn failure (identical to the real bug) rather than truncating
-    // early.
+    // 13 max_iterations: 12 introspection-only rounds + 1 nudged
+    // terminal round. < 13 means the nudge can't land before
+    // truncation; > 13 leaves slack the test doesn't need.
     let (status, body) = setup_and_orchestrate(
         &h,
         &mock_url,
         "Summarize the key design principles of Minecraft creative mode in three bullet points.",
-        8,
+        13,
     )
     .await;
 
@@ -387,23 +392,23 @@ async fn stuck_introspection_loop_recovers_on_iteration_three() {
         .unwrap_or("<missing>");
     assert_ne!(
         termination, "max_iterations_reached",
-        "F38: orchestrator must break an introspection-only loop via the \
-         iteration-3 nudge. Full body: {body}",
+        "F38/#797: orchestrator must break an introspection-only loop \
+         via the iteration-12 nudge. Full body: {body}",
     );
 
-    // Exactly four provider turns: three introspection rounds + the
-    // nudged terminal round. >4 means the nudge failed to land and the
-    // loop kept running; <4 means the mock terminated early (shouldn't
+    // Exactly 13 provider turns: 12 introspection rounds + the nudged
+    // terminal round. >13 means the nudge failed to land and the loop
+    // kept running; <13 means the mock terminated early (shouldn't
     // happen unless someone flipped the iteration threshold).
     let n = hits.load(Ordering::SeqCst);
     assert_eq!(
-        n, 4,
-        "F38: expected exactly 4 LLM calls (3 introspection + 1 nudged \
-         terminal); got {n}. Full body: {body}",
+        n, 13,
+        "F38/#797: expected exactly 13 LLM calls (12 introspection + 1 \
+         nudged terminal); got {n}. Full body: {body}",
     );
 
-    // The F38 directive must have landed in the user message on turn 4
-    // (index 3) — not before, not after that would matter. We assert
+    // The F38 directive must have landed in the user message on turn 13
+    // (index 12) — not before, not after that would matter. We assert
     // the header string because it's the stable part of the suffix.
     let user_msgs = captured_user
         .lock()
@@ -411,21 +416,21 @@ async fn stuck_introspection_loop_recovers_on_iteration_three() {
         .clone();
     assert_eq!(
         user_msgs.len(),
-        4,
-        "F38: expected four captured user messages; got {}",
+        13,
+        "F38/#797: expected 13 captured user messages; got {}",
         user_msgs.len()
     );
-    for (i, msg) in user_msgs.iter().enumerate().take(3) {
+    for (i, msg) in user_msgs.iter().enumerate().take(12) {
         assert!(
             !msg.contains(EXPECTED_DIRECTIVE_HEADER),
-            "F38: iteration {i} must NOT carry the stuck-loop directive \
-             (threshold is 3). Got:\n{msg}"
+            "F38/#797: iteration {i} must NOT carry the stuck-loop directive \
+             (threshold is 12). Got:\n{msg}"
         );
     }
     assert!(
-        user_msgs[3].contains(EXPECTED_DIRECTIVE_HEADER),
-        "F38: iteration 3 MUST carry the stuck-loop directive. Got:\n{}",
-        user_msgs[3]
+        user_msgs[12].contains(EXPECTED_DIRECTIVE_HEADER),
+        "F38/#797: iteration 12 MUST carry the stuck-loop directive. Got:\n{}",
+        user_msgs[12]
     );
 
     // `complete_run` must sit at index 0 in the tools array on every
@@ -487,11 +492,17 @@ fn stuck_nudge_predicate_and_wording_match_contract() {
     };
 
     let threshold = stuck_iteration_threshold_for_tests();
+    // #797: bumped from 3 to 12 — R21 dogfood proved 3 was too
+    // aggressive against procedural goals (clone+branch+write+commit
+    // +push+PR is 9-12 distinct DECIDE turns; the old threshold
+    // forced complete_run("partial") at iter=3 mid-procedural-goal).
+    // 12 still catches genuine introspection loops while not
+    // strangling the dogfood norm.
     assert_eq!(
-        threshold, 3,
-        "F38: threshold MUST stay at 3 — dogfood-v5 proved 4+ \
-         iterations are needed to catch the GLM-4.7 introspection loop \
-         while still letting healthy multi-step runs finish."
+        threshold, 12,
+        "F38/#797: threshold MUST stay at 12 — R21 proved 3 was too \
+         aggressive for procedural goals; 12 catches Q&A introspection \
+         loops without strangling clone+branch+write+commit+push+PR."
     );
 
     let make_step = |kind: &str| StepSummary {
@@ -500,42 +511,25 @@ fn stuck_nudge_predicate_and_wording_match_contract() {
         summary: "x".to_owned(),
         succeeded: true,
     };
+    let make_invokes =
+        |n: usize| -> Vec<StepSummary> { (0..n).map(|_| make_step("invoke_tool")).collect() };
 
     // Below threshold with non-terminal history → no nudge.
     assert!(!should_inject_stuck_nudge_for_tests(
         0,
         &[make_step("invoke_tool")]
     ));
-    assert!(!should_inject_stuck_nudge_for_tests(
-        2,
-        &[
-            make_step("invoke_tool"),
-            make_step("invoke_tool"),
-            make_step("invoke_tool"),
-        ]
-    ));
+    assert!(!should_inject_stuck_nudge_for_tests(11, &make_invokes(11)));
 
     // At threshold with non-terminal history → nudge.
-    assert!(should_inject_stuck_nudge_for_tests(
-        3,
-        &[
-            make_step("invoke_tool"),
-            make_step("invoke_tool"),
-            make_step("invoke_tool"),
-        ]
-    ));
+    assert!(should_inject_stuck_nudge_for_tests(12, &make_invokes(12)));
 
     // At threshold BUT a previous step was `complete_run` → no nudge
     // (defensive: we never want to double-terminate or re-prompt after
     // the model already agreed to finish).
-    assert!(!should_inject_stuck_nudge_for_tests(
-        4,
-        &[
-            make_step("invoke_tool"),
-            make_step("complete_run"),
-            make_step("invoke_tool"),
-        ]
-    ));
+    let mut mixed = make_invokes(11);
+    mixed[5] = make_step("complete_run");
+    assert!(!should_inject_stuck_nudge_for_tests(12, &mixed));
 
     // At threshold but EMPTY history (e.g. resume-mid-run edge case) →
     // no nudge, because there's nothing to nudge against.
@@ -569,15 +563,9 @@ fn stuck_nudge_predicate_and_wording_match_contract() {
     // terminal does NOT exempt the tail. This is the long-running
     // multi-phase-run shape — e.g. a run that completed once, was
     // extended, and has now drifted into another stuck streak.
-    assert!(should_inject_stuck_nudge_for_tests(
-        10,
-        &[
-            make_step("complete_run"),
-            make_step("invoke_tool"),
-            make_step("invoke_tool"),
-            make_step("invoke_tool"),
-        ]
-    ));
+    let mut history = vec![make_step("complete_run")];
+    history.extend(make_invokes(12));
+    assert!(should_inject_stuck_nudge_for_tests(20, &history));
 
     // Wording: the header must be the exact literal the integration
     // test greps for, and the suffix must urge `complete_run` by name.

@@ -939,10 +939,17 @@ fn build_user_message(
         .parent_context
         .as_ref()
         .map(|c| format!("## Parent context\n{c}"));
+    // #797: iteration counter is intentionally hidden from the
+    // model. R21 dogfood surfaced that sub-agents read `iteration: 3`
+    // and self-bailed with partial-completion reports thinking they
+    // were near the limit, even though the cap (now 50) was
+    // nowhere near. The iteration counter is internal orchestrator
+    // bookkeeping; the model already has step_history for "what
+    // happened so far" context. Operators still get iteration via
+    // the projection (`run.iteration`) and the trajectory endpoint.
     let run_state_part = format!(
-        "## Run state\nrun_id: {}\niteration: {}\nagent_type: {}",
+        "## Run state\nrun_id: {}\nagent_type: {}",
         ctx.run_id.as_str(),
-        ctx.iteration,
         ctx.agent_type,
     );
     let has_memory = !gather.memory_chunks.is_empty();
@@ -1069,15 +1076,21 @@ fn build_user_message(
     };
 
     // ── Step history — most recent first, truncate oldest ────────────────────
+    //
+    // #797: drop the `[iteration]` prefix on each step line. Same
+    // reasoning as the `## Run state` change above — the iteration
+    // counter was triggering self-bail behaviour in sub-agents
+    // (R21 dogfood). Position in the list communicates recency,
+    // and `action_kind | summary | ok=...` is what the model needs
+    // to decide the next move. Operators still get the iteration
+    // field via the trajectory endpoint, which preserves the full
+    // ReasoningStepRecord structure.
     let step_section: Option<String> = if gather.step_history.is_empty() {
         None
     } else {
         let mut lines: Vec<String> = Vec::new();
         for s in gather.step_history.iter().rev() {
-            let line = format!(
-                "- [{}] {} | {} | ok={}",
-                s.iteration, s.action_kind, s.summary, s.succeeded,
-            );
+            let line = format!("- {} | {} | ok={}", s.action_kind, s.summary, s.succeeded,);
             if let Some(rem) = remaining.as_mut() {
                 let cost = estimate_tokens(&line) + 1;
                 if *rem < cost {
@@ -1363,11 +1376,13 @@ pub(crate) fn spawn_subagent_tool_def() -> serde_json::Value {
 /// notify_operator × 3 … with `complete_run × 0`) early enough to
 /// salvage the run.
 ///
-/// # Why three and not higher
+/// # Why this threshold
 ///
-/// Gemini review on PR #300 flagged threshold=3 as aggressive against the
-/// default `max_iterations = 20` cap. Two facts make the choice safe in
-/// practice:
+/// Original Gemini review on PR #300 flagged threshold=3 as
+/// aggressive against the then-default `max_iterations = 20` cap.
+/// R21 dogfood (#797) confirmed it fires too early on procedural
+/// goals; bumped to 12 here, with `DEFAULT_MAX_ITERATIONS` raised
+/// to 50. Two facts make the choice safe in practice:
 ///
 /// 1. **The nudge is escapable.** [`stuck_nudge_suffix`] explicitly lets
 ///    the model call `complete_run` with `final_answer = "<what I still
@@ -1386,7 +1401,24 @@ pub(crate) fn spawn_subagent_tool_def() -> serde_json::Value {
 /// early, bump this to 4–5 rather than disabling the feature entirely;
 /// the fix for dogfood-v5 task-1 collapses quickly if the threshold
 /// drifts above ~6.
-pub(crate) const STUCK_ITERATION_THRESHOLD: u32 = 3;
+///
+/// Bumped from 3 → 12 (R21 dogfood, #797). The original 3 was sized
+/// for a Q&A-shaped workload — 3 introspection-only iterations
+/// without a `complete_run` was a real bug shape on dogfood-v5
+/// task-1. But on a procedural workload like "clone + branch +
+/// write file + cargo check + commit + push + gh pr create", 9-12
+/// consecutive `invoke_tool` steps are EXPECTED — none of them
+/// terminate, none should. The old threshold fired the
+/// "STOP — FINAL DIRECTIVE" suffix mid-procedural-goal at iter=3,
+/// forcing the model to call `complete_run("partial")` instead of
+/// completing the work. R21 shipped 0 PRs across 8 dogfood-m1
+/// issues because of this; 13 of 20 sub-agents bailed at iter=3
+/// with "I ran out of iterations" reports. The new threshold (12)
+/// still catches genuine introspection loops — a Q&A run that
+/// emits 12 consecutive `invoke_tool` steps without ever calling
+/// `complete_run` is still pathological — without strangling the
+/// procedural shape that's the dogfood norm.
+pub(crate) const STUCK_ITERATION_THRESHOLD: u32 = 12;
 
 /// Decide whether to append the stuck-loop directive to this iteration's
 /// user message.
@@ -2376,6 +2408,58 @@ mod tests {
             !msg.contains("## Parent context"),
             "user message must NOT include `## Parent context` when ctx.parent_context is None"
         );
+    }
+
+    #[test]
+    fn build_user_message_does_not_render_iteration_to_model() {
+        // #797: iteration is internal orchestrator bookkeeping. R21
+        // dogfood found sub-agents reading `iteration: 3` and self-
+        // bailing with partial-completion reports thinking they were
+        // near the cap (which is now 50, but the model can't see
+        // that). Removing iteration from both `## Run state` and
+        // step-history line prefixes prevents the model from making
+        // bogus pacing decisions based on a counter it doesn't know
+        // the cap of.
+        let mut c = ctx();
+        c.iteration = 17;
+        c.run_id = cairn_domain::RunId::new("run_797_test");
+        let mut g = empty_gather();
+        g.step_history = vec![
+            crate::context::StepSummary {
+                iteration: 3,
+                action_kind: "invoke_tool".to_owned(),
+                summary: "test summary one".to_owned(),
+                succeeded: true,
+            },
+            crate::context::StepSummary {
+                iteration: 12,
+                action_kind: "invoke_tool".to_owned(),
+                summary: "test summary two".to_owned(),
+                succeeded: true,
+            },
+        ];
+        let msg = build_user_message(&c, &g, None, false);
+        // The Run state block must NOT carry the iteration line.
+        assert!(
+            !msg.contains("\niteration: 17"),
+            "user message must NOT render `iteration: 17` in Run state block (#797). msg:\n{msg}"
+        );
+        // Step history lines must NOT prefix with [N].
+        assert!(
+            !msg.contains("- [3]"),
+            "step history must NOT render `[3]` iteration prefix (#797). msg:\n{msg}"
+        );
+        assert!(
+            !msg.contains("- [12]"),
+            "step history must NOT render `[12]` iteration prefix (#797). msg:\n{msg}"
+        );
+        // run_id and agent_type should still be there — only the
+        // iteration line is hidden.
+        assert!(msg.contains("run_id: run_797_test"));
+        // The step entries themselves should still appear (under the
+        // new format `- {action_kind} | {summary} | ok={succeeded}`).
+        assert!(msg.contains("test summary one"));
+        assert!(msg.contains("test summary two"));
     }
 
     // ── #774 footer-by-response-shape tests ─────────────────────────────

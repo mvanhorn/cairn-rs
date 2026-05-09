@@ -201,8 +201,8 @@ audience: structured, terse, citation-backed, machine-parseable.
 You do not spawn further sub-agents. If the goal is too large for one \
 agent, surface that as a blocker; the parent re-plans.
 
-You do not introspect this run. Your goal, iteration index, and step \
-history are already in this prompt. Do not call get_run, list_runs, \
+You do not introspect this run. Your goal and step history are \
+already in this prompt. Do not call get_run, list_runs, \
 search_events, get_approvals, get_task, or wait_for_task on your own \
 run id. Tools that are NOT in your allowed set will not appear in the \
 tool list — do not invent names.

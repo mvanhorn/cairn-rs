@@ -465,7 +465,14 @@ pub struct LoopConfig {
 /// reference the cairn-wide default by name rather than duplicating
 /// the literal. Operator override continues to flow through the
 /// per-run / per-project / per-system `max_iterations` default.
-pub const DEFAULT_MAX_ITERATIONS: u32 = 20;
+///
+/// Bumped from 20 to 50 (R21 dogfood, #797). Typical procedural
+/// sub-agent goals (clone repo, branch, write file, cargo check,
+/// commit, push, `gh pr create`) need 9 to 12 distinct DECIDE
+/// turns, and each tool call requiring approval is a separate
+/// iteration. 20 was sized for a Q&A-shaped run; 50 fits a real
+/// procedural delivery without having to override per-run.
+pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
 impl Default for LoopConfig {
     fn default() -> Self {
@@ -581,9 +588,22 @@ pub struct BreakerConfig {
 impl Default for BreakerConfig {
     fn default() -> Self {
         Self {
-            round_cap: 30,
+            // #797: bumped from 30 → 60 to stay above the new
+            // DEFAULT_MAX_ITERATIONS (50). If round_cap < max_iterations,
+            // the breaker fires before the iteration cap and operators
+            // see a confusing "round breaker tripped" message instead
+            // of a clean "max iterations reached" termination — Gemini
+            // PR #798 review caught this. The 60 leaves headroom above
+            // the 50-iteration cap for any iteration-count slack.
+            round_cap: 60,
             token_cap: 200_000,
-            no_tool_use_streak: 3,
+            // #797: bumped from 3 → 12 to mirror the
+            // STUCK_ITERATION_THRESHOLD bump in decide_impl.rs. The
+            // breaker fires when N consecutive iterations have no
+            // tool use; on a procedural goal the model legitimately
+            // alternates between tool calls and deliberation, so 3
+            // was way too tight and tripped on the dogfood norm.
+            no_tool_use_streak: 12,
             wall_clock_ms: 15 * 60 * 1_000, // 15 minutes
             warn_ratio_bps: 8_000,          // 80 %
         }

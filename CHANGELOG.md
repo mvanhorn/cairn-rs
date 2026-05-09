@@ -163,6 +163,42 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Sub-agents stop self-bailing at low iteration counts (#797).**
+  R21 dogfood (2026-05-09) surfaced the next layer of the
+  iteration-counter pathology: even though `DEFAULT_MAX_ITERATIONS`
+  was 20, sub-agents were calling `complete_run` with "partial
+  completion" reports at `iter=3`, never delivering multi-step
+  procedural goals (clone → branch → write file → cargo check →
+  commit → push → `gh pr create`). 13 of 20 sub-agents in R21
+  hit `iter=3` and bailed; zero PRs were delivered across 8
+  dogfood-m1 issues despite the orchestrator correctly delegating
+  to executors and re-spawning on partial completions.
+
+  Root cause: the user message rendered `iteration: 3` in the
+  `## Run state` block and `[3]` prefixes on each step-history
+  line, with no indication of the cap. The model read those numbers
+  and self-paced — concluding it was near a limit and producing a
+  graceful "partial" report instead of continuing.
+
+  Fix: stop rendering `iteration` to the model. The user message's
+  `## Run state` now carries only `run_id` + `agent_type`, and
+  step-history lines drop the `[N]` prefix. The iteration counter
+  remains internal orchestrator bookkeeping — operators still get
+  it via `RunRecord.iteration` (HTTP API) and the
+  `/v1/runs/:id/trajectory` endpoint, but the model never sees a
+  number it can pattern-match against. Also bumped
+  `DEFAULT_MAX_ITERATIONS` from 20 → 50: a typical procedural
+  goal needs 9-12 distinct DECIDE turns and each approval-gated
+  tool call is a separate iteration, so 20 was sized for a
+  Q&A-shaped run and not the procedural goals dogfood actually
+  exercises.
+
+  Regression test:
+  `decide_impl::tests::build_user_message_does_not_render_iteration_to_model`
+  asserts no `iteration: N` line in `## Run state` and no `[N]`
+  prefix on step-history lines. Pre-fix simulation (revert the
+  format string) makes the test fail.
+
 - **Replace event-log iteration scan with projection-backed
   `RunRecord.iteration` field (#791).** PR #790's #788 fix derived
   prior-iteration count from a forward scan of

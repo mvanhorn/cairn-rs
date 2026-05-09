@@ -379,26 +379,22 @@ async fn iteration_counter_survives_orchestrate_resume() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Locate the step-history section. Pre-fix every entry would
-    // start with `[0]`. Post-fix at least one entry must start with
-    // `[N]` where N >= 1.
-    let step_section_idx = user_content.find("## Step history").unwrap_or_else(|| {
-        panic!(
-            "expected '## Step history' section in user message; got {} chars: {}",
-            user_content.len(),
-            &user_content[..user_content.len().min(800)],
-        )
-    });
-    let step_section = &user_content[step_section_idx..];
-    let nonzero_iter_marker_present = step_section
-        .lines()
-        .filter(|l| l.starts_with("- ["))
-        .any(|l| !l.starts_with("- [0]"));
-
+    // The original #788 test asserted on the `[N]` iteration prefix
+    // rendered in `## Step history`. PR #798 (#797) removed that
+    // prefix from the user message — the iteration counter is now
+    // intentionally hidden from the LLM. The invariant `#788 fixed`
+    // is preserved at a stronger surface: the projection-backed
+    // `RunRecord.iteration >= 1` assertion (above) reads the same
+    // counter through the API. If that field was 0, we'd know the
+    // resume boundary didn't increment.
+    //
+    // Sanity-check that the user message still renders SOMETHING in
+    // the step-history section so future regressions don't drop it
+    // entirely.
     assert!(
-        nonzero_iter_marker_present,
-        "#788 regression: every step_history entry rendered with [0] iteration prefix. \
-         This means OrchestrationContext.iteration was reset to 0 on every \
-         /orchestrate-resume POST. Step history section was:\n\n{step_section}",
+        user_content.contains("## Step history"),
+        "user message must still include `## Step history` section. Got {} chars: {}",
+        user_content.len(),
+        &user_content[..user_content.len().min(400)],
     );
 }

@@ -2081,11 +2081,18 @@ fn maybe_compact_history(
 
     let before_steps = step_history.len();
 
+    // #797: do NOT include `iter {}: ` prefix in the compacted
+    // summary. Compacted summaries flow back into step_history
+    // (under action_kind="compacted_summary") and get rendered to
+    // the LLM in the next DECIDE's user message — so any iteration
+    // numbers leak right back into model context. Render only the
+    // ordered action kinds + status; positional ordering in the
+    // compacted_text already preserves chronology.
     let compacted_text: String = step_history[..to_compact]
         .iter()
         .map(|s| {
             let status = if s.succeeded { "ok" } else { "fail" };
-            format!("  iter {}: {} [{}]", s.iteration, s.action_kind, status)
+            format!("  - {} [{}]", s.action_kind, status)
         })
         .collect::<Vec<_>>()
         .join("\n");
