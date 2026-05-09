@@ -752,6 +752,33 @@ pub fn assembled_prompt_for(role_id: &str) -> String {
     assembled_prompt_for_role(generic)
 }
 
+/// Resolve the `ResponseShape` for a role id without allocating a
+/// fresh `Vec<AgentRole>` (cf. `default_roles()` which clones every
+/// role's multi-KB system prompt). Used per-iteration by
+/// `cairn-orchestrator::build_user_message` (#774) to pick the right
+/// footer; called on every DECIDE turn, so the cheap lookup matters.
+///
+/// Unknown role ids fall back to the registered `generic` role's
+/// shape. This matches `assembled_prompt_for`'s fallback contract —
+/// keeping the two paths' fallback semantics aligned avoids the
+/// pathology where a mis-spelled role gets a generic system prompt
+/// but a DirectAnswer footer (or vice versa).
+///
+/// SOURCE OF TRUTH: this table mirrors the `response_shape` field on
+/// each role in `default_roles()`. A `default_roles_response_shapes_match_table`
+/// test in this module pins the contract — if either side drifts the
+/// test fails loudly.
+pub fn response_shape_for(role_id: &str) -> ResponseShape {
+    // Static-allocation lookup keyed on role_id. If a future role is
+    // added to `default_roles()`, add it here too — the contract test
+    // catches the drift.
+    match role_id {
+        "orchestrator" => ResponseShape::DirectAnswer,
+        "executor" | "researcher" | "reviewer" | "generic" => ResponseShape::ProceduralArtifact,
+        _ => ResponseShape::ProceduralArtifact, // unknown → generic-shaped
+    }
+}
+
 /// Assemble the rendered prompt from a role record. Public for callers
 /// that already have an `AgentRole` in hand (e.g. a future operator-
 /// extensible registry).
@@ -1186,6 +1213,37 @@ mod tests {
         assert_eq!(
             unknown, generic,
             "unknown role_id must render the generic-assembled prompt"
+        );
+    }
+
+    /// #774: contract test — the cheap `response_shape_for` static
+    /// lookup MUST match every role's `response_shape` field in
+    /// `default_roles()`. The table is duplicated for performance
+    /// (avoids allocating a fresh Vec<AgentRole> with cloned
+    /// multi-KB prompt strings on every DECIDE turn); this test
+    /// catches drift.
+    #[test]
+    fn response_shape_for_matches_default_roles_response_shape() {
+        for role in default_roles() {
+            assert_eq!(
+                response_shape_for(&role.role_id),
+                role.response_shape,
+                "response_shape_for({:?}) must match default_roles().response_shape; \
+                 if you added a new role, update the static table in \
+                 `response_shape_for`.",
+                role.role_id,
+            );
+        }
+    }
+
+    /// Unknown role_ids fall back to ProceduralArtifact — the safer
+    /// shape (a DirectAnswer footer on an unknown procedural role
+    /// would re-introduce the R19 wedge).
+    #[test]
+    fn response_shape_for_unknown_role_returns_procedural_artifact() {
+        assert_eq!(
+            response_shape_for("not-a-real-role-xyz"),
+            ResponseShape::ProceduralArtifact,
         );
     }
 

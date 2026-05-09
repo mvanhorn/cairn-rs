@@ -946,28 +946,70 @@ fn build_user_message(
         ctx.agent_type,
     );
     let has_memory = !gather.memory_chunks.is_empty();
+    // #774: footer shape depends on the role's `response_shape`.
+    // DirectAnswer roles (orchestrator, future Q&A specialties) get
+    // the "answer NOW with complete_run" nudge. ProceduralArtifact
+    // roles (executor, researcher, reviewer, generic) get a
+    // continuation footer that does NOT pressure early termination —
+    // for them, complete_run before the artifact exists is the
+    // failure mode, not the success criterion. R19 dogfood evidence:
+    // the executor's prompt told it to follow Phase 1-5 but the
+    // footer kept telling it to "complete_run NOW" — it split the
+    // difference, did one defensive bash, never wrote a file.
+    //
+    // Unknown role_id falls back to the generic role's shape via the
+    // registry lookup (generic = ProceduralArtifact), matching the
+    // assembled-prompt fallback wired in `build_system_prompt`.
+    let response_shape = cairn_domain::agent_roles::response_shape_for(&ctx.agent_type);
     let memory_hint = if has_memory {
         "Memory contains relevant context above. Use it to inform your answer.".to_owned()
     } else {
-        "No relevant memories retrieved. If the goal needs external information, \
-         call a tool to fetch it; otherwise answer directly."
-            .to_owned()
+        match response_shape {
+            cairn_domain::agent_roles::ResponseShape::DirectAnswer => {
+                "No relevant memories retrieved. If the goal needs external information, \
+                 call a tool to fetch it; otherwise answer directly."
+                    .to_owned()
+            }
+            cairn_domain::agent_roles::ResponseShape::ProceduralArtifact => {
+                "No relevant memories retrieved. Use your specialty's tools to \
+                 produce the artifact the goal asks for."
+                    .to_owned()
+            }
+        }
     };
-    // F30: footer must not reintroduce the pre-fix four-phase workflow
-    // (see `build_system_prompt`'s design note). The decision rule is
-    // restated concisely so the user message echoes the system prompt
-    // instead of contradicting it.
-    let footer = format!(
-        "## Next step\n\
-         {memory_hint}\n\
-         If you already have the answer, call the `complete_run` tool NOW \
-         with the full answer in `final_answer`. If you need external \
-         information, call the appropriate tool once and then complete_run \
-         on the next iteration. Do not call introspection tools \
-         (get_run, list_runs, search_events, get_approvals, get_task) \
-         about this run itself — the goal and step history are already \
-         in this prompt."
-    );
+    // F30 + #774: footer must not reintroduce the pre-fix four-phase
+    // workflow (see `build_system_prompt`'s design note). The
+    // decision rule is restated concisely so the user message echoes
+    // the system prompt instead of contradicting it. The shape
+    // depends on the role's response_shape (#774).
+    let footer = match response_shape {
+        cairn_domain::agent_roles::ResponseShape::DirectAnswer => format!(
+            "## Next step\n\
+             {memory_hint}\n\
+             If you already have the answer, call the `complete_run` tool NOW \
+             with the full answer in `final_answer`. If you need external \
+             information, call the appropriate tool once and then complete_run \
+             on the next iteration. Do not call introspection tools \
+             (get_run, list_runs, search_events, get_approvals, get_task) \
+             about this run itself — the goal and step history are already \
+             in this prompt."
+        ),
+        cairn_domain::agent_roles::ResponseShape::ProceduralArtifact => format!(
+            "## Next step\n\
+             {memory_hint}\n\
+             Continue from your most recent step in the step history. If your \
+             specialty's Phase 5 (Report / Deliver) has NOT yet begun, do not \
+             call `complete_run` — the artifact is not produced yet, and \
+             completing here ships half-done work. Use your next tool call to \
+             advance whichever phase you are in (Locate / Implement / Verify, \
+             or your specialty's equivalent). Only call `complete_run` when \
+             the goal's success criteria are demonstrably met (file written, \
+             build passes, citations gathered, review delivered). Do not call \
+             introspection tools (get_run, list_runs, search_events, \
+             get_approvals, get_task) about this run itself — the goal and \
+             step history are already in this prompt."
+        ),
+    };
 
     // The stuck-loop nudge is part of the fixed-cost prefix when
     // enabled: it must appear in the final prompt even if the budget
@@ -2261,6 +2303,101 @@ mod tests {
         assert!(
             !msg.contains("## Parent context"),
             "user message must NOT include `## Parent context` when ctx.parent_context is None"
+        );
+    }
+
+    // ── #774 footer-by-response-shape tests ─────────────────────────────
+
+    /// Direct-answer roles (orchestrator, future Q&A specialties)
+    /// keep the "answer NOW" footer — that's correct for
+    /// trivia/synthesis goals where a single tool call (or none)
+    /// then complete_run is the right shape.
+    #[test]
+    fn build_user_message_direct_answer_role_keeps_complete_run_now_footer() {
+        let mut c = ctx();
+        c.agent_type = "orchestrator".to_owned(); // DirectAnswer
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            msg.contains("complete_run` tool NOW"),
+            "DirectAnswer footer must keep the answer-NOW nudge"
+        );
+        // Continuation phrasing must NOT appear — that's the
+        // procedural-artifact branch.
+        assert!(
+            !msg.contains("the artifact is not produced yet"),
+            "DirectAnswer footer must NOT include the procedural \
+             continuation phrasing"
+        );
+    }
+
+    /// Procedural-artifact roles (executor, researcher, reviewer,
+    /// generic) get a continuation footer that DOES NOT pressure
+    /// early `complete_run`. This is the #774 fix — pre-#774 the
+    /// footer told every subagent "answer NOW", contradicting the
+    /// role's Phase 1-5 instructions and producing the R19 wedge.
+    #[test]
+    fn build_user_message_procedural_role_uses_continuation_footer() {
+        let mut c = ctx();
+        c.agent_type = "executor".to_owned(); // ProceduralArtifact
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            msg.contains("Phase 5"),
+            "ProceduralArtifact footer must mention Phase 5 to anchor \
+             the don't-complete-early rule"
+        );
+        assert!(
+            msg.contains("do not call `complete_run`"),
+            "ProceduralArtifact footer must explicitly forbid early \
+             complete_run"
+        );
+        // The DirectAnswer "NOW" nudge must NOT appear for procedural
+        // roles — that was the R19 wedge driver.
+        assert!(
+            !msg.contains("complete_run` tool NOW"),
+            "ProceduralArtifact footer must NOT include the answer-NOW \
+             nudge — that contradicts the role's Phase 1-5 contract \
+             and was the R19 wedge driver"
+        );
+    }
+
+    /// Researcher (also ProceduralArtifact) gets the same continuation
+    /// footer as executor — pinning the test for both roles documents
+    /// the contract symmetry.
+    #[test]
+    fn build_user_message_researcher_uses_continuation_footer() {
+        let mut c = ctx();
+        c.agent_type = "researcher".to_owned();
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(msg.contains("Phase 5"));
+        assert!(msg.contains("do not call `complete_run`"));
+        assert!(!msg.contains("complete_run` tool NOW"));
+    }
+
+    /// Generic role is ProceduralArtifact — confirms the new role
+    /// gets the right footer too.
+    #[test]
+    fn build_user_message_generic_role_uses_continuation_footer() {
+        let mut c = ctx();
+        c.agent_type = "generic".to_owned();
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(msg.contains("do not call `complete_run`"));
+        assert!(!msg.contains("complete_run` tool NOW"));
+    }
+
+    /// Unknown role_id falls back to the generic role's shape
+    /// (ProceduralArtifact). Mirrors the assembled-prompt fallback
+    /// in `build_system_prompt` so the two paths stay aligned —
+    /// otherwise an unknown role gets a generic system prompt but
+    /// a DirectAnswer footer, re-introducing the R19 wedge.
+    #[test]
+    fn build_user_message_unknown_role_falls_back_to_procedural_footer() {
+        let mut c = ctx();
+        c.agent_type = "wizard".to_owned(); // not registered
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            msg.contains("do not call `complete_run`"),
+            "unknown role_id must fall back to ProceduralArtifact \
+             footer (matches assembled-prompt fallback to generic)"
         );
     }
 

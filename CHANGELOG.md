@@ -9,6 +9,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Per-iteration footer no longer biases procedural sub-agents toward
+  early `complete_run` (#774).** Pre-fix, every DECIDE iteration appended
+  a `## Next step` footer that read "If you already have the answer,
+  call the `complete_run` tool NOW" — correct for orchestrator and
+  Q&A roles, wrong for executor / researcher / reviewer / generic
+  whose specialty prompts explicitly walk through Phase 1–5 with
+  `complete_run` reserved for Phase 5 (Report). R19 dogfood evidence:
+  the executor subagent did 71 iterations of bash discovery and 0
+  write/edit calls — the model split the difference between "complete
+  NOW" and "make it through Phase 5", defaulting to a defensive bash
+  every turn. Now the footer branches on `AgentRole.response_shape`:
+  DirectAnswer roles keep the answer-NOW nudge; ProceduralArtifact
+  roles get a continuation footer that explicitly forbids
+  `complete_run` until the goal's success criteria are demonstrably
+  met. Memory-hint sentence likewise branches — procedural roles no
+  longer see "answer directly" when memory retrieval returns empty.
+  Unknown role ids fall back to the generic role's shape
+  (ProceduralArtifact), matching the assembled-prompt fallback wired
+  in #775.
+
 ### Changed
 
 - **AgentRole architecture refactor (#775).** The four built-in role
