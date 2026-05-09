@@ -319,4 +319,61 @@ async fn trajectory_endpoint_returns_reasoning_step_after_decide() {
         current_action.get("tool_name").and_then(|v| v.as_str()),
         Some("bash"),
     );
+
+    // #807: `?from_iteration=N` must filter results to
+    // `iteration >= N`. Pre-fix the param was deserialized but
+    // ignored — every poll returned the full trajectory regardless
+    // of from_iteration. The single iter-0 step we just emitted
+    // should be present at from_iteration=0 and absent at
+    // from_iteration=1.
+    let r = h
+        .client()
+        .get(format!(
+            "{}/v1/runs/{}/trajectory?from_iteration=0",
+            h.base_url, run_id,
+        ))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("trajectory endpoint reachable (from_iteration=0)");
+    assert_eq!(r.status().as_u16(), 200);
+    let body = r.json::<Value>().await.unwrap_or(Value::Null);
+    let items = body
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !items.is_empty(),
+        "#807: from_iteration=0 must include iter 0; got empty"
+    );
+
+    let r = h
+        .client()
+        .get(format!(
+            "{}/v1/runs/{}/trajectory?from_iteration=1",
+            h.base_url, run_id,
+        ))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("trajectory endpoint reachable (from_iteration=1)");
+    assert_eq!(r.status().as_u16(), 200);
+    let body = r.json::<Value>().await.unwrap_or(Value::Null);
+    let items = body
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        items.is_empty(),
+        "#807: from_iteration=1 must filter out iter 0; got {} items",
+        items.len(),
+    );
+    let from_iter_echo = body.get("from_iteration").and_then(|v| v.as_u64());
+    assert_eq!(
+        from_iter_echo,
+        Some(1),
+        "#807: response should echo `from_iteration` so client can confirm the param was applied"
+    );
 }

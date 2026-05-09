@@ -606,11 +606,26 @@ pub(crate) async fn get_run_audit_trail_handler(
 /// `REASONING_STEP_CAP_PER_RUN` steps per run (FIFO eviction past
 /// that). pg/sqlite parity is a follow-up — those backends currently
 /// return an empty trajectory.
+/// Query string for `GET /v1/runs/:id/trajectory`. Extends the shared
+/// `PaginationQuery` shape with `from_iteration` so operators can poll
+/// incrementally without re-receiving the full trajectory on every
+/// request (#807). When unset the endpoint behaves as before.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct TrajectoryQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    /// Only return steps whose `iteration >= from_iteration`. Useful
+    /// for incremental polling: the client tracks the highest
+    /// iteration it has rendered and asks for `from_iteration =
+    /// highest + 1` on the next poll.
+    pub from_iteration: Option<u32>,
+}
+
 pub(crate) async fn get_run_trajectory_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
     Path(id): Path<String>,
-    Query(pagination): Query<PaginationQuery>,
+    Query(query): Query<TrajectoryQuery>,
 ) -> impl IntoResponse {
     let run_id = RunId::new(id);
     // Tenant gate before exposing any trajectory data.
@@ -620,32 +635,47 @@ pub(crate) async fn get_run_trajectory_handler(
         Err(response) => return response,
     };
 
-    let limit = pagination.limit.unwrap_or(200).min(200);
-    let offset = pagination.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(200).min(200);
+    let offset = query.offset.unwrap_or(0);
     use cairn_store::projections::reasoning_step::ReasoningStepReadModel;
     let total =
         match ReasoningStepReadModel::count_for_run(state.runtime.store.as_ref(), &run_id).await {
             Ok(n) => n,
             Err(err) => return store_error_response(err),
         };
-    match ReasoningStepReadModel::list_by_run(state.runtime.store.as_ref(), &run_id, limit, offset)
+    // #807 + Gemini PR #816 review: fetch the full trajectory then
+    // apply filter and pagination in memory. Pre-fix this code passed
+    // (limit, offset) into list_by_run BEFORE the from_iteration
+    // filter, which meant `?offset=0&limit=10&from_iteration=10`
+    // returned an empty page (the read model gave us iters 0-9 and
+    // the filter dropped them all) even though iters 10+ existed.
+    // The per-run trajectory is bounded by `REASONING_STEP_CAP_PER_RUN`
+    // (200) so fetching unbounded here is bounded in practice; the
+    // savings from DB-level pagination are negligible at this scale.
+    match ReasoningStepReadModel::list_by_run(state.runtime.store.as_ref(), &run_id, usize::MAX, 0)
         .await
     {
-        Ok(items) => {
-            // `total` is the full count for the run (Gemini PR #794
-            // review): clients can compute `has_more` as
-            // `offset + items.len() < total`. `items.len()` is the
-            // returned-page size — kept on the response for
-            // convenience.
+        Ok(mut items) => {
+            if let Some(min_iter) = query.from_iteration {
+                items.retain(|r| r.iteration >= min_iter);
+            }
+            // Filtered count BEFORE pagination — clients can compute
+            // `has_more` as `offset + items_returned.len() < filtered_count`.
+            // `total` stays as the unfiltered run-level count for
+            // back-compat with consumers that already key off it.
+            let filtered_count = items.len();
+            let items: Vec<_> = items.into_iter().skip(offset).take(limit).collect();
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "run_id": run_id.as_str(),
                     "items": items,
                     "count": items.len(),
+                    "filtered_count": filtered_count,
                     "total": total,
                     "limit": limit,
                     "offset": offset,
+                    "from_iteration": query.from_iteration,
                 })),
             )
                 .into_response()
