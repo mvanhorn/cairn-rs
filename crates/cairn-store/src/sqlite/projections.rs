@@ -4005,14 +4005,63 @@ impl SqliteSyncProjection {
             // #789: per-iteration reasoning step. In-memory only for
             // now; sqlite parity tracked as a follow-up issue.
             RuntimeEvent::RunReasoningStepRecorded(_) => {}
-            // RFC 031 PR-A: operator-defined agent roles. Durable
-            // `project_agent_roles` projection writers land in a
-            // follow-up; PR-A is the shape skeleton only (no HTTP,
-            // no writes, no UI). `ToolDeclaredButMissing` is
-            // Ephemeral regardless of backend.
-            RuntimeEvent::AgentRoleDefined(_)
-            | RuntimeEvent::AgentRoleRetracted(_)
-            | RuntimeEvent::ToolDeclaredButMissing(_) => {}
+            // RFC 031 PR-B2: `project_agent_roles` projection (sqlite).
+            // Byte-parity with the pg applier — `AgentRoleDefined`
+            // upserts and clears `retracted_at` / `retracted_by`;
+            // `AgentRoleRetracted` updates those two columns in place.
+            // sqlite's ON CONFLICT syntax matches pg's.
+            RuntimeEvent::AgentRoleDefined(e) => {
+                let role_json = serde_json::to_string(&e.role)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO project_agent_roles
+                         (tenant_id, workspace_id, project_id, role_id,
+                          role_json, shadows_builtin, defined_by, defined_at,
+                          retracted_at, retracted_by)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL)
+                     ON CONFLICT (tenant_id, workspace_id, project_id, role_id)
+                     DO UPDATE SET
+                         role_json = excluded.role_json,
+                         shadows_builtin = excluded.shadows_builtin,
+                         defined_by = excluded.defined_by,
+                         defined_at = excluded.defined_at,
+                         retracted_at = NULL,
+                         retracted_by = NULL",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.role.role_id.as_str())
+                .bind(&role_json)
+                .bind(e.shadows_builtin.as_deref())
+                .bind(e.defined_by.as_str())
+                .bind(e.at_ms as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::AgentRoleRetracted(e) => {
+                sqlx::query(
+                    "UPDATE project_agent_roles
+                        SET retracted_at = ?1,
+                            retracted_by = ?2
+                      WHERE tenant_id = ?3
+                        AND workspace_id = ?4
+                        AND project_id = ?5
+                        AND role_id = ?6",
+                )
+                .bind(e.at_ms as i64)
+                .bind(e.retracted_by.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.role_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // Ephemeral — observability-only, no projection row.
+            RuntimeEvent::ToolDeclaredButMissing(_) => {}
         }
 
         Ok(())

@@ -13,6 +13,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::StoreError;
 
+/// Canonical column list for the `project_agent_roles` table.
+///
+/// Shared between the pg and sqlite adapters so the two
+/// `AgentRoleReadModel` impls cannot drift on column order / naming.
+/// The order here matches the `AgentRoleRow` struct field order in
+/// both adapter files; sqlx's `FromRow` derive binds by name, not
+/// position, but keeping them textually aligned makes the intent
+/// obvious on read.
+pub const AGENT_ROLE_PROJECTION_COLS: &str =
+    "tenant_id, workspace_id, project_id, role_id, role_json, \
+     shadows_builtin, defined_by, defined_at, retracted_at, retracted_by";
+
 /// One row of the `project_agent_roles` projection.
 ///
 /// `retracted_at.is_none()` ⇔ "active row". The `resolve` and `list`

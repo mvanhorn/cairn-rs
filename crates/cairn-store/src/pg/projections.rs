@@ -4399,18 +4399,67 @@ impl PgSyncProjection {
             // this variant on pg yet — the registry declares it
             // Ephemeral.
             RuntimeEvent::RunReasoningStepRecorded(_) => {}
-            // RFC 031 PR-A: operator-defined agent roles. The durable
-            // `project_agent_roles` projection table lands in a
-            // follow-up PR (PR-A's pg/sqlite projection writers are
-            // out of scope — PR-A is the shape skeleton, no HTTP yet
-            // means no writes yet). For now this is an explicit no-op;
-            // the projection registry declares the two lifecycle
-            // variants Projected (backing table `project_agent_roles`)
-            // so the stub-guard passes. `ToolDeclaredButMissing` is
-            // Ephemeral — no projection row regardless of backend.
-            RuntimeEvent::AgentRoleDefined(_)
-            | RuntimeEvent::AgentRoleRetracted(_)
-            | RuntimeEvent::ToolDeclaredButMissing(_) => {}
+            // RFC 031 PR-B2: `project_agent_roles` projection (pg).
+            // `AgentRoleDefined` upserts a row, explicitly clearing
+            // `retracted_at` + `retracted_by` to NULL so a re-POST
+            // after retract reactivates the same PK atomically (§D6).
+            // `AgentRoleRetracted` sets those two columns; the applier
+            // tolerates a missing row (corrupted-log replay) because
+            // the HTTP handler already returns 404 before emitting the
+            // event on operator-initiated retracts.
+            RuntimeEvent::AgentRoleDefined(e) => {
+                let role_json = serde_json::to_string(&e.role)
+                    .map_err(|err| StoreError::Serialization(err.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO project_agent_roles
+                         (tenant_id, workspace_id, project_id, role_id,
+                          role_json, shadows_builtin, defined_by, defined_at,
+                          retracted_at, retracted_by)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL)
+                     ON CONFLICT (tenant_id, workspace_id, project_id, role_id)
+                     DO UPDATE SET
+                         role_json = EXCLUDED.role_json,
+                         shadows_builtin = EXCLUDED.shadows_builtin,
+                         defined_by = EXCLUDED.defined_by,
+                         defined_at = EXCLUDED.defined_at,
+                         retracted_at = NULL,
+                         retracted_by = NULL",
+                )
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.role.role_id.as_str())
+                .bind(&role_json)
+                .bind(e.shadows_builtin.as_deref())
+                .bind(e.defined_by.as_str())
+                .bind(e.at_ms as i64)
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            RuntimeEvent::AgentRoleRetracted(e) => {
+                sqlx::query(
+                    "UPDATE project_agent_roles
+                        SET retracted_at = $1,
+                            retracted_by = $2
+                      WHERE tenant_id = $3
+                        AND workspace_id = $4
+                        AND project_id = $5
+                        AND role_id = $6",
+                )
+                .bind(e.at_ms as i64)
+                .bind(e.retracted_by.as_str())
+                .bind(e.project.tenant_id.as_str())
+                .bind(e.project.workspace_id.as_str())
+                .bind(e.project.project_id.as_str())
+                .bind(e.role_id.as_str())
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| StoreError::Internal(err.to_string()))?;
+            }
+            // `ToolDeclaredButMissing` is Ephemeral per the projection
+            // registry — observability-only, no projection row.
+            RuntimeEvent::ToolDeclaredButMissing(_) => {}
         }
 
         Ok(())

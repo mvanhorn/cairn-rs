@@ -6589,3 +6589,111 @@ impl crate::projections::PauseScheduleReadModel for SqliteAdapter {
             .collect())
     }
 }
+
+// ── RFC 031 PR-B2: AgentRoleReadModel impl ───────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct SqliteAgentRoleRow {
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    role_id: String,
+    role_json: String,
+    shadows_builtin: Option<String>,
+    defined_by: String,
+    defined_at: i64,
+    retracted_at: Option<i64>,
+    retracted_by: Option<String>,
+}
+
+impl SqliteAgentRoleRow {
+    fn into_record(self) -> Result<crate::projections::AgentRoleRecord, StoreError> {
+        let role: cairn_domain::agent_roles::AgentRole = serde_json::from_str(&self.role_json)
+            .map_err(|err| StoreError::Serialization(err.to_string()))?;
+        Ok(crate::projections::AgentRoleRecord {
+            project: ProjectKey::new(
+                self.tenant_id.as_str(),
+                self.workspace_id.as_str(),
+                self.project_id.as_str(),
+            ),
+            role_id: self.role_id,
+            role,
+            shadows_builtin: self.shadows_builtin,
+            defined_by: OperatorId::new(self.defined_by),
+            defined_at: self.defined_at.max(0) as u64,
+            retracted_at: self.retracted_at.map(|v| v.max(0) as u64),
+            retracted_by: self.retracted_by.map(OperatorId::new),
+        })
+    }
+}
+
+#[async_trait]
+impl crate::projections::AgentRoleReadModel for SqliteAdapter {
+    async fn get_active(
+        &self,
+        project: &ProjectKey,
+        role_id: &str,
+    ) -> Result<Option<crate::projections::AgentRoleRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {cols} FROM project_agent_roles \
+             WHERE tenant_id = ? AND workspace_id = ? \
+               AND project_id = ? AND role_id = ? \
+               AND retracted_at IS NULL",
+            cols = crate::projections::AGENT_ROLE_PROJECTION_COLS
+        );
+        let row: Option<SqliteAgentRoleRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(role_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(SqliteAgentRoleRow::into_record).transpose()
+    }
+
+    async fn get_any(
+        &self,
+        project: &ProjectKey,
+        role_id: &str,
+    ) -> Result<Option<crate::projections::AgentRoleRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {cols} FROM project_agent_roles \
+             WHERE tenant_id = ? AND workspace_id = ? \
+               AND project_id = ? AND role_id = ?",
+            cols = crate::projections::AGENT_ROLE_PROJECTION_COLS
+        );
+        let row: Option<SqliteAgentRoleRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(role_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(SqliteAgentRoleRow::into_record).transpose()
+    }
+
+    async fn list_active(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::AgentRoleRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {cols} FROM project_agent_roles \
+             WHERE tenant_id = ? AND workspace_id = ? \
+               AND project_id = ? AND retracted_at IS NULL \
+             ORDER BY role_id ASC",
+            cols = crate::projections::AGENT_ROLE_PROJECTION_COLS
+        );
+        let rows: Vec<SqliteAgentRoleRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter()
+            .map(SqliteAgentRoleRow::into_record)
+            .collect()
+    }
+}

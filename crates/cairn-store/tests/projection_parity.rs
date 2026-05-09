@@ -471,6 +471,9 @@ mod in_memory_vs_sqlite {
             "TenantRoleRevoked",
             // RFC 026 PR-A2: tenant PATCH edit fixture below.
             "TenantUpdated",
+            // RFC 031 PR-B2: agent-role lifecycle fixtures below.
+            "AgentRoleDefined",
+            "AgentRoleRetracted",
         ];
         for v in exercised {
             let status = lookup(v).unwrap_or_else(|| panic!("{v} missing from registry"));
@@ -4733,6 +4736,161 @@ mod in_memory_vs_sqlite {
             sqlite_updated_at as u64, mem_rec.updated_at,
             "updated_at parity between in-memory and sqlite"
         );
+    }
+
+    // ── RFC 031 PR-B2: `project_agent_roles` projection parity ─────
+    //     Covers the three surface points of the durable projection:
+    //     (1) happy-path define projects active row with the same
+    //         shadows_builtin / defined_at values on both backends;
+    //     (2) retract sets retracted_at on the existing row without
+    //         deletion — `get_active` drops it, `get_any` keeps it;
+    //     (3) re-POST after retract (`AgentRoleDefined` on the same
+    //         key) clears retracted_at back to None per §D6 — load-
+    //         bearing parity check because pg/sqlite implement the
+    //         upsert with DB-specific ON CONFLICT clauses.
+    use cairn_domain::agent_roles::{AgentRole as ParityAgentRole, AgentRoleTier as ParityTier};
+    use cairn_domain::events::{AgentRoleDefined, AgentRoleRetracted};
+    use cairn_store::projections::AgentRoleReadModel;
+
+    fn parity_role(id: &str) -> ParityAgentRole {
+        ParityAgentRole::new(id, "Demo Role", ParityTier::Standard)
+            .with_description("parity fixture role")
+            .with_system_prompt("## Specialty\nParity.\n")
+    }
+
+    #[tokio::test]
+    async fn agent_role_projection_matches_across_backends_on_define() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let role = parity_role("pr-reviewer-parity");
+        let events = vec![env(RuntimeEvent::AgentRoleDefined(AgentRoleDefined {
+            project: project(),
+            role,
+            shadows_builtin: None,
+            defined_by: OperatorId::new("op_parity"),
+            at_ms: 1_730_000_000_000,
+        }))];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = AgentRoleReadModel::get_active(&mem, &project(), "pr-reviewer-parity")
+            .await
+            .unwrap()
+            .expect("mem active row after define");
+        let sqlite_row = AgentRoleReadModel::get_active(&adapter, &project(), "pr-reviewer-parity")
+            .await
+            .unwrap()
+            .expect("sqlite active row after define");
+
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.role.role_id, "pr-reviewer-parity");
+        assert_eq!(mem_row.defined_at, 1_730_000_000_000);
+        assert!(mem_row.is_active());
+    }
+
+    #[tokio::test]
+    async fn agent_role_projection_matches_across_backends_on_retract() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let role = parity_role("retract-parity");
+        let events = vec![
+            env(RuntimeEvent::AgentRoleDefined(AgentRoleDefined {
+                project: project(),
+                role,
+                shadows_builtin: None,
+                defined_by: OperatorId::new("op_define"),
+                at_ms: 1_730_000_000_000,
+            })),
+            env(RuntimeEvent::AgentRoleRetracted(AgentRoleRetracted {
+                project: project(),
+                role_id: "retract-parity".to_owned(),
+                retracted_by: OperatorId::new("op_retract"),
+                at_ms: 1_730_000_000_500,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        assert!(
+            AgentRoleReadModel::get_active(&mem, &project(), "retract-parity")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            AgentRoleReadModel::get_active(&adapter, &project(), "retract-parity")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mem_row = AgentRoleReadModel::get_any(&mem, &project(), "retract-parity")
+            .await
+            .unwrap()
+            .unwrap();
+        let sqlite_row = AgentRoleReadModel::get_any(&adapter, &project(), "retract-parity")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.retracted_at, Some(1_730_000_000_500));
+        assert_eq!(
+            mem_row.retracted_by.as_ref().unwrap().as_str(),
+            "op_retract"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_role_projection_matches_across_backends_on_repost_after_retract() {
+        let mem = InMemoryStore::new();
+        let adapter = SqliteAdapter::in_memory().await.unwrap();
+        let sqlite_log = cairn_store::sqlite::SqliteEventLog::new(adapter.pool().clone());
+
+        let role_v1 = ParityAgentRole::new("redef-parity", "V1", ParityTier::Standard)
+            .with_system_prompt("## Specialty\nV1.\n");
+        let role_v2 = ParityAgentRole::new("redef-parity", "V2", ParityTier::Standard)
+            .with_system_prompt("## Specialty\nV2.\n");
+        let events = vec![
+            env(RuntimeEvent::AgentRoleDefined(AgentRoleDefined {
+                project: project(),
+                role: role_v1,
+                shadows_builtin: None,
+                defined_by: OperatorId::new("op_v1"),
+                at_ms: 1_730_000_000_000,
+            })),
+            env(RuntimeEvent::AgentRoleRetracted(AgentRoleRetracted {
+                project: project(),
+                role_id: "redef-parity".to_owned(),
+                retracted_by: OperatorId::new("op_retract"),
+                at_ms: 1_730_000_000_500,
+            })),
+            env(RuntimeEvent::AgentRoleDefined(AgentRoleDefined {
+                project: project(),
+                role: role_v2,
+                shadows_builtin: None,
+                defined_by: OperatorId::new("op_v2"),
+                at_ms: 1_730_000_001_000,
+            })),
+        ];
+        append_both(&mem, &sqlite_log, &events).await;
+
+        let mem_row = AgentRoleReadModel::get_active(&mem, &project(), "redef-parity")
+            .await
+            .unwrap()
+            .expect("active row after re-POST");
+        let sqlite_row = AgentRoleReadModel::get_active(&adapter, &project(), "redef-parity")
+            .await
+            .unwrap()
+            .expect("sqlite active row after re-POST");
+
+        assert_eq!(mem_row, sqlite_row);
+        assert_eq!(mem_row.role.display_name, "V2");
+        assert_eq!(mem_row.defined_at, 1_730_000_001_000);
+        assert!(mem_row.retracted_at.is_none());
+        assert!(mem_row.retracted_by.is_none());
+        assert!(mem_row.is_active());
     }
 }
 

@@ -5901,3 +5901,109 @@ fn pg_run_cost_alert_row_into_record(
         actual_cost_micros: actual_cost_micros.max(0) as u64,
     }
 }
+
+// ── RFC 031 PR-B2: AgentRoleReadModel impl ───────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct AgentRoleRow {
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    role_id: String,
+    role_json: String,
+    shadows_builtin: Option<String>,
+    defined_by: String,
+    defined_at: i64,
+    retracted_at: Option<i64>,
+    retracted_by: Option<String>,
+}
+
+impl AgentRoleRow {
+    fn into_record(self) -> Result<crate::projections::AgentRoleRecord, StoreError> {
+        let role: cairn_domain::agent_roles::AgentRole = serde_json::from_str(&self.role_json)
+            .map_err(|err| StoreError::Serialization(err.to_string()))?;
+        Ok(crate::projections::AgentRoleRecord {
+            project: ProjectKey::new(
+                self.tenant_id.as_str(),
+                self.workspace_id.as_str(),
+                self.project_id.as_str(),
+            ),
+            role_id: self.role_id,
+            role,
+            shadows_builtin: self.shadows_builtin,
+            defined_by: OperatorId::new(self.defined_by),
+            defined_at: self.defined_at.max(0) as u64,
+            retracted_at: self.retracted_at.map(|v| v.max(0) as u64),
+            retracted_by: self.retracted_by.map(OperatorId::new),
+        })
+    }
+}
+
+#[async_trait]
+impl crate::projections::AgentRoleReadModel for PgAdapter {
+    async fn get_active(
+        &self,
+        project: &ProjectKey,
+        role_id: &str,
+    ) -> Result<Option<crate::projections::AgentRoleRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {cols} FROM project_agent_roles \
+             WHERE tenant_id = $1 AND workspace_id = $2 \
+               AND project_id = $3 AND role_id = $4 \
+               AND retracted_at IS NULL",
+            cols = crate::projections::AGENT_ROLE_PROJECTION_COLS
+        );
+        let row: Option<AgentRoleRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(role_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(AgentRoleRow::into_record).transpose()
+    }
+
+    async fn get_any(
+        &self,
+        project: &ProjectKey,
+        role_id: &str,
+    ) -> Result<Option<crate::projections::AgentRoleRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {cols} FROM project_agent_roles \
+             WHERE tenant_id = $1 AND workspace_id = $2 \
+               AND project_id = $3 AND role_id = $4",
+            cols = crate::projections::AGENT_ROLE_PROJECTION_COLS
+        );
+        let row: Option<AgentRoleRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .bind(role_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        row.map(AgentRoleRow::into_record).transpose()
+    }
+
+    async fn list_active(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::AgentRoleRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {cols} FROM project_agent_roles \
+             WHERE tenant_id = $1 AND workspace_id = $2 \
+               AND project_id = $3 AND retracted_at IS NULL \
+             ORDER BY role_id ASC",
+            cols = crate::projections::AGENT_ROLE_PROJECTION_COLS
+        );
+        let rows: Vec<AgentRoleRow> = sqlx::query_as(&sql)
+            .bind(project.tenant_id.as_str())
+            .bind(project.workspace_id.as_str())
+            .bind(project.project_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::Internal(e.to_string()))?;
+        rows.into_iter().map(AgentRoleRow::into_record).collect()
+    }
+}

@@ -91,6 +91,30 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (each validator rule has at least one pass + one fail case), 13 service unit (tests
   already landed in PR-A; no net-new service tests in PR-B).
 
+- **RFC 031 PR-B2: operator-defined agent roles — Postgres + SQLite durable projection parity.**
+  Closes the durable-backend gap left open by PR-B: pg and sqlite operators no longer need
+  the boot-time replay into `InMemoryStore` to power the agent-roles HTTP surface.
+
+  Key changes:
+
+  - `V074__create_project_agent_roles.sql` migration (pg). `project_agent_roles` table with
+    composite PK on `(tenant_id, workspace_id, project_id, role_id)`. BIGINT ms-since-epoch
+    timestamps — no JSONB, no partial indexes per portability guidelines. Mirrored verbatim
+    in `sqlite/schema.rs`.
+
+  - `PgSyncProjection` and `SqliteSyncProjection` `apply` arms for `AgentRoleDefined`
+    (upsert + clear `retracted_at`/`retracted_by` to NULL per §D6) and `AgentRoleRetracted`
+    (UPDATE those two columns). Replaces the PR-A explicit no-op arms.
+
+  - `AgentRoleReadModel` impls for `PgAdapter` and `SqliteAdapter` (`get_active`, `get_any`,
+    `list_active`). Both adapters use a shared column-list constant to keep SELECT column
+    order in sync across query sites.
+
+  - 3 new `projection_parity.rs` fixtures: define (active row parity), retract (`get_active`
+    returns None / `get_any` returns tombstone), re-POST after retract (`retracted_at` clears
+    atomically). All three assert byte-equality between in-memory and sqlite; schema shape is
+    enforced against pg via `pg_migration_contract` + `schema_parity`.
+
 - **`cairn-providers` native Bedrock Converse tool calls.** The native
   `Bedrock` backend now translates cairn's `Tool` / `ToolCall` / `ChatMessage`
   types into the Converse `toolConfig` + content-block shape and parses

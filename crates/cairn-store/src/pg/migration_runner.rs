@@ -482,6 +482,29 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "create_provider_projections",
         include_str!("migrations/V072__create_provider_projections.sql"),
     ),
+    // #791: projection-backed iteration counter on runs. The SQL file
+    // shipped in #792 but was never added to this registry (the
+    // in-memory + sqlite paths carried the column via their monolithic
+    // schema modules). Wiring it here keeps pg operators who boot via
+    // the migration runner in lockstep with the reader-side column
+    // the applier expects. `CHECK (iteration >= 0)` is idempotent on
+    // re-run, and `ADD COLUMN … DEFAULT 0` is a no-op when the column
+    // already exists.
+    (
+        73,
+        "runs_iteration_counter",
+        include_str!("migrations/V073__runs_iteration_counter.sql"),
+    ),
+    // RFC 031 PR-B2: `project_agent_roles` projection table. PR-B wired
+    // the InMemoryStore applier + HTTP surface + tests; PR-B2 closes
+    // the durable-backend gap so pg serves the handler directly rather
+    // than via the boot-time replay into `InMemoryStore`. Mirrored in
+    // `sqlite/schema.rs` (same table shape).
+    (
+        74,
+        "create_project_agent_roles",
+        include_str!("migrations/V074__create_project_agent_roles.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

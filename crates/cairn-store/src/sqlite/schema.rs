@@ -1643,4 +1643,25 @@ CREATE VIEW IF NOT EXISTS v_all_ingest_jobs AS
            document_id, provider_ref, status, source_type, reason,
            submitted_at_ms, updated_at_ms
       FROM memory_ingest_jobs;
+
+-- RFC 031 PR-B2: `project_agent_roles` projection (sqlite parity).
+-- Mirror at `crates/cairn-store/src/pg/migrations/V074__create_project_agent_roles.sql`.
+-- The applier writes the same columns on pg and sqlite; the backend-
+-- agnostic parity harness asserts byte-equality of the projected rows.
+CREATE TABLE IF NOT EXISTS project_agent_roles (
+    tenant_id          TEXT    NOT NULL,
+    workspace_id       TEXT    NOT NULL,
+    project_id         TEXT    NOT NULL,
+    role_id            TEXT    NOT NULL,
+    role_json          TEXT    NOT NULL,
+    shadows_builtin    TEXT,
+    defined_by         TEXT    NOT NULL,
+    defined_at         INTEGER NOT NULL,
+    retracted_at       INTEGER,
+    retracted_by       TEXT,
+    PRIMARY KEY (tenant_id, workspace_id, project_id, role_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_agent_roles_active
+    ON project_agent_roles (tenant_id, workspace_id, project_id, role_id);
 "#;
