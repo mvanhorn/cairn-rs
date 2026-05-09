@@ -319,11 +319,27 @@ async fn spawn_subagent_persists_parent_context_on_child_run_default() {
     );
 
     let body: Value = r.json().await.expect("defaults body json");
-    assert_eq!(
-        body.get("value").and_then(|v| v.as_str()),
-        Some(PARENT_CONTEXT),
-        "#775: child run's parent_context default must match the LLM's \
-         `tool_args[\"parent_context\"]` verbatim. Body: {body}",
+    let value = body
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    // #813: post-fix, the runtime auto-prepends a `Workspace path: <abs>`
+    // header to the child's parent_context so sub-agents know where to
+    // `cd` on their first DECIDE without a discovery round-trip. The
+    // LLM-supplied parent_context follows. Pre-#813 the child's
+    // parent_context was the LLM's string verbatim; post-#813 we
+    // assert the LLM's string is CONTAINED (so the LLM intent is
+    // preserved) AND the workspace_line prefix is present.
+    assert!(
+        value.contains(PARENT_CONTEXT),
+        "#775 + #813: child run's parent_context must contain the LLM's \
+         `tool_args[\"parent_context\"]` verbatim. value={value}",
+    );
+    assert!(
+        value.contains("Workspace path:"),
+        "#813: child run's parent_context must auto-include the \
+         resolved workspace path so sub-agents skip the discovery \
+         loop on their first DECIDE. value={value}",
     );
 }
 
@@ -431,8 +447,13 @@ async fn spawn_subagent_omits_parent_context_default_when_unset() {
         .and_then(|v| v.as_str())
         .expect("child has run_id");
 
-    // The parent_context default key MUST be 404 — no spawn-time
-    // value, no row.
+    // #775 + #813: pre-#813 this test asserted 404 — the persistence
+    // path was gated on `Some(_)` so a spawn without LLM-supplied
+    // parent_context wrote no row. Post-#813 the runtime ALWAYS
+    // injects a `Workspace path: <abs>` header into the child's
+    // parent_context so sub-agents skip the discovery loop on their
+    // first DECIDE. The row exists; its content is the workspace
+    // line alone (no LLM-supplied tail).
     let key = format!("run:{child_run_id}:parent_context");
     let r = h
         .client()
@@ -446,11 +467,22 @@ async fn spawn_subagent_omits_parent_context_default_when_unset() {
         .expect("defaults GET reaches server");
     assert_eq!(
         r.status().as_u16(),
-        404,
-        "#775: when the LLM omits parent_context, the persistence \
-         path must not write a default. A 200 here means we leak \
-         empty rows on every spawn that didn't supply context. \
+        200,
+        "#813: parent_context is auto-populated with the workspace \
+         path on every spawn, even when the LLM omits parent_context. \
+         A 404 here means the workspace-path auto-inject regressed. \
          Body: {}",
         r.text().await.unwrap_or_default(),
+    );
+    let body: Value = r.json().await.expect("defaults body json");
+    let value = body
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        value.contains("Workspace path:"),
+        "#813: parent_context must contain the workspace_line when \
+         the LLM omits parent_context (auto-inject is the only \
+         source). value={value}",
     );
 }

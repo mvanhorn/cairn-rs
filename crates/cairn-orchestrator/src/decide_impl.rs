@@ -947,10 +947,18 @@ fn build_user_message(
     // bookkeeping; the model already has step_history for "what
     // happened so far" context. Operators still get iteration via
     // the projection (`run.iteration`) and the trajectory endpoint.
+    // #813: workspace path rendered into ## Run state so sub-agents
+    // know where to `cd` before running git / file commands. R23
+    // dogfood found executors spending 11+ iterations on `pwd`/`find
+    // Cargo.toml`/`ls /tmp/cairn-runs/...` discovery loops because the
+    // working directory was set in the runtime context but never
+    // surfaced in the prompt. Path is rendered verbatim — no truncation
+    // — so the model can copy-paste it into a `cd` command.
     let run_state_part = format!(
-        "## Run state\nrun_id: {}\nagent_type: {}",
+        "## Run state\nrun_id: {}\nagent_type: {}\nworkspace_path: {}",
         ctx.run_id.as_str(),
         ctx.agent_type,
+        ctx.working_dir.display(),
     );
     let has_memory = !gather.memory_chunks.is_empty();
     // #774: footer shape depends on the role's `response_shape`.
@@ -2368,6 +2376,29 @@ mod tests {
             enum_strs.len(),
             expected_count,
             "role enum must be derived from default_roles() minus orchestrator"
+        );
+    }
+
+    /// #813: `## Run state` must include the resolved `working_dir`
+    /// so sub-agents see the workspace path on their first DECIDE
+    /// without a discovery round-trip. R23 dogfood found executors
+    /// running 11 inline `pwd`/`find Cargo.toml`/`ls /tmp/...` calls
+    /// because the runtime had the path in `OrchestrationContext`
+    /// but never surfaced it in the prompt.
+    #[test]
+    fn build_user_message_renders_workspace_path_in_run_state() {
+        let mut c = ctx();
+        c.working_dir = std::path::PathBuf::from("/home/ubuntu/dogfood-roguelike");
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            msg.contains("## Run state"),
+            "user message must include `## Run state` header"
+        );
+        assert!(
+            msg.contains("workspace_path: /home/ubuntu/dogfood-roguelike"),
+            "#813: `## Run state` must surface the resolved working_dir as \
+             `workspace_path: <path>` so the child knows where to `cd`. \
+             Got: {msg}"
         );
     }
 

@@ -1268,7 +1268,7 @@ impl RuntimeExecutePhase {
                 // ignored — the schema declares `string` so any other
                 // shape is malformed and the child is better off without
                 // garbage context than with it.
-                let parent_context: Option<String> = proposal
+                let llm_parent_context: Option<String> = proposal
                     .tool_args
                     .as_ref()
                     .and_then(|args| args.get("parent_context"))
@@ -1276,6 +1276,71 @@ impl RuntimeExecutePhase {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned);
+
+                // #813: ALWAYS thread the parent's resolved workspace
+                // path into the child's parent_context. R23 dogfood
+                // showed executor sub-agents spending 11+ iterations on
+                // `pwd` / `find Cargo.toml` / `ls /tmp/cairn-runs/...`
+                // discovery loops because `working_dir` was set in the
+                // runtime context but not surfaced anywhere the child
+                // could see it. The orchestrator role doesn't have file
+                // tools (#806), so it can't include the path itself —
+                // the runtime is the only actor with both the resolved
+                // working_dir and the spawn site. We inject a
+                // `Workspace path: <abs path>` line at the top of the
+                // child's parent_context so the LLM sees it on its
+                // first DECIDE without a discovery round-trip. The
+                // LLM-supplied context (if any) follows.
+                //
+                // Path safety (Gemini PR #814 review): only inject the
+                // workspace_line when `ctx.working_dir` is an absolute
+                // path with no `.` / `..` components. A relative or
+                // dotted path would tell the LLM to `cd .` (which
+                // resolves wherever the harness is running) or
+                // `cd ../..` (path-traversal). Either is worse than
+                // omitting the line and letting the LLM run its
+                // discovery loop. `working_dir` is normally produced
+                // by `working_dir_for_run` which canonicalizes, but
+                // the validation here is cheap and closes the gap if
+                // a future caller short-circuits that helper.
+                let workspace_path_safe = {
+                    let p = &ctx.working_dir;
+                    let s = p.to_string_lossy();
+                    p.is_absolute()
+                        && !s.is_empty()
+                        && !p.components().any(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::CurDir | std::path::Component::ParentDir
+                            )
+                        })
+                };
+                let parent_context: Option<String> = if workspace_path_safe {
+                    let workspace_line = format!(
+                        "Workspace path: {}\n\
+                         Start by `cd`-ing here. The repository / project lives at this path; \
+                         do not search for it.",
+                        ctx.working_dir.display(),
+                    );
+                    match llm_parent_context {
+                        Some(llm_ctx) => Some(format!("{workspace_line}\n\n{llm_ctx}")),
+                        None => Some(workspace_line),
+                    }
+                } else {
+                    // Working dir is relative / empty / contains `..`.
+                    // Skip the auto-inject — sending an unsafe path to
+                    // the LLM is worse than the discovery loop. Log at
+                    // WARN so operators can see why a child is back to
+                    // the discovery path.
+                    tracing::warn!(
+                        run_id = %ctx.run_id,
+                        working_dir = %ctx.working_dir.display(),
+                        "#813 + #814 review: parent's working_dir is not a clean absolute path \
+                         (relative / empty / contains `.` or `..`); skipping workspace_line \
+                         auto-inject for child spawn"
+                    );
+                    llm_parent_context
+                };
 
                 let child_task_id = TaskId::new(new_id("child_task"));
                 // #670 G1+G2: scope the child task to the parent's
