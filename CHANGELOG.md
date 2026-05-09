@@ -95,6 +95,34 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`OrchestrationContext.iteration` now persists across
+  `/orchestrate`-resume boundaries (#788).** Pre-fix,
+  `crates/cairn-app/src/handlers/runs/orchestrate.rs:975` hardcoded
+  `iteration: 0` on every POST to `/v1/runs/:id/orchestrate` —
+  including F49 auto-resume kicks after tool-call approval. Result:
+  every resumed loop ran with `ctx.iteration == 0`, so every step
+  pushed by F25 drain or by the loop's own `step_history` rendered
+  as `[0]` in the next DECIDE prompt's `## Step history` section,
+  and `should_inject_stuck_nudge` (which gates on iteration count)
+  never fired across resumes. R20 dogfood (2026-05-09) saw an
+  executor subagent run 36 LLM calls / 62 approved bash invocations
+  on issue #8 with every step rendered `[0]`, and the model
+  responded "Looking at the step history, it seems there have been
+  many attempts with various issues" before issuing yet another
+  bash discovery call. Post-fix, prior-iteration count is derived
+  from the run's event log by counting
+  `RunStateChanged { from: WaitingApproval, to: Running }`
+  transitions — the only run-indexed event that fires
+  deterministically once per resumed iteration. Read by
+  `EntityRef::Run`, no schema change. Doesn't fix the bash-loop
+  pathology directly (#789 tracks the design conversation), but
+  removes a confounder that masked the loop pattern from the
+  model and from the iteration-threshold nudge. Regression test:
+  `crates/cairn-app/tests/test_788_iteration_counter_persists_across_resumes.rs`
+  drives a tool-call → approve → resume cycle and asserts the
+  rendered step-history contains a `[N]` entry with `N >= 1`;
+  the test fails on pre-fix code.
+
 - **Per-iteration footer no longer biases procedural sub-agents toward
   early `complete_run` (#774).** Pre-fix, every DECIDE iteration appended
   a `## Next step` footer that read "If you already have the answer,
