@@ -9,6 +9,28 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **Boot-time scrub of operator-environment credential variables
+  (#773).** `cairn-app` now removes well-known credential env vars
+  (`GH_TOKEN`, `GITHUB_TOKEN`, `AWS_*`, `AZURE_*`, `GCP_*`,
+  `OPENAI_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`, plus generic
+  `*_API_KEY` / `*_SECRET` / `*_ACCESS_TOKEN` suffix patterns) from
+  `std::env` at startup, before any subprocess spawn. Without the
+  scrub, an operator's stale `GH_TOKEN` propagates into every
+  bash subprocess the harness-tools layer spawns for sub-agents and
+  shadows the host's valid hosts.yml credentials — observed wedge
+  in R19 dogfood (executor sub-agent looped 71 iterations on
+  `gh auth status` with `unset GH_TOKEN` between calls because each
+  new bash subprocess re-inherited the bad token from cairn-app's
+  env). Sub-agents that need a credential get it via the cairn
+  credential service (POST `/v1/admin/tenants/.../credentials`),
+  not via inherited operator env. Operator override:
+  `CAIRN_INHERIT_OPERATOR_ENV=1` keeps the legacy behaviour for
+  trusted local-dev environments. `CAIRN_ADMIN_TOKEN`,
+  `CAIRN_CREDENTIAL_KEY`, `CAIRN_FABRIC_WAITPOINT_HMAC_SECRET` are
+  on a never-scrub allowlist (cairn-app reads them legitimately).
+
 ### Fixed
 
 - **Per-iteration footer no longer biases procedural sub-agents toward

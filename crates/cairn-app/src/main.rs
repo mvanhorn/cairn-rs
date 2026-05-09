@@ -478,6 +478,45 @@ async fn real_main() {
     // Silently ignored when the file doesn't exist.
     let _ = dotenvy::dotenv();
 
+    // #773: scrub credential env vars from cairn-app's process
+    // environment before any subprocess spawn. Operator-environment
+    // credentials (`GH_TOKEN`, `AWS_*`, `OPENAI_API_KEY`, …)
+    // inherited from the launching shell would otherwise propagate
+    // into every bash subprocess the harness-tools layer spawns for
+    // sub-agents. R19 dogfood reproduced the wedge: a stale
+    // `GH_TOKEN` shadowed gh CLI's valid hosts.yml credentials,
+    // every `gh` call returned 401, the executor sub-agent looped
+    // for 71 iterations on `unset GH_TOKEN; gh auth status` without
+    // ever writing a file. Removing the var at the cairn-app
+    // process layer covers every spawned bash by inheritance.
+    //
+    // Operator override: `CAIRN_INHERIT_OPERATOR_ENV=1` keeps the
+    // legacy behaviour (used by local dev where the host's env is
+    // intentionally trusted). Tracing is not yet initialised here
+    // — log to stderr.
+    {
+        let report = cairn_app::credential_env_scrub::scrub_credential_env_vars();
+        if report.skipped_via_override {
+            eprintln!(
+                "#773 credential env scrub: SKIPPED (CAIRN_INHERIT_OPERATOR_ENV \
+                 is set). Operator-environment credentials propagate into \
+                 sub-agent bash subprocesses; this is acceptable only for \
+                 trusted local-dev environments."
+            );
+        } else if !report.removed.is_empty() {
+            // Sort for stable log output. Names only; values are
+            // credentials and never logged.
+            let mut names = report.removed.clone();
+            names.sort();
+            eprintln!(
+                "#773 credential env scrub: removed {} operator-inherited \
+                 credential vars before any subprocess spawn (names only): {}",
+                names.len(),
+                names.join(", "),
+            );
+        }
+    }
+
     // Initialise structured request tracing.  Operators can tune verbosity via
     // the RUST_LOG env var (e.g. RUST_LOG=cairn_app=info,tower_http=debug).
     //

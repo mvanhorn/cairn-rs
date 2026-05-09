@@ -8,6 +8,7 @@
 
 pub mod bootstrap;
 pub mod child_run_driver;
+pub mod credential_env_scrub;
 pub mod errors;
 pub mod extractors;
 pub mod fabric_adapter;
