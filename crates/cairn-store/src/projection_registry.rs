@@ -265,6 +265,21 @@ pub const REGISTRY: &[ProjectionEntry] = &[
         },
     },
     ProjectionEntry {
+        // #789: per-iteration compacted reasoning record. Lives on the
+        // InMemoryStore's per-run reasoning_steps vec (capped at
+        // REASONING_STEP_CAP_PER_RUN = 200). Read endpoints on
+        // `--db memory` serve from there; pg/sqlite operators get an
+        // empty trajectory until backend parity lands as a follow-up.
+        // Marked Ephemeral (not Stubbed) because the projection IS
+        // implemented — just only on the in-memory backend, not the
+        // durable ones, and the stub-guard CI job rejects new
+        // log_stub sites which Stubbed implies.
+        variant: "RunReasoningStepRecorded",
+        status: ProjectionStatus::Ephemeral {
+            reason: "#789: per-iteration trajectory record materialized only on InMemoryStore for now; pg/sqlite parity tracked as follow-up",
+        },
+    },
+    ProjectionEntry {
         variant: "RecoveryAttempted",
         status: ProjectionStatus::Projected {
             table: Some("recovery_attempts"),
@@ -1641,16 +1656,21 @@ mod tests {
         //     startup family-mismatch scan emits these; SSE + metrics
         //     only, no read-model row needed. Net: +2 Ephemeral →
         //     141 / 35 / 0.
+        //
+        //   * #789: `RunReasoningStepRecorded` added as Ephemeral —
+        //     materialized only on InMemoryStore for now (per-run
+        //     vec, capped at 200), pg/sqlite parity is a follow-up.
+        //     Net: +1 Ephemeral → 141 / 36 / 0.
         assert_eq!(
             projected, 141,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
-            ephemeral, 35,
+            ephemeral, 36,
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 176);
+        assert_eq!(projected + ephemeral + stubbed, 177);
     }
 
     #[test]

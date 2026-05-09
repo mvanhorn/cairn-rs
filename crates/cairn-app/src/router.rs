@@ -1072,6 +1072,11 @@ impl AppBootstrap {
             .route("/v1/runs/:id/audit", get(get_run_audit_trail_handler))
             .route("/v1/runs/:id/cost", get(get_run_cost_handler))
             .route("/v1/runs/:id/telemetry", get(get_run_telemetry_handler))
+            // #789: per-run reasoning trajectory for post-mortem replay.
+            .route("/v1/runs/:id/trajectory", get(get_run_trajectory_handler))
+            // #789: live fleet view of every active agent in the
+            // caller's tenant + their current action.
+            .route("/v1/admin/agents/live", get(get_live_agents_handler))
             .route("/v1/runs/:id/recover", post(recover_run_handler))
             .route("/v1/runs/:id/events", get(list_run_events_handler))
             .route("/v1/runs/:id/replay", get(replay_run_handler))

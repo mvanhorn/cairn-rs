@@ -43,6 +43,7 @@ pub mod plan_review;
 pub mod prompt;
 pub mod provider;
 pub mod quota;
+pub mod reasoning_step;
 pub mod recovery;
 pub mod retention;
 pub mod routing;

@@ -593,3 +593,146 @@ pub(crate) async fn get_run_audit_trail_handler(
     )
         .into_response()
 }
+
+/// #789: per-run reasoning trajectory for post-mortem replay.
+///
+/// `GET /v1/runs/:id/trajectory` returns the run's compacted
+/// per-iteration reasoning steps in chronological order. Each step
+/// carries the model's chain-of-thought, the top-1 proposed action,
+/// the user-message delta vs the prior iteration, and the calibrated
+/// confidence — enough to read the run like a story.
+///
+/// On `--db memory` the projection serves up to
+/// `REASONING_STEP_CAP_PER_RUN` steps per run (FIFO eviction past
+/// that). pg/sqlite parity is a follow-up — those backends currently
+/// return an empty trajectory.
+pub(crate) async fn get_run_trajectory_handler(
+    State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
+    Path(id): Path<String>,
+    Query(pagination): Query<PaginationQuery>,
+) -> impl IntoResponse {
+    let run_id = RunId::new(id);
+    // Tenant gate before exposing any trajectory data.
+    let _run = match load_run_visible_to_tenant(state.as_ref(), &tenant_scope, &run_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return run_not_found_response(),
+        Err(response) => return response,
+    };
+
+    let limit = pagination.limit.unwrap_or(200).min(200);
+    let offset = pagination.offset.unwrap_or(0);
+    use cairn_store::projections::reasoning_step::ReasoningStepReadModel;
+    let total =
+        match ReasoningStepReadModel::count_for_run(state.runtime.store.as_ref(), &run_id).await {
+            Ok(n) => n,
+            Err(err) => return store_error_response(err),
+        };
+    match ReasoningStepReadModel::list_by_run(state.runtime.store.as_ref(), &run_id, limit, offset)
+        .await
+    {
+        Ok(items) => {
+            // `total` is the full count for the run (Gemini PR #794
+            // review): clients can compute `has_more` as
+            // `offset + items.len() < total`. `items.len()` is the
+            // returned-page size — kept on the response for
+            // convenience.
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": run_id.as_str(),
+                    "items": items,
+                    "count": items.len(),
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => store_error_response(err),
+    }
+}
+
+/// #789: live fleet view — every active agent + its current action.
+///
+/// `GET /v1/admin/agents/live` returns a snapshot of every run in a
+/// non-terminal state for the caller's tenant, joined with the most
+/// recent reasoning step (current action + reasoning preview). Used
+/// by the operator dashboard to answer "what's in the box right now,
+/// and what is each agent thinking?".
+///
+/// Tenant-scoped: admin gets all tenants, regular operators see only
+/// their tenant's runs.
+pub(crate) async fn get_live_agents_handler(
+    State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
+) -> impl IntoResponse {
+    use cairn_store::projections::reasoning_step::ReasoningStepReadModel;
+    use cairn_store::projections::RunReadModel;
+    // Aggregate runs across the non-terminal states. RunReadModel
+    // exposes `list_by_state` indexed on the projection's state
+    // column; iterate the active set and concat. Tenant filter
+    // happens client-side because the trait doesn't expose a
+    // `list_active_by_tenant` helper today (see follow-up: add one
+    // and replace this loop with a single index-friendly call).
+    let active_states = [
+        cairn_domain::RunState::Pending,
+        cairn_domain::RunState::Running,
+        cairn_domain::RunState::WaitingApproval,
+        cairn_domain::RunState::WaitingDependency,
+        cairn_domain::RunState::Paused,
+    ];
+    let mut runs: Vec<cairn_store::projections::RunRecord> = Vec::new();
+    for run_state in active_states {
+        match RunReadModel::list_by_state(state.runtime.store.as_ref(), run_state, 500).await {
+            Ok(rs) => runs.extend(rs.into_iter().filter(|r| {
+                tenant_scope.is_admin || r.project.tenant_id == *tenant_scope.tenant_id()
+            })),
+            Err(err) => return store_error_response(err),
+        }
+    }
+    let mut agents: Vec<serde_json::Value> = Vec::new();
+    for run in runs {
+        // N+1 caveat (Gemini PR #794 review): each iteration takes
+        // the in-memory state lock once. With the InMemoryStore
+        // that's a single Mutex acquisition per active run —
+        // measured microseconds even with 500 active runs. A future
+        // bulk-fetch helper on the trait would amortize this (and
+        // let pg/sqlite serve from a single round-trip when parity
+        // lands); tracked as a follow-up.
+        //
+        // Errors propagate now (vs the previous `unwrap_or(None)`
+        // which silently swallowed projection failures — Gemini
+        // same review).
+        let latest =
+            match ReasoningStepReadModel::latest_for_run(state.runtime.store.as_ref(), &run.run_id)
+                .await
+            {
+                Ok(opt) => opt,
+                Err(err) => return store_error_response(err),
+            };
+        agents.push(serde_json::json!({
+            "run_id": run.run_id.as_str(),
+            "session_id": run.session_id.as_str(),
+            "agent_role_id": run.agent_role_id,
+            "state": format!("{:?}", run.state).to_lowercase(),
+            "iteration": run.iteration,
+            "started_at_ms": run.created_at,
+            "updated_at_ms": run.updated_at,
+            "current_action": latest.as_ref().map(|s| serde_json::to_value(&s.proposed_action).unwrap_or(serde_json::Value::Null)),
+            "current_reasoning_compact": latest.as_ref().map(|s| s.reasoning_compact.clone()),
+            "confidence": latest.as_ref().map(|s| s.confidence),
+            "last_step_at_ms": latest.as_ref().map(|s| s.recorded_at_ms),
+        }));
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tenant_id": tenant_scope.tenant_id().as_str(),
+            "agents": agents,
+            "count": agents.len(),
+        })),
+    )
+        .into_response()
+}

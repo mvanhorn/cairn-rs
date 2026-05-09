@@ -8,6 +8,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 
 | Method | Path | Classification | Notes |
 |---|---|---|---|
+| `GET` | `/v1/admin/agents/live` | Preserve | #789; live fleet view — every active agent (run state ∈ {pending, running, waiting_approval, waiting_dependency, paused}) joined with the latest reasoning step (current_action + reasoning preview + confidence). Tenant-scoped. |
 | `GET` | `/v1/admin/audit-log` | Preserve | audit log entries |
 | `GET` | `/v1/admin/audit-log/:resource_type/:resource_id` | Preserve |  |
 | `POST` | `/v1/admin/backup` | Preserve |  |

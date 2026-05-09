@@ -42,6 +42,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `GET` | `/v1/runs/:id/tasks` | Preserve |  |
 | `POST` | `/v1/runs/:id/tasks` | Preserve |  |
 | `GET` | `/v1/runs/:id/telemetry` | Preserve | F29 CD; live-aggregated `{state, stuck, provider_calls, tool_invocations, totals, phase_timings}` |
+| `GET` | `/v1/runs/:id/trajectory` | Preserve | #789; query: limit?, offset?; chronological per-iteration reasoning steps (chain-of-thought + top-1 proposed action + step-history snapshot + confidence) for post-mortem replay |
 | `GET` | `/v1/runs/:id/tool-invocations` | Preserve |  |
 | `POST` | `/v1/runs/batch` | Preserve |  |
 | `GET` | `/v1/runs/cost-alerts` | Preserve | { items } |

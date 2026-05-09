@@ -546,7 +546,13 @@ impl<P: GraphProjection> EventProjector<P> {
             // existing node, observable via the `eval_runs` table, not
             // via new graph edges.
             | RuntimeEvent::EvalRunScored(_)
-            | RuntimeEvent::EvalRubricScored(_) => {}
+            | RuntimeEvent::EvalRubricScored(_)
+            // #789: per-iteration reasoning records are operator
+            // observability — not provenance. The decision artefact
+            // (run, tool invocation, etc.) is already in the graph;
+            // reasoning steps describe the model's internal thinking,
+            // which doesn't add provenance edges.
+            | RuntimeEvent::RunReasoningStepRecorded(_) => {}
 
             RuntimeEvent::EvalRunStarted(e) => {
                 self.add_node(

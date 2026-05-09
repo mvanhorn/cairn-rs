@@ -34,6 +34,7 @@ GET	/metrics	preserve	-	-
 GET	/openapi.json	preserve	-	-
 GET	/ready	preserve	-	-
 GET	/v1/a2a/tasks/:id	preserve	-	A2A task status
+GET	/v1/admin/agents/live	preserve	-	-
 GET	/v1/admin/audit-log	preserve	-	audit log entries
 GET	/v1/admin/audit-log/:resource_type/:resource_id	preserve	-	-
 GET	/v1/admin/capabilities	preserve	-	feature capability map
@@ -209,6 +210,7 @@ GET	/v1/runs/:id/subagent-spawns	preserve	-	-
 GET	/v1/runs/:id/tasks	preserve	-	-
 GET	/v1/runs/:id/telemetry	preserve	-	-
 GET	/v1/runs/:id/tool-invocations	preserve	-	-
+GET	/v1/runs/:id/trajectory	preserve	-	-
 GET	/v1/runs/cost-alerts	preserve	-	{ items }
 GET	/v1/runs/escalated	preserve	-	{ items }
 GET	/v1/runs/resume-due	preserve	-	{ items }

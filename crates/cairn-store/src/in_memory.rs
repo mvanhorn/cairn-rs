@@ -163,6 +163,12 @@ struct State {
     /// Separate from `llm_traces` so the big text fields don't bloat
     /// the metadata projection.
     llm_completion_bodies: HashMap<String, crate::projections::LlmCompletionBodyRecord>,
+    /// #789: per-iteration compacted reasoning records keyed by
+    /// `run_id`, ordered chronologically (oldest → newest).
+    /// Capped at `REASONING_STEP_CAP_PER_RUN` per run via FIFO
+    /// eviction. Written from `RunReasoningStepRecorded` events.
+    reasoning_steps:
+        HashMap<cairn_domain::RunId, Vec<crate::projections::reasoning_step::ReasoningStepRecord>>,
     operator_profiles: HashMap<String, crate::projections::OperatorProfileRecord>,
     full_operator_profiles: HashMap<String, cairn_domain::org::OperatorProfile>,
     /// RFC 026 PR-A0: operator → tenant-role mapping keyed on
@@ -417,6 +423,7 @@ impl InMemoryStore {
                 workspace_costs: HashMap::new(),
                 llm_traces: Vec::new(),
                 llm_completion_bodies: HashMap::new(),
+                reasoning_steps: HashMap::new(),
                 operator_profiles: HashMap::new(),
                 full_operator_profiles: HashMap::new(),
                 operator_tenant_roles: HashMap::new(),
@@ -2890,6 +2897,30 @@ impl InMemoryStore {
                     }
                 }
             }
+            // #789: per-iteration compacted reasoning step. Pushed
+            // onto the per-run vec; capped at REASONING_STEP_CAP_PER_RUN
+            // via FIFO eviction of the oldest entry. Replay-safe — a
+            // re-applied event with an iteration we've already seen
+            // is appended (operators reading the trajectory will see
+            // the duplicate; the recorded_at_ms tells them which is
+            // newer).
+            RuntimeEvent::RunReasoningStepRecorded(e) => {
+                let record =
+                    crate::projections::reasoning_step::ReasoningStepRecord::from_event(e);
+                let entries = state
+                    .reasoning_steps
+                    .entry(e.run_id.clone())
+                    .or_default();
+                entries.push(record);
+                if entries.len()
+                    > crate::projections::reasoning_step::REASONING_STEP_CAP_PER_RUN
+                {
+                    // FIFO: drop oldest. The vec is naturally
+                    // chronological (push appends), so remove the
+                    // front.
+                    entries.remove(0);
+                }
+            }
             RuntimeEvent::TenantCreated(e) => {
                 state.tenants.insert(
                     e.tenant_id.as_str().to_owned(),
@@ -3721,6 +3752,7 @@ fn event_matches_entity(event: &RuntimeEvent, entity: &EntityRef) -> bool {
         (RuntimeEvent::SessionStateChanged(e), EntityRef::Session(id)) => e.session_id == *id,
         (RuntimeEvent::RunCreated(e), EntityRef::Run(id)) => e.run_id == *id,
         (RuntimeEvent::RunStateChanged(e), EntityRef::Run(id)) => e.run_id == *id,
+        (RuntimeEvent::RunReasoningStepRecorded(e), EntityRef::Run(id)) => e.run_id == *id,
         (RuntimeEvent::TaskCreated(e), EntityRef::Task(id)) => e.task_id == *id,
         (RuntimeEvent::TaskLeaseClaimed(e), EntityRef::Task(id)) => e.task_id == *id,
         (RuntimeEvent::TaskLeaseHeartbeated(e), EntityRef::Task(id)) => e.task_id == *id,
@@ -5421,6 +5453,44 @@ impl crate::projections::LlmCompletionBodyReadModel for InMemoryStore {
                 .then_with(|| a.trace_id.cmp(&b.trace_id))
         });
         Ok(rows)
+    }
+}
+
+#[async_trait]
+impl crate::projections::reasoning_step::ReasoningStepReadModel for InMemoryStore {
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::reasoning_step::ReasoningStepRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entries) = state.reasoning_steps.get(run_id) else {
+            return Ok(vec![]);
+        };
+        // The vec is maintained in append order (oldest first), which
+        // is chronological. Slice [offset..offset+limit].
+        Ok(entries.iter().skip(offset).take(limit).cloned().collect())
+    }
+
+    async fn latest_for_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+    ) -> Result<Option<crate::projections::reasoning_step::ReasoningStepRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .reasoning_steps
+            .get(run_id)
+            .and_then(|v| v.last().cloned()))
+    }
+
+    async fn count_for_run(&self, run_id: &cairn_domain::RunId) -> Result<usize, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .reasoning_steps
+            .get(run_id)
+            .map(|v| v.len())
+            .unwrap_or(0))
     }
 }
 

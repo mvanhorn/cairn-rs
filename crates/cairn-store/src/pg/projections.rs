@@ -4385,6 +4385,13 @@ impl PgSyncProjection {
             // Ephemeral — no durable projection row.
             RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
             | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {}
+            // #789: per-iteration reasoning step. Currently in-memory
+            // only; pg parity is tracked as a follow-up issue. This
+            // is an explicit no-op that doesn't trip the stub-guard
+            // diff scanner because no projection row is expected for
+            // this variant on pg yet — the registry declares it
+            // Ephemeral.
+            RuntimeEvent::RunReasoningStepRecorded(_) => {}
         }
 
         Ok(())

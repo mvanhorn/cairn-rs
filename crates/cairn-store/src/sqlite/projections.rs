@@ -4002,6 +4002,9 @@ impl SqliteSyncProjection {
             // dashboard consumes them via SSE.
             RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
             | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {}
+            // #789: per-iteration reasoning step. In-memory only for
+            // now; sqlite parity tracked as a follow-up issue.
+            RuntimeEvent::RunReasoningStepRecorded(_) => {}
         }
 
         Ok(())

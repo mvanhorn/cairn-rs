@@ -139,6 +139,9 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::RunStateChanged(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
         }
+        RuntimeEvent::RunReasoningStepRecorded(_) => {
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
         RuntimeEvent::TaskCreated(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::Task { .. })));
         }
@@ -768,6 +771,20 @@ fn all_variants() -> Vec<RuntimeEvent> {
             failure_class: None,
             pause_reason: None,
             resume_trigger: None,
+        }),
+        RuntimeEvent::RunReasoningStepRecorded(cairn_domain::events::RunReasoningStep {
+            project: p(),
+            run_id: run(),
+            session_id: sess(),
+            iteration: 0,
+            recorded_at_ms: 0,
+            model_id: "test".to_owned(),
+            reasoning_compact: "".to_owned(),
+            proposed_action: cairn_domain::events::ProposedActionSummary::Other {
+                action_type: "none".to_owned(),
+            },
+            step_history_snapshot: "".to_owned(),
+            confidence: 0.0,
         }),
         RuntimeEvent::TaskCreated(TaskCreated {
             project: p(),
@@ -2161,12 +2178,12 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 176 variants in the RuntimeEvent enum (174 prior + RFC 030
-    // finalize: 2 family-mismatch audit events).
+    // 177 variants in the RuntimeEvent enum (176 prior + #789:
+    // RunReasoningStepRecorded).
     assert_eq!(
         variants.len(),
-        176,
-        "all_variants() must construct exactly 176 RuntimeEvent instances"
+        177,
+        "all_variants() must construct exactly 177 RuntimeEvent instances"
     );
 }
 

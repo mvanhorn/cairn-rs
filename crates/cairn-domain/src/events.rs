@@ -174,6 +174,12 @@ pub enum RuntimeEvent {
     /// token/cost metadata. See `LlmCompletionRecorded` for the body
     /// shape and `LlmPromptOutputReadModel` for the projection.
     LlmCompletionRecorded(LlmCompletionRecorded),
+    /// #789: compacted per-iteration reasoning record. See
+    /// `RunReasoningStep` for the body shape. Run-keyed, intended to
+    /// power the live `/v1/admin/agents/live` view and the
+    /// `/v1/runs/:id/trajectory` post-mortem replay endpoint without
+    /// loading the full LLM body trace.
+    RunReasoningStepRecorded(RunReasoningStep),
     SoulPatchProposed(SoulPatchProposed),
     SoulPatchApplied(SoulPatchApplied),
     /// GAP-006: session-level accumulated cost updated after a provider call.
@@ -456,6 +462,7 @@ impl RuntimeEvent {
             RuntimeEvent::RouteDecisionMade(event) => &event.project,
             RuntimeEvent::ProviderCallCompleted(event) => &event.project,
             RuntimeEvent::LlmCompletionRecorded(event) => &event.project,
+            RuntimeEvent::RunReasoningStepRecorded(event) => &event.project,
             RuntimeEvent::SoulPatchProposed(event) => &event.project,
             RuntimeEvent::SoulPatchApplied(event) => &event.project,
             RuntimeEvent::SessionCostUpdated(event) => &event.project,
@@ -760,6 +767,11 @@ impl RuntimeEvent {
             RuntimeEvent::RouteDecisionMade(_) => None,
             RuntimeEvent::ProviderCallCompleted(_) => None,
             RuntimeEvent::LlmCompletionRecorded(_) => None,
+            // #789: run-keyed so `read_by_entity(Run(id))` returns
+            // the full per-run trajectory in chronological order.
+            RuntimeEvent::RunReasoningStepRecorded(event) => Some(RuntimeEntityRef::Run {
+                run_id: event.run_id.clone(),
+            }),
             RuntimeEvent::SoulPatchProposed(_) => None,
             RuntimeEvent::SoulPatchApplied(_) => None,
             RuntimeEvent::SessionCostUpdated(_) => None,
@@ -2102,6 +2114,112 @@ pub struct LlmCompletionRecorded {
     /// Unix epoch ms when the body was recorded.
     pub recorded_at_ms: u64,
 }
+
+/// #789 — compacted per-iteration reasoning record. Operators get a
+/// post-mortem trajectory + a live "what is this agent thinking right
+/// now" view from this; without it, diagnosing a stuck-in-loop run
+/// requires fetching every per-call LLM body trace and reading them
+/// in order, which is expensive and only works AFTER the run is
+/// killed.
+///
+/// This event is the smaller cousin of `LlmCompletionRecorded`. The
+/// full body is still captured by that event behind
+/// `CAIRN_LLM_TRACE_BODIES_ENABLED`; this one extracts only the
+/// signals an operator scanning a fleet view actually reads:
+///
+/// - `reasoning_compact`: the model's chain-of-thought, truncated to
+///   ~1 KiB.
+/// - `proposed_action`: the highest-confidence proposal.
+/// - `user_message_delta`: what's NEW in the rendered step history
+///   since the prior iteration. Empty on iteration 0.
+/// - `confidence`: the model's calibrated_confidence on the top
+///   proposal.
+///
+/// Run-keyed (`primary_entity_ref` returns `RuntimeEntityRef::Run`)
+/// so `read_by_entity(Run(id))` returns this run's full trajectory
+/// without a session-wide filter.
+// `confidence` is f64; uses the `OutcomeRecorded` pattern below to
+// implement `PartialEq`/`Eq` via `f64::to_bits` so two events with
+// the same bit pattern (including NaN) compare equal — needed
+// because the `RuntimeEvent` enum derives `Eq`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunReasoningStep {
+    pub project: ProjectKey,
+    pub run_id: crate::ids::RunId,
+    pub session_id: crate::ids::SessionId,
+    pub iteration: u32,
+    pub recorded_at_ms: u64,
+    /// Model identifier actually used for this iteration's DECIDE.
+    pub model_id: String,
+    /// Truncated chain-of-thought from the model's free-text response,
+    /// post-redaction. Bounded to ~1 KiB (head + tail concat with a
+    /// `…[truncated]…` marker if cut). NOT a substitute for
+    /// `LlmCompletionRecorded.response_text` — that holds the full
+    /// payload when bodies are enabled.
+    pub reasoning_compact: String,
+    /// The single highest-confidence proposed action for this
+    /// iteration. Multi-proposal cases are uncommon and operators
+    /// rarely care about runner-up proposals; if they do, the full
+    /// proposal array lives on the LLM body trace.
+    pub proposed_action: ProposedActionSummary,
+    /// Snapshot of the full rendered `## Step history` section of
+    /// the user message at this iteration. The trajectory consumer
+    /// computes the iteration-to-iteration delta at read time by
+    /// diffing this against the prior step's snapshot — which makes
+    /// the diff correct for additive histories (Gemini review on
+    /// PR #794). Bounded to ~3 KiB via truncation; runs that have
+    /// accumulated more than that get a `…[truncated]` marker.
+    pub step_history_snapshot: String,
+    /// Calibrated confidence the model assigned to the top proposal,
+    /// in [0.0, 1.0]. From `DecideOutput.calibrated_confidence`.
+    pub confidence: f64,
+}
+
+/// #789 — compacted shape for the top-1 proposed action recorded in a
+/// `RunReasoningStep`. Forward-compat: an `Other` variant catches any
+/// new `ActionType` introduced upstream so the projection apply
+/// doesn't need a synchronized release with the orchestrator.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProposedActionSummary {
+    /// `invoke_tool` proposal. `args_preview` is the JSON-serialised
+    /// args truncated to ~120 chars.
+    ToolCall {
+        tool_name: String,
+        args_preview: String,
+    },
+    /// `complete_run` proposal. `final_answer_preview` is the first
+    /// ~200 chars of the final answer text.
+    CompleteRun { final_answer_preview: String },
+    /// `spawn_subagent` proposal. `goal_preview` is the first ~120
+    /// chars of the child goal.
+    SpawnSubagent { role: String, goal_preview: String },
+    /// `escalate_to_operator` proposal. `reason_preview` is the
+    /// first ~120 chars of the reason.
+    EscalateToOperator { reason_preview: String },
+    /// Any other / future ActionType. `kind` carries the raw
+    /// stringified action type for forward-compat.
+    Other { action_type: String },
+}
+
+impl PartialEq for RunReasoningStep {
+    fn eq(&self, other: &Self) -> bool {
+        self.project == other.project
+            && self.run_id == other.run_id
+            && self.session_id == other.session_id
+            && self.iteration == other.iteration
+            && self.recorded_at_ms == other.recorded_at_ms
+            && self.model_id == other.model_id
+            && self.reasoning_compact == other.reasoning_compact
+            && self.proposed_action == other.proposed_action
+            && self.step_history_snapshot == other.step_history_snapshot
+            && self.confidence.to_bits() == other.confidence.to_bits()
+    }
+}
+
+impl Eq for RunReasoningStep {}
+
+impl Eq for ProposedActionSummary {}
 
 /// A soul patch has been proposed and is awaiting operator review.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

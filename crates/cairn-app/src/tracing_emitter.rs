@@ -233,6 +233,199 @@ pub(crate) async fn record_decide_trace(
     // No explicit `insert_trace` here — see the function docstring.
 }
 
+/// #789: emit a compacted per-iteration `RunReasoningStep` event.
+/// Sibling to `record_decide_trace` — both fire on every DECIDE
+/// completion. This event is the smaller cousin: operators reading
+/// the live agent dashboard or the post-mortem trajectory replay see
+/// only the model's chain-of-thought summary, the top-1 proposed
+/// action, the user-message delta vs the prior iteration, and the
+/// confidence. The full body (prompts, tool defs, raw tool_calls)
+/// stays on `LlmCompletionRecorded` for deeper investigation.
+///
+/// Best-effort: a store-append failure here does NOT abort the run.
+/// The reasoning step is observability scaffolding, not a durability
+/// invariant — losing one is annoying but not corrupting. The
+/// `record_decide_trace` sibling already handles the
+/// dual-write-divergence latch for operator-visible failures.
+pub(crate) async fn record_reasoning_step(
+    ctx: &OrchestrationContext,
+    d: &DecideOutput,
+    store: &Arc<cairn_store::InMemoryStore>,
+) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let reasoning_compact = compact_reasoning(&d.raw_response);
+    let proposed_action = summarise_top_proposal(d);
+    // Snapshot the FULL `## Step history` section the model saw at
+    // this iteration (post-fix per Gemini PR #794 review). Trajectory
+    // consumers compute the iteration-to-iteration delta at read time
+    // by diffing this snapshot against the prior step's snapshot —
+    // which is correct for additive histories, unlike the broken
+    // "diff against prior iteration's delta" approach the first cut
+    // shipped with.
+    let step_history_snapshot = extract_step_history_section(&d.messages_json)
+        .map(|s| {
+            const SNAPSHOT_CAP: usize = 3072;
+            if s.len() > SNAPSHOT_CAP {
+                format!(
+                    "{}…[truncated]",
+                    safe_char_boundary_prefix(&s, SNAPSHOT_CAP)
+                )
+            } else {
+                s
+            }
+        })
+        .unwrap_or_default();
+
+    let event = EventEnvelope::for_runtime_event(
+        EventId::new(format!(
+            "evt_reasoning_{}_{}_{}",
+            ctx.run_id.as_str(),
+            ctx.iteration,
+            now
+        )),
+        EventSource::Runtime,
+        RuntimeEvent::RunReasoningStepRecorded(cairn_domain::events::RunReasoningStep {
+            project: ctx.project.clone(),
+            run_id: ctx.run_id.clone(),
+            session_id: ctx.session_id.clone(),
+            iteration: ctx.iteration,
+            recorded_at_ms: now,
+            model_id: d.model_id.clone(),
+            reasoning_compact,
+            proposed_action,
+            step_history_snapshot,
+            confidence: d.calibrated_confidence,
+        }),
+    );
+
+    if let Err(e) = store.append(&[event]).await {
+        // Observability scaffolding — log the failure at WARN so
+        // operators can see the gap without aborting the run.
+        tracing::warn!(
+            run_id = %ctx.run_id,
+            iteration = ctx.iteration,
+            error = %e,
+            "#789: failed to append RunReasoningStep — trajectory will have a gap at this iteration"
+        );
+    }
+}
+
+/// Truncate the model's free-text response to ~1 KiB for the
+/// reasoning_compact field. Strategy: head + tail concatenation if
+/// over budget, with a `…[truncated N chars]…` marker so operators
+/// can tell something was cut.
+fn compact_reasoning(raw: &str) -> String {
+    const HEAD: usize = 600;
+    const TAIL: usize = 400;
+    if raw.len() <= HEAD + TAIL {
+        return raw.to_owned();
+    }
+    let head = safe_char_boundary_prefix(raw, HEAD);
+    let tail = safe_char_boundary_suffix(raw, TAIL);
+    let cut = raw.len().saturating_sub(head.len() + tail.len());
+    format!("{head}\n…[truncated {cut} chars]…\n{tail}")
+}
+
+/// Take the longest UTF-8-valid prefix ≤ `max_bytes`. Avoids panics
+/// from slicing in the middle of a multi-byte sequence.
+fn safe_char_boundary_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn safe_char_boundary_suffix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len().saturating_sub(max_bytes);
+    while !s.is_char_boundary(start) && start < s.len() {
+        start += 1;
+    }
+    &s[start..]
+}
+
+/// Extract the highest-confidence proposal from the DecideOutput and
+/// translate to the wire-stable `ProposedActionSummary` shape.
+/// Returns `Other { action_type: "none" }` when the proposal list is
+/// empty, which can happen on early-error termination.
+fn summarise_top_proposal(d: &DecideOutput) -> cairn_domain::events::ProposedActionSummary {
+    use cairn_domain::events::ProposedActionSummary;
+    let Some(top) = d.proposals.first() else {
+        return ProposedActionSummary::Other {
+            action_type: "none".to_owned(),
+        };
+    };
+    match &top.action_type {
+        cairn_domain::ActionType::InvokeTool => {
+            let tool_name = top.tool_name.clone().unwrap_or_default();
+            let args_preview = top
+                .tool_args
+                .as_ref()
+                .map(|v| {
+                    let s = v.to_string();
+                    safe_char_boundary_prefix(&s, 120).to_owned()
+                })
+                .unwrap_or_default();
+            ProposedActionSummary::ToolCall {
+                tool_name,
+                args_preview,
+            }
+        }
+        cairn_domain::ActionType::CompleteRun => ProposedActionSummary::CompleteRun {
+            final_answer_preview: safe_char_boundary_prefix(&top.description, 200).to_owned(),
+        },
+        cairn_domain::ActionType::SpawnSubagent => {
+            let role = top.tool_name.clone().unwrap_or_default();
+            let goal_preview = top
+                .tool_args
+                .as_ref()
+                .and_then(|v| v.get("goal"))
+                .and_then(|v| v.as_str())
+                .map(|s| safe_char_boundary_prefix(s, 120).to_owned())
+                .unwrap_or_default();
+            ProposedActionSummary::SpawnSubagent { role, goal_preview }
+        }
+        cairn_domain::ActionType::EscalateToOperator => {
+            let reason_preview = safe_char_boundary_prefix(&top.description, 120).to_owned();
+            ProposedActionSummary::EscalateToOperator { reason_preview }
+        }
+        other => ProposedActionSummary::Other {
+            action_type: format!("{other:?}").to_lowercase(),
+        },
+    }
+}
+
+/// Best-effort extraction of the `## Step history` section from the
+/// user message in `messages_json`. Returns `None` if the message
+/// can't be parsed or the section is absent.
+fn extract_step_history_section(messages_json: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(messages_json).ok()?;
+    let messages = parsed.as_array()?;
+    let user_content = messages
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())?;
+    let start_idx = user_content.find("## Step history")?;
+    // Section ends at the next `## ` heading or end-of-string.
+    let after_start = &user_content[start_idx..];
+    let end_offset = after_start[1..]
+        .find("\n## ")
+        .map(|i| i + 1)
+        .unwrap_or(after_start.len());
+    Some(after_start[..end_offset].to_owned())
+}
+
 /// Issue #668: operator opt-out for chain-of-thought body persistence.
 ///
 /// Default `true`. Set `CAIRN_LLM_TRACE_BODIES_ENABLED=false` on

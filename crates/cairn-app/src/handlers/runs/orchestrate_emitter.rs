@@ -126,6 +126,18 @@ impl cairn_orchestrator::OrchestratorEventEmitter for TracingEmitter {
             &self.fatal_error,
         )
         .await;
+        // #789: emit a compacted per-iteration reasoning step
+        // alongside the full LLM body trace. Best-effort — failures
+        // log at WARN inside record_reasoning_step but don't abort
+        // the run.
+        //
+        // The event carries a snapshot of the full `## Step history`
+        // section the model saw this iteration (Gemini PR #794
+        // review fix). Trajectory consumers compute deltas at read
+        // time by diffing snapshot[N] vs snapshot[N-1] — correct
+        // for additive histories, no per-iteration prior-state
+        // lookup needed.
+        crate::tracing_emitter::record_reasoning_step(ctx, d, &self.store).await;
     }
     async fn on_tool_called(
         &self,

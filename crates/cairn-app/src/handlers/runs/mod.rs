@@ -85,7 +85,7 @@ pub(crate) use plan::{
 };
 #[allow(unused_imports)]
 pub(crate) use telemetry::{
-    diagnose_run_handler, get_run_audit_trail_handler, get_run_telemetry_handler,
-    list_escalated_runs_handler, list_stalled_runs_handler, AuditEntry, AuditTrail,
-    StalledRunsQuery,
+    diagnose_run_handler, get_live_agents_handler, get_run_audit_trail_handler,
+    get_run_telemetry_handler, get_run_trajectory_handler, list_escalated_runs_handler,
+    list_stalled_runs_handler, AuditEntry, AuditTrail, StalledRunsQuery,
 };

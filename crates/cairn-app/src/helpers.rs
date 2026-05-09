@@ -1405,6 +1405,7 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::RouteDecisionMade(_) => "route_decision_made",
         RuntimeEvent::ProviderCallCompleted(_) => "provider_call_completed",
         RuntimeEvent::LlmCompletionRecorded(_) => "llm_completion_recorded",
+        RuntimeEvent::RunReasoningStepRecorded(_) => "run_reasoning_step_recorded",
         RuntimeEvent::ProviderModelRegistered(_) => "provider_model_registered",
         RuntimeEvent::RunCostAlertSet(_) => "run_cost_alert_set",
         RuntimeEvent::RunCostAlertTriggered(_) => "run_cost_alert_triggered",
@@ -1955,6 +1956,12 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         }
         RuntimeEvent::LlmCompletionRecorded(e) => {
             format!("LLM completion body recorded for trace {}", e.trace_id)
+        }
+        RuntimeEvent::RunReasoningStepRecorded(e) => {
+            format!(
+                "Reasoning step recorded for run {} iteration {}",
+                e.run_id, e.iteration
+            )
         }
         RuntimeEvent::ApprovalPolicyCreated(policy) => {
             format!("Approval policy {} created", policy.policy_id)

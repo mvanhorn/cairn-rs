@@ -34,6 +34,51 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   block; multi-turn `user → assistant(toolUse) → user(toolResult)`
   produced `"3 + 4 = 7"` with `finish_reason = end_turn`.
 
+- **Per-iteration reasoning step observability (#789, PR-A backend).**
+  Operators get two new endpoints to investigate stuck agents and
+  tail what's running in real time:
+
+  - `GET /v1/runs/:id/trajectory` — returns the run's compacted
+    per-iteration reasoning steps in chronological order. Each
+    step carries the model's chain-of-thought (truncated to
+    ~1 KiB), the top-1 proposed action (tool call /
+    complete_run / spawn_subagent / escalate), the user-message
+    delta vs the prior iteration, and the calibrated confidence.
+    Read it like a story: prompt delta → reasoning → action.
+  - `GET /v1/admin/agents/live` — fleet-view snapshot of every
+    non-terminal run for the caller's tenant, joined with the
+    most-recent reasoning step. Each entry shows the run's
+    current iteration, current action, current reasoning preview,
+    and confidence. Answers "what's in the box right now, and
+    what is each agent thinking?"
+
+  New domain event `RunReasoningStepRecorded` (run-keyed) emitted
+  on every DECIDE phase by `record_reasoning_step` in
+  `tracing_emitter.rs`. Materialized on the `InMemoryStore`
+  per-run vec capped at 200 entries (FIFO eviction); pg/sqlite
+  parity is a follow-up. Compaction is pure string ops — no
+  extra LLM calls per iteration.
+
+  R20 dogfood (2026-05-09) symptom this addresses: an executor
+  subagent ran 36 LLM calls / 62 bash invocations on issue #8
+  (wire CI) without ever calling write/edit, and operators had
+  no live view to diagnose why. With this PR an operator hitting
+  `/v1/admin/agents/live` sees every active agent's chain-of-
+  thought + current action + confidence — they can read the
+  pathology forming in real time and either intervene or capture
+  enough state for a post-mortem before killing the run. The
+  fix for the bash-loop pathology itself is a separate design
+  conversation; this PR ships the observability substrate so
+  that conversation has data to work from.
+
+  Regression test `test_789_reasoning_step_observability` (LiveHarness)
+  drives one DECIDE iteration through a mock LLM, asserts
+  `/v1/runs/:id/trajectory` returns one step with the model's
+  reasoning + bash tool-call summary, and asserts
+  `/v1/admin/agents/live` lists the active run with its
+  current_action populated. Pre-fix simulation (disabled
+  `record_reasoning_step` call site) makes the test fail.
+
 - **`cairn-providers` SigV4 signer for the Bedrock backends.** New
   `signer` module exposing `RequestSigner` (trait), `BearerAuth`
   (back-compat default), and `SigV4Signer` (AWS SigV4 via the default
