@@ -22,14 +22,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::chat::{ChatMessage, ChatProvider, ChatResponse, ChatRole, StructuredOutput, Tool};
+use crate::chat::{
+    ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageContent, StructuredOutput, Tool,
+    ToolChoice,
+};
 use crate::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use crate::embedding::EmbeddingProvider;
 use crate::error::{ProviderError, safe_raw_response};
 use crate::models::ModelsProvider;
 use crate::redact::redact_secrets;
 use crate::signer::{BearerAuth, RequestSigner, SigV4Signer};
-use crate::{CairnProvider, ToolCall, Usage};
+use crate::{CairnProvider, FunctionCall, ToolCall, Usage};
 
 /// Default HTTP client timeout for Bedrock (seconds).
 ///
@@ -42,6 +45,10 @@ pub struct Bedrock {
     region: String,
     signer: Arc<dyn RequestSigner>,
     client: reqwest::Client,
+    /// Override for the default `https://bedrock-runtime.{region}.amazonaws.com`
+    /// endpoint. Intended for tests only — points the converse calls at
+    /// an httpmock server without changing production behaviour.
+    endpoint_override: Option<String>,
 }
 
 impl Bedrock {
@@ -80,6 +87,7 @@ impl Bedrock {
             region: region.into(),
             signer: Arc::new(BearerAuth::new(api_key.into())),
             client,
+            endpoint_override: None,
         })
     }
 
@@ -106,6 +114,7 @@ impl Bedrock {
             region,
             signer: Arc::new(signer),
             client,
+            endpoint_override: None,
         })
     }
 
@@ -123,7 +132,17 @@ impl Bedrock {
             region: region.into(),
             signer,
             client,
+            endpoint_override: None,
         })
+    }
+
+    /// Override the API endpoint. Intended for tests only — redirects
+    /// converse calls to an httpmock server. Production callers should
+    /// not touch this.
+    #[doc(hidden)]
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint_override = Some(endpoint.into());
+        self
     }
 
     /// Construct from environment variables — Bearer-only, sync.
@@ -192,68 +211,62 @@ impl Bedrock {
         tools: Option<&[Tool]>,
         schema: Option<StructuredOutput>,
     ) -> Result<Box<dyn ChatResponse>, ProviderError> {
-        if tools.is_some_and(|tools| !tools.is_empty()) || schema.is_some() {
+        // Structured-output / JSON-schema enforcement still needs
+        // Converse-specific wiring. Drop the hard guard so plain tool
+        // calls go through, but reject `schema` until we add
+        // `additionalModelRequestFields` mapping for Claude's
+        // `response_format` shim.
+        if schema.is_some() {
             return Err(ProviderError::Unsupported(
-                "Bedrock chat_with_tools does not support tools or structured output yet"
-                    .to_owned(),
+                "Bedrock structured output not yet implemented".to_owned(),
             ));
         }
 
         let model = model
             .filter(|model| !model.trim().is_empty())
             .unwrap_or(&self.model_id);
-        let wire_msgs: Vec<Value> = messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": m.role.to_string(),
-                    "content": m.content,
-                })
-            })
-            .collect();
-        let system = messages
-            .iter()
-            .find(|m| m.role == ChatRole::System)
-            .map(|m| m.content.clone());
-        let (text, input_tokens, output_tokens) = self.converse(model, wire_msgs, system).await?;
-        let usage = match (input_tokens, output_tokens) {
-            (Some(i), Some(o)) => Some(Usage {
-                prompt_tokens: i,
-                completion_tokens: o,
-                total_tokens: i + o,
-                cached_tokens: None,
-            }),
-            _ => None,
-        };
-        Ok(Box::new(BedrockChatResponse { text, usage }))
-    }
 
-    async fn converse(
-        &self,
-        model: &str,
-        messages: Vec<Value>,
-        system: Option<String>,
-    ) -> Result<(String, Option<u32>, Option<u32>), ProviderError> {
-        let url = format!(
-            "https://bedrock-runtime.{}.amazonaws.com/model/{}/converse",
-            self.region, model
-        );
+        // Route system messages into Converse's dedicated `system` field,
+        // and everything else into `messages[]` with content-block
+        // translation. Only the *first* system message is preserved,
+        // matching Converse's single-shot system-prompt contract; any
+        // subsequent system messages are appended so long prompts split
+        // across several entries still work.
+        let system_blocks: Vec<Value> = messages
+            .iter()
+            .filter(|m| m.role == ChatRole::System)
+            .map(|m| serde_json::json!({ "text": m.content }))
+            .collect();
+
         let bedrock_msgs: Vec<Value> = messages
             .iter()
-            .filter(|m| m["role"].as_str() != Some("system"))
-            .map(|m| {
-                let role = m["role"].as_str().unwrap_or("user");
-                let content = m["content"].as_str().unwrap_or("");
-                serde_json::json!({
-                    "role": role,
-                    "content": [{"text": content}]
-                })
-            })
-            .collect();
+            .filter(|m| m.role != ChatRole::System)
+            .map(chat_message_to_converse)
+            .collect::<Result<Vec<_>, _>>()?;
+
         let mut body_json = serde_json::json!({ "messages": bedrock_msgs });
-        if let Some(sys) = &system {
-            body_json["system"] = serde_json::json!([{"text": sys}]);
+        if !system_blocks.is_empty() {
+            body_json["system"] = Value::Array(system_blocks);
         }
+        if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+            body_json["toolConfig"] = build_tool_config(tools, None)?;
+        }
+
+        self.converse_raw(model, body_json).await
+    }
+
+    async fn converse_raw(
+        &self,
+        model: &str,
+        body_json: Value,
+    ) -> Result<Box<dyn ChatResponse>, ProviderError> {
+        let url = match self.endpoint_override.as_deref() {
+            Some(base) => format!("{}/model/{}/converse", base.trim_end_matches('/'), model),
+            None => format!(
+                "https://bedrock-runtime.{}.amazonaws.com/model/{}/converse",
+                self.region, model
+            ),
+        };
         // Serialize once so we can both hash the exact bytes in the
         // SigV4 canonical request AND send them on the wire. If we let
         // `reqwest::RequestBuilder::json` re-serialize we'd risk a
@@ -290,39 +303,299 @@ impl Bedrock {
             .json()
             .await
             .map_err(|e| ProviderError::Http(redact_secrets(&format!("parse: {e}"))))?;
-        let text = resp_body["output"]["message"]["content"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|c| c["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .unwrap_or_default();
-        let input_tokens = resp_body["usage"]["inputTokens"].as_u64().map(|n| n as u32);
-        let output_tokens = resp_body["usage"]["outputTokens"]
-            .as_u64()
-            .map(|n| n as u32);
-        Ok((text, input_tokens, output_tokens))
+        parse_converse_response(resp_body)
     }
+
+    /// Thin wrapper for the completion path. Plain text-only converse
+    /// without tools or schema — preserves the legacy sync contract.
+    async fn converse_text_only(
+        &self,
+        model: &str,
+        messages: Vec<Value>,
+        system: Option<String>,
+    ) -> Result<String, ProviderError> {
+        let mut body_json = serde_json::json!({ "messages": messages });
+        if let Some(sys) = system {
+            body_json["system"] = serde_json::json!([{ "text": sys }]);
+        }
+        let resp = self.converse_raw(model, body_json).await?;
+        Ok(resp.text().unwrap_or_default())
+    }
+}
+
+// ── Request mapping: cairn types → Converse wire ─────────────────────
+
+/// Translate one cairn `ChatMessage` into a Converse message object.
+///
+/// Rules:
+/// * `System` is filtered upstream (routes to the request-level `system`
+///   field instead of `messages`).
+/// * `User` / `Assistant` text becomes `content: [{text}]`.
+/// * `Assistant` with `MessageContent::ToolUse(calls)` becomes one
+///   `toolUse` block per call, each carrying the JSON-parsed arguments.
+/// * `Tool` role with `MessageContent::ToolResult(calls)` becomes a
+///   single `user` message (Converse requires tool results to arrive
+///   from the user side) holding one `toolResult` block per call; the
+///   call's `arguments` string is surfaced as the tool-result body.
+fn chat_message_to_converse(m: &ChatMessage) -> Result<Value, ProviderError> {
+    match (&m.role, &m.content_type) {
+        (ChatRole::System, _) => Err(ProviderError::InvalidRequest(
+            "system messages are routed to the Converse `system` field; \
+             chat_message_to_converse should not receive them"
+                .to_owned(),
+        )),
+        (ChatRole::Assistant, MessageContent::ToolUse(calls)) => {
+            let mut content = Vec::with_capacity(calls.len() + usize::from(!m.content.is_empty()));
+            if !m.content.is_empty() {
+                content.push(serde_json::json!({ "text": m.content }));
+            }
+            for call in calls {
+                // Bedrock's Converse API requires `toolUse.input` to
+                // be a JSON *object*. Accept only if parsing yields an
+                // object; everything else (invalid JSON, a string, a
+                // number, an array) falls back to the `_raw` wrapper
+                // so one ill-formed turn can't poison the whole run.
+                let input: Value = serde_json::from_str(&call.function.arguments)
+                    .ok()
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| serde_json::json!({ "_raw": call.function.arguments }));
+                content.push(serde_json::json!({
+                    "toolUse": {
+                        "toolUseId": call.id,
+                        "name": call.function.name,
+                        "input": input,
+                    }
+                }));
+            }
+            Ok(serde_json::json!({ "role": "assistant", "content": content }))
+        }
+        (ChatRole::Tool, MessageContent::ToolResult(calls)) => {
+            // Converse carries tool results on a `user` turn. Each
+            // call gets its own `toolResult` block; the arguments
+            // string on the `ToolCall` is the tool's raw output.
+            let content: Vec<Value> = calls
+                .iter()
+                .map(|call| {
+                    serde_json::json!({
+                        "toolResult": {
+                            "toolUseId": call.id,
+                            "content": [{"text": call.function.arguments}],
+                        }
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "role": "user", "content": content }))
+        }
+        (role, _) => {
+            // Plain text path for everything else (`User` / `Assistant`
+            // without tool content). `Tool` role without the expected
+            // `ToolResult` content is silently downgraded to a user-
+            // text block — Converse has no other legal representation
+            // for it, and refusing the whole request here would
+            // regress callers that pre-flatten tool output into text.
+            let wire_role = match role {
+                ChatRole::Assistant => "assistant",
+                _ => "user",
+            };
+            Ok(serde_json::json!({
+                "role": wire_role,
+                "content": [{"text": m.content}],
+            }))
+        }
+    }
+}
+
+/// Build the Converse `toolConfig` value from a cairn tool slice.
+///
+/// Maps 1:1 onto Bedrock's schema:
+/// `toolConfig.tools[].toolSpec = {name, description, inputSchema.json}`.
+/// `ToolChoice` mapping:
+/// * `Auto` → `{auto: {}}` (also the Converse default; we omit the field
+///   to stay compatible with models that reject explicit `auto`).
+/// * `Any` → `{any: {}}`
+/// * `Specific` → `{tool: {name}}`
+/// * `None` → no `toolConfig` at all (we're called only when `tools` is
+///   non-empty; suppressing `toolConfig` lets the model answer in plain
+///   text as the caller asked).
+fn build_tool_config(
+    tools: &[Tool],
+    tool_choice: Option<&ToolChoice>,
+) -> Result<Value, ProviderError> {
+    let specs: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            if t.function.name.trim().is_empty() {
+                return Err(ProviderError::InvalidRequest(
+                    "Bedrock toolSpec.name must not be empty".to_owned(),
+                ));
+            }
+            let mut tool_spec = serde_json::json!({
+                "name": t.function.name,
+                "description": t.function.description,
+                "inputSchema": { "json": t.function.parameters.clone() },
+            });
+            // Converse accepts an empty description; dropping an empty
+            // string is cheaper on the wire than sending it. No-op when
+            // the caller already omitted it.
+            if t.function.description.is_empty() {
+                tool_spec.as_object_mut().unwrap().remove("description");
+            }
+            Ok(serde_json::json!({ "toolSpec": tool_spec }))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut cfg = serde_json::json!({ "tools": specs });
+    match tool_choice {
+        None | Some(ToolChoice::Auto) => {}
+        Some(ToolChoice::Any) => {
+            cfg["toolChoice"] = serde_json::json!({ "any": {} });
+        }
+        Some(ToolChoice::Specific(name)) => {
+            cfg["toolChoice"] = serde_json::json!({ "tool": { "name": name } });
+        }
+        Some(ToolChoice::None) => {
+            // Caller asked for no tool use even though tools were
+            // supplied. Converse has no "tools available but forbid
+            // invocation" knob, so we drop toolConfig entirely — the
+            // model will answer with text. This matches how the
+            // OpenAI-compat backend treats `tool_choice: "none"`.
+            return Ok(Value::Null);
+        }
+    }
+    Ok(cfg)
+}
+
+// ── Response mapping: Converse wire → cairn types ────────────────────
+
+/// Parse a Converse response into a cairn [`ChatResponse`].
+///
+/// Content blocks are split into:
+/// * `{text}` blocks → concatenated into the response's `text()`.
+/// * `{toolUse}` blocks → appended to `tool_calls()` with the input
+///   object re-encoded as a JSON string (cairn's `FunctionCall::arguments`
+///   is a `String`, not a `Value`, for OpenAI-wire parity).
+///
+/// `stopReason` surfaces as `finish_reason()`. `usage.inputTokens` /
+/// `usage.outputTokens` / `usage.cacheReadInputTokens` become `Usage`.
+fn parse_converse_response(mut resp: Value) -> Result<Box<dyn ChatResponse>, ProviderError> {
+    // Move the content array out of the response rather than cloning
+    // — a long tool call can carry several KB of input JSON and the
+    // caller doesn't need the original array afterwards.
+    let content: Vec<Value> = match resp.pointer_mut("/output/message/content") {
+        Some(Value::Array(arr)) => std::mem::take(arr),
+        _ => Vec::new(),
+    };
+
+    let mut text = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    for mut block in content {
+        if let Some(t) = block.get("text").and_then(Value::as_str) {
+            text.push_str(t);
+            continue;
+        }
+        // Take ownership of the toolUse sub-object so we can move
+        // `input` out of it without cloning. `Value::take` leaves
+        // `Null` in place and hands us the original tree.
+        let tu = match block.pointer_mut("/toolUse") {
+            Some(v) => v.take(),
+            None => continue,
+        };
+        let Value::Object(mut tu_obj) = tu else {
+            // `toolUse` present but not an object — the upstream is
+            // malformed. Surface as a Provider error so the operator
+            // can see the breakage instead of silently dropping it.
+            return Err(ProviderError::Provider(
+                "Bedrock toolUse block is not an object".to_owned(),
+            ));
+        };
+        let id = tu_obj
+            .get("toolUseId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Provider("Bedrock toolUse block missing toolUseId".to_owned())
+            })?
+            .to_owned();
+        let name = tu_obj
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Provider("Bedrock toolUse block missing name".to_owned())
+            })?
+            .to_owned();
+        // `input` is required per the Converse spec. Treat its
+        // absence as a protocol error rather than silently minting
+        // `null` arguments — downstream orchestrators use this to
+        // drive the next turn and a silent `null` would corrupt it.
+        let input_val = tu_obj.remove("input").ok_or_else(|| {
+            ProviderError::Provider("Bedrock toolUse block missing input".to_owned())
+        })?;
+        let arguments = serde_json::to_string(&input_val)
+            .map_err(|e| ProviderError::Provider(format!("encode toolUse.input: {e}")))?;
+        tool_calls.push(ToolCall {
+            id,
+            call_type: "function".to_owned(),
+            function: FunctionCall { name, arguments },
+        });
+    }
+
+    let stop_reason = resp
+        .get("stopReason")
+        .and_then(Value::as_str)
+        .map(String::from);
+
+    let input_tokens = resp["usage"]["inputTokens"].as_u64().map(|n| n as u32);
+    let output_tokens = resp["usage"]["outputTokens"].as_u64().map(|n| n as u32);
+    let cache_read = resp["usage"]["cacheReadInputTokens"]
+        .as_u64()
+        .map(|n| n as u32)
+        .filter(|n| *n > 0);
+    let usage = match (input_tokens, output_tokens) {
+        (Some(i), Some(o)) => Some(Usage {
+            prompt_tokens: i,
+            completion_tokens: o,
+            total_tokens: i + o,
+            cached_tokens: cache_read,
+        }),
+        _ => None,
+    };
+
+    Ok(Box::new(BedrockChatResponse {
+        text,
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
+        usage,
+        finish_reason: stop_reason,
+    }))
 }
 
 // ── ChatProvider ─────────────────────────────────────────────────────────────
 
 struct BedrockChatResponse {
     text: String,
+    tool_calls: Option<Vec<ToolCall>>,
     usage: Option<Usage>,
+    finish_reason: Option<String>,
 }
 
 impl ChatResponse for BedrockChatResponse {
     fn text(&self) -> Option<String> {
-        Some(self.text.clone())
+        if self.text.is_empty() {
+            None
+        } else {
+            Some(self.text.clone())
+        }
     }
     fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        None
+        self.tool_calls.clone()
     }
     fn usage(&self) -> Option<Usage> {
         self.usage.clone()
+    }
+    fn finish_reason(&self) -> Option<String> {
+        self.finish_reason.clone()
     }
 }
 
@@ -330,6 +603,8 @@ impl std::fmt::Debug for BedrockChatResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BedrockChatResponse")
             .field("text", &self.text)
+            .field("tool_calls", &self.tool_calls)
+            .field("finish_reason", &self.finish_reason)
             .finish()
     }
 }
@@ -360,9 +635,11 @@ impl CompletionProvider for Bedrock {
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, ProviderError> {
         let messages = vec![serde_json::json!({
             "role": "user",
-            "content": req.prompt,
+            "content": [{ "text": req.prompt }],
         })];
-        let (text, _, _) = self.converse(&self.model_id, messages, None).await?;
+        let text = self
+            .converse_text_only(&self.model_id, messages, None)
+            .await?;
         Ok(CompletionResponse { text })
     }
 }
@@ -404,6 +681,8 @@ fn build_http_client() -> Result<reqwest::Client, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FunctionCall;
+    use crate::chat::FunctionDef;
     use std::sync::Arc;
 
     #[test]
@@ -423,5 +702,334 @@ mod tests {
         ));
         let b = Bedrock::with_signer("us.anthropic.claude-opus-4-7", "us-west-2", signer).unwrap();
         assert_eq!(b.auth_scheme(), "sigv4");
+    }
+
+    // ── Request mapping ──────────────────────────────────────────
+
+    fn sample_tool() -> Tool {
+        Tool {
+            tool_type: "function".to_owned(),
+            function: FunctionDef {
+                name: "add_numbers".to_owned(),
+                description: "add two integers".to_owned(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "integer"},
+                        "b": {"type": "integer"}
+                    },
+                    "required": ["a", "b"]
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn build_tool_config_maps_toolspec_shape() {
+        let tools = vec![sample_tool()];
+        let cfg = build_tool_config(&tools, None).unwrap();
+        let spec = &cfg["tools"][0]["toolSpec"];
+        assert_eq!(spec["name"], "add_numbers");
+        assert_eq!(spec["description"], "add two integers");
+        // inputSchema.json carries the full JSON schema as Converse expects.
+        assert_eq!(spec["inputSchema"]["json"]["type"], "object");
+        assert_eq!(
+            spec["inputSchema"]["json"]["properties"]["a"]["type"],
+            "integer"
+        );
+        // Auto toolChoice is implicit — Converse defaults to auto when
+        // the field is absent.
+        assert!(cfg.get("toolChoice").is_none());
+    }
+
+    #[test]
+    fn build_tool_config_omits_empty_description() {
+        let mut t = sample_tool();
+        t.function.description.clear();
+        let cfg = build_tool_config(&[t], None).unwrap();
+        assert!(cfg["tools"][0]["toolSpec"].get("description").is_none());
+    }
+
+    #[test]
+    fn build_tool_config_rejects_empty_tool_name() {
+        let mut t = sample_tool();
+        t.function.name.clear();
+        let err = build_tool_config(&[t], None).unwrap_err();
+        assert!(matches!(err, ProviderError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn build_tool_config_maps_any_choice() {
+        let cfg = build_tool_config(&[sample_tool()], Some(&ToolChoice::Any)).unwrap();
+        assert_eq!(cfg["toolChoice"]["any"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn build_tool_config_maps_specific_choice() {
+        let cfg = build_tool_config(
+            &[sample_tool()],
+            Some(&ToolChoice::Specific("add_numbers".to_owned())),
+        )
+        .unwrap();
+        assert_eq!(cfg["toolChoice"]["tool"]["name"], "add_numbers");
+    }
+
+    #[test]
+    fn build_tool_config_none_choice_returns_null() {
+        // `ToolChoice::None` suppresses toolConfig entirely — Converse
+        // has no "tools available but forbidden" knob.
+        let cfg = build_tool_config(&[sample_tool()], Some(&ToolChoice::None)).unwrap();
+        assert!(cfg.is_null());
+    }
+
+    #[test]
+    fn chat_message_to_converse_text_roundtrip() {
+        let wire = chat_message_to_converse(&ChatMessage::user("hi")).unwrap();
+        assert_eq!(wire["role"], "user");
+        assert_eq!(wire["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn chat_message_to_converse_assistant_tool_use() {
+        // Assistant ToolUse should serialise as a `toolUse` content
+        // block with the parsed input object, not a stringified one.
+        let msg = ChatMessage {
+            role: ChatRole::Assistant,
+            content_type: MessageContent::ToolUse(vec![ToolCall {
+                id: "tc1".to_owned(),
+                call_type: "function".to_owned(),
+                function: FunctionCall {
+                    name: "add_numbers".to_owned(),
+                    arguments: r#"{"a":3,"b":4}"#.to_owned(),
+                },
+            }]),
+            content: String::new(),
+        };
+        let wire = chat_message_to_converse(&msg).unwrap();
+        assert_eq!(wire["role"], "assistant");
+        let tu = &wire["content"][0]["toolUse"];
+        assert_eq!(tu["toolUseId"], "tc1");
+        assert_eq!(tu["name"], "add_numbers");
+        assert_eq!(tu["input"]["a"], 3);
+        assert_eq!(tu["input"]["b"], 4);
+    }
+
+    #[test]
+    fn chat_message_to_converse_assistant_tool_use_with_text() {
+        // Assistant can both emit text and call a tool in the same
+        // turn — the text block must lead.
+        let msg = ChatMessage {
+            role: ChatRole::Assistant,
+            content_type: MessageContent::ToolUse(vec![ToolCall {
+                id: "tc1".to_owned(),
+                call_type: "function".to_owned(),
+                function: FunctionCall {
+                    name: "f".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            }]),
+            content: "Thinking about it...".to_owned(),
+        };
+        let wire = chat_message_to_converse(&msg).unwrap();
+        assert_eq!(wire["content"][0]["text"], "Thinking about it...");
+        assert_eq!(wire["content"][1]["toolUse"]["toolUseId"], "tc1");
+    }
+
+    #[test]
+    fn chat_message_to_converse_tool_result_becomes_user_turn() {
+        // Converse carries tool results on a user turn, not a tool
+        // turn (unlike OpenAI). Assert we translate correctly.
+        let msg =
+            ChatMessage::tool_result("tc1".to_owned(), "add_numbers".to_owned(), "7".to_owned());
+        let wire = chat_message_to_converse(&msg).unwrap();
+        assert_eq!(wire["role"], "user");
+        let tr = &wire["content"][0]["toolResult"];
+        assert_eq!(tr["toolUseId"], "tc1");
+        assert_eq!(tr["content"][0]["text"], "7");
+    }
+
+    #[test]
+    fn chat_message_to_converse_tolerates_invalid_json_tool_args() {
+        // If the model produced invalid JSON tool args, wrap in `_raw`
+        // rather than erroring the whole turn.
+        let msg = ChatMessage {
+            role: ChatRole::Assistant,
+            content_type: MessageContent::ToolUse(vec![ToolCall {
+                id: "tc1".to_owned(),
+                call_type: "function".to_owned(),
+                function: FunctionCall {
+                    name: "f".to_owned(),
+                    arguments: "not json".to_owned(),
+                },
+            }]),
+            content: String::new(),
+        };
+        let wire = chat_message_to_converse(&msg).unwrap();
+        assert_eq!(wire["content"][0]["toolUse"]["input"]["_raw"], "not json");
+    }
+
+    // ── Response parsing ─────────────────────────────────────────
+
+    #[test]
+    fn parse_converse_response_text_only() {
+        let resp = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "hello"}]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}
+        });
+        let parsed = parse_converse_response(resp).unwrap();
+        assert_eq!(parsed.text().as_deref(), Some("hello"));
+        assert!(parsed.tool_calls().is_none());
+        assert_eq!(parsed.finish_reason().as_deref(), Some("end_turn"));
+        let u = parsed.usage().unwrap();
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 2);
+    }
+
+    #[test]
+    fn parse_converse_response_tool_use() {
+        // Real-shape fixture captured from `aws bedrock-runtime converse`
+        // against us.anthropic.claude-opus-4-7.
+        let resp = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "toolUse": {
+                            "toolUseId": "tooluse_Z9sULYOSOASUR3SNOjygiX",
+                            "name": "add_numbers",
+                            "input": {"a": 3, "b": 4},
+                            "type": "tool_use"
+                        }
+                    }]
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 789, "outputTokens": 86, "totalTokens": 875, "cacheReadInputTokens": 0}
+        });
+        let parsed = parse_converse_response(resp).unwrap();
+        // Text is None (empty is normalised to None in `text()`).
+        assert!(parsed.text().is_none());
+        let calls = parsed.tool_calls().expect("tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "tooluse_Z9sULYOSOASUR3SNOjygiX");
+        assert_eq!(calls[0].function.name, "add_numbers");
+        // Arguments serialised back to canonical JSON string.
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["a"], 3);
+        assert_eq!(args["b"], 4);
+        assert_eq!(parsed.finish_reason().as_deref(), Some("tool_use"));
+        // Cache tokens = 0 normalise to None so metrics don't report noise.
+        assert!(parsed.usage().unwrap().cached_tokens.is_none());
+    }
+
+    #[test]
+    fn parse_converse_response_mixed_text_and_tool_use() {
+        let resp = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"text": "Let me compute that."},
+                        {"toolUse": {"toolUseId": "tc1", "name": "f", "input": {}}}
+                    ]
+                }
+            },
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 1, "outputTokens": 1}
+        });
+        let parsed = parse_converse_response(resp).unwrap();
+        assert_eq!(parsed.text().as_deref(), Some("Let me compute that."));
+        assert_eq!(parsed.tool_calls().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_converse_response_populates_cache_read_tokens() {
+        let resp = serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 10, "outputTokens": 2, "cacheReadInputTokens": 7}
+        });
+        let u = parse_converse_response(resp).unwrap().usage().unwrap();
+        assert_eq!(u.cached_tokens, Some(7));
+    }
+
+    #[test]
+    fn parse_converse_response_rejects_tool_use_missing_id() {
+        let resp = serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"toolUse": {"name": "f", "input": {}}}]}},
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 1, "outputTokens": 1}
+        });
+        let err = parse_converse_response(resp).unwrap_err();
+        assert!(matches!(err, ProviderError::Provider(_)));
+    }
+
+    #[test]
+    fn parse_converse_response_rejects_tool_use_missing_input() {
+        // The Converse spec requires `input` on every `toolUse` block.
+        // A silent `null` would corrupt the next turn's orchestration,
+        // so reject explicitly.
+        let resp = serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"toolUse": {"toolUseId": "t", "name": "f"}}]}},
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 1, "outputTokens": 1}
+        });
+        let err = parse_converse_response(resp).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ProviderError::Provider(_)) && msg.contains("input"),
+            "expected missing-input rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_converse_response_rejects_tool_use_non_object() {
+        // Defensive: a malformed upstream sending `toolUse: "oops"`
+        // shouldn't silently drop the block.
+        let resp = serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"toolUse": "oops"}]}},
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 1, "outputTokens": 1}
+        });
+        let err = parse_converse_response(resp).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, ProviderError::Provider(_)) && msg.contains("not an object"),
+            "expected non-object rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn chat_message_to_converse_rejects_non_object_valid_json_tool_args() {
+        // Bedrock requires toolUse.input to be a JSON *object*. Valid
+        // JSON that isn't an object (string, number, array) must fall
+        // back to the `_raw` wrapper so we don't send a request the
+        // service will reject.
+        for non_object in ["\"foo\"", "42", "[1,2,3]", "null", "true"] {
+            let msg = ChatMessage {
+                role: ChatRole::Assistant,
+                content_type: MessageContent::ToolUse(vec![ToolCall {
+                    id: "tc1".to_owned(),
+                    call_type: "function".to_owned(),
+                    function: FunctionCall {
+                        name: "f".to_owned(),
+                        arguments: non_object.to_owned(),
+                    },
+                }]),
+                content: String::new(),
+            };
+            let wire = chat_message_to_converse(&msg).unwrap();
+            let input = &wire["content"][0]["toolUse"]["input"];
+            assert!(
+                input.is_object() && input["_raw"] == non_object,
+                "non-object JSON {non_object:?} should wrap as _raw; got {input:?}"
+            );
+        }
     }
 }

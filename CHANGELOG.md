@@ -11,6 +11,29 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`cairn-providers` native Bedrock Converse tool calls.** The native
+  `Bedrock` backend now translates cairn's `Tool` / `ToolCall` / `ChatMessage`
+  types into the Converse `toolConfig` + content-block shape and parses
+  `toolUse` response blocks back into `ChatResponse::tool_calls()`.
+  Removes the legacy `Unsupported("Bedrock chat_with_tools does not
+  support tools")` guard. Structured-output enforcement (JSON schema)
+  remains unsupported — that path requires `additionalModelRequestFields`
+  mapping and will land separately. Covers all four shape transitions
+  the orchestrator needs: user → assistant toolUse → user toolResult →
+  assistant text. Invalid JSON tool arguments are tolerated via a `_raw`
+  wrapper key rather than failing the turn. Stop reason now surfaces as
+  `finish_reason()` and `cacheReadInputTokens` flows into `Usage`.
+  17 unit tests covering `build_tool_config` (all four `ToolChoice`
+  arms + empty-name rejection + empty-description elision) and
+  `chat_message_to_converse` / `parse_converse_response` (tool-use,
+  tool-result, mixed blocks, missing toolUseId), plus 6 httpmock
+  integration tests covering the full wire-level request body, multi-turn
+  toolResult serialization, system-message routing, and 429/500 error
+  paths. Verified live against `us.anthropic.claude-opus-4-7` on EC2
+  via SigV4/IMDS — single-turn tool call returned a real `toolUse`
+  block; multi-turn `user → assistant(toolUse) → user(toolResult)`
+  produced `"3 + 4 = 7"` with `finish_reason = end_turn`.
+
 - **`cairn-providers` SigV4 signer for the Bedrock backends.** New
   `signer` module exposing `RequestSigner` (trait), `BearerAuth`
   (back-compat default), and `SigV4Signer` (AWS SigV4 via the default
