@@ -187,6 +187,26 @@ async fn trajectory_endpoint_returns_reasoning_step_after_decide() {
         .expect("run reaches server");
     assert_eq!(r.status().as_u16(), 201);
 
+    // #806: orchestrator no longer carries `bash` in its tool
+    // allowlist — workspace inspection now spawns a status-checker.
+    // The mock LLM in this test returns a `bash` tool call, which
+    // the orchestrator role would now refuse to surface. Pin the run's
+    // agent_role to `status-checker` (which keeps bash for read-only
+    // inspection) so the trajectory shape this test is exercising
+    // continues to render.
+    let r = h
+        .client()
+        .put(format!(
+            "{}/v1/settings/defaults/tenant/{}/run:{}:agent_role",
+            h.base_url, tenant, run_id,
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({ "value": "status-checker" }))
+        .send()
+        .await
+        .expect("run-scoped agent_role default reaches server");
+    assert_eq!(r.status().as_u16(), 200);
+
     // POST /orchestrate to drive one DECIDE iteration.
     let _ = h
         .client()

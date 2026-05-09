@@ -254,27 +254,32 @@ is acceptable.
 
 ## Delegation is the default
 
-Every unit of work belongs to a sub-agent unless it falls into one \
-of five carve-outs that are inherently orchestrator work:
+You have NO filesystem, code-inspection, or shell tools — no read, \
+grep, glob, lsp, or bash. Every unit of work that touches the \
+workspace is a sub-agent spawn. The four carve-outs that ARE \
+inherently orchestrator work:
 
 1. **State-reads** — get_run / list_runs / get_task / search_events / \
-   wait_for_task / get_approvals to check on sub-agents.
-2. **Sub-agent verification** — read the file they said they wrote, \
-   re-run the test they said passed, grep the symbol they said \
-   exists. Read-only inspection that confirms claims match reality.
-3. **Synthesis** — assembling sub-agent outputs into the final \
-   answer in complete_run.
-4. **Planning and decomposition** — intrinsically your role; no \
-   sub-agent for it.
-5. **Cheap cross-output decisions** — picking which of two returned \
-   outputs to use, or whether a third is needed.
+   wait_for_task / get_approvals on sub-agents inside cairn.
+2. **Synthesis** — assembling sub-agent outputs into complete_run.
+3. **Planning and decomposition** — your role; no sub-agent for it.
+4. **Cheap cross-output decisions** — picking which of two outputs \
+   to use, or whether a third is needed.
 
-If what you are about to do is NOT one of the five, delegate via \
-spawn_subagent (researcher for citation-backed investigation, \
-executor for code changes, reviewer for structured audits). \
-Retrievals, analyses, Q&A-that-needs-lookup, writing, code edits \
-all go to sub-agents. If no specialist role fits, call \
-escalate_to_operator — do not do the work yourself.
+If your action is NOT one of the four, delegate via \
+spawn_subagent. Specialist routing:
+
+- **status-checker** — read-only workspace + git inspection. \
+  \"Does file X exist?\", \"Did the test pass?\", \"What does \
+  `git status` say?\". Spawn this for ALL workspace verification, \
+  including verifying a peer sub-agent's claim.
+- **researcher** — citation-backed investigation (codebase or web).
+- **executor** — code changes (write / edit / build / test).
+- **reviewer** — structured audit of an artefact.
+
+If no specialist role fits, call escalate_to_operator — do not do \
+the work yourself, and do not invent a workaround that bypasses \
+delegation.
 
 ## Fleet management
 
@@ -301,11 +306,11 @@ Identify the concrete deliverable the operator will receive in \
 complete_run.
 
 Phase 2 — Plan and decompose. Break the goal into units. For each, \
-pick the specialist role (researcher, executor, reviewer). Spawn in \
-parallel when units are independent. Spawn even a small unit if the \
-work requires a tool you do not have. The only reason to keep work \
-inline is the five carve-outs. Delegate any single unit that would \
-take >5 of your own iterations.
+pick the specialist role (status-checker, researcher, executor, \
+reviewer). Spawn in parallel when units are independent. Spawn even \
+a small unit if the work requires a tool you do not have. The only \
+reason to keep work inline is the four carve-outs. Delegate any \
+single unit that would take >5 of your own iterations.
 
 Phase 3 — Dispatch and track. spawn_subagent each planned unit. \
 While they run, read step_history each iteration; detect stalls; \
@@ -313,8 +318,10 @@ steer if needed. Do NOT pick up their work while they run — that \
 wastes delegation.
 
 Phase 4 — Verify. When a sub-agent reports done, verify their \
-claims: read the file, re-run the test, grep the symbol. Trust \
-but check. Read-only inspection only, never edit.
+claims by spawning a status-checker with a precise question \
+(\"Does `<path>` exist and contain `<expected>`?\", \"Did `cargo \
+test -p <crate>` exit 0?\"). Trust but check, via delegation. You \
+cannot inspect the workspace yourself.
 
 Phase 5 — Synthesise and deliver. Assemble sub-agent outputs into \
 the final answer. Call complete_run with the full content in \
@@ -352,10 +359,10 @@ outcome.
 
 ## What NOT to do
 
-- Do NOT do the work yourself. Retrieval, writing, analysis, code \
-  edits belong to sub-agents. If your action is not a state-read, \
-  verification, synthesis, planning, or cross-output decision, you \
-  are executing — stop and delegate.
+- Do NOT do the work yourself. You have no filesystem or shell \
+  tools — there is no inline path. Workspace verification goes to \
+  status-checker; everything else goes to executor / researcher / \
+  reviewer.
 - Do NOT answer from training data. Even if you believe you know \
   the answer, spawn a researcher to verify and cite.
 - Do NOT call complete_run after only reading the goal. \
@@ -381,9 +388,10 @@ examples. That is research, not orchestration. Delegate. Phase 3 \
 breaker crates with the most recent-6-month downloads on \
 crates.io, one usage example per crate citing file:line\"). While \
 it runs, read step_history. Phase 4 — Researcher returns three \
-crates with citations; pick one and grep its file:line read-only \
-to confirm. Phase 5 — complete_run with the researcher's three \
-crates + examples.
+crates with citations; spawn_subagent(role=status-checker, \
+goal=\"Verify the file:line cited for crate X actually contains \
+the claimed symbol\") to confirm one citation. Phase 5 — \
+complete_run with the researcher's three crates + examples.
 
 Error-recovery: first researcher returns two crates plus \"could \
 not find a third.\" Do NOT fill in from training. Re-scope: \
@@ -393,8 +401,123 @@ when it returns. If both attempts return \"crates.io unreachable,\" \
 do NOT answer from training — call escalate_to_operator with what \
 you tried.
 
-You have status-read, inspection, delegation, and synthesis tools. \
-Delegation is the default; carve-outs are the exceptions.";
+You have state-read, delegation, and synthesis tools — and only \
+those. Anything that touches the workspace is a sub-agent spawn.";
+
+/// Status-checker specialty overlay. Pre-pended with
+/// [`BASE_SUBAGENT_PROMPT`] at consumption time via
+/// [`assembled_prompt_for`].
+///
+/// Status-checker is the orchestrator's eyes on the workspace. It runs
+/// read-only filesystem and git inspection — `read` / `grep` / `glob` /
+/// `lsp` and inspection-only `bash` — and reports back a structured
+/// findings document. It NEVER writes, edits, runs builds or tests
+/// (executor's job), and never spawns its own sub-agents.
+///
+/// Why this role exists (#806): when the orchestrator's tool palette
+/// included read/grep/glob/bash, the model's path of least resistance
+/// on any "verify X" question was another inline bash call, even on
+/// goals that explicitly needed file creation. Stripping the orchestrator
+/// of those tools and routing verification through a dedicated
+/// read-only role makes "delegate" the literal only path forward.
+const STATUS_CHECKER_PROMPT: &str = "\
+Your specialty is read-only inspection of the workspace and git \
+state. The parent has handed you a yes/no or describe-this question \
+about something on disk; your job is to look, report what is there, \
+and stop. You never write, edit, build, install, or run anything \
+that changes state.
+
+## Workflow phases
+
+Phase 1 — Understand. Read the parent's question. Identify the \
+exact thing to check (a file path, a symbol, a test result, a git \
+state) and the shape the parent expects back (yes/no, a value, a \
+short summary).
+
+Phase 2 — Plan the inspection. Pick the right tool for the question. \
+Read the file when it is about content. Grep when it is about \
+presence of a symbol or pattern. Glob when it is about which files \
+match a shape. Bash for inspection-only commands (`git status`, \
+`git log`, `cargo --version`, `ls`, `cat`, `wc -l`). Pick the \
+narrowest tool that answers the question.
+
+Phase 3 — Inspect. Run the tool. Read the output. NEVER use verbs \
+that mutate (`rm`, `mv`, `cp`, `sed -i`, output redirection, \
+package install, state-changing git, etc.) — the bash policy will \
+reject them anyway.
+
+Phase 4 — Cross-check. If the first inspection is ambiguous (a \
+grep that returned 50 matches, a read that hit only the file's \
+first 2000 lines), run one more narrowing tool call to disambiguate \
+before reporting. Never guess; check.
+
+Phase 5 — Report. Call complete_run with a structured finding: the \
+question restated, the answer (yes/no/value/short-summary), and the \
+evidence (file path + content excerpt, command + output excerpt, \
+exit code). Cite specific paths and line numbers where applicable.
+
+## Completion gate
+
+Before complete_run:
+
+- The parent's question is answered, in the shape they asked for.
+- The answer is grounded in actual tool output captured in this run \
+  — not inferred, not guessed, not generalised from training.
+- Evidence is included verbatim (or a short representative excerpt) \
+  so the parent can sanity-check.
+- You ran zero mutating commands.
+
+## Error recovery
+
+A read fails: try a related path or query. Bash tool refuses an \
+attempted command (the bash policy correctly rejects mutation \
+verbs): do not retry with a workaround that hides the mutation — \
+report \"can only inspect, mutation requested\" as the answer and \
+stop. The parent will respawn an executor if action is what they \
+needed. If the question is genuinely unanswerable from inspection \
+alone (\"will this build succeed?\" requires actually running a \
+build, which is mutating in cairn's sandbox model), say so \
+explicitly in the report.
+
+## What NOT to do
+
+- Do NOT write, edit, multi-edit, or use bash redirection (`>` / \
+  `>>` / `tee`). Mutation is out of scope and the harness will \
+  reject it anyway.
+- Do NOT run `cargo build`, `cargo test`, `npm install`, `pip \
+  install`, or any other side-effect-having command. Test execution \
+  is the executor's job; you READ the result if it is already on \
+  disk (e.g. a CI log file the operator pointed at), you do not \
+  produce one.
+- Do NOT spawn sub-agents. Per the base contract, sub-agents do not \
+  spawn further sub-agents; status-checker is no exception.
+- Do NOT answer from training. If you cannot inspect the answer, \
+  say so.
+- Do NOT pad with prose. The parent wants a tight finding, not an \
+  essay.
+
+## Example trajectory
+
+Goal: \"Confirm `crates/cairn-domain/src/agent_roles.rs` defines a \
+role with `role_id = \\\"status-checker\\\"`.\"
+
+Phase 1 — Question: does this exact file contain a role with id \
+status-checker. Answer shape: yes/no plus the matching line. Phase \
+2 — Plan: `grep -n` is the right tool (presence of a literal in a \
+known file). Phase 3 — Inspect: \
+`grep -n 'status-checker' crates/cairn-domain/src/agent_roles.rs`. \
+Output shows two matches — line 1098 (a role-id literal) and line \
+1310 (a comment). Phase 4 — Cross-check: the line 1098 literal is \
+the AgentRole declaration; line 1310 is just a comment in another \
+section. Single canonical declaration. Phase 5 — Report: \
+complete_run final_answer = \"Yes. \
+crates/cairn-domain/src/agent_roles.rs:1098 declares \
+AgentRole::new(\\\"status-checker\\\", ...). One additional comment \
+match at line 1310 referencing the role; no other definition.\"
+
+Error-recovery: if the file does not exist, the read returns ENOENT. \
+Do not guess at a nearby filename — report \"file not found at \
+<path>\" and stop. Parent re-scopes if needed.";
 
 /// Executor specialty overlay. Pre-pended with [`BASE_SUBAGENT_PROMPT`]
 /// at consumption time via [`assembled_prompt_for`]. Identity opener,
@@ -798,7 +921,9 @@ pub fn response_shape_for(role_id: &str) -> ResponseShape {
     // catches the drift.
     match role_id {
         "orchestrator" => ResponseShape::DirectAnswer,
-        "executor" | "researcher" | "reviewer" | "generic" => ResponseShape::ProceduralArtifact,
+        "executor" | "researcher" | "reviewer" | "generic" | "status-checker" => {
+            ResponseShape::ProceduralArtifact
+        }
         _ => ResponseShape::ProceduralArtifact, // unknown → generic-shaped
     }
 }
@@ -832,46 +957,65 @@ pub fn assembled_prompt_for_role(role: &AgentRole) -> String {
 pub fn default_roles() -> Vec<AgentRole> {
     vec![
         // Orchestrator's specialty is managing the run — not executing it.
-        // It reads state, inspects artifacts (read/grep/glob), runs
-        // read-only verification shell commands (cargo test, pytest,
-        // git status, etc.), spawns sub-agents, synthesises their output,
-        // and calls complete_run. It does NOT fetch external URLs,
-        // mutate files, or run inline retrievals that belong to an
-        // `executor` / `researcher` sub-agent.
+        // It reads cairn-internal fleet state, spawns sub-agents,
+        // synthesises their output, and calls complete_run. It has NO
+        // filesystem, code-inspection, or shell tools: every workspace
+        // verification (read/grep/glob/lsp, bash) goes through a
+        // status-checker sub-agent spawn.
         //
-        // The #702 / R9 failure mode was precisely the inverse: with no
-        // tool-surface restriction the orchestrator saw webfetch in its
-        // toolbox and called it three times inline instead of spawning
-        // a researcher. The allowlist below makes the doctrine
-        // structural — the LLM cannot pick a mutating or externally-
-        // fetching tool because the schema is never advertised to it.
+        // History — why the surface is THIS narrow (#702, #806):
         //
-        // Shell (bash / bash_output / bash_kill) is further constrained
-        // at the harness-tools permission layer to inspection + test-
-        // runner verbs only; mutation verbs (rm / cp / mv / sed / write-
-        // redirects / state-changing git / package-install) are
-        // rejected at invocation time.
+        //   #702 / R9: with no tool-surface restriction the orchestrator
+        //   saw webfetch in its toolbox and called it inline three times
+        //   instead of spawning a researcher. The first allowlist
+        //   (PR #705/#706/#708) removed mutating + externally-fetching
+        //   tools, which closed that hole.
+        //
+        //   #806 / R22: with read/grep/glob/bash still in the allowlist
+        //   the orchestrator kept doing the work itself via
+        //   "verification" bash calls — 11 consecutive `find` / `ls` /
+        //   `git status` invocations on a goal that needed file
+        //   creation, never once spawning a sub-agent. The model knew
+        //   it should delegate (every iteration's reasoning said so);
+        //   the prompt said so. But as long as bash was in the tool
+        //   palette, the LLM's path of least resistance was another
+        //   bash call. The fix is structural: drop the inline-act tools
+        //   and route every workspace-touching question through a
+        //   status-checker spawn.
+        //
+        // What stays:
+        //
+        //   - get_run / list_runs / get_task / search_events /
+        //     wait_for_task / get_approvals (cairn-internal fleet
+        //     state — cheap, cairn-owned, not "doing the work")
+        //   - list_agents / agent_description (planning aids — read the
+        //     registry to pick a delegate)
+        //   - memory_search / memory_store / scratch_pad (planning +
+        //     synthesis substrate; no workspace touch)
+        //   - spawn_subagent / complete_run / escalate_to_operator /
+        //     notify_operator / cancel_task (the directive set)
+        //   - tool_search (discover specialist tools to add to a child
+        //     spawn's parent_context)
+        //
+        // What is gone (delegate to status-checker / researcher /
+        // executor / reviewer instead):
+        //
+        //   - read, grep, glob, lsp, bash, bash_output, bash_kill
+        //
+        // The doctrine fence is now structural in both directions:
+        // mutation isn't reachable, and inline read-only "verification"
+        // isn't either.
         AgentRole::new("orchestrator", "Orchestrator", AgentRoleTier::Orchestrator)
             .with_description(
                 "Plans, decomposes, and dispatches goals to specialist sub-agents. \
-                 Reads state, verifies sub-agent claims, synthesises results, and \
-                 delivers the final answer to the operator. Never executes the work \
-                 itself.",
+                 Reads cairn fleet state, synthesises sub-agent output, and delivers \
+                 the final answer to the operator. Has no filesystem or shell tools; \
+                 workspace verification spawns a status-checker.",
             )
             .with_response_shape(ResponseShape::DirectAnswer)
             .with_system_prompt(ORCHESTRATOR_PROMPT)
             .with_tools([
-                // Observational — filesystem + code
-                "read",
-                "grep",
-                "glob",
-                "lsp",
-                // Observational — shell (constrained at the harness
-                // permission layer; see orchestrator bash policy)
-                "bash",
-                "bash_output",
-                "bash_kill",
-                // Observational — fleet state
+                // Observational — fleet state (cairn-internal, not workspace)
                 "get_run",
                 "list_runs",
                 "get_task",
@@ -900,6 +1044,44 @@ pub fn default_roles() -> Vec<AgentRole> {
                 "tool_search",
             ])
             .with_max_context_tokens(200_000),
+        // #806: status-checker is the orchestrator's eyes on the
+        // workspace. Read-only filesystem + git inspection only;
+        // anything that mutates is rejected. Spawned by the
+        // orchestrator for every "verify X" question — both
+        // sub-agent claim verification and operator-initiated checks.
+        // Its tool palette is intentionally narrower than reviewer's:
+        // reviewer audits artefacts and writes structured findings;
+        // status-checker answers concrete yes/no/value questions and
+        // reports the evidence.
+        AgentRole::new("status-checker", "Status Checker", AgentRoleTier::Standard)
+            .with_description(
+                "Read-only inspection of the workspace and git state. Answers \
+                 concrete yes/no/value questions about files, symbols, \
+                 build/test results already on disk, git status. Returns a \
+                 tight evidence-backed finding. Never writes, never builds, \
+                 never spawns. Best for: verifying a peer sub-agent's claim, \
+                 checking workspace state before dispatching an executor.",
+            )
+            .with_response_shape(ResponseShape::ProceduralArtifact)
+            .with_system_prompt(STATUS_CHECKER_PROMPT)
+            .with_tools([
+                // Read-only inspection
+                "read",
+                "grep",
+                "glob",
+                "lsp",
+                // Inspection-only shell. The harness-tools bash policy
+                // already rejects mutation verbs (rm/cp/mv/sed -i,
+                // output redirection, package install, state-changing
+                // git) at invocation time — status-checker inherits
+                // that fence and the prompt reinforces it.
+                "bash",
+                "bash_output",
+                "bash_kill",
+                // Termination + escalation
+                "complete_run",
+                "escalate_to_operator",
+            ]),
         // #707: researcher needs REAL registered tool names to actually
         // research. The prior `cairn.*` placeholders (cairn.search /
         // cairn.retrieve / cairn.webSearch / cairn.fetchUrl) are NOT
@@ -1096,6 +1278,7 @@ mod tests {
 
     const DEFAULT_ROLE_IDS: &[&str] = &[
         "orchestrator",
+        "status-checker",
         "executor",
         "researcher",
         "reviewer",
@@ -1122,9 +1305,10 @@ mod tests {
     #[test]
     fn default_roles_non_empty() {
         let roles = default_roles();
-        assert_eq!(roles.len(), 5);
+        assert_eq!(roles.len(), 6);
         let ids: Vec<_> = roles.iter().map(|r| r.role_id.as_str()).collect();
         assert!(ids.contains(&"orchestrator"));
+        assert!(ids.contains(&"status-checker"));
         assert!(ids.contains(&"researcher"));
         assert!(ids.contains(&"executor"));
         assert!(ids.contains(&"reviewer"));
@@ -1297,6 +1481,68 @@ mod tests {
             .tools
             .iter()
             .any(|t| t.contains("write") || t.contains("Write")));
+    }
+
+    /// #806 regression guard: the orchestrator MUST NOT have any
+    /// filesystem, code-inspection, or shell tool in its allowlist.
+    /// Workspace inspection now goes through a status-checker spawn;
+    /// if any of these tools sneak back in, the bash-loop pathology
+    /// returns (R22 dogfood proved this end-to-end).
+    #[test]
+    fn orchestrator_has_no_workspace_inspection_tools() {
+        let roles = default_roles();
+        let orch = roles.iter().find(|r| r.role_id == "orchestrator").unwrap();
+        let banned = [
+            "read",
+            "grep",
+            "glob",
+            "lsp",
+            "bash",
+            "bash_output",
+            "bash_kill",
+        ];
+        for tool in banned {
+            assert!(
+                !orch.tools.iter().any(|t| t == tool),
+                "#806 regression: orchestrator allowlist MUST NOT include {tool:?}; \
+                 workspace inspection spawns a status-checker. Found tools: {:?}",
+                orch.tools
+            );
+        }
+        // Sanity: spawn_subagent IS still there.
+        assert!(
+            orch.tools.iter().any(|t| t == "spawn_subagent"),
+            "orchestrator allowlist must keep spawn_subagent; got {:?}",
+            orch.tools
+        );
+    }
+
+    /// #806 regression guard: status-checker is read-only — no write,
+    /// no edit, no multi-edit. Mutation goes to executor.
+    #[test]
+    fn status_checker_is_read_only() {
+        let roles = default_roles();
+        let sc = roles
+            .iter()
+            .find(|r| r.role_id == "status-checker")
+            .expect("status-checker must be registered (#806)");
+        let banned = ["write", "edit", "multiedit", "spawn_subagent"];
+        for tool in banned {
+            assert!(
+                !sc.tools.iter().any(|t| t == tool),
+                "status-checker must not include {tool:?}; mutation + delegation \
+                 are out of scope. Found tools: {:?}",
+                sc.tools
+            );
+        }
+        // Sanity: read-only inspection tools ARE present.
+        for tool in ["read", "grep", "glob", "bash"] {
+            assert!(
+                sc.tools.iter().any(|t| t == tool),
+                "status-checker must include {tool:?} for inspection; got {:?}",
+                sc.tools
+            );
+        }
     }
 
     // ── Prompt structural-contract tests ──────────────────────────────────────

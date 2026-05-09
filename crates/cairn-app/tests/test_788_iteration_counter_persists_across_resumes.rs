@@ -243,6 +243,31 @@ async fn iteration_counter_survives_orchestrate_resume() {
         .expect("run reaches server");
     assert_eq!(r.status().as_u16(), 201);
 
+    // #806: the orchestrator role no longer has `bash` in its tool
+    // allowlist — workspace inspection now spawns a status-checker.
+    // This test is exercising the approval-driven resume path with
+    // a bash tool call, which is now status-checker's territory.
+    // Pin agent_role on the run via the run-scoped default
+    // (`run:<run_id>:agent_role`) — that's the key the orchestrate
+    // path reads via `resolve_run_string_default(... "agent_role")`.
+    let r = h
+        .client()
+        .put(format!(
+            "{}/v1/settings/defaults/tenant/{}/run:{}:agent_role",
+            h.base_url, tenant, run_id,
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({ "value": "status-checker" }))
+        .send()
+        .await
+        .expect("run-scoped default agent_role reaches server");
+    let put_status = r.status().as_u16();
+    let put_body = r.text().await.unwrap_or_default();
+    assert_eq!(
+        put_status, 200,
+        "PUT run-scoped agent_role default must succeed; body={put_body}"
+    );
+
     // First /orchestrate POST. The mock returns a bash tool call
     // requiring approval; the loop suspends.
     let r = h

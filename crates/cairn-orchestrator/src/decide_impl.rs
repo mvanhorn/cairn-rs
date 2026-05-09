@@ -1337,7 +1337,7 @@ pub(crate) fn spawn_subagent_tool_def() -> serde_json::Value {
         "type": "function",
         "function": {
             "name": "spawn_subagent",
-            "description": "Delegate a concrete task to a sub-agent and wait for its result. The current run SUSPENDS until the sub-agent terminates; when it resumes, the sub-agent's completion summary is surfaced in the step_history under action_kind=\"subagent_complete\". Use this when the current run's goal decomposes into a self-contained sub-task that another role is better suited to handle. Call `list_agents` first if you are unsure which role fits.",
+            "description": "Delegate a concrete task to a sub-agent and wait for its result. The current run SUSPENDS until the sub-agent terminates; when it resumes, the sub-agent's completion summary is surfaced in the step_history under action_kind=\"subagent_complete\". Use this when the current run's goal decomposes into a self-contained sub-task that another role is better suited to handle. Routing — `status-checker` for read-only workspace/git inspection (every \"does X exist? did the test pass? what does git status say?\" question goes here, including verifying a peer sub-agent's claim); `executor` for code changes; `researcher` for citation-backed investigation; `reviewer` for structured audits; `generic` only as a last resort. Call `list_agents` for the full registry.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2340,7 +2340,13 @@ mod tests {
             enum_values.iter().filter_map(|v| v.as_str()).collect();
 
         // All non-orchestrator default roles must appear.
-        for expected in ["executor", "researcher", "reviewer", "generic"] {
+        for expected in [
+            "status-checker",
+            "executor",
+            "researcher",
+            "reviewer",
+            "generic",
+        ] {
             assert!(
                 enum_strs.contains(expected),
                 "role enum must include {expected:?}; got {enum_strs:?}"
@@ -3349,6 +3355,12 @@ mod tests {
     }
 
     /// End-to-end: model returns native tool_calls → proposals are InvokeTool
+    ///
+    /// Runs as the `status-checker` role so `grep` survives the
+    /// per-role tool-surface filter. Pre-#806 this used the default
+    /// `orchestrator` agent_type, but #806 stripped grep/read/glob/
+    /// lsp/bash from the orchestrator surface — those tools now live
+    /// on status-checker.
     #[tokio::test]
     async fn decide_uses_native_tool_calls_when_present() {
         struct NativeToolProvider;
@@ -3394,7 +3406,9 @@ mod tests {
         )));
         let phase =
             LlmDecidePhase::new(Arc::new(NativeToolProvider), "test-model").with_tools(registry);
-        let out = phase.decide(&ctx(), &empty_gather()).await.unwrap();
+        let mut c = ctx();
+        c.agent_type = "status-checker".to_owned();
+        let out = phase.decide(&c, &empty_gather()).await.unwrap();
 
         assert_eq!(out.proposals.len(), 1);
         assert_eq!(out.proposals[0].action_type, ActionType::InvokeTool);
@@ -3473,11 +3487,11 @@ mod tests {
             captured: captured.clone(),
         });
 
-        // Register two harness tools: `grep` (on the orchestrator
-        // allowlist) and `webfetch` (NOT on it). Post-fix the
-        // provider should see grep + not see webfetch. Pre-fix (no
-        // filter applied) webfetch was in the array — that's the
-        // bug R9 exposed.
+        // Register two harness tools: `grep` (NOT on the orchestrator
+        // allowlist after #806 — workspace inspection now spawns a
+        // status-checker) and `webfetch` (was never on it). Post-#806
+        // the provider should see neither. Pre-#702 BOTH were in the
+        // array; pre-#806 grep was in the array but webfetch was not.
         let registry = Arc::new(
             BuiltinToolRegistry::new()
                 .register(Arc::new(cairn_harness_tools::HarnessBuiltin::<
@@ -3503,11 +3517,6 @@ mod tests {
             .collect();
 
         assert!(
-            names.iter().any(|n| n == "grep"),
-            "grep is on the orchestrator allowlist and must be in the \
-             tool surface; got {names:?}"
-        );
-        assert!(
             names.iter().any(|n| n == "complete_run"),
             "complete_run must always be advertised; got {names:?}"
         );
@@ -3521,6 +3530,14 @@ mod tests {
              orchestrator role. R9 proved that with webfetch in the \
              tool surface the model calls it inline instead of \
              delegating. names={names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "grep"),
+            "#806 regression: grep must NOT be advertised to the \
+             orchestrator role. R22 proved that with grep / read / \
+             glob / lsp / bash in the orchestrator's tool surface \
+             the model loops on workspace inspection instead of \
+             spawning a status-checker. names={names:?}"
         );
     }
 

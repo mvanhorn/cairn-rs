@@ -338,10 +338,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_all_returns_five_builtins_alphabetical() {
+    async fn list_all_returns_six_builtins_alphabetical() {
         let service = svc();
         let items = service.list(&project(), SourceFilter::All).await.unwrap();
-        assert_eq!(items.len(), 5);
+        // #806 added `status-checker` to the original five built-ins.
+        assert_eq!(items.len(), 6);
         let ids: Vec<&str> = items.iter().map(|i| i.role.role_id.as_str()).collect();
         // Alphabetical ordering by role_id.
         assert_eq!(
@@ -351,7 +352,8 @@ mod tests {
                 "generic",
                 "orchestrator",
                 "researcher",
-                "reviewer"
+                "reviewer",
+                "status-checker",
             ]
         );
         assert!(items

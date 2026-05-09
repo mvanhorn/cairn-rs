@@ -136,18 +136,25 @@ mod tests {
             .get("agents")
             .and_then(|v| v.as_array())
             .expect("agents array");
-        // #775 ships 5 default roles; orchestrator is filtered out.
+        // #775 added `generic` (5 defaults). #806 added `status-checker`
+        // (6 defaults). Orchestrator is always filtered out.
         assert_eq!(
             agents.len(),
-            4,
-            "expected 4 agents (5 default - orchestrator)"
+            5,
+            "expected 5 agents (6 default - orchestrator)"
         );
 
         let ids: Vec<&str> = agents
             .iter()
             .filter_map(|a| a.get("role_id").and_then(|v| v.as_str()))
             .collect();
-        for expected in ["executor", "researcher", "reviewer", "generic"] {
+        for expected in [
+            "status-checker",
+            "executor",
+            "researcher",
+            "reviewer",
+            "generic",
+        ] {
             assert!(ids.contains(&expected), "missing {expected}");
         }
         assert!(
