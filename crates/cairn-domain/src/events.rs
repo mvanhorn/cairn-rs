@@ -384,6 +384,20 @@ pub enum RuntimeEvent {
     /// Ingest status transition reported by the memory provider.
     /// Updates the row on `memory_ingest_jobs`.
     MemoryIngestStatusUpdated(MemoryIngestStatusUpdated),
+
+    /// RFC 030 §Rollout: the startup family-mismatch scan found a
+    /// project whose knowledge-slot provider advertised memory-family
+    /// semantics at handshake (or vice versa). Emitted once per
+    /// offending project per boot. Feeds the operator-health badge +
+    /// gives the operator a pointer to reconfigure the slot.
+    ///
+    /// Audit-only: the event does not change the configured
+    /// provider_ref — operators must PUT the correct family-specific
+    /// endpoint (`/v1/projects/:p/memory-provider` /
+    /// `.../knowledge-provider`).
+    KnowledgeProviderFamilyMismatch(KnowledgeProviderFamilyMismatch),
+    /// Memory-slot twin of `KnowledgeProviderFamilyMismatch`.
+    MemoryProviderFamilyMismatch(MemoryProviderFamilyMismatch),
 }
 
 impl RuntimeEvent {
@@ -482,6 +496,8 @@ impl RuntimeEvent {
             RuntimeEvent::MemoryIngestSubmitted(event) => &event.project,
             RuntimeEvent::MemoryIngestRejected(event) => &event.project,
             RuntimeEvent::MemoryIngestStatusUpdated(event) => &event.project,
+            RuntimeEvent::KnowledgeProviderFamilyMismatch(event) => &event.project,
+            RuntimeEvent::MemoryProviderFamilyMismatch(event) => &event.project,
             RuntimeEvent::TriggerCreated(event) => &event.project,
             RuntimeEvent::TriggerEnabled(event) => &event.project,
             RuntimeEvent::TriggerDisabled(event) => &event.project,
@@ -905,6 +921,8 @@ impl RuntimeEvent {
             RuntimeEvent::MemoryIngestSubmitted(_) => None,
             RuntimeEvent::MemoryIngestRejected(_) => None,
             RuntimeEvent::MemoryIngestStatusUpdated(_) => None,
+            RuntimeEvent::KnowledgeProviderFamilyMismatch(_) => None,
+            RuntimeEvent::MemoryProviderFamilyMismatch(_) => None,
         }
     }
 }
@@ -3459,6 +3477,45 @@ pub struct KnowledgeIngestRejected {
     pub provider_ref: crate::ids::ProviderRef,
     /// Free-form short reason string for operator UI.
     pub reason: String,
+    pub at_ms: u64,
+}
+
+/// RFC 030 §Rollout: boot-time scan detected a family mismatch on a
+/// project's provider slot. Emitted once per offending project per
+/// boot; the scan is idempotent on the event log because the emission
+/// is driven by the plugin host's handshake snapshot, not by a
+/// deduplicating stream read.
+///
+/// `observed_family` is the family the plugin actually declared at its
+/// most recent handshake; `configured_slot` is the slot the operator
+/// assigned it via `PUT /knowledge-provider` or `PUT /memory-provider`.
+/// A mismatch is an operator misconfigured a memory-only adapter
+/// (e.g. mem0) on the knowledge slot — the runtime doesn't auto-fix
+/// because the correct remediation is slot-specific.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeProviderFamilyMismatch {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    /// `"memory_provider"` — what the plugin claimed at handshake.
+    /// Stored as the snake_case serde repr for cross-language
+    /// consumers.
+    pub observed_family: String,
+    /// Always `"knowledge_provider"` for this variant. Kept explicit
+    /// so operator tooling doesn't have to know which slot the event
+    /// is about from the variant name alone.
+    pub configured_slot: String,
+    pub at_ms: u64,
+}
+
+/// Memory-slot twin of `KnowledgeProviderFamilyMismatch`.
+/// `observed_family` is `"knowledge_provider"`, `configured_slot` is
+/// `"memory_provider"`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProviderFamilyMismatch {
+    pub project: crate::tenancy::ProjectKey,
+    pub provider_ref: crate::ids::ProviderRef,
+    pub observed_family: String,
+    pub configured_slot: String,
     pub at_ms: u64,
 }
 

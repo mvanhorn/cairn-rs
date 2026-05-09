@@ -1458,6 +1458,8 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::MemoryIngestSubmitted(_) => "memory_ingest_submitted",
         RuntimeEvent::MemoryIngestRejected(_) => "memory_ingest_rejected",
         RuntimeEvent::MemoryIngestStatusUpdated(_) => "memory_ingest_status_updated",
+        RuntimeEvent::KnowledgeProviderFamilyMismatch(_) => "knowledge_provider_family_mismatch",
+        RuntimeEvent::MemoryProviderFamilyMismatch(_) => "memory_provider_family_mismatch",
     }
 }
 
@@ -2196,6 +2198,18 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
             "Memory ingest {} → {} for project {}",
             e.document_id,
             sanitize_for_event_message(&e.status),
+            e.project.project_id
+        ),
+        RuntimeEvent::KnowledgeProviderFamilyMismatch(e) => format!(
+            "Provider {} on knowledge slot declared family {} at handshake (project {})",
+            e.provider_ref,
+            sanitize_for_event_message(&e.observed_family),
+            e.project.project_id
+        ),
+        RuntimeEvent::MemoryProviderFamilyMismatch(e) => format!(
+            "Provider {} on memory slot declared family {} at handshake (project {})",
+            e.provider_ref,
+            sanitize_for_event_message(&e.observed_family),
             e.project.project_id
         ),
     }

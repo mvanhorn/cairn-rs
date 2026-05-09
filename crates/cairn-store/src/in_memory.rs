@@ -3475,6 +3475,11 @@ impl InMemoryStore {
             | RuntimeEvent::MemoryIngestSubmitted(_)
             | RuntimeEvent::MemoryIngestRejected(_)
             | RuntimeEvent::MemoryIngestStatusUpdated(_) => {}
+            // RFC 030 finalize: family-mismatch audits are Ephemeral
+            // — no in-memory projection state to mutate. Operator
+            // visibility is via SSE + metrics.
+            RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
+            | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {}
         }
     }
 }

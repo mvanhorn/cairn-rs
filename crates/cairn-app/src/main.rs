@@ -1282,7 +1282,7 @@ async fn real_main() {
     // model exposes a batched `list_by_source_ids` surface).
     {
         use cairn_memory::event_log_resolver::EventLogProviderResolver;
-        use cairn_memory::multi_provider::{MultiProviderIngest, MultiProviderRetrieval};
+        use cairn_memory::multi_provider::MultiProviderRetrieval;
         use cairn_memory::post_hoc_rescorer::{NoOpCredibilityLookup, PostHocRescorer};
         use cairn_memory::{retrieval::RetrievalService, IngestService};
         use cairn_plugin_proto::CapabilityFamily;
@@ -1320,84 +1320,41 @@ async fn real_main() {
             )
             .with_response_hook(rescorer),
         ) as Arc<dyn RetrievalService>;
-        let ingest = Arc::new(MultiProviderIngest::new(
-            lib_state.ingest.clone(),
-            EventLogProviderResolver::new(store),
-            dispatcher,
-        )) as Arc<dyn IngestService>;
-        // RFC 030 PR-F: dedicated `MultiProviderMemory` retrieval +
-        // memory rescorer so the memory-family path has the right
-        // family tag on every response and skips `multi_neighbors`.
-        // The dispatcher slot is the same stdio host for today — PR-G
-        // wires a family-aware resolver; until then both families
-        // route through `cairn-default`.
-        use cairn_memory::multi_provider_memory::{
-            MemoryPluginDispatcher, MemoryPluginError, MultiProviderMemory,
-        };
+        // Knowledge-family ingest pipeline is not surfaced through the
+        // tool registry (knowledge tools are retrieval-only today); the
+        // direct bundle import/export flows use `lib_state.ingest`.
+        // A `MultiProviderIngest` wiring for plugin knowledge ingest
+        // will reconstruct this here when the feature lands; `store`
+        // was consumed by the knowledge resolver above, so nothing
+        // here depends on it further.
 
-        // Bridge the single stdio knowledge dispatcher into the memory
-        // trait so PR-F doesn't reach into plugin-host internals. PR-G
-        // replaces this with a real mem0 adapter. Conversions go through
-        // dedicated `From` impls on the wire types (cairn-plugin-proto)
-        // + `From<KnowledgePluginError> for MemoryPluginError` (cairn-
-        // memory) — no serde_json round-trip, one field-move per struct,
-        // error arms centralised.
-        struct KnowledgeDispatcherAsMemory<T>(T);
-        #[async_trait::async_trait]
-        impl<T: cairn_memory::multi_provider::KnowledgePluginDispatcher + Send + Sync>
-            MemoryPluginDispatcher for KnowledgeDispatcherAsMemory<T>
-        {
-            async fn query(
-                &self,
-                plugin_id: &str,
-                params: cairn_plugin_proto::memory::MemoryQueryParams,
-            ) -> Result<cairn_plugin_proto::memory::MemoryQueryResult, MemoryPluginError>
-            {
-                let k_res = self.0.query(plugin_id, params.into()).await?;
-                Ok(k_res.into())
-            }
-            async fn ingest(
-                &self,
-                plugin_id: &str,
-                params: cairn_plugin_proto::memory::MemoryIngestParams,
-            ) -> Result<cairn_plugin_proto::memory::MemoryIngestAck, MemoryPluginError>
-            {
-                let ack = self.0.ingest(plugin_id, params.into()).await?;
-                Ok(ack.into())
-            }
-            async fn ingest_status(
-                &self,
-                plugin_id: &str,
-                params: cairn_plugin_proto::memory::MemoryIngestStatusParams,
-            ) -> Result<cairn_plugin_proto::memory::MemoryIngestStatusResult, MemoryPluginError>
-            {
-                let res = self.0.ingest_status(plugin_id, params.into()).await?;
-                Ok(res.into())
-            }
-        }
-
-        let memory_dispatcher = Arc::new(KnowledgeDispatcherAsMemory(
+        // Memory-family wiring: separate `memory_retrieval` +
+        // `memory_ingest` Arcs from lib_state (distinct
+        // `InMemoryDocumentStore` per family so memory chunks and
+        // knowledge chunks never share storage), a memory-family
+        // resolver projecting only `MemoryProviderConfigured` events,
+        // and a single `KnowledgeDispatcherAsMemory` instance shared
+        // across retrieval + ingest dispatch (avoids rebuilding the
+        // bridge for each call path + keeps any future per-dispatcher
+        // state cached).
+        use cairn_memory::event_log_resolver::EventLogMemoryProviderResolver;
+        use cairn_memory::multi_provider_memory::{MultiProviderMemory, MultiProviderMemoryIngest};
+        let memory_dispatcher = Arc::new(cairn_app::main_bridges::KnowledgeDispatcherAsMemory(
             lib_state.knowledge_dispatcher.clone(),
         ));
-        // RFC 030 PR-G: the memory-family resolver projects only
-        // `MemoryProviderConfigured` events, so the `cairn-default`
-        // bootstrap emitted by `ProjectCreated` routes correctly even
-        // when the knowledge slot has been changed.
-        use cairn_memory::event_log_resolver::EventLogMemoryProviderResolver;
         let memory_retrieval = Arc::new(
             MultiProviderMemory::new(
-                lib_state.retrieval.clone(),
+                lib_state.memory_retrieval.clone(),
                 EventLogMemoryProviderResolver::new(lib_state.runtime.store.clone()),
-                memory_dispatcher,
+                memory_dispatcher.clone(),
             )
             .with_response_hook(memory_rescorer),
         ) as Arc<dyn RetrievalService>;
-        // Ingest stays on the knowledge pipeline for cairn-default today;
-        // a dedicated `MultiProviderMemoryIngest` wiring lands once mem0
-        // + other auto-extract adapters need an explicit memory-ingest
-        // path. Cairn-default accepts either family through the shared
-        // in-process pipeline.
-        let memory_ingest = ingest.clone();
+        let memory_ingest = Arc::new(MultiProviderMemoryIngest::new(
+            lib_state.memory_ingest.clone(),
+            EventLogMemoryProviderResolver::new(lib_state.runtime.store.clone()),
+            memory_dispatcher,
+        )) as Arc<dyn IngestService>;
         let auto_extract_resolver: std::sync::Arc<
             dyn cairn_app::tool_impls::MemoryAutoExtractResolver,
         > = std::sync::Arc::new(cairn_app::tool_impls::NeverAutoExtract);
@@ -1419,6 +1376,39 @@ async fn real_main() {
         };
         lib_mut.tool_registry = Some(Arc::new(registry));
         eprintln!("tool registry: memory tools + cairn.registerRepo wired");
+    }
+
+    // ── Boot-time provider-slot backfill + family-mismatch scan ───────────
+    // Emits `cairn-default` bootstrap bindings for projects created
+    // before the dual-family `ProjectCreated` emission, and flags
+    // plugin slots whose handshake-declared family doesn't match
+    // their configured slot. Best-effort: failures log at WARN but
+    // do not block boot. The plugin-family lookup currently has no
+    // cache surface to consult (the plugin host's per-id handshake
+    // snapshot isn't exposed to this crate yet), so the mismatch
+    // scan ships as a no-op for plugin refs today; it activates once
+    // the plugin host exposes a `family_for_plugin_id` surface.
+    // Backfill is active regardless.
+    {
+        let summary = cairn_app::provider_boot_scan::run_provider_boot_scan(
+            lib_state.runtime.store.clone(),
+            |_plugin_id| None,
+        )
+        .await;
+        if summary.backfilled_knowledge > 0
+            || summary.backfilled_memory > 0
+            || summary.knowledge_mismatches > 0
+            || summary.memory_mismatches > 0
+        {
+            eprintln!(
+                "provider boot scan: backfilled_knowledge={} backfilled_memory={} \
+                 knowledge_mismatches={} memory_mismatches={}",
+                summary.backfilled_knowledge,
+                summary.backfilled_memory,
+                summary.knowledge_mismatches,
+                summary.memory_mismatches
+            );
+        }
     }
 
     // ── Binary-specific state (shares runtime + tokens with lib.rs) ────────

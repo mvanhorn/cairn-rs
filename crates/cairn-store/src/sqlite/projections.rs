@@ -3979,6 +3979,11 @@ impl SqliteSyncProjection {
                 .await
                 .map_err(|err| StoreError::Internal(err.to_string()))?;
             }
+            // RFC 030 finalize: family-mismatch audit events are
+            // Ephemeral — no durable projection row. Operator health
+            // dashboard consumes them via SSE.
+            RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
+            | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {}
         }
 
         Ok(())

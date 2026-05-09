@@ -532,6 +532,11 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::MemoryIngestSubmitted(_)
             | RuntimeEvent::MemoryIngestRejected(_)
             | RuntimeEvent::MemoryIngestStatusUpdated(_)
+            // RFC 030 finalize: family-mismatch audits are not
+            // modelled in the provenance graph — operator-visibility
+            // only.
+            | RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
+            | RuntimeEvent::MemoryProviderFamilyMismatch(_)
             // RFC-025 Phase 1: eval scoring events are projection-only
             // (they update the `eval_runs` read-model metrics columns in
             // milestones 3/4/5). The graph projector does not need to

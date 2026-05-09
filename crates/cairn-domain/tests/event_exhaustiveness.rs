@@ -18,9 +18,10 @@ use cairn_domain::errors::RuntimeEntityRef;
 use cairn_domain::events::StateTransition;
 use cairn_domain::events::{
     KnowledgeIngestRejected, KnowledgeIngestStatusUpdated, KnowledgeIngestSubmitted,
-    KnowledgeProviderCapabilityChanged, KnowledgeProviderConfigured, KnowledgeProviderUnavailable,
-    MemoryIngestRejected, MemoryIngestStatusUpdated, MemoryIngestSubmitted,
-    MemoryProviderCapabilityChanged, MemoryProviderConfigured, MemoryProviderUnavailable,
+    KnowledgeProviderCapabilityChanged, KnowledgeProviderConfigured,
+    KnowledgeProviderFamilyMismatch, KnowledgeProviderUnavailable, MemoryIngestRejected,
+    MemoryIngestStatusUpdated, MemoryIngestSubmitted, MemoryProviderCapabilityChanged,
+    MemoryProviderConfigured, MemoryProviderFamilyMismatch, MemoryProviderUnavailable,
     ResolvedProviderSnapshot,
 };
 use cairn_domain::ids::{DocumentId, KnowledgeDocumentId, ProviderRef};
@@ -718,6 +719,14 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         | RuntimeEvent::MemoryIngestSubmitted(_)
         | RuntimeEvent::MemoryIngestRejected(_)
         | RuntimeEvent::MemoryIngestStatusUpdated(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        // RFC 030 finalize: family-mismatch audit events are
+        // project-scoped (keyed on the offending slot's project) with
+        // no run/session entity.
+        RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
+        | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {
             assert_ne!(proj.tenant_id.as_str(), "_system");
             assert!(eref.is_none());
         }
@@ -2129,6 +2138,21 @@ fn all_variants() -> Vec<RuntimeEvent> {
             status: "completed".to_owned(),
             at_ms: ts,
         }),
+        // RFC 030 finalize: family-mismatch audit events.
+        RuntimeEvent::KnowledgeProviderFamilyMismatch(KnowledgeProviderFamilyMismatch {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            observed_family: "memory_provider".to_owned(),
+            configured_slot: "knowledge_provider".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryProviderFamilyMismatch(MemoryProviderFamilyMismatch {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:bedrock-kb"),
+            observed_family: "knowledge_provider".to_owned(),
+            configured_slot: "memory_provider".to_owned(),
+            at_ms: ts,
+        }),
     ]
 }
 
@@ -2137,12 +2161,12 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 174 variants in the RuntimeEvent enum (168 prior + RFC 030 6 new
-    // memory-provider lifecycle events).
+    // 176 variants in the RuntimeEvent enum (174 prior + RFC 030
+    // finalize: 2 family-mismatch audit events).
     assert_eq!(
         variants.len(),
-        174,
-        "all_variants() must construct exactly 174 RuntimeEvent instances"
+        176,
+        "all_variants() must construct exactly 176 RuntimeEvent instances"
     );
 }
 

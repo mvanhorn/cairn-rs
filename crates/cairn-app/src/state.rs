@@ -248,10 +248,35 @@ pub struct AppState {
     /// Monotonic counter for SSE frame sequence IDs.
     pub sse_seq: Arc<std::sync::atomic::AtomicU64>,
     pub graph: Arc<InMemoryGraphStore>,
+    /// RFC 029: knowledge-family document store. Holds curated,
+    /// operator-ingested chunks (design docs, runbooks, bundle
+    /// imports). Backing store for every handler under `/v1/memory/…`,
+    /// `knowledge_search`, and the bundle import/export flows — those
+    /// surfaces predate RFC 030 and are knowledge-corpus-only.
     pub document_store: Arc<InMemoryDocumentStore>,
+    /// RFC 030 §Isolation: memory-family document store — episodic,
+    /// agent-written content. Separate `InMemoryDocumentStore`
+    /// (no `Arc` sharing with `document_store`) so a memory-family
+    /// store doesn't leak into the knowledge corpus and vice versa.
+    /// Backs `memory_search` / `memory_store` through
+    /// `memory_retrieval` + `memory_ingest`. Today cairn-default
+    /// serves both families because no memory-specific pipeline
+    /// ships in-tree yet; the split still matters for correctness
+    /// under operators who mix cairn-default with a memory plugin
+    /// (cross-family chunk bleed is impossible by construction when
+    /// the stores are distinct).
+    pub memory_document_store: Arc<InMemoryDocumentStore>,
+    /// RFC 029: knowledge-family retrieval over `document_store`.
     pub retrieval: Arc<InMemoryRetrieval>,
+    /// RFC 030 PR-G / §Isolation: memory-family retrieval over the
+    /// separate `memory_document_store`.
+    pub memory_retrieval: Arc<InMemoryRetrieval>,
     pub deep_search: Arc<AppDeepSearch>,
+    /// RFC 029: knowledge-family ingest pipeline.
     pub ingest: Arc<AppIngestPipeline>,
+    /// RFC 030 §Isolation: memory-family ingest pipeline over
+    /// `memory_document_store`.
+    pub memory_ingest: Arc<AppIngestPipeline>,
     pub diagnostics: Arc<InMemoryDiagnostics>,
     pub feed: Arc<FeedStore>,
     pub bundle_import: Arc<InMemoryImportService>,
@@ -801,6 +826,16 @@ impl AppState {
         let graph = Arc::new(InMemoryGraphStore::new());
         let plugin_registry = Arc::new(InMemoryPluginRegistry::new());
         let document_store = Arc::new(InMemoryDocumentStore::new());
+        // RFC 030 §Isolation: the memory-family document store is a
+        // fresh `InMemoryDocumentStore` instance — explicitly not a
+        // clone of `document_store`. Keeping the Arcs distinct is the
+        // whole point: episodic memory and curated knowledge share a
+        // runtime pipeline (in-tree cairn-default) but must not share
+        // durable state. A plugin that flips the memory slot to an
+        // external adapter will still see its own store when the
+        // family resolver picks `cairn-default`; the knowledge slot's
+        // corpus is unaffected.
+        let memory_document_store = Arc::new(InMemoryDocumentStore::new());
         let diagnostics = Arc::new(InMemoryDiagnostics::new());
         let evals = Arc::new(
             ProductEvalRunService::with_graph_and_event_log(
@@ -833,6 +868,17 @@ impl AppState {
             InMemoryRetrieval::with_diagnostics(document_store.clone(), diagnostics.clone())
                 .with_graph(graph.clone()),
         );
+        // RFC 030: memory-family retrieval over the isolated store.
+        // Shares the same diagnostics + graph handles — diagnostics
+        // are per-source (source_credibility is family-agnostic in
+        // the v1 projection) and the graph only carries
+        // knowledge-corpus chunks today. When a memory-only
+        // credibility projection arrives, wire a per-family
+        // diagnostics instance here.
+        let memory_retrieval = Arc::new(
+            InMemoryRetrieval::with_diagnostics(memory_document_store.clone(), diagnostics.clone())
+                .with_graph(graph.clone()),
+        );
         // RFC 029 PR-B1: wrap the inner retrieval in MultiProviderRetrieval
         // so every deep-search hop dispatches through the same provider
         // resolver as the agent's memory_search tool.
@@ -863,6 +909,15 @@ impl AppState {
         );
         let ingest = Arc::new(IngestPipeline::new(
             document_store.clone(),
+            ParagraphChunker::default(),
+        ));
+        // RFC 030: memory-family ingest pipeline over the isolated
+        // `memory_document_store`. Chunker is identical (paragraph
+        // chunking works for both episodic memory traces and curated
+        // knowledge chunks); when a memory-specific chunker ships it
+        // gets swapped in here without touching the knowledge path.
+        let memory_ingest = Arc::new(IngestPipeline::new(
+            memory_document_store.clone(),
             ParagraphChunker::default(),
         ));
         let feed = Arc::new(FeedStore::new());
@@ -1024,9 +1079,12 @@ impl AppState {
         let mut state = Self {
             config,
             document_store,
+            memory_document_store,
             retrieval,
+            memory_retrieval,
             deep_search,
             ingest,
+            memory_ingest,
             diagnostics,
             feed,
             bundle_import,

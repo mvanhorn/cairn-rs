@@ -561,6 +561,23 @@ pub const REGISTRY: &[ProjectionEntry] = &[
             table: Some("memory_ingest_jobs"),
         },
     },
+    // RFC 030 finalize: family-mismatch audit events. Ephemeral — the
+    // event log itself is the audit trail; operator health surfaces
+    // subscribe via SSE + metrics. No durable read-model row because
+    // the scan emission is idempotent per-boot and the operator only
+    // needs the latest observation.
+    ProjectionEntry {
+        variant: "KnowledgeProviderFamilyMismatch",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 030 §Rollout: startup family-mismatch audit signal; SSE + metrics only, no read-model row needed",
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryProviderFamilyMismatch",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 030 §Rollout: startup family-mismatch audit signal; SSE + metrics only, no read-model row needed",
+        },
+    },
     // ── Ephemeral (31) ────────────────────────────────────────────────────
     // Operator observability surfaces (SSE + metrics) with no durable read
     // model. The event log itself is the audit trail.
@@ -1618,16 +1635,22 @@ mod tests {
         //     memory events to the memory tables + knowledge events to the
         //     knowledge tables so a single-family read stays on one table.
         //     Net: +6 Projected → 141 / 33 / 0.
+        //   * RFC 030 finalize: two family-mismatch audit events
+        //     (`KnowledgeProviderFamilyMismatch`,
+        //     `MemoryProviderFamilyMismatch`) added as Ephemeral — the
+        //     startup family-mismatch scan emits these; SSE + metrics
+        //     only, no read-model row needed. Net: +2 Ephemeral →
+        //     141 / 35 / 0.
         assert_eq!(
             projected, 141,
             "Projected count drifted; update registry + RFC"
         );
         assert_eq!(
-            ephemeral, 33,
+            ephemeral, 35,
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 174);
+        assert_eq!(projected + ephemeral + stubbed, 176);
     }
 
     #[test]
