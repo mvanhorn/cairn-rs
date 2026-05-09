@@ -542,9 +542,27 @@ pub(crate) async fn drive_run_iteration(
     // `try_kick_auto_resume` already verified all pending approvals
     // are gone, so we can safely flip back to Running and let the
     // loop continue.
+    //
+    // `WaitingDependency` is the post-G5 entry state when a child
+    // sub-agent reaches a terminal state and `ParentAutoResume`
+    // re-invokes drive_run_iteration on the parent. `Paused` is the
+    // operator-paced equivalent (PUT /v1/runs/:id/resume → drive).
+    // Both are real resume boundaries — per #795 the projection-side
+    // `is_run_resume_boundary()` advances the iteration counter on
+    // these transitions, but only when they're observed in the event
+    // log. If the entry handler doesn't append a RunStateChanged for
+    // these states, the projection counter doesn't advance and
+    // `record_reasoning_step` keeps re-emitting at the same iteration,
+    // which #796 dedup then drops. R23 dogfood saw a parent that
+    // ran 6 spawn cycles but the trajectory only captured iter 0
+    // because the WaitingDependency → Running transitions never
+    // landed (#812). Including them here gives every resume DECIDE a
+    // distinct iteration in the trajectory.
     let resume_from_state = match run.state {
-        cairn_domain::RunState::Pending => Some(cairn_domain::RunState::Pending),
-        cairn_domain::RunState::WaitingApproval => Some(cairn_domain::RunState::WaitingApproval),
+        cairn_domain::RunState::Pending
+        | cairn_domain::RunState::WaitingApproval
+        | cairn_domain::RunState::WaitingDependency
+        | cairn_domain::RunState::Paused => Some(run.state),
         _ => None,
     };
     if let Some(from_state) = resume_from_state {
