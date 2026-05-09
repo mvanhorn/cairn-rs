@@ -1295,17 +1295,43 @@ pub(crate) fn complete_run_tool_def() -> serde_json::Value {
 /// still accepts the nested form for backward compat with runs that
 /// rely on the JSON-action envelope.
 pub(crate) fn spawn_subagent_tool_def() -> serde_json::Value {
+    // #776: derive the `role` enum from `default_roles()`. Pre-#776
+    // the field was a free-form string; the LLM could pass any
+    // value, and unknown roles silently fell through to the
+    // generic-shaped prompt. Now the schema-validation layer
+    // rejects unknown roles up front. Excludes the orchestrator
+    // role — sub-agents do not delegate to a parent.
+    //
+    // Cached via OnceLock per Gemini review on PR #786:
+    // `spawn_subagent_tool_def()` runs on every DECIDE turn, and
+    // `default_roles()` clones every role's multi-KB system prompt
+    // string. The cache means we pay the allocation cost exactly
+    // once per process. Adding a new role to default_roles()
+    // requires a process restart to take effect, which matches
+    // the rest of the registry's contract (default_roles is a
+    // compile-time constant set today; the dynamic-registry
+    // refactor is RFC future work).
+    static ROLE_ENUM: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let role_enum = ROLE_ENUM.get_or_init(|| {
+        cairn_domain::agent_roles::default_roles()
+            .into_iter()
+            .filter(|r| r.role_id != "orchestrator")
+            .map(|r| r.role_id)
+            .collect()
+    });
+
     serde_json::json!({
         "type": "function",
         "function": {
             "name": "spawn_subagent",
-            "description": "Delegate a concrete task to a sub-agent and wait for its result. The current run SUSPENDS until the sub-agent terminates; when it resumes, the sub-agent's completion summary is surfaced in the step_history under action_kind=\"subagent_complete\". Use this when the current run's goal decomposes into a self-contained sub-task that another role (researcher, executor, reviewer, or generic) is better suited to handle.",
+            "description": "Delegate a concrete task to a sub-agent and wait for its result. The current run SUSPENDS until the sub-agent terminates; when it resumes, the sub-agent's completion summary is surfaced in the step_history under action_kind=\"subagent_complete\". Use this when the current run's goal decomposes into a self-contained sub-task that another role is better suited to handle. Call `list_agents` first if you are unsure which role fits.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "role": {
                         "type": "string",
-                        "description": "The sub-agent role. Known roles: `researcher` (reads, cites, summarises), `executor` (writes code, runs tools), `reviewer` (audits work, read-only), `generic` (no specialty bias — workflow comes from the goal text). Pick `generic` when no specialty cleanly fits and the goal text fully describes the workflow. Unknown roles fall back to `generic` at the sub-agent side."
+                        "enum": role_enum,
+                        "description": "The sub-agent role. Use `list_agents` to enumerate available roles + their descriptions, or `agent_description(role_id)` to read a single role's full record. The allowed values are derived at runtime from `default_roles()` — adding a new role to that registry automatically adds it here."
                     },
                     "goal": {
                         "type": "string",
@@ -2256,6 +2282,52 @@ mod tests {
             params.get("additionalProperties").and_then(|v| v.as_bool()),
             Some(false),
             "additionalProperties:false enables strict-mode enforcement",
+        );
+    }
+
+    /// #776: the `role` parameter is a runtime-derived JSON `enum`
+    /// over the registered roles in `default_roles()`, MINUS the
+    /// orchestrator (sub-agents do not delegate to a parent).
+    /// Adding a new role to `default_roles()` automatically extends
+    /// the schema; removing one removes the choice. Both sides
+    /// catch typos at the schema-validation layer instead of at
+    /// the silent-fallback layer.
+    #[test]
+    fn spawn_subagent_role_enum_derived_from_default_roles() {
+        let def = spawn_subagent_tool_def();
+        let role_schema = def
+            .pointer("/function/parameters/properties/role")
+            .expect("role schema present");
+        let enum_values = role_schema
+            .get("enum")
+            .and_then(|v| v.as_array())
+            .expect("role.enum present");
+        let enum_strs: std::collections::HashSet<&str> =
+            enum_values.iter().filter_map(|v| v.as_str()).collect();
+
+        // All non-orchestrator default roles must appear.
+        for expected in ["executor", "researcher", "reviewer", "generic"] {
+            assert!(
+                enum_strs.contains(expected),
+                "role enum must include {expected:?}; got {enum_strs:?}"
+            );
+        }
+        // Orchestrator must NOT appear — sub-agents do not spawn the
+        // parent role.
+        assert!(
+            !enum_strs.contains("orchestrator"),
+            "role enum must NOT include `orchestrator` (parent role); got {enum_strs:?}"
+        );
+        // The derivation contract: enum size matches default_roles
+        // minus orchestrator.
+        let expected_count = cairn_domain::agent_roles::default_roles()
+            .iter()
+            .filter(|r| r.role_id != "orchestrator")
+            .count();
+        assert_eq!(
+            enum_strs.len(),
+            expected_count,
+            "role enum must be derived from default_roles() minus orchestrator"
         );
     }
 

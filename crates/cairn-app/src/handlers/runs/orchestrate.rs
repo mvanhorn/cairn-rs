@@ -1312,6 +1312,12 @@ pub(crate) async fn drive_run_iteration(
             std::sync::Arc::new(SearchEventsTool::new(store_ref.clone()));
         let wait_for_task: std::sync::Arc<dyn cairn_tools::ToolHandler> =
             std::sync::Arc::new(WaitForTaskTool::new(store_ref.clone()));
+        // #776: orchestrator-only agent registry introspection.
+        // Stateless — both tools just read `default_roles()`.
+        let list_agents: std::sync::Arc<dyn cairn_tools::ToolHandler> =
+            std::sync::Arc::new(cairn_tools::builtins::ListAgentsTool::new());
+        let agent_description: std::sync::Arc<dyn cairn_tools::ToolHandler> =
+            std::sync::Arc::new(cairn_tools::builtins::AgentDescriptionTool::new());
 
         // ── Internal tools ──────────────────────────────────────────────────
         let scratch_pad: std::sync::Arc<dyn cairn_tools::ToolHandler> =
@@ -1367,6 +1373,8 @@ pub(crate) async fn drive_run_iteration(
                 .register(list_runs.clone())
                 .register(search_events.clone())
                 .register(wait_for_task.clone())
+                .register(list_agents.clone())
+                .register(agent_description.clone())
                 // Internal
                 .register(scratch_pad.clone())
                 .register(skill_tool.clone())

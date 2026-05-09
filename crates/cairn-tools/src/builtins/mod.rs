@@ -15,6 +15,7 @@
 
 // Note: bash, file_read, file_write, glob_find, grep_search, web_fetch
 // were removed in favor of cairn-harness-tools.
+pub mod agent_description;
 pub mod calculate;
 pub mod cancel_task;
 pub mod eval_score;
@@ -25,6 +26,7 @@ pub mod github_api;
 pub mod graph_query;
 pub mod http_request;
 pub mod json_extract;
+pub mod list_agents;
 pub mod list_runs;
 pub mod memory_search;
 pub mod memory_store;
@@ -48,6 +50,7 @@ use cairn_domain::{policy::ExecutionClass, ProjectKey, RuntimeEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use agent_description::AgentDescriptionTool;
 pub use calculate::CalculateTool;
 pub use cancel_task::CancelTaskTool;
 pub use eval_score::EvalScoreTool;
@@ -61,6 +64,7 @@ pub use github_api::{
 pub use graph_query::GraphQueryTool;
 pub use http_request::HttpRequestTool;
 pub use json_extract::JsonExtractTool;
+pub use list_agents::ListAgentsTool;
 pub use list_runs::ListRunsTool;
 pub use memory_search::MemorySearchTool;
 pub use memory_store::MemoryStoreTool;

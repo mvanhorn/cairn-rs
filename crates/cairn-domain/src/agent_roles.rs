@@ -854,6 +854,15 @@ pub fn default_roles() -> Vec<AgentRole> {
                 "get_approvals",
                 "search_events",
                 "wait_for_task",
+                // Observational — agent registry introspection (#776).
+                // `list_agents` enumerates registered roles; the
+                // orchestrator uses it during planning to choose the
+                // right delegate. `agent_description` returns the
+                // full record (allowed tools + response_shape) for
+                // a single role when more detail is needed before
+                // spawning. Both read-only.
+                "list_agents",
+                "agent_description",
                 // Observational — memory (read + scratch only)
                 "memory_search",
                 "memory_store",
@@ -1568,6 +1577,10 @@ mod tests {
             "notify_operator",
             "plugin_tool",
             "resolve_approval",
+            // #776: agent-registry introspection tools — orchestrator-only
+            // observational reads of default_roles().
+            "list_agents",
+            "agent_description",
             "schedule_task",
             "scratch_pad",
             "search_events",

@@ -26,6 +26,33 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and wire-type deserialization for all 7 methods; unit tests cover
   serde round-trips for all 8 wire types.
 
+- **`list_agents` and `agent_description` orchestrator-only tools
+  (#776).** The orchestrator can now enumerate registered sub-agent
+  roles before delegating, instead of relying on hardcoded role
+  names baked into `spawn_subagent`'s schema description. R19
+  dogfood symptom this prevents: the orchestrator picked
+  `executor` for goals that should have gone to `researcher`
+  because the role names looked similar enough at the prompt
+  layer; with a real description-introspection path the wrong
+  choice becomes visible. `list_agents` returns
+  `[{role_id, display_name, description, tier, response_shape}, ...]`
+  for every role except the orchestrator (which doesn't delegate
+  to itself); `agent_description(role_id)` returns the same plus
+  the role's allowed-tools list, max-context-tokens cap, and
+  specialty-overlay prompt. Both read-only, both registered as
+  `Registered` tier so they appear in the orchestrator's prompt
+  by default. Sub-agents do not get these tools — they already
+  know their role.
+
+- **`spawn_subagent.role` schema is now a runtime-derived JSON
+  enum (#776).** Pre-#776 the field was a free-form string; the
+  LLM could pass any value, and unknown roles silently fell
+  through to the generic prompt at the sub-agent side. The
+  `role` parameter now declares an `enum` derived from
+  `default_roles()` minus orchestrator. Schema-validation
+  rejects unknown roles up front, and adding a new role to
+  `default_roles()` automatically extends the schema.
+
 ### Security
 
 - **Boot-time scrub of operator-environment credential variables
