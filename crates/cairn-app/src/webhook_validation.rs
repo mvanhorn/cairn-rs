@@ -301,8 +301,16 @@ async fn validate_url_target(
     //
     //   https + allow_internal_destinations (explicit operator opt-in
     //   for self-hosted stacks with a local https sink):
-    //            SSRF block list skipped. Operator has accepted the
-    //            risk.
+    //            SSRF block list skipped — EXCEPT metadata-service
+    //            destinations (#803). The cloud-metadata IPs are an
+    //            unconditional refusal regardless of mode: an EC2
+    //            dev box still has IMDS, and a webhook to
+    //            `https://169.254.169.254/…/security-credentials/...`
+    //            exfils credentials whether the operator opted into
+    //            internal destinations or not. RFC 1918 / loopback
+    //            opt-ins remain valid because those have legitimate
+    //            dev sinks (Alertmanager, internal Slack bridge);
+    //            the cloud metadata IPs do not.
     if is_http {
         if !is_loopback_host(&parsed) {
             return Err(format!(
@@ -311,7 +319,23 @@ async fn validate_url_target(
                 host = parsed.host_str().unwrap_or("<none>")
             ));
         }
-    } else if !policy.allow_internal_destinations {
+    } else if policy.allow_internal_destinations {
+        // #803: with the internal-destinations opt-in set, the SSRF
+        // block list is relaxed for legitimate dev sinks (RFC 1918,
+        // loopback, etc.) — but cloud metadata destinations remain
+        // unconditionally blocked.
+        check_host_not_cloud_metadata(&parsed, kind).await?;
+    } else {
+        // Default production policy: SSRF block list applies. Cloud
+        // metadata IPs are a subset of that list (169.254.0.0/16
+        // covers IMDS; 100.64.0.0/10 covers Alibaba; fc00::/7 covers
+        // AWS IPv6 IMDS), so we don't need a separate metadata pass —
+        // the block list catches them with a "blocked range
+        // (...link-local / IMDS)" message that's still operator-
+        // actionable. Skipping the metadata pass here saves a
+        // redundant DNS round-trip on every webhook registration
+        // (Gemini PR #804 review) and closes a small DNS-rebinding
+        // window between the two passes.
         check_host_not_blocked(&parsed, kind).await?;
     }
 
@@ -325,6 +349,145 @@ fn is_loopback_host(parsed: &url::Url) -> bool {
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
     }
+}
+
+/// #803: refuse cloud-metadata destinations regardless of mode or
+/// `allow_internal_destinations`. The IPs and hostnames covered here
+/// are the well-known instance metadata services across the major
+/// clouds (AWS / GCP / Azure / Alibaba). Webhooks have no legitimate
+/// reason to target them, and a webhook that DOES is the canonical
+/// credential-exfil shape: cairn POSTs run-completion bodies to a
+/// URL whose response (or whose URL itself, in the access-log of an
+/// attacker-controlled sink) yields IAM credentials.
+///
+/// Returns `Err` if the host (literal or DNS-resolved) is a metadata
+/// destination. The wording on the error is firm — there is no opt-in
+/// flag mentioned in the message, since none unlocks this gate.
+async fn check_host_not_cloud_metadata(parsed: &url::Url, kind: &str) -> Result<(), String> {
+    let host = parsed
+        .host()
+        .ok_or_else(|| format!("{kind} target is missing a host"))?;
+
+    // Hostname fast path. Some clouds expose metadata via an internal
+    // domain name (`metadata.google.internal`, `metadata.azure.com`).
+    // Catch the literal hostname before falling through to DNS so an
+    // operator who fat-fingers the form gets a clear "metadata
+    // service" error rather than "blocked range" after lookup.
+    if let url::Host::Domain(d) = &host {
+        if is_cloud_metadata_hostname(d) {
+            return Err(format!(
+                "{kind} target '{d}' is a cloud metadata service \
+                 (IMDS / Google metadata / Azure IMDS); blocked \
+                 unconditionally to prevent credential exfil"
+            ));
+        }
+    }
+
+    match host {
+        url::Host::Ipv4(ip) => {
+            if let Some(reason) = classify_cloud_metadata_ipv4(ip) {
+                return Err(format!(
+                    "{kind} target {ip} is a cloud metadata destination \
+                     ({reason}); blocked unconditionally to prevent \
+                     credential exfil"
+                ));
+            }
+            return Ok(());
+        }
+        url::Host::Ipv6(ip) => {
+            if let Some(reason) = classify_cloud_metadata_ipv6(ip) {
+                return Err(format!(
+                    "{kind} target {ip} is a cloud metadata destination \
+                     ({reason}); blocked unconditionally to prevent \
+                     credential exfil"
+                ));
+            }
+            return Ok(());
+        }
+        url::Host::Domain(_) => {}
+    }
+
+    // DNS path mirrors `check_host_not_blocked`: resolve every record
+    // and refuse if any resolves to a metadata IP. Same fail-open
+    // policy on resolver errors — a name that doesn't resolve cannot
+    // be hit from the webhook dispatcher either.
+    let host_str = host.to_string();
+    let lookup_target = format!("{host_str}:0");
+    let addrs = match tokio::net::lookup_host(&lookup_target).await {
+        Ok(iter) => iter,
+        Err(_) => return Ok(()),
+    };
+    for sock in addrs {
+        let ip = sock.ip();
+        let metadata_reason = match ip {
+            std::net::IpAddr::V4(v4) => classify_cloud_metadata_ipv4(v4),
+            std::net::IpAddr::V6(v6) => classify_cloud_metadata_ipv6(v6),
+        };
+        if let Some(reason) = metadata_reason {
+            // SEC-007: as in `check_host_not_blocked`, do not echo the
+            // resolved IP — only the category. The caller did not
+            // supply the IP, and printing it leaks internal DNS topology
+            // in multi-tenant deployments.
+            return Err(format!(
+                "{kind} target '{host_str}' resolves to a cloud metadata \
+                 destination ({reason}); blocked unconditionally to \
+                 prevent credential exfil"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Hostnames the major clouds expose for instance metadata. Matched
+/// case-insensitively against the URL host. Strict equality — a
+/// subdomain like `attacker.metadata.google.internal` is not on this
+/// list (no real cloud uses subdomains for IMDS) and goes through the
+/// regular DNS resolution path.
+fn is_cloud_metadata_hostname(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    matches!(
+        h.as_str(),
+        // GCP
+        "metadata.google.internal"
+        | "metadata"
+        // Azure
+        | "metadata.azure.com"
+    )
+}
+
+/// IPv4 cloud-metadata IPs. The 169.254.169.254 address is the
+/// canonical AWS / Azure / GCP / Alibaba / Oracle / DigitalOcean /
+/// Hetzner / Scaleway / Equinix / Tencent / IBM / Linode / Vultr
+/// metadata service. Some Alibaba instances also expose 100.100.100.200.
+fn classify_cloud_metadata_ipv4(ip: std::net::Ipv4Addr) -> Option<&'static str> {
+    let octets = ip.octets();
+    if octets == [169, 254, 169, 254] {
+        return Some("AWS / Azure / GCP IMDS (169.254.169.254)");
+    }
+    if octets == [100, 100, 100, 200] {
+        return Some("Alibaba metadata (100.100.100.200)");
+    }
+    None
+}
+
+/// IPv6 cloud-metadata addresses. AWS exposes IMDS over IPv6 at
+/// `fd00:ec2::254` on instances configured for v6 metadata, and the
+/// IPv4-mapped form `::ffff:169.254.169.254` is also a common bypass
+/// vector (some network stacks honour the embedded v4).
+fn classify_cloud_metadata_ipv6(ip: std::net::Ipv6Addr) -> Option<&'static str> {
+    // Embedded-IPv4 forms — both `::ffff:169.254.169.254`
+    // (IPv4-mapped) and `::169.254.169.254` (deprecated
+    // IPv4-compatible). `to_ipv4()` covers both.
+    if let Some(v4) = ip.to_ipv4() {
+        if let Some(reason) = classify_cloud_metadata_ipv4(v4) {
+            return Some(reason);
+        }
+    }
+    // AWS IPv6 IMDS: `fd00:ec2::254`
+    if ip.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254] {
+        return Some("AWS IMDS over IPv6 (fd00:ec2::254)");
+    }
+    None
 }
 
 /// Resolve the URL's host and refuse if any resolved IP (or the host
@@ -940,18 +1103,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_internal_flag_allows_link_local() {
-        // With the opt-in, even 169.254 is allowed — operators
-        // explicitly accept the risk.
+    async fn webhook_internal_flag_allows_link_local_non_metadata() {
+        // With the opt-in, non-metadata link-local addresses are
+        // allowed — operators explicitly accept the risk.
+        // 169.254.169.253 is link-local but NOT the AWS / Azure / GCP
+        // IMDS IP (.254). The IMDS IP itself is covered by the
+        // separate #803 always-block, exercised below.
         let policy = WebhookValidationPolicy {
             allow_insecure_scheme: false,
             allow_internal_destinations: true,
         };
         assert!(
-            validate_channel(&ch("webhook", "https://169.254.169.254/hook"), policy,)
+            validate_channel(&ch("webhook", "https://169.254.169.253/hook"), policy)
                 .await
                 .is_ok()
         );
+    }
+
+    // ── #803: IMDS is always-blocked, even with allow_internal_destinations ──
+
+    #[tokio::test]
+    async fn webhook_imds_blocked_even_with_internal_destinations_flag() {
+        // #803: a Local-mode operator (or one who set
+        // CAIRN_ALLOW_INTERNAL_WEBHOOKS=1) must STILL be refused IMDS.
+        // RFC 1918 / loopback opt-ins remain valid (legitimate dev
+        // sinks); cloud metadata IPs do not.
+        let permissive = WebhookValidationPolicy {
+            allow_insecure_scheme: true,
+            allow_internal_destinations: true,
+        };
+        for url in [
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::169.254.169.254]/latest/meta-data/",
+            "https://[::ffff:169.254.169.254]/latest/meta-data/",
+            "https://[fd00:ec2::254]/latest/meta-data/",
+            "https://100.100.100.200/", // Alibaba metadata
+        ] {
+            let result = validate_channel(&ch("webhook", url), permissive).await;
+            let err = result.expect_err(&format!(
+                "#803: {url} must be blocked, but validate_channel returned Ok"
+            ));
+            assert!(
+                err.contains("metadata") || err.contains("IMDS"),
+                "#803: {url} must be blocked as a cloud metadata destination; got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_imds_hostname_blocked_even_with_internal_destinations_flag() {
+        // #803: GCP and Azure expose metadata via internal hostnames
+        // that resolve to 169.254.169.254 from inside the VM. We can't
+        // hit DNS deterministically in the test (the resolver isn't
+        // mocked at this layer), so we only assert the hostname-literal
+        // fast path: a webhook whose host string IS the metadata
+        // hostname is refused before DNS resolution.
+        let permissive = WebhookValidationPolicy {
+            allow_insecure_scheme: false,
+            allow_internal_destinations: true,
+        };
+        for hostname in ["metadata.google.internal", "metadata.azure.com"] {
+            let url = format!("https://{hostname}/computeMetadata/v1/");
+            let err = validate_channel(&ch("webhook", &url), permissive)
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("metadata") || err.contains("IMDS"),
+                "#803: hostname {hostname} must be blocked; got: {err}"
+            );
+        }
     }
 
     // ── email ────────────────────────────────────────────────────────────

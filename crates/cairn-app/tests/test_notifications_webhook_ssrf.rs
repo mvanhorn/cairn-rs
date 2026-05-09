@@ -259,21 +259,49 @@ async fn webhook_insecure_flag_alone_still_blocks_https_imds() {
 
 /// The internal-flag opt-in ALSO applies to https — self-hosted stacks
 /// that terminate TLS on the internal host must still reach their
-/// sink. Covers 169.254 IMDS-on-purpose (yes, that's a valid case for
-/// internal infra monitoring on cloud agents).
+/// non-metadata link-local sink. Pre-#803 this test used
+/// `169.254.169.254` (the IMDS IP); post-#803 the IMDS IP is always
+/// blocked, so this test exercises a non-metadata link-local IP
+/// (169.254.169.253) that the flag still unlocks.
 #[tokio::test]
 async fn webhook_allowed_with_internal_flag_for_link_local_https() {
     let h = LiveHarness::setup_with_env(&[("CAIRN_ALLOW_INTERNAL_WEBHOOKS", "1")]).await;
     let (status, body) = post_prefs(
         &h,
         "op-internal-ll",
-        prefs_body(&h, vec![channel("webhook", "https://169.254.169.254/hook")]),
+        prefs_body(&h, vec![channel("webhook", "https://169.254.169.253/hook")]),
     )
     .await;
     assert_eq!(
         status, 201,
-        "CAIRN_ALLOW_INTERNAL_WEBHOOKS=1 must permit https://169.254 sinks; \
-         got {status} body={body}"
+        "CAIRN_ALLOW_INTERNAL_WEBHOOKS=1 must permit https://169.254.169.253 \
+         (non-metadata link-local) sinks; got {status} body={body}"
+    );
+}
+
+/// #803: the internal-flag opt-in MUST NOT unlock cloud metadata IPs.
+/// 169.254.169.254 is the canonical IMDS endpoint across AWS / GCP /
+/// Azure; webhooks to it are unconditionally refused regardless of the
+/// flag. Pre-#803 this scenario returned 201 in Local mode and with
+/// the flag set in team mode — that's the regression the fix closes.
+#[tokio::test]
+async fn webhook_imds_still_blocked_even_with_internal_flag() {
+    let h = LiveHarness::setup_with_env(&[("CAIRN_ALLOW_INTERNAL_WEBHOOKS", "1")]).await;
+    let (status, body) = post_prefs(
+        &h,
+        "op-imds-still-blocked",
+        prefs_body(&h, vec![channel("webhook", "https://169.254.169.254/hook")]),
+    )
+    .await;
+    assert_eq!(
+        status, 422,
+        "#803: IMDS https target must be 422 even with \
+         CAIRN_ALLOW_INTERNAL_WEBHOOKS=1; got {status} body={body}"
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("metadata") || msg.contains("IMDS"),
+        "#803: error body.message must explain the metadata block; got: {msg}"
     );
 }
 
