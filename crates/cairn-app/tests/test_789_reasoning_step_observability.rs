@@ -274,6 +274,17 @@ async fn trajectory_endpoint_returns_reasoning_step_after_decide() {
         "top proposal tool_name should be bash",
     );
 
+    // #805: trajectory items must surface `proposal_count` so
+    // operators can detect multi-proposal iterations (parallel tool
+    // batches) where `proposed_action` is the top-1 view. The mock
+    // returns a single tool_call per response so count should be 1.
+    let proposal_count = first.get("proposal_count").and_then(|v| v.as_u64());
+    assert_eq!(
+        proposal_count,
+        Some(1),
+        "#805: trajectory must surface `proposal_count` for the iteration; got {proposal_count:?}",
+    );
+
     // Live agents endpoint should list the run with current_action
     // populated.
     let r = h

@@ -798,6 +798,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             proposed_action: cairn_domain::events::ProposedActionSummary::Other {
                 action_type: "none".to_owned(),
             },
+            proposal_count: 1,
             step_history_snapshot: "".to_owned(),
             confidence: 0.0,
         }),

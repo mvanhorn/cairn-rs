@@ -2206,10 +2206,24 @@ pub struct RunReasoningStep {
     /// payload when bodies are enabled.
     pub reasoning_compact: String,
     /// The single highest-confidence proposed action for this
-    /// iteration. Multi-proposal cases are uncommon and operators
-    /// rarely care about runner-up proposals; if they do, the full
-    /// proposal array lives on the LLM body trace.
+    /// iteration. Multi-proposal cases (LLMs returning >1 tool_call
+    /// in one response — e.g. parallel inspect-then-act batches) are
+    /// uncommon and operators rarely care about runner-up proposals;
+    /// if they do, the full proposal array lives on the LLM body
+    /// trace. See `proposal_count` below to detect multi-proposal
+    /// iterations at a glance.
     pub proposed_action: ProposedActionSummary,
+    /// #805: total number of proposals the LLM emitted on this
+    /// iteration. For most iterations this is `1` and `proposed_action`
+    /// is the only proposal. When `> 1` the LLM returned multiple
+    /// tool_calls in one response (parallel batch); `proposed_action`
+    /// shows only the top-1, and the operator can drill into
+    /// `LlmCompletionRecorded.response_text` for the full set.
+    /// Surfacing the count here lets the trajectory UI flag
+    /// multi-proposal iterations without forcing a body-trace lookup.
+    /// Defaults to `1` on serde-replay of pre-#805 events.
+    #[serde(default = "default_proposal_count")]
+    pub proposal_count: u32,
     /// Snapshot of the full rendered `## Step history` section of
     /// the user message at this iteration. The trajectory consumer
     /// computes the iteration-to-iteration delta at read time by
@@ -2260,6 +2274,7 @@ impl PartialEq for RunReasoningStep {
             && self.model_id == other.model_id
             && self.reasoning_compact == other.reasoning_compact
             && self.proposed_action == other.proposed_action
+            && self.proposal_count == other.proposal_count
             && self.step_history_snapshot == other.step_history_snapshot
             && self.confidence.to_bits() == other.confidence.to_bits()
     }
@@ -2939,6 +2954,14 @@ fn default_true() -> bool {
 /// normalisation branch.
 fn default_empty_json_array() -> String {
     "[]".to_owned()
+}
+
+/// #805: serde default for `RunReasoningStep.proposal_count` so
+/// pre-#805 event-log entries replay as single-proposal iterations.
+/// The pre-#805 emitter only ever wrote one `proposed_action`, so
+/// counting them as 1 is the historically-correct value.
+fn default_proposal_count() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

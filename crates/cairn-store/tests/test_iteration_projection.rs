@@ -240,6 +240,7 @@ async fn reasoning_step_apply_dedups_on_iteration_value() {
             proposed_action: ProposedActionSummary::Other {
                 action_type: "tool_call".to_owned(),
             },
+            proposal_count: 1,
             step_history_snapshot: "snap1".to_owned(),
             confidence: 0.5,
         }),
@@ -261,6 +262,7 @@ async fn reasoning_step_apply_dedups_on_iteration_value() {
             proposed_action: ProposedActionSummary::Other {
                 action_type: "tool_call".to_owned(),
             },
+            proposal_count: 1,
             step_history_snapshot: "snap2".to_owned(),
             confidence: 0.7,
         }),

@@ -297,6 +297,13 @@ pub(crate) async fn record_reasoning_step(
             model_id: d.model_id.clone(),
             reasoning_compact,
             proposed_action,
+            // #805: total proposals so the trajectory UI can flag
+            // multi-proposal iterations (parallel tool batches) where
+            // `proposed_action` is the top-1 view and the operator
+            // should drill into the LLM body trace for the full set.
+            // Bounded by u32::MAX in practice (LLM responses don't
+            // exceed a handful of tool_calls).
+            proposal_count: d.proposals.len() as u32,
             step_history_snapshot,
             confidence: d.calibrated_confidence,
         }),

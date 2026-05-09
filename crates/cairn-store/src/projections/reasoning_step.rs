@@ -30,8 +30,20 @@ pub struct ReasoningStepRecord {
     pub model_id: String,
     pub reasoning_compact: String,
     pub proposed_action: ProposedActionSummary,
+    /// #805: total proposals the LLM emitted on this iteration. `1`
+    /// when the LLM returned exactly one tool_call (the common case);
+    /// `> 1` when the LLM returned a parallel batch and
+    /// `proposed_action` is only the top-1 view. Pre-#805 records
+    /// reconstructed from the event log default to `1` via the event's
+    /// own serde default.
+    #[serde(default = "default_proposal_count_record")]
+    pub proposal_count: u32,
     pub step_history_snapshot: String,
     pub confidence: f64,
+}
+
+fn default_proposal_count_record() -> u32 {
+    1
 }
 
 impl ReasoningStepRecord {
@@ -44,6 +56,7 @@ impl ReasoningStepRecord {
             model_id: event.model_id.clone(),
             reasoning_compact: event.reasoning_compact.clone(),
             proposed_action: event.proposed_action.clone(),
+            proposal_count: event.proposal_count,
             step_history_snapshot: event.step_history_snapshot.clone(),
             confidence: event.confidence,
         }
