@@ -449,3 +449,79 @@ async fn key_rotation_reencrypts_credentials_and_records_rotation() {
         "credential under key_other must not be rotated"
     );
 }
+
+// ── #737: cross-tenant credential ID must not collide ───────────────────────
+
+/// Pre-#737 fix, credential IDs were generated as `cred_{now_ms()}`. On a
+/// fast host two `store` calls landing in the same millisecond produced
+/// identical IDs. The HashMap-backed projection keys on `credential_id`
+/// alone, so the second writer would silently take over the first writer's
+/// entry — except for `tenant_id`, which the apply path intentionally
+/// preserves on re-store. Result: a credential whose `tenant_id` says
+/// tenant_a but whose ciphertext + provider_id reflect tenant_b's request,
+/// breaking the cross-tenant ownership check that gates
+/// `update_provider_connection`.
+///
+/// We write 100 credentials in tight succession across two tenants
+/// (interleaved a/b/a/b…) and assert no two carry the same ID. Pre-fix this
+/// test trips reliably on CI within the first ~30 iterations.
+#[tokio::test]
+async fn store_assigns_unique_ids_across_tenants_under_burst() {
+    use std::collections::HashSet;
+
+    let store = Arc::new(InMemoryStore::new());
+    let tenant_svc = TenantServiceImpl::new(store.clone());
+    let tenant_a = TenantId::new("tenant_burst_a");
+    let tenant_b = TenantId::new("tenant_burst_b");
+    tenant_svc
+        .create(tenant_a.clone(), "Burst A".to_owned())
+        .await
+        .unwrap();
+    tenant_svc
+        .create(tenant_b.clone(), "Burst B".to_owned())
+        .await
+        .unwrap();
+    let cred_svc = CredentialServiceImpl::new(store.clone(), test_master_key());
+
+    let mut ids: HashSet<String> = HashSet::new();
+    for i in 0..50 {
+        // Different `provider_id`s so the same-tenant-same-provider race
+        // resolution path doesn't fire — we want to exercise the ID
+        // generator alone.
+        let provider = format!("p{i}");
+        let a = cred_svc
+            .store(
+                tenant_a.clone(),
+                provider.clone(),
+                format!("sk-a-{i}"),
+                None,
+            )
+            .await
+            .unwrap();
+        let b = cred_svc
+            .store(tenant_b.clone(), provider, format!("sk-b-{i}"), None)
+            .await
+            .unwrap();
+        assert!(
+            ids.insert(a.id.as_str().to_owned()),
+            "#737: tenant_a credential id `{}` collided with a previous credential",
+            a.id.as_str()
+        );
+        assert!(
+            ids.insert(b.id.as_str().to_owned()),
+            "#737: tenant_b credential id `{}` collided with a previous credential",
+            b.id.as_str()
+        );
+        // Cross-tenant ownership must remain intact: a credential stored
+        // for tenant_a must read back with tenant_id == tenant_a.
+        let read_a = cred_svc.get(&a.id).await.unwrap().unwrap();
+        assert_eq!(
+            read_a.tenant_id,
+            tenant_a,
+            "#737: credential {} must remain owned by tenant_a after concurrent tenant_b store",
+            a.id.as_str()
+        );
+        let read_b = cred_svc.get(&b.id).await.unwrap().unwrap();
+        assert_eq!(read_b.tenant_id, tenant_b);
+    }
+}

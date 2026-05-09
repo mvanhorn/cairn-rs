@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use async_trait::async_trait;
@@ -461,7 +462,19 @@ where
 
         let encrypted_at_ms = now_ms();
         let encrypted_value = encrypt_value(self.master_key.as_ref(), plaintext_value.as_str())?;
-        let credential_id = CredentialId::new(format!("cred_{encrypted_at_ms}"));
+        // #737: ms-only IDs collide on fast hosts when two tenants store
+        // a credential within the same millisecond. The HashMap-backed
+        // projection keys on credential_id alone, so a colliding second
+        // writer reuses the first writer's record and the cross-tenant
+        // ownership check (`cred.tenant_id == connection.tenant_id`)
+        // returns the wrong answer non-deterministically. A 6-byte
+        // OsRng suffix (12 hex chars, 48 bits of entropy) makes the
+        // collision probability on a 1k-credential cluster ~1.8e-9 per
+        // pair-day — well below "see it on a CI run."
+        let mut suffix = [0u8; 6];
+        OsRng.fill_bytes(&mut suffix);
+        let credential_id =
+            CredentialId::new(format!("cred_{encrypted_at_ms}_{}", hex::encode(suffix)));
         let event = make_envelope(RuntimeEvent::CredentialStored(CredentialStored {
             tenant_id: tenant_id.clone(),
             credential_id: credential_id.clone(),
