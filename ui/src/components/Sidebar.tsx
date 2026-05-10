@@ -61,6 +61,7 @@ export type NavPage =
   | 'approvals'
   | 'prompts'
   | 'agent-templates'
+  | 'agents'
   | 'traces'
   | 'memory'
   | 'costs'
@@ -126,6 +127,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'decisions',        label: 'Decisions',        icon: Scale       },
       { id: 'prompts',          label: 'Prompts',          icon: FileText    },
       { id: 'agent-templates',  label: 'Agent Templates',  icon: Bot         },
+      { id: 'agents',           label: 'Agent Roles',      icon: Users       },
     ],
   },
   {

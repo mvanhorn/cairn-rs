@@ -123,6 +123,45 @@ async function apiFetch<T>(
   return JSON.parse(text) as T;
 }
 
+/**
+ * RFC 031 PR-D: variant of `apiFetch` that returns the parsed body AND
+ * the raw `Response` so callers can read response headers (notably the
+ * `ETag` emitted on agent-role GET/POST/PATCH 2xx responses). Reuses
+ * the same auth + error-envelope semantics as `apiFetch`.
+ */
+async function apiFetchWithResponse<T>(
+  config: ApiClientConfig,
+  path: string,
+  options: RequestInit = {},
+): Promise<{ body: T; response: Response }> {
+  const url = `${config.baseUrl}${path}`;
+  const headers: HeadersInit = {
+    Authorization: `Bearer ${config.token}`,
+    ...(options.body ? { "Content-Type": "application/json" } : {}),
+    ...options.headers,
+  };
+  const response = await fetch(url, { ...options, headers });
+  if (!response.ok) {
+    let code = "unknown_error";
+    let message = `HTTP ${response.status}`;
+    try {
+      const err = await response.json();
+      code = err.code ?? err.error_code ?? code;
+      message = err.message ?? err.hint ?? err.error ?? message;
+    } catch {
+      /* keep defaults */
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  const text = await response.text();
+  // Trim before the emptiness check so whitespace-only responses
+  // (e.g. a server that sends `"\n"` for 204-ish bodies) skip the
+  // JSON.parse call that would otherwise throw. Mirrors the
+  // defensive shape the canonical `apiFetch` already uses.
+  const body = text.trim() ? (JSON.parse(text) as T) : (undefined as T);
+  return { body, response };
+}
+
 // ── List response unwrapper ───────────────────────────────────────────────────
 
 /**
@@ -2891,6 +2930,102 @@ export function createApiClient(config: ApiClientConfig) {
         if (e instanceof ApiError && e.status === 404) return null;
         throw e;
       }
+    },
+
+    // ── RFC 031: operator-defined agent roles ─────────────────────────────────
+
+    /** GET /v1/projects/:project/agent-roles — list merged built-in +
+     *  operator-defined roles for the caller's active project scope.
+     *  Optional `source` filter narrows by provenance. */
+    listAgentRoles: async (
+      source?: import("./types").AgentRoleSource | "all",
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").AgentRoleListResponse> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      const query = source && source !== "all" ? `?source=${source}` : "";
+      return get(`/v1/projects/${path}/agent-roles${query}`);
+    },
+
+    /** GET /v1/projects/:project/agent-roles/:id — fetch one role.
+     *  Returns the record + the `ETag` header value so the editor can
+     *  thread it into `If-Match` on PATCH. `etag` is null when the
+     *  response doesn't carry the header (built-in fallback rows). */
+    getAgentRole: async (
+      roleId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<{
+      item: import("./types").AgentRoleListItem;
+      etag: string | null;
+    }> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      const { body, response } = await apiFetchWithResponse<
+        import("./types").AgentRoleListItem
+      >(config, `/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}`, {
+        method: "GET",
+      });
+      return { item: body, etag: response.headers.get("ETag") };
+    },
+
+    /** POST /v1/projects/:project/agent-roles — create a role. 201 on
+     *  success (including re-POST after retract per §D6); 409 on
+     *  active-id collision; 422 on structural validation failure; 413
+     *  on §D4 size overflow. */
+    createAgentRole: async (
+      body: import("./types").CreateAgentRoleRequest,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<{
+      result: import("./types").DefineAgentRoleResponse;
+      etag: string | null;
+    }> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      const { body: result, response } = await apiFetchWithResponse<
+        import("./types").DefineAgentRoleResponse
+      >(config, `/v1/projects/${path}/agent-roles`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      return { result, etag: response.headers.get("ETag") };
+    },
+
+    /** PATCH /v1/projects/:project/agent-roles/:id — JSON Merge Patch
+     *  update. `ifMatch` supplies the `If-Match` header; a stale value
+     *  surfaces as ApiError(412). Pass `null` to opt out of the
+     *  lost-update check (the §PATCH semantics make If-Match optional). */
+    patchAgentRole: async (
+      roleId: string,
+      body: import("./types").PatchAgentRoleRequest,
+      ifMatch: string | null,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<{
+      result: import("./types").DefineAgentRoleResponse;
+      etag: string | null;
+    }> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      const headers: HeadersInit = ifMatch ? { "If-Match": ifMatch } : {};
+      const { body: result, response } = await apiFetchWithResponse<
+        import("./types").DefineAgentRoleResponse
+      >(config, `/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}`, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+        headers,
+      });
+      return { result, etag: response.headers.get("ETag") };
+    },
+
+    /** DELETE /v1/projects/:project/agent-roles/:id — retract a role.
+     *  Idempotent per §D7: a repeat DELETE returns the original
+     *  `retracted_at` with no new event. */
+    retractAgentRole: async (
+      roleId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").RetractAgentRoleResponse> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return del(`/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}`);
     },
   };
 }

@@ -2453,3 +2453,92 @@ export interface RotateWaitpointHmacResponse {
   failed: RotateWaitpointHmacFailure[];
   new_kid: string;
 }
+
+// ── RFC 031: operator-defined agent roles ───────────────────────────────────
+
+export type AgentRoleTier = "standard" | "research" | "orchestrator" | "generic";
+export type ResponseShape = "direct_answer" | "procedural_artifact";
+export type AgentRoleSource = "builtin" | "custom" | "custom_shadow";
+
+/** Wire shape of an `AgentRole` record as returned by
+ *  `GET /v1/projects/:project/agent-roles[/:id]`. Mirrors the Rust
+ *  `cairn_domain::agent_roles::AgentRole` struct. */
+export interface AgentRole {
+  role_id: string;
+  display_name: string;
+  description: string;
+  system_prompt: string | null;
+  tools: string[];
+  forbid_all_tools: boolean;
+  max_context_tokens: number | null;
+  tier: AgentRoleTier;
+  response_shape: ResponseShape;
+}
+
+/** One item in `GET /v1/projects/:project/agent-roles`. `source`
+ *  drives the badge in the list; `defined_at` / `defined_by` are
+ *  populated for custom / custom_shadow rows and null for built-ins. */
+export interface AgentRoleListItem {
+  role: AgentRole;
+  source: AgentRoleSource;
+  shadows_builtin: string | null;
+  defined_at: number | null;
+  defined_by: string | null;
+}
+
+export interface AgentRoleListResponse {
+  items: AgentRoleListItem[];
+  total: number;
+  has_more: boolean;
+}
+
+/** POST body for creating a role. `id` is the wire name; the Rust
+ *  struct field is `role_id`, but the HTTP handler accepts `id`
+ *  (see `CreateAgentRoleRequest`). */
+export interface CreateAgentRoleRequest {
+  id: string;
+  name: string;
+  tier: AgentRoleTier;
+  description?: string;
+  system_prompt: string;
+  tools?: string[];
+  forbid_all_tools?: boolean;
+  max_context_tokens?: number | null;
+  response_shape?: ResponseShape;
+}
+
+/** PATCH body — JSON Merge Patch over mutable fields. `id` and
+ *  `tier` are immutable (422 `ImmutableField` when present). */
+export interface PatchAgentRoleRequest {
+  name?: string;
+  description?: string;
+  system_prompt?: string;
+  tools?: string[];
+  forbid_all_tools?: boolean;
+  max_context_tokens?: number | null;
+  response_shape?: ResponseShape;
+}
+
+/** One entry in the POST / PATCH response `warnings[]` array. */
+export interface AgentRoleAdvisory {
+  code: string;
+  message: string;
+}
+
+/** POST / PATCH success response. */
+export interface DefineAgentRoleResponse {
+  role: AgentRole;
+  source: AgentRoleSource;
+  shadows_builtin: string | null;
+  defined_at: number;
+  defined_by: string;
+  warnings: AgentRoleAdvisory[];
+}
+
+/** DELETE success response (§D7 idempotent). */
+export interface RetractAgentRoleResponse {
+  role_id: string;
+  retracted_at: number;
+  retracted_by: string;
+  warnings: AgentRoleAdvisory[];
+}

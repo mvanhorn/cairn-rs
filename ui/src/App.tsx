@@ -52,6 +52,9 @@ const AuditLogPage       = lazy(() => import('./pages/AuditLogPage').then(m => (
 const SettingsPage         = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })));
 const ProfilePage          = lazy(() => import('./pages/ProfilePage').then(m => ({ default: m.ProfilePage })));
 const AgentTemplatesPage   = lazy(() => import('./pages/AgentTemplatesPage').then(m => ({ default: m.AgentTemplatesPage })));
+const AgentRolesPage       = lazy(() => import('./pages/AgentRolesPage').then(m => ({ default: m.AgentRolesPage })));
+const AgentRoleDetailPage  = lazy(() => import('./pages/AgentRoleDetailPage').then(m => ({ default: m.AgentRoleDetailPage })));
+const AgentRoleEditorPage  = lazy(() => import('./pages/AgentRoleEditorPage').then(m => ({ default: m.AgentRoleEditorPage })));
 import { NotFoundPage } from './pages/NotFoundPage';
 import { AdminGate } from './components/AdminGate';
 
@@ -132,6 +135,24 @@ function renderRoute(route: Route): React.ReactNode {
       </Guarded>
     );
   }
+  if (route.kind === 'agent-role-detail') {
+    return (
+      <Guarded name="Agent Role">
+        <Suspense fallback={<PageLoader />}>
+          <AgentRoleDetailPage roleId={route.roleId} />
+        </Suspense>
+      </Guarded>
+    );
+  }
+  if (route.kind === 'agent-role-editor') {
+    return (
+      <Guarded name="Agent Role Editor">
+        <Suspense fallback={<PageLoader />}>
+          <AgentRoleEditorPage mode={route.mode} roleId={route.roleId} />
+        </Suspense>
+      </Guarded>
+    );
+  }
 
   const page = (route as { kind: 'page'; page: NavPage }).page;
 
@@ -183,6 +204,7 @@ function renderRoute(route: Route): React.ReactNode {
       case 'profile':          return <ProfilePage />;
       case 'playground':       return <PlaygroundPage />;
       case 'agent-templates':  return <AgentTemplatesPage />;
+      case 'agents':           return <AgentRolesPage />;
       default:            return <NotFoundPage />;
     }
   })();

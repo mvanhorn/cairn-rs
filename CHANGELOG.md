@@ -156,6 +156,52 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `spawn_subagent_tool_def_uses_run_scoped_cache`. All 200 cairn-orchestrator unit tests
     pass; 311 cairn-app unit tests pass; `agent_roles_http` 20/20; `bootstrap_server` 34/34.
 
+- **RFC 031 PR-D1: operator-defined agent roles — UI first slice.**
+  Lands the load-bearing operator journeys for RFC 031 in the cairn-app
+  dashboard: list, detail, create, and edit agent roles end-to-end.
+
+  Key changes:
+
+  - `ui/src/pages/AgentRolesPage.tsx` — merged list of built-in +
+    operator-defined roles for the active project scope. Source badges
+    distinguish `builtin` / `custom` / `custom_shadow`; click a row to
+    view / edit. "New role" button routes to the editor.
+
+  - `ui/src/pages/AgentRoleDetailPage.tsx` — role detail with metadata,
+    tool allowlist, assembled system prompt, and Edit / Retract (or
+    "Restore built-in" on a shadow) actions. Built-in rows render
+    read-only. Placeholder section reserved for the PR-D2 history panel.
+
+  - `ui/src/pages/AgentRoleEditorPage.tsx` — unified create + edit form.
+    Immutable `id` / `tier` on edit (§D6); `If-Match` ETag threaded from
+    the initial GET into PATCH for lost-update protection (§PATCH); §D4
+    size counters; §D3 `forbid_all_tools` + `tools[]` wiring; 422
+    `details.failures[]` surfaced as field-level errors + form-level
+    banner; POST / PATCH `warnings[]` rendered as a blue advisory panel.
+
+  - Three new `Route` variants in `components/Layout.tsx`
+    (`agent-role-detail`, `agent-role-editor`, plus the `agents` page).
+    Breadcrumbs wired. Sidebar gains an "Agent Roles" entry under
+    Operations (next to Agent Templates).
+
+  - API client: `listAgentRoles`, `getAgentRole`, `createAgentRole`,
+    `patchAgentRole`, `retractAgentRole` added to `defaultApi`. New
+    `apiFetchWithResponse` helper returns both body and `Response` so
+    the editor can round-trip the `ETag` header into `If-Match` on PATCH.
+
+  - `lib/types.ts`: `AgentRole`, `AgentRoleListItem`,
+    `AgentRoleListResponse`, `CreateAgentRoleRequest`,
+    `PatchAgentRoleRequest`, `AgentRoleAdvisory`, `DefineAgentRoleResponse`,
+    `RetractAgentRoleResponse`.
+
+  Verification: `npx tsc --noEmit` clean; `npm run build` clean;
+  `cargo build -p cairn-app` clean (rust-embed picks up the new bundle);
+  219 UI unit tests pass. Lint baseline unchanged (109 existing errors, no
+  new debt). Deferred to PR-D2+: draft persistence, section-indicator
+  rail, history panel with prompt diff, retract-during-active-run modal,
+  copy-to-project, Playwright e2e.
+
+
 - **`cairn-providers` native Bedrock Converse tool calls.** The native
   `Bedrock` backend now translates cairn's `Tool` / `ToolCall` / `ChatMessage`
   types into the Converse `toolConfig` + content-block shape and parses

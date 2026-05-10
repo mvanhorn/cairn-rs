@@ -10,7 +10,7 @@ import { type BreadcrumbItem } from './Breadcrumb';
 // All top-level pages — must match NavPage union in Sidebar.tsx
 const VALID_PAGES: NavPage[] = [
   'dashboard', 'workspaces', 'tenants', 'operators', 'quotas', 'retention',
-  'sessions', 'runs', 'tasks', 'workers', 'orchestration', 'approvals', 'triggers', 'decisions', 'prompts', 'agent-templates',
+  'sessions', 'runs', 'tasks', 'workers', 'orchestration', 'approvals', 'triggers', 'decisions', 'prompts', 'agent-templates', 'agents',
   'traces', 'memory', 'sources', 'costs', 'cost-calc', 'evals', 'graph', 'audit-log', 'logs', 'metrics',
   'providers', 'plugins', 'skills', 'credentials', 'integrations', 'project-repos', 'channels', 'notifications', 'deployment', 'playground', 'test-harness', 'api-docs', 'settings', 'profile',
 ];
@@ -25,10 +25,31 @@ export type Route =
   | { kind: 'eval-compare'; leftId: string; rightId: string }
   | { kind: 'eval-results'; runId: string }
   | { kind: 'project-dashboard'; projectId: string }
+  | { kind: 'agent-role-detail'; roleId: string }
+  | { kind: 'agent-role-editor'; mode: 'new' | 'edit'; roleId?: string }
   | { kind: 'not-found'; hash: string };
 
 export function parseRoute(hash: string): Route {
   const h = hash.replace(/^#/, '');
+  if (h === 'agent-new') {
+    return { kind: 'agent-role-editor', mode: 'new' };
+  }
+  if (h.startsWith('agent-edit/') && h.length > 'agent-edit/'.length) {
+    const raw = h.slice('agent-edit/'.length);
+    try {
+      return { kind: 'agent-role-editor', mode: 'edit', roleId: decodeURIComponent(raw) };
+    } catch {
+      return { kind: 'not-found', hash: h };
+    }
+  }
+  if (h.startsWith('agent/') && h.length > 'agent/'.length) {
+    const raw = h.slice('agent/'.length);
+    try {
+      return { kind: 'agent-role-detail', roleId: decodeURIComponent(raw) };
+    } catch {
+      return { kind: 'not-found', hash: h };
+    }
+  }
   if (h.startsWith('run/') && h.length > 4) {
     return { kind: 'run-detail', runId: h.slice(4) };
   }
@@ -87,6 +108,7 @@ export const PAGE_TITLES: Record<NavPage, string> = {
   decisions:          'Decisions',
   prompts:            'Prompts',
   'agent-templates':  'Agent Templates',
+  agents:             'Agent Roles',
   traces:      'Traces',
   memory:      'Memory',
   sources:     'Sources',
@@ -129,6 +151,7 @@ const PAGE_GROUP: Partial<Record<NavPage, string>> = {
   decisions:          'Operations',
   prompts:            'Operations',
   'agent-templates':  'Operations',
+  agents:             'Operations',
   traces:      'Observability',
   memory:      'Observability',
   sources:     'Observability',
@@ -181,6 +204,20 @@ export function buildBreadcrumbs(route: Route): BreadcrumbItem[] {
       { label: shortId(route.sessionId) },
     ];
   }
+  if (route.kind === 'agent-role-detail') {
+    return [
+      { label: 'Operations' },
+      { label: 'Agent Roles', href: '#agents' },
+      { label: shortId(route.roleId) },
+    ];
+  }
+  if (route.kind === 'agent-role-editor') {
+    return [
+      { label: 'Operations' },
+      { label: 'Agent Roles', href: '#agents' },
+      { label: route.mode === 'new' ? 'New role' : `Edit ${shortId(route.roleId ?? '')}` },
+    ];
+  }
   if (route.kind === 'not-found') return [{ label: 'Not Found' }];
   return [];
 }
@@ -191,6 +228,8 @@ function activePage(route: Route): NavPage {
   if (route.kind === 'eval-compare')      return 'evals';
   if (route.kind === 'eval-results')      return 'evals';
   if (route.kind === 'project-dashboard') return 'dashboard';
+  if (route.kind === 'agent-role-detail') return 'agents';
+  if (route.kind === 'agent-role-editor') return 'agents';
   if (route.kind === 'not-found')         return 'dashboard';
   return route.page;
 }
