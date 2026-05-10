@@ -1501,16 +1501,43 @@ where
             // gate that blocks the happy path when its own check breaks
             // is worse than the non-authoritative baseline.
             if self.config.orchestrator_strict_completion_gate {
-                let gate_would_reject = decide_output
+                // #821: scope the gate's check to errors NEW since the
+                // last rejection (or run start). Pre-#821 the gate
+                // rejected on the run-wide error count, which meant a
+                // single transient `error:` line from any earlier
+                // iteration's tool output would permanently block
+                // complete_run — even after the model fixed every
+                // actual problem and produced the deliverable. R25
+                // dogfood saw this end-to-end: the executor wrote
+                // .github/workflows/ci.yml, committed, pushed, and
+                // opened a PR; then every complete_run attempt was
+                // rejected because earlier `git status` runs had
+                // emitted `error: src refspec ...` style lines that
+                // were no longer relevant.
+                // #823 review (Gemini): two conditions reject:
+                //   (a) errors_since_baseline > 0 — the model
+                //       introduced fresh errors since the last
+                //       attempt (or this is the first attempt with
+                //       any errors at all).
+                //   (b) baseline is active AND the model made no
+                //       tool-call progress between rejections.
+                //       Without this the model can bypass the gate
+                //       by retrying complete_run with zero work
+                //       done; #660's #821-aware fixture proves this
+                //       was a real hole.
+                let proposes_complete_run = decide_output
                     .proposals
                     .iter()
-                    .any(|p| p.action_type == cairn_domain::ActionType::CompleteRun)
-                    && verification_acc.error_count() > 0;
+                    .any(|p| p.action_type == cairn_domain::ActionType::CompleteRun);
+                let has_new_errors = verification_acc.errors_since_baseline() > 0;
+                let stalled_since_rejection = !verification_acc.made_progress_since_baseline();
+                let gate_would_reject =
+                    proposes_complete_run && (has_new_errors || stalled_since_rejection);
 
                 if gate_would_reject {
-                    let error_count = verification_acc.error_count();
+                    let error_count = verification_acc.errors_since_baseline();
                     let preview: Vec<String> = verification_acc
-                        .errors()
+                        .errors_since_baseline_slice()
                         .iter()
                         .take(crate::context::COMPLETION_GATE_ERROR_PREVIEW)
                         .cloned()
@@ -1523,8 +1550,8 @@ where
                         iteration     = ctx.iteration,
                         rejection_num = completion_gate_rejections,
                         error_count,
-                        "#660 strict completion gate rejecting complete_run — \
-                         verification accumulator has errors"
+                        stalled_since_rejection,
+                        "#660 strict completion gate rejecting complete_run"
                     );
 
                     if completion_gate_rejections >= crate::context::MAX_COMPLETION_GATE_REJECTIONS
@@ -1536,12 +1563,20 @@ where
                         // `FailureClass::VerificationRejected` terminal
                         // state. Keep the literal prefix stable — it's a
                         // contract with `crates/cairn-app/src/handlers/runs/helpers.rs`.
-                        let reason = format!(
-                            "verification_rejected: {error_count} error(s) after \
-                             {completion_gate_rejections} complete_run attempts. \
-                             First errors: {}",
-                            preview.join(" | "),
-                        );
+                        let reason = if stalled_since_rejection && error_count == 0 {
+                            format!(
+                                "verification_rejected: {completion_gate_rejections} \
+                                 complete_run attempts with no intervening tool call \
+                                 to address prior rejection feedback."
+                            )
+                        } else {
+                            format!(
+                                "verification_rejected: {error_count} error(s) after \
+                                 {completion_gate_rejections} complete_run attempts. \
+                                 First errors: {}",
+                                preview.join(" | "),
+                            )
+                        };
                         tracing::warn!(
                             run_id    = %ctx.run_id,
                             iteration = ctx.iteration,
@@ -1565,7 +1600,23 @@ where
                     // `decide_impl::build_user_message`). Marked
                     // `succeeded=false` so the model reads it as a
                     // failure signal, not a completed action.
-                    let rejection_summary = if preview.is_empty() {
+                    let rejection_summary = if stalled_since_rejection && error_count == 0 {
+                        // #823 review (Gemini): tell the model
+                        // explicitly that retrying complete_run with
+                        // no work in between is the bypass we're
+                        // refusing. Otherwise the only signal it has
+                        // is "you got rejected again" without a
+                        // pointer at WHY.
+                        format!(
+                            "complete_run refused by strict completion gate: \
+                             you have not run any tool calls since the prior \
+                             rejection. Issue at least one tool call to \
+                             investigate or address the verification feedback \
+                             before retrying complete_run \
+                             (attempt {completion_gate_rejections} of {}).",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                        )
+                    } else if preview.is_empty() {
                         format!(
                             "complete_run refused by strict completion gate: \
                              verification accumulator has {error_count} error(s). \
@@ -1592,6 +1643,19 @@ where
                     };
                     step_history.push(rejection_step);
                     ctx.step_history = step_history.clone();
+
+                    // #821: advance the verification baseline so the
+                    // NEXT complete_run attempt is judged only on
+                    // errors observed AFTER this rejection. Errors
+                    // we just told the model about ("Fix these")
+                    // shouldn't re-block the next attempt — only NEW
+                    // errors emitted by the model's recovery work
+                    // should. Without this, the model is stuck: the
+                    // gate rejects on the same set of errors forever
+                    // because the accumulator only grows. The
+                    // sidecar at Done still reports the full run-wide
+                    // error history via `verification_acc.finish()`.
+                    verification_acc.mark_baseline();
 
                     // If nothing non-terminal is left to dispatch this
                     // turn, skip execute entirely and let the next

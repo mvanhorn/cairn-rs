@@ -2341,23 +2341,168 @@ error[E0382]: borrow of moved value: `x`\n   --> src/lib.rs:3:5\n\
 error[E0502]: cannot borrow `y` as mutable because it is also borrowed as immutable\n   --> src/lib.rs:10:5\n\
 warning: unused import: `std::io::Write`\n   --> src/lib.rs:1:5\n\
 error: could not compile `demo` due to 2 previous errors\n";
+
+    /// #821: ExecutePhase variant that emits the configured
+    /// cargo-error stdout on EVERY iteration's bash invocation, not
+    /// just iter 0. Used with `BashAndCompleteEveryIterationDecide`
+    /// to drive the rejection-cap test under the new per-attempt
+    /// window contract.
+    pub(super) struct EveryIterationErrorsExecute {
+        pub stdout: String,
+        pub exit_code: i32,
+        pub dispatch_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pub complete_run_dispatches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExecutePhase for EveryIterationErrorsExecute {
+        async fn execute(
+            &self,
+            _ctx: &OrchestrationContext,
+            decide: &DecideOutput,
+        ) -> Result<ExecuteOutcome, OrchestratorError> {
+            self.dispatch_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let carries_complete_run = decide
+                .proposals
+                .iter()
+                .any(|p| p.action_type == ActionType::CompleteRun);
+            if carries_complete_run {
+                self.complete_run_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            let results: Vec<ActionResult> = decide
+                .proposals
+                .iter()
+                .map(|p| {
+                    let tool_output = if p.action_type == ActionType::InvokeTool
+                        && p.tool_name.as_deref() == Some("bash")
+                    {
+                        let mut map = serde_json::Map::new();
+                        map.insert(
+                            "stdout".into(),
+                            serde_json::Value::String(self.stdout.clone()),
+                        );
+                        map.insert("exit_code".into(), serde_json::Value::from(self.exit_code));
+                        Some(serde_json::Value::Object(map))
+                    } else {
+                        None
+                    };
+                    ActionResult {
+                        proposal: p.clone(),
+                        status: ActionStatus::Succeeded,
+                        tool_output,
+                        invocation_id: None,
+                        duration_ms: 0,
+                    }
+                })
+                .collect();
+
+            let loop_signal = if carries_complete_run {
+                LoopSignal::Done
+            } else {
+                LoopSignal::Continue
+            };
+
+            Ok(ExecuteOutcome {
+                results,
+                loop_signal,
+            })
+        }
+    }
+
+    /// #821 / #823 review: fixture for the gate-allows-on-recovery
+    /// test. iter 0 = [bash] populates the accumulator with errors.
+    /// iter 1+ = [bash, complete_run]; with `TwoPhaseExecute` the
+    /// post-iter-0 bash returns clean output, so each retry adds
+    /// progress (a tool observation) without adding new errors. Post
+    /// the gate's first rejection + mark_baseline, the second attempt
+    /// sees zero new errors AND made_progress_since_baseline → ALLOW.
+    pub(super) struct BashThenBashAndCompleteDecide {
+        pub calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DecidePhase for BashThenBashAndCompleteDecide {
+        async fn decide(
+            &self,
+            _ctx: &OrchestrationContext,
+            _gather: &GatherOutput,
+        ) -> Result<DecideOutput, OrchestratorError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let bash = ActionProposal {
+                action_type: ActionType::InvokeTool,
+                description: "run cargo build".to_owned(),
+                confidence: 0.9,
+                tool_name: Some("bash".to_owned()),
+                tool_args: Some(serde_json::json!({ "command": "cargo build" })),
+                requires_approval: false,
+            };
+            let proposals = if n == 0 {
+                // First iteration: bash only. Populates accumulator
+                // before the gate ever sees a complete_run.
+                vec![bash]
+            } else {
+                // Subsequent iterations: bash followed by complete_run.
+                // The gate at the top of the iteration sees errors
+                // accumulated from the PREVIOUS iteration's bash → it
+                // rejects the complete_run → mark_baseline() advances
+                // → next iteration's bash adds fresh errors → repeat.
+                vec![
+                    bash,
+                    ActionProposal {
+                        action_type: ActionType::CompleteRun,
+                        description: "all done".to_owned(),
+                        confidence: 0.9,
+                        tool_name: None,
+                        tool_args: None,
+                        requires_approval: false,
+                    },
+                ]
+            };
+            Ok(DecideOutput {
+                raw_response: r#"[{"action_type":"invoke_tool","tool_name":"bash"},{"action_type":"complete_run"}]"#
+                    .to_owned(),
+                proposals,
+                calibrated_confidence: 0.9,
+                requires_approval: false,
+                model_id: "test-model".to_owned(),
+                latency_ms: 20,
+                input_tokens: None,
+                output_tokens: None,
+                system_prompt: String::new(),
+                messages_json: "[]".to_owned(),
+                tool_calls_json: "[]".to_owned(),
+                tool_defs_json: "[]".to_owned(),
+            })
+        }
+    }
 }
 
-/// #660 (1): gate ON + errors + CompleteRun → gate rejects; loop
-/// continues rather than completing; execute never sees the
-/// CompleteRun proposal.
+/// #660 + #821 + #823 review: gate ON + errors + a recovery tool
+/// call between rejections → gate rejects the first complete_run,
+/// the model issues a clean bash on retry (no new errors AND
+/// progress made), gate allows the second complete_run, run
+/// completes.
+///
+/// Why the fixture has a bash on EVERY retry: the post-#823-review
+/// contract requires both (a) zero new errors since the last
+/// rejection AND (b) at least one tool observation since the last
+/// rejection — otherwise the model could bypass the gate by retrying
+/// complete_run with no work in between.
 #[tokio::test]
 async fn completion_gate_rejects_complete_run_when_verification_has_errors() {
-    use gate_fixtures::{BashThenCompleteDecide, TwoPhaseExecute, CARGO_ERROR_STDOUT};
+    use gate_fixtures::{BashThenBashAndCompleteDecide, TwoPhaseExecute, CARGO_ERROR_STDOUT};
 
     let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let complete_run_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // Cap iterations at 4 so we can observe at least one rejection + one
-    // re-decide turn (iter 0 bash, iter 1 rejected complete_run, iter 2
-    // re-proposed complete_run…). We don't want the cap to collide with
-    // the gate's own 3-rejection cap here — that's the next test.
+    // re-decide turn. The gate's 3-rejection cap is exercised by the
+    // separate `completion_gate_force_fails_after_three_rejections_*`
+    // test below.
     let config = LoopConfig {
         max_iterations: 4,
         breakers: permissive_breakers(),
@@ -2367,9 +2512,12 @@ async fn completion_gate_rejects_complete_run_when_verification_has_errors() {
     };
     let lp = OrchestratorLoop::new(
         FixedGather,
-        BashThenCompleteDecide {
+        BashThenBashAndCompleteDecide {
             calls: decide_calls.clone(),
         },
+        // TwoPhaseExecute emits cargo-error stdout ONLY on iter 0.
+        // iter 1+ bash invocations get an empty tool_output, so each
+        // retry's bash is "progress without new errors."
         TwoPhaseExecute {
             iter0_stdout: CARGO_ERROR_STDOUT.to_owned(),
             iter0_exit_code: 101,
@@ -2381,34 +2529,35 @@ async fn completion_gate_rejects_complete_run_when_verification_has_errors() {
 
     let result = lp.run(ctx()).await.unwrap();
 
-    // With max_iterations=4 and each rejection bumping the counter,
-    // the loop terminates either via MaxIterationsReached (if the gate
-    // lets every re-decide fire) or Failed(VerificationRejected) once
-    // the 3-reject cap hits. Both are valid "did NOT complete" shapes
-    // for this test — the load-bearing invariant is that
-    // `LoopTermination::Completed` is NOT observed.
+    // #660 + #821 + #823 review: gate rejects the FIRST complete_run
+    // attempt because the cargo errors are in the accumulator. After
+    // rejection, mark_baseline advances + tool counter resets. iter 1's
+    // bash runs (counts as progress) and emits clean output (no new
+    // errors). The second complete_run attempt clears both gate
+    // conditions and run terminates as Completed.
     assert!(
-        !matches!(result, LoopTermination::Completed { .. }),
-        "gate must block `complete_run` when verification errors are \
-         present; got {result:?}"
+        matches!(result, LoopTermination::Completed { .. }),
+        "#821 + #823 review: gate must allow complete_run on the \
+         second attempt when no NEW errors AND at least one tool call \
+         happened since the first rejection; got {result:?}"
     );
 
     // The decide phase must have been re-invoked after the first
-    // CompleteRun proposal, proving the loop re-entered DECIDE instead
-    // of terminating.
+    // CompleteRun proposal, proving the loop re-entered DECIDE
+    // instead of terminating on the rejection.
     assert!(
-        decide_calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
-        "DECIDE must re-run after a rejection (iter 0 bash + iter 1+ \
-         complete_run attempts); got {} decide calls",
+        decide_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "DECIDE must re-run after a rejection; got {} decide calls",
         decide_calls.load(std::sync::atomic::Ordering::SeqCst),
     );
 
-    // Execute must never have dispatched a CompleteRun — the gate
-    // strips the proposal in place before the execute phase runs.
+    // Execute must have dispatched CompleteRun exactly once — on the
+    // attempt that cleared both #821 and #823-review gate conditions.
     assert_eq!(
         complete_run_dispatches.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "CompleteRun must never reach execute while the gate is rejecting",
+        1,
+        "#821 + #823 review: CompleteRun must reach execute on the \
+         attempt with cleared baseline AND made progress"
     );
 }
 
@@ -2458,21 +2607,102 @@ async fn completion_gate_allows_complete_run_when_verification_clean() {
     );
 }
 
-/// #660 (3): gate ON + errors + three CompleteRun attempts →
-/// `LoopTermination::Failed` with the contract reason prefix. Proves
-/// the rejection cap prevents budget burn and that the failure reason
-/// carries the `verification_rejected:` prefix the handler's
-/// `classify_failed_reason` keys on.
+/// #660 (3) + #821: gate failure-cap behavior with the new
+/// per-attempt-window contract. Pre-#821 the test fixture
+/// `BashThenCompleteDecide + iter0_stdout=cargo errors` triggered
+/// 3 consecutive rejections because the gate's check was run-wide
+/// and iter 0's errors were never cleared. Post-#821 the gate
+/// scopes its check to errors NEW since the last attempt, so this
+/// fixture's "iter 0 errors, then complete_run forever" shape now
+/// terminates as Completed on the second attempt.
+///
+/// To still exercise the rejection cap, use the
+/// `BashAndCompleteOnEveryIteration` fixture: every iteration
+/// emits a bash with cargo errors AND a complete_run. The gate
+/// sees fresh errors every iteration, rejects every iteration,
+/// hits the 3-reject cap, fails with the `verification_rejected:`
+/// prefix.
 #[tokio::test]
-async fn completion_gate_force_fails_after_three_rejections() {
+async fn completion_gate_force_fails_after_three_rejections_with_persistent_errors() {
+    use gate_fixtures::{
+        BashThenBashAndCompleteDecide, EveryIterationErrorsExecute, CARGO_ERROR_STDOUT,
+    };
+
+    let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let complete_run_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Each iteration after the first emits BOTH a bash and a
+    // complete_run. The bash runs first (Phase 1 of execute),
+    // populates the accumulator with fresh errors, THEN the gate's
+    // next-iteration check finds those errors. With
+    // mark_baseline()-after-rejection, every iteration's fresh errors
+    // count as "new since last attempt" → gate keeps rejecting →
+    // 3-reject cap fires.
+    let config = LoopConfig {
+        max_iterations: 20,
+        breakers: permissive_breakers(),
+        orchestrator_strict_completion_gate: true,
+        ..Default::default()
+    };
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        BashThenBashAndCompleteDecide {
+            calls: decide_calls.clone(),
+        },
+        EveryIterationErrorsExecute {
+            stdout: CARGO_ERROR_STDOUT.to_owned(),
+            exit_code: 101,
+            dispatch_count: dispatch_count.clone(),
+            complete_run_dispatches: complete_run_dispatches.clone(),
+        },
+        config,
+    );
+    let result = lp.run(ctx()).await.unwrap();
+
+    match result {
+        LoopTermination::Failed { reason } => {
+            assert!(
+                reason.starts_with("verification_rejected:"),
+                "#660: Failed reason MUST start with `verification_rejected:` — \
+                 this prefix is the wire contract with \
+                 `classify_failed_reason` in the HTTP handler. Got: {reason}"
+            );
+            assert!(
+                reason.contains("error"),
+                "reason should include at least one error excerpt; got: {reason}"
+            );
+        }
+        other => panic!("expected LoopTermination::Failed(verification_rejected), got {other:?}"),
+    }
+
+    // CompleteRun must have been stripped on every rejection — the
+    // gate strips before execute. complete_run_dispatches counts
+    // proposals that REACHED execute, so under persistent-errors it
+    // stays at 0.
+    assert_eq!(
+        complete_run_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "CompleteRun must never reach execute when persistent errors trigger every-iteration rejection",
+    );
+}
+
+/// #823 review (Gemini): the no-progress bypass case. Iter 0 = bash
+/// with errors. Iter 1+ = complete_run only, no bash. With ONLY the
+/// errors_since_baseline check (the original #821 fix), iter 2's
+/// complete_run would slip through because no new errors arrived
+/// after iter 1's mark_baseline. The added `made_progress_since_baseline`
+/// rule forces every retry to issue at least one tool call to count
+/// — `BashThenCompleteDecide` issues none, so all 3 retries reject
+/// and the cap fires.
+#[tokio::test]
+async fn completion_gate_blocks_no_progress_complete_run_retries() {
     use gate_fixtures::{BashThenCompleteDecide, TwoPhaseExecute, CARGO_ERROR_STDOUT};
 
     let decide_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let complete_run_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    // Max iterations comfortably above the 3-reject cap so the cap is
-    // what fires the failure, not the iteration budget.
     let config = LoopConfig {
         max_iterations: 20,
         breakers: permissive_breakers(),
@@ -2498,27 +2728,16 @@ async fn completion_gate_force_fails_after_three_rejections() {
         LoopTermination::Failed { reason } => {
             assert!(
                 reason.starts_with("verification_rejected:"),
-                "#660: Failed reason MUST start with `verification_rejected:` — \
-                 this prefix is the wire contract with \
-                 `classify_failed_reason` in the HTTP handler. Got: {reason}"
-            );
-            // Evidence of the triggering errors must travel back to the
-            // operator so the run's failure is actionable without
-            // digging through the event log.
-            assert!(
-                reason.contains("error"),
-                "reason should include at least one error excerpt; got: {reason}"
+                "Failed reason must use the `verification_rejected:` prefix; got: {reason}"
             );
         }
-        other => panic!("expected LoopTermination::Failed(verification_rejected), got {other:?}"),
+        other => panic!("expected Failed (3-reject cap on no-progress retries); got {other:?}"),
     }
 
-    // And CompleteRun never reached execute — the gate blocked all
-    // three attempts before dispatch.
     assert_eq!(
         complete_run_dispatches.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "CompleteRun must never reach execute across all three rejections",
+        "no-progress retries must never reach execute"
     );
 }
 

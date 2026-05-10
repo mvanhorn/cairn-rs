@@ -98,6 +98,58 @@ pub struct VerificationAccumulator {
     errors: Vec<String>,
     commands: Vec<CommandOutcome>,
     tool_results_scanned: usize,
+    /// #821: total errors observed across the run's lifetime,
+    /// independent of the [`MAX_ENTRIES_PER_BUCKET`] cap on the
+    /// `errors` vector. Used together with `errors_baseline_total`
+    /// to compute the gate's "errors since last attempt" decision —
+    /// counting the *capped* `errors.len()` would silently freeze
+    /// once the bucket fills (Gemini caught this on PR #823: at
+    /// `errors.len() == 50`, `mark_baseline()` would lock the
+    /// baseline at 50 and `errors_since_baseline` would return 0
+    /// forever, opening a bypass for the strict completion gate).
+    /// This counter increments on every observed error line even
+    /// when the bucket is full and the line is dropped from the
+    /// preview slice.
+    errors_total_observed: usize,
+    /// #821: snapshot of `errors_total_observed` at the last
+    /// `mark_baseline()` call. The strict completion gate uses
+    /// `errors_total_observed - errors_baseline_total` to decide
+    /// whether a new attempt has accumulated fresh errors since
+    /// the previous rejection. Without this, a single transient
+    /// `error:` line in iter 5 (e.g. a stderr fragment from a
+    /// successful `git status`) would permanently block complete_run
+    /// regardless of whether the model addressed it. R25 dogfood
+    /// proved this end-to-end: the executor ran 12 iterations,
+    /// completed the actual work, and was rejected on every
+    /// complete_run attempt by errors from earlier iterations the
+    /// model had already moved past.
+    errors_baseline_total: usize,
+    /// #821: snapshot of `errors.len()` (the capped buffer's
+    /// length) at the last `mark_baseline()` call. Used only by
+    /// `errors_since_baseline_slice()` to slice the preview the
+    /// rejection step shows the model — distinct from the count
+    /// used by the gate decision (which uses the uncapped totals
+    /// above). When the cap is reached the slice may be shorter
+    /// than the count; that's expected — operators see a sample,
+    /// the gate sees the truth.
+    errors_baseline_slice_idx: usize,
+    /// #823 review (Gemini): true once the gate has rejected at
+    /// least one complete_run (i.e. `mark_baseline` has been called).
+    /// Until the model issues at least one tool call AFTER that
+    /// rejection, the gate keeps treating the next complete_run as
+    /// "no progress" and rejects again. Without this, the #821
+    /// recovery carve-out would let the model bypass the gate by
+    /// retrying complete_run with no work done in between (the gate
+    /// sees errors_since_baseline == 0 and allows). Test fixture
+    /// `test_660_completion_gate.rs` exercises exactly this shape.
+    baseline_active: bool,
+    /// #823 review (Gemini): incremented on every `observe(...)` of
+    /// an `InvokeTool` action that completes after `mark_baseline`.
+    /// Reset to 0 by `mark_baseline`. The gate consults this through
+    /// `made_progress_since_baseline()` to require the model to
+    /// actually try something between rejections — not just retry
+    /// complete_run with no intervening tool call.
+    tool_observations_since_baseline: usize,
 }
 
 impl VerificationAccumulator {
@@ -113,6 +165,14 @@ impl VerificationAccumulator {
             return;
         }
         self.tool_results_scanned += 1;
+        // #823 review (Gemini): a tool call after `mark_baseline()`
+        // counts as "the model tried something" — without this signal
+        // the gate would let a model bypass by retrying complete_run
+        // with zero work done between rejections.
+        if self.baseline_active {
+            self.tool_observations_since_baseline =
+                self.tool_observations_since_baseline.saturating_add(1);
+        }
 
         let tool_name = result.proposal.tool_name.as_deref().unwrap_or("<unknown>");
 
@@ -137,12 +197,14 @@ impl VerificationAccumulator {
         }
 
         // Text scan. Iterate string sources lazily, scanning in place to
-        // avoid cloning large stdout/stderr payloads. Once both buckets
-        // are full we can short-circuit the remaining sources entirely.
+        // avoid cloning large stdout/stderr payloads. We keep scanning
+        // even after the preview buckets fill so the uncapped
+        // `errors_total_observed` counter (#821) reflects every error
+        // line — the strict completion gate relies on this counter, not
+        // on `errors.len()`. The bucket pushes themselves still cap at
+        // [`MAX_ENTRIES_PER_BUCKET`] inside `scan_text`, so memory is
+        // bounded regardless.
         for src in iter_text_sources(result) {
-            if self.buckets_full() {
-                return;
-            }
             self.scan_text(&src);
         }
     }
@@ -176,24 +238,102 @@ impl VerificationAccumulator {
         self.errors.len()
     }
 
-    fn buckets_full(&self) -> bool {
-        self.warnings.len() >= MAX_ENTRIES_PER_BUCKET && self.errors.len() >= MAX_ENTRIES_PER_BUCKET
+    /// #821: count of errors since the last `mark_baseline()` call.
+    /// Used by the strict completion gate to scope its decision to
+    /// "new since the last attempt" rather than "ever." The gate
+    /// records the baseline AFTER each rejection so the next attempt
+    /// is judged only on whether NEW errors appeared.
+    ///
+    /// Counts against the uncapped `errors_total_observed` counter,
+    /// not `errors.len()`, so the gate keeps observing new errors
+    /// even after the [`MAX_ENTRIES_PER_BUCKET`] preview bucket is
+    /// full. (Counting `errors.len()` would let a model bypass the
+    /// gate by retrying complete_run after the buffer hit 50 — once
+    /// `mark_baseline()` snapshots a full bucket, `errors.len() -
+    /// baseline` is always 0 even if new errors are streaming in.)
+    pub fn errors_since_baseline(&self) -> usize {
+        self.errors_total_observed
+            .saturating_sub(self.errors_baseline_total)
+    }
+
+    /// #821: non-consuming peek at errors observed since the last
+    /// `mark_baseline()` call. The strict completion gate uses this
+    /// to build the rejection's user-facing preview — the model
+    /// should see only the errors it's expected to address THIS
+    /// attempt, not a cumulative ledger of every transient `error:`
+    /// line the run has ever produced.
+    ///
+    /// This slice is bounded by the [`MAX_ENTRIES_PER_BUCKET`] cap
+    /// on `errors`. When the bucket is full the slice may be shorter
+    /// than `errors_since_baseline()` reports — that count is the
+    /// truth, this slice is a sample for the rejection preview.
+    pub fn errors_since_baseline_slice(&self) -> &[String] {
+        let cap = self.errors_baseline_slice_idx.min(self.errors.len());
+        &self.errors[cap..]
+    }
+
+    /// #821: advance the baseline so future calls to
+    /// `errors_since_baseline*` return only errors observed AFTER
+    /// this call. The strict completion gate calls this immediately
+    /// after rejecting a complete_run so the next attempt is judged
+    /// fresh. The full error history remains in `self.errors` and
+    /// flows into `finish()`'s sidecar — the baseline only affects
+    /// the gate's per-attempt window.
+    ///
+    /// Snapshots two state variables: the uncapped total counter
+    /// (used for the gate decision) and the buffer index (used for
+    /// the preview slice). See the field docs on
+    /// `errors_total_observed` for why we track both.
+    ///
+    /// Also flips on `baseline_active` and resets the tool-progress
+    /// counter so the next gate consultation can require the model
+    /// to actually try something between rejections (#823 review).
+    pub fn mark_baseline(&mut self) {
+        self.errors_baseline_total = self.errors_total_observed;
+        self.errors_baseline_slice_idx = self.errors.len();
+        self.baseline_active = true;
+        self.tool_observations_since_baseline = 0;
+    }
+
+    /// #823 review (Gemini): has the model issued at least one tool
+    /// call since the most recent `mark_baseline()`? Always true
+    /// before the first rejection (no baseline set yet). After a
+    /// rejection, returns false until the model `observe`s at least
+    /// one `InvokeTool` action — i.e. it has tried something to
+    /// address the rejection feedback rather than just retrying
+    /// complete_run with no progress.
+    ///
+    /// The gate uses this in addition to `errors_since_baseline()`:
+    /// it allows complete_run only when (zero new errors AND the
+    /// model made progress) OR (no rejection has happened yet).
+    pub fn made_progress_since_baseline(&self) -> bool {
+        !self.baseline_active || self.tool_observations_since_baseline > 0
     }
 
     fn scan_text(&mut self, text: &str) {
         for raw_line in text.lines() {
-            if self.buckets_full() {
-                return;
-            }
             // Trim leading whitespace so indented diagnostics still match.
             // Don't trim trailing — loss of a trailing period or bracket
             // changes the meaning of the line.
             let line = raw_line.trim_start();
 
-            if is_warning_line(line) && self.warnings.len() < MAX_ENTRIES_PER_BUCKET {
-                self.warnings.push(truncate(line, MAX_LINE_LEN));
-            } else if is_error_line(line) && self.errors.len() < MAX_ENTRIES_PER_BUCKET {
-                self.errors.push(truncate(line, MAX_LINE_LEN));
+            if is_warning_line(line) {
+                // Warnings are buffer-only; we don't track a gate
+                // counter for them, so skipping past the cap is fine.
+                if self.warnings.len() < MAX_ENTRIES_PER_BUCKET {
+                    self.warnings.push(truncate(line, MAX_LINE_LEN));
+                }
+            } else if is_error_line(line) {
+                // #821: increment the uncapped total even when the
+                // preview bucket is full so the gate's
+                // errors_since_baseline math stays correct. The
+                // bucket itself only fills to MAX_ENTRIES_PER_BUCKET
+                // so previews remain bounded; the gate decision uses
+                // errors_total_observed instead of errors.len().
+                self.errors_total_observed = self.errors_total_observed.saturating_add(1);
+                if self.errors.len() < MAX_ENTRIES_PER_BUCKET {
+                    self.errors.push(truncate(line, MAX_LINE_LEN));
+                }
             }
         }
     }
@@ -584,5 +724,140 @@ error[E0308]: mismatched types
         }
         let incremental = acc.finish();
         assert_eq!(batch, incremental);
+    }
+
+    /// #821 / #823 review (Gemini high-pri): `errors_since_baseline()`
+    /// must NOT freeze at 0 once the preview bucket fills to
+    /// [`MAX_ENTRIES_PER_BUCKET`]. Pre-fix path:
+    /// `mark_baseline()` snapshotted `errors.len()` (capped at 50);
+    /// at full bucket the next `errors_since_baseline()` returned
+    /// `50 - 50 = 0` even when fresh errors were still arriving,
+    /// opening a strict-gate bypass. Post-fix path tracks an uncapped
+    /// `errors_total_observed` counter that increments on every error
+    /// line — the slice for the rejection preview stays bounded by
+    /// the bucket, but the gate's count is the truth.
+    #[test]
+    fn errors_since_baseline_keeps_counting_past_bucket_cap() {
+        // 60 error lines is 10 over the cap. The preview bucket
+        // tops out at 50; the total counter should reach 60.
+        let mut stdout = String::new();
+        for i in 0..60 {
+            stdout.push_str(&format!("error: synthetic {i}\n"));
+        }
+        let mut acc = VerificationAccumulator::new();
+        acc.observe(&bash_result("cargo check", &stdout, Some(1)));
+
+        assert_eq!(
+            acc.errors().len(),
+            MAX_ENTRIES_PER_BUCKET,
+            "preview bucket caps at {MAX_ENTRIES_PER_BUCKET}"
+        );
+        assert_eq!(
+            acc.errors_since_baseline(),
+            60,
+            "uncapped counter must reflect every observed error \
+             before mark_baseline()"
+        );
+
+        // Mark baseline; pre-fix this would lock the count at 0
+        // forever. Post-fix, fresh errors keep advancing the count.
+        acc.mark_baseline();
+        assert_eq!(
+            acc.errors_since_baseline(),
+            0,
+            "right after mark_baseline the delta is 0"
+        );
+
+        // Add 5 more error lines via a second tool result. The
+        // preview bucket is already full so these don't appear in
+        // `errors_since_baseline_slice()`, but the count advances.
+        let mut more = String::new();
+        for i in 0..5 {
+            more.push_str(&format!("error: post-baseline {i}\n"));
+        }
+        acc.observe(&bash_result("cargo check", &more, Some(1)));
+
+        assert_eq!(
+            acc.errors().len(),
+            MAX_ENTRIES_PER_BUCKET,
+            "preview bucket stays at cap (no new pushes)"
+        );
+        assert_eq!(
+            acc.errors_since_baseline(),
+            5,
+            "uncapped counter must report 5 fresh errors past the \
+             bucket cap; this is the strict-gate bypass Gemini caught \
+             on PR #823"
+        );
+
+        // The slice for the rejection preview is bounded by the
+        // bucket — operators see a sample, the gate sees the truth.
+        // After mark_baseline at full bucket, the slice is empty
+        // (no entries are PUSHED past the cap), which is fine: the
+        // gate decision uses the count, not the slice.
+        assert!(
+            acc.errors_since_baseline_slice().is_empty(),
+            "preview slice cannot show entries that didn't push"
+        );
+    }
+
+    /// Sanity: `mark_baseline()` followed by `mark_baseline()` is a
+    /// no-op on the uncapped counter (no errors observed between
+    /// them), so the gate sees 0. This is the well-behaved path —
+    /// the test above covered the past-cap edge case.
+    #[test]
+    fn double_mark_baseline_with_no_intervening_errors_reports_zero() {
+        let mut acc = VerificationAccumulator::new();
+        acc.observe(&bash_result("ls", "hello\n", Some(0)));
+        acc.mark_baseline();
+        assert_eq!(acc.errors_since_baseline(), 0);
+        acc.mark_baseline();
+        assert_eq!(acc.errors_since_baseline(), 0);
+    }
+
+    /// #823 review (Gemini): `made_progress_since_baseline()` must
+    /// return false after a rejection until the model issues at
+    /// least one tool call. The strict completion gate uses this to
+    /// refuse complete_run when the model retries without doing
+    /// any work between rejections — closes the bypass that the
+    /// errors_since_baseline-only check left open.
+    #[test]
+    fn made_progress_since_baseline_tracks_tool_calls_after_rejection() {
+        let mut acc = VerificationAccumulator::new();
+
+        // Before any rejection there is no baseline; "progress" is
+        // vacuously true so the gate doesn't block the very first
+        // complete_run attempt unless errors say so.
+        assert!(
+            acc.made_progress_since_baseline(),
+            "no baseline yet → vacuously progressed"
+        );
+
+        // Simulate the gate rejecting a complete_run.
+        acc.mark_baseline();
+        assert!(
+            !acc.made_progress_since_baseline(),
+            "right after mark_baseline, model has done nothing yet"
+        );
+
+        // Model retries complete_run with no tool calls. The gate
+        // should still see "no progress" — this is the bypass we're
+        // refusing.
+        acc.mark_baseline();
+        assert!(
+            !acc.made_progress_since_baseline(),
+            "another rejection with no tool call between → still no progress"
+        );
+
+        // Now the model actually runs a tool. Progress = true.
+        acc.observe(&bash_result("ls", "hello\n", Some(0)));
+        assert!(
+            acc.made_progress_since_baseline(),
+            "tool call after baseline counts as progress"
+        );
+
+        // Next rejection resets progress to false again.
+        acc.mark_baseline();
+        assert!(!acc.made_progress_since_baseline());
     }
 }
