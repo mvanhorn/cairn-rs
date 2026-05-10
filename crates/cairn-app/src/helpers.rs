@@ -279,10 +279,26 @@ fn ephemeral_run_dir(run_id: &RunId) -> PathBuf {
         );
         return std::env::temp_dir().join("cairn-runs");
     }
-    tracing::debug!(
+    // #819 (R24 dogfood): operators routinely register a repo and
+    // expect runs to operate on it, but a registration keyed against
+    // the wrong ProjectKey silently no-ops here — the resolver falls
+    // through to ephemeral and the executor lands in an empty dir.
+    // Pre-#819 this log was at DEBUG and operators missed it. INFO
+    // is the right level: every run that lands here is one of two
+    // shapes — (a) intentional API-driven orchestration with no repo
+    // (correct, expected) or (b) a registration-misroute (the bug).
+    // Naming the path operators can fix the typo from a quick
+    // `journalctl -u cairn` instead of waiting for the run to fail.
+    tracing::info!(
         run_id = %run_id,
         path = %ephemeral.display(),
-        "no repo allowlisted for project; using ephemeral run directory"
+        "no repo or local_fs path allowlisted for project; using ephemeral run directory"
+    );
+    tracing::debug!(
+        run_id = %run_id,
+        "If you registered a repo and expected the run to operate on it, verify the \
+         registration's project segment matches the run's (tenant_id, workspace_id, \
+         project_id) — see #819."
     );
     ephemeral
 }

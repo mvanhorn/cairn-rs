@@ -197,7 +197,51 @@ fn project_key_from_path(project: &str) -> Result<ProjectKey, String> {
         return Ok(ProjectKey::new(tenant_id, workspace_id, project_id));
     }
 
+    // #819: detect dashed-scope form (`tenant-workspace-project`) and
+    // refuse it loudly. R24 dogfood used this format in the URL path
+    // and the request silently fell through to the single-segment
+    // shorthand, registering against
+    // `(default_tenant, default_workspace, "tenant-workspace-project")`
+    // — a project key no real run will ever match. The registration
+    // succeeded with 200 and the operator only saw "no repo
+    // allowlisted" later when their run fell through to the ephemeral
+    // sandbox. Reject up-front with an actionable error so the
+    // operator fixes the URL instead.
+    //
+    // Heuristic: at least two `-` chars AND the prefix matches the
+    // default tenant or starts with `<id>-<id>-<id>`-shaped tokens.
+    // Rather than try to disambiguate operator-chosen ids that
+    // legitimately contain dashes (`my-team-prod` is a valid single
+    // project id), we only reject the EXACT shape that would have
+    // produced a runtime mismatch in R24: starts with a known
+    // tenant/workspace prefix from `state.runtime.tenants`. We don't
+    // have state here (this is a pure helper), so the conservative
+    // check is "looks like 3 dash-joined segments where the FIRST
+    // segment is the canonical default tenant". That catches the R24
+    // shape without over-rejecting legitimate single-id project
+    // names.
+    if project.starts_with(crate::DEFAULT_TENANT_ID)
+        && project.as_bytes().get(crate::DEFAULT_TENANT_ID.len()) == Some(&b'-')
+        && project[crate::DEFAULT_TENANT_ID.len() + 1..].contains('-')
+    {
+        return Err(format!(
+            "project path appears to be a dash-joined scope ({project:?}); the canonical \
+             format is `tenant_id/workspace_id/project_id` URL-encoded as \
+             `tenant_id%2Fworkspace_id%2Fproject_id`. If you meant a single-segment \
+             project id that contains dashes, ensure it does not start with \
+             `{}-`.",
+            crate::DEFAULT_TENANT_ID
+        ));
+    }
+
     validate_project_segment(project, "project_id")?;
+    tracing::debug!(
+        project = %project,
+        tenant = %crate::DEFAULT_TENANT_ID,
+        workspace = %crate::DEFAULT_WORKSPACE_ID,
+        "repo route project segment parsed as single-id shorthand. If you meant a \
+         multi-tenant scope, use `tenant/workspace/project` URL-encoded."
+    );
     Ok(ProjectKey::new(
         crate::DEFAULT_TENANT_ID,
         crate::DEFAULT_WORKSPACE_ID,
@@ -664,4 +708,56 @@ pub async fn delete_project_repo_handler(
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pre-#819 the dashed scope form (`tenant-workspace-project`)
+    /// silently fell through to the single-segment shorthand,
+    /// registering against
+    /// `(default_tenant, default_workspace, "tenant-workspace-project")`.
+    /// R24 dogfood used this URL form, the registration responded 200,
+    /// but no run ever matched the key. Post-#819 the parser rejects
+    /// the dashed form up-front when the prefix matches the canonical
+    /// default tenant.
+    #[test]
+    fn project_key_from_path_rejects_dashed_default_scope() {
+        let err = project_key_from_path("default_tenant-default_workspace-default_project")
+            .expect_err("#819: dashed default-scope must reject");
+        assert!(
+            err.contains("dash-joined") && err.contains("%2F"),
+            "#819 error must explain the dash-joined shape and point at              URL-encoded slash form; got: {err}"
+        );
+    }
+
+    /// Canonical slash-separated scope form continues to parse.
+    #[test]
+    fn project_key_from_path_accepts_canonical_scope() {
+        let key = project_key_from_path("tenant-a/workspace-a/project-a")
+            .expect("slash-separated must parse");
+        assert_eq!(key.tenant_id.as_str(), "tenant-a");
+        assert_eq!(key.workspace_id.as_str(), "workspace-a");
+        assert_eq!(key.project_id.as_str(), "project-a");
+    }
+
+    /// Single-segment shorthand still works for ids that don't look
+    /// like the dashed default-scope shape. `my-team-prod` is a
+    /// legitimate operator-chosen project id with dashes.
+    #[test]
+    fn project_key_from_path_accepts_single_id_with_dashes() {
+        let key = project_key_from_path("my-team-prod").expect("single id with dashes");
+        assert_eq!(key.tenant_id.as_str(), crate::DEFAULT_TENANT_ID);
+        assert_eq!(key.workspace_id.as_str(), crate::DEFAULT_WORKSPACE_ID);
+        assert_eq!(key.project_id.as_str(), "my-team-prod");
+    }
+
+    /// Single-segment shorthand without dashes — most common case for
+    /// dev-mode single-tenant deployments.
+    #[test]
+    fn project_key_from_path_accepts_single_id_no_dashes() {
+        let key = project_key_from_path("myproj").expect("single id");
+        assert_eq!(key.project_id.as_str(), "myproj");
+    }
 }
