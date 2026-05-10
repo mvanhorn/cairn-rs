@@ -451,6 +451,42 @@ const FAILURE_ADMISSION_SENTINELS: &[&str] = &[
     // `**Remaining**` all match.
     "### remaining",
     "**remaining",
+    // R32 (2026-05-10, M1-2 dogfood post-#837): multiple sub-agents
+    // hit a conflict (duplicate `pub mod map;` in src/main.rs) and
+    // correctly diagnosed it, but called complete_run with
+    // admission summaries instead of fail_run. New shapes observed:
+    //
+    //   - "## Status: Incomplete"
+    //   - "**M1-2 Implementation Status: INCOMPLETE - <reason>**"
+    //   - "The goal has not been completed. ..."
+    //   - "The task cannot be completed due to a compilation error"
+    //   - "What remains to be done: <list>"
+    //
+    // All four phrases narrowed to the most specific anchor that
+    // still catches the R32 text, to avoid re-opening the
+    // `sentinel_scan_does_not_fire_on_legitimate_r28_shape_near_misses`
+    // / `sentinel_scan_full_body_does_not_fire_on_legitimate_long_summaries`
+    // false-positive cases ("Nothing remains to be done", "It
+    // remains to be seen", "refactor has not been completed").
+    //
+    // `status: incomplete` generalises on the R26 family
+    // (`status: blocked` / `status: partially complete`).
+    "status: incomplete",
+    // `task cannot be completed` is narrower than the earlier-
+    // dropped `cannot complete` bigram — the "task" anchor keeps
+    // this from firing on scope-deferral prose like "cannot
+    // complete the full audit in scope" (research caveat).
+    "task cannot be completed",
+    // `goal has not been completed` — explicit run-status
+    // admission. Broader `has not been completed` was too close to
+    // "the refactor has not been completed in this PR" (legit
+    // deferral), so we anchor to the "goal" subject.
+    "goal has not been completed",
+    // `what remains to be done` — R32 section-header list-opener.
+    // Broader `remains to be done` was too close to "Nothing
+    // remains to be done" / "It remains to be seen" (legit
+    // success phrases), so we anchor to the "what" interrogative.
+    "what remains to be done",
     // ── Removed phrases (FP audit regression, post-R30) ──────────
     // An internal audit after R30 revealed the phrases below fired
     // on realistic *success-with-caveats* summaries that are the
@@ -1314,6 +1350,31 @@ error[E0308]: mismatched types
               check: clean. Follow-up scope tracked at #XYZ; not performed \
               in this PR because it changes a public API and needs an RFC.",
             ),
+            // R32 tightening FP guards — the NARROWED sentinels
+            // must not fire on these legitimate shapes.
+            (
+                "nothing-remains-to-be-done",
+                "Refactor complete. All downstream callers migrated. \
+              Nothing remains to be done in this PR; follow-up work \
+              tracked at #XYZ.",
+            ),
+            (
+                "remains-to-be-seen",
+                "Summary of proposal review. It remains to be seen whether \
+              the user accepts the tradeoff between A and B.",
+            ),
+            (
+                "refactor-deferred-not-run-goal",
+                "Shipped phase 1 of the refactor. The public API rename \
+              has not been completed in this PR — tracked at #XYZ for \
+              phase 2 to avoid cross-cutting review load.",
+            ),
+            (
+                "status-incomplete-as-code-literal",
+                "Audit complete. The field enum includes Status::Complete \
+              and Status::Incomplete values (line 42); no dead code. \
+              cargo check passes.",
+            ),
         ];
 
         let mut failures = Vec::new();
@@ -1515,6 +1576,68 @@ error[E0308]: mismatched types
             "Done:\n- wrote code\n\n**Remaining**\n- push to origin"
         )
         .is_some());
+    }
+
+    /// R32 (2026-05-10, M1-2 dogfood post-#837): multiple sub-agents
+    /// hit a conflicting file state, correctly diagnosed it, but
+    /// called complete_run with admission summaries instead of
+    /// fail_run. Pin each observed shape so the gate catches it.
+    #[test]
+    fn sentinel_scan_matches_r32_admission_shapes() {
+        // R32 sub-agent _2: "## Status: Incomplete\n\nThe repository
+        // was successfully cloned..."
+        assert!(
+            detect_self_reported_failure(
+                "## Status: Incomplete\n\nThe repository was successfully cloned..."
+            )
+            .is_some(),
+            "R32 exact: markdown heading + Status: Incomplete"
+        );
+
+        // R32 sub-agent _43: "## Status: Incomplete - Multiple steps remain"
+        assert!(
+            detect_self_reported_failure(
+                "## Status: Incomplete - Multiple steps remain\n\nThe goal has NOT been fully completed."
+            )
+            .is_some(),
+            "R32 exact: Status: Incomplete with tail phrase"
+        );
+
+        // R32 sub-agent _213: "**M1-2 Implementation Status: INCOMPLETE - Compilation Error**"
+        assert!(
+            detect_self_reported_failure(
+                "**M1-2 Implementation Status: INCOMPLETE - Compilation Error**\n\nThe task cannot be completed due to a compilation error..."
+            )
+            .is_some(),
+            "R32 exact: bold markdown + Status: INCOMPLETE"
+        );
+
+        // R32 sub-agent _293: "The goal has not been completed. Here is the current status:"
+        assert!(
+            detect_self_reported_failure(
+                "The goal has not been completed. Here is the current status:\n\n**What was identified:**\n..."
+            )
+            .is_some(),
+            "R32 exact: 'goal has not been completed' run-status admission"
+        );
+
+        // Section header: "What remains to be done:"
+        assert!(
+            detect_self_reported_failure(
+                "Changes so far.\n\n**What remains to be done:**\n1. Remove the duplicate declaration\n2. Commit + push"
+            )
+            .is_some(),
+            "R32 exact: 'What remains to be done:' section header"
+        );
+
+        // "task cannot be completed" inside an admission prose.
+        assert!(
+            detect_self_reported_failure(
+                "## Status: Incomplete\n\nThe task cannot be completed due to a compilation conflict in src/main.rs."
+            )
+            .is_some(),
+            "R32 exact: 'task cannot be completed' prose admission"
+        );
     }
 
     /// #832 regression: legitimate summaries that happen to include
