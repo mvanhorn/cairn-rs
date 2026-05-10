@@ -3027,6 +3027,21 @@ export function createApiClient(config: ApiClientConfig) {
       const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
       return del(`/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}`);
     },
+
+    /** GET /v1/projects/:project/agent-roles/:id/history — RFC 031
+     *  PR-D3 §History panel. Returns every `AgentRoleDefined` /
+     *  `AgentRoleRetracted` event for `(project, role_id)` oldest
+     *  first. Unknown role ids return an empty list (200, not 404). */
+    getAgentRoleHistory: async (
+      roleId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").AgentRoleHistoryResponse> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return get(
+        `/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}/history`,
+      );
+    },
   };
 }
 

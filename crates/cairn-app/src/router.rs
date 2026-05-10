@@ -1851,6 +1851,11 @@ impl AppBootstrap {
                     .delete(delete_agent_role_handler)
                     .layer(DefaultBodyLimit::max(131_072)),
             )
+            // RFC 031 PR-D3 §History panel — per-role event log.
+            .route(
+                "/v1/projects/:project/agent-roles/:role_id/history",
+                get(get_agent_role_history_handler),
+            )
             // ── Triggers (RFC 022) ────────────────────────────────────────────
             .route(
                 "/v1/projects/:project/triggers",

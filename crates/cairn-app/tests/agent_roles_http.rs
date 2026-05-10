@@ -718,3 +718,105 @@ async fn list_invalid_source_filter_returns_400() {
     let resp = send(&app, "GET", &uri, Some(ADMIN_TOKEN), None, None).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ── RFC 031 PR-D3 §History panel — per-role event history ─────────────────
+
+fn project_history_path(id: &str) -> String {
+    format!("{}/history", project_path_id(id))
+}
+
+#[tokio::test]
+async fn history_returns_defined_then_retracted_in_order() {
+    let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    register_tokens(&state).await;
+
+    // create → patch → retract produces three history entries.
+    let r1 = send(
+        &app,
+        "POST",
+        &project_path(),
+        Some(ADMIN_TOKEN),
+        None,
+        Some(good_body("history-role")),
+    )
+    .await;
+    assert_eq!(r1.status(), StatusCode::CREATED);
+
+    let patch_body = serde_json::json!({"name": "History v2"});
+    let r2 = send(
+        &app,
+        "PATCH",
+        &project_path_id("history-role"),
+        Some(ADMIN_TOKEN),
+        None,
+        Some(patch_body),
+    )
+    .await;
+    assert_eq!(r2.status(), StatusCode::OK);
+
+    let r3 = send(
+        &app,
+        "DELETE",
+        &project_path_id("history-role"),
+        Some(ADMIN_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(r3.status(), StatusCode::OK);
+
+    let resp = send(
+        &app,
+        "GET",
+        &project_history_path("history-role"),
+        Some(ADMIN_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = response_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "two Defined + one Retracted");
+    assert_eq!(items[0]["kind"], "defined");
+    assert_eq!(items[1]["kind"], "defined");
+    assert_eq!(items[1]["role"]["display_name"], "History v2");
+    assert_eq!(items[2]["kind"], "retracted");
+}
+
+#[tokio::test]
+async fn history_is_empty_for_unknown_role() {
+    let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    register_tokens(&state).await;
+
+    let resp = send(
+        &app,
+        "GET",
+        &project_history_path("never-existed"),
+        Some(ADMIN_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = response_json(resp).await;
+    assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    assert_eq!(json["total"].as_u64().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn history_cross_tenant_is_refused() {
+    let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
+    register_tokens(&state).await;
+
+    let resp = send(
+        &app,
+        "GET",
+        &project_history_path("any-role"),
+        Some(CROSS_TENANT_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

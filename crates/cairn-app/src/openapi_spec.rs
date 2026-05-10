@@ -2873,6 +2873,23 @@ pub const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/v1/projects/{project}/agent-roles/{role_id}/history": {
+      "get": {
+        "tags": ["Agent roles"],
+        "summary": "Per-role event history (RFC 031 PR-D3 §History panel)",
+        "description": "Returns every `AgentRoleDefined` / `AgentRoleRetracted` event on the global event log matching `(project, role_id)`, oldest first. Used by the role-detail UI to render a timeline with prompt diffs between successive `defined` entries. No pagination — bounded by human iteration cadence.",
+        "operationId": "getAgentRoleHistory",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "role_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Ordered history entries (oldest → newest)" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Cross-tenant access refused" }
+        }
+      }
+    },
     "/v1/projects/{project}/triggers": {
       "get": {
         "tags": ["Triggers"],

@@ -38,6 +38,7 @@ use cairn_domain::agent_roles_validation::{
 use cairn_domain::ProjectKey;
 use cairn_runtime::services::{AgentRoleService, ResolvedRole, RoleSource, SourceFilter};
 use cairn_store::projections::{AgentRoleReadModel, AgentRoleRecord};
+use cairn_store::EventLog;
 
 use crate::errors::{
     api_error_with_details, json_rejection_response, runtime_error_response, store_error_response,
@@ -739,4 +740,115 @@ pub(crate) async fn delete_agent_role_handler(
         }
         Err(err) => store_error_response(err),
     }
+}
+
+// ── RFC 031 PR-D3 §History panel ─────────────────────────────────────────────
+
+/// One entry in the agent-role history response. The shape is
+/// deliberately narrow — the UI only needs the kind, actor, timestamp,
+/// and (for `defined` events) enough of the role snapshot to render a
+/// diff between consecutive entries.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AgentRoleHistoryEntry {
+    /// `"defined"` or `"retracted"`.
+    pub(crate) kind: &'static str,
+    pub(crate) at_ms: u64,
+    pub(crate) actor: String,
+    /// `Some(role)` on `defined` entries so the UI can diff the
+    /// prompt / tools / shape between successive snapshots. `None`
+    /// on `retracted` entries.
+    pub(crate) role: Option<cairn_domain::agent_roles::AgentRole>,
+    /// `Some("reviewer")` etc. on `defined` entries when the id
+    /// matches a built-in. `None` otherwise + on retract entries.
+    pub(crate) shadows_builtin: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AgentRoleHistoryResponse {
+    pub(crate) items: Vec<AgentRoleHistoryEntry>,
+    pub(crate) total: usize,
+}
+
+/// `GET /v1/projects/:project/agent-roles/:id/history` — RFC 031 PR-D3
+/// §History panel.
+///
+/// Returns every `AgentRoleDefined` / `AgentRoleRetracted` event on
+/// the global event log that matches `(project, role_id)`, oldest
+/// first. The UI renders the list with a prompt diff between
+/// consecutive `defined` entries.
+///
+/// Reads the full event stream in chunks of 10 000; filter-in-memory
+/// is fine because a single project's role-mutation events are
+/// bounded by human iteration cadence (dozens per role over the
+/// project's lifetime, not millions). No pagination in v1 — the UI
+/// renders the full history inline.
+pub(crate) async fn get_agent_role_history_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path((project_raw, role_id)): Path<(String, String)>,
+) -> Response {
+    let project = match resolve_project(&principal, &project_raw) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    // Walk the event log in chunks until exhausted. The per-role
+    // history is bounded; reading more than one page is rare in
+    // practice.
+    const CHUNK: usize = 10_000;
+    let mut cursor: Option<cairn_store::EventPosition> = None;
+    let mut items: Vec<AgentRoleHistoryEntry> = Vec::new();
+    let store = state.runtime.store.as_ref();
+    loop {
+        let batch = match store.read_stream(cursor, CHUNK).await {
+            Ok(v) => v,
+            Err(e) => return store_error_response(e),
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.last().map(|e| e.position);
+        for stored in &batch {
+            match &stored.envelope.payload {
+                cairn_domain::RuntimeEvent::AgentRoleDefined(e)
+                    if e.project == project && e.role.role_id == role_id =>
+                {
+                    items.push(AgentRoleHistoryEntry {
+                        kind: "defined",
+                        at_ms: e.at_ms,
+                        actor: e.defined_by.as_str().to_owned(),
+                        role: Some(e.role.clone()),
+                        shadows_builtin: e.shadows_builtin.clone(),
+                    });
+                }
+                cairn_domain::RuntimeEvent::AgentRoleRetracted(e)
+                    if e.project == project && e.role_id == role_id =>
+                {
+                    items.push(AgentRoleHistoryEntry {
+                        kind: "retracted",
+                        at_ms: e.at_ms,
+                        actor: e.retracted_by.as_str().to_owned(),
+                        role: None,
+                        shadows_builtin: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        cursor = last;
+        if batch.len() < CHUNK {
+            break;
+        }
+    }
+
+    // Append order is stream order == timestamp order modulo clock
+    // skew. Keep it explicit for the UI so older → newer rendering
+    // doesn't need a secondary sort.
+    items.sort_by_key(|i| i.at_ms);
+    let total = items.len();
+    (
+        StatusCode::OK,
+        Json(AgentRoleHistoryResponse { items, total }),
+    )
+        .into_response()
 }

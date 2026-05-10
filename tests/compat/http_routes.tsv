@@ -161,6 +161,7 @@ GET	/v1/plugins/tools/search	preserve	-	-
 GET	/v1/policies/decisions	preserve	query: limit?	{ items }
 GET	/v1/projects/:project/agent-roles	preserve	-	-
 GET	/v1/projects/:project/agent-roles/:role_id	preserve	-	-
+GET	/v1/projects/:project/agent-roles/:role_id/history	preserve	-	-
 GET	/v1/projects/:project/ingest-jobs	preserve	-	-
 GET	/v1/projects/:project/knowledge-scoring-policy	preserve	-	-
 GET	/v1/projects/:project/knowledge-scoring-policy/valid-dimensions	preserve	-	-

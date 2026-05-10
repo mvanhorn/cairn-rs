@@ -2542,3 +2542,20 @@ export interface RetractAgentRoleResponse {
   retracted_by: string;
   warnings: AgentRoleAdvisory[];
 }
+
+/** One entry in `GET /v1/projects/:project/agent-roles/:id/history`.
+ *  `role` + `shadows_builtin` are populated on `defined` entries so
+ *  the UI can diff consecutive snapshots; both are null on `retracted`
+ *  entries. */
+export interface AgentRoleHistoryEntry {
+  kind: "defined" | "retracted";
+  at_ms: number;
+  actor: string;
+  role: AgentRole | null;
+  shadows_builtin: string | null;
+}
+
+export interface AgentRoleHistoryResponse {
+  items: AgentRoleHistoryEntry[];
+  total: number;
+}

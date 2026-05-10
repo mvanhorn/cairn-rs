@@ -156,6 +156,56 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `spawn_subagent_tool_def_uses_run_scoped_cache`. All 200 cairn-orchestrator unit tests
     pass; 311 cairn-app unit tests pass; `agent_roles_http` 20/20; `bootstrap_server` 34/34.
 
+- **RFC 031 PR-D3: operator-defined agent roles — history panel, retract modal, copy-to-project.**
+  Third and final RFC 031 UI slice. Lands the per-role event timeline,
+  a §D7-aware retract-confirmation modal, and the copy-to-project flow
+  (RFC 031 §History panel, §Retract, §Copy to project).
+
+  Key changes:
+
+  - `GET /v1/projects/:project/agent-roles/:id/history` — new handler
+    in `crates/cairn-app/src/handlers/agent_roles.rs`. Walks the global
+    event log in 10 000-event chunks, filters `AgentRoleDefined` and
+    `AgentRoleRetracted` events matching `(project, role_id)`, returns
+    oldest-first. Routed, OpenAPI-documented, compat TSV regenerated,
+    `docs/api/projects.md` updated. 3 new integration tests
+    (`history_returns_defined_then_retracted_in_order`,
+    `history_is_empty_for_unknown_role`,
+    `history_cross_tenant_is_refused`).
+
+  - `ui/src/components/AgentRoleHistoryPanel.tsx` — timeline UI.
+    Consecutive `defined` entries show a change summary (name / tier /
+    response_shape / tools / forbid flag / prompt-length delta). First
+    definition emits a "First definition" label; retract entries quote
+    the §D7 guarantee verbatim.
+
+  - `ui/src/components/AgentRoleRetractModal.tsx` — replaces the PR-D1
+    `window.confirm`. Two-button dialog (Keep / Retract) with an amber
+    §D7 banner: running orchestrations never interrupted; new runs fall
+    back. The RFC-prescribed runs-count probe
+    (`?agent_role_id=X&state=active`) is deferred — §D7 holds
+    regardless, the count is a v1.1 enhancement.
+
+  - `ui/src/components/AgentRoleCopyToProjectModal.tsx` — POST against
+    the target project scope. 201 → toast + close. 409 → conflict step
+    with [Overwrite] (PATCH with fetched ETag) / [Rename & retry]
+    (appends `-copy` to the id, returns to form step). 412 on the PATCH
+    re-fetches the latest ETag and surfaces a stale-tab warning.
+
+  - `ui/src/pages/AgentRoleDetailPage.tsx` updated to mount all three
+    components. Copy-to-project button appears on every role (built-in
+    or custom). Retract / Edit buttons remain gated on `isEditable`.
+
+  Scope trim (known): `/v1/projects/:project/runs?agent_role_id=X&state=active`
+  not added — larger than PR-D3 scope, deferred to a follow-on.
+
+  Verification: `npx tsc --noEmit` clean; 230/230 UI unit tests pass.
+  Lint baseline unchanged (109 existing errors, no new debt). `npm run
+  build` clean; `cargo build -p cairn-app` clean; `cargo clippy -p
+  cairn-app --lib --tests` clean; `cargo fmt --all` clean.
+  `agent_roles_http` 23/23 (+3 history fixtures); `compat_catalog_sync`
+  16/16; `api_docs_coverage` 1/1.
+
 - **RFC 031 PR-D2: operator-defined agent roles — editor polish.**
   Lands draft persistence, the section-indicator rail, and the shared
   source badge for the agent-role editor (RFC 031 §Draft persistence,

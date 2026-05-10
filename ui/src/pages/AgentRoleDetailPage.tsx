@@ -1,22 +1,29 @@
 /**
- * RFC 031 PR-D1 — Agent Role detail page.
+ * RFC 031 PR-D — Agent Role detail page.
  *
  * Read-only view of a single role, with Edit and Retract actions when
  * the row is operator-defined (source: custom | custom_shadow).
  * Built-in rows show the assembled prompt without edit affordances.
  *
- * History panel (every AgentRole* event for this id with a prompt
- * diff between consecutive Defined events) is deferred to PR-D2 —
- * the detail page leaves an anchor section for it.
+ * PR-D3 lands:
+ *   - History panel with the full AgentRoleDefined / AgentRoleRetracted
+ *     timeline and inter-snapshot change summaries.
+ *   - Retract-confirmation modal (replaces the PR-D1 `window.confirm`)
+ *     with the full §D7 explanation + explicit two-button choice.
+ *   - Copy-to-project modal that targets another project scope.
  */
 
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Edit2, Loader2, Trash2, Wrench } from "lucide-react";
+import { ArrowLeft, Copy, Edit2, Loader2, Trash2, Wrench } from "lucide-react";
 
 import { defaultApi, ApiError } from "../lib/api";
 import { useToast } from "../components/Toast";
 import { useScope } from "../hooks/useScope";
 import { AgentRoleBadge } from "../components/AgentRoleBadge";
+import { AgentRoleHistoryPanel } from "../components/AgentRoleHistoryPanel";
+import { AgentRoleRetractModal } from "../components/AgentRoleRetractModal";
+import { AgentRoleCopyToProjectModal } from "../components/AgentRoleCopyToProjectModal";
 
 interface Props {
   roleId: string;
@@ -26,6 +33,8 @@ export function AgentRoleDetailPage({ roleId }: Props) {
   const toast = useToast();
   const qc = useQueryClient();
   const [scope] = useScope();
+  const [retractModalOpen, setRetractModalOpen] = useState(false);
+  const [copyModalOpen, setCopyModalOpen] = useState(false);
 
   const { data, isLoading, isError, error } = useQuery({
     queryKey: [
@@ -88,15 +97,7 @@ export function AgentRoleDetailPage({ roleId }: Props) {
     window.location.hash = `agent-edit/${encodeURIComponent(roleId)}`;
   };
 
-  const onRetract = () => {
-    const confirmed = window.confirm(
-      item.source === "custom_shadow"
-        ? `Restore the built-in \`${roleId}\` for this project? Running orchestrations continue with the retired shadow; new runs use the built-in.`
-        : `Retract \`${roleId}\`? Running orchestrations keep the retired prompt; new runs fall back to generic (§D7).`,
-    );
-    if (!confirmed) return;
-    retractMut.mutate();
-  };
+  const onRetract = () => setRetractModalOpen(true);
 
   return (
     <div className="flex flex-col h-full bg-gray-50 dark:bg-zinc-900">
@@ -120,29 +121,39 @@ export function AgentRoleDetailPage({ roleId }: Props) {
             ETag {etag}
           </span>
         )}
-        {isEditable && (
-          <div className="ml-auto flex items-center gap-2">
-            <button
-              onClick={onRetract}
-              disabled={retractMut.isPending}
-              className="flex items-center gap-1 px-2 py-1 rounded-md border border-red-400 dark:border-red-600 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 text-[11px] font-medium transition-colors disabled:opacity-50"
-            >
-              {retractMut.isPending ? (
-                <Loader2 size={11} className="animate-spin" />
-              ) : (
-                <Trash2 size={11} />
-              )}
-              {item.source === "custom_shadow" ? "Restore built-in" : "Retract"}
-            </button>
-            <button
-              onClick={onEdit}
-              className="flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-medium transition-colors"
-            >
-              <Edit2 size={11} />
-              Edit
-            </button>
-          </div>
-        )}
+        <div className="ml-auto flex items-center gap-2">
+          <button
+            onClick={() => setCopyModalOpen(true)}
+            className="flex items-center gap-1 px-2 py-1 rounded-md border border-gray-300 dark:border-zinc-700 text-gray-600 dark:text-zinc-400 hover:bg-gray-100 dark:hover:bg-zinc-800 text-[11px] font-medium transition-colors"
+            title="Copy this role into another project"
+          >
+            <Copy size={11} />
+            Copy to project…
+          </button>
+          {isEditable && (
+            <>
+              <button
+                onClick={onRetract}
+                disabled={retractMut.isPending}
+                className="flex items-center gap-1 px-2 py-1 rounded-md border border-red-400 dark:border-red-600 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 text-[11px] font-medium transition-colors disabled:opacity-50"
+              >
+                {retractMut.isPending ? (
+                  <Loader2 size={11} className="animate-spin" />
+                ) : (
+                  <Trash2 size={11} />
+                )}
+                {item.source === "custom_shadow" ? "Restore built-in" : "Retract"}
+              </button>
+              <button
+                onClick={onEdit}
+                className="flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-medium transition-colors"
+              >
+                <Edit2 size={11} />
+                Edit
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-5">
@@ -247,17 +258,41 @@ export function AgentRoleDetailPage({ roleId }: Props) {
             </pre>
           </div>
 
-          {/* History placeholder (PR-D2) */}
-          <div className="rounded-xl border border-dashed border-gray-300 dark:border-zinc-700 bg-gray-50/50 dark:bg-zinc-900/50 px-5 py-4">
-            <h2 className="text-[12px] font-semibold text-gray-800 dark:text-zinc-200 mb-1 uppercase tracking-wide">
+          {/* RFC 031 PR-D3 — History panel. */}
+          <div className="rounded-xl border border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-5">
+            <h2 className="text-[12px] font-semibold text-gray-800 dark:text-zinc-200 mb-3 uppercase tracking-wide">
               History
             </h2>
-            <p className="text-[11px] text-gray-400 dark:text-zinc-600 italic">
-              AgentRoleDefined / Retracted event log with prompt diff lands in PR-D2.
-            </p>
+            <AgentRoleHistoryPanel roleId={roleId} />
           </div>
         </div>
       </div>
+
+      {/* RFC 031 PR-D3 — retract-confirmation modal. Replaces the
+           PR-D1 `window.confirm` with an explicit two-button choice
+           and the full §D7 explanation, so the operator sees the
+           consequence ("running orchestrations never interrupted;
+           new runs fall back") before committing. */}
+      {retractModalOpen && (
+        <AgentRoleRetractModal
+          roleId={roleId}
+          source={item.source}
+          onCancel={() => setRetractModalOpen(false)}
+          onConfirm={() => {
+            setRetractModalOpen(false);
+            retractMut.mutate();
+          }}
+          isPending={retractMut.isPending}
+        />
+      )}
+
+      {/* RFC 031 PR-D3 — copy-to-project modal. */}
+      {copyModalOpen && (
+        <AgentRoleCopyToProjectModal
+          role={role}
+          onClose={() => setCopyModalOpen(false)}
+        />
+      )}
     </div>
   );
 }
