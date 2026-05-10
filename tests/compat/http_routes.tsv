@@ -172,6 +172,7 @@ GET	/v1/projects/:project/repos	preserve	-	-
 GET	/v1/projects/:project/repos/:owner/:repo	preserve	-	-
 GET	/v1/projects/:project/run-templates	preserve	-	-
 GET	/v1/projects/:project/run-templates/:template_id	preserve	-	-
+GET	/v1/projects/:project/tools	preserve	-	-
 GET	/v1/projects/:project/triggers	preserve	-	-
 GET	/v1/projects/:project/triggers/:trigger_id	preserve	-	-
 GET	/v1/projects/:tenant/:workspace/:project/costs	preserve	-	{ total_cost_micros, total_tokens_in, total_tokens_out, provider_calls }

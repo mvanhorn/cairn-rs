@@ -16,6 +16,7 @@ pub(crate) mod integrations;
 pub(crate) mod memory;
 pub(crate) mod model_catalog;
 pub(crate) mod plugins;
+pub(crate) mod project_tools;
 pub(crate) mod prompts;
 pub(crate) mod providers;
 pub(crate) mod runs;

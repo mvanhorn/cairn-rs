@@ -1856,6 +1856,14 @@ impl AppBootstrap {
                 "/v1/projects/:project/agent-roles/:role_id/history",
                 get(get_agent_role_history_handler),
             )
+            // #799 — per-project tool-id listing powering the RFC 031
+            // role-editor tool-allowlist autocomplete. Cross-cutting read;
+            // any authenticated operator whose tenant scope covers the
+            // target project.
+            .route(
+                "/v1/projects/:project/tools",
+                get(list_project_tools_handler),
+            )
             // ── Triggers (RFC 022) ────────────────────────────────────────────
             .route(
                 "/v1/projects/:project/triggers",

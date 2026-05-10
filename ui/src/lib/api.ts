@@ -3042,6 +3042,18 @@ export function createApiClient(config: ApiClientConfig) {
         `/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}/history`,
       );
     },
+
+    /** GET /v1/projects/:project/tools — #799 per-project tool
+     *  inventory. Powers the RFC 031 role-editor tool autocomplete.
+     *  Returns every built-in + every plugin-exposed tool honouring
+     *  the project's enablement allowlists, sorted alphabetically. */
+    listProjectTools: async (
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").ProjectToolsResponse> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return get(`/v1/projects/${path}/tools`);
+    },
   };
 }
 

@@ -32,6 +32,7 @@ import { defaultApi, ApiError } from "../lib/api";
 import { useToast } from "../components/Toast";
 import { useScope } from "../hooks/useScope";
 import { AgentRoleSectionRail } from "../components/AgentRoleSectionRail";
+import { AgentRoleToolPicker } from "../components/AgentRoleToolPicker";
 import { analysePrompt } from "../lib/agentRolePromptCheck";
 import { useAgentRoleDraft } from "../hooks/useAgentRoleDraft";
 import type {
@@ -648,23 +649,15 @@ export function AgentRoleEditorPage({ mode, roleId }: Props) {
                 <Wrench size={10} className="inline mr-1" />
                 Tools (allowlist)
               </label>
-              <textarea
+              <AgentRoleToolPicker
                 value={form.tools}
-                onChange={(e) => setForm((f) => ({ ...f, tools: e.target.value }))}
+                onChange={(next) => setForm((f) => ({ ...f, tools: next }))}
                 disabled={form.forbid_all_tools}
-                rows={3}
-                placeholder="grep, read, bash, post_inline_comment"
-                className={clsx(
-                  "w-full rounded-lg border px-3 py-2 text-[12px] font-mono resize-none focus:outline-none focus:ring-1 transition-colors",
-                  form.forbid_all_tools
-                    ? "bg-gray-100 dark:bg-zinc-800 border-gray-200 dark:border-zinc-700 text-gray-400 dark:text-zinc-600 cursor-not-allowed"
-                    : "bg-gray-50 dark:bg-zinc-900 border-gray-200 dark:border-zinc-700 text-gray-800 dark:text-zinc-200 focus:border-indigo-500 focus:ring-indigo-500/30",
-                )}
               />
               <p className="text-[11px] text-gray-400 dark:text-zinc-600 mt-1">
-                Comma- or whitespace-separated tool ids. Empty = no restriction (§D3). Unknown
-                tool ids emit <span className="font-mono">ToolDeclaredButMissing</span> at
-                DECIDE time, deduped per run.
+                Empty = no restriction (§D3). Unknown tool ids emit{" "}
+                <span className="font-mono">ToolDeclaredButMissing</span> at DECIDE time,
+                deduped per run.
               </p>
               {fieldError("tools")}
             </div>

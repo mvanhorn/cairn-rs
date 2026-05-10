@@ -11,6 +11,32 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **#799 — `GET /v1/projects/:project/tools` per-project tool inventory.**
+  Returns every built-in tool (Core / Registered / Deferred with the
+  registry's `tier`) plus every plugin-advertised tool from plugins
+  currently enabled for this project (RFC 015), honouring each
+  enablement's `tool_allowlist`. Response: `{items, total, has_more}`
+  sorted alphabetically by `id`; each item carries `{id, source, tier,
+  description, parameters_schema}` with `source = "builtin"` or
+  `"plugin:<plugin_id>"`.
+
+  Powers the RFC 031 role-editor tool-allowlist autocomplete
+  (`AgentRoleToolPicker`) — the operator sees grouped, tier-badged
+  tool cards with search, click-to-toggle selection, and a
+  "declared but not in registry" bucket for stale allowlist entries.
+  The picker falls back to the legacy freehand textarea when the
+  endpoint is empty (fresh project, no plugins) or errors. No admin
+  guard — read-only endpoint, any authenticated operator in the
+  tenant scope can call it.
+
+  4 new integration tests in `crates/cairn-app/tests/project_tools_http.rs`
+  cover 401 (missing bearer), 403 (cross-tenant), 200 shape on both
+  admin + plain-operator tokens, 400 (bad project path). OpenAPI
+  spec + compat TSV + `docs/api/projects.md` updated; UI build
+  passes; lint matches main baseline; `cargo clippy` clean.
+
+  Closes [#799](https://github.com/avifenesh/cairn-rs/issues/799).
+
 - **RFC 031 PR-A: operator-defined agent roles — shape skeleton.**
   Lands the domain and service skeleton for operator-defined per-project
   agent roles (RFC 031 §Implementation Plan PR-A). Zero observable

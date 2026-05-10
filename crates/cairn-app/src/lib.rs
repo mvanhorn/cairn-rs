@@ -134,6 +134,8 @@ pub(crate) use handlers::memory::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::plugins::*;
 #[allow(unused_imports)]
+pub(crate) use handlers::project_tools::*;
+#[allow(unused_imports)]
 pub(crate) use handlers::prompts::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::providers::*;

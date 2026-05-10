@@ -2572,3 +2572,26 @@ export interface AgentRoleHistoryResponse {
   items: AgentRoleHistoryEntry[];
   total: number;
 }
+
+// ── #799: per-project tool inventory ───────────────────────────────────────
+
+/** Tier reported on each project-tool row. Plugin-sourced tools are
+ *  always `"registered"`; built-ins report the registry's tier. */
+export type ProjectToolTier = "core" | "registered" | "deferred";
+
+/** One item in `GET /v1/projects/:project/tools`. `source` is
+ *  `"builtin"` or `"plugin:<plugin_id>"`; `parameters_schema` is
+ *  inlined so hover previews don't need a second round-trip. */
+export interface ProjectToolItem {
+  id: string;
+  source: string;
+  tier: ProjectToolTier;
+  description: string;
+  parameters_schema: unknown;
+}
+
+export interface ProjectToolsResponse {
+  items: ProjectToolItem[];
+  total: number;
+  has_more: boolean;
+}

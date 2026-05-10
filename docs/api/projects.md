@@ -4,7 +4,7 @@ Project-scoped sub-resources: repos, run-templates, triggers (enable/disable/res
 
 Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes.tsv). Drift from this table against the live router is enforced by `cargo test -p cairn-api --test compat_catalog_sync`.
 
-**Routes: 36**
+**Routes: 37**
 
 | Method | Path | Classification | Notes |
 |---|---|---|---|
@@ -14,6 +14,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `PATCH` | `/v1/projects/:project/agent-roles/:role_id` | Preserve | RFC 031: JSON Merge Patch. `id`/`tier` immutable (422 `ImmutableField`). Optional `If-Match: "<etag>"` (stale → 412). Admin-only. |
 | `DELETE` | `/v1/projects/:project/agent-roles/:role_id` | Preserve | RFC 031 §D7: retract the role. Idempotent on already-retracted rows (returns original `retracted_at`). Admin-only. |
 | `GET` | `/v1/projects/:project/agent-roles/:role_id/history` | Preserve | RFC 031 PR-D3 §History panel: per-role event log. Returns every `AgentRoleDefined` / `AgentRoleRetracted` event for `(project, role_id)` oldest-first. No pagination (bounded by human iteration cadence). |
+| `GET` | `/v1/projects/:project/tools` | Preserve | #799: per-project tool inventory. Union of built-ins (with `tier = core\|registered\|deferred`) + plugin tools from enabled plugins (honouring each enablement's `tool_allowlist`). Response carries `items[]` + `total` + `has_more: false`. Powers the RFC 031 role-editor tool autocomplete; no admin guard. |
 | `DELETE` | `/v1/projects/:proj/plugins/:id` | Preserve |  |
 | `GET` | `/v1/projects/:tenant/:workspace/:project/costs` | Preserve | F29 CD-2: lifetime cost rollup (µUSD + tokens + provider calls). Zeros for never-billed projects. |
 | `POST` | `/v1/projects/:proj/plugins/:id` | Preserve |  |

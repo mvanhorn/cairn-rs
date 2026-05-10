@@ -2890,6 +2890,23 @@ pub const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/v1/projects/{project}/tools": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Per-project tool inventory (closes #799)",
+        "description": "Union of every built-in tool (Core/Registered/Deferred) and every tool advertised by a plugin that is currently enabled for this project (RFC 015). Plugin tools respect each enablement's `tool_allowlist`. Response `items[]` carries `{id, source, tier, description, parameters_schema}` with `source` set to `\"builtin\"` or `\"plugin:<plugin_id>\"`. Powers the RFC 031 role-editor tool autocomplete; no admin guard required.",
+        "operationId": "listProjectTools",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Tool inventory for the project" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Cross-tenant access refused" },
+          "400": { "description": "Invalid project path segment" }
+        }
+      }
+    },
     "/v1/projects/{project}/triggers": {
       "get": {
         "tags": ["Triggers"],
