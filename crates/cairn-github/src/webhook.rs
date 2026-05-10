@@ -60,6 +60,15 @@ pub enum WebhookEventPayload {
     IssueComment(IssueCommentEvent),
     PullRequest(PullRequestEvent),
     PullRequestReview(PullRequestReviewEvent),
+    /// `pull_request_review_comment` — a single inline comment on a
+    /// PR (create, edit, delete, or a reply in an existing thread).
+    /// Distinct from `PullRequestReview` (the umbrella review
+    /// envelope) and `IssueComment` (top-level PR discussion, not
+    /// anchored to a file/line). This is the event type needed by
+    /// agent reviewers that learn from replies to their inline
+    /// comments — the reply body + diff hunk live here, not on the
+    /// review envelope.
+    PullRequestReviewComment(PullRequestReviewCommentEvent),
     Push(PushEvent),
     Other(serde_json::Value),
 }
@@ -83,6 +92,10 @@ impl WebhookEvent {
             "pull_request_review" => {
                 let evt: PullRequestReviewEvent = serde_json::from_slice(body)?;
                 WebhookEventPayload::PullRequestReview(evt)
+            }
+            "pull_request_review_comment" => {
+                let evt: PullRequestReviewCommentEvent = serde_json::from_slice(body)?;
+                WebhookEventPayload::PullRequestReviewComment(evt)
             }
             "push" => {
                 let evt: PushEvent = serde_json::from_slice(body)?;
@@ -108,6 +121,7 @@ impl WebhookEvent {
             WebhookEventPayload::IssueComment(e) => Some(&e.action),
             WebhookEventPayload::PullRequest(e) => Some(&e.action),
             WebhookEventPayload::PullRequestReview(e) => Some(&e.action),
+            WebhookEventPayload::PullRequestReviewComment(e) => Some(&e.action),
             WebhookEventPayload::Push(_) => None,
             WebhookEventPayload::Other(v) => v.get("action")?.as_str(),
         }
@@ -128,6 +142,7 @@ impl WebhookEvent {
             WebhookEventPayload::IssueComment(e) => Some(&e.repository.full_name),
             WebhookEventPayload::PullRequest(e) => Some(&e.repository.full_name),
             WebhookEventPayload::PullRequestReview(e) => Some(&e.repository.full_name),
+            WebhookEventPayload::PullRequestReviewComment(e) => Some(&e.repository.full_name),
             WebhookEventPayload::Push(e) => Some(&e.repository.full_name),
             WebhookEventPayload::Other(v) => v.get("repository")?.get("full_name")?.as_str(),
         }
@@ -140,6 +155,7 @@ impl WebhookEvent {
             WebhookEventPayload::IssueComment(e) => e.installation.as_ref()?.id,
             WebhookEventPayload::PullRequest(e) => e.installation.as_ref()?.id,
             WebhookEventPayload::PullRequestReview(e) => e.installation.as_ref()?.id,
+            WebhookEventPayload::PullRequestReviewComment(e) => e.installation.as_ref()?.id,
             WebhookEventPayload::Push(e) => e.installation.as_ref()?.id,
             WebhookEventPayload::Other(v) => v.get("installation")?.get("id")?.as_u64()?,
         };
@@ -186,6 +202,22 @@ pub struct PullRequestEvent {
 pub struct PullRequestReviewEvent {
     pub action: String,
     pub review: Review,
+    pub pull_request: PullRequest,
+    pub repository: Repository,
+    pub sender: User,
+    #[serde(default)]
+    pub installation: Option<Installation>,
+}
+
+/// `pull_request_review_comment` event envelope.
+///
+/// Actions seen in the wild: `created`, `edited`, `deleted`. Replies
+/// in an existing thread also fire `created` and populate
+/// `comment.in_reply_to_id`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PullRequestReviewCommentEvent {
+    pub action: String,
+    pub comment: ReviewComment,
     pub pull_request: PullRequest,
     pub repository: Repository,
     pub sender: User,
@@ -260,6 +292,48 @@ pub struct Review {
     #[serde(default)]
     pub body: Option<String>,
     pub user: User,
+    pub html_url: String,
+}
+
+/// Single inline review comment anchored to a file/line.
+///
+/// This is the payload of `pull_request_review_comment`. It's
+/// distinct from the `PullRequestReviewComment` returned by the
+/// `list_pull_request_review_comments` REST API (in `client.rs`) —
+/// the webhook shape is trimmed to the operator-relevant fields.
+/// If an agent posted the parent comment, a reply fires a new event
+/// with `in_reply_to_id` = parent's `id`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub id: u64,
+    /// Non-null on replies; identifies the parent comment the reply
+    /// is attached to. Agents use this to find which of their
+    /// inline comments the human is responding to.
+    #[serde(default)]
+    pub in_reply_to_id: Option<u64>,
+    /// Review envelope this comment belongs to. Single-comment
+    /// threads created outside a formal review still carry the
+    /// implicit review id that GitHub mints.
+    #[serde(default)]
+    pub pull_request_review_id: Option<u64>,
+    pub user: User,
+    pub body: String,
+    /// File path the comment is anchored to.
+    pub path: String,
+    /// Line in the new version of the file (`side = "RIGHT"`). Null
+    /// on file-level comments (`subject_type = "file"`) or when
+    /// GitHub's diff tracker can't place the comment after a force-
+    /// push rewrote the diff.
+    #[serde(default)]
+    pub line: Option<u32>,
+    /// Commit SHA the comment was originally posted against.
+    #[serde(default)]
+    pub commit_id: Option<String>,
+    /// The diff-hunk text around the anchored line — agents that
+    /// want to learn from a reply compact `{comment.body, diff_hunk,
+    /// parent_comment}` into one memory record.
+    #[serde(default)]
+    pub diff_hunk: Option<String>,
     pub html_url: String,
 }
 
@@ -379,6 +453,103 @@ mod tests {
         assert_eq!(event.event_key(), "check_run.completed");
         assert_eq!(event.installation_id(), Some(99));
         assert!(matches!(event.payload, WebhookEventPayload::Other(_)));
+    }
+
+    #[test]
+    fn parse_pull_request_review_comment_created() {
+        // Abridged-but-realistic `pull_request_review_comment.created`
+        // payload shape from the GitHub webhook docs. Fields we rely
+        // on in the product: action, comment.{id, in_reply_to_id,
+        // body, path, line, diff_hunk}, pull_request.number, repo,
+        // installation. Optional fields we tolerate being absent:
+        // commit_id (present on real payloads, omitted here to prove
+        // the `#[serde(default)]` guard works).
+        let body = serde_json::json!({
+            "action": "created",
+            "comment": {
+                "id": 444_888,
+                "in_reply_to_id": 444_000,
+                "pull_request_review_id": 4_259_524_777_u64,
+                "user": {"login": "human-reviewer", "id": 7},
+                "body": "Good catch — I'll retry on EINTR instead.",
+                "path": "src/socket.c",
+                "line": 382,
+                "diff_hunk": "@@ -378,3 +378,7 @@ static int connSocketBlockingConnect(...)",
+                "html_url": "https://github.com/avifenesh/valkey/pull/5#discussion_r444888"
+            },
+            "pull_request": {
+                "number": 5,
+                "title": "Fix: connSocketBlockingConnect ignores aeWait errors",
+                "state": "open",
+                "user": {"login": "bot", "id": 3_633_497},
+                "html_url": "https://github.com/avifenesh/valkey/pull/5"
+            },
+            "repository": {"full_name": "avifenesh/valkey"},
+            "sender": {"login": "human-reviewer", "id": 7},
+            "installation": {"id": 130_312_695}
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+
+        let event =
+            WebhookEvent::parse("pull_request_review_comment", "delivery-4", &bytes).unwrap();
+        assert_eq!(event.event_key(), "pull_request_review_comment.created");
+        assert_eq!(event.repository(), Some("avifenesh/valkey"));
+        assert_eq!(event.installation_id(), Some(130_312_695));
+
+        let WebhookEventPayload::PullRequestReviewComment(e) = &event.payload else {
+            panic!(
+                "expected PullRequestReviewComment variant, got {:?}",
+                event.payload
+            );
+        };
+        assert_eq!(e.comment.id, 444_888);
+        assert_eq!(e.comment.in_reply_to_id, Some(444_000));
+        assert_eq!(e.comment.path, "src/socket.c");
+        assert_eq!(e.comment.line, Some(382));
+        assert_eq!(e.pull_request.number, 5);
+        // Optional field absent from the fixture — serde(default) must
+        // parse as None rather than failing the whole payload.
+        assert!(e.comment.commit_id.is_none());
+        // diff_hunk is critical for learning from replies — must round-
+        // trip so downstream consumers can compact it with the reply.
+        assert!(e
+            .comment
+            .diff_hunk
+            .as_deref()
+            .unwrap()
+            .contains("connSocketBlockingConnect"));
+    }
+
+    #[test]
+    fn parse_pull_request_review_comment_without_reply() {
+        // A top-level inline comment (not a reply). `in_reply_to_id`
+        // absent; the field must default to None, not fail parsing.
+        let body = serde_json::json!({
+            "action": "created",
+            "comment": {
+                "id": 555,
+                "user": {"login": "h", "id": 1},
+                "body": "...",
+                "path": "x.c",
+                "html_url": "https://example.com"
+            },
+            "pull_request": {
+                "number": 1, "title": "t", "state": "open",
+                "user": {"login": "b", "id": 2},
+                "html_url": "https://example.com"
+            },
+            "repository": {"full_name": "o/r"},
+            "sender": {"login": "h", "id": 1}
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let event =
+            WebhookEvent::parse("pull_request_review_comment", "delivery-5", &bytes).unwrap();
+        let WebhookEventPayload::PullRequestReviewComment(e) = &event.payload else {
+            panic!("variant");
+        };
+        assert!(e.comment.in_reply_to_id.is_none());
+        assert!(e.comment.line.is_none());
+        assert!(e.comment.diff_hunk.is_none());
     }
 
     #[test]

@@ -136,6 +136,14 @@ pub(crate) async fn acknowledge_event(
         cairn_github::WebhookEventPayload::Issues(e) => Some(e.issue.number),
         cairn_github::WebhookEventPayload::IssueComment(e) => Some(e.issue.number),
         cairn_github::WebhookEventPayload::PullRequest(e) => Some(e.pull_request.number),
+        // `pull_request_review_comment` carries the PR number on the
+        // event envelope; this is what lets an agent reviewer pick up
+        // human replies to its inline comments without a second
+        // REST lookup.
+        cairn_github::WebhookEventPayload::PullRequestReviewComment(e) => {
+            Some(e.pull_request.number)
+        }
+        cairn_github::WebhookEventPayload::PullRequestReview(e) => Some(e.pull_request.number),
         _ => None,
     };
 
@@ -151,19 +159,19 @@ pub(crate) async fn acknowledge_event(
     Ok(())
 }
 
-pub(crate) async fn process_webhook_orchestrate(
-    state: &AppState,
-    github: &GitHubPlugin,
+/// Derive the (goal, issue_or_pr_number) pair from a webhook event
+/// envelope. Pure — no AppState, no plugin, no IO — so it's unit-
+/// testable end-to-end.
+///
+/// The `goal` string is what gets fed into the downstream run as the
+/// initial prompt-surface text. For `pull_request_review_comment` it
+/// includes `in_reply_to_id` when present, so the downstream agent
+/// can correlate a human reply with its own prior inline comment.
+pub(crate) fn derive_webhook_goal(
     event: &cairn_github::WebhookEvent,
-) -> Result<(), String> {
-    use cairn_domain::{RunId, SessionId};
-    use cairn_store::projections::SessionReadModel;
-
-    let repo_full = event.repository().unwrap_or("unknown/unknown");
-    let (owner, repo_name) = repo_full.split_once('/').unwrap_or(("unknown", "unknown"));
-    let installation_id = event.installation_id().ok_or("no installation_id")?;
-
-    let (goal, issue_number) = match &event.payload {
+    repo_full: &str,
+) -> (String, Option<u64>) {
+    match &event.payload {
         cairn_github::WebhookEventPayload::Issues(e) => {
             let body = e.issue.body.as_deref().unwrap_or("");
             (
@@ -191,11 +199,72 @@ pub(crate) async fn process_webhook_orchestrate(
                 Some(e.pull_request.number),
             )
         }
+        // A human replied to (or edited/deleted) an inline comment.
+        // The goal carries the comment body, diff hunk, anchor, and
+        // — critically — `in_reply_to_id` so the downstream agent can
+        // correlate the reply with its own prior comment and treat it
+        // as a labeled training signal.
+        cairn_github::WebhookEventPayload::PullRequestReviewComment(e) => {
+            let parent = e
+                .comment
+                .in_reply_to_id
+                .map(|id| format!(" (in reply to #{id})"))
+                .unwrap_or_default();
+            let diff_hunk = e.comment.diff_hunk.as_deref().unwrap_or("");
+            let line = e
+                .comment
+                .line
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            (
+                format!(
+                    "GitHub PR #{pr_n} review-comment {action} by @{user}{parent} on \
+                     `{path}:{line}`:\n\n{body}\n\n--- diff hunk ---\n{diff_hunk}\n\n\
+                     Repository: {repo_full}",
+                    pr_n = e.pull_request.number,
+                    action = e.action,
+                    user = e.comment.user.login,
+                    path = e.comment.path,
+                    body = e.comment.body,
+                ),
+                Some(e.pull_request.number),
+            )
+        }
+        cairn_github::WebhookEventPayload::PullRequestReview(e) => {
+            let body = e.review.body.as_deref().unwrap_or("");
+            (
+                format!(
+                    "GitHub PR #{} review {} by @{}: state={}\n\n{}\n\nRepository: {}",
+                    e.pull_request.number,
+                    e.action,
+                    e.review.user.login,
+                    e.review.state,
+                    body,
+                    repo_full
+                ),
+                Some(e.pull_request.number),
+            )
+        }
         _ => (
             format!("GitHub event: {} on {}", event.event_key(), repo_full),
             None,
         ),
-    };
+    }
+}
+
+pub(crate) async fn process_webhook_orchestrate(
+    state: &AppState,
+    github: &GitHubPlugin,
+    event: &cairn_github::WebhookEvent,
+) -> Result<(), String> {
+    use cairn_domain::{RunId, SessionId};
+    use cairn_store::projections::SessionReadModel;
+
+    let repo_full = event.repository().unwrap_or("unknown/unknown");
+    let (owner, repo_name) = repo_full.split_once('/').unwrap_or(("unknown", "unknown"));
+    let installation_id = event.installation_id().ok_or("no installation_id")?;
+
+    let (goal, issue_number) = derive_webhook_goal(event, repo_full);
 
     // T6a-C5: derive the project from the GitHub installation_id. Fall
     // back to an operator-configured default (env) only when no explicit
@@ -1624,4 +1693,155 @@ pub(crate) async fn verify_github_installation_handler(
         expires_at,
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_github::{WebhookEvent, WebhookEventPayload};
+
+    fn parse(event_type: &str, body: serde_json::Value) -> WebhookEvent {
+        WebhookEvent::parse(event_type, "dlv", &serde_json::to_vec(&body).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn derive_goal_pull_request_review_comment_with_reply() {
+        // A human reply to an agent's inline comment. The goal must
+        // carry the reply body, parent id, file anchor, and diff
+        // hunk so the downstream agent can correlate the reply with
+        // its prior finding.
+        let event = parse(
+            "pull_request_review_comment",
+            serde_json::json!({
+                "action": "created",
+                "comment": {
+                    "id": 777,
+                    "in_reply_to_id": 333,
+                    "user": {"login": "human-reviewer", "id": 1},
+                    "body": "good catch — I'll retry on EINTR",
+                    "path": "src/socket.c",
+                    "line": 382,
+                    "diff_hunk": "@@ -378,3 +378,7 @@ connSocketBlockingConnect",
+                    "html_url": "https://example.com"
+                },
+                "pull_request": {
+                    "number": 5, "title": "t", "state": "open",
+                    "user": {"login": "bot", "id": 2}, "html_url": "u"
+                },
+                "repository": {"full_name": "avifenesh/valkey"},
+                "sender": {"login": "human-reviewer", "id": 1},
+                "installation": {"id": 130_312_695}
+            }),
+        );
+
+        let (goal, pr) = derive_webhook_goal(&event, "avifenesh/valkey");
+        assert_eq!(pr, Some(5));
+        assert!(goal.contains("PR #5"), "goal names the PR: {goal}");
+        assert!(
+            goal.contains("review-comment created"),
+            "goal names the action: {goal}"
+        );
+        assert!(
+            goal.contains("@human-reviewer"),
+            "goal names the commenter: {goal}"
+        );
+        assert!(
+            goal.contains("in reply to #333"),
+            "goal preserves in_reply_to_id so the agent can correlate replies: {goal}",
+        );
+        assert!(
+            goal.contains("src/socket.c") && goal.contains(":382"),
+            "goal anchors to file:line: {goal}",
+        );
+        assert!(
+            goal.contains("connSocketBlockingConnect"),
+            "goal carries diff-hunk context: {goal}",
+        );
+        assert!(
+            goal.contains("good catch"),
+            "goal carries the reply body: {goal}",
+        );
+    }
+
+    #[test]
+    fn derive_goal_pull_request_review_comment_top_level() {
+        // Same event type, no in_reply_to_id — a top-level inline
+        // review comment. Agent logic distinguishes these by the
+        // absence of the "in reply to" phrase.
+        let event = parse(
+            "pull_request_review_comment",
+            serde_json::json!({
+                "action": "created",
+                "comment": {
+                    "id": 888,
+                    "user": {"login": "h", "id": 1},
+                    "body": "...",
+                    "path": "x.c",
+                    "html_url": "u"
+                },
+                "pull_request": {
+                    "number": 42, "title": "t", "state": "open",
+                    "user": {"login": "b", "id": 2}, "html_url": "u"
+                },
+                "repository": {"full_name": "o/r"},
+                "sender": {"login": "h", "id": 1}
+            }),
+        );
+
+        let (goal, pr) = derive_webhook_goal(&event, "o/r");
+        assert_eq!(pr, Some(42));
+        assert!(
+            !goal.contains("in reply to"),
+            "no reply tag on top-level: {goal}"
+        );
+        assert!(goal.contains(":?"), "missing line renders as ? : {goal}");
+    }
+
+    #[test]
+    fn derive_goal_pull_request_review_envelope() {
+        // Top-level review (state=APPROVED/CHANGES_REQUESTED/COMMENTED)
+        // envelope, distinct from an inline comment.
+        let event = parse(
+            "pull_request_review",
+            serde_json::json!({
+                "action": "submitted",
+                "review": {
+                    "id": 1,
+                    "state": "CHANGES_REQUESTED",
+                    "body": "breaking change needs docs update",
+                    "user": {"login": "maintainer", "id": 9},
+                    "html_url": "u"
+                },
+                "pull_request": {
+                    "number": 100, "title": "t", "state": "open",
+                    "user": {"login": "a", "id": 2}, "html_url": "u"
+                },
+                "repository": {"full_name": "o/r"},
+                "sender": {"login": "maintainer", "id": 9}
+            }),
+        );
+
+        let (goal, pr) = derive_webhook_goal(&event, "o/r");
+        assert_eq!(pr, Some(100));
+        assert!(goal.contains("state=CHANGES_REQUESTED"));
+        assert!(goal.contains("breaking change needs docs update"));
+    }
+
+    #[test]
+    fn derive_goal_falls_through_on_unknown_event_types() {
+        // Events other than the typed variants must not crash — the
+        // goal degrades gracefully to "event on repo" and pr_number
+        // is None.
+        let event = parse(
+            "check_run",
+            serde_json::json!({
+                "action": "completed",
+                "repository": {"full_name": "o/r"}
+            }),
+        );
+        let (goal, pr) = derive_webhook_goal(&event, "o/r");
+        assert_eq!(pr, None);
+        assert!(goal.contains("check_run.completed"));
+        assert!(matches!(event.payload, WebhookEventPayload::Other(_)));
+    }
 }
