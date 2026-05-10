@@ -457,6 +457,7 @@ impl Integration for GitHubPlugin {
                 .register(Arc::new(GhApiWriteFileTool::new(gh_provider.clone())))
                 .register(Arc::new(GhApiCreatePrTool::new(gh_provider.clone())))
                 .register(Arc::new(GhApiMergePrTool::new(gh_provider.clone())))
+                .register(Arc::new(GhApiReviewPrTool::new(gh_provider.clone())))
                 .register(Arc::new(GhApiListContentsTool::new(gh_provider))),
         )
     }

@@ -59,7 +59,7 @@ pub use get_run::GetRunTool;
 pub use get_task::GetTaskTool;
 pub use github_api::{
     GhApiCreateBranchTool, GhApiCreatePrTool, GhApiListContentsTool, GhApiMergePrTool,
-    GhApiReadFileTool, GhApiWriteFileTool, GitHubClientProvider,
+    GhApiReadFileTool, GhApiReviewPrTool, GhApiWriteFileTool, GitHubClientProvider,
 };
 pub use graph_query::GraphQueryTool;
 pub use http_request::HttpRequestTool;

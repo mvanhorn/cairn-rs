@@ -391,6 +391,281 @@ impl ToolHandler for GhApiCreatePrTool {
     }
 }
 
+// ── github_api.review_pr ─────────────────────────────────────────────────────
+//
+// Post one pull-request review — a top-level summary body plus any
+// number of inline line-anchored comments — via one API call. Maps
+// directly to `POST /repos/:o/:r/pulls/:n/reviews`. The event kind
+// (`COMMENT` / `REQUEST_CHANGES` / `APPROVE`) controls whether the
+// review blocks merge or is advisory.
+//
+// Motivation: agent reviewers need to emit "here's my overall take
+// plus N specific inline findings" in a single atomic review thread.
+// Posting N separate inline comments fragments the GitHub UI and
+// loses the "one review" affordance.
+
+pub struct GhApiReviewPrTool {
+    provider: Arc<GitHubClientProvider>,
+}
+
+impl GhApiReviewPrTool {
+    pub fn new(provider: Arc<GitHubClientProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for GhApiReviewPrTool {
+    fn name(&self) -> &str {
+        "github_api.review_pr"
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Deferred
+    }
+    fn tool_effect(&self) -> ToolEffect {
+        ToolEffect::External
+    }
+    fn retry_safety(&self) -> RetrySafety {
+        // Duplicate reviews *are* idempotent-ish (GitHub dedupes
+        // identical bodies in the UI), but a retry after a
+        // network-layer timeout would post twice. Mark as
+        // DangerousPause to surface the choice to the operator.
+        RetrySafety::DangerousPause
+    }
+    fn description(&self) -> &str {
+        "Post a pull request review with a summary body and any number \
+         of inline file:line comments in one API call. Use for batch \
+         review feedback from an agent reviewer."
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["repo", "pr_number"],
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "owner/repo"
+                },
+                "pr_number": {
+                    "type": "integer",
+                    "description": "PR number"
+                },
+                "commit_id": {
+                    "type": "string",
+                    "description": "Commit SHA to target (default: PR head). \
+                                    Inline comments anchor against this commit."
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Top-level review body (markdown). Optional \
+                                    only when posting inline comments without a \
+                                    summary."
+                },
+                "event": {
+                    "type": "string",
+                    "enum": ["COMMENT", "REQUEST_CHANGES", "APPROVE"],
+                    "description": "Review event kind. COMMENT is advisory; \
+                                    REQUEST_CHANGES blocks merge; APPROVE \
+                                    unblocks. Defaults to COMMENT."
+                },
+                "comments": {
+                    "type": "array",
+                    "description": "Inline comments (optional). Each carries \
+                                    path+line+body.",
+                    "items": {
+                        "type": "object",
+                        "required": ["path", "body"],
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repo-relative file path"
+                            },
+                            "line": {
+                                "type": "integer",
+                                "description": "Line number in the new version \
+                                                (RIGHT side). Required for \
+                                                line-anchored comments; omit \
+                                                for file-level comments + set \
+                                                subject_type=file."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Comment markdown"
+                            },
+                            "side": {
+                                "type": "string",
+                                "enum": ["LEFT", "RIGHT"],
+                                "description": "Defaults to RIGHT"
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "Multi-line range start (pair \
+                                                with `line`)"
+                            },
+                            "start_side": {
+                                "type": "string",
+                                "enum": ["LEFT", "RIGHT"]
+                            },
+                            "subject_type": {
+                                "type": "string",
+                                "enum": ["line", "file"],
+                                "description": "Defaults to `line`"
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+    fn execution_class(&self) -> ExecutionClass {
+        ExecutionClass::Sensitive
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Execute
+    }
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Orchestration
+    }
+
+    async fn execute(
+        &self,
+        _project: &ProjectKey,
+        mut args: Value,
+    ) -> Result<ToolResult, ToolError> {
+        // Validate arguments up-front so a malformed call surfaces
+        // as InvalidArgs without waiting for the GitHub client to
+        // initialize. Keeps the error contract clean for callers.
+        let repo = require_str(&args, "repo")?.to_owned();
+        let (owner, repo_name) = split_repo(&repo)?;
+        let owner = owner.to_owned();
+        let repo_name = repo_name.to_owned();
+        let pr_number = args
+            .get("pr_number")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ToolError::InvalidArgs {
+                field: "pr_number".into(),
+                message: "missing or not an integer".into(),
+            })?;
+
+        // Take the body/commit_id/event strings out of `args` instead
+        // of borrowing them — a per-review body can be multi-kB of
+        // markdown, and we'd otherwise clone it when handing to the
+        // request struct below.
+        // Take owned strings out of `args` so we don't clone kB-sized
+        // review bodies. `Value::take` leaves `Value::Null` behind;
+        // `if let Value::String(s) = …` keeps the match zero-copy.
+        let commit_id = match args.get_mut("commit_id").map(Value::take) {
+            Some(Value::String(s)) => Some(s),
+            _ => None,
+        };
+        let body = match args.get_mut("body").map(Value::take) {
+            Some(Value::String(s)) => Some(s),
+            _ => None,
+        };
+        let event = args
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or("COMMENT")
+            .to_owned();
+
+        // Own the inline-comment strings so the borrows in
+        // ReviewCommentInput<'_> live through the request build. The
+        // GitHub client's request type borrows from the caller — it
+        // never copies — so we keep everything in a local vec.
+        #[derive(Default)]
+        struct OwnedInline {
+            path: String,
+            body: String,
+            line: Option<u32>,
+            side: Option<String>,
+            start_line: Option<u32>,
+            start_side: Option<String>,
+            subject_type: Option<String>,
+        }
+
+        // `Value::take` moves the inner Vec out of `args`, so the
+        // comment strings can be moved into OwnedInline instead of
+        // cloned. On PRs with many long inline bodies this avoids
+        // O(N * body_bytes) of extra allocation.
+        let comments_vec: Vec<Value> = match args.get_mut("comments").map(Value::take) {
+            Some(Value::Array(v)) => v,
+            _ => Vec::new(),
+        };
+        let mut owned_comments: Vec<OwnedInline> = Vec::with_capacity(comments_vec.len());
+        for mut c in comments_vec {
+            let path = match c.get_mut("path").map(Value::take) {
+                Some(Value::String(s)) => s,
+                _ => {
+                    return Err(ToolError::InvalidArgs {
+                        field: "comments[].path".into(),
+                        message: "required, missing".into(),
+                    });
+                }
+            };
+            let cbody = match c.get_mut("body").map(Value::take) {
+                Some(Value::String(s)) => s,
+                _ => {
+                    return Err(ToolError::InvalidArgs {
+                        field: "comments[].body".into(),
+                        message: "required, missing".into(),
+                    });
+                }
+            };
+            let take_string = |c: &mut Value, k: &str| -> Option<String> {
+                match c.get_mut(k).map(Value::take) {
+                    Some(Value::String(s)) => Some(s),
+                    _ => None,
+                }
+            };
+            owned_comments.push(OwnedInline {
+                path,
+                body: cbody,
+                line: c.get("line").and_then(Value::as_u64).map(|v| v as u32),
+                side: take_string(&mut c, "side"),
+                start_line: c
+                    .get("start_line")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32),
+                start_side: take_string(&mut c, "start_side"),
+                subject_type: take_string(&mut c, "subject_type"),
+            });
+        }
+
+        let comment_inputs: Vec<cairn_github::ReviewCommentInput<'_>> = owned_comments
+            .iter()
+            .map(|c| cairn_github::ReviewCommentInput {
+                path: &c.path,
+                body: &c.body,
+                line: c.line,
+                side: c.side.as_deref(),
+                start_line: c.start_line,
+                start_side: c.start_side.as_deref(),
+                subject_type: c.subject_type.as_deref(),
+            })
+            .collect();
+
+        let req = cairn_github::CreatePullRequestReviewRequest {
+            commit_id: commit_id.as_deref(),
+            body: body.as_deref(),
+            event: Some(&event),
+            comments: comment_inputs,
+        };
+
+        let client = self.provider.get().await?;
+        let review = client
+            .create_pull_request_review(&owner, &repo_name, pr_number, &req)
+            .await
+            .map_err(|e| ToolError::Transient(e.to_string()))?;
+
+        Ok(ToolResult::ok(serde_json::json!({
+            "review_id": review.id,
+            "state": review.state,
+            "url": review.html_url,
+            "comments_posted": owned_comments.len(),
+        })))
+    }
+}
+
 // ── github_api.merge_pr ──────────────────────────────────────────────────────
 
 pub struct GhApiMergePrTool {
@@ -572,6 +847,10 @@ mod tests {
             ToolTier::Deferred
         );
         assert_eq!(
+            GhApiReviewPrTool::new(provider.clone()).tier(),
+            ToolTier::Deferred
+        );
+        assert_eq!(
             GhApiListContentsTool::new(provider).tier(),
             ToolTier::Deferred
         );
@@ -593,9 +872,77 @@ mod tests {
             ExecutionClass::Sensitive
         );
         assert_eq!(
-            GhApiMergePrTool::new(provider).execution_class(),
+            GhApiMergePrTool::new(provider.clone()).execution_class(),
             ExecutionClass::Sensitive
         );
+        assert_eq!(
+            GhApiReviewPrTool::new(provider).execution_class(),
+            ExecutionClass::Sensitive
+        );
+    }
+
+    #[tokio::test]
+    async fn review_pr_rejects_missing_pr_number() {
+        let tool = GhApiReviewPrTool::new(Arc::new(GitHubClientProvider::new()));
+        let err = tool
+            .execute(
+                &ProjectKey::new("t", "w", "p"),
+                serde_json::json!({"repo": "o/r", "body": "..."}),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidArgs { field, .. } => {
+                assert_eq!(field, "pr_number");
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn review_pr_rejects_comment_missing_path() {
+        // Each inline comment must carry `path` + `body`. Missing
+        // `path` must surface as InvalidArgs before the GitHub
+        // client is touched — agents get a clean validation error,
+        // not "App not configured".
+        let tool = GhApiReviewPrTool::new(Arc::new(GitHubClientProvider::new()));
+        let err = tool
+            .execute(
+                &ProjectKey::new("t", "w", "p"),
+                serde_json::json!({
+                    "repo": "o/r",
+                    "pr_number": 1,
+                    "comments": [{"body": "lgtm"}],
+                }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidArgs { field, .. } => {
+                assert_eq!(field, "comments[].path");
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_pr_tool_name_and_category() {
+        let tool = GhApiReviewPrTool::new(Arc::new(GitHubClientProvider::new()));
+        assert_eq!(tool.name(), "github_api.review_pr");
+        assert_eq!(tool.category(), ToolCategory::Orchestration);
+        assert_eq!(tool.permission_level(), PermissionLevel::Execute);
+    }
+
+    #[test]
+    fn review_pr_schema_requires_repo_and_pr_number() {
+        let tool = GhApiReviewPrTool::new(Arc::new(GitHubClientProvider::new()));
+        let schema = tool.parameters_schema();
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "repo"));
+        assert!(required.iter().any(|v| v == "pr_number"));
+        // `body` is deliberately NOT required — agents may post
+        // inline-only reviews without a top-level summary.
+        assert!(!required.iter().any(|v| v == "body"));
     }
 
     #[test]
