@@ -49,6 +49,14 @@ pub struct Bedrock {
     /// endpoint. Intended for tests only — points the converse calls at
     /// an httpmock server without changing production behaviour.
     endpoint_override: Option<String>,
+    /// Per-request completion-token ceiling included in Converse's
+    /// `inferenceConfig.maxTokens`. When `None` *and* the
+    /// `BEDROCK_MAX_TOKENS` env var is unset, Converse applies its
+    /// model-specific default (4096 for Claude). Tests set this
+    /// directly via [`Bedrock::with_max_tokens`]; production operators
+    /// override via the env var, which is read once per request in
+    /// `chat_with_tools_for_model`.
+    max_tokens: Option<u32>,
 }
 
 impl Bedrock {
@@ -88,6 +96,7 @@ impl Bedrock {
             signer: Arc::new(BearerAuth::new(api_key.into())),
             client,
             endpoint_override: None,
+            max_tokens: None,
         })
     }
 
@@ -115,6 +124,7 @@ impl Bedrock {
             signer: Arc::new(signer),
             client,
             endpoint_override: None,
+            max_tokens: None,
         })
     }
 
@@ -133,6 +143,7 @@ impl Bedrock {
             signer,
             client,
             endpoint_override: None,
+            max_tokens: None,
         })
     }
 
@@ -143,6 +154,39 @@ impl Bedrock {
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint_override = Some(endpoint.into());
         self
+    }
+
+    /// Set the per-request completion-token ceiling. The value is
+    /// forwarded to Converse as `inferenceConfig.maxTokens`. When
+    /// unset and no `BEDROCK_MAX_TOKENS` env var is present, Converse
+    /// applies its model-specific default (4096 for Claude on tool-
+    /// calling paths) — long-response workloads (large reviewer
+    /// prompts, multi-tool-call turns) routinely hit that ceiling,
+    /// truncating the completion mid-tool-call.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Resolve the effective max-tokens cap. Field wins over env.
+    /// Whitespace-only / unparseable env values are treated as unset
+    /// (silent ignore) so a typo can't turn a running binary into an
+    /// outage.
+    ///
+    /// Why `std::env::var` on every call and not a `OnceLock` cache:
+    /// Bedrock requests are the slow path (hundreds of milliseconds
+    /// on Converse). A single env lookup is ~100 ns — vanishing
+    /// against the request cost. The integration tests (and future
+    /// on-the-fly operator config reloads) also need the env to be
+    /// re-read, which a `OnceLock` cache would permanently freeze to
+    /// whatever the first caller observed.
+    fn resolve_max_tokens(&self) -> Option<u32> {
+        self.max_tokens.or_else(|| {
+            std::env::var("BEDROCK_MAX_TOKENS")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        })
     }
 
     /// Construct from environment variables — Bearer-only, sync.
@@ -252,6 +296,19 @@ impl Bedrock {
             body_json["toolConfig"] = build_tool_config(tools, None)?;
         }
 
+        // Converse defaults `maxTokens` to 4096 for Claude when
+        // `inferenceConfig` is absent — long reviews with many tool
+        // calls hit that ceiling and truncate. Per-instance
+        // `Bedrock::with_max_tokens` wins; `BEDROCK_MAX_TOKENS` env var
+        // is the operator-facing fallback so existing binaries can be
+        // rescued without a rebuild. When neither is set, omit the
+        // block and let Converse apply its model default (preserves
+        // behavior for every existing caller). Applied in both the
+        // tool-calling and completion paths via `resolve_max_tokens`.
+        if let Some(n) = self.resolve_max_tokens() {
+            body_json["inferenceConfig"] = serde_json::json!({ "maxTokens": n });
+        }
+
         self.converse_raw(model, body_json).await
     }
 
@@ -317,6 +374,13 @@ impl Bedrock {
         let mut body_json = serde_json::json!({ "messages": messages });
         if let Some(sys) = system {
             body_json["system"] = serde_json::json!([{ "text": sys }]);
+        }
+        // Same ceiling policy as the tool-calling path; without this
+        // the completion surface (used by every non-chat prompt) is
+        // silently capped at Converse's default even when the caller
+        // or operator raised `max_tokens`.
+        if let Some(n) = self.resolve_max_tokens() {
+            body_json["inferenceConfig"] = serde_json::json!({ "maxTokens": n });
         }
         let resp = self.converse_raw(model, body_json).await?;
         Ok(resp.text().unwrap_or_default())
