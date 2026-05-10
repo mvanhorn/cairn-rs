@@ -351,14 +351,27 @@ pub fn extract_verification(tool_results: &[ActionResult]) -> CompletionVerifica
     acc.finish()
 }
 
-/// Maximum chars the sentinel scan inspects at the start of a
-/// `complete_run` final answer. Admission phrases live in the opening
-/// status line by convention (`"## Status: Blocked"`, `"Task
-/// incomplete."`), so a short head-cap is enough. Free text further
-/// down can legitimately mention `"failed"` / `"not implemented"`
-/// (e.g. a researcher's report saying `"upstream API failed when X"`).
-/// Scanning the whole answer would fire on those false positives.
-const SENTINEL_SCAN_HEAD_CHARS: usize = 200;
+/// Maximum chars the broad-sentinel scan inspects at the start of a
+/// `complete_run` final answer. Admission phrases for the R26/R27/R28
+/// shapes land in the opening of the summary; anchoring there keeps
+/// broader phrases (like `"failed"` / `"not implemented"`) from
+/// false-positing on non-admission prose further down.
+///
+/// R29 bumped this from 200 → 1000: the R29 summary opened with a
+/// `**Completed:**` section listing a long GitHub URL + file paths
+/// that pushed the `**Remaining tasks:**` admission past the prior
+/// 200-char head. 1000 covers the full status prologue + transition
+/// into an admission section for every observed shape while staying
+/// bounded. Scan cost is one allocation of ≤1000 chars per DECIDE
+/// turn; amortised cost vs. the LLM call that produced `final_answer`
+/// is negligible.
+///
+/// If a future dogfood round surfaces an admission past 1000 chars,
+/// consider (a) adding the phrase to [`HIGH_SPECIFICITY_FULL_BODY_SENTINELS`]
+/// instead of widening the head, or (b) raising this to 1500 only if
+/// the false-positive audit in `sentinel_scan_does_not_fire_on_legitimate_answers`
+/// still passes.
+const SENTINEL_SCAN_HEAD_CHARS: usize = 1000;
 
 /// Phrases whose presence in the opening of a `complete_run`
 /// `final_answer` indicates the model is self-reporting failure
@@ -445,6 +458,53 @@ const FAILURE_ADMISSION_SENTINELS: &[&str] = &[
     "**remaining",
 ];
 
+/// High-specificity sentinels that scan the FULL final_answer body,
+/// not just the head. These catch admissions at any depth — R29
+/// surfaced shapes that put the admission past the 1000-char head
+/// of a verbose Completed:/Remaining: summary.
+///
+/// Contract: each phrase here falls into one of TWO categories
+/// (Gemini review #836 noted the distinction should be explicit):
+///
+/// 1. **Structural section headers** — markdown artifacts that
+///    introduce a list of unfinished items. Examples:
+///    `**Remaining tasks:**`, `### Remaining tasks`. By convention
+///    these only appear when the model is literally naming an
+///    unfinished-work section; legitimate prose doesn't use them.
+///
+/// 2. **Closing-scaffold prose phrases** — multi-word fragments
+///    the model uses to hedge when it knows the deliverable isn't
+///    ready. Examples: `cannot be provided until`,
+///    `the final deliverable cannot`. These carry slightly higher
+///    false-positive risk than structural headers (a disclaimer in
+///    an unrelated report could mention "cannot be provided until
+///    <X> is received"), but the phrase specificity makes that
+///    risk low in practice. Each prose entry here must be backed
+///    by a dogfood observation — do NOT add speculative prose.
+///
+/// If an observed false positive fires against this list, narrow
+/// the phrase, move a structural variant to category 1, or move
+/// an over-broad prose variant to the head-anchored
+/// [`FAILURE_ADMISSION_SENTINELS`] list instead.
+const HIGH_SPECIFICITY_FULL_BODY_SENTINELS: &[&str] = &[
+    // Category 1: structural section headers. R29 exact header
+    // plus slight-variation siblings. The model used
+    // `**Remaining tasks:**` at char ~500 of a summary that opened
+    // with a `**Completed:**` list.
+    "**remaining tasks:**",
+    "**remaining tasks**",
+    "### remaining tasks",
+    "## remaining tasks",
+    // Category 2: closing-scaffold prose phrases. R29's closing
+    // sentence explicitly said `"The final deliverable ... cannot be
+    // provided until these steps are completed."` Both fragments are
+    // model scaffolding — operators don't legitimately emit a
+    // final_answer that describes what cannot be provided by the
+    // run itself.
+    "cannot be provided until",
+    "the final deliverable cannot",
+];
+
 /// Scan the opening of a `complete_run` proposal's `final_answer` for
 /// phrases that indicate the model is self-reporting failure. Returns
 /// the first matched sentinel if one is present, otherwise `None`.
@@ -459,21 +519,45 @@ const FAILURE_ADMISSION_SENTINELS: &[&str] = &[
 /// picked `complete_run` for admitted failures. This scan is the
 /// server-side backstop for that non-compliance.
 pub fn detect_self_reported_failure(final_answer: &str) -> Option<&'static str> {
-    // Build the head once, lower-casing each char during iteration so
-    // the scan runs against a single allocation. `to_ascii_lowercase`
-    // on a char is a no-op for non-ASCII (the sentinels are all ASCII
-    // so non-ASCII chars can't contribute to a match anyway). The
-    // head is bounded at `SENTINEL_SCAN_HEAD_CHARS`; amortised cost
-    // is negligible versus the LLM call that produced `final_answer`.
+    // Head-scan: bounded to `SENTINEL_SCAN_HEAD_CHARS`, matches the
+    // broad [`FAILURE_ADMISSION_SENTINELS`] list. Admissions for most
+    // observed shapes land in the opening of the summary; anchoring
+    // there keeps broader phrases from false-positing on
+    // non-admission prose further down.
+    //
+    // Lower-case each char during iteration so the scan runs against
+    // a single allocation. `to_ascii_lowercase` on a char is a no-op
+    // for non-ASCII; the sentinels are all ASCII so non-ASCII chars
+    // can't contribute to a match.
     let head: String = final_answer
         .chars()
         .take(SENTINEL_SCAN_HEAD_CHARS)
         .map(|c| c.to_ascii_lowercase())
         .collect();
 
-    FAILURE_ADMISSION_SENTINELS
+    if let Some(hit) = FAILURE_ADMISSION_SENTINELS
         .iter()
         .find(|sentinel| head.contains(*sentinel))
+        .copied()
+    {
+        return Some(hit);
+    }
+
+    // Full-body scan: match the narrower
+    // [`HIGH_SPECIFICITY_FULL_BODY_SENTINELS`] list against the
+    // entire final_answer. R29 surfaced shapes that put the admission
+    // past the 1000-char head (verbose Completed:/Remaining: summaries
+    // with long file paths / URLs pushing text forward). Each phrase
+    // here is constrained to be essentially impossible in legitimate
+    // prose, so scanning the full body is safe.
+    //
+    // Lower-cases the whole body in one pass. For a pathological
+    // multi-megabyte final_answer this allocates once — still cheap
+    // compared to the LLM call.
+    let lower = final_answer.to_ascii_lowercase();
+    HIGH_SPECIFICITY_FULL_BODY_SENTINELS
+        .iter()
+        .find(|sentinel| lower.contains(*sentinel))
         .copied()
 }
 
@@ -1105,6 +1189,125 @@ error[E0308]: mismatched types
     fn sentinel_scan_empty_answer_does_not_match() {
         assert!(detect_self_reported_failure("").is_none());
         assert!(detect_self_reported_failure("   \n\n\t ").is_none());
+    }
+
+    /// #835 / R29 regression: verbatim R29 summary opened with a
+    /// long Completed: bullet list (GitHub URL + file paths) that
+    /// pushed the `**Remaining tasks:**` admission past the old
+    /// 200-char head window. The new 1000-char window plus the
+    /// full-body high-specificity sentinel set both catch it.
+    #[test]
+    fn sentinel_scan_matches_r29_past_200_char_admission() {
+        // Verbatim R29 summary from run_subagent_child_task_1778420725297_61.
+        let r29_summary = "The goal was to set up a Rust roguelike project with \
+                           ratatui+crossterm scaffolding and create a PR. Based on \
+                           the step history, here is the current status:\n\n\
+                           **Completed:**\n\
+                           - ✓ Cloned https://github.com/avifenesh/cairn-dogfood-roguelike \
+                           to /tmp/cairn-runs/dogfood-r29-m1-1-1778419867\n\
+                           - ✓ Created branch m1/01-cargo-init\n\
+                           - ✓ Ran cargo init --name roguelike\n\
+                           - ✓ Added ratatui=0.27 and crossterm=0.28 to Cargo.toml\n\
+                           - ✓ Replaced src/main.rs with a crossterm+ratatui stub \
+                           (51 lines)\n\n\
+                           **Remaining tasks:**\n\
+                           - ⚠ Run cargo check and verify zero warnings\n\
+                           - ⚠ Commit with message \"M1-1: Initialize Rust binary \
+                           crate with ratatui+crossterm (#1)\"\n\
+                           - ⚠ Push the branch\n\
+                           - ⚠ Create PR with gh pr create\n";
+
+        let matched = detect_self_reported_failure(r29_summary).expect(
+            "#835: R29 summary MUST match — either via widened head scan \
+                     hitting '**remaining' or via high-specificity full-body scan \
+                     hitting '**remaining tasks:**'",
+        );
+
+        // The widened head now includes "**Remaining tasks:**" so the
+        // head-scan's "**remaining" sentinel from #832 catches it
+        // first. Either match is acceptable; the assertion names both
+        // so a future refactor that shifts the detection path still
+        // passes.
+        assert!(
+            matched == "**remaining" || matched == "**remaining tasks:**",
+            "expected the '**remaining' head sentinel or the \
+             '**remaining tasks:**' full-body sentinel; got {matched:?}"
+        );
+    }
+
+    /// #835: the high-specificity full-body sentinels must match
+    /// even when the admission lives past the head window. Each
+    /// phrase tested individually so a future narrowing of the list
+    /// still passes the specific case.
+    #[test]
+    fn sentinel_scan_high_specificity_full_body_sentinels_match_past_head() {
+        let padding = "a".repeat(SENTINEL_SCAN_HEAD_CHARS + 200);
+
+        // `**Remaining tasks:**` buried past the head — the primary
+        // R29 shape.
+        let s = format!("Summary of work.\n\n{padding}\n\n**Remaining tasks:**\n- push");
+        assert!(
+            detect_self_reported_failure(&s).is_some(),
+            "#835: '**remaining tasks:**' past the head must match via \
+             the full-body high-specificity scan"
+        );
+
+        // Variant without trailing colon.
+        let s = format!("Summary.\n\n{padding}\n\n### Remaining tasks\n- commit");
+        assert!(
+            detect_self_reported_failure(&s).is_some(),
+            "#835: '### remaining tasks' heading variant must match"
+        );
+
+        // "Cannot be provided until" — R29 closing admission.
+        let s = format!("Summary.\n\n{padding}\n\nThe PR URL cannot be provided until we push.");
+        assert!(
+            detect_self_reported_failure(&s).is_some(),
+            "#835: 'cannot be provided until' must match anywhere in body"
+        );
+    }
+
+    /// #835 regression: the high-specificity list must NOT fire on
+    /// legitimate prose even with the full-body scan. Each phrase
+    /// was chosen to be essentially impossible in non-admission
+    /// text, but we still assert that legitimate answers flow.
+    #[test]
+    fn sentinel_scan_full_body_does_not_fire_on_legitimate_long_summaries() {
+        // A real change summary that's long, detailed, and mentions
+        // words from the sentinel list in non-admission contexts.
+        let legit = "Renamed parse_raw to parse_input across the public API. \
+            Touched 3 files: parser.rs (line 42, definition), lib.rs (line 88, \
+            re-export), tests/integration.rs (line 14, caller). Ran cargo check \
+            -p bar — passes with zero warnings. Ran cargo test -p bar — 47 \
+            tests pass, 0 failures, 0 ignored. Committed as 'refactor: rename \
+            parse_raw -> parse_input'. PR opened at https://github.com/x/y/pull/42. \
+            Downstream consumers were notified via the #releases channel. This \
+            change is backwards-compatible because the old name remains as a \
+            #[deprecated] re-export for one release cycle. Nothing further \
+            remains to be done in this PR; follow-up work tracked at #XYZ.";
+        assert!(
+            detect_self_reported_failure(legit).is_none(),
+            "legitimate long success summary must not false-positive on any \
+             head or full-body sentinel"
+        );
+
+        // A researcher's report that explicitly talks about unfinished
+        // upstream work but is itself a completed run. This is the
+        // shape most at risk of a false positive — it genuinely
+        // describes something incomplete, but the subject isn't the
+        // run's own deliverable.
+        let research = "Summary of findings on the upstream library's state. \
+            The project's public API is stable but several advanced features \
+            remain underdocumented. Specifically, 3 of the 7 extension points \
+            lack worked examples. My recommendation is to file upstream issues \
+            requesting docs for each. This completes the scoped research; see \
+            sections below for the full citation trail and evidence for each \
+            claim.";
+        assert!(
+            detect_self_reported_failure(research).is_none(),
+            "researcher's report describing upstream incompleteness must not \
+             match — the run's own deliverable (the report) is complete"
+        );
     }
 
     /// #832 / R28 regression: glm-4.7's M1-1 sub-agent wrote
