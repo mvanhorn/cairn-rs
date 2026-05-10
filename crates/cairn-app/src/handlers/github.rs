@@ -401,7 +401,15 @@ pub(crate) async fn webhook_trigger_orchestration(
         Arc::new(full)
     };
 
-    let decide = LlmDecidePhase::new(brain, model_id).with_tools(registry.clone());
+    // RFC 031 PR-C: thread the agent-role resolver + event log so the
+    // GitHub webhook run DECIDE pipeline honors operator-defined roles
+    // and emits `ToolDeclaredButMissing` advisories. Mirrors the
+    // /v1/runs/:id/orchestrate handler's wiring via
+    // `AppState::agent_role_service`.
+    let decide = LlmDecidePhase::new(brain, model_id)
+        .with_tools(registry.clone())
+        .with_agent_roles(state.agent_role_service())
+        .with_event_log(state.runtime.store.clone());
 
     let store = state.runtime.store.clone();
     let config = LoopConfig {

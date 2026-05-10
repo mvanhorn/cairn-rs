@@ -1675,7 +1675,18 @@ pub(crate) async fn drive_run_iteration(
         .into_response());
     }
 
-    let decide = LlmDecidePhase::from_routed(routed).with_tools(registry.clone());
+    // RFC 031 PR-C: thread the operator-defined agent-role resolver
+    // + event log into DECIDE. The resolver backs sites 1/2/3/4 (tool
+    // allowlist, system prompt, memory hint, footer) on every DECIDE
+    // turn; the event log is the sink for `ToolDeclaredButMissing`
+    // advisories emitted from site 1 when a role declares a tool id
+    // that isn't currently registered. `AppState::agent_role_service`
+    // centralises the `Arc<dyn AgentRoleService>` construction so the
+    // GitHub webhook handler and this handler stay on one path.
+    let decide = LlmDecidePhase::from_routed(routed)
+        .with_tools(registry.clone())
+        .with_agent_roles(state.agent_role_service())
+        .with_event_log(state.runtime.store.clone());
 
     // Build loop config first so checkpoint policy is available for execute.
     // #651: fall back to the persisted `max_iterations` default when the

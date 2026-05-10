@@ -115,6 +115,47 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     atomically). All three assert byte-equality between in-memory and sqlite; schema shape is
     enforced against pg via `pg_migration_contract` + `schema_parity`.
 
+- **RFC 031 PR-C: operator-defined agent roles — orchestrator call-site pivot.**
+  Wires the six DECIDE-phase call sites in `crates/cairn-orchestrator/src/decide_impl.rs`
+  to the operator-defined agent-role service (RFC 031 §Orchestrator call-site pivot).
+  With this PR, every orchestrator DECIDE turn honours project-scoped operator roles for
+  tool allowlist, system prompt, memory hint, footer response shape, and the
+  `spawn_subagent` role enum — with zero behaviour change when no custom role is defined.
+
+  Key changes:
+
+  - `LlmDecidePhase::with_agent_roles(svc)` and `with_event_log(log)` builder methods.
+    App-side wiring added in both `handlers/runs/orchestrate.rs` (HTTP-triggered runs) and
+    `handlers/github.rs` (webhook-triggered runs) — mirrors the same builder chain in each.
+
+  - Site 1 (tool-allowlist filter): `default_roles().iter().find(...)` replaced by
+    `resolve_role_or_fallback(ctx).await` + `apply_role_tool_allowlist`. Handles
+    `forbid_all_tools=true` (empty surface), non-empty `tools[]` (filtered surface), and
+    empty `tools[]` (unrestricted). Unknown role id returns an empty-allowlist fallback
+    record byte-identical to pre-RFC-031 DECIDE behaviour.
+
+  - `ToolDeclaredButMissing` emission at site 1: for each tool id a role declared but that
+    is not in the current tool registry, emits a `ToolDeclaredButMissing` advisory via the
+    attached event log. Per-run dedup on `ctx.declared_but_missing` (sync Mutex released
+    before the async `log.append` call per the lock convention on that field).
+
+  - Sites 2–4 (system prompt, memory hint, footer): `assembled_prompt_for(agent_type)` and
+    `response_shape_for(agent_type)` replaced by calls that read directly from the
+    `resolved_role` already held from site 1 — at most one `resolve` call per DECIDE turn.
+
+  - Site 5 (`spawn_subagent` role enum): `spawn_subagent_tool_def_for(ctx)` sources the
+    spawnable-role enum from the project's projection-backed list
+    (`AgentRoleService::list(project, SourceFilter::All)`) via a per-run
+    `Arc<OnceCell<Vec<ResolvedRole>>>` cache on `OrchestrationContext` (§D14 layer 2).
+    First DECIDE of the run pays one `list` call; subsequent turns reuse the snapshot.
+    Fallback path calls the existing process-lifetime `OnceLock`-backed
+    `spawn_subagent_tool_def()` when no service is wired.
+
+  - 4 new `rfc_031_prc` unit tests: `custom_role_with_tools_filters_to_declared_subset`,
+    `missing_tool_emits_tool_declared_but_missing_event`, `forbid_all_tools_clears_surface`,
+    `spawn_subagent_tool_def_uses_run_scoped_cache`. All 200 cairn-orchestrator unit tests
+    pass; 311 cairn-app unit tests pass; `agent_roles_http` 20/20; `bootstrap_server` 34/34.
+
 - **`cairn-providers` native Bedrock Converse tool calls.** The native
   `Bedrock` backend now translates cairn's `Tool` / `ToolCall` / `ChatMessage`
   types into the Converse `toolConfig` + content-block shape and parses

@@ -707,6 +707,21 @@ impl ScopedBindingConcurrency {
 // ── AppState impl ────────────────────────────────────────────────────────────
 
 impl AppState {
+    /// RFC 031 PR-C: shared `AgentRoleService` handle for the DECIDE
+    /// pipeline wiring. The service is stateless (it only holds an
+    /// `Arc<InMemoryStore>`), so the underlying allocation cost is
+    /// negligible; returning a fresh `Arc<dyn AgentRoleService>`
+    /// here keeps every handler on one construction path instead of
+    /// open-coding `Arc::new(AgentRoleServiceImpl::new(store.clone()))`
+    /// at each call site.
+    pub fn agent_role_service(
+        &self,
+    ) -> std::sync::Arc<dyn cairn_runtime::services::AgentRoleService> {
+        std::sync::Arc::new(cairn_runtime::services::AgentRoleServiceImpl::new(
+            self.runtime.store.clone(),
+        ))
+    }
+
     // RFC-025 Phase 1.5b (2026-04-28): `replay_graph` removed.
     //
     // The graph read-model is declared Ephemeral. `AppState.graph` is
