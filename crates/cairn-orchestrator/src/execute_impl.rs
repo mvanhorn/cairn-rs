@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use crate::context::{
     ActionResult, ActionStatus, DecideOutput, ExecuteOutcome, LoopSignal, OrchestrationContext,
+    StepSummary,
 };
 use crate::error::OrchestratorError;
 use crate::execute::{ApprovedDispatch, ExecutePhase};
@@ -1316,17 +1317,26 @@ impl RuntimeExecutePhase {
                             )
                         })
                 };
-                let parent_context: Option<String> = if workspace_path_safe {
-                    let workspace_line = format!(
+                // R35 (2026-05-10) dogfood: the orchestrator correctly
+                // re-spawned fresh sub-agents after predecessors failed
+                // the completion gate, but each child started with
+                // `parent_context = null` (or only the workspace_line)
+                // and re-did discovery from zero — same clone, same
+                // reads, same failed approach, same gate rejection.
+                // Synthesise a `## Prior sibling attempts` block from
+                // `step_history` when there are failed `subagent_complete`
+                // entries, and prepend it so the child sees predecessor
+                // context on its first DECIDE. Helper caps at 2 entries
+                // and ~1200 chars each to bound the prompt.
+                let prior_siblings_block = recent_failed_siblings_summary(&ctx.step_history);
+
+                let workspace_line_opt: Option<String> = if workspace_path_safe {
+                    Some(format!(
                         "Workspace path: {}\n\
                          Start by `cd`-ing here. The repository / project lives at this path; \
                          do not search for it.",
                         ctx.working_dir.display(),
-                    );
-                    match llm_parent_context {
-                        Some(llm_ctx) => Some(format!("{workspace_line}\n\n{llm_ctx}")),
-                        None => Some(workspace_line),
-                    }
+                    ))
                 } else {
                     // Working dir is relative / empty / contains `..`.
                     // Skip the auto-inject — sending an unsafe path to
@@ -1340,7 +1350,32 @@ impl RuntimeExecutePhase {
                          (relative / empty / contains `.` or `..`); skipping workspace_line \
                          auto-inject for child spawn"
                     );
-                    llm_parent_context
+                    None
+                };
+
+                // Compose `parent_context` from, in order:
+                //   1. prior-siblings synthesised block (when present)
+                //   2. workspace_line (when path is safe)
+                //   3. LLM-supplied parent_context (when present)
+                //
+                // Each separator is a blank line so downstream prompt
+                // rendering treats them as independent markdown blocks.
+                let parent_context: Option<String> = {
+                    let mut sections: Vec<String> = Vec::new();
+                    if let Some(block) = prior_siblings_block {
+                        sections.push(block);
+                    }
+                    if let Some(line) = workspace_line_opt {
+                        sections.push(line);
+                    }
+                    if let Some(llm_ctx) = llm_parent_context {
+                        sections.push(llm_ctx);
+                    }
+                    if sections.is_empty() {
+                        None
+                    } else {
+                        Some(sections.join("\n\n"))
+                    }
                 };
 
                 let child_task_id = TaskId::new(new_id("child_task"));
@@ -1814,6 +1849,89 @@ fn build_display_summary(proposal: &cairn_domain::ActionProposal, tool_name: &st
     }
 }
 
+/// Per-sibling summary cap when synthesising prior-attempt context. Keeps
+/// the injected block bounded even if a predecessor produced a large
+/// final_answer. 1200 chars preserves enough prose for the model to see
+/// what was tried, what succeeded, and what the gate rejected on without
+/// bloating the prompt.
+const PRIOR_SIBLING_SUMMARY_CAP: usize = 1200;
+
+/// Maximum number of prior failed siblings to surface in `parent_context`.
+/// Two is enough: the child only needs "what the immediate predecessor
+/// tried" plus "what the one before that tried" to avoid reattempting the
+/// same dead ends. Older attempts stay in `step_history` for the model to
+/// reach through explicitly if it wants more.
+const PRIOR_SIBLING_COUNT_CAP: usize = 2;
+
+/// Synthesise a `## Prior sibling attempts` block from `step_history` when
+/// the parent is re-spawning a child after one or more failed siblings.
+///
+/// R35 (2026-05-10) dogfood surfaced the architectural gap this closes:
+/// after a sub-agent failed the completion gate (e.g. admission sentinel
+/// fired on `**Remaining:**`), the parent correctly re-spawned a fresh
+/// child — but the new child started with `parent_context = null` and
+/// rediscovered everything from zero (cloned the repo, checked `git
+/// status`, read files, re-tried the same approach, hit the same gate).
+/// The ephemeral sandbox means the workspace itself resets, so there's no
+/// on-disk artifact the new child can inspect to see "my predecessor
+/// already wrote `src/main.rs` and got as far as `cargo check`."
+///
+/// This helper extracts the most recent failed siblings' summaries from
+/// `step_history` and formats them as a priming block the SpawnSubagent
+/// branch prepends to the child's `parent_context`. The block is labelled
+/// clearly so the model treats it as "what my peer tried" rather than
+/// "instructions from the operator."
+///
+/// Returns `None` when `step_history` contains no failed `subagent_complete`
+/// entries — callers can then pass `parent_context` through unchanged.
+fn recent_failed_siblings_summary(step_history: &[StepSummary]) -> Option<String> {
+    // Walk newest-first: step_history is appended chronologically (see
+    // `build_subagent_complete_steps` rustdoc — "oldest-to-newest"), so
+    // `.iter().rev()` surfaces the most-recent failures first. Collect
+    // up to PRIOR_SIBLING_COUNT_CAP, then reverse back to chronological
+    // order in the rendered block ("Attempt 1, Attempt 2, ...").
+    let mut recent: Vec<&StepSummary> = step_history
+        .iter()
+        .rev()
+        .filter(|s| s.action_kind == "subagent_complete" && !s.succeeded)
+        .take(PRIOR_SIBLING_COUNT_CAP)
+        .collect();
+    if recent.is_empty() {
+        return None;
+    }
+    recent.reverse();
+
+    let mut out = String::from(
+        "## Prior sibling attempts (this goal was tried before — don't start from zero)\n\n",
+    );
+    for (idx, summary) in recent.iter().enumerate() {
+        let attempt_num = idx + 1;
+        let body = truncate_for_prior_sibling(&summary.summary, PRIOR_SIBLING_SUMMARY_CAP);
+        out.push_str(&format!("Attempt {attempt_num}: {body}\n\n"));
+    }
+    out.push_str(
+        "Read each attempt carefully. Continue from where the last one stopped — do not \
+         repeat work that already succeeded. Do not repeat approaches that already failed.\n",
+    );
+    Some(out)
+}
+
+/// Truncate a prior-sibling summary to at most `cap` chars, breaking at
+/// a char boundary and appending an ellipsis when the original is longer.
+/// UTF-8 safe: uses `char_indices` to land on a code-point boundary.
+fn truncate_for_prior_sibling(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let cut = text
+        .char_indices()
+        .take_while(|(i, _)| *i < cap)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    format!("{}…", &text[..cut])
+}
+
 /// Legacy fallback when no [`ToolCallApprovalService`] is wired. Preserves
 /// the pre-BP-v2 `ApprovalService::request_with_context` short-circuit so
 /// existing tests that construct the execute phase without the new service
@@ -2086,6 +2204,116 @@ fn truncate_text_for_context(text: &str, token_limit: usize) -> String {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prior_siblings_tests {
+    use super::*;
+
+    fn step(action_kind: &str, summary: &str, succeeded: bool) -> StepSummary {
+        StepSummary {
+            iteration: 0,
+            action_kind: action_kind.to_owned(),
+            summary: summary.to_owned(),
+            succeeded,
+        }
+    }
+
+    #[test]
+    fn none_when_history_has_no_failed_subagent_completes() {
+        let history = vec![
+            step("tool_call", "ran cargo check", true),
+            step("subagent_complete", "child x (completed): shipped PR", true),
+            step("continue", "advancing", true),
+        ];
+        assert!(recent_failed_siblings_summary(&history).is_none());
+    }
+
+    #[test]
+    fn none_on_empty_history() {
+        assert!(recent_failed_siblings_summary(&[]).is_none());
+    }
+
+    #[test]
+    fn surfaces_single_failed_sibling() {
+        let history = vec![
+            step("tool_call", "ran cargo check", true),
+            step(
+                "subagent_complete",
+                "child run-a (failed): gate rejected — sentinel `**remaining`",
+                false,
+            ),
+        ];
+        let out = recent_failed_siblings_summary(&history).expect("block present");
+        assert!(out.contains("## Prior sibling attempts"));
+        assert!(out.contains("Attempt 1: child run-a (failed): gate rejected"));
+        assert!(!out.contains("Attempt 2:"));
+        assert!(out.contains("Continue from where the last one stopped"));
+    }
+
+    #[test]
+    fn caps_at_two_most_recent_and_skips_successes() {
+        let history = vec![
+            step("subagent_complete", "child run-1 (failed): first", false),
+            step("subagent_complete", "child run-2 (completed): won", true),
+            step("subagent_complete", "child run-3 (failed): second", false),
+            step("subagent_complete", "child run-4 (failed): third", false),
+        ];
+        let out = recent_failed_siblings_summary(&history).expect("block present");
+        // Newest-first scan → take last two failed → reverse to chronological:
+        // run-3 should be Attempt 1, run-4 should be Attempt 2.
+        assert!(out.contains("Attempt 1: child run-3 (failed): second"));
+        assert!(out.contains("Attempt 2: child run-4 (failed): third"));
+        // Completed sibling never surfaces.
+        assert!(!out.contains("run-2"));
+        // Oldest failed sibling (run-1) pushed out by the cap.
+        assert!(!out.contains("run-1"));
+    }
+
+    #[test]
+    fn ignores_non_subagent_complete_kinds_even_if_failed() {
+        let history = vec![
+            step("tool_call", "cargo check errored", false),
+            step("continue", "retry", false),
+        ];
+        assert!(recent_failed_siblings_summary(&history).is_none());
+    }
+
+    #[test]
+    fn truncates_long_summaries_at_char_boundary_with_ellipsis() {
+        // Build a summary well over PRIOR_SIBLING_SUMMARY_CAP.
+        let long_body = "a".repeat(PRIOR_SIBLING_SUMMARY_CAP + 500);
+        let long_summary = format!("child run-x (failed): {long_body}");
+        let history = vec![step("subagent_complete", &long_summary, false)];
+        let out = recent_failed_siblings_summary(&history).expect("block present");
+        assert!(out.contains("…"), "expected ellipsis suffix on truncation");
+        // Full unbounded body should NOT appear.
+        assert!(
+            !out.contains(&long_body),
+            "full summary body leaked past the cap"
+        );
+    }
+
+    #[test]
+    fn truncate_helper_utf8_safe_on_multibyte_boundary() {
+        // 4-byte char (😀) placed so a naive byte slice at `cap` would
+        // split the code point. Helper must land on a valid boundary.
+        let s = format!("{}😀{}", "a".repeat(10), "b".repeat(20));
+        let out = truncate_for_prior_sibling(&s, 11);
+        // The helper may either include the 😀 or stop just before it —
+        // what matters is that the output is valid UTF-8 and ends with
+        // an ellipsis when truncation happened.
+        assert!(out.is_char_boundary(out.len()));
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_helper_returns_original_when_within_cap() {
+        let s = "short summary";
+        let out = truncate_for_prior_sibling(s, 100);
+        assert_eq!(out, s);
+        assert!(!out.ends_with('…'));
+    }
+}
 
 #[cfg(test)]
 mod signal_aggregation_tests {
