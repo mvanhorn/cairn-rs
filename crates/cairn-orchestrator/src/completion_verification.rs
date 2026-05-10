@@ -419,6 +419,30 @@ const FAILURE_ADMISSION_SENTINELS: &[&str] = &[
     // "not performed" / "not completed" is.
     "not performed",
     "not completed",
+    // #832 / R28: model reached further than R27 (wrote Cargo.toml,
+    // src/main.rs, ran cargo check) but bailed at push+PR with
+    // "The work is **nearly complete** but not fully finished".
+    // The phrases below were all emitted in the same summary
+    // opening — adding each so the scan catches this variant.
+    "nearly complete",
+    "not fully finished",
+    "not yet complete",
+    "still remaining",
+    // "still remains to be <verb>ed" — R28 anticipated variant.
+    // Gemini review (#834): the shorter "remains to be" would fire
+    // on legitimate success phrases like "Nothing remains to be
+    // done" or "It remains to be seen if..."; the "still" anchor
+    // specialises the match to admissions of unfinished work.
+    "still remains to be",
+    // Section headers that (by R27 and R28 convention) prefix a
+    // list of unfinished items. Head-anchored: the scan only fires
+    // when the summary OPENS with a "Remaining:" section; free
+    // text further down that mentions remaining work flows through.
+    // Gemini review (#834): drop the trailing `:**` on the bold
+    // variant so `**Remaining**:`, `**Remaining** :`, and bare
+    // `**Remaining**` all match.
+    "### remaining",
+    "**remaining",
 ];
 
 /// Scan the opening of a `complete_run` proposal's `final_answer` for
@@ -1081,5 +1105,115 @@ error[E0308]: mismatched types
     fn sentinel_scan_empty_answer_does_not_match() {
         assert!(detect_self_reported_failure("").is_none());
         assert!(detect_self_reported_failure("   \n\n\t ").is_none());
+    }
+
+    /// #832 / R28 regression: glm-4.7's M1-1 sub-agent wrote
+    /// Cargo.toml, src/main.rs, ran cargo check (passed), committed
+    /// — then bailed at push+PR with a summary opening `"The work is
+    /// **nearly complete** but not fully finished. Here's what was
+    /// done: ... ### Remaining: 1. Restore .gitignore 2. Push the
+    /// branch 3. Create PR"`. The original R26/R27 sentinels missed
+    /// all four signal phrases. Pin each so R28 doesn't come back.
+    #[test]
+    fn sentinel_scan_matches_r28_admission_shapes() {
+        // Exact R28 opening — "nearly complete" anchors the scan.
+        assert!(detect_self_reported_failure(
+            "## Progress Summary\n\nThe work is **nearly complete** but not fully finished. \
+             Here's what was done:"
+        )
+        .is_some());
+
+        // Each phrase individually — the list is what the scan
+        // keys on, so assert them one-for-one.
+        assert!(detect_self_reported_failure("Work is nearly complete.").is_some());
+        assert!(detect_self_reported_failure("not fully finished — a few steps remain").is_some());
+        assert!(
+            detect_self_reported_failure("Status: not yet complete; pending PR creation").is_some()
+        );
+        assert!(detect_self_reported_failure("Still remaining: push + PR.").is_some());
+        // Gemini review (#834): matches the full specific anchor
+        // "still remains to be" so legitimate "nothing remains to
+        // be done" / "it remains to be seen" don't false-positive.
+        assert!(detect_self_reported_failure(
+            "Summary: work still remains to be pushed to origin."
+        )
+        .is_some());
+
+        // Section-header anchors. R27 and R28 both used "### Remaining:"
+        // and "**Remaining:**" as a bulleted list of unfinished
+        // items at the top of the summary. Matching the header
+        // anchors catches the shape even if the surrounding prose
+        // doesn't happen to hit another sentinel.
+        assert!(detect_self_reported_failure(
+            "Summary of changes.\n\n### Remaining:\n1. Push the branch"
+        )
+        .is_some());
+        assert!(detect_self_reported_failure(
+            "Done:\n- wrote code\n\n**Remaining:**\n- push to origin"
+        )
+        .is_some());
+        // Gemini review (#834): the bold anchor must tolerate
+        // variation in colon placement / missing colon so subtle
+        // markdown drift ("**Remaining**:" vs "**Remaining:**" vs
+        // just "**Remaining**") all match.
+        assert!(detect_self_reported_failure(
+            "Done:\n- wrote code\n\n**Remaining**:\n- push to origin"
+        )
+        .is_some());
+        assert!(detect_self_reported_failure(
+            "Done:\n- wrote code\n\n**Remaining**\n- push to origin"
+        )
+        .is_some());
+    }
+
+    /// #832 regression: legitimate summaries that happen to include
+    /// the word "remaining" or "complete" must NOT fire. The head
+    /// anchor and phrase specificity are the defence.
+    #[test]
+    fn sentinel_scan_does_not_fire_on_legitimate_r28_shape_near_misses() {
+        // Gemini review (#834): test the exact false-positive
+        // shapes the narrowed sentinel is designed to avoid. Before
+        // the narrowing, the shorter "remains to be" bigram would
+        // have matched these — the specific "still remains to be"
+        // anchor keeps them safely out.
+        assert!(
+            detect_self_reported_failure("Nothing remains to be done.").is_none(),
+            "'remains to be' without 'still' must not match on a success shape"
+        );
+        assert!(
+            detect_self_reported_failure("It remains to be seen whether the user accepts.")
+                .is_none(),
+            "idiomatic 'it remains to be seen' must not match"
+        );
+
+        // Real change summary that lists files left to test but
+        // doesn't self-admit run failure.
+        assert!(
+            detect_self_reported_failure(
+                "Renamed parse_raw -> parse_input. All callers updated. \
+             cargo check -p bar passes. It remains to be seen if the \
+             user requires further changes — filing #XYZ to track."
+            )
+            .is_none(),
+            "'remains to be' in non-admission prose must not match"
+        );
+
+        // A researcher's report mentioning "nearly complete" in a
+        // citation about something else. Past the 200-char head the
+        // scan is silent.
+        let padding = "a".repeat(SENTINEL_SCAN_HEAD_CHARS);
+        let legit =
+            format!("Summary of findings.\n\n{padding}\nThe upstream library is nearly complete.");
+        assert!(
+            detect_self_reported_failure(&legit).is_none(),
+            "post-head 'nearly complete' must not match"
+        );
+
+        // "completed" in a success shape — opposite of "not
+        // completed". The scan must not false-positive.
+        assert!(
+            detect_self_reported_failure("Task completed. All acceptance criteria satisfied.")
+                .is_none()
+        );
     }
 }
