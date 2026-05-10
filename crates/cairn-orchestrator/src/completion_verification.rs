@@ -397,14 +397,15 @@ const SENTINEL_SCAN_HEAD_CHARS: usize = 1000;
 /// Every phrase here must be covered by the
 /// `sentinel_scan_matches_r26_r27_admission_shapes` unit test.
 const FAILURE_ADMISSION_SENTINELS: &[&str] = &[
-    // R26 / R27 observed shapes — exact phrases the models emitted.
+    // R26 / R27 observed shapes — exact status-line openers the
+    // models emitted. These are self-describing run-status
+    // admissions: the model literally labels its own output
+    // "Status: Blocked" / "Status: Partially Complete" / "Task
+    // incomplete." Legitimate success summaries don't open with a
+    // "Status: <failure>" header.
     "status: blocked",
     "status: partially complete",
     "task incomplete",
-    "cannot provide",
-    "cannot complete",
-    "unable to complete",
-    "unable to proceed",
     // R27 summary verb-specific variants — "was never executed"
     // ("cargo init was never run"), "was never run", "was never
     // written" (src/main.rs), "was never added" (deps), "was never
@@ -426,21 +427,15 @@ const FAILURE_ADMISSION_SENTINELS: &[&str] = &[
     "were never completed",
     "were never committed",
     "were never run",
-    // Bulleted-status shapes seen in R27: "- ❌ <item>" at the top.
-    // We don't anchor on the ❌ emoji itself because that's not
-    // reliably ASCII-decomposable, but the accompanying prose
-    // "not performed" / "not completed" is.
-    "not performed",
-    "not completed",
     // #832 / R28: model reached further than R27 (wrote Cargo.toml,
     // src/main.rs, ran cargo check) but bailed at push+PR with
     // "The work is **nearly complete** but not fully finished".
-    // The phrases below were all emitted in the same summary
-    // opening — adding each so the scan catches this variant.
+    // Each of these is a run-status phrase — "nearly complete" /
+    // "not fully finished" / "not yet complete" only appear when
+    // describing the run itself, not code or external state.
     "nearly complete",
     "not fully finished",
     "not yet complete",
-    "still remaining",
     // "still remains to be <verb>ed" — R28 anticipated variant.
     // Gemini review (#834): the shorter "remains to be" would fire
     // on legitimate success phrases like "Nothing remains to be
@@ -456,6 +451,41 @@ const FAILURE_ADMISSION_SENTINELS: &[&str] = &[
     // `**Remaining**` all match.
     "### remaining",
     "**remaining",
+    // ── Removed phrases (FP audit regression, post-R30) ──────────
+    // An internal audit after R30 revealed the phrases below fired
+    // on realistic *success-with-caveats* summaries that are the
+    // norm for researcher / reviewer roles:
+    //
+    //   * `"cannot provide"` fired on "cannot provide benchmarks —
+    //     staging was unreachable" (legit research caveat).
+    //   * `"cannot complete"` fired on "cannot complete the full
+    //     audit in scope — 3 of 30 endpoints required paid access"
+    //     (legit scope deferral).
+    //   * `"still remaining"` fired on "2 follow-up issues still
+    //     remaining in the backlog (filed as #XYZ)" (legit forward-
+    //     looking scope note on a successful run).
+    //   * `"not completed"` fired on "edge-case 'not completed yet'
+    //     handler shown at line 78" (describing code behaviour).
+    //   * `"not performed"` fired on "not performed in this PR
+    //     because it changes a public API" (legit scope deferral).
+    //   * `"unable to complete"` / `"unable to proceed"` — never
+    //     observed standalone in dogfood; speculative.
+    //
+    // These were over-broad generalizations added during R26–R29
+    // list expansion, not dogfood-observed phrases. The R26 case
+    // ("Cannot provide final deliverables") is already covered by
+    // `"status: partially complete"`, which is the structural
+    // opener in the same summary. The R27 bulleted "NOT performed"
+    // case is covered by the specific `"were never <verb>ed"`
+    // variants. The R29 "cannot be provided until" phrase lives in
+    // `HIGH_SPECIFICITY_FULL_BODY_SENTINELS` with a narrower anchor.
+    //
+    // Sentinel-list discipline, reaffirmed:
+    //   * only phrases observed in actual dogfood transcripts,
+    //   * only phrases that describe the RUN'S OWN STATUS (not
+    //     code behaviour, backlog items, or upstream failures),
+    //   * every new phrase must pass
+    //     `sentinel_scan_fp_regression_legitimate_success_with_caveats`.
 ];
 
 /// High-specificity sentinels that scan the FULL final_answer body,
@@ -1117,9 +1147,17 @@ error[E0308]: mismatched types
             "R27 plural-verb exact phrase"
         );
 
-        // "Cannot provide" / "Unable to complete" variants.
-        assert!(detect_self_reported_failure("Cannot provide the requested files.").is_some());
-        assert!(detect_self_reported_failure("Unable to complete this task.").is_some());
+        // FP audit (post-R30): the naked "Cannot provide" / "Unable
+        // to complete" phrases were removed from the sentinel list
+        // because they fired on legitimate research caveats like
+        // "Cannot provide benchmarks — staging was unreachable." The
+        // R26 summary that looked like it depended on "cannot provide"
+        // ("**Status: Partially Complete - Cannot provide final
+        // deliverables**") is actually caught by the structural
+        // "status: partially complete" sentinel on the preceding
+        // clause, so no dogfood coverage is lost. See
+        // `sentinel_scan_fp_regression_legitimate_success_with_caveats`
+        // for the regression guard.
     }
 
     /// Case-insensitivity is a contract — the scan lower-cases the
@@ -1189,6 +1227,111 @@ error[E0308]: mismatched types
     fn sentinel_scan_empty_answer_does_not_match() {
         assert!(detect_self_reported_failure("").is_none());
         assert!(detect_self_reported_failure("   \n\n\t ").is_none());
+    }
+
+    /// FP REGRESSION GUARD — post-R30 audit. Each case below is a
+    /// realistic *successful* complete_run summary that the pre-audit
+    /// sentinel list (through #836) false-positive'd on. Every case
+    /// must stay `None`. If a future sentinel addition re-introduces
+    /// a false positive here, this test fires and the addition must
+    /// be narrowed or moved to the full-body high-specificity list
+    /// with a tighter anchor.
+    ///
+    /// Adding a new case: copy the shape from any dogfood transcript
+    /// where a research / review / doc-writing / planning agent
+    /// produced a legitimate summary-with-caveats. Prefer the exact
+    /// phrasing the agent emitted over a paraphrase.
+    #[test]
+    fn sentinel_scan_fp_regression_legitimate_success_with_caveats() {
+        let cases: &[(&str, &str)] = &[
+            // Real success + forward-looking backlog mention.
+            (
+                "backlog-followup",
+                "Implementation complete. Cargo check passes, tests green, PR opened \
+              at /pull/42. 2 follow-up issues still remaining in the backlog \
+              (filed as #XYZ).",
+            ),
+            // Researcher honestly flagging a caveat on an otherwise-
+            // complete report.
+            (
+                "research-unreachable-env",
+                "Summary of findings: the API accepts 3 auth modes. Cannot provide \
+              benchmark numbers — the staging env was unreachable during the \
+              research window. See findings below.",
+            ),
+            // Scope deferral: the audit was smaller than ideal but
+            // the agent documented what it did cover.
+            (
+                "research-paid-tier",
+                "Cannot complete the full exhaustive audit in scope — 3 of 30 \
+              endpoints required paid-tier access. Coverage: 27/30 documented \
+              with citations.",
+            ),
+            // Reviewer returning a request-changes verdict. The
+            // review itself is complete — the CODE needs work, but
+            // the reviewer's run delivered its output.
+            (
+                "review-verdict",
+                "Review verdict: request-changes. 2 critical findings at \
+              parser.rs:42 and lib.rs:88. 1 warning at test.rs:14. Suggested \
+              fix for each in the detailed sections below.",
+            ),
+            // Changelog summary that mentions "was never documented"
+            // in a non-run-status context.
+            (
+                "changelog-with-was-never",
+                "## Changelog\n\n- Fixed memory leak in connection pool\n\
+              - Was never documented that the retry hook fires post-close; \
+              added note.\n- Removed deprecated API; migration guide at \
+              docs/migrate.md.",
+            ),
+            // Research deliverable that declines to pick a winner
+            // among options. "Cannot provide a single 'best'" is
+            // the honest framing, not an admission of run failure.
+            (
+                "tradeoffs-not-single-best",
+                "Research complete. Findings: 3 implementation approaches (A/B/C) \
+              with tradeoffs documented. We cannot provide a single 'best' \
+              recommendation — the choice depends on operator priorities not \
+              captured in the goal.",
+            ),
+            // Short factual answer with no caveats — the trivial
+            // baseline that must also stay clean.
+            ("short-happy", "Paris is the capital of France."),
+            // Summary describes a CODE behaviour ("not completed
+            // yet") rather than the run's status.
+            (
+                "spec-with-not-completed",
+                "Status: green. Covers every AC. Edge-case 'not completed yet' \
+              handler shown at line 78 is now explicitly documented with a \
+              #[cfg(test)] proof at line 145.",
+            ),
+            // Explicit scope deferral: "not performed in this PR"
+            // with a filed follow-up is a legitimate success shape.
+            (
+                "followup-tracked",
+                "Changes applied. cargo test -p bar: 47 pass, 0 fail. cargo \
+              check: clean. Follow-up scope tracked at #XYZ; not performed \
+              in this PR because it changes a public API and needs an RFC.",
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (label, text) in cases {
+            if let Some(matched) = detect_self_reported_failure(text) {
+                failures.push(format!("  * {label}: matched {matched:?}"));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Sentinel scan FP regression — the following legitimate \
+             success-with-caveats summaries false-positive'd. Either \
+             narrow the matched sentinel to a more specific anchor or \
+             move it to HIGH_SPECIFICITY_FULL_BODY_SENTINELS with a \
+             tighter contract.\n\n{}",
+            failures.join("\n")
+        );
     }
 
     /// #835 / R29 regression: verbatim R29 summary opened with a
@@ -1333,7 +1476,12 @@ error[E0308]: mismatched types
         assert!(
             detect_self_reported_failure("Status: not yet complete; pending PR creation").is_some()
         );
-        assert!(detect_self_reported_failure("Still remaining: push + PR.").is_some());
+        // FP audit (post-R30): "still remaining" was removed from
+        // the sentinel list — it fired on "2 follow-up issues still
+        // remaining in the backlog" (legit forward-looking scope on
+        // a successful run). The R28 section-header anchor
+        // `**Remaining:**` below still catches the actual R28 case.
+        //
         // Gemini review (#834): matches the full specific anchor
         // "still remains to be" so legitimate "nothing remains to
         // be done" / "it remains to be seen" don't false-positive.
