@@ -8048,11 +8048,18 @@ impl InMemoryStore {
     }
 
     /// List runs with optional filters.
+    ///
+    /// `agent_role_id` filters by the run's `agent_role_id` field; it
+    /// matches `Some(id)` (exact equality) — rows with `None` never
+    /// match when the filter is present. Used by the RFC 031
+    /// retract-confirmation modal to surface the N-runs-currently-
+    /// using-this-role count before the operator commits.
     pub async fn list_runs_filtered(
         &self,
         query: &cairn_domain::tenancy::ProjectKey,
         session_id: Option<&cairn_domain::SessionId>,
         status: Option<cairn_domain::RunState>,
+        agent_role_id: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::projections::RunRecord>, crate::StoreError> {
@@ -8063,6 +8070,13 @@ impl InMemoryStore {
             .filter(|r| r.project == *query)
             .filter(|r| session_id.is_none_or(|s| r.session_id == *s))
             .filter(|r| status.is_none_or(|st| r.state == st))
+            .filter(|r| {
+                agent_role_id.is_none_or(|role| {
+                    r.agent_role_id
+                        .as_deref()
+                        .is_some_and(|existing| existing == role)
+                })
+            })
             .skip(offset)
             .take(limit)
             .cloned()
@@ -10086,5 +10100,69 @@ mod tests {
             .map(|r| r.run_id.as_str().to_owned())
             .collect();
         assert_eq!(union.len(), 4, "pages must be disjoint");
+    }
+
+    // RFC 031 PR-D3 — `list_runs_filtered` honours `agent_role_id`.
+    // Powers the retract-modal in-flight-runs probe.
+    #[tokio::test]
+    async fn list_runs_filtered_honours_agent_role_id() {
+        let store = InMemoryStore::new();
+        let project = ProjectKey::new("t_r", "w_r", "p_r");
+        let session_id = SessionId::new("sess_r");
+
+        // Seed: r0 (role=alpha), r1 (role=alpha), r2 (role=beta),
+        // r3 (role=None). RunCreated carries agent_role_id directly.
+        let seed = [
+            ("r0", Some("alpha")),
+            ("r1", Some("alpha")),
+            ("r2", Some("beta")),
+            ("r3", None),
+        ];
+        for (run_id, role) in &seed {
+            store
+                .append(&[make_envelope(RuntimeEvent::RunCreated(RunCreated {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: RunId::new(*run_id),
+                    parent_run_id: None,
+                    agent_role_id: role.map(str::to_owned),
+                    prompt_release_id: None,
+                }))])
+                .await
+                .unwrap();
+        }
+
+        // No filter → all 4.
+        let all = store
+            .list_runs_filtered(&project, None, None, None, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 4);
+
+        // Filter by role=alpha → 2.
+        let alpha = store
+            .list_runs_filtered(&project, None, None, Some("alpha"), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(alpha.len(), 2);
+        assert!(alpha
+            .iter()
+            .all(|r| r.agent_role_id.as_deref() == Some("alpha")));
+
+        // Filter by role=beta → 1.
+        let beta = store
+            .list_runs_filtered(&project, None, None, Some("beta"), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].run_id.as_str(), "r2");
+
+        // Filter by a role no run carries → 0 (the None-role rows
+        // don't match by the exact-equality predicate).
+        let ghost = store
+            .list_runs_filtered(&project, None, None, Some("ghost"), 100, 0)
+            .await
+            .unwrap();
+        assert!(ghost.is_empty());
     }
 }

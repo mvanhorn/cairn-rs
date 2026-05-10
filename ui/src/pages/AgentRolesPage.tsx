@@ -31,6 +31,7 @@ function Row({ item }: RowProps) {
   return (
     <button
       onClick={onClick}
+      data-testid={`agent-role-row-${item.role.role_id}`}
       className="w-full text-left rounded-xl border border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 hover:border-indigo-500 dark:hover:border-indigo-400 transition-colors px-5 py-4 flex items-start gap-4 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
     >
       <div className="flex-1 min-w-0">
@@ -118,6 +119,7 @@ export function AgentRolesPage() {
         <div className="ml-auto">
           <button
             onClick={goToNew}
+            data-testid="agent-roles-new-btn"
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] font-medium transition-colors shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
           >
             <Plus size={12} />

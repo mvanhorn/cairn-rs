@@ -728,8 +728,14 @@ pub const OPENAPI_JSON: &str = r##"{
         "summary": "List runs",
         "operationId": "listRuns",
         "parameters": [
-          { "name": "limit",  "in": "query", "schema": { "type": "integer" } },
-          { "name": "offset", "in": "query", "schema": { "type": "integer" } }
+          { "name": "tenant_id",     "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id",  "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "session_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "status",        "in": "query", "description": "Run-state wire name (`pending`, `running`, `waiting_approval`, `completed`, `failed`, `canceled`). Unknown values return 422.", "schema": { "type": "string" } },
+          { "name": "agent_role_id", "in": "query", "description": "RFC 031 PR-D3 — filter runs by their `agent_role_id`. Exact-match equality; runs without a role never match. Powers the retract-confirmation modal's in-flight-runs probe.", "schema": { "type": "string" } },
+          { "name": "limit",         "in": "query", "schema": { "type": "integer" } },
+          { "name": "offset",        "in": "query", "schema": { "type": "integer" } }
         ],
         "responses": { "200": { "description": "Run list" } }
       },

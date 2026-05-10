@@ -110,6 +110,11 @@ pub(crate) struct RunListQuery {
     pub(crate) project_id: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) status: Option<String>,
+    /// RFC 031 PR-D3 — filter runs by their `agent_role_id`. Exact-
+    /// match equality on the run's role; runs with no role set never
+    /// match. Powers the retract-confirmation modal's in-flight-runs
+    /// probe.
+    pub(crate) agent_role_id: Option<String>,
     pub(crate) limit: Option<usize>,
     pub(crate) offset: Option<usize>,
 }
@@ -270,6 +275,11 @@ pub(crate) async fn list_runs_handler(
     };
     let session_id = query.session_id.as_deref().map(SessionId::new);
     let limit = query.limit();
+    let agent_role_id = query
+        .agent_role_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     match state
         .runtime
         .store
@@ -277,6 +287,7 @@ pub(crate) async fn list_runs_handler(
             &RunListQuery::project(&query),
             session_id.as_ref(),
             status_filter,
+            agent_role_id,
             limit + 1,
             query.offset(),
         )

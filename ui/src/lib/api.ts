@@ -538,22 +538,34 @@ export function createApiClient(config: ApiClientConfig) {
 
     // ── Runs ──────────────────────────────────────────────────────────────────
 
-    /** GET /v1/runs — list runs (filtered by project if params supplied). */
+    /** GET /v1/runs — list runs (filtered by project if params supplied).
+     *
+     *  `status` and `agent_role_id` narrow the server-side scan:
+     *  - `status` = run-state wire name (`pending`, `running`,
+     *    `waiting_approval`, …). Unknown values produce 422.
+     *  - `agent_role_id` exact-matches the run's `agent_role_id`;
+     *    runs without a role set never match (RFC 031 PR-D3). Used
+     *    by the retract-confirmation modal to probe in-flight-run
+     *    count before the operator commits. */
     getRuns: (params?: {
       tenant_id?: string;
       workspace_id?: string;
       project_id?: string;
+      status?: string;
+      agent_role_id?: string;
       limit?: number;
       offset?: number;
       inherit_scope?: boolean;
     }): Promise<RunRecord[]> => {
       const merged = params?.inherit_scope === false ? (params ?? {}) : withScope(params);
       const qs = new URLSearchParams();
-      if (merged.tenant_id)             qs.set("tenant_id",    merged.tenant_id);
-      if (merged.workspace_id)          qs.set("workspace_id", merged.workspace_id);
-      if (merged.project_id)            qs.set("project_id",   merged.project_id);
-      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
-      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      if (merged.tenant_id)                qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id)             qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)               qs.set("project_id",   merged.project_id);
+      if (params?.status)                  qs.set("status",        params.status);
+      if (params?.agent_role_id)           qs.set("agent_role_id", params.agent_role_id);
+      if (params?.limit  !== undefined)    qs.set("limit",         String(params.limit));
+      if (params?.offset !== undefined)    qs.set("offset",        String(params.offset));
       const query = qs.toString() ? `?${qs}` : "";
       return getList(`/v1/runs${query}`);
     },

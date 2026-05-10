@@ -135,6 +135,7 @@ export function AgentRoleDetailPage({ roleId }: Props) {
               <button
                 onClick={onRetract}
                 disabled={retractMut.isPending}
+                data-testid="agent-role-retract-btn"
                 className="flex items-center gap-1 px-2 py-1 rounded-md border border-red-400 dark:border-red-600 text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 text-[11px] font-medium transition-colors disabled:opacity-50"
               >
                 {retractMut.isPending ? (
@@ -146,6 +147,7 @@ export function AgentRoleDetailPage({ roleId }: Props) {
               </button>
               <button
                 onClick={onEdit}
+                data-testid="agent-role-edit-btn"
                 className="flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-medium transition-colors"
               >
                 <Edit2 size={11} />
