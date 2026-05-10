@@ -96,13 +96,24 @@ pub(super) fn redact_provider_error(raw: Option<&str>) -> Option<String> {
 /// so operators can still filter failed runs by class.
 pub(super) fn classify_failed_reason(reason: &str) -> cairn_domain::FailureClass {
     let lower = reason.to_ascii_lowercase();
+    // #825: execute_impl::derive_signal emits a reason prefixed with
+    // `model_reported_failure:` when the agent emits FailRun. Match
+    // BEFORE the verification_rejected branch — both are agent-
+    // terminated failures but #660/#821/#823's gate rejection (which
+    // fires on `error:` lines in tool output) uses the
+    // `verification_rejected:` prefix, while #825's explicit
+    // self-reported failure uses this one. Literal prefix is a
+    // contract with cairn-orchestrator::execute_impl::derive_signal.
+    if lower.starts_with("model_reported_failure") {
+        cairn_domain::FailureClass::ModelReportedFailure
+    }
     // #660: the strict completion gate emits a reason string that
     // starts with the literal `verification_rejected:` prefix (see
     // `crates/cairn-orchestrator/src/loop_runner.rs` — the LoopConfig
     // rustdoc documents the contract). Match the prefix so a future
     // change to the error list / attempt count suffix can't silently
     // drop the classification back to `ExecutionError`.
-    if lower.starts_with("verification_rejected") {
+    else if lower.starts_with("verification_rejected") {
         cairn_domain::FailureClass::VerificationRejected
     } else if lower.contains("lease") && (lower.contains("expir") || lower.contains("lost")) {
         cairn_domain::FailureClass::LeaseExpired
@@ -267,6 +278,45 @@ mod tests {
         assert_eq!(
             classify_failed_reason("tool error: stdout exceeded 1MB"),
             FailureClass::ExecutionError,
+        );
+    }
+
+    /// #825: the orchestrator emits `model_reported_failure: <reason>`
+    /// when the agent calls `ActionType::FailRun`. The classifier must
+    /// route this to `FailureClass::ModelReportedFailure` so operator
+    /// dashboards distinguish agent-declared blockage from generic
+    /// infrastructure errors.
+    #[test]
+    fn classify_failed_reason_matches_model_reported_failure_prefix() {
+        use cairn_domain::FailureClass;
+        let reason = "model_reported_failure: blocked: src/main.rs does not exist; depends on M1-1";
+        assert_eq!(
+            classify_failed_reason(reason),
+            FailureClass::ModelReportedFailure,
+            "#825: the `model_reported_failure:` prefix is the wire \
+             contract between execute_impl::derive_signal and this \
+             classifier; a change here must be reflected in \
+             execute_impl::derive_signal."
+        );
+    }
+
+    /// #825: the model_reported_failure prefix must take priority over
+    /// other heuristic substring matches. A fail_run reason may
+    /// legitimately mention "timeout" or "approval" in free text
+    /// (e.g. "blocked: upstream service timeout preventing us from
+    /// proceeding"); the explicit prefix wins so the classification
+    /// stays stable.
+    #[test]
+    fn classify_failed_reason_model_reported_failure_beats_substring_heuristics() {
+        use cairn_domain::FailureClass;
+        assert_eq!(
+            classify_failed_reason(
+                "model_reported_failure: blocked: upstream service timeout preventing us \
+                 from retrieving the config; operator approval would not change this"
+            ),
+            FailureClass::ModelReportedFailure,
+            "explicit prefix must take priority over `timeout` / \
+             `approval` substrings"
         );
     }
 }

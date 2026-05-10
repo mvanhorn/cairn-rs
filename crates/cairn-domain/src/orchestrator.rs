@@ -30,6 +30,13 @@ pub enum ActionType {
     SendNotification,
     /// Mark the current run as successfully completed.
     CompleteRun,
+    /// #825: mark the current run as failed because the agent determined it
+    /// cannot proceed. Distinct from `CompleteRun` (deliverable exists) and
+    /// `EscalateToOperator` (operator input would unblock). Use when a
+    /// precondition is missing, the goal is contradictory, or a dependency
+    /// was not met and no operator intervention would change that outcome.
+    /// Maps to `RunService::fail(FailureClass::ModelReportedFailure)`.
+    FailRun,
     /// Escalate to a human operator when the agent is stuck or uncertain.
     EscalateToOperator,
 }
@@ -107,6 +114,21 @@ impl ActionProposal {
             tool_name: None,
             tool_args: None,
             requires_approval: true,
+        }
+    }
+
+    /// #825: construct a fail-run proposal. The `reason` lands in
+    /// `description` and flows into the run's terminal record so
+    /// operators see WHY the agent gave up without parsing a free-form
+    /// `complete_run` summary.
+    pub fn fail_run(reason: impl Into<String>, confidence: f64) -> Self {
+        Self {
+            action_type: ActionType::FailRun,
+            description: reason.into(),
+            confidence,
+            tool_name: None,
+            tool_args: None,
+            requires_approval: false,
         }
     }
 }
@@ -211,6 +233,13 @@ mod tests {
             serde_json::to_string(&ActionType::EscalateToOperator).unwrap(),
             r#""escalate_to_operator""#
         );
+        assert_eq!(
+            serde_json::to_string(&ActionType::FailRun).unwrap(),
+            r#""fail_run""#,
+            "#825: FailRun must wire as snake_case `fail_run` — this string \
+             is the contract between the LLM's JSON output and the \
+             orchestrator's decide-parser"
+        );
     }
 
     #[test]
@@ -243,5 +272,22 @@ mod tests {
         let p = ActionProposal::escalate("stuck on ambiguous requirement", 0.2);
         assert_eq!(p.action_type, ActionType::EscalateToOperator);
         assert!(p.requires_approval);
+    }
+
+    #[test]
+    fn fail_run_builder_sets_no_tool_and_no_approval() {
+        // #825: fail_run is a terminal verb, not a gated operator ask.
+        // It must not trigger the approval path (that's escalate's job)
+        // and must have no tool_name/tool_args (consistent with
+        // complete_run's shape).
+        let p = ActionProposal::fail_run("blocked: src/main.rs missing", 0.9);
+        assert_eq!(p.action_type, ActionType::FailRun);
+        assert_eq!(p.description, "blocked: src/main.rs missing");
+        assert!(p.tool_name.is_none());
+        assert!(p.tool_args.is_none());
+        assert!(
+            !p.requires_approval,
+            "fail_run is terminal — approval is for escalate_to_operator"
+        );
     }
 }

@@ -210,10 +210,19 @@ specialty defines below.
 ## Autonomous completion mandate
 
 Keep going until the goal is fully done at the depth your specialty \
-warrants. A half-done deliverable is not completion. If you truly \
-cannot make progress after honest effort, surface a precise blocker \
-rather than reporting false success or fabricating a plausible-sounding \
-result.
+warrants. A half-done deliverable is not completion.
+
+If you truly cannot make progress after honest effort, surface a \
+precise blocker — do NOT report false success. Use the terminal verb \
+that matches reality:
+- **complete_run** when the deliverable exists and is verified.
+- **escalate_to_operator** when operator input would unblock you.
+- **fail_run** when you tried and cannot proceed, and no operator \
+  action would change that. Put the concrete obstacle in `reason`.
+
+Never call complete_run with a summary that says \"blocked\", \
+\"partially complete\", or \"cannot provide\". That is false success. \
+Call fail_run instead.
 
 ## Sub-agent contract
 
@@ -344,18 +353,22 @@ Before complete_run, verify ALL:
 
 If any item is false, return to the earliest unsatisfied phase.
 
-## Error recovery
+## Error recovery and terminal verbs
 
-Tool call fails: read the error, try a different state-read or \
-verification path. Sub-agent returns empty / off-target / blocked: \
-do NOT re-spawn with the same arguments — same call, same result. \
-Re-scope the delegation (narrower goal, different role, extra \
-context from the predecessor's partial work). Budget three re-scopes \
-on a unit before escalating. If blocked by something outside your \
-control (missing credentials, no specialist role fits, impossible \
-constraint), call escalate_to_operator with what you tried and what \
-you need — NOT complete_run. False success is not a legitimate \
-outcome.
+Tool call fails: try a different state-read. Sub-agent empty / \
+off-target / blocked: re-scope (narrower goal, different role, \
+predecessor context). Three re-scopes max before terminating.
+
+Terminal verbs — match the truth:
+
+- **complete_run** — deliverable exists AND is verified.
+- **escalate_to_operator** — operator input would unblock; resuming \
+  IS feasible.
+- **fail_run** — tried, cannot proceed, no operator action would \
+  unblock. Put the obstacle in `reason`.
+
+complete_run with a \"blocked\" / \"partially complete\" summary is \
+false success. Use fail_run.
 
 ## What NOT to do
 
@@ -467,17 +480,28 @@ Before complete_run:
   so the parent can sanity-check.
 - You ran zero mutating commands.
 
-## Error recovery
+## Error recovery and terminal verbs
 
 A read fails: try a related path or query. Bash tool refuses an \
 attempted command (the bash policy correctly rejects mutation \
 verbs): do not retry with a workaround that hides the mutation — \
 report \"can only inspect, mutation requested\" as the answer and \
 stop. The parent will respawn an executor if action is what they \
-needed. If the question is genuinely unanswerable from inspection \
-alone (\"will this build succeed?\" requires actually running a \
-build, which is mutating in cairn's sandbox model), say so \
-explicitly in the report.
+needed.
+
+Three terminal verbs — use the one that matches the truth:
+
+- **complete_run** — you answered the parent's question from actual \
+  inspection (including when the honest answer is \"file not found\" \
+  or \"symbol not present\").
+- **escalate_to_operator** — you need operator input to proceed \
+  (e.g. access to a path outside the sandbox).
+- **fail_run** — the question is genuinely unanswerable from \
+  inspection alone (e.g. \"will this build succeed?\" requires \
+  running a build, which is mutating in cairn's sandbox model). \
+  Put the concrete obstacle in `reason`. \"File not found\" is NOT \
+  fail_run — that is a valid complete_run answer (the parent wanted \
+  to know if the file was there).
 
 ## What NOT to do
 
@@ -568,14 +592,27 @@ Before declaring done:
 - The final report names every file touched and the verification command \
   + result.
 
-## Error recovery
+## Error recovery and terminal verbs
 
 When a tool call fails, read the error and adjust. When a compile or \
 test fails, read the output carefully, find the root cause in your own \
-recent edits, and fix it. If the goal as given is impossible (asks to \
-modify a file that does not exist, asks for behaviour that contradicts \
-a higher-level invariant), stop and report the contradiction precisely \
-rather than papering over it.
+recent edits, and fix it.
+
+Three terminal verbs — use the one that matches the truth:
+
+- **complete_run** — target files modified, build and tests pass, \
+  nothing left to do. This is a success signal.
+- **escalate_to_operator** — you are blocked by something the operator \
+  can unblock immediately (missing credential for a remote, approval \
+  for a destructive action, a clarification on ambiguous intent).
+- **fail_run** — the goal as given is impossible or a required \
+  precondition is missing (a file the goal says to modify does not \
+  exist; a dependency that must land first has not landed; the \
+  behaviour requested contradicts a higher-level invariant). Put the \
+  concrete obstacle in `reason`.
+
+Never call complete_run with a summary that says \"blocked\" or \
+\"partially complete\". Use fail_run instead.
 
 ## What NOT to do
 
@@ -586,6 +623,8 @@ rather than papering over it.
 - Do NOT leave TODOs, commented-out code, or placeholder functions in \
   files you wrote.
 - Do NOT modify files outside the goal's scope. Stay surgical.
+- Do NOT call complete_run when blocked. Call fail_run — operator \
+  dashboards depend on the terminal verb matching reality.
 
 ## Example trajectory (error recovery)
 
@@ -654,14 +693,26 @@ Before returning:
   prevents answering it.
 - Findings are structured so the caller can skim and act.
 
-## Error recovery
+## Error recovery and terminal verbs
 
 If a source is unreachable (fetch fails, file not found), try an \
 alternative (different URL, grep for the symbol elsewhere, adjacent \
-doc). If the question as scoped cannot be answered from available \
-sources, say so explicitly with what you tried — do not fabricate a \
-plausible-sounding answer. If your tools return empty results, widen \
-the query before concluding the information does not exist.
+doc). Widen the query before concluding information does not exist.
+
+Three terminal verbs — use the one that matches the truth:
+
+- **complete_run** — you answered the scoped question with \
+  citations.
+- **escalate_to_operator** — you need specific operator input to \
+  proceed (e.g. a login for a private source) and they can provide \
+  it.
+- **fail_run** — the question as scoped cannot be answered from \
+  available sources and no reasonable operator action would fix \
+  that (the source does not exist; the claim is unverifiable; the \
+  question is internally contradictory). Put the concrete obstacle \
+  in `reason`. A report with \"unverified\" / \"conflicting sources\" \
+  sections is a complete_run, not a fail_run — only use fail_run \
+  when you cannot produce a useful report at all.
 
 ## What NOT to do
 
@@ -674,6 +725,8 @@ the query before concluding the information does not exist.
   do not do it yourself.
 - Do NOT invent file paths, line numbers, or URLs. If you need to cite \
   something, read it first.
+- Do NOT fabricate a plausible-sounding answer when sources do not \
+  support one. Call fail_run with what you tried.
 
 ## Example trajectory (source conflict)
 
@@ -744,12 +797,25 @@ Before returning:
 - The verdict is explicit (approve / request-changes / block).
 - If no findings exist, the review says so explicitly.
 
-## Error recovery
+## Error recovery and terminal verbs
 
 If a file is unreadable (path does not exist, binary blob), note it \
 and continue with the rest of the scope — do not fail the review \
 over one missing file. If the scope is underspecified, pick the \
 narrowest reasonable interpretation and state it.
+
+Three terminal verbs — use the one that matches the truth:
+
+- **complete_run** — you produced a review document with verdict + \
+  findings (even a \"0 findings\" review is a complete_run).
+- **escalate_to_operator** — you need operator input to proceed \
+  (e.g. access to a restricted source, clarification on scope that \
+  would materially change the review).
+- **fail_run** — no files in scope are readable, the requested scope \
+  is nonsensical, or you cannot produce a review at all. Put the \
+  concrete obstacle in `reason`. A review with caveats is still a \
+  complete_run — only use fail_run when you cannot deliver a useful \
+  review document.
 
 ## What NOT to do
 
@@ -1630,6 +1696,30 @@ mod tests {
                 prompt.contains("complete_run"),
                 "{role_id} prompt must name complete_run as the \
                  termination action in Phase 5"
+            );
+        }
+    }
+
+    #[test]
+    fn every_role_prompt_names_fail_run_as_truthful_failure_verb() {
+        // #825: without the prompt naming the verb, the model has no way
+        // to discover it — it will fall back to complete_run with a
+        // "Status: Blocked" summary (R26 pathology). Every role's prompt
+        // must document fail_run alongside complete_run /
+        // escalate_to_operator so the model can choose the right one.
+        //
+        // This guard pairs with the runtime work in
+        // cairn-orchestrator::execute_impl (FailRun dispatch →
+        // LoopSignal::Failed with `model_reported_failure:` prefix) and
+        // cairn-app::handlers::runs::helpers::classify_failed_reason
+        // (prefix → FailureClass::ModelReportedFailure).
+        for role_id in DEFAULT_ROLE_IDS {
+            let prompt = prompt_of(role_id);
+            assert!(
+                prompt.contains("fail_run"),
+                "#825: {role_id} prompt must name fail_run — without it \
+                 the model won't discover the verb and will fall back to \
+                 lying via complete_run"
             );
         }
     }

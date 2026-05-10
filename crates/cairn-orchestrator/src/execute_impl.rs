@@ -366,6 +366,7 @@ impl ExecutePhase for RuntimeExecutePhase {
             matches!(
                 p.action_type,
                 ActionType::CompleteRun
+                    | ActionType::FailRun
                     | ActionType::SpawnSubagent
                     | ActionType::EscalateToOperator
             )
@@ -1481,6 +1482,40 @@ impl RuntimeExecutePhase {
                 }),
             },
 
+            // ── FailRun (#825) ─────────────────────────────────────────────
+            // Terminal self-reported failure. Parallel to CompleteRun but
+            // routes to RunService::fail with FailureClass::ModelReportedFailure.
+            // The proposal's `description` carries the agent's reason — it
+            // flows through derive_signal into LoopSignal::Failed { reason },
+            // which the HTTP layer's classify_failed_reason recognises via
+            // the `model_reported_failure:` prefix.
+            ActionType::FailRun => match self
+                .run_service
+                .fail(
+                    &ctx.session_id,
+                    &ctx.run_id,
+                    cairn_domain::FailureClass::ModelReportedFailure,
+                )
+                .await
+            {
+                Ok(_) => Ok(ActionResult {
+                    proposal: proposal.clone(),
+                    status: ActionStatus::Succeeded,
+                    tool_output: None,
+                    invocation_id: None,
+                    duration_ms: 0,
+                }),
+                Err(e) => Ok(ActionResult {
+                    proposal: proposal.clone(),
+                    status: ActionStatus::Failed {
+                        reason: e.to_string(),
+                    },
+                    tool_output: None,
+                    invocation_id: None,
+                    duration_ms: 0,
+                }),
+            },
+
             // ── EscalateToOperator ─────────────────────────────────────────
             ActionType::EscalateToOperator => {
                 let approval_id = ApprovalId::new(new_id("appr"));
@@ -1888,6 +1923,17 @@ pub(crate) fn derive_signal(result: &ActionResult, current: &LoopSignal) -> Loop
             // CompleteRun → Done
             if result.proposal.action_type == ActionType::CompleteRun {
                 LoopSignal::Done
+            } else if result.proposal.action_type == ActionType::FailRun {
+                // #825: FailRun dispatch succeeded (RunService::fail
+                // flipped the run to state=failed). Signal terminal
+                // failure so the loop returns LoopTermination::Failed.
+                // The reason string uses the `model_reported_failure:`
+                // prefix so classify_failed_reason in the HTTP layer
+                // maps this to FailureClass::ModelReportedFailure.
+                // Proposal.description is the agent's free-text reason.
+                LoopSignal::Failed {
+                    reason: format!("model_reported_failure: {}", result.proposal.description),
+                }
             } else {
                 LoopSignal::Continue
             }
@@ -2243,6 +2289,67 @@ mod signal_aggregation_tests {
                  carve-out must ONLY fire on the malformed prefix; got {other:?}"
             ),
         }
+    }
+
+    /// #825: `FailRun` dispatch succeeded — the run is terminal.
+    /// `derive_signal` must map this to `LoopSignal::Failed` with a
+    /// reason carrying the `model_reported_failure:` prefix, NOT to
+    /// `LoopSignal::Done` (which would flip the run to
+    /// state=completed) and NOT to `LoopSignal::Continue` (which
+    /// would leave the run running after the service already flipped
+    /// it to Failed).
+    ///
+    /// The proposal's description carries the agent's reason; it
+    /// gets prefixed so classify_failed_reason in the HTTP layer
+    /// routes the terminal to FailureClass::ModelReportedFailure.
+    #[test]
+    fn derive_signal_fail_run_success_maps_to_failed_with_prefix() {
+        let proposal = ActionProposal::fail_run("blocked: missing dep", 0.95);
+        let result = ActionResult {
+            proposal,
+            status: ActionStatus::Succeeded,
+            tool_output: None,
+            invocation_id: None,
+            duration_ms: 0,
+        };
+        let got = derive_signal(&result, &LoopSignal::Continue);
+        match got {
+            LoopSignal::Failed { reason } => {
+                assert!(
+                    reason.starts_with("model_reported_failure:"),
+                    "#825: reason must carry the model_reported_failure: \
+                     prefix so classify_failed_reason maps it to \
+                     FailureClass::ModelReportedFailure. Got: {reason}"
+                );
+                assert!(
+                    reason.contains("blocked: missing dep"),
+                    "reason must preserve the agent's original text. Got: {reason}"
+                );
+            }
+            other => panic!("#825: expected Failed, got {other:?}"),
+        }
+    }
+
+    /// #825 + CompleteRun symmetry: CompleteRun success → Done,
+    /// FailRun success → Failed. Different terminal signals, so the
+    /// loop runner knows which `LoopTermination` variant to return.
+    #[test]
+    fn derive_signal_complete_run_still_maps_to_done_after_fail_run_addition() {
+        // Regression guard: adding the FailRun branch must NOT have
+        // altered the CompleteRun semantics.
+        let proposal = ActionProposal::complete_run("final answer", 0.95);
+        let result = ActionResult {
+            proposal,
+            status: ActionStatus::Succeeded,
+            tool_output: None,
+            invocation_id: None,
+            duration_ms: 0,
+        };
+        let got = derive_signal(&result, &LoopSignal::Continue);
+        assert!(
+            matches!(got, LoopSignal::Done),
+            "CompleteRun success must still map to Done; got {got:?}"
+        );
     }
 }
 

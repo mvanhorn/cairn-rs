@@ -81,6 +81,12 @@ pub fn failure_class_category(failure_class: FailureClass) -> &'static str {
         // the failure is upstream provider availability, not a policy
         // decision or operator action.
         FailureClass::AllProvidersExhausted => "execution",
+        // #825: the agent emitted `ActionType::FailRun` — truthful
+        // self-reported failure. Bucketed under "agent" because the
+        // failure originated with the agent's own judgment ("I tried
+        // and I cannot proceed"), distinct from policy refusal,
+        // execution error, or operator cancel.
+        FailureClass::ModelReportedFailure => "agent",
     }
 }
 
@@ -103,6 +109,7 @@ pub fn failure_class_reason(failure_class: FailureClass) -> &'static str {
         FailureClass::VerificationRejected => "verification_rejected",
         FailureClass::OrphanChild => "orphan_child",
         FailureClass::AllProvidersExhausted => "all_providers_exhausted",
+        FailureClass::ModelReportedFailure => "model_reported_failure",
     }
 }
 

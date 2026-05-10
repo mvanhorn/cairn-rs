@@ -494,8 +494,15 @@ impl DecidePhase for LlmDecidePhase {
         // a 20-tool list on trivially-answerable prompts — see
         // `test_f38_complete_run_actually_invoked.rs` for the pinned
         // regression.
-        let mut tool_defs: Vec<serde_json::Value> = Vec::with_capacity(tool_descs.len() + 1);
+        let mut tool_defs: Vec<serde_json::Value> = Vec::with_capacity(tool_descs.len() + 3);
         tool_defs.push(complete_run_tool_def());
+        // #825: fail_run as a native tool def so the model can terminate
+        // truthfully when a precondition is missing. Without this
+        // verb, blocked sub-agents call complete_run with "Status:
+        // Blocked" summaries and runs flip to state=completed (R26
+        // dogfood pathology). See fail_run_tool_def() for the full
+        // rationale.
+        tool_defs.push(fail_run_tool_def());
         // #697 R5-A: spawn_subagent is a native tool def now. Models
         // emit reliable structured JSON against the flat `{role, goal}`
         // schema; the legacy prose-described meta-verb shape produced
@@ -976,11 +983,11 @@ JSON action array shape (used for meta-actions above, and as the
 legacy fallback when the provider has no native tool calling): ONLY
 a JSON array of action objects — no prose, no markdown fences — with
 fields:
-- "action_type": one of "invoke_tool"|"complete_run"|"create_memory"|"spawn_subagent"|"send_notification"|"escalate_to_operator"
+- "action_type": one of "invoke_tool"|"complete_run"|"fail_run"|"create_memory"|"spawn_subagent"|"send_notification"|"escalate_to_operator"
 - "description": concise explanation for most actions; for complete_run,
                  the FULL user-facing answer (prose, bullets, whatever the
                  user asked for) — this is what the user sees as the run's
-                 final output.
+                 final output. For fail_run, the reason you cannot proceed.
 - "confidence": float 0.0-1.0
 - "requires_approval": boolean
 - "tool_name" (for invoke_tool/spawn_subagent): tool ID or sub-agent role
@@ -992,7 +999,14 @@ Field conventions:
                   tool_args = {...}. Prefer native tool calls.
 - complete_run:   description = the full user-facing answer. NOT a meta-
                   summary like "answered the user's question." Write it
-                  for the user to read.
+                  for the user to read. Do NOT use complete_run when you
+                  are blocked or partially-complete — use fail_run.
+- fail_run:       description = why you cannot proceed (short, concrete,
+                  operator-facing). Use when a precondition is missing,
+                  the goal is contradictory, or a dependency was not met
+                  and no operator intervention would unblock you. If
+                  operator intervention WOULD unblock, use
+                  escalate_to_operator instead.
 - spawn_subagent: tool_name = role,  tool_args = {"goal": "..."}
 - create_memory:  tool_args = {"content": "..."}"#
             .to_owned()
@@ -1004,7 +1018,8 @@ Field conventions:
              - \"description\": concise explanation for most actions; for \
                complete_run, the FULL user-facing answer (prose, bullets, \
                whatever the user asked for). The user sees this verbatim as \
-               the run's final output — write it for them to read.\n\
+               the run's final output — write it for them to read. For \
+               fail_run, the reason you cannot proceed.\n\
              - \"confidence\": float 0.0–1.0\n\
              - \"requires_approval\": boolean\n\
              - \"tool_name\" (for invoke_tool/spawn_subagent): tool ID or sub-agent role\n\
@@ -1013,12 +1028,18 @@ Field conventions:
              Field conventions:\n\
              - invoke_tool:    tool_name = tool ID,  tool_args = {{...}}\n\
              - complete_run:   description = the full user-facing answer \
-               (not a meta-summary like \"answered the user's question\")\n\
+               (not a meta-summary like \"answered the user's question\"). \
+               Do NOT use complete_run when you are blocked — use fail_run.\n\
+             - fail_run:       description = why you cannot proceed. Use \
+               when a precondition is missing, the goal is contradictory, \
+               or a dependency was not met and no operator intervention \
+               would unblock you. If operator intervention WOULD unblock, \
+               use escalate_to_operator instead.\n\
              - spawn_subagent: tool_name = role,  tool_args = {{\"goal\": \"...\"}}\n\
              - create_memory:  tool_args = {{\"content\": \"...\"}}\n\
              \n\
              Return ONLY the JSON array — no markdown fences, no explanation text.",
-            action_types = r#""invoke_tool"|"complete_run"|"create_memory"|"spawn_subagent"|"send_notification"|"escalate_to_operator""#,
+            action_types = r#""invoke_tool"|"complete_run"|"fail_run"|"create_memory"|"spawn_subagent"|"send_notification"|"escalate_to_operator""#,
         )
     };
 
@@ -1542,6 +1563,52 @@ pub(crate) fn complete_run_tool_def() -> serde_json::Value {
     })
 }
 
+/// #825: native tool schema for `fail_run` — the truthful terminal
+/// verb for "I tried, I cannot proceed." Parallel to `complete_run`
+/// but routes to `RunService::fail(FailureClass::ModelReportedFailure)`
+/// instead of `complete`.
+///
+/// R26 dogfood exposed why this exists: a sub-agent that correctly
+/// diagnosed its own block (e.g. "M1-7 needs M1-1 first") had only
+/// `complete_run` as a terminal verb, so it called complete_run with a
+/// `final_answer` saying "Status: Blocked" — and the run flipped to
+/// `state=completed`. Operator dashboards saw success; the only failure
+/// signal was buried in free-text. Adding `fail_run` gives the model a
+/// wire-level verb that matches its intent.
+///
+/// Description is directive so GLM-class models pick this over
+/// complete_run when the deliverable doesn't exist. Reviewer-class
+/// models tend to default to complete_run even on admitted failure.
+pub(crate) fn fail_run_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "fail_run",
+            "description": "Mark this run as FAILED because you tried and \
+    cannot proceed. Call this — NOT `complete_run` — when a precondition is \
+    missing, the goal is contradictory, a dependency was not met, or you \
+    exhausted your options and no operator intervention would unblock you. \
+    If operator intervention WOULD unblock you (needs approval, credential \
+    rotation, clarification), call `escalate_to_operator` instead. Never \
+    call `complete_run` with a summary saying you are blocked — use this \
+    verb so the run record reflects reality.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why you cannot proceed. Short, \
+    concrete, operator-facing. Example: 'blocked: src/main.rs does not exist; \
+    depends on M1-1'. Do NOT restate the goal; name the obstacle."
+                    }
+                },
+                "required": ["reason"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// Native tool schema for `spawn_subagent` — the subagent-delegation
 /// meta-verb. Publishing this as a native tool definition instead of a
 /// prose-only meta-verb is #697 R5-A: dogfood R5 showed that
@@ -1965,6 +2032,44 @@ fn tool_calls_to_proposals(
                 });
             }
 
+            // #825: native `fail_run` tool call → terminal FailRun proposal.
+            // Parallel to complete_run above: reason lands in
+            // proposal.description, which derive_signal wraps in the
+            // `model_reported_failure:` prefix so the HTTP layer routes
+            // it to FailureClass::ModelReportedFailure. Tolerate the
+            // same aliases complete_run tolerates (description, answer,
+            // content, summary) because GLM/Qwen/Gemma models drift
+            // the same way on the new verb. A schema miss escalates to
+            // the operator, matching the complete_run posture — we do
+            // NOT invent a reason (would silently mask schema drift).
+            if name == "fail_run" {
+                let reason = args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        for alias in ["description", "answer", "content", "summary"] {
+                            if let Some(s) = args.get(alias).and_then(|v| v.as_str()) {
+                                return Some(s.to_owned());
+                            }
+                        }
+                        None
+                    });
+
+                return Some(match reason {
+                    Some(text) => ActionProposal::fail_run(text, 0.95),
+                    None => ActionProposal::escalate(
+                        format!(
+                            "Model called `fail_run` but omitted the required \
+                             `reason` argument (and none of the tolerated \
+                             aliases description/answer/content/summary were \
+                             present). Raw arguments: {args}"
+                        ),
+                        0.0,
+                    ),
+                });
+            }
+
             // Check if this tool is a safe read-only action.
             let requires_approval = tool_descs
                 .iter()
@@ -2092,6 +2197,9 @@ fn parse_one(v: serde_json::Value) -> Option<ActionProposal> {
         "create_memory" => ActionType::CreateMemory,
         "send_notification" => ActionType::SendNotification,
         "complete_run" => ActionType::CompleteRun,
+        // #825: truthful terminal "I tried, I can't proceed." See
+        // FailureClass::ModelReportedFailure + fail_run_tool_def().
+        "fail_run" => ActionType::FailRun,
         "escalate_to_operator" => ActionType::EscalateToOperator,
         _ => return None,
     };
@@ -2969,6 +3077,97 @@ mod tests {
     }
 
     #[test]
+    fn fail_run_tool_call_maps_to_fail_run_proposal() {
+        // #825: a native `fail_run(reason: "...")` tool_call must
+        // translate to a terminal `ActionType::FailRun` proposal whose
+        // description carries the reason verbatim. execute_impl's
+        // derive_signal wraps this in the `model_reported_failure:`
+        // prefix, which classify_failed_reason in the HTTP layer
+        // routes to FailureClass::ModelReportedFailure.
+        let tool_calls = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "fail_run",
+                "arguments": {
+                    "reason": "blocked: src/main.rs does not exist; depends on M1-1"
+                }
+            }
+        })];
+        let proposals = tool_calls_to_proposals(&tool_calls, &[]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].action_type, ActionType::FailRun);
+        assert_eq!(
+            proposals[0].description,
+            "blocked: src/main.rs does not exist; depends on M1-1"
+        );
+        assert!(proposals[0].tool_name.is_none());
+        assert!(proposals[0].tool_args.is_none());
+        assert!(
+            !proposals[0].requires_approval,
+            "fail_run is terminal — approval is for escalate_to_operator"
+        );
+    }
+
+    #[test]
+    fn fail_run_tool_call_accepts_description_alias() {
+        // #825: mirror complete_run's lenient alias handling. Some
+        // models (GLM, Qwen3) key the reason under `description`
+        // instead of the schema-declared `reason`; tolerate that to
+        // match the complete_run posture.
+        let tool_calls = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "fail_run",
+                "arguments": { "description": "contradictory goal" }
+            }
+        })];
+        let proposals = tool_calls_to_proposals(&tool_calls, &[]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].action_type, ActionType::FailRun);
+        assert_eq!(proposals[0].description, "contradictory goal");
+    }
+
+    #[test]
+    fn fail_run_tool_call_missing_reason_escalates() {
+        // #825: if the model calls fail_run without `reason` AND
+        // without a tolerated alias, escalate with the raw args.
+        // Same posture as complete_run: never invent a default reason;
+        // keep schema drift loud.
+        let tool_calls = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "fail_run",
+                "arguments": { "wrong_field": "oops" }
+            }
+        })];
+        let proposals = tool_calls_to_proposals(&tool_calls, &[]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].action_type, ActionType::EscalateToOperator);
+        assert!(
+            proposals[0].description.contains("reason"),
+            "escalation should name the missing field; got: {}",
+            proposals[0].description,
+        );
+        assert!(
+            proposals[0].description.contains("wrong_field"),
+            "escalation should include raw args; got: {}",
+            proposals[0].description,
+        );
+    }
+
+    #[test]
+    fn fail_run_json_action_shape_parses_to_fail_run_proposal() {
+        // #825: the legacy JSON-action array shape (used when native
+        // tool calling is unavailable) must also recognise fail_run.
+        // parse_proposals is the entry point for that path.
+        let raw = r#"[{"action_type":"fail_run","description":"blocked on X","confidence":0.9,"requires_approval":false}]"#;
+        let proposals = parse_proposals(raw);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].action_type, ActionType::FailRun);
+        assert_eq!(proposals[0].description, "blocked on X");
+    }
+
+    #[test]
     fn tool_calls_unwrap_handles_stringified_arguments() {
         // OpenAI-compatible providers serialize arguments as a JSON string.
         let tool_calls = vec![serde_json::json!({
@@ -3708,13 +3907,15 @@ mod tests {
                 tools: &[serde_json::Value],
             ) -> Result<GenerationResponse, ProviderAdapterError> {
                 // Verify tools were sent. F38 injects `complete_run` at
-                // index 0 and #697 R5-A injects `spawn_subagent` at index
-                // 1, so `grep` (the only registered tool here) sits at
-                // index 2.
+                // index 0, #825 injects `fail_run` at index 1, and
+                // #697 R5-A injects `spawn_subagent` at index 2, so
+                // `grep` (the only registered tool here) sits at
+                // index 3.
                 assert!(!tools.is_empty(), "tools should be passed to generate");
                 assert_eq!(tools[0]["function"]["name"], "complete_run");
-                assert_eq!(tools[1]["function"]["name"], "spawn_subagent");
-                assert_eq!(tools[2]["function"]["name"], "grep");
+                assert_eq!(tools[1]["function"]["name"], "fail_run");
+                assert_eq!(tools[2]["function"]["name"], "spawn_subagent");
+                assert_eq!(tools[3]["function"]["name"], "grep");
 
                 Ok(GenerationResponse {
                     text: String::new(), // no text — only tool_calls

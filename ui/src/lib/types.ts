@@ -545,7 +545,20 @@ export type FailureClass =
    * runs which short-circuit to terminal so G5's `child_completed`
    * signal fires and the parent's auto-resume can decide what to do.
    */
-  | "all_providers_exhausted";
+  | "all_providers_exhausted"
+  /**
+   * #825: the agent emitted `ActionType::FailRun` — a truthful
+   * self-report of "I tried, I cannot proceed." Distinct from
+   * `verification_rejected` (model lied about a passing build) and
+   * `execution_error` (infrastructure fault). R26 dogfood (2026-05-10)
+   * found sub-agents that correctly diagnosed their own blocker but
+   * had no terminal verb for it, so they called `complete_run` with
+   * a "Status: Blocked" summary and the run flipped to `completed`.
+   * This variant lets operator dashboards distinguish agent-declared
+   * failure (missing precondition, contradictory goal, dependency not
+   * met) from the other failure classes.
+   */
+  | "model_reported_failure";
 
 /** GET /v1/runs — array of RunRecord */
 export interface RunRecord {

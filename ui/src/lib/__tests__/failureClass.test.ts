@@ -43,6 +43,7 @@ export const FAILURE_CLASS_VALUES = [
   "verification_rejected",
   "orphan_child",
   "all_providers_exhausted",
+  "model_reported_failure",
 ] as const satisfies readonly FailureClass[];
 
 // ── Compile-time coverage ────────────────────────────────────────────────────

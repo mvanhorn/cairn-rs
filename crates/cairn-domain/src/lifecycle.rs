@@ -110,6 +110,28 @@ pub enum FailureClass {
     /// R3-B for the original waiting_approval transition and #750 for
     /// the parent-stuck-in-waiting_dependency bug this resolves.
     AllProvidersExhausted,
+    /// #825: the agent emitted `ActionType::FailRun` — a truthful
+    /// self-report of "I tried, I cannot proceed." R26 dogfood
+    /// surfaced the gap: before `FailRun` existed, a model that
+    /// correctly diagnosed its own block (e.g. "M1-7 needs M1-1
+    /// first") had only `CompleteRun` available as a terminal verb,
+    /// so it would call complete_run with a summary saying "Status:
+    /// Blocked" and the run flipped to `state=completed`. This
+    /// variant lets operator dashboards distinguish agent-declared
+    /// failure (usually: missing precondition, contradictory goal,
+    /// dependency not met) from `ExecutionError` (infrastructure
+    /// fault), `VerificationRejected` (model lied about a passing
+    /// build), and `ApprovalRejected` (operator declined).
+    ///
+    /// When the agent should prefer which terminal:
+    /// * `CompleteRun` — deliverable exists AND verification is clean.
+    /// * `FailRun` / `ModelReportedFailure` — the agent cannot produce
+    ///   the deliverable and no operator intervention would change
+    ///   that outcome.
+    /// * `EscalateToOperator` — the agent is paused waiting for
+    ///   specific operator input (approval, rotated credential,
+    ///   clarification) and resuming IS feasible.
+    ModelReportedFailure,
 }
 
 /// Canonical pause reasons in v1.
@@ -334,9 +356,23 @@ pub fn derive_session_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        can_resume_run_to, can_resume_task_to, derive_session_state, RunResumeTarget, RunState,
-        SessionState, TaskResumeTarget, TaskState,
+        can_resume_run_to, can_resume_task_to, derive_session_state, FailureClass, RunResumeTarget,
+        RunState, SessionState, TaskResumeTarget, TaskState,
     };
+
+    #[test]
+    fn failure_class_model_reported_failure_serialises_snake_case() {
+        // #825: the wire shape `"model_reported_failure"` is the
+        // contract between the orchestrator's reason-string classifier
+        // (classify_failed_reason) and operator dashboards / API
+        // consumers. Any rename breaks both.
+        assert_eq!(
+            serde_json::to_string(&FailureClass::ModelReportedFailure).unwrap(),
+            r#""model_reported_failure""#
+        );
+        let decoded: FailureClass = serde_json::from_str(r#""model_reported_failure""#).unwrap();
+        assert_eq!(decoded, FailureClass::ModelReportedFailure);
+    }
 
     #[test]
     fn session_derivation_prefers_archive() {

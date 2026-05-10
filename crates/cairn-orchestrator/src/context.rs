@@ -322,6 +322,7 @@ impl DecideOutput {
                     || matches!(
                         p.action_type,
                         cairn_domain::ActionType::CompleteRun
+                            | cairn_domain::ActionType::FailRun
                             | cairn_domain::ActionType::EscalateToOperator
                             | cairn_domain::ActionType::SpawnSubagent
                     )
@@ -629,6 +630,7 @@ pub struct BreakerConfig {
     /// least one of:
     ///   * a proposal with a concrete `tool_name: Some(_)` (invoke_tool),
     ///   * an `ActionType::CompleteRun` proposal (intentional terminal),
+    ///   * an `ActionType::FailRun` proposal (intentional terminal, #825),
     ///   * an `ActionType::EscalateToOperator` proposal (intentional gate),
     ///   * an `ActionType::SpawnSubagent` proposal (intentional delegation).
     ///
@@ -790,6 +792,16 @@ mod tests {
             proposal(ActionType::SpawnSubagent, None),
         ]);
         assert_eq!(d.tool_or_terminal_count(), 2);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_counts_fail_run_without_tool_name() {
+        // #825: fail_run is an intentional terminal just like
+        // complete_run — the NoToolUseConsecutive breaker must not
+        // treat it as a zero-progress round right before execute
+        // dispatches the terminal.
+        let d = empty_decide(vec![proposal(ActionType::FailRun, None)]);
+        assert_eq!(d.tool_or_terminal_count(), 1);
     }
 
     #[test]

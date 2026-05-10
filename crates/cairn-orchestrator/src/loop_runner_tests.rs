@@ -3273,3 +3273,78 @@ async fn malformed_spawn_proposal_bounded_retry_cap_fails_run() {
         "no valid spawn was proposed, so no successful spawn should have run"
     );
 }
+
+// ── #825: FailRun terminates with Failed, not Completed ──────────────────
+
+/// #825: when DECIDE emits `ActionType::FailRun`, the loop must
+/// terminate with `LoopTermination::Failed { reason }` carrying the
+/// `model_reported_failure:` prefix — NOT `LoopTermination::Completed`.
+/// This is the end-to-end loop-level equivalent of the `derive_signal`
+/// unit test; it pins that every intervening phase (terminal-index
+/// scan in execute, loop-signal aggregation, termination mapping)
+/// preserves the Failed semantics.
+#[tokio::test]
+async fn fail_run_proposal_terminates_with_model_reported_failure() {
+    let decide_output = DecideOutput {
+        raw_response:
+            r#"[{"action_type":"fail_run","description":"blocked: src/main.rs missing"}]"#
+                .to_owned(),
+        proposals: vec![ActionProposal::fail_run(
+            "blocked: src/main.rs missing; depends on M1-1",
+            0.95,
+        )],
+        calibrated_confidence: 0.95,
+        requires_approval: false,
+        model_id: "test-model".to_owned(),
+        latency_ms: 10,
+        input_tokens: None,
+        output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
+    };
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        ScriptedDecide::always(decide_output),
+        // ScriptedExecute wraps every proposal as Succeeded and
+        // copies through the configured loop_signal. derive_signal
+        // (when the real execute runs) converts FailRun+Succeeded
+        // into Failed; we emulate that here by configuring the
+        // signal directly so the test is independent of the live
+        // RunService.
+        ScriptedExecute {
+            signal: LoopSignal::Failed {
+                reason: "model_reported_failure: blocked: src/main.rs missing; depends on M1-1"
+                    .to_owned(),
+            },
+        },
+        LoopConfig {
+            max_iterations: 5,
+            breakers: permissive_breakers(),
+            ..Default::default()
+        },
+    );
+
+    let result = lp.run(ctx()).await.unwrap();
+    match result {
+        LoopTermination::Failed { reason } => {
+            assert!(
+                reason.starts_with("model_reported_failure:"),
+                "#825: Failed reason MUST start with `model_reported_failure:` \
+                 so classify_failed_reason routes to \
+                 FailureClass::ModelReportedFailure. Got: {reason}"
+            );
+            assert!(
+                reason.contains("blocked: src/main.rs missing"),
+                "reason must preserve the agent's original text. Got: {reason}"
+            );
+        }
+        LoopTermination::Completed { .. } => panic!(
+            "#825 regression: FailRun MUST NOT map to Completed — that \
+             is the bug this feature exists to fix (R26 pathology)."
+        ),
+        other => panic!("expected LoopTermination::Failed, got {other:?}"),
+    }
+}
