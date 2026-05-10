@@ -156,6 +156,55 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `spawn_subagent_tool_def_uses_run_scoped_cache`. All 200 cairn-orchestrator unit tests
     pass; 311 cairn-app unit tests pass; `agent_roles_http` 20/20; `bootstrap_server` 34/34.
 
+- **RFC 031 PR-D2: operator-defined agent roles — editor polish.**
+  Lands draft persistence, the section-indicator rail, and the shared
+  source badge for the agent-role editor (RFC 031 §Draft persistence,
+  §Editor form layout).
+
+  Key changes:
+
+  - `ui/src/lib/agentRolePromptCheck.ts` — 227-LOC client-side preview
+    of the server's `validate_prompt_structure`. Same ATX-H2 regex +
+    counters (≥ 2 `### Phase` headings, ≥ 3 column-0 bullets) +
+    orchestrator-shadow exemption. Exposes `analysePrompt(prompt, roleId,
+    tier) → PromptStructureReport` with `SectionStatus[]` (id, label,
+    present, detail, offset) and `AntiPatternHit[]` (early_completion,
+    caps_adversarial, identity_shadow).
+
+  - `ui/src/hooks/useAgentRoleDraft.ts` — 250 ms debounced localStorage
+    draft hook. Key shape per RFC §Draft persistence:
+    `cairn:agent_role_draft:{tenant}:{workspace}:{project}:edit:{role_id}`
+    (edit) / `…:new:{tab_uuid}` (new, tab-isolated via sessionStorage).
+    Exposes `write`, `loadExisting`, `clear`.
+
+  - `ui/src/components/AgentRoleBadge.tsx` — extracted shared source
+    badge (`builtin` / `custom` / `custom_shadow`). Removes the inline
+    `sourceBadge` helpers PR-D1 duplicated in `AgentRolesPage` and
+    `AgentRoleDetailPage`.
+
+  - `ui/src/components/AgentRoleSectionRail.tsx` — present/missing/
+    insufficient badges with jump-to-section click handler (scrolls
+    the system-prompt textarea to the section header offset).
+
+  - `ui/src/pages/AgentRoleEditorPage.tsx` — wires draft persistence
+    (restore-draft banner on mount, debounced writes on every edit,
+    clear on save success) and the section-indicator rail below the
+    system-prompt textarea.
+
+  - `ui/src/lib/__tests__/agentRolePromptCheck.test.ts` — 11 unit
+    fixtures covering: all-present specialty prompt, section synonyms,
+    insufficient-phases, insufficient-bullets, missing sections,
+    orchestrator-shadow 2-section layout, orchestrator non-id tier
+    fallthrough, and all three anti-pattern regex shapes.
+
+  Verification: `npx tsc --noEmit` clean; 230/230 UI unit tests pass
+  (was 219; +11 `analysePrompt` fixtures). Lint baseline unchanged (109
+  existing errors, no new debt). `npm run build` clean; `cargo build -p
+  cairn-app` clean. Deferred to PR-D3: retract-during-active-run
+  confirmation modal, copy-to-project flow, history panel with prompt
+  diff, Playwright e2e smoke.
+
+
 - **RFC 031 PR-D1: operator-defined agent roles — UI first slice.**
   Lands the load-bearing operator journeys for RFC 031 in the cairn-app
   dashboard: list, detail, create, and edit agent roles end-to-end.

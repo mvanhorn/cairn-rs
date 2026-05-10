@@ -11,40 +11,15 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Edit2, Loader2, Shield, Trash2, User, Users, Wrench } from "lucide-react";
-import { clsx } from "clsx";
+import { ArrowLeft, Edit2, Loader2, Trash2, Wrench } from "lucide-react";
 
 import { defaultApi, ApiError } from "../lib/api";
 import { useToast } from "../components/Toast";
 import { useScope } from "../hooks/useScope";
-import type { AgentRoleSource } from "../lib/types";
+import { AgentRoleBadge } from "../components/AgentRoleBadge";
 
 interface Props {
   roleId: string;
-}
-
-function sourceBadge(source: AgentRoleSource) {
-  switch (source) {
-    case "builtin":
-      return {
-        label: "Built-in",
-        color:
-          "text-gray-500 dark:text-zinc-400 bg-gray-100/60 dark:bg-zinc-800/60 border-gray-200 dark:border-zinc-700",
-        icon: <Shield size={10} />,
-      };
-    case "custom":
-      return {
-        label: "Custom",
-        color: "text-indigo-400 bg-indigo-950/40 border-indigo-800/40",
-        icon: <User size={10} />,
-      };
-    case "custom_shadow":
-      return {
-        label: "Custom · shadows built-in",
-        color: "text-amber-400 bg-amber-950/40 border-amber-800/40",
-        icon: <Users size={10} />,
-      };
-  }
 }
 
 export function AgentRoleDetailPage({ roleId }: Props) {
@@ -107,7 +82,6 @@ export function AgentRoleDetailPage({ roleId }: Props) {
 
   const { item, etag } = data;
   const role = item.role;
-  const badge = sourceBadge(item.source);
   const isEditable = item.source === "custom" || item.source === "custom_shadow";
 
   const onEdit = () => {
@@ -137,15 +111,7 @@ export function AgentRoleDetailPage({ roleId }: Props) {
         <span className="text-[13px] font-medium text-gray-800 dark:text-zinc-200 font-mono">
           {role.role_id}
         </span>
-        <span
-          className={clsx(
-            "flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded border",
-            badge.color,
-          )}
-        >
-          {badge.icon}
-          {badge.label}
-        </span>
+        <AgentRoleBadge source={item.source} />
         {etag && (
           <span
             className="text-[10px] font-mono text-gray-400 dark:text-zinc-600"

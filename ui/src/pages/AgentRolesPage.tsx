@@ -12,43 +12,18 @@
  */
 
 import { useQuery } from "@tanstack/react-query";
-import { Loader2, Plus, Shield, User, Users, Wrench } from "lucide-react";
-import { clsx } from "clsx";
+import { Loader2, Plus, Wrench } from "lucide-react";
 
 import { defaultApi } from "../lib/api";
-import type { AgentRoleListItem, AgentRoleSource } from "../lib/types";
+import type { AgentRoleListItem } from "../lib/types";
 import { useScope } from "../hooks/useScope";
-
-function sourceBadge(source: AgentRoleSource) {
-  switch (source) {
-    case "builtin":
-      return {
-        label: "Built-in",
-        color:
-          "text-gray-500 dark:text-zinc-400 bg-gray-100/60 dark:bg-zinc-800/60 border-gray-200 dark:border-zinc-700",
-        icon: <Shield size={10} />,
-      };
-    case "custom":
-      return {
-        label: "Custom",
-        color: "text-indigo-400 bg-indigo-950/40 border-indigo-800/40",
-        icon: <User size={10} />,
-      };
-    case "custom_shadow":
-      return {
-        label: "Custom · shadows built-in",
-        color: "text-amber-400 bg-amber-950/40 border-amber-800/40",
-        icon: <Users size={10} />,
-      };
-  }
-}
+import { AgentRoleBadge } from "../components/AgentRoleBadge";
 
 interface RowProps {
   item: AgentRoleListItem;
 }
 
 function Row({ item }: RowProps) {
-  const badge = sourceBadge(item.source);
   const isEditable = item.source === "custom" || item.source === "custom_shadow";
   const onClick = () => {
     window.location.hash = `agent/${encodeURIComponent(item.role.role_id)}`;
@@ -63,15 +38,7 @@ function Row({ item }: RowProps) {
           <span className="text-[14px] font-semibold text-gray-900 dark:text-zinc-100 font-mono">
             {item.role.role_id}
           </span>
-          <span
-            className={clsx(
-              "flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded border",
-              badge.color,
-            )}
-          >
-            {badge.icon}
-            {badge.label}
-          </span>
+          <AgentRoleBadge source={item.source} />
           <span className="text-[10px] font-mono text-gray-400 dark:text-zinc-600 bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded px-1.5 py-0.5">
             {item.role.tier}
           </span>

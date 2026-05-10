@@ -1,8 +1,7 @@
 /**
- * RFC 031 PR-D1 — Agent Role editor page (create + edit in one form).
+ * RFC 031 PR-D — Agent Role editor page (create + edit in one form).
  *
- * Left pane: metadata fields (id, name, tier, description,
- * response_shape, max_context_tokens, tools, forbid_all_tools).
+ * Left pane: metadata fields + section-indicator rail.
  * Right pane: system_prompt textarea with size counter.
  *
  * §D6: on edit the `id` field is disabled; the server rejects PATCH
@@ -13,12 +12,18 @@
  * `details.failures[]` renders as inline field errors; unknown codes
  * fall through to a form-level banner (forward-compat).
  *
- * Draft-persistence (localStorage), section-indicator rail, copy-to-
- * project, and retract-during-active-run confirmation all land in
- * PR-D2 / PR-D3.
+ * PR-D2 adds:
+ *   - Client-side section-indicator rail (preview of the server's
+ *     structural validator; `lib/agentRolePromptCheck.ts`).
+ *   - Draft persistence to localStorage via `useAgentRoleDraft` — 250 ms
+ *     debounced writes, Restore-draft banner on mount, clear on
+ *     successful save.
+ *
+ * Copy-to-project and retract-during-active-run confirmation are
+ * PR-D3 follow-ups.
  */
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Loader2, Save, Wrench, X } from "lucide-react";
 import { clsx } from "clsx";
@@ -26,6 +31,9 @@ import { clsx } from "clsx";
 import { defaultApi, ApiError } from "../lib/api";
 import { useToast } from "../components/Toast";
 import { useScope } from "../hooks/useScope";
+import { AgentRoleSectionRail } from "../components/AgentRoleSectionRail";
+import { analysePrompt } from "../lib/agentRolePromptCheck";
+import { useAgentRoleDraft } from "../hooks/useAgentRoleDraft";
 import type {
   AgentRole,
   AgentRoleAdvisory,
@@ -154,11 +162,38 @@ export function AgentRoleEditorPage({ mode, roleId }: Props) {
   // is safe here per React docs ("Storing information from previous
   // renders") and avoids the `react-hooks/set-state-in-effect` rule
   // the bare `useEffect` path triggers.
-  const [form, setForm] = useState<FormState>(EMPTY_FORM);
+  const [form, setFormState] = useState<FormState>(EMPTY_FORM);
   const [etag, setEtag] = useState<string | null>(null);
   const [seededFrom, setSeededFrom] = useState<unknown>(null);
   const [failures, setFailures] = useState<ValidationFailure[]>([]);
   const [warnings, setWarnings] = useState<AgentRoleAdvisory[]>([]);
+
+  // RFC 031 PR-D2 §Draft persistence — debounced localStorage-backed
+  // draft. See `useAgentRoleDraft` docstring for the key shape.
+  const draft = useAgentRoleDraft<FormState>({
+    scope: {
+      tenant: scope.tenant_id,
+      workspace: scope.workspace_id,
+      project: scope.project_id,
+    },
+    mode,
+    roleId,
+  });
+
+  // Wrap `setForm` so every user edit writes the draft. The initial
+  // server-sync seed below (when `seededFrom !== data`) also writes
+  // the draft, but that's fine — the debounce swallows the immediate
+  // re-hit when the operator starts typing, and the saved envelope
+  // is overwritten with the first post-seed edit anyway.
+  const setForm: typeof setFormState = (next) => {
+    setFormState((prev) => {
+      const resolved = typeof next === "function"
+        ? (next as (p: FormState) => FormState)(prev)
+        : next;
+      draft.write(resolved);
+      return resolved;
+    });
+  };
 
   if (
     mode === "edit" &&
@@ -166,8 +201,37 @@ export function AgentRoleEditorPage({ mode, roleId }: Props) {
     seededFrom !== initialQuery.data
   ) {
     setSeededFrom(initialQuery.data);
-    setForm(roleToForm(initialQuery.data.item.role));
+    setFormState(roleToForm(initialQuery.data.item.role));
     setEtag(initialQuery.data.etag);
+  }
+
+  // RFC 031 PR-D2 §Draft persistence — restore banner. Load once on
+  // mount; the `loadedDraft` state-slot memoises the decision so the
+  // banner stays put until the operator accepts or dismisses it.
+  const [loadedDraft, setLoadedDraft] = useState<{
+    savedAt: number;
+    data: FormState;
+  } | null | "checked">(null);
+  if (loadedDraft === null) {
+    const envelope = draft.loadExisting();
+    // Only surface the banner if the draft differs from the current
+    // form state — if the operator lands on the editor with an empty
+    // draft, no banner should fire. For edit-mode we defer until the
+    // initial fetch has seeded, so the comparison is meaningful.
+    if (mode === "new") {
+      if (envelope && JSON.stringify(envelope.data) !== JSON.stringify(EMPTY_FORM)) {
+        setLoadedDraft({ savedAt: envelope.saved_at, data: envelope.data });
+      } else {
+        setLoadedDraft("checked");
+      }
+    } else if (mode === "edit" && initialQuery.data) {
+      const serverState = roleToForm(initialQuery.data.item.role);
+      if (envelope && JSON.stringify(envelope.data) !== JSON.stringify(serverState)) {
+        setLoadedDraft({ savedAt: envelope.saved_at, data: envelope.data });
+      } else {
+        setLoadedDraft("checked");
+      }
+    }
   }
 
   // ── Client-side size checks (server is authoritative) ──
@@ -194,6 +258,35 @@ export function AgentRoleEditorPage({ mode, roleId }: Props) {
     form.name.length <= NAME_MAX_CHARS;
 
   const canSubmit = idValid && sizesOk && form.name.trim().length > 0 && form.system_prompt.trim().length > 0;
+
+  // RFC 031 PR-D2 §Editor form layout — live structural-validation preview.
+  const promptReport = useMemo(
+    () => analysePrompt(form.system_prompt, form.id || "generic", form.tier),
+    [form.system_prompt, form.id, form.tier],
+  );
+
+  // Textarea ref for "jump to section" from the rail. Byte offsets
+  // from `analysePrompt` are UTF-8 counts; they coincide with string
+  // char indices inside the ASCII-dominant RFC-031 prompts, so we
+  // use them as selection endpoints directly.
+  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const jumpToOffset = (offset: number) => {
+    const el = promptTextareaRef.current;
+    if (!el) return;
+    el.focus();
+    try {
+      el.setSelectionRange(offset, offset);
+      // Scroll the caret roughly into view. Textareas don't expose a
+      // scrollTo-selection API; approximate by a ratio of char-offset
+      // to total-length times scrollHeight.
+      const ratio = form.system_prompt.length > 0 ? offset / form.system_prompt.length : 0;
+      el.scrollTop = Math.max(0, ratio * el.scrollHeight - el.clientHeight / 2);
+    } catch {
+      /* setSelectionRange may reject on Safari when the element is
+       * not focused; the focus() above should prevent that, but the
+       * try/catch keeps the rail resilient. */
+    }
+  };
 
   // ── Submit ──
   const saveMut = useMutation({
@@ -239,6 +332,11 @@ export function AgentRoleEditorPage({ mode, roleId }: Props) {
           ? `Created ${r.result.role.role_id}.`
           : `Updated ${r.result.role.role_id}.`,
       );
+      // RFC 031 PR-D2 §Draft persistence — clear on success. New-shape
+      // keys die with the tab_uuid anyway; edit-shape keys stick
+      // around and would otherwise surface a stale Restore banner
+      // on the next navigation into the editor.
+      draft.clear();
       qc.invalidateQueries({ queryKey: ["agent-roles"] });
       qc.invalidateQueries({ queryKey: ["agent-role"] });
       window.location.hash = `agent/${encodeURIComponent(r.result.role.role_id)}`;
@@ -332,6 +430,40 @@ export function AgentRoleEditorPage({ mode, roleId }: Props) {
       </div>
 
       <div className="flex-1 overflow-y-auto p-5">
+        {/* RFC 031 PR-D2 §Draft persistence — restore banner. */}
+        {loadedDraft && typeof loadedDraft === "object" && (
+          <div className="max-w-6xl mb-4 rounded-lg border border-amber-400 dark:border-amber-600 bg-amber-50 dark:bg-amber-950/40 px-4 py-3 flex items-center justify-between gap-3">
+            <p className="text-[12px] text-amber-800 dark:text-amber-200">
+              <span className="font-semibold">Unsaved draft found.</span>{" "}
+              Last edit at{" "}
+              <span className="font-mono">
+                {new Date(loadedDraft.savedAt).toLocaleString()}
+              </span>
+              {" — restore your in-progress changes?"}
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => {
+                  setFormState(loadedDraft.data);
+                  setLoadedDraft("checked");
+                }}
+                className="px-3 py-1 rounded-md bg-amber-600 hover:bg-amber-500 text-white text-[11px] font-medium transition-colors"
+              >
+                Restore
+              </button>
+              <button
+                onClick={() => {
+                  draft.clear();
+                  setLoadedDraft("checked");
+                }}
+                className="px-3 py-1 rounded-md border border-amber-400 dark:border-amber-700 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-950/70 text-[11px] font-medium transition-colors"
+              >
+                Discard
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="max-w-6xl grid grid-cols-1 lg:grid-cols-2 gap-5">
           {/* Left pane — metadata */}
           <div className="space-y-4">
@@ -558,6 +690,7 @@ export function AgentRoleEditorPage({ mode, roleId }: Props) {
               </span>
             </div>
             <textarea
+              ref={promptTextareaRef}
               value={form.system_prompt}
               onChange={(e) =>
                 setForm((f) => ({ ...f, system_prompt: e.target.value }))
@@ -574,6 +707,11 @@ export function AgentRoleEditorPage({ mode, roleId }: Props) {
               Orchestrator-shadow prompts only need Completion criteria + What not to do.
             </p>
             {fieldError("system_prompt")}
+
+            {/* RFC 031 PR-D2 §Editor form layout — section-indicator rail. */}
+            <div className="mt-3 rounded-lg border border-gray-200 dark:border-zinc-800 bg-gray-50/60 dark:bg-zinc-900/60 p-3">
+              <AgentRoleSectionRail report={promptReport} onJumpTo={jumpToOffset} />
+            </div>
           </div>
         </div>
 
