@@ -351,6 +351,108 @@ pub fn extract_verification(tool_results: &[ActionResult]) -> CompletionVerifica
     acc.finish()
 }
 
+/// Maximum chars the sentinel scan inspects at the start of a
+/// `complete_run` final answer. Admission phrases live in the opening
+/// status line by convention (`"## Status: Blocked"`, `"Task
+/// incomplete."`), so a short head-cap is enough. Free text further
+/// down can legitimately mention `"failed"` / `"not implemented"`
+/// (e.g. a researcher's report saying `"upstream API failed when X"`).
+/// Scanning the whole answer would fire on those false positives.
+const SENTINEL_SCAN_HEAD_CHARS: usize = 200;
+
+/// Phrases whose presence in the opening of a `complete_run`
+/// `final_answer` indicates the model is self-reporting failure
+/// rather than delivering a real result. R27 dogfood surfaced that
+/// even with `ActionType::FailRun` published as a native tool,
+/// glm-4.7 still picks `complete_run` and writes summaries like
+/// `"Task incomplete. The following was NOT performed: ..."`.
+///
+/// Each phrase is lower-cased ASCII — the scanner lowercases the
+/// head of the answer before matching so `"## Status: Blocked"`
+/// matches `"status: blocked"` without the caller having to think
+/// about casing.
+///
+/// Keep this list **narrow**. Additions must be:
+/// * admissions of the run's terminal status — not neutral text that
+///   happens to mention failure (a research report describing an
+///   upstream failure is NOT an admission of failure by the current
+///   run);
+/// * phrases that appear at the TOP of the admission, because the
+///   scan is head-anchored;
+/// * distinctive enough that they don't fire on legitimate prose.
+///
+/// Every phrase here must be covered by the
+/// `sentinel_scan_matches_r26_r27_admission_shapes` unit test.
+const FAILURE_ADMISSION_SENTINELS: &[&str] = &[
+    // R26 / R27 observed shapes — exact phrases the models emitted.
+    "status: blocked",
+    "status: partially complete",
+    "task incomplete",
+    "cannot provide",
+    "cannot complete",
+    "unable to complete",
+    "unable to proceed",
+    // R27 summary verb-specific variants — "was never executed"
+    // ("cargo init was never run"), "was never run", "was never
+    // written" (src/main.rs), "was never added" (deps), "was never
+    // committed" (git flow). Anchored to the verb so legitimate
+    // prose like "performance was never a concern" doesn't match.
+    // The list is narrow by design; add a new verb here (and the
+    // sentinel test) only when dogfood surfaces it.
+    "was never executed",
+    "was never run",
+    "was never written",
+    "was never added",
+    "was never committed",
+    "was never created",
+    // Plural variants of the above ("were never performed", "were
+    // never added", "were never committed"). Same anchoring
+    // discipline — the bigram `were never` alone is too broad.
+    "were never performed",
+    "were never added",
+    "were never completed",
+    "were never committed",
+    "were never run",
+    // Bulleted-status shapes seen in R27: "- ❌ <item>" at the top.
+    // We don't anchor on the ❌ emoji itself because that's not
+    // reliably ASCII-decomposable, but the accompanying prose
+    // "not performed" / "not completed" is.
+    "not performed",
+    "not completed",
+];
+
+/// Scan the opening of a `complete_run` proposal's `final_answer` for
+/// phrases that indicate the model is self-reporting failure. Returns
+/// the first matched sentinel if one is present, otherwise `None`.
+///
+/// The strict completion gate in `loop_runner` calls this as a third
+/// reject condition (alongside `errors_since_baseline > 0` and
+/// `stalled_since_rejection`). See the [`FAILURE_ADMISSION_SENTINELS`]
+/// rustdoc for the list and the contract additions must honour.
+///
+/// R26/R27 pathology: models had `ActionType::FailRun` available
+/// (published in tool_defs, documented in the role prompts) and still
+/// picked `complete_run` for admitted failures. This scan is the
+/// server-side backstop for that non-compliance.
+pub fn detect_self_reported_failure(final_answer: &str) -> Option<&'static str> {
+    // Build the head once, lower-casing each char during iteration so
+    // the scan runs against a single allocation. `to_ascii_lowercase`
+    // on a char is a no-op for non-ASCII (the sentinels are all ASCII
+    // so non-ASCII chars can't contribute to a match anyway). The
+    // head is bounded at `SENTINEL_SCAN_HEAD_CHARS`; amortised cost
+    // is negligible versus the LLM call that produced `final_answer`.
+    let head: String = final_answer
+        .chars()
+        .take(SENTINEL_SCAN_HEAD_CHARS)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+
+    FAILURE_ADMISSION_SENTINELS
+        .iter()
+        .find(|sentinel| head.contains(*sentinel))
+        .copied()
+}
+
 /// Yield each scannable `&str` from an `ActionResult` without cloning. For
 /// structured JSON tool outputs we look at a small set of canonical key
 /// names (`stdout`, `stderr`, `output`, `message`, …) rather than the
@@ -859,5 +961,125 @@ error[E0308]: mismatched types
         // Next rejection resets progress to false again.
         acc.mark_baseline();
         assert!(!acc.made_progress_since_baseline());
+    }
+
+    // ── #830: sentinel-scan on complete_run.final_answer ────────────────────
+
+    /// Every R26/R27 observed admission shape must match. If a new
+    /// dogfood round surfaces a new shape, add it here before
+    /// extending [`FAILURE_ADMISSION_SENTINELS`] — the dogfood
+    /// finding is the contract.
+    #[test]
+    fn sentinel_scan_matches_r26_r27_admission_shapes() {
+        // R26 (M1-7): "## Status: Blocked - src/main.rs does not exist"
+        assert!(detect_self_reported_failure(
+            "## Status: Blocked - src/main.rs does not exist\n\nThe repository was cloned..."
+        )
+        .is_some());
+
+        // R26 (M1-8): "**Status: Partially Complete - Cannot provide final deliverables**"
+        assert!(detect_self_reported_failure(
+            "**Status: Partially Complete - Cannot provide final deliverables**"
+        )
+        .is_some());
+
+        // R27 (M1-1): "Task incomplete. The repository was cloned and branch ..."
+        assert!(detect_self_reported_failure(
+            "Task incomplete. The repository was cloned and branch `m1/01-cargo-init` \
+             was created, but the following required steps were NOT performed:\n\
+             1. `cargo init --name roguelike` was never executed (no Cargo.toml or src/ exists)"
+        )
+        .is_some());
+
+        // R27 shape — specific verb forms the executor's summary used.
+        assert!(
+            detect_self_reported_failure("The cargo check was never run to verify the build.")
+                .is_some()
+        );
+        assert!(
+            detect_self_reported_failure("cargo init was never executed").is_some(),
+            "R27 exact phrase"
+        );
+        assert!(
+            detect_self_reported_failure("src/main.rs was never written").is_some(),
+            "R27 exact phrase"
+        );
+        assert!(
+            detect_self_reported_failure("Dependencies were never added to Cargo.toml").is_some(),
+            "R27 plural-verb exact phrase"
+        );
+
+        // "Cannot provide" / "Unable to complete" variants.
+        assert!(detect_self_reported_failure("Cannot provide the requested files.").is_some());
+        assert!(detect_self_reported_failure("Unable to complete this task.").is_some());
+    }
+
+    /// Case-insensitivity is a contract — the scan lower-cases the
+    /// head before matching. Models emit these phrases with varying
+    /// capitalisation (`## Status: Blocked`, `STATUS: BLOCKED`, etc.)
+    /// so the scan must catch all of them without per-case sentinels.
+    #[test]
+    fn sentinel_scan_is_case_insensitive() {
+        assert!(detect_self_reported_failure("STATUS: BLOCKED - missing dep").is_some());
+        assert!(detect_self_reported_failure("Status: Blocked - missing dep").is_some());
+        assert!(detect_self_reported_failure("status: blocked - missing dep").is_some());
+    }
+
+    /// Which sentinel matched is surfaced verbatim in the rejection
+    /// `StepSummary` so the model sees the exact phrase that tripped
+    /// the gate. Assert that the returned &str is actually one of
+    /// the configured sentinels (not some reconstructed substring).
+    #[test]
+    fn sentinel_scan_returns_the_matched_phrase() {
+        let matched = detect_self_reported_failure("## Status: Blocked - missing dep")
+            .expect("expected a sentinel match");
+        assert_eq!(matched, "status: blocked");
+    }
+
+    /// Regression: **legitimate** complete_run answers must NOT
+    /// match a sentinel. The scan is head-anchored so a bullet list
+    /// or prose answer with no admission prefix flows through.
+    #[test]
+    fn sentinel_scan_does_not_fire_on_legitimate_answers() {
+        // Factual prose answer.
+        assert!(detect_self_reported_failure("Paris is the capital of France.").is_none());
+
+        // Structured bullet deliverable.
+        assert!(detect_self_reported_failure(
+            "Changes applied:\n- Renamed parse_raw → parse_input in parser.rs:42\n\
+             - Updated caller at lib.rs:88\n- cargo check -p bar passes."
+        )
+        .is_none());
+
+        // A researcher's report mentioning an upstream failure far
+        // from the top — past the SENTINEL_SCAN_HEAD_CHARS window.
+        let padding = "a".repeat(SENTINEL_SCAN_HEAD_CHARS);
+        let legitimate = format!(
+            "Summary of findings.\n\n{padding}\nThe upstream API failed when X (unrelated)."
+        );
+        assert!(
+            detect_self_reported_failure(&legitimate).is_none(),
+            "text past the head-scan window must NOT fire the gate"
+        );
+
+        // An answer that happens to use words from the sentinel list
+        // in non-admission contexts.
+        assert!(
+            detect_self_reported_failure(
+                "The algorithm works as follows. Performance was never a concern because X."
+            )
+            .is_none(),
+            "free text with 'was never' but no terminal-status admission must not match"
+        );
+    }
+
+    /// Empty / whitespace-only final_answer: no match. Those are a
+    /// different kind of bug (complete_run without a useful summary)
+    /// that decide_impl's missing-final_answer fallback handles by
+    /// escalating to the operator.
+    #[test]
+    fn sentinel_scan_empty_answer_does_not_match() {
+        assert!(detect_self_reported_failure("").is_none());
+        assert!(detect_self_reported_failure("   \n\n\t ").is_none());
     }
 }

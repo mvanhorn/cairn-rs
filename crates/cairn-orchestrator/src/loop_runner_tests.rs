@@ -3348,3 +3348,156 @@ async fn fail_run_proposal_terminates_with_model_reported_failure() {
         other => panic!("expected LoopTermination::Failed, got {other:?}"),
     }
 }
+
+// ── #830: sentinel-scan rejects complete_run with admission summaries ────
+
+/// #830: models that ignore the `fail_run` verb and emit `complete_run`
+/// with a `final_answer` self-admitting failure must be caught by the
+/// strict completion gate. Three consecutive rejections fire the
+/// verification_rejected terminal so the run fails loudly instead of
+/// flipping to state=completed with the lie buried in the summary
+/// (R27 pathology, reproduced by this fixture).
+///
+/// The fixture mirrors what R27 captured on the wire: every DECIDE
+/// turn emits a complete_run proposal whose description opens with
+/// an admission shape. With the gate in place: 3 rejections →
+/// Failed(verification_rejected). Without it: the first attempt would
+/// flip to Completed.
+#[tokio::test]
+async fn completion_gate_rejects_complete_run_admission_and_fails_after_three() {
+    use cairn_domain::ActionProposal;
+
+    struct AdmissionDecide;
+    #[async_trait]
+    impl DecidePhase for AdmissionDecide {
+        async fn decide(
+            &self,
+            _ctx: &OrchestrationContext,
+            _: &GatherOutput,
+        ) -> Result<DecideOutput, OrchestratorError> {
+            // R27-shape admission: the model explicitly acknowledges
+            // the work is incomplete but still wraps it as a success.
+            let description = "Task incomplete. The repository was cloned and branch \
+                was created, but the following required steps were NOT performed: \
+                cargo init was never executed, Cargo.toml was never written, \
+                dependencies were never added, cargo check was never run.";
+            Ok(DecideOutput {
+                raw_response: r#"[{"action_type":"complete_run","description":"..."}]"#.to_owned(),
+                proposals: vec![ActionProposal::complete_run(description, 0.95)],
+                calibrated_confidence: 0.95,
+                requires_approval: false,
+                model_id: "test-model".to_owned(),
+                latency_ms: 10,
+                input_tokens: None,
+                output_tokens: None,
+                system_prompt: String::new(),
+                messages_json: "[]".to_owned(),
+                tool_calls_json: "[]".to_owned(),
+                tool_defs_json: "[]".to_owned(),
+            })
+        }
+    }
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        AdmissionDecide,
+        // Execute signals Done on CompleteRun success. The gate
+        // strips CompleteRun before execute sees it, so this path
+        // is never reached under #830 — but configuring Done here
+        // proves the pre-#830 bug shape: if the gate let the
+        // proposal through, the loop would terminate Completed.
+        ScriptedExecute {
+            signal: LoopSignal::Done,
+        },
+        LoopConfig {
+            max_iterations: 20,
+            breakers: permissive_breakers(),
+            orchestrator_strict_completion_gate: true,
+            ..Default::default()
+        },
+    );
+
+    let result = lp.run(ctx()).await.unwrap();
+
+    match result {
+        LoopTermination::Failed { reason } => {
+            assert!(
+                reason.starts_with("verification_rejected:"),
+                "#830: Failed reason MUST start with `verification_rejected:` \
+                 so classify_failed_reason routes to \
+                 FailureClass::VerificationRejected. Got: {reason}"
+            );
+            assert!(
+                reason.contains("self-reporting failure") || reason.contains("sentinel"),
+                "#830: cap-hit reason should surface the admission-sentinel \
+                 termination path so operators can distinguish it from an \
+                 error-bucket verification_rejected. Got: {reason}"
+            );
+        }
+        LoopTermination::Completed { .. } => panic!(
+            "#830 regression: admission-shaped complete_run MUST NOT flip \
+             the run to Completed — that is the R26/R27 pathology this \
+             feature exists to fix."
+        ),
+        other => panic!("expected LoopTermination::Failed, got {other:?}"),
+    }
+}
+
+/// #830 regression guard: the sentinel scan must NOT fire on a
+/// legitimate complete_run. A clean final_answer (a bullet-list
+/// deliverable, a prose answer, etc.) flows through and the loop
+/// terminates Completed.
+#[tokio::test]
+async fn completion_gate_allows_legitimate_complete_run_answers() {
+    use cairn_domain::ActionProposal;
+
+    struct LegitimateDecide;
+    #[async_trait]
+    impl DecidePhase for LegitimateDecide {
+        async fn decide(
+            &self,
+            _ctx: &OrchestrationContext,
+            _: &GatherOutput,
+        ) -> Result<DecideOutput, OrchestratorError> {
+            Ok(DecideOutput {
+                raw_response: r#"[{"action_type":"complete_run","description":"..."}]"#.to_owned(),
+                proposals: vec![ActionProposal::complete_run(
+                    "Renamed parse_raw to parse_input in parser.rs:42. \
+                     Updated caller at lib.rs:88. cargo check -p bar passes.",
+                    0.95,
+                )],
+                calibrated_confidence: 0.95,
+                requires_approval: false,
+                model_id: "test-model".to_owned(),
+                latency_ms: 10,
+                input_tokens: None,
+                output_tokens: None,
+                system_prompt: String::new(),
+                messages_json: "[]".to_owned(),
+                tool_calls_json: "[]".to_owned(),
+                tool_defs_json: "[]".to_owned(),
+            })
+        }
+    }
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        LegitimateDecide,
+        ScriptedExecute {
+            signal: LoopSignal::Done,
+        },
+        LoopConfig {
+            max_iterations: 5,
+            breakers: permissive_breakers(),
+            orchestrator_strict_completion_gate: true,
+            ..Default::default()
+        },
+    );
+
+    let result = lp.run(ctx()).await.unwrap();
+    assert!(
+        matches!(result, LoopTermination::Completed { .. }),
+        "#830: a legitimate complete_run answer must pass the sentinel scan \
+         and terminate Completed. Got: {result:?}"
+    );
+}

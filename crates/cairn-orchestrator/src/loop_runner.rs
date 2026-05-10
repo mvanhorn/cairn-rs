@@ -1514,25 +1514,53 @@ where
                 // rejected because earlier `git status` runs had
                 // emitted `error: src refspec ...` style lines that
                 // were no longer relevant.
-                // #823 review (Gemini): two conditions reject:
-                //   (a) errors_since_baseline > 0 — the model
-                //       introduced fresh errors since the last
-                //       attempt (or this is the first attempt with
-                //       any errors at all).
-                //   (b) baseline is active AND the model made no
-                //       tool-call progress between rejections.
-                //       Without this the model can bypass the gate
-                //       by retrying complete_run with zero work
-                //       done; #660's #821-aware fixture proves this
-                //       was a real hole.
-                let proposes_complete_run = decide_output
+                // Three conditions reject a CompleteRun proposal:
+                //   (a) #823 review (Gemini) — errors_since_baseline
+                //       > 0: the model introduced fresh errors since
+                //       the last attempt (or this is the first
+                //       attempt with any errors at all).
+                //   (b) #823 review (Gemini) — baseline is active AND
+                //       the model made no tool-call progress between
+                //       rejections. Without this the model can bypass
+                //       the gate by retrying complete_run with zero
+                //       work done; #660's #821-aware fixture proves
+                //       this was a real hole.
+                //   (c) #830 — the proposal's `final_answer` opens
+                //       with a failure-admission sentinel (R27 saw
+                //       glm-4.7 call complete_run with `"Task
+                //       incomplete. The following was NOT performed:
+                //       ..."` even though ActionType::FailRun was in
+                //       the published tool_defs). Server-side backstop
+                //       for model non-compliance with the prompt-level
+                //       "use fail_run when blocked" directive.
+                // Single pass over proposals: the CompleteRun
+                // lookup for `proposes_complete_run` and `#830`'s
+                // sentinel scan both need the same proposal, so find
+                // it once (Gemini review, medium).
+                let complete_run_proposal = decide_output
                     .proposals
                     .iter()
-                    .any(|p| p.action_type == cairn_domain::ActionType::CompleteRun);
+                    .find(|p| p.action_type == cairn_domain::ActionType::CompleteRun);
+                let proposes_complete_run = complete_run_proposal.is_some();
                 let has_new_errors = verification_acc.errors_since_baseline() > 0;
                 let stalled_since_rejection = !verification_acc.made_progress_since_baseline();
-                let gate_would_reject =
-                    proposes_complete_run && (has_new_errors || stalled_since_rejection);
+
+                // #830: scan the CompleteRun proposal's final_answer
+                // (stored in `description` per decide_impl's
+                // translation) for admission sentinels. `None` when
+                // no CompleteRun is in proposals or description is
+                // empty — either way the gate has nothing to
+                // inspect on this condition, preserving the pre-#830
+                // branch behaviour.
+                let self_reported_failure: Option<&'static str> =
+                    complete_run_proposal.and_then(|p| {
+                        crate::completion_verification::detect_self_reported_failure(&p.description)
+                    });
+
+                let gate_would_reject = proposes_complete_run
+                    && (has_new_errors
+                        || stalled_since_rejection
+                        || self_reported_failure.is_some());
 
                 if gate_would_reject {
                     let error_count = verification_acc.errors_since_baseline();
@@ -1551,6 +1579,7 @@ where
                         rejection_num = completion_gate_rejections,
                         error_count,
                         stalled_since_rejection,
+                        self_reported_failure_sentinel = self_reported_failure.unwrap_or(""),
                         "#660 strict completion gate rejecting complete_run"
                     );
 
@@ -1563,7 +1592,20 @@ where
                         // `FailureClass::VerificationRejected` terminal
                         // state. Keep the literal prefix stable — it's a
                         // contract with `crates/cairn-app/src/handlers/runs/helpers.rs`.
-                        let reason = if stalled_since_rejection && error_count == 0 {
+                        let reason = if let Some(sentinel) = self_reported_failure {
+                            // #830: the model kept calling complete_run
+                            // with a failure-admission summary even
+                            // after 3 rejections telling it to use
+                            // fail_run. Terminal reason names the
+                            // sentinel so operators see WHY in the
+                            // run record.
+                            format!(
+                                "verification_rejected: {completion_gate_rejections} \
+                                 complete_run attempts with a summary self-reporting \
+                                 failure (sentinel: {sentinel:?}). The agent should \
+                                 have called fail_run instead."
+                            )
+                        } else if stalled_since_rejection && error_count == 0 {
                             format!(
                                 "verification_rejected: {completion_gate_rejections} \
                                  complete_run attempts with no intervening tool call \
@@ -1600,7 +1642,26 @@ where
                     // `decide_impl::build_user_message`). Marked
                     // `succeeded=false` so the model reads it as a
                     // failure signal, not a completed action.
-                    let rejection_summary = if stalled_since_rejection && error_count == 0 {
+                    let rejection_summary = if let Some(sentinel) = self_reported_failure {
+                        // #830: the model's final_answer opens with a
+                        // failure-admission phrase — it knows the run
+                        // isn't done but called complete_run anyway.
+                        // Tell it explicitly: use fail_run, or keep
+                        // working. The quoted sentinel shows the
+                        // model exactly which phrase was matched so
+                        // it doesn't have to guess what tripped the
+                        // gate.
+                        format!(
+                            "complete_run refused by strict completion gate: \
+                             your final_answer opens with {sentinel:?}, which \
+                             is a failure-admission phrase. Call `fail_run` \
+                             with that reason to terminate truthfully, OR do \
+                             the work that's still outstanding and retry \
+                             complete_run once the deliverable actually exists \
+                             (attempt {completion_gate_rejections} of {}).",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                        )
+                    } else if stalled_since_rejection && error_count == 0 {
                         // #823 review (Gemini): tell the model
                         // explicitly that retrying complete_run with
                         // no work in between is the bypass we're
