@@ -2200,7 +2200,9 @@ fn parse_spawn_subagent_args(args: &serde_json::Value) -> (String, String) {
 /// declares `string`, and a malformed shape is better dropped than
 /// propagated to `TaskService::spawn_subagent` which would reject it
 /// with a less-specific error.
-fn extract_spawn_subagent_optionals(args: &serde_json::Value) -> (Option<String>, Option<String>) {
+pub(crate) fn extract_spawn_subagent_optionals(
+    args: &serde_json::Value,
+) -> (Option<String>, Option<String>) {
     let obj = match args.as_object() {
         Some(o) => o,
         None => return (None, None),
@@ -3027,6 +3029,58 @@ mod tests {
         assert!(
             reuse.is_none(),
             "empty reuse_sandbox_from must drop to None"
+        );
+    }
+
+    /// #844 PR-2 (Gemini review): the legacy nested shape — emitted by
+    /// text-parsing-mode runs on pre-#697 system prompts — must yield
+    /// the same extracted values as the flat shape. Before the shared
+    /// helper was `pub(crate)` and reused in `execute_impl`, the
+    /// execute side's inline `tool_args.get(...)` only looked at the
+    /// top level and silently dropped reuse/parent_context on the
+    /// nested shape.
+    #[test]
+    fn extract_spawn_subagent_optionals_handles_legacy_nested_shape() {
+        let args = serde_json::json!({
+            "tool_name": "executor",
+            "tool_args": {
+                "goal": "g",
+                "parent_context": "nested ctx",
+                "reuse_sandbox_from": "run_nested_123"
+            }
+        });
+        let (pc, reuse) = extract_spawn_subagent_optionals(&args);
+        assert_eq!(pc.as_deref(), Some("nested ctx"));
+        assert_eq!(reuse.as_deref(), Some("run_nested_123"));
+    }
+
+    /// #844 PR-2 (Copilot review): `reuse_sandbox_from` must carry
+    /// through to the adapter whether it originated from the flat or
+    /// the legacy nested shape. The shared extractor is the single
+    /// source of truth for both forms — a regression where
+    /// `execute_impl` or `decide_impl` uses a different extraction
+    /// path would diverge silently. This test pins byte-identical
+    /// results across the two shapes.
+    #[test]
+    fn extract_spawn_subagent_optionals_flat_and_nested_agree() {
+        let flat = serde_json::json!({
+            "role": "executor",
+            "goal": "g",
+            "parent_context": "ctx",
+            "reuse_sandbox_from": "run_abc"
+        });
+        let nested = serde_json::json!({
+            "tool_name": "executor",
+            "tool_args": {
+                "goal": "g",
+                "parent_context": "ctx",
+                "reuse_sandbox_from": "run_abc"
+            }
+        });
+        assert_eq!(
+            extract_spawn_subagent_optionals(&flat),
+            extract_spawn_subagent_optionals(&nested),
+            "flat and legacy-nested shapes must produce identical optionals"
         );
     }
 

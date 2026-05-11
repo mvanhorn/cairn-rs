@@ -2219,27 +2219,37 @@ impl TaskService for FabricTaskServiceAdapter {
                 .clone()
                 .unwrap_or_else(|| reuse_run.run_id.clone());
 
-            if reuse_root != parent_root {
+            if reuse_root != parent_root || reuse_run.project != parent_project {
+                // Copilot review: the earlier version of this message
+                // included both the referenced run's root id AND the
+                // parent's root id verbatim. Because the reason string
+                // propagates into `ActionStatus::Failed.reason` and on
+                // into `step_history`, a prompt-injected LLM could use
+                // the rejection as an oracle to enumerate run ids and
+                // project structure. Collapse the same-root and same-
+                // project checks into a single "not eligible" message
+                // and leak no other ids / roots / project names back
+                // to the LLM. The spawn-adapter's `tracing::warn!`
+                // path (operator-visible, not LLM-visible) still has
+                // the full context for debugging.
+                tracing::warn!(
+                    parent_run_id = %parent_run_id,
+                    reuse_sandbox_from = %reuse_id,
+                    reuse_root = %reuse_root,
+                    parent_root = %parent_root,
+                    reuse_project = ?reuse_run.project,
+                    parent_project = ?parent_project,
+                    "#844 PR-2: cross-root / cross-project reuse_sandbox_from rejected",
+                );
                 return Err(RuntimeError::Validation {
                     reason: format!(
-                        "spawn_subagent.reuse_sandbox_from={reuse}: not a sibling \
-                         under the parent's root (referenced run's root={reuse_root}, \
-                         parent's root={parent_root}). Only prior siblings under the \
-                         same root may share a sandbox — cross-root sandbox sharing \
-                         leaks work across unrelated goals.",
-                        reuse = reuse_id.as_str(),
-                        reuse_root = reuse_root.as_str(),
-                        parent_root = parent_root.as_str(),
-                    ),
-                });
-            }
-
-            if reuse_run.project != parent_project {
-                return Err(RuntimeError::Validation {
-                    reason: format!(
-                        "spawn_subagent.reuse_sandbox_from={reuse}: project \
-                         mismatch (referenced run's project differs from the \
-                         parent's). Sandbox sharing across projects is rejected.",
+                        "spawn_subagent.reuse_sandbox_from={reuse}: not an \
+                         eligible same-root sibling of this parent. Only \
+                         prior siblings under the same root (same parent \
+                         chain) and same project may share a sandbox. \
+                         Re-emit with a run_id from the `## Prior sibling \
+                         attempts` block, or omit the field for a fresh \
+                         sandbox.",
                         reuse = reuse_id.as_str(),
                     ),
                 });

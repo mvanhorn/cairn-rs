@@ -632,6 +632,71 @@ async fn spawn_subagent_rejects_unknown_reuse_sandbox_from_id() {
     );
 }
 
+/// #844 PR-2 (Copilot review): when the LLM emits
+/// `reuse_sandbox_from` as a non-string (number, object, etc.), the
+/// execute layer MUST reject loudly via MALFORMED_SPAWN_PROPOSAL_PREFIX
+/// — NOT silently fall through to a fresh sandbox. Silent fallback
+/// would rob the retry loop of its schema-drift signal, and the LLM
+/// would keep emitting the wrong shape without correction. Observable:
+/// no child row is created, and step_history picks up the rejection.
+#[tokio::test]
+async fn spawn_subagent_rejects_non_string_reuse_sandbox_from() {
+    let h = LiveHarness::setup().await;
+    // Non-string: an integer. The tool_def declares
+    // `reuse_sandbox_from: string`, so this is schema-drift.
+    let plan = vec![json!([{
+        "action_type":       "spawn_subagent",
+        "description":       "#844: non-string reuse_sandbox_from",
+        "tool_name":         DELEGATED_ROLE,
+        "tool_args":         {
+            "goal":               "child goal",
+            "reuse_sandbox_from": 42,
+        },
+        "confidence":        0.95,
+        "requires_approval": false,
+    }])];
+    let (mock_url, _hits, _plan) = spawn_mock(plan).await;
+    let (_session_id, parent_run_id, _project_id) =
+        provision_run(&h, &mock_url, "malformed-type").await;
+
+    let r = h
+        .client()
+        .post(format!(
+            "{}/v1/runs/{}/orchestrate",
+            h.base_url, parent_run_id
+        ))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "goal": "#844 PR-2 malformed-type parent goal",
+            "max_iterations": 1,
+        }))
+        .send()
+        .await
+        .expect("orchestrate reaches server");
+    assert!(matches!(r.status().as_u16(), 200 | 202));
+
+    // No child row — the execute layer rejected the malformed
+    // tool_args BEFORE calling TaskService::spawn_subagent.
+    let r = h
+        .client()
+        .get(format!("{}/v1/runs/{}/children", h.base_url, parent_run_id))
+        .bearer_auth(&h.admin_token)
+        .send()
+        .await
+        .expect("children endpoint reachable");
+    let body: Value = r.json().await.unwrap();
+    let items = body
+        .get("items")
+        .and_then(|v| v.as_array())
+        .expect("children response items");
+    assert!(
+        items.is_empty(),
+        "#844 PR-2: non-string reuse_sandbox_from must be rejected at \
+         the execute-layer type guard BEFORE creating a child row. Got \
+         children: {items:?}"
+    );
+}
+
 /// #844 PR-2: when the LLM omits `reuse_sandbox_from`, no default
 /// row is written to the child. Parallel to
 /// `spawn_subagent_omits_parent_context_default_when_unset` (#775).
