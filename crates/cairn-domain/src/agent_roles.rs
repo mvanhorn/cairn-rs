@@ -288,7 +288,9 @@ spawn_subagent. Specialist routing:
 
 If no specialist role fits, call escalate_to_operator — do not do \
 the work yourself, and do not invent a workaround that bypasses \
-delegation.
+delegation. Never put an absolute sandbox path (e.g. \
+`/tmp/cairn-runs/...`) in `goal` — the runtime injects each \
+sub-agent's own sandbox. Repo-relative paths are fine.
 
 ## Fleet management
 
@@ -994,6 +996,31 @@ pub fn response_shape_for(role_id: &str) -> ResponseShape {
     }
 }
 
+/// Static fallback lookup for `AgentRoleTier` keyed on `role_id`. Used
+/// when the full `AgentRole` record is not available (legacy callers,
+/// pre-RFC-031 paths, or cross-crate helpers). Prefer reading
+/// `AgentRole::tier` directly when you hold the record.
+///
+/// SOURCE OF TRUTH: this table mirrors the `tier` field on each role in
+/// `default_roles()`. The `default_roles_tiers_match_table` test in
+/// this module pins the contract — if either side drifts, the test
+/// fails.
+///
+/// Added in #844 PR-1: the prompt renderer drops `workspace_path` from
+/// the orchestrator's `## Run state` section, and the check needed a
+/// structural discriminator (tier) rather than a string match on
+/// `role_id == "orchestrator"` — the latter silently misfires on
+/// custom orchestrator-tier roles from RFC-031's operator registry.
+pub fn tier_for(role_id: &str) -> AgentRoleTier {
+    match role_id {
+        "orchestrator" => AgentRoleTier::Orchestrator,
+        "researcher" => AgentRoleTier::Research,
+        "generic" => AgentRoleTier::Generic,
+        "executor" | "reviewer" | "status-checker" => AgentRoleTier::Standard,
+        _ => AgentRoleTier::Standard, // unknown → safest sub-agent tier
+    }
+}
+
 /// Assemble the rendered prompt from a role record. Public for callers
 /// that already have an `AgentRole` in hand (e.g. a future operator-
 /// extensible registry).
@@ -1329,7 +1356,13 @@ mod tests {
     /// suggestion rather than a default. The specialist prompts
     /// (executor / researcher / reviewer) stay well under 6000 and do not
     /// need this headroom.
-    const PROMPT_MAX_CHARS: usize = 7_500;
+    // Bumped 7500 → 7650 in #844 PR-1 to fit the sandbox-path anti-leak
+    // line in ORCHESTRATOR_PROMPT. R36 dogfood (2026-05-11) proved the
+    // orchestrator LLM will otherwise copy its own workspace_path into
+    // sub-agent goals and send children to empty directories. +64
+    // chars needed, +150 reserved for small future additions before
+    // we'd have to trim prose elsewhere.
+    const PROMPT_MAX_CHARS: usize = 7_650;
 
     /// Every built-in role prompt MUST contain these anchors. They are the
     /// structural contract that the orchestrator loop and the completion-
@@ -1528,6 +1561,30 @@ mod tests {
             response_shape_for("not-a-real-role-xyz"),
             ResponseShape::ProceduralArtifact,
         );
+    }
+
+    /// #844: `tier_for` static lookup MUST match every role's `tier`
+    /// field in `default_roles()`. Same drift-guard shape as
+    /// `response_shape_for_matches_default_roles_response_shape`.
+    #[test]
+    fn tier_for_matches_default_roles_tier() {
+        for role in default_roles() {
+            assert_eq!(
+                tier_for(&role.role_id),
+                role.tier,
+                "tier_for({:?}) must match default_roles().tier; if you \
+                 added a new role, update the static table in `tier_for`.",
+                role.role_id,
+            );
+        }
+    }
+
+    /// Unknown role_ids fall back to `Standard` — the safest sub-agent
+    /// tier (never accidentally grants orchestrator capabilities to
+    /// an unknown role).
+    #[test]
+    fn tier_for_unknown_role_returns_standard() {
+        assert_eq!(tier_for("not-a-real-role-xyz"), AgentRoleTier::Standard);
     }
 
     #[test]

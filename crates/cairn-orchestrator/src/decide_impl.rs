@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use cairn_domain::{
-    agent_roles::{default_roles, AgentRole, ResponseShape},
+    agent_roles::{default_roles, tier_for, AgentRole, AgentRoleTier, ResponseShape},
     events::ToolDeclaredButMissing,
     providers::{GenerationProvider, ProviderBindingSettings},
     ActionProposal, ActionType, RuntimeEvent,
@@ -1213,12 +1213,45 @@ fn build_user_message_with_role(
     // working directory was set in the runtime context but never
     // surfaced in the prompt. Path is rendered verbatim — no truncation
     // — so the model can copy-paste it into a `cd` command.
-    let run_state_part = format!(
-        "## Run state\nrun_id: {}\nagent_type: {}\nworkspace_path: {}",
-        ctx.run_id.as_str(),
-        ctx.agent_type,
-        ctx.working_dir.display(),
-    );
+    //
+    // #844: the orchestrator role is the ONE exception. It has no
+    // fs / bash / code-inspection tools (the strictest-by-default
+    // surface from the orchestrator-doctrine PRs #705/#706/#708), so
+    // its own `working_dir` is operationally meaningless to it — and
+    // surfacing it was actively harmful: R36 dogfood showed the
+    // orchestrator LLM copying its own workspace_path into sub-agent
+    // goal strings ("do X at /tmp/cairn-runs/<parent>/"), which then
+    // pointed the child at an empty directory since children get
+    // their own sandbox allocated at spawn time. Dropping the line
+    // for orchestrator closes the leak; the per-child workspace_line
+    // auto-inject via #813 still tells the child where ITS sandbox
+    // lives.
+    //
+    // Discriminator is `AgentRoleTier::Orchestrator`, not a string
+    // match on `role_id == "orchestrator"` (Gemini PR #846 review):
+    // RFC-031's operator registry lets a tenant define a custom
+    // orchestrator-tier role with any `role_id`. Tier is the
+    // structural contract — any role whose capability profile says
+    // "no fs tools, delegates everything" must not see its own
+    // workspace_path. Same fallback shape as the `response_shape`
+    // resolution a few lines below.
+    let tier: AgentRoleTier = role
+        .map(|r| r.tier)
+        .unwrap_or_else(|| tier_for(&ctx.agent_type));
+    let run_state_part = if matches!(tier, AgentRoleTier::Orchestrator) {
+        format!(
+            "## Run state\nrun_id: {}\nagent_type: {}",
+            ctx.run_id.as_str(),
+            ctx.agent_type,
+        )
+    } else {
+        format!(
+            "## Run state\nrun_id: {}\nagent_type: {}\nworkspace_path: {}",
+            ctx.run_id.as_str(),
+            ctx.agent_type,
+            ctx.working_dir.display(),
+        )
+    };
     let has_memory = !gather.memory_chunks.is_empty();
     // #774: footer shape depends on the role's `response_shape`.
     // DirectAnswer roles (orchestrator, future Q&A specialties) get
@@ -2790,14 +2823,15 @@ mod tests {
     }
 
     /// #813: `## Run state` must include the resolved `working_dir`
-    /// so sub-agents see the workspace path on their first DECIDE
-    /// without a discovery round-trip. R23 dogfood found executors
-    /// running 11 inline `pwd`/`find Cargo.toml`/`ls /tmp/...` calls
-    /// because the runtime had the path in `OrchestrationContext`
+    /// for sub-agent roles so they see the workspace path on their
+    /// first DECIDE without a discovery round-trip. R23 dogfood found
+    /// executors running 11 inline `pwd`/`find Cargo.toml`/`ls /tmp/...`
+    /// calls because the runtime had the path in `OrchestrationContext`
     /// but never surfaced it in the prompt.
     #[test]
-    fn build_user_message_renders_workspace_path_in_run_state() {
+    fn build_user_message_renders_workspace_path_in_run_state_for_subagent() {
         let mut c = ctx();
+        c.agent_type = "executor".to_owned();
         c.working_dir = std::path::PathBuf::from("/home/ubuntu/dogfood-roguelike");
         let msg = build_user_message(&c, &empty_gather(), None, false);
         assert!(
@@ -2809,6 +2843,108 @@ mod tests {
             "#813: `## Run state` must surface the resolved working_dir as \
              `workspace_path: <path>` so the child knows where to `cd`. \
              Got: {msg}"
+        );
+    }
+
+    /// #844: the orchestrator role MUST NOT see its own `workspace_path`
+    /// in `## Run state`. It has no fs/bash/code-inspection tools (per
+    /// the #705/#706/#708 fence), so the path is operationally dead
+    /// weight — and R36 dogfood showed the orchestrator LLM copying its
+    /// own workspace_path into sub-agent goal strings, which pointed
+    /// children at empty directories because each child gets its own
+    /// sandbox allocated at spawn time. The child's own workspace_line
+    /// auto-inject (#813) is the correct surface for the child's path;
+    /// the orchestrator has no business knowing its own.
+    #[test]
+    fn build_user_message_omits_workspace_path_for_orchestrator() {
+        let mut c = ctx();
+        assert_eq!(
+            c.agent_type, "orchestrator",
+            "precondition: ctx() defaults agent_type to orchestrator"
+        );
+        c.working_dir = std::path::PathBuf::from("/tmp/cairn-runs/orch-run-xyz");
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            msg.contains("## Run state"),
+            "user message must still include `## Run state` header"
+        );
+        assert!(
+            msg.contains("agent_type: orchestrator"),
+            "user message must still name the agent_type"
+        );
+        assert!(
+            !msg.contains("workspace_path:"),
+            "#844: orchestrator's `## Run state` MUST NOT include \
+             `workspace_path:` — the orchestrator has no fs/bash tools \
+             so its own path is meaningless, and dogfood (R36) showed \
+             it leaking into sub-agent goals. Got: {msg}"
+        );
+        assert!(
+            !msg.contains("/tmp/cairn-runs/orch-run-xyz"),
+            "#844: orchestrator must not see its working_dir string \
+             anywhere in the user message. Got: {msg}"
+        );
+    }
+
+    /// #844 review (Gemini / Copilot on PR #846): the tier discriminator
+    /// must catch RFC-031 operator-defined orchestrator-tier roles
+    /// whose `role_id` is NOT the literal string "orchestrator". A
+    /// string-based check would leak workspace_path for every custom
+    /// orchestrator in the registry. Pins the structural contract:
+    /// what matters is `AgentRole::tier`, not the role_id.
+    #[test]
+    fn build_user_message_omits_workspace_path_for_custom_orchestrator_tier_role() {
+        let mut c = ctx();
+        // Custom role_id — neither the default "orchestrator" nor any
+        // known role_id in tier_for's static table. Tier must be the
+        // thing that matters.
+        c.agent_type = "tenant_custom_manager_v2".to_owned();
+        c.working_dir = std::path::PathBuf::from("/tmp/cairn-runs/custom-orch-xyz");
+
+        // Build a role record with Orchestrator tier but the custom id.
+        let role = AgentRole::new(
+            c.agent_type.clone(),
+            "Tenant Custom Manager v2",
+            cairn_domain::agent_roles::AgentRoleTier::Orchestrator,
+        );
+        let msg = build_user_message_with_role(&c, &empty_gather(), None, false, Some(&role));
+
+        assert!(msg.contains("## Run state"), "header still required: {msg}");
+        assert!(
+            msg.contains("agent_type: tenant_custom_manager_v2"),
+            "custom agent_type must still be named in the header"
+        );
+        assert!(
+            !msg.contains("workspace_path:"),
+            "#844: any role with AgentRoleTier::Orchestrator MUST NOT \
+             see workspace_path in its prompt, regardless of role_id. \
+             Got: {msg}"
+        );
+        assert!(
+            !msg.contains("/tmp/cairn-runs/custom-orch-xyz"),
+            "custom orchestrator's working_dir must not appear anywhere. \
+             Got: {msg}"
+        );
+    }
+
+    /// #844 review complement: a role_id that the static `tier_for`
+    /// lookup doesn't recognise falls back to `Standard`, so the
+    /// worker MUST still see workspace_path (pre-fix behaviour for
+    /// anything that isn't orchestrator-tier). Guards against a
+    /// future refactor flipping the fallback to orchestrator-tier,
+    /// which would blanket-hide workspace_path from unknown roles.
+    #[test]
+    fn build_user_message_keeps_workspace_path_for_unknown_role_without_record() {
+        let mut c = ctx();
+        c.agent_type = "unknown-role-xyz".to_owned();
+        c.working_dir = std::path::PathBuf::from("/tmp/cairn-runs/unknown-xyz");
+        // No AgentRole record supplied — exercises the tier_for fallback.
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            msg.contains("workspace_path: /tmp/cairn-runs/unknown-xyz"),
+            "unknown role_id with no AgentRole record must still see \
+             workspace_path (tier_for falls back to Standard, not \
+             Orchestrator). Got: {msg}"
         );
     }
 
