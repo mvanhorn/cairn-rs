@@ -442,19 +442,33 @@ pub(crate) async fn process_webhook_orchestrate(
         "Created session + run for GitHub webhook"
     );
 
-    // Build the webhook-path `LoopConfig` once and persist its loop
-    // limits (`max_iterations`, `timeout_ms`) under the per-run defaults
-    // keys that `handlers/runs/orchestrate.rs` consults. Without this,
-    // the F49 auto-resume POST (`/v1/runs/:id/orchestrate` with empty
-    // body) would drop back to `LoopConfig::default()` on every
-    // approval-cycle kick — the regression we saw on PR #10 (Raft
-    // cluster-bus review), where the agent burned its budget fetching
-    // the diff and never reached `github_api.review_pr`.
+    // Persist per-run defaults that `handlers/runs/orchestrate.rs`
+    // consults so every F49 auto-resume POST (`/v1/runs/:id/orchestrate`
+    // with empty body) recovers the webhook-path envelope + goal
+    // instead of dropping back to `LoopConfig::default()` +
+    // "Execute the run objective." on every approval-cycle kick:
+    //
+    // - `goal`: the GitHub-PR-specific prompt (PR number, repo slug,
+    //   PR body). Without this, the agent loses all context after the
+    //   first approval, self-reports "goal string not in context", and
+    //   refuses to invoke `github_api.review_pr`.
+    // - `max_iterations` / `timeout_ms`: loop limits. Without these,
+    //   the resume kick drops back to the LoopConfig defaults (50 / 5m)
+    //   and the run exhausts its envelope mid-review.
     //
     // Breaker caps stay off the per-run defaults path: they're read
     // from `runtime_config.orchestrator_*` (env +
     // `CAIRN_ORCHESTRATOR_*`), so one operator-level setting applies
     // to every run regardless of entry path.
+    if let Err(err) =
+        crate::persist_run_string_default(state, &project, &run.run_id, "goal", &goal).await
+    {
+        tracing::warn!(
+            run_id = %run_id_str,
+            error = %err,
+            "failed to persist run goal default; auto-resume will lose the PR-review objective"
+        );
+    }
     let webhook_cfg = webhook_loop_config_from_env();
     if let Err(err) = crate::persist_run_u32_default(
         state,
@@ -1389,6 +1403,11 @@ pub(crate) async fn orchestrate_single_issue(
     // so scan-queue dispatched runs honor the same budgets and their
     // F49 auto-resume kicks inherit them. See the persistence block in
     // `process_webhook_orchestrate` for the rationale.
+    if let Err(err) =
+        crate::persist_run_string_default(state, &run.project, &run.run_id, "goal", &goal).await
+    {
+        tracing::warn!(run_id = %run.run_id, error = %err, "failed to persist run goal default; auto-resume will lose the issue-resolution objective");
+    }
     let webhook_cfg = webhook_loop_config_from_env();
     if let Err(err) = crate::persist_run_u32_default(
         state,
