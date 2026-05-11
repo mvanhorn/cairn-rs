@@ -2160,6 +2160,7 @@ impl TaskService for FabricTaskServiceAdapter {
         goal: String,
         role: String,
         parent_context: Option<String>,
+        reuse_sandbox_from: Option<RunId>,
     ) -> Result<TaskRecord, RuntimeError> {
         // #670 G4 PR-1a cross-tenant contract: derive the child's
         // project from the parent run row. No caller-supplied project
@@ -2179,6 +2180,71 @@ impl TaskService for FabricTaskServiceAdapter {
         let parent_project = parent.project.clone();
         let parent_session_id = parent.session_id.clone();
         let parent_tenant = parent_project.tenant_id.clone();
+
+        // #844 PR-2: validate `reuse_sandbox_from`. The explicit opt-in
+        // escape hatch the parent LLM uses to let a replacement sub-
+        // agent continue from a dead sibling's on-disk work. Must
+        // reference a **sibling under the same root** and the same
+        // project — any other value is rejected at this boundary so
+        // the LLM cannot point the child at an unrelated run's sandbox
+        // (cross-root / cross-project reads), and there is no silent
+        // fallback to a fresh sandbox on a bad id (the LLM would keep
+        // emitting the wrong id without feedback). Validation-class
+        // errors surface into `execute_impl`'s `ActionStatus::Failed`
+        // reason → step_history → the next DECIDE sees the rejection.
+        if let Some(reuse_id) = reuse_sandbox_from.as_ref() {
+            // Parent's root is its own id when parent IS the root
+            // (parent.root_run_id == None pre-V069, or == parent_run_id
+            // when projected). Siblings under the same root must match
+            // this anchor.
+            let parent_root = parent
+                .root_run_id
+                .clone()
+                .unwrap_or_else(|| parent_run_id.clone());
+
+            let reuse_run = RunReadModel::get(self.store.as_ref(), reuse_id)
+                .await?
+                .ok_or_else(|| RuntimeError::Validation {
+                    reason: format!(
+                        "spawn_subagent.reuse_sandbox_from={reuse}: referenced \
+                         run does not exist — pass the run_id of a prior \
+                         sibling under the same root, or omit the field for \
+                         a fresh sandbox",
+                        reuse = reuse_id.as_str(),
+                    ),
+                })?;
+
+            let reuse_root = reuse_run
+                .root_run_id
+                .clone()
+                .unwrap_or_else(|| reuse_run.run_id.clone());
+
+            if reuse_root != parent_root {
+                return Err(RuntimeError::Validation {
+                    reason: format!(
+                        "spawn_subagent.reuse_sandbox_from={reuse}: not a sibling \
+                         under the parent's root (referenced run's root={reuse_root}, \
+                         parent's root={parent_root}). Only prior siblings under the \
+                         same root may share a sandbox — cross-root sandbox sharing \
+                         leaks work across unrelated goals.",
+                        reuse = reuse_id.as_str(),
+                        reuse_root = reuse_root.as_str(),
+                        parent_root = parent_root.as_str(),
+                    ),
+                });
+            }
+
+            if reuse_run.project != parent_project {
+                return Err(RuntimeError::Validation {
+                    reason: format!(
+                        "spawn_subagent.reuse_sandbox_from={reuse}: project \
+                         mismatch (referenced run's project differs from the \
+                         parent's). Sandbox sharing across projects is rejected.",
+                        reuse = reuse_id.as_str(),
+                    ),
+                });
+            }
+        }
 
         // G3: child_run_id should be Some(id) on the LLM-initiated
         // path (execute_impl mints one). If the caller passed None
@@ -2293,6 +2359,40 @@ impl TaskService for FabricTaskServiceAdapter {
                         "#775: failed to persist child run parent_context default; \
                          child's first iteration will not see the `## Parent context` \
                          section and the parent's binding direction is silently lost",
+                    );
+                }
+            }
+
+            // #844 PR-2: persist the opt-in `reuse_sandbox_from` id on
+            // the child's defaults. Read back by the orchestrate
+            // handler via `resolve_run_string_default(..., "reuse_sandbox_from")`
+            // before calling `working_dir_for_run` — when set, the
+            // child's working_dir resolves to the referenced run's
+            // sandbox instead of a fresh one. Validated above against
+            // the authoritative projection, so the row written here is
+            // known-good at write time. `None` → no row, no default,
+            // fresh sandbox (today's behaviour, byte-identical).
+            if let Some(ref reuse_id) = reuse_sandbox_from {
+                let reuse_key = format!("run:{}:reuse_sandbox_from", child_run_id.as_str());
+                if let Err(err) = defaults
+                    .set(
+                        cairn_domain::tenancy::Scope::Project,
+                        parent_project.project_id.to_string(),
+                        reuse_key,
+                        serde_json::Value::String(reuse_id.as_str().to_owned()),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        parent_run_id = %parent_run_id,
+                        child_run_id = %child_run_id,
+                        reuse_sandbox_from = %reuse_id,
+                        "#844 PR-2: failed to persist child run reuse_sandbox_from \
+                         default; child's working_dir will resolve to a fresh \
+                         sandbox instead of the requested prior sibling's — \
+                         partial on-disk work from the predecessor will not be \
+                         visible to the child",
                     );
                 }
             }

@@ -1279,6 +1279,22 @@ impl RuntimeExecutePhase {
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned);
 
+                // #844 PR-2: optional opt-in `reuse_sandbox_from`. Same
+                // shape as parent_context — trimmed empty → None. The
+                // field carries a prior sibling run_id; the adapter
+                // validates it belongs to the same root + project.
+                // Non-string values silently ignored (malformed tool_args
+                // shape → schema miss; better to fall through to a
+                // fresh sandbox than to panic the child).
+                let reuse_sandbox_from: Option<cairn_domain::RunId> = proposal
+                    .tool_args
+                    .as_ref()
+                    .and_then(|args| args.get("reuse_sandbox_from"))
+                    .and_then(|c| c.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| cairn_domain::RunId::new(s.to_owned()));
+
                 // #813: ALWAYS thread the parent's resolved workspace
                 // path into the child's parent_context. R23 dogfood
                 // showed executor sub-agents spending 11+ iterations on
@@ -1423,6 +1439,13 @@ impl RuntimeExecutePhase {
                         // #775: optional parent freeform context for
                         // the child's first DECIDE prompt.
                         parent_context,
+                        // #844 PR-2: optional opt-in reference to a
+                        // prior sibling whose sandbox the child should
+                        // reuse. Validated at the adapter layer
+                        // (same-root + same-project); rejections
+                        // surface into step_history via the `Err(e)`
+                        // branch below so the LLM can correct.
+                        reuse_sandbox_from,
                     )
                     .await
                 {

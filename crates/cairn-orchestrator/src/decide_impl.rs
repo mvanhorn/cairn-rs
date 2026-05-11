@@ -1685,6 +1685,10 @@ fn spawn_subagent_tool_def_with_enum(role_enum: Vec<String>) -> serde_json::Valu
                     "parent_context": {
                         "type": "string",
                         "description": "OPTIONAL. Freeform context the parent threads into the child's first DECIDE prompt under a `## Parent context` section. Useful on a re-spawn after a failed first attempt — e.g. 'previous attempt looped on `gh auth status`; do not call `gh auth status`, the workspace at /tmp/.../foo already has gh credentials'. Do NOT put the goal itself here — the goal goes in `goal`."
+                    },
+                    "reuse_sandbox_from": {
+                        "type": "string",
+                        "description": "OPTIONAL. Run id of a prior sibling under the same root whose sandbox should be reused. When set, the new child inherits that run's working_dir — use it to let a replacement sub-agent continue from a dead sibling's partial on-disk work (e.g. a first attempt cloned the repo and applied half the changes before the completion gate rejected it; a second attempt with `reuse_sandbox_from` set to the first's run_id picks up from that on-disk state instead of re-cloning into an empty dir). Leave unset for a fresh sandbox (today's default behaviour). The referenced run MUST be a sibling of this spawn under the same root (same parent chain) and same project — any other value is rejected and the rejection surfaces back into step_history on the next DECIDE."
                     }
                 },
                 "required": ["role", "goal"],
@@ -1967,12 +1971,31 @@ fn tool_calls_to_proposals(
             // byte-identically on the legacy path.
             if raw_name == "spawn_subagent" {
                 let (role, goal) = parse_spawn_subagent_args(&raw_args);
+                // #775 / #844: carry the optional freeform
+                // parent_context AND the opt-in reuse_sandbox_from
+                // sibling id through on the native tool-call path.
+                // Pre-#775 these fields were lost when the native
+                // shape was reconstructed into `{goal}` only; the
+                // execute layer then saw a stripped tool_args and
+                // the features were effectively dead on providers
+                // that use native tool calls (OpenAI, Anthropic,
+                // Bedrock). Extract from both the flat and the
+                // nested legacy shapes.
+                let (parent_context_opt, reuse_sandbox_opt) =
+                    extract_spawn_subagent_optionals(&raw_args);
+                let mut forwarded = serde_json::json!({ "goal": goal });
+                if let Some(pc) = parent_context_opt {
+                    forwarded["parent_context"] = serde_json::Value::String(pc);
+                }
+                if let Some(reuse) = reuse_sandbox_opt {
+                    forwarded["reuse_sandbox_from"] = serde_json::Value::String(reuse);
+                }
                 return Some(ActionProposal {
                     action_type: ActionType::SpawnSubagent,
                     description: format!("spawn {role}"),
                     confidence: 0.9,
                     tool_name: Some(role),
-                    tool_args: Some(serde_json::json!({ "goal": goal })),
+                    tool_args: Some(forwarded),
                     requires_approval: false,
                 });
             }
@@ -2160,6 +2183,52 @@ fn parse_spawn_subagent_args(args: &serde_json::Value) -> (String, String) {
         .unwrap_or("")
         .to_owned();
     (role, goal)
+}
+
+/// #844 PR-2 + #775: extract the optional freeform `parent_context` and
+/// the opt-in `reuse_sandbox_from` sibling id from a `spawn_subagent`
+/// tool-call's `arguments`. Accepts the same two shapes as
+/// [`parse_spawn_subagent_args`]:
+///
+///   1. Flat (native): `args.parent_context` / `args.reuse_sandbox_from`
+///   2. Legacy nested: `args.tool_args.parent_context` /
+///      `args.tool_args.reuse_sandbox_from`
+///
+/// Whitespace-only / empty strings → `None` so the persistence path
+/// (which is gated by `Some(_)`) does not write a default row with a
+/// blank value. Non-string values are silently ignored — the schema
+/// declares `string`, and a malformed shape is better dropped than
+/// propagated to `TaskService::spawn_subagent` which would reject it
+/// with a less-specific error.
+fn extract_spawn_subagent_optionals(args: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return (None, None),
+    };
+    // Prefer the flat shape; fall back to the nested legacy tool_args
+    // object. Do NOT merge — the two shapes are alternates on the
+    // wire and mixing would be an LLM error we shouldn't paper over.
+    let source: &serde_json::Map<String, serde_json::Value> =
+        if obj.contains_key("parent_context") || obj.contains_key("reuse_sandbox_from") {
+            obj
+        } else if let Some(inner) = obj.get("tool_args").and_then(|v| v.as_object()) {
+            inner
+        } else {
+            obj
+        };
+    let pc = source
+        .get("parent_context")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let reuse = source
+        .get("reuse_sandbox_from")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    (pc, reuse)
 }
 
 fn unwrap_meta_envelope(name: &str, args: serde_json::Value) -> (String, serde_json::Value) {
@@ -2734,6 +2803,230 @@ mod tests {
             params.get("additionalProperties").and_then(|v| v.as_bool()),
             Some(false),
             "additionalProperties:false enables strict-mode enforcement",
+        );
+    }
+
+    /// #844 PR-2: `reuse_sandbox_from` is an optional top-level string
+    /// in the `spawn_subagent` tool_def. It must be present in
+    /// `properties` so constrained-decoding providers see it on the
+    /// wire, and it must NOT be in `required` so omitting it is the
+    /// default behaviour (fresh sandbox). The description must name
+    /// the same-root + same-sibling contract so a model reading the
+    /// schema can't emit an unrelated run_id and expect it to work.
+    #[test]
+    fn spawn_subagent_tool_def_exposes_reuse_sandbox_from_as_optional() {
+        let def = spawn_subagent_tool_def();
+        let params = def
+            .pointer("/function/parameters")
+            .expect("tool def has parameters");
+        let props = params
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties present");
+        let required_set: std::collections::HashSet<&str> = params
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required present")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            props.contains_key("reuse_sandbox_from"),
+            "#844 PR-2: reuse_sandbox_from must appear in tool_def properties"
+        );
+        assert!(
+            !required_set.contains("reuse_sandbox_from"),
+            "#844 PR-2: reuse_sandbox_from must NOT be required — unset is the \
+             default (fresh sandbox); setting it is the explicit opt-in."
+        );
+        let field = &props["reuse_sandbox_from"];
+        assert_eq!(
+            field.get("type").and_then(|v| v.as_str()),
+            Some("string"),
+            "#844 PR-2: reuse_sandbox_from must be typed `string`"
+        );
+        let desc = field
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            desc.contains("prior sibling") || desc.contains("sibling"),
+            "#844 PR-2: description must name the sibling contract; got: {desc}"
+        );
+        assert!(
+            desc.contains("same root") || desc.contains("same-root"),
+            "#844 PR-2: description must name the same-root contract; got: {desc}"
+        );
+    }
+
+    /// #844 PR-2: the JSON-action parser must preserve
+    /// `reuse_sandbox_from` when the LLM emits it alongside `role` +
+    /// `goal`. Pre-PR-2 the field did not exist; the parser's
+    /// `tool_args` pass-through already round-trips unknown keys, so
+    /// this is a contract test that guards against a future "strip
+    /// unknown keys" refactor.
+    #[test]
+    fn parse_one_json_action_preserves_reuse_sandbox_from() {
+        let json = serde_json::json!({
+            "action_type": "spawn_subagent",
+            "description": "retry with dead sibling's sandbox",
+            "tool_name": "executor",
+            "tool_args": {
+                "goal": "finish applying the patches the predecessor started",
+                "reuse_sandbox_from": "run_subagent_child_task_1234_0"
+            },
+            "confidence": 0.9
+        });
+        let proposal = parse_one(json).expect("parse_one returns Some for spawn_subagent");
+        assert_eq!(
+            proposal.action_type,
+            cairn_domain::ActionType::SpawnSubagent
+        );
+        let args = proposal.tool_args.as_ref().expect("tool_args populated");
+        assert_eq!(
+            args.get("reuse_sandbox_from").and_then(|v| v.as_str()),
+            Some("run_subagent_child_task_1234_0"),
+            "#844 PR-2: JSON-action parser must preserve reuse_sandbox_from verbatim"
+        );
+    }
+
+    /// #844 PR-2: the JSON-action parser must leave `reuse_sandbox_from`
+    /// absent (not `null`, not empty-string) when the LLM does not
+    /// emit it. Execute-side extraction is `Option<RunId>`-shaped —
+    /// the absence signal is what triggers the fresh-sandbox default.
+    #[test]
+    fn parse_one_json_action_omits_reuse_sandbox_from_when_absent() {
+        let json = serde_json::json!({
+            "action_type": "spawn_subagent",
+            "description": "fresh spawn — no reuse",
+            "tool_name": "executor",
+            "tool_args": { "goal": "fresh goal" },
+            "confidence": 0.9
+        });
+        let proposal = parse_one(json).expect("parse_one returns Some for spawn_subagent");
+        let args = proposal.tool_args.as_ref().expect("tool_args populated");
+        assert!(
+            args.get("reuse_sandbox_from").is_none(),
+            "#844 PR-2: absent reuse_sandbox_from must NOT materialise as null \
+             or empty-string in parsed tool_args"
+        );
+    }
+
+    /// #844 PR-2 + #775: the native-tool-call parser (used by
+    /// OpenAI/Anthropic/Bedrock structured-output providers) must
+    /// carry `reuse_sandbox_from` AND `parent_context` through on
+    /// the flat shape. Pre-PR-2 the native path reconstructed
+    /// `tool_args` as `{goal}` only, dropping every other field.
+    #[test]
+    fn tool_calls_to_proposals_native_flat_carries_reuse_and_parent_context() {
+        let tool_calls = [serde_json::json!({
+            "function": {
+                "name": "spawn_subagent",
+                "arguments": {
+                    "role": "executor",
+                    "goal": "retry",
+                    "parent_context": "prior attempt failed the gate",
+                    "reuse_sandbox_from": "run_prior_sibling_42"
+                }
+            }
+        })];
+        let proposals = tool_calls_to_proposals(&tool_calls, &[]);
+        assert_eq!(proposals.len(), 1);
+        let args = proposals[0]
+            .tool_args
+            .as_ref()
+            .expect("native tool_call preserves tool_args");
+        assert_eq!(
+            args.get("goal").and_then(|v| v.as_str()),
+            Some("retry"),
+            "goal must be preserved on native-tool-call path"
+        );
+        assert_eq!(
+            args.get("parent_context").and_then(|v| v.as_str()),
+            Some("prior attempt failed the gate"),
+            "#775 regression: parent_context must be preserved on native-tool-call path"
+        );
+        assert_eq!(
+            args.get("reuse_sandbox_from").and_then(|v| v.as_str()),
+            Some("run_prior_sibling_42"),
+            "#844 PR-2: reuse_sandbox_from must be preserved on native-tool-call path"
+        );
+    }
+
+    /// #844 PR-2: native tool_call for spawn_subagent WITHOUT
+    /// reuse_sandbox_from must not invent an empty string or null —
+    /// the absence is the signal for fresh-sandbox default.
+    #[test]
+    fn tool_calls_to_proposals_native_omits_reuse_when_absent() {
+        let tool_calls = [serde_json::json!({
+            "function": {
+                "name": "spawn_subagent",
+                "arguments": { "role": "executor", "goal": "fresh" }
+            }
+        })];
+        let proposals = tool_calls_to_proposals(&tool_calls, &[]);
+        assert_eq!(proposals.len(), 1);
+        let args = proposals[0]
+            .tool_args
+            .as_ref()
+            .expect("tool_args populated");
+        assert!(
+            args.get("reuse_sandbox_from").is_none(),
+            "#844 PR-2: absent field must not materialise on native path"
+        );
+    }
+
+    /// #844 PR-2: the legacy nested shape
+    /// `{"tool_name": "executor", "tool_args": { "goal": ..., "reuse_sandbox_from": ... }}`
+    /// must extract reuse_sandbox_from too. Kept for compat with JSON-
+    /// action-envelope-style runs mid-flight against pre-#697 system
+    /// prompts.
+    #[test]
+    fn tool_calls_to_proposals_native_legacy_nested_carries_reuse() {
+        let tool_calls = [serde_json::json!({
+            "function": {
+                "name": "spawn_subagent",
+                "arguments": {
+                    "tool_name": "executor",
+                    "tool_args": {
+                        "goal": "retry",
+                        "reuse_sandbox_from": "run_nested_prior"
+                    }
+                }
+            }
+        })];
+        let proposals = tool_calls_to_proposals(&tool_calls, &[]);
+        assert_eq!(proposals.len(), 1);
+        let args = proposals[0]
+            .tool_args
+            .as_ref()
+            .expect("tool_args populated");
+        assert_eq!(
+            args.get("reuse_sandbox_from").and_then(|v| v.as_str()),
+            Some("run_nested_prior"),
+            "#844 PR-2: legacy nested shape must carry reuse_sandbox_from"
+        );
+    }
+
+    /// #844 PR-2: whitespace-only / empty-string values are normalised
+    /// to "absent" — the execute-side extraction treats blank as `None`
+    /// and the spawn adapter never writes a default row with a blank
+    /// value. A blank value on the wire would otherwise propagate as
+    /// an InvalidArgument rejection on every spawn, which is worse
+    /// than simply dropping it.
+    #[test]
+    fn extract_spawn_subagent_optionals_drops_blanks() {
+        let args = serde_json::json!({
+            "role": "executor",
+            "goal": "g",
+            "parent_context": "   ",
+            "reuse_sandbox_from": ""
+        });
+        let (pc, reuse) = extract_spawn_subagent_optionals(&args);
+        assert!(pc.is_none(), "whitespace parent_context must drop to None");
+        assert!(
+            reuse.is_none(),
+            "empty reuse_sandbox_from must drop to None"
         );
     }
 
