@@ -292,9 +292,17 @@ impl Bedrock {
         if !system_blocks.is_empty() {
             body_json["system"] = Value::Array(system_blocks);
         }
-        if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-            body_json["toolConfig"] = build_tool_config(tools, None)?;
-        }
+        // Capture the sanitized→original tool-name map so the response
+        // parser can restore cairn's original ids on any `toolUse`
+        // blocks. Empty when `tools` is absent/empty; lookups return
+        // `None` and fall through to the raw name unchanged.
+        let tool_name_map = if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+            let (cfg, rename) = build_tool_config(tools, None)?;
+            body_json["toolConfig"] = cfg;
+            rename
+        } else {
+            std::collections::HashMap::new()
+        };
 
         // Converse defaults `maxTokens` to 4096 for Claude when
         // `inferenceConfig` is absent — long reviews with many tool
@@ -309,13 +317,14 @@ impl Bedrock {
             body_json["inferenceConfig"] = serde_json::json!({ "maxTokens": n });
         }
 
-        self.converse_raw(model, body_json).await
+        self.converse_raw(model, body_json, &tool_name_map).await
     }
 
     async fn converse_raw(
         &self,
         model: &str,
         body_json: Value,
+        tool_name_map: &std::collections::HashMap<String, String>,
     ) -> Result<Box<dyn ChatResponse>, ProviderError> {
         let url = match self.endpoint_override.as_deref() {
             Some(base) => format!("{}/model/{}/converse", base.trim_end_matches('/'), model),
@@ -360,7 +369,7 @@ impl Bedrock {
             .json()
             .await
             .map_err(|e| ProviderError::Http(redact_secrets(&format!("parse: {e}"))))?;
-        parse_converse_response(resp_body)
+        parse_converse_response(resp_body, tool_name_map)
     }
 
     /// Thin wrapper for the completion path. Plain text-only converse
@@ -382,7 +391,9 @@ impl Bedrock {
         if let Some(n) = self.resolve_max_tokens() {
             body_json["inferenceConfig"] = serde_json::json!({ "maxTokens": n });
         }
-        let resp = self.converse_raw(model, body_json).await?;
+        // No tools on the completion path → empty rename map.
+        let empty = std::collections::HashMap::new();
+        let resp = self.converse_raw(model, body_json, &empty).await?;
         Ok(resp.text().unwrap_or_default())
     }
 }
@@ -426,7 +437,20 @@ fn chat_message_to_converse(m: &ChatMessage) -> Result<Value, ProviderError> {
                 content.push(serde_json::json!({
                     "toolUse": {
                         "toolUseId": call.id,
-                        "name": call.function.name,
+                        // Sanitize here for the same reason we sanitize
+                        // `toolSpec.name` in `build_tool_config`:
+                        // Bedrock requires every `toolUse.name` in the
+                        // message history to match `[a-zA-Z0-9_-]+` and
+                        // to be consistent with the ids in `toolConfig`.
+                        // The cairn `ToolCall` always carries the
+                        // original id (the response parser reverse-
+                        // mapped it on the prior turn), so we sanitize
+                        // on the way back out. Round-trip stays clean
+                        // because the model receives the sanitized
+                        // name, emits it back, and the parser rewrites
+                        // it to the original — the id on the
+                        // orchestrator side never changes.
+                        "name": sanitize_bedrock_tool_name(&call.function.name),
                         "input": input,
                     }
                 }));
@@ -469,22 +493,56 @@ fn chat_message_to_converse(m: &ChatMessage) -> Result<Value, ProviderError> {
     }
 }
 
+/// Sanitize a cairn tool name into Bedrock's `toolSpec.name` constraint
+/// (`[a-zA-Z0-9_-]+`). Any character outside that set — most commonly the
+/// `.` that cairn uses as a namespace separator (`github_api.review_pr`,
+/// `memory.search`, etc.) — collapses to `_`. The reverse mapping is
+/// stored in the caller's `HashMap<String, String>` so an inbound
+/// `toolUse.name` from Bedrock can be rewritten back to cairn's
+/// original id.
+fn sanitize_bedrock_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Build the Converse `toolConfig` value from a cairn tool slice.
 ///
 /// Maps 1:1 onto Bedrock's schema:
 /// `toolConfig.tools[].toolSpec = {name, description, inputSchema.json}`.
+///
+/// Bedrock's Converse API enforces `toolSpec.name` ∈ `[a-zA-Z0-9_-]+`.
+/// Cairn tool ids routinely include `.` (e.g. `github_api.review_pr`),
+/// which fails that regex — observed on the dogfood as:
+///   `Bedrock 400: Value 'github_api.review_pr' at
+///   'toolConfig.tools.6.member.toolSpec.name' failed to satisfy constraint`.
+/// We sanitize on the way out via `sanitize_bedrock_tool_name` and hand
+/// back a `HashMap<sanitized → original>` so the caller can reverse-map
+/// the name on any inbound `toolUse` block before passing it back to
+/// the orchestrator. Collisions after sanitization are a hard error —
+/// silently dropping one tool would make the agent think it's available
+/// but route every invocation to its namesake.
+///
 /// `ToolChoice` mapping:
 /// * `Auto` → `{auto: {}}` (also the Converse default; we omit the field
 ///   to stay compatible with models that reject explicit `auto`).
 /// * `Any` → `{any: {}}`
-/// * `Specific` → `{tool: {name}}`
+/// * `Specific` → `{tool: {name}}` (sanitized on the way out).
 /// * `None` → no `toolConfig` at all (we're called only when `tools` is
 ///   non-empty; suppressing `toolConfig` lets the model answer in plain
 ///   text as the caller asked).
 fn build_tool_config(
     tools: &[Tool],
     tool_choice: Option<&ToolChoice>,
-) -> Result<Value, ProviderError> {
+) -> Result<(Value, std::collections::HashMap<String, String>), ProviderError> {
+    let mut rename: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(tools.len());
     let specs: Vec<Value> = tools
         .iter()
         .map(|t| {
@@ -493,8 +551,19 @@ fn build_tool_config(
                     "Bedrock toolSpec.name must not be empty".to_owned(),
                 ));
             }
+            let original = &t.function.name;
+            let safe = sanitize_bedrock_tool_name(original);
+            if let Some(prev) = rename.insert(safe.clone(), original.clone())
+                && prev != *original
+            {
+                return Err(ProviderError::InvalidRequest(format!(
+                    "Bedrock tool-name sanitization collision: '{}' and '{}' \
+                     both map to '{}'; rename one to avoid ambiguity",
+                    prev, original, safe
+                )));
+            }
             let mut tool_spec = serde_json::json!({
-                "name": t.function.name,
+                "name": safe,
                 "description": t.function.description,
                 "inputSchema": { "json": t.function.parameters.clone() },
             });
@@ -515,7 +584,8 @@ fn build_tool_config(
             cfg["toolChoice"] = serde_json::json!({ "any": {} });
         }
         Some(ToolChoice::Specific(name)) => {
-            cfg["toolChoice"] = serde_json::json!({ "tool": { "name": name } });
+            cfg["toolChoice"] =
+                serde_json::json!({ "tool": { "name": sanitize_bedrock_tool_name(name) } });
         }
         Some(ToolChoice::None) => {
             // Caller asked for no tool use even though tools were
@@ -523,10 +593,10 @@ fn build_tool_config(
             // invocation" knob, so we drop toolConfig entirely — the
             // model will answer with text. This matches how the
             // OpenAI-compat backend treats `tool_choice: "none"`.
-            return Ok(Value::Null);
+            return Ok((Value::Null, rename));
         }
     }
-    Ok(cfg)
+    Ok((cfg, rename))
 }
 
 // ── Response mapping: Converse wire → cairn types ────────────────────
@@ -539,9 +609,20 @@ fn build_tool_config(
 ///   object re-encoded as a JSON string (cairn's `FunctionCall::arguments`
 ///   is a `String`, not a `Value`, for OpenAI-wire parity).
 ///
+/// `rename` is the outbound sanitization map from
+/// [`build_tool_config`]; we reverse it here so the cairn orchestrator
+/// sees the original tool id (e.g. `github_api.review_pr`), not the
+/// Bedrock-sanitized name (e.g. `github_api_review_pr`). Unknown names
+/// pass through unchanged — the model can (and rarely does) mint a
+/// name we didn't register, and the downstream `ToolCall` handler will
+/// reject it.
+///
 /// `stopReason` surfaces as `finish_reason()`. `usage.inputTokens` /
 /// `usage.outputTokens` / `usage.cacheReadInputTokens` become `Usage`.
-fn parse_converse_response(mut resp: Value) -> Result<Box<dyn ChatResponse>, ProviderError> {
+fn parse_converse_response(
+    mut resp: Value,
+    rename: &std::collections::HashMap<String, String>,
+) -> Result<Box<dyn ChatResponse>, ProviderError> {
     // Move the content array out of the response rather than cloning
     // — a long tool call can carry several KB of input JSON and the
     // caller doesn't need the original array afterwards.
@@ -579,13 +660,15 @@ fn parse_converse_response(mut resp: Value) -> Result<Box<dyn ChatResponse>, Pro
                 ProviderError::Provider("Bedrock toolUse block missing toolUseId".to_owned())
             })?
             .to_owned();
-        let name = tu_obj
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProviderError::Provider("Bedrock toolUse block missing name".to_owned())
-            })?
-            .to_owned();
+        let name_raw = tu_obj.get("name").and_then(Value::as_str).ok_or_else(|| {
+            ProviderError::Provider("Bedrock toolUse block missing name".to_owned())
+        })?;
+        // Reverse the outbound sanitization so the orchestrator sees
+        // the original cairn tool id, not the Bedrock-sanitized name.
+        let name = rename
+            .get(name_raw)
+            .cloned()
+            .unwrap_or_else(|| name_raw.to_owned());
         // `input` is required per the Converse spec. Treat its
         // absence as a protocol error rather than silently minting
         // `null` arguments — downstream orchestrators use this to
@@ -788,10 +871,92 @@ mod tests {
         }
     }
 
+    /// Regression guard: Bedrock's toolSpec.name regex is
+    /// `[a-zA-Z0-9_-]+`, but cairn ids routinely contain `.`
+    /// (`github_api.review_pr`, `memory.search`). Sanitize on the
+    /// way out and round-trip the name back on the way in.
+    #[test]
+    fn build_tool_config_sanitizes_dot_in_tool_name() {
+        let t = Tool {
+            tool_type: "function".to_owned(),
+            function: FunctionDef {
+                name: "github_api.review_pr".to_owned(),
+                description: "post PR review".to_owned(),
+                parameters: serde_json::json!({"type":"object","properties":{}}),
+            },
+        };
+        let (cfg, rename) = build_tool_config(&[t], None).unwrap();
+        assert_eq!(
+            cfg["tools"][0]["toolSpec"]["name"], "github_api_review_pr",
+            "dot must be sanitized to underscore for Converse toolSpec.name regex"
+        );
+        assert_eq!(
+            rename.get("github_api_review_pr"),
+            Some(&"github_api.review_pr".to_owned()),
+            "rename map carries the sanitized→original reverse lookup"
+        );
+    }
+
+    #[test]
+    fn build_tool_config_rejects_sanitization_collision() {
+        // Two tools that sanitize to the same Bedrock name — silently
+        // dropping one would make the agent think the tool is available
+        // but route every invocation to its namesake. Surface as an
+        // InvalidRequest instead.
+        let a = Tool {
+            tool_type: "function".to_owned(),
+            function: FunctionDef {
+                name: "a.b".to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+        };
+        let b = Tool {
+            tool_type: "function".to_owned(),
+            function: FunctionDef {
+                name: "a_b".to_owned(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+        };
+        let err = build_tool_config(&[a, b], None).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("sanitization collision"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_converse_response_restores_original_tool_name() {
+        let resp = serde_json::json!({
+            "output": {
+                "message": {
+                    "content": [{
+                        "toolUse": {
+                            "toolUseId": "tu_1",
+                            "name": "github_api_review_pr",
+                            "input": {"repo": "o/r", "pr_number": 1}
+                        }
+                    }]
+                }
+            }
+        });
+        let mut rename = std::collections::HashMap::new();
+        rename.insert(
+            "github_api_review_pr".to_owned(),
+            "github_api.review_pr".to_owned(),
+        );
+        let parsed = parse_converse_response(resp, &rename).unwrap();
+        let calls = parsed.tool_calls().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].function.name, "github_api.review_pr",
+            "inbound tool_use.name must be reverse-mapped to the original cairn id"
+        );
+    }
+
     #[test]
     fn build_tool_config_maps_toolspec_shape() {
         let tools = vec![sample_tool()];
-        let cfg = build_tool_config(&tools, None).unwrap();
+        let cfg = build_tool_config(&tools, None).unwrap().0;
         let spec = &cfg["tools"][0]["toolSpec"];
         assert_eq!(spec["name"], "add_numbers");
         assert_eq!(spec["description"], "add two integers");
@@ -810,7 +975,7 @@ mod tests {
     fn build_tool_config_omits_empty_description() {
         let mut t = sample_tool();
         t.function.description.clear();
-        let cfg = build_tool_config(&[t], None).unwrap();
+        let cfg = build_tool_config(&[t], None).unwrap().0;
         assert!(cfg["tools"][0]["toolSpec"].get("description").is_none());
     }
 
@@ -824,7 +989,9 @@ mod tests {
 
     #[test]
     fn build_tool_config_maps_any_choice() {
-        let cfg = build_tool_config(&[sample_tool()], Some(&ToolChoice::Any)).unwrap();
+        let cfg = build_tool_config(&[sample_tool()], Some(&ToolChoice::Any))
+            .unwrap()
+            .0;
         assert_eq!(cfg["toolChoice"]["any"], serde_json::json!({}));
     }
 
@@ -834,7 +1001,8 @@ mod tests {
             &[sample_tool()],
             Some(&ToolChoice::Specific("add_numbers".to_owned())),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(cfg["toolChoice"]["tool"]["name"], "add_numbers");
     }
 
@@ -842,7 +1010,9 @@ mod tests {
     fn build_tool_config_none_choice_returns_null() {
         // `ToolChoice::None` suppresses toolConfig entirely — Converse
         // has no "tools available but forbidden" knob.
-        let cfg = build_tool_config(&[sample_tool()], Some(&ToolChoice::None)).unwrap();
+        let cfg = build_tool_config(&[sample_tool()], Some(&ToolChoice::None))
+            .unwrap()
+            .0;
         assert!(cfg.is_null());
     }
 
@@ -851,6 +1021,32 @@ mod tests {
         let wire = chat_message_to_converse(&ChatMessage::user("hi")).unwrap();
         assert_eq!(wire["role"], "user");
         assert_eq!(wire["content"][0]["text"], "hi");
+    }
+
+    /// Regression: Bedrock rejects a multi-turn conversation if any
+    /// `toolUse.name` in the message history contains `.`, even though
+    /// the response parser restored the cairn id to carry through the
+    /// orchestrator's `ToolCall` history. Sanitize on the way back out.
+    #[test]
+    fn chat_message_to_converse_sanitizes_tool_use_name_in_history() {
+        let msg = ChatMessage {
+            role: ChatRole::Assistant,
+            content_type: MessageContent::ToolUse(vec![ToolCall {
+                id: "tc1".to_owned(),
+                call_type: "function".to_owned(),
+                function: FunctionCall {
+                    name: "github_api.review_pr".to_owned(),
+                    arguments: r#"{"repo":"o/r","pr_number":1}"#.to_owned(),
+                },
+            }]),
+            content: String::new(),
+        };
+        let wire = chat_message_to_converse(&msg).unwrap();
+        let tu = &wire["content"][0]["toolUse"];
+        assert_eq!(
+            tu["name"], "github_api_review_pr",
+            "toolUse.name must be sanitized to match the configured toolSpec.name"
+        );
     }
 
     #[test]
@@ -946,7 +1142,7 @@ mod tests {
             "stopReason": "end_turn",
             "usage": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}
         });
-        let parsed = parse_converse_response(resp).unwrap();
+        let parsed = parse_converse_response(resp, &std::collections::HashMap::new()).unwrap();
         assert_eq!(parsed.text().as_deref(), Some("hello"));
         assert!(parsed.tool_calls().is_none());
         assert_eq!(parsed.finish_reason().as_deref(), Some("end_turn"));
@@ -976,7 +1172,7 @@ mod tests {
             "stopReason": "tool_use",
             "usage": {"inputTokens": 789, "outputTokens": 86, "totalTokens": 875, "cacheReadInputTokens": 0}
         });
-        let parsed = parse_converse_response(resp).unwrap();
+        let parsed = parse_converse_response(resp, &std::collections::HashMap::new()).unwrap();
         // Text is None (empty is normalised to None in `text()`).
         assert!(parsed.text().is_none());
         let calls = parsed.tool_calls().expect("tool_calls");
@@ -1007,7 +1203,7 @@ mod tests {
             "stopReason": "tool_use",
             "usage": {"inputTokens": 1, "outputTokens": 1}
         });
-        let parsed = parse_converse_response(resp).unwrap();
+        let parsed = parse_converse_response(resp, &std::collections::HashMap::new()).unwrap();
         assert_eq!(parsed.text().as_deref(), Some("Let me compute that."));
         assert_eq!(parsed.tool_calls().unwrap().len(), 1);
     }
@@ -1019,7 +1215,10 @@ mod tests {
             "stopReason": "end_turn",
             "usage": {"inputTokens": 10, "outputTokens": 2, "cacheReadInputTokens": 7}
         });
-        let u = parse_converse_response(resp).unwrap().usage().unwrap();
+        let u = parse_converse_response(resp, &std::collections::HashMap::new())
+            .unwrap()
+            .usage()
+            .unwrap();
         assert_eq!(u.cached_tokens, Some(7));
     }
 
@@ -1030,7 +1229,7 @@ mod tests {
             "stopReason": "tool_use",
             "usage": {"inputTokens": 1, "outputTokens": 1}
         });
-        let err = parse_converse_response(resp).unwrap_err();
+        let err = parse_converse_response(resp, &std::collections::HashMap::new()).unwrap_err();
         assert!(matches!(err, ProviderError::Provider(_)));
     }
 
@@ -1044,7 +1243,7 @@ mod tests {
             "stopReason": "tool_use",
             "usage": {"inputTokens": 1, "outputTokens": 1}
         });
-        let err = parse_converse_response(resp).unwrap_err();
+        let err = parse_converse_response(resp, &std::collections::HashMap::new()).unwrap_err();
         let msg = err.to_string();
         assert!(
             matches!(err, ProviderError::Provider(_)) && msg.contains("input"),
@@ -1061,7 +1260,7 @@ mod tests {
             "stopReason": "tool_use",
             "usage": {"inputTokens": 1, "outputTokens": 1}
         });
-        let err = parse_converse_response(resp).unwrap_err();
+        let err = parse_converse_response(resp, &std::collections::HashMap::new()).unwrap_err();
         let msg = err.to_string();
         assert!(
             matches!(err, ProviderError::Provider(_)) && msg.contains("not an object"),
