@@ -323,23 +323,32 @@ async fn spawn_subagent_persists_parent_context_on_child_run_default() {
         .get("value")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    // #813: post-fix, the runtime auto-prepends a `Workspace path: <abs>`
-    // header to the child's parent_context so sub-agents know where to
-    // `cd` on their first DECIDE without a discovery round-trip. The
-    // LLM-supplied parent_context follows. Pre-#813 the child's
-    // parent_context was the LLM's string verbatim; post-#813 we
-    // assert the LLM's string is CONTAINED (so the LLM intent is
-    // preserved) AND the workspace_line prefix is present.
-    assert!(
-        value.contains(PARENT_CONTEXT),
-        "#775 + #813: child run's parent_context must contain the LLM's \
-         `tool_args[\"parent_context\"]` verbatim. value={value}",
+    // #775 + #844 PR-3: the child's `parent_context` default contains
+    // the LLM's `tool_args["parent_context"]` verbatim — nothing more.
+    //
+    // Pre-#844 PR-3 the runtime also prepended a `Workspace path:
+    // <abs>` line sourced from the PARENT's `ctx.working_dir` at
+    // spawn time. R37 dogfood (2026-05-11) found that was wrong —
+    // the parent's working_dir is NOT the child's sandbox (each
+    // child gets its own allocated at orchestrate-boot), so the
+    // injected line pointed every child at the parent's empty
+    // ephemeral directory. The child's own workspace path now
+    // surfaces via `## Run state { workspace_path: <child.working_dir> }`
+    // in the CHILD's DECIDE-time user message (#813 renderer-side
+    // contract, preserved by #844 PR-1 for all non-orchestrator
+    // roles). So the spawn-time default is LLM-supplied content only.
+    assert_eq!(
+        value, PARENT_CONTEXT,
+        "#775 + #844 PR-3: child's parent_context must be exactly the \
+         LLM's `tool_args[\"parent_context\"]` — no auto-prepended \
+         workspace_line. value={value}",
     );
     assert!(
-        value.contains("Workspace path:"),
-        "#813: child run's parent_context must auto-include the \
-         resolved workspace path so sub-agents skip the discovery \
-         loop on their first DECIDE. value={value}",
+        !value.contains("Workspace path:"),
+        "#844 PR-3: spawn-time workspace_line injection must be gone. \
+         The child's path is rendered via its own `## Run state` \
+         header at DECIDE time, not leaked into parent_context with \
+         the parent's path. value={value}",
     );
 }
 
@@ -447,13 +456,23 @@ async fn spawn_subagent_omits_parent_context_default_when_unset() {
         .and_then(|v| v.as_str())
         .expect("child has run_id");
 
-    // #775 + #813: pre-#813 this test asserted 404 — the persistence
-    // path was gated on `Some(_)` so a spawn without LLM-supplied
-    // parent_context wrote no row. Post-#813 the runtime ALWAYS
-    // injects a `Workspace path: <abs>` header into the child's
-    // parent_context so sub-agents skip the discovery loop on their
-    // first DECIDE. The row exists; its content is the workspace
-    // line alone (no LLM-supplied tail).
+    // #775 + #844 PR-3: when the LLM omits parent_context, no
+    // default row is written (back to pre-#813 semantics).
+    //
+    // History:
+    //   - Pre-#813: 404 — persistence gated on LLM-supplied `Some(_)`.
+    //   - #813: 200 with synthesised `Workspace path:` line from the
+    //     PARENT's `ctx.working_dir`. R37 dogfood (2026-05-11) proved
+    //     that was incorrect — the parent's working_dir is not the
+    //     child's sandbox, so the line pointed every child at an
+    //     empty parent directory.
+    //   - #844 PR-3: 404 again. The child's own sandbox path
+    //     surfaces via `## Run state { workspace_path: ... }` in the
+    //     CHILD's DECIDE-time prompt (rendered from the child's own
+    //     working_dir, not the parent's). The prior-siblings block
+    //     from PR-843 still fires on re-spawn via step_history, but
+    //     that's an orthogonal content source that doesn't need a
+    //     row on first-spawn.
     let key = format!("run:{child_run_id}:parent_context");
     let r = h
         .client()
@@ -467,22 +486,14 @@ async fn spawn_subagent_omits_parent_context_default_when_unset() {
         .expect("defaults GET reaches server");
     assert_eq!(
         r.status().as_u16(),
-        200,
-        "#813: parent_context is auto-populated with the workspace \
-         path on every spawn, even when the LLM omits parent_context. \
-         A 404 here means the workspace-path auto-inject regressed. \
-         Body: {}",
+        404,
+        "#844 PR-3: when the LLM omits parent_context on a first spawn \
+         (no failed siblings in step_history), no default row must be \
+         written — the spawn-time workspace_line injection has been \
+         removed because it leaked the parent's path. The child's \
+         path surfaces via its own `## Run state` header. \
+         Got status {} body: {}",
+        r.status().as_u16(),
         r.text().await.unwrap_or_default(),
-    );
-    let body: Value = r.json().await.expect("defaults body json");
-    let value = body
-        .get("value")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    assert!(
-        value.contains("Workspace path:"),
-        "#813: parent_context must contain the workspace_line when \
-         the LLM omits parent_context (auto-inject is the only \
-         source). value={value}",
     );
 }

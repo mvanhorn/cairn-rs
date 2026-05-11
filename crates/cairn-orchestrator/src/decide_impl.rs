@@ -1223,9 +1223,12 @@ fn build_user_message_with_role(
     // goal strings ("do X at /tmp/cairn-runs/<parent>/"), which then
     // pointed the child at an empty directory since children get
     // their own sandbox allocated at spawn time. Dropping the line
-    // for orchestrator closes the leak; the per-child workspace_line
-    // auto-inject via #813 still tells the child where ITS sandbox
-    // lives.
+    // for orchestrator closes the leak; the child's own `## Run
+    // state { workspace_path }` below still tells each sub-agent
+    // role where ITS sandbox lives, rendered from the child's own
+    // `ctx.working_dir` at its DECIDE time (#844 PR-3 removed the
+    // redundant spawn-time workspace_line that was sourcing the
+    // parent's working_dir).
     //
     // Discriminator is `AgentRoleTier::Orchestrator`, not a string
     // match on `role_id == "orchestrator"` (Gemini PR #846 review):
@@ -3199,9 +3202,10 @@ mod tests {
     /// weight — and R36 dogfood showed the orchestrator LLM copying its
     /// own workspace_path into sub-agent goal strings, which pointed
     /// children at empty directories because each child gets its own
-    /// sandbox allocated at spawn time. The child's own workspace_line
-    /// auto-inject (#813) is the correct surface for the child's path;
-    /// the orchestrator has no business knowing its own.
+    /// sandbox allocated at spawn time. The child's own `## Run
+    /// state { workspace_path }` render is the correct surface for
+    /// the child's path; the orchestrator has no business knowing
+    /// its own.
     #[test]
     fn build_user_message_omits_workspace_path_for_orchestrator() {
         let mut c = ctx();

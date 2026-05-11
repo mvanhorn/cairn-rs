@@ -1325,84 +1325,52 @@ impl RuntimeExecutePhase {
                 let reuse_sandbox_from: Option<cairn_domain::RunId> =
                     reuse_sandbox_from_str.map(cairn_domain::RunId::new);
 
-                // #813: ALWAYS thread the parent's resolved workspace
-                // path into the child's parent_context. R23 dogfood
-                // showed executor sub-agents spending 11+ iterations on
-                // `pwd` / `find Cargo.toml` / `ls /tmp/cairn-runs/...`
-                // discovery loops because `working_dir` was set in the
-                // runtime context but not surfaced anywhere the child
-                // could see it. The orchestrator role doesn't have file
-                // tools (#806), so it can't include the path itself —
-                // the runtime is the only actor with both the resolved
-                // working_dir and the spawn site. We inject a
-                // `Workspace path: <abs path>` line at the top of the
-                // child's parent_context so the LLM sees it on its
-                // first DECIDE without a discovery round-trip. The
-                // LLM-supplied context (if any) follows.
-                //
-                // Path safety (Gemini PR #814 review): only inject the
-                // workspace_line when `ctx.working_dir` is an absolute
-                // path with no `.` / `..` components. A relative or
-                // dotted path would tell the LLM to `cd .` (which
-                // resolves wherever the harness is running) or
-                // `cd ../..` (path-traversal). Either is worse than
-                // omitting the line and letting the LLM run its
-                // discovery loop. `working_dir` is normally produced
-                // by `working_dir_for_run` which canonicalizes, but
-                // the validation here is cheap and closes the gap if
-                // a future caller short-circuits that helper.
-                let workspace_path_safe = {
-                    let p = &ctx.working_dir;
-                    let s = p.to_string_lossy();
-                    p.is_absolute()
-                        && !s.is_empty()
-                        && !p.components().any(|c| {
-                            matches!(
-                                c,
-                                std::path::Component::CurDir | std::path::Component::ParentDir
-                            )
-                        })
-                };
                 // R35 (2026-05-10) dogfood: the orchestrator correctly
                 // re-spawned fresh sub-agents after predecessors failed
                 // the completion gate, but each child started with
-                // `parent_context = null` (or only the workspace_line)
-                // and re-did discovery from zero — same clone, same
-                // reads, same failed approach, same gate rejection.
-                // Synthesise a `## Prior sibling attempts` block from
-                // `step_history` when there are failed `subagent_complete`
-                // entries, and prepend it so the child sees predecessor
-                // context on its first DECIDE. Helper caps at 2 entries
-                // and ~1200 chars each to bound the prompt.
+                // `parent_context = null` and re-did discovery from
+                // zero — same clone, same reads, same failed approach,
+                // same gate rejection. Synthesise a `## Prior sibling
+                // attempts` block from `step_history` when there are
+                // failed `subagent_complete` entries, and prepend it so
+                // the child sees predecessor context on its first
+                // DECIDE. Helper caps at 2 entries and ~1200 chars each
+                // to bound the prompt.
                 let prior_siblings_block = recent_failed_siblings_summary(&ctx.step_history);
 
-                let workspace_line_opt: Option<String> = if workspace_path_safe {
-                    Some(format!(
-                        "Workspace path: {}\n\
-                         Start by `cd`-ing here. The repository / project lives at this path; \
-                         do not search for it.",
-                        ctx.working_dir.display(),
-                    ))
-                } else {
-                    // Working dir is relative / empty / contains `..`.
-                    // Skip the auto-inject — sending an unsafe path to
-                    // the LLM is worse than the discovery loop. Log at
-                    // WARN so operators can see why a child is back to
-                    // the discovery path.
-                    tracing::warn!(
-                        run_id = %ctx.run_id,
-                        working_dir = %ctx.working_dir.display(),
-                        "#813 + #814 review: parent's working_dir is not a clean absolute path \
-                         (relative / empty / contains `.` or `..`); skipping workspace_line \
-                         auto-inject for child spawn"
-                    );
-                    None
-                };
-
+                // #844 PR-3: the spawn-time `Workspace path:` auto-inject
+                // (originally added in #813 for executor discovery-loop
+                // relief) was threading the PARENT's `ctx.working_dir`
+                // into the child's `parent_context` — because at this
+                // call site `ctx` is the parent's OrchestrationContext,
+                // not the child's. R37 dogfood (2026-05-11) showed all
+                // 3 re-spawned children cd'ing into the parent's
+                // ephemeral sandbox (`/tmp/cairn-runs/<parent-id>/`)
+                // and writing real cargo+src files there, instead of
+                // into their own allocated sandbox. Every re-spawn
+                // burned through discovery on the parent's pile of
+                // stale artefacts.
+                //
+                // The #813 contract is preserved by the CHILD's own
+                // DECIDE-time render: `build_user_message` emits
+                // `## Run state { workspace_path: <child.working_dir> }`
+                // for non-orchestrator roles (see #844 PR-1), where
+                // `child.working_dir` is `working_dir_for_run(child)`
+                // resolved at the child's orchestrate boot. That is
+                // the CHILD's actual sandbox, not the parent's. The
+                // executor-discovery-loop relief #813 aimed for still
+                // fires via that header — no functional regression.
+                //
+                // Dropping the spawn-time injection entirely here is
+                // the fix: it was never the right plumbing for the
+                // child's path, and PR-2 (#847) now covers deliberate
+                // sandbox-reuse via `reuse_sandbox_from` which replays
+                // at the child's boot, not via a string in
+                // parent_context.
+                //
                 // Compose `parent_context` from, in order:
                 //   1. prior-siblings synthesised block (when present)
-                //   2. workspace_line (when path is safe)
-                //   3. LLM-supplied parent_context (when present)
+                //   2. LLM-supplied parent_context (when present)
                 //
                 // Each separator is a blank line so downstream prompt
                 // rendering treats them as independent markdown blocks.
@@ -1410,9 +1378,6 @@ impl RuntimeExecutePhase {
                     let mut sections: Vec<String> = Vec::new();
                     if let Some(block) = prior_siblings_block {
                         sections.push(block);
-                    }
-                    if let Some(line) = workspace_line_opt {
-                        sections.push(line);
                     }
                     if let Some(llm_ctx) = llm_parent_context {
                         sections.push(llm_ctx);
