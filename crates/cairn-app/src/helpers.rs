@@ -428,6 +428,50 @@ pub(crate) async fn persist_run_u32_default(
         .map(|_| ())
 }
 
+/// Read a run's per-run u64 default. Used to recover `timeout_ms` on
+/// the empty-body auto-resume POST so the first operator-chosen
+/// timeout survives every subsequent kick (same shape as
+/// [`resolve_run_u32_default`] for `max_iterations`).
+pub(crate) async fn resolve_run_u64_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+) -> Option<u64> {
+    let key = run_default_key(run_id, suffix);
+    state
+        .runtime
+        .defaults
+        .resolve(project, &key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_u64())
+}
+
+/// Persist a run's per-run u64 default (currently `timeout_ms`).
+/// Mirrors [`persist_run_u32_default`] — stored in the same `defaults`
+/// projection under the `run:<id>:<suffix>` key.
+pub(crate) async fn persist_run_u64_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: u64,
+) -> Result<(), cairn_runtime::RuntimeError> {
+    state
+        .runtime
+        .defaults
+        .set(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            serde_json::Value::Number(serde_json::Number::from(value)),
+        )
+        .await
+        .map(|_| ())
+}
+
 /// #660: read a run's per-run boolean default. Accepts either a native
 /// JSON bool or a string spelling (`"true"`, `"false"`, `"1"`, `"0"`,
 /// `"yes"`, `"no"`) so operators flipping the flag via a curl one-liner

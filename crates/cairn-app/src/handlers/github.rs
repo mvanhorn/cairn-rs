@@ -442,6 +442,51 @@ pub(crate) async fn process_webhook_orchestrate(
         "Created session + run for GitHub webhook"
     );
 
+    // Build the webhook-path `LoopConfig` once and persist its loop
+    // limits (`max_iterations`, `timeout_ms`) under the per-run defaults
+    // keys that `handlers/runs/orchestrate.rs` consults. Without this,
+    // the F49 auto-resume POST (`/v1/runs/:id/orchestrate` with empty
+    // body) would drop back to `LoopConfig::default()` on every
+    // approval-cycle kick — the regression we saw on PR #10 (Raft
+    // cluster-bus review), where the agent burned its budget fetching
+    // the diff and never reached `github_api.review_pr`.
+    //
+    // Breaker caps stay off the per-run defaults path: they're read
+    // from `runtime_config.orchestrator_*` (env +
+    // `CAIRN_ORCHESTRATOR_*`), so one operator-level setting applies
+    // to every run regardless of entry path.
+    let webhook_cfg = webhook_loop_config_from_env();
+    if let Err(err) = crate::persist_run_u32_default(
+        state,
+        &project,
+        &run.run_id,
+        "max_iterations",
+        webhook_cfg.max_iterations,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id_str,
+            error = %err,
+            "failed to persist run max_iterations default; auto-resume may fall back to LoopConfig default"
+        );
+    }
+    if let Err(err) = crate::persist_run_u64_default(
+        state,
+        &project,
+        &run.run_id,
+        "timeout_ms",
+        webhook_cfg.timeout_ms,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id_str,
+            error = %err,
+            "failed to persist run timeout_ms default; auto-resume may fall back to LoopConfig default"
+        );
+    }
+
     if let Some(number) = issue_number {
         let client = github.client_for_installation(installation_id).await;
         let msg = format!(
@@ -478,6 +523,7 @@ pub(crate) async fn process_webhook_orchestrate(
         &work_item.body,
         Some(installation_id),
         Some(&work_item),
+        webhook_cfg,
     )
     .await
 }
@@ -488,6 +534,10 @@ pub(crate) async fn webhook_trigger_orchestration(
     goal: &str,
     _installation_id: Option<u64>,
     work_item: Option<&cairn_integrations::WorkItem>,
+    // Built once in `process_webhook_orchestrate` (along with the
+    // per-run `max_iterations` / `timeout_ms` persistence) so the env
+    // vars are read once per webhook delivery, not twice.
+    loop_config: cairn_orchestrator::LoopConfig,
 ) -> Result<(), String> {
     use cairn_orchestrator::{
         LlmDecidePhase, LoopTermination, OrchestrationContext, OrchestratorLoop,
@@ -617,25 +667,14 @@ pub(crate) async fn webhook_trigger_orchestration(
         .with_event_log(state.runtime.store.clone());
 
     let store = state.runtime.store.clone();
-    // Webhook-triggered runs inherit `LoopConfig::default()` like the
-    // rest of cairn. Operators who need a different envelope for
-    // webhook runs (e.g. large upstream PR reviews that legitimately
-    // exceed 200k tokens / 50 iterations / 15 min) set it per
-    // deployment via env vars read here — the binary stays a single
-    // service with one conservative default; local/dev/dogfood boots
-    // opt in to higher ceilings without shipping different binaries.
-    //
-    // Breaker caps are clamped so they stay strictly above
-    // `max_iterations` / `timeout_ms` — when operators raise one via
-    // env, the paired breaker is auto-bumped to keep the "clean
-    // termination via TimedOut/MaxIterations, breaker as safety net"
-    // invariant that the rest of cairn relies on.
-    //
-    // NOTE: this path does NOT consult the per-run / per-project /
-    // per-system settings-defaults projection that
-    // `POST /v1/runs/:id/orchestrate` uses. Known follow-up; for now,
-    // env vars are the only knob for webhook runs.
-    let config = webhook_loop_config_from_env();
+    // `loop_config` was built in `process_webhook_orchestrate` from
+    // `webhook_loop_config_from_env()` so env vars are read once per
+    // webhook delivery (not twice). The caller also persisted its
+    // `max_iterations` and `timeout_ms` to the per-run defaults
+    // projection so every subsequent F49 auto-resume kick through
+    // `POST /v1/runs/:id/orchestrate` (empty body) inherits the same
+    // envelope.
+    let config = loop_config;
 
     let execute = RuntimeExecutePhase::builder()
         .tool_registry(registry)
@@ -1346,12 +1385,40 @@ pub(crate) async fn orchestrate_single_issue(
         )
         .await
         .map_err(|e| format!("repo allowlist failed: {}", e.client_message()))?;
+    // Mirror the webhook-path envelope + per-run defaults persistence
+    // so scan-queue dispatched runs honor the same budgets and their
+    // F49 auto-resume kicks inherit them. See the persistence block in
+    // `process_webhook_orchestrate` for the rationale.
+    let webhook_cfg = webhook_loop_config_from_env();
+    if let Err(err) = crate::persist_run_u32_default(
+        state,
+        &run.project,
+        &run.run_id,
+        "max_iterations",
+        webhook_cfg.max_iterations,
+    )
+    .await
+    {
+        tracing::warn!(run_id = %run.run_id, error = %err, "failed to persist run max_iterations default; auto-resume may fall back to LoopConfig default");
+    }
+    if let Err(err) = crate::persist_run_u64_default(
+        state,
+        &run.project,
+        &run.run_id,
+        "timeout_ms",
+        webhook_cfg.timeout_ms,
+    )
+    .await
+    {
+        tracing::warn!(run_id = %run.run_id, error = %err, "failed to persist run timeout_ms default; auto-resume may fall back to LoopConfig default");
+    }
     webhook_trigger_orchestration(
         state,
         &run,
         &goal,
         Some(entry.installation_id),
         Some(&work_item),
+        webhook_cfg,
     )
     .await?;
     let final_state =

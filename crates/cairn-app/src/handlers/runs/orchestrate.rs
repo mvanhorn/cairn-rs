@@ -30,7 +30,7 @@ use crate::sandbox::workspace_error_response;
 use crate::state::AppState;
 use crate::{
     resolve_run_bool_default, resolve_run_mode_default, resolve_run_string_default,
-    resolve_run_u32_default,
+    resolve_run_u32_default, resolve_run_u64_default,
 };
 
 /// Body for `POST /v1/runs/:id/orchestrate`.
@@ -998,6 +998,14 @@ pub(crate) async fn drive_run_iteration(
         resolve_run_mode_default(state.as_ref(), &run.project, &run.run_id).await;
     let default_max_iterations =
         resolve_run_u32_default(state.as_ref(), &run.project, &run.run_id, "max_iterations").await;
+    // Companion to `default_max_iterations`: recover `timeout_ms` on
+    // the empty-body auto-resume POST so the first operator-chosen
+    // timeout survives every subsequent kick. Without this, a webhook
+    // run with a 60 min timeout gets 5 min on resume, times out mid-
+    // review. Persistence-side is symmetric: the webhook handler and
+    // the body-first-contact branch below both write the key.
+    let default_timeout_ms =
+        resolve_run_u64_default(state.as_ref(), &run.project, &run.run_id, "timeout_ms").await;
     // #660: strict completion gate flag. Absent key → None → default
     // `true` flows in via `LoopConfig::default()` below. Operators who
     // want the legacy "LLM calls it done no matter what" flow flip the
@@ -1021,6 +1029,7 @@ pub(crate) async fn drive_run_iteration(
     // the run with a "no objective" summary (issue #651 root cause).
     let body_has_goal = body.goal.is_some();
     let body_has_max_iterations = body.max_iterations.is_some();
+    let body_has_timeout_ms = body.timeout_ms.is_some();
     let goal_value = body
         .goal
         .or(default_goal.clone())
@@ -1222,6 +1231,37 @@ pub(crate) async fn drive_run_iteration(
                 run_id = %run.run_id,
                 error = %err,
                 "#651: failed to persist run max_iterations default; auto-resume may fall back to LoopConfig default"
+            );
+        }
+    }
+
+    // Same back-fill shape for `timeout_ms`. Without this, a webhook-
+    // triggered run's 60 min timeout would revert to the 5-min default
+    // on every F49 auto-resume kick. Body-first-contact writes the
+    // caller's value; absent-and-unset writes the LoopConfig default
+    // so subsequent resume kicks see a stable value instead of the
+    // (default-resolves-to-5-min-via-LoopConfig::default()) None path.
+    let persist_timeout: Option<u64> = if body_has_timeout_ms {
+        body.timeout_ms
+    } else if default_timeout_ms.is_none() {
+        Some(cairn_orchestrator::LoopConfig::default().timeout_ms)
+    } else {
+        None
+    };
+    if let Some(v) = persist_timeout {
+        if let Err(err) = crate::persist_run_u64_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "timeout_ms",
+            v,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = %run.run_id,
+                error = %err,
+                "failed to persist run timeout_ms default; auto-resume may fall back to LoopConfig default"
             );
         }
     }
@@ -1801,7 +1841,7 @@ pub(crate) async fn drive_run_iteration(
     if let Some(m) = body.max_iterations.or(default_max_iterations) {
         cfg.max_iterations = m;
     }
-    if let Some(t) = body.timeout_ms {
+    if let Some(t) = body.timeout_ms.or(default_timeout_ms) {
         cfg.timeout_ms = t;
     }
     // #660: route the per-run default into LoopConfig. Absent → inherit
