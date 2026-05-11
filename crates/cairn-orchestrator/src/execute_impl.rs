@@ -1264,20 +1264,66 @@ impl RuntimeExecutePhase {
                     }
                 };
 
-                // #775: optional freeform parent_context. Trimmed empty
-                // → None (don't surface a `## Parent context` section
-                // for whitespace). Non-string values are silently
-                // ignored — the schema declares `string` so any other
-                // shape is malformed and the child is better off without
-                // garbage context than with it.
-                let llm_parent_context: Option<String> = proposal
+                // #775 + #844 PR-2: pull BOTH optional fields
+                // (`parent_context`, `reuse_sandbox_from`) through the
+                // shared extractor that decide_impl uses on the native
+                // tool-call path. Using the same helper here closes the
+                // gap Gemini review flagged — a legacy nested shape
+                // `{"tool_name": "executor", "tool_args": {"goal":
+                // "...", "reuse_sandbox_from": "..."}}` was previously
+                // only handled in the parse layer; the execute-side
+                // inline extraction only looked at the flat top level,
+                // so text-parsing-mode runs would drop the field.
+                let (llm_parent_context, reuse_sandbox_from_str) = proposal
                     .tool_args
                     .as_ref()
-                    .and_then(|args| args.get("parent_context"))
-                    .and_then(|c| c.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
+                    .map(crate::decide_impl::extract_spawn_subagent_optionals)
+                    .unwrap_or((None, None));
+
+                // #844 PR-2 type guard (Copilot review): when the LLM
+                // emits `reuse_sandbox_from` as a non-string (number,
+                // null, object, array), the shared extractor returns
+                // `None` — effectively a silent fallback to a fresh
+                // sandbox. That hides schema drift from the LLM and
+                // robs the retry loop of its correction signal. Detect
+                // the key-present-but-wrong-type shape and surface as
+                // MALFORMED so `derive_signal` routes it to
+                // `LoopSignal::Continue` and the step_history rejection
+                // tells the LLM exactly what to fix.
+                if let Some(raw) = proposal
+                    .tool_args
+                    .as_ref()
+                    .and_then(|args| args.get("reuse_sandbox_from"))
+                {
+                    if reuse_sandbox_from_str.is_none() && !raw.is_null() && !raw.is_string() {
+                        return Ok(ActionResult {
+                            proposal: proposal.clone(),
+                            status: ActionStatus::Failed {
+                                reason: format!(
+                                    "{MALFORMED_SPAWN_PROPOSAL_PREFIX}spawn_subagent: \
+                                     tool_args[\"reuse_sandbox_from\"] must be a \
+                                     string run_id (the LLM emitted a non-string \
+                                     value of shape {}). Re-emit with a string \
+                                     run_id from the `## Prior sibling attempts` \
+                                     block, or omit the field for a fresh sandbox.",
+                                    match raw {
+                                        serde_json::Value::Number(_) => "number",
+                                        serde_json::Value::Bool(_) => "boolean",
+                                        serde_json::Value::Array(_) => "array",
+                                        serde_json::Value::Object(_) => "object",
+                                        _ => "unexpected",
+                                    }
+                                ),
+                            },
+                            tool_output: None,
+                            invocation_id: None,
+                            duration_ms: 0,
+                        });
+                    }
+                }
+
+                let reuse_sandbox_from: Option<cairn_domain::RunId> =
+                    reuse_sandbox_from_str.map(cairn_domain::RunId::new);
 
                 // #813: ALWAYS thread the parent's resolved workspace
                 // path into the child's parent_context. R23 dogfood
@@ -1423,6 +1469,13 @@ impl RuntimeExecutePhase {
                         // #775: optional parent freeform context for
                         // the child's first DECIDE prompt.
                         parent_context,
+                        // #844 PR-2: optional opt-in reference to a
+                        // prior sibling whose sandbox the child should
+                        // reuse. Validated at the adapter layer
+                        // (same-root + same-project); rejections
+                        // surface into step_history via the `Err(e)`
+                        // branch below so the LLM can correct.
+                        reuse_sandbox_from,
                     )
                     .await
                 {

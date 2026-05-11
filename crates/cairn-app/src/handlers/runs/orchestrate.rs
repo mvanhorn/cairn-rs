@@ -874,7 +874,110 @@ pub(crate) async fn drive_run_iteration(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let working_dir = match working_dir_for_run(state.as_ref(), &run).await {
+    // #844 PR-2: resolve the opt-in `reuse_sandbox_from` default the
+    // parent LLM set on this child via `spawn_subagent`. When present,
+    // the child's working_dir resolves against the **referenced
+    // sibling run** instead of the child's own id — so the new child
+    // inherits any partial on-disk work the dead sibling left behind
+    // (repo clone, applied patches, cached build artefacts). When
+    // absent (the common case, including all root runs + children
+    // spawned without the opt-in), falls through to today's
+    // per-child-id resolution.
+    //
+    // Defense-in-depth: the spawn-side validation in
+    // `fabric_adapter::spawn_subagent` already rejects cross-root /
+    // cross-project ids at write time, so a persisted default is
+    // known-good at the time of write. But defaults rows are
+    // mutable via `PUT /v1/settings/defaults/...`, and an older
+    // code path (pre-PR-2) could write a value without the
+    // sibling check. Re-validate here before handing to
+    // `working_dir_for_run` so the sandbox-inheritance path never
+    // blindly trusts the row.
+    let reuse_sandbox_from = resolve_run_string_default(
+        state.as_ref(),
+        &run.project,
+        &run.run_id,
+        "reuse_sandbox_from",
+    )
+    .await;
+    let run_for_working_dir: cairn_store::projections::RunRecord = if let Some(reuse_id_str) =
+        reuse_sandbox_from
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        let reuse_id = cairn_domain::RunId::new(reuse_id_str.to_owned());
+        // Read the reuse-run straight from the projection — `run` is
+        // already known to be tenant-visible to the caller by the
+        // outer handler (tenant_scope check at handler entry), and
+        // the same-root + same-project gate below enforces that the
+        // reuse target sits in the same tenancy envelope. Using
+        // `RunReadModel::get` here (not `load_run_visible_to_tenant`,
+        // which needs a `TenantScope`) keeps `drive_run_iteration`'s
+        // signature unchanged and still blocks cross-tenancy leakage.
+        match cairn_store::projections::RunReadModel::get(state.runtime.store.as_ref(), &reuse_id)
+            .await
+        {
+            Ok(Some(reuse_run)) => {
+                // Same-root + same-project gate. Matches the spawn-
+                // side validation verbatim; keeps operator-mutated
+                // defaults from cross-rooting at read time.
+                let child_root = run
+                    .root_run_id
+                    .clone()
+                    .unwrap_or_else(|| run.run_id.clone());
+                let reuse_root = reuse_run
+                    .root_run_id
+                    .clone()
+                    .unwrap_or_else(|| reuse_run.run_id.clone());
+                if reuse_root == child_root && reuse_run.project == run.project {
+                    tracing::info!(
+                        run_id = %run.run_id,
+                        reuse_sandbox_from = %reuse_id,
+                        "#844 PR-2: resolving working_dir against prior sibling's \
+                         sandbox (reuse_sandbox_from default)",
+                    );
+                    reuse_run
+                } else {
+                    tracing::warn!(
+                        run_id = %run.run_id,
+                        reuse_sandbox_from = %reuse_id,
+                        reuse_root = %reuse_root,
+                        child_root = %child_root,
+                        "#844 PR-2: reuse_sandbox_from default points at a run \
+                         in a different root/project; falling back to fresh \
+                         sandbox. Defense-in-depth — spawn-side validation \
+                         should have caught this at write time.",
+                    );
+                    run.clone()
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    reuse_sandbox_from = %reuse_id,
+                    "#844 PR-2: reuse_sandbox_from default references a run \
+                     that does not exist; falling back to fresh sandbox.",
+                );
+                run.clone()
+            }
+            Err(err) => {
+                // Store error loading the reuse run — don't fail the
+                // whole orchestrate; degrade to fresh sandbox and log.
+                tracing::warn!(
+                    error = %err,
+                    run_id = %run.run_id,
+                    reuse_sandbox_from = %reuse_id,
+                    "#844 PR-2: failed to load reuse_sandbox_from run; \
+                     falling back to fresh sandbox.",
+                );
+                run.clone()
+            }
+        }
+    } else {
+        run.clone()
+    };
+    let working_dir = match working_dir_for_run(state.as_ref(), &run_for_working_dir).await {
         Ok(path) => path,
         Err(err) => return Err(workspace_error_response(err)),
     };

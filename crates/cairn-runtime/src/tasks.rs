@@ -247,12 +247,26 @@ pub trait TaskService: Send + Sync {
     /// `## Parent context` section. `None` when the parent did not
     /// provide one. Impls MUST record on the emitted event verbatim.
     ///
+    /// `reuse_sandbox_from` (#844 PR-2) is the optional escape hatch
+    /// for continuing partial on-disk work across re-spawns. When
+    /// `Some(prior_sibling_run_id)`, the child inherits the named
+    /// prior run's working directory instead of getting a fresh one.
+    /// `None` keeps today's fresh-per-spawn behaviour. Impls MUST
+    /// validate that the referenced run is a **sibling under the
+    /// same root** (i.e. `root_run_id == parent.root_run_id` or
+    /// matches the parent's own id when parent is itself root) AND
+    /// lives in the same project — any other value is rejected as
+    /// `RuntimeError::Validation` so the rejection surfaces via
+    /// step_history and the LLM can correct on the next DECIDE.
+    /// No silent fallback to a fresh sandbox.
+    ///
     /// The default impl returns an error. `TaskService` has no
     /// built-in `RunService::get` to derive project from parent, so
     /// there is no generic way to fulfil the contract from within
     /// `TaskService`. Impls MUST override. This is not a regression
     /// — the old default impl accepted a caller-supplied `project`
     /// which was the very tenancy hole this change closes.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_subagent(
         &self,
         _parent_run_id: RunId,
@@ -263,6 +277,7 @@ pub trait TaskService: Send + Sync {
         _goal: String,
         _role: String,
         _parent_context: Option<String>,
+        _reuse_sandbox_from: Option<RunId>,
     ) -> Result<TaskRecord, RuntimeError> {
         Err(RuntimeError::Internal(
             "TaskService::spawn_subagent default impl called — impls must \
