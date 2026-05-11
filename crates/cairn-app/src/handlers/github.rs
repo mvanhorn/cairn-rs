@@ -252,6 +252,104 @@ pub(crate) fn derive_webhook_goal(
     }
 }
 
+/// Webhook-path iteration floor — the pre-#848 in-binary value, kept
+/// so removing the previous commit's hardcoded bumps does not regress
+/// webhook runs to the cairn-wide 5-minute default. Operators raise
+/// via `CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS`.
+const WEBHOOK_DEFAULT_MAX_ITERATIONS: u32 = 50;
+/// Webhook-path wall-clock floor (30 minutes) — same rationale.
+const WEBHOOK_DEFAULT_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+
+/// Envelope for webhook-triggered orchestrator runs. Starts from
+/// `LoopConfig::default()` and applies the webhook-path floors above
+/// (50 iter / 30 min, matching the pre-#848 hardcoded values on `main`)
+/// so no existing deployment regresses when this helper landed.
+/// Operators opt into a larger envelope per-deployment via env.
+///
+/// Env knobs (all optional, all read at call time — not cached):
+/// - `CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS` — u32, overrides `max_iterations`
+/// - `CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS` — u64, overrides `timeout_ms`
+/// - `CAIRN_GITHUB_WEBHOOK_TOKEN_CAP` — u64, overrides `breakers.token_cap`
+///
+/// Breaker caps (`round_cap`, `wall_clock_ms`, the others) are NOT
+/// exposed to env yet — if operators need to tighten or loosen them
+/// specifically, file a follow-up. The current helper auto-bumps
+/// `round_cap` / `wall_clock_ms` when they would otherwise sit
+/// at-or-below the loop limit so runs terminate cleanly via
+/// `LoopTermination::TimedOut` / `MaxIterations` rather than tripping
+/// the safety-net breaker first.
+///
+/// Extreme env values (e.g. `u32::MAX` / `u64::MAX`) are rejected by
+/// `parse_env_limit`: anything that leaves less than a sane headroom
+/// to the breaker is ignored and the floor default is used instead,
+/// with a warning log. That preserves the strictly-above invariant
+/// without silently clamping, which would be the worse failure mode.
+fn webhook_loop_config_from_env() -> cairn_orchestrator::LoopConfig {
+    let mut cfg = cairn_orchestrator::LoopConfig::default();
+    cfg.max_iterations = WEBHOOK_DEFAULT_MAX_ITERATIONS;
+    cfg.timeout_ms = WEBHOOK_DEFAULT_TIMEOUT_MS;
+
+    cfg.max_iterations = parse_env_limit::<u32>(
+        "CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS",
+        cfg.max_iterations,
+        u32::MAX - 50,
+    );
+    cfg.timeout_ms = parse_env_limit::<u64>(
+        "CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS",
+        cfg.timeout_ms,
+        u64::MAX - 10 * 60 * 1_000,
+    );
+    if let Some(v) = std::env::var("CAIRN_GITHUB_WEBHOOK_TOKEN_CAP")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        cfg.breakers.token_cap = v;
+    }
+
+    // Preserve the "breaker strictly above loop limit" invariant that
+    // the rest of cairn relies on (see `BreakerConfig` rustdoc). The
+    // `max_allowed` caller above already guarantees we can saturating-add
+    // the safety margin without wrapping.
+    if cfg.breakers.round_cap <= cfg.max_iterations {
+        cfg.breakers.round_cap = cfg.max_iterations.saturating_add(50);
+    }
+    if cfg.breakers.wall_clock_ms <= cfg.timeout_ms {
+        cfg.breakers.wall_clock_ms = cfg.timeout_ms.saturating_add(10 * 60 * 1_000);
+    }
+    cfg
+}
+
+/// Parse an env-var-backed loop limit, rejecting values > `max_allowed`
+/// (which would make it impossible to keep a strictly-greater breaker
+/// cap without wrapping). Invalid/out-of-range values log a WARN and
+/// fall back to `default`.
+fn parse_env_limit<T>(key: &str, default: T, max_allowed: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Copy + std::fmt::Display,
+{
+    let Ok(raw) = std::env::var(key) else {
+        return default;
+    };
+    let Ok(parsed) = raw.parse::<T>() else {
+        tracing::warn!(
+            env_key = key,
+            raw = %raw,
+            "ignoring unparseable env value; falling back to default"
+        );
+        return default;
+    };
+    if parsed > max_allowed {
+        tracing::warn!(
+            env_key = key,
+            value = %parsed,
+            max_allowed = %max_allowed,
+            "env value exceeds max_allowed (would break breaker-above-limit invariant); falling back to default"
+        );
+        return default;
+    }
+    parsed
+}
+
 pub(crate) async fn process_webhook_orchestrate(
     state: &AppState,
     github: &GitHubPlugin,
@@ -392,7 +490,7 @@ pub(crate) async fn webhook_trigger_orchestration(
     work_item: Option<&cairn_integrations::WorkItem>,
 ) -> Result<(), String> {
     use cairn_orchestrator::{
-        LlmDecidePhase, LoopConfig, LoopTermination, OrchestrationContext, OrchestratorLoop,
+        LlmDecidePhase, LoopTermination, OrchestrationContext, OrchestratorLoop,
         RuntimeExecutePhase, StandardGatherPhase,
     };
     use cairn_runtime::services::{
@@ -519,11 +617,25 @@ pub(crate) async fn webhook_trigger_orchestration(
         .with_event_log(state.runtime.store.clone());
 
     let store = state.runtime.store.clone();
-    let config = LoopConfig {
-        max_iterations: 50,
-        timeout_ms: 30 * 60 * 1_000,
-        ..LoopConfig::default()
-    };
+    // Webhook-triggered runs inherit `LoopConfig::default()` like the
+    // rest of cairn. Operators who need a different envelope for
+    // webhook runs (e.g. large upstream PR reviews that legitimately
+    // exceed 200k tokens / 50 iterations / 15 min) set it per
+    // deployment via env vars read here — the binary stays a single
+    // service with one conservative default; local/dev/dogfood boots
+    // opt in to higher ceilings without shipping different binaries.
+    //
+    // Breaker caps are clamped so they stay strictly above
+    // `max_iterations` / `timeout_ms` — when operators raise one via
+    // env, the paired breaker is auto-bumped to keep the "clean
+    // termination via TimedOut/MaxIterations, breaker as safety net"
+    // invariant that the rest of cairn relies on.
+    //
+    // NOTE: this path does NOT consult the per-run / per-project /
+    // per-system settings-defaults projection that
+    // `POST /v1/runs/:id/orchestrate` uses. Known follow-up; for now,
+    // env vars are the only knob for webhook runs.
+    let config = webhook_loop_config_from_env();
 
     let execute = RuntimeExecutePhase::builder()
         .tool_registry(registry)
@@ -1881,5 +1993,157 @@ mod tests {
         assert_eq!(pr, None);
         assert!(goal.contains("check_run.completed"));
         assert!(matches!(event.payload, WebhookEventPayload::Other(_)));
+    }
+
+    // ── env-var test helpers ───────────────────────────────────────
+    //
+    // Tests that mutate `CAIRN_GITHUB_WEBHOOK_*` env vars must (a) hold
+    // the process-wide `ENV_MUTEX` so they don't race other tests in
+    // this binary, and (b) save + restore pre-existing values so a
+    // developer or CI host that already has these set is not clobbered.
+    // `EnvGuard` is an RAII wrapper that does both; its `Drop` runs
+    // even on panic, so the test's pre-existing env survives.
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_mutex() -> &'static Mutex<()> {
+        static M: OnceLock<Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard<'a> {
+        keys: Vec<(&'static str, Option<String>)>,
+        _lock: MutexGuard<'a, ()>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn new(sets: &[(&'static str, &str)]) -> Self {
+            // On poisoning, take the inner — a prior test may have
+            // panicked mid-mutation, but the env has already been
+            // restored by its own Drop, so the state is still usable.
+            let lock = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
+            let keys: Vec<(&'static str, Option<String>)> = sets
+                .iter()
+                .map(|(k, v)| {
+                    let prior = std::env::var(k).ok();
+                    // SAFETY: protected by `env_mutex()` — this thread
+                    // holds the only lock on all CAIRN_GITHUB_WEBHOOK_*
+                    // env mutation in this binary. FFI callers outside
+                    // the test harness are not in scope here.
+                    unsafe { std::env::set_var(k, v) };
+                    (*k, prior)
+                })
+                .collect();
+            EnvGuard { keys, _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            for (k, prior) in &self.keys {
+                // SAFETY: same as EnvGuard::new — mutex-protected,
+                // and this runs even on panic.
+                unsafe {
+                    match prior {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Guard against a config regression: when operators raise
+    /// `max_iterations` / `timeout_ms` via env, the paired breaker must
+    /// auto-bump to stay strictly above the loop limit so runs terminate
+    /// via `LoopTermination::{TimedOut, MaxIterations}` rather than
+    /// tripping the safety-net breaker first.
+    #[test]
+    fn webhook_loop_config_from_env_preserves_breaker_invariant() {
+        let _g = EnvGuard::new(&[
+            ("CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS", "300"),
+            ("CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS", "7200000"), // 120 min
+            ("CAIRN_GITHUB_WEBHOOK_TOKEN_CAP", "750000"),
+        ]);
+        let cfg = webhook_loop_config_from_env();
+        assert_eq!(cfg.max_iterations, 300);
+        assert_eq!(cfg.timeout_ms, 7_200_000);
+        assert_eq!(cfg.breakers.token_cap, 750_000);
+        assert!(
+            cfg.breakers.round_cap > cfg.max_iterations,
+            "round_cap {} must stay > max_iterations {}",
+            cfg.breakers.round_cap,
+            cfg.max_iterations
+        );
+        assert!(
+            cfg.breakers.wall_clock_ms > cfg.timeout_ms,
+            "wall_clock_ms {} must stay > timeout_ms {}",
+            cfg.breakers.wall_clock_ms,
+            cfg.timeout_ms
+        );
+    }
+
+    /// Extreme env values (or anything that leaves no headroom for the
+    /// paired breaker's `saturating_add` to stay strictly greater) must
+    /// be rejected and fall back to the webhook floor defaults — NOT
+    /// silently clamp, which would be the worse failure mode.
+    #[test]
+    fn webhook_loop_config_rejects_extreme_env_values() {
+        let _g = EnvGuard::new(&[
+            ("CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS", &u32::MAX.to_string()),
+            ("CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS", &u64::MAX.to_string()),
+        ]);
+        let cfg = webhook_loop_config_from_env();
+        assert_eq!(
+            cfg.max_iterations, WEBHOOK_DEFAULT_MAX_ITERATIONS,
+            "u32::MAX must be rejected; floor should win"
+        );
+        assert_eq!(
+            cfg.timeout_ms, WEBHOOK_DEFAULT_TIMEOUT_MS,
+            "u64::MAX must be rejected; floor should win"
+        );
+        assert!(cfg.breakers.round_cap > cfg.max_iterations);
+        assert!(cfg.breakers.wall_clock_ms > cfg.timeout_ms);
+    }
+
+    /// With no env overrides, the helper must return the webhook-path
+    /// floor defaults. This pins the no-regression promise from #848
+    /// and #850 — a deployment that doesn't set any of the env vars
+    /// must keep behaving exactly like it did before.
+    #[test]
+    fn webhook_loop_config_defaults_match_pre_rework_behavior() {
+        // Empty EnvGuard still serialises against the other tests.
+        let _g = EnvGuard::new(&[]);
+        // The EnvGuard itself doesn't clear — if a developer has these
+        // exported in their shell, the assertion would spuriously fail.
+        // Explicitly unset for this test.
+        let prior: Vec<(&str, Option<String>)> = [
+            "CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS",
+            "CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS",
+            "CAIRN_GITHUB_WEBHOOK_TOKEN_CAP",
+        ]
+        .iter()
+        .map(|k| {
+            let p = std::env::var(k).ok();
+            // SAFETY: mutex-held via _g.
+            unsafe { std::env::remove_var(k) };
+            (*k, p)
+        })
+        .collect();
+
+        let cfg = webhook_loop_config_from_env();
+
+        // Restore.
+        for (k, p) in prior {
+            // SAFETY: mutex-held via _g.
+            unsafe {
+                match p {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+
+        assert_eq!(cfg.max_iterations, WEBHOOK_DEFAULT_MAX_ITERATIONS);
+        assert_eq!(cfg.timeout_ms, WEBHOOK_DEFAULT_TIMEOUT_MS);
     }
 }
