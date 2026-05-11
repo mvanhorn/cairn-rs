@@ -510,6 +510,7 @@ fn stuck_nudge_predicate_and_wording_match_contract() {
         action_kind: kind.to_owned(),
         summary: "x".to_owned(),
         succeeded: true,
+        verified_output: None,
     };
     let make_invokes =
         |n: usize| -> Vec<StepSummary> { (0..n).map(|_| make_step("invoke_tool")).collect() };
@@ -701,6 +702,7 @@ async fn plan_mode_never_receives_stuck_nudge() {
                 action_kind: "invoke_tool".to_owned(),
                 summary: format!("introspect {i}"),
                 succeeded: true,
+                verified_output: None,
             })
             .collect(),
         is_recovery: false,

@@ -166,6 +166,16 @@ pub async fn build_subagent_complete_steps<R: RunService + ?Sized>(
                             body = summary_text,
                         ),
                         succeeded,
+                        // RFC 032 PR-1: `verified_output` threads
+                        // structured contract evidence from the child
+                        // to the parent. PR-3 populates this from the
+                        // child's `RunCompletionAnnotated` event
+                        // payload once verifiers emit
+                        // `ContractVerifiedOutput`. Phase 1 leaves
+                        // `None` — parent-level aggregate contracts
+                        // that depend on structured output land in
+                        // Phase 2.
+                        verified_output: None,
                     });
                 }
                 None if matches!(child.state, RunState::Completed) => {

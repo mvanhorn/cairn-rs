@@ -630,6 +630,7 @@ where
                 // failure). The summary text itself carries the
                 // rejection semantics.
                 succeeded: true,
+                verified_output: None,
             };
             out.push(DrainedRejection { summary });
         }
@@ -911,6 +912,7 @@ where
                         action_kind,
                         summary,
                         succeeded,
+                        verified_output: None,
                     });
                 }
             }
@@ -1701,6 +1703,7 @@ where
                         action_kind: "complete_run_rejected".to_owned(),
                         summary: rejection_summary,
                         succeeded: false,
+                        verified_output: None,
                     };
                     step_history.push(rejection_step);
                     ctx.step_history = step_history.clone();
@@ -2227,6 +2230,7 @@ fn maybe_compact_history(
         action_kind: "compacted_summary".to_owned(),
         summary: format!("Compacted {} prior steps:\n{}", to_compact, compacted_text),
         succeeded: true,
+        verified_output: None,
     };
 
     let recent: Vec<StepSummary> = step_history[to_compact..].to_vec();
@@ -2412,6 +2416,7 @@ fn build_step_summary(
         action_kind,
         summary,
         succeeded,
+        verified_output: None,
     }
 }
 

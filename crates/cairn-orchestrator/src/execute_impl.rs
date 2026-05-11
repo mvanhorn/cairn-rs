@@ -2233,6 +2233,7 @@ mod prior_siblings_tests {
             action_kind: action_kind.to_owned(),
             summary: summary.to_owned(),
             succeeded,
+            verified_output: None,
         }
     }
 

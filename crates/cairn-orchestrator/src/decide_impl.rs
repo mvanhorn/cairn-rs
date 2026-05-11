@@ -3418,12 +3418,14 @@ mod tests {
                 action_kind: "invoke_tool".to_owned(),
                 summary: "test summary one".to_owned(),
                 succeeded: true,
+                verified_output: None,
             },
             crate::context::StepSummary {
                 iteration: 12,
                 action_kind: "invoke_tool".to_owned(),
                 summary: "test summary two".to_owned(),
                 succeeded: true,
+                verified_output: None,
             },
         ];
         let msg = build_user_message(&c, &g, None, false);
@@ -3738,6 +3740,7 @@ mod tests {
             action_kind: "invoke_tool".to_owned(),
             summary: "searched for architecture docs".to_owned(),
             succeeded: true,
+            verified_output: None,
         }];
         let msg = build_user_message(&ctx(), &g, None, false);
         assert!(
@@ -3968,6 +3971,7 @@ mod tests {
                 action_kind: "invoke_tool".to_owned(),
                 summary: "did a thing".to_owned(),
                 succeeded: true,
+                verified_output: None,
             })
             .collect();
 
@@ -3992,6 +3996,7 @@ mod tests {
             action_kind: "invoke_tool".to_owned(),
             summary: "searched for architecture docs".to_owned(),
             succeeded: true,
+            verified_output: None,
         }];
         // memory chunk with distinctive text
         g.memory_chunks = vec![cairn_memory::retrieval::RetrievalResult {

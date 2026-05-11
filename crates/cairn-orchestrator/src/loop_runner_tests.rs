@@ -1286,6 +1286,7 @@ async fn compaction_triggers_when_history_exceeds_threshold() {
                 action_kind: "tool_call".to_owned(),
                 summary: format!("Called tool_{i} with result: some long output text repeated many times to ensure token threshold is met. Extra padding to make the history large."),
                 succeeded: true,
+                verified_output: None,
             })
             .collect();
 
@@ -1305,6 +1306,7 @@ async fn compaction_triggers_when_history_exceeds_threshold() {
         action_kind: "compacted_summary".to_owned(),
         summary: format!("Compacted {} prior steps:\n{}", to_compact, compacted_text),
         succeeded: true,
+        verified_output: None,
     };
 
     let recent: Vec<StepSummary> = step_history[to_compact..].to_vec();
@@ -1365,6 +1367,7 @@ fn compaction_is_throttled_within_cooldown_window() {
                     "Iteration {i} returned a very large diagnostic payload that should trigger compaction."
                 ),
                 succeeded: true,
+                verified_output: None,
             })
             .collect();
     let mut last_compaction_iteration = None;
@@ -1380,6 +1383,7 @@ fn compaction_is_throttled_within_cooldown_window() {
         action_kind: "tool_call".to_owned(),
         summary: format!("Iteration {i} also returned a large payload but falls inside cooldown."),
         succeeded: true,
+        verified_output: None,
     }));
 
     let second = maybe_compact_history(&mut history, 1, &config, &mut last_compaction_iteration);
