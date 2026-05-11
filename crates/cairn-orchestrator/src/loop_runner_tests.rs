@@ -91,6 +91,7 @@ fn ctx() -> OrchestrationContext {
         agent_type: "test_agent".to_owned(),
         run_started_at_ms: now_millis(),
         working_dir: PathBuf::from("."),
+        completion_contract: None,
         run_mode: cairn_domain::decisions::RunMode::Direct,
         discovered_tool_names: vec![],
         step_history: vec![],
@@ -3503,5 +3504,223 @@ async fn completion_gate_allows_legitimate_complete_run_answers() {
         matches!(result, LoopTermination::Completed { .. }),
         "#830: a legitimate complete_run answer must pass the sentinel scan \
          and terminate Completed. Got: {result:?}"
+    );
+}
+
+// ── RFC 032 PR-4: completion-contract gate integration ──────────────────────
+
+/// Test-only `ContractVerifier` that always returns a fixed outcome.
+/// The gate reads the trait object, calls `verify`, and routes based on
+/// the result — the test needs a stub that lets it script rejection or
+/// acceptance without depending on cairn-github / ProjectRepoAccessService
+/// wiring (that's PR-5's concern).
+struct StubContractVerifier {
+    outcome: StubOutcome,
+}
+
+#[derive(Clone)]
+enum StubOutcome {
+    Accept(cairn_domain::completion_contracts::ContractVerifiedOutput),
+    Reject(cairn_domain::completion_contracts::ContractRejectionCode),
+}
+
+#[async_trait]
+impl ContractVerifier for StubContractVerifier {
+    async fn verify(
+        &self,
+        _contract: &cairn_domain::completion_contracts::CompletionContract,
+        _ctx: &OrchestrationContext,
+        _final_answer: &str,
+    ) -> Result<
+        cairn_domain::completion_contracts::ContractVerifiedOutput,
+        crate::contract_verifier::VerifierRejection,
+    > {
+        match &self.outcome {
+            StubOutcome::Accept(out) => Ok(out.clone()),
+            StubOutcome::Reject(code) => Err(crate::contract_verifier::VerifierRejection {
+                code: *code,
+                operator_trace: "stub verifier rejection — test-only".to_owned(),
+            }),
+        }
+    }
+}
+
+fn ctx_with_contract(
+    contract: cairn_domain::completion_contracts::CompletionContract,
+) -> OrchestrationContext {
+    let mut c = ctx();
+    c.completion_contract = Some(contract);
+    c
+}
+
+/// Accept path: contract verifier returns Ok → gate passes through →
+/// complete_run terminates the run Completed. Pre-RFC-032 behaviour is
+/// preserved for runs without a contract / without a verifier; this
+/// test pins that wiring a verifier + a contract does not regress the
+/// happy path.
+#[tokio::test]
+async fn contract_verifier_accept_passes_complete_run_through() {
+    use cairn_domain::completion_contracts::{CompletionContract, ContractVerifiedOutput};
+
+    let verifier = std::sync::Arc::new(StubContractVerifier {
+        outcome: StubOutcome::Accept(ContractVerifiedOutput::ProseNonEmpty),
+    });
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        ScriptedDecide::always(decide_done()),
+        ScriptedExecute {
+            signal: LoopSignal::Done,
+        },
+        LoopConfig {
+            max_iterations: 3,
+            breakers: permissive_breakers(),
+            orchestrator_strict_completion_gate: true,
+            ..Default::default()
+        },
+    )
+    .with_contract_verifier(verifier);
+
+    let result = lp
+        .run(ctx_with_contract(CompletionContract::ProseNonEmpty))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, LoopTermination::Completed { .. }),
+        "contract verifier Accept must let complete_run through. Got: {result:?}"
+    );
+}
+
+/// Reject path: verifier returns `Err(PrNotFound)` on every attempt.
+/// The gate increments `completion_gate_rejections` and, after
+/// `MAX_COMPLETION_GATE_REJECTIONS` attempts, terminates the run with
+/// a reason string prefixed `contract_not_met:` — the wire contract
+/// with cairn-app's `classify_failed_reason` which maps that to
+/// `FailureClass::ContractNotMet`.
+#[tokio::test]
+async fn contract_verifier_reject_fails_run_with_contract_not_met_prefix() {
+    use cairn_domain::completion_contracts::{CompletionContract, ContractRejectionCode};
+
+    let verifier = std::sync::Arc::new(StubContractVerifier {
+        outcome: StubOutcome::Reject(ContractRejectionCode::PrNotFound),
+    });
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        // Every iteration proposes complete_run — the gate keeps
+        // rejecting until the cap trips.
+        ScriptedDecide::always(decide_done()),
+        ScriptedExecute {
+            signal: LoopSignal::Done,
+        },
+        LoopConfig {
+            // Set high enough for MAX_COMPLETION_GATE_REJECTIONS + 1
+            // rejections before max_iterations would trip.
+            max_iterations: crate::context::MAX_COMPLETION_GATE_REJECTIONS + 5,
+            breakers: permissive_breakers(),
+            orchestrator_strict_completion_gate: true,
+            ..Default::default()
+        },
+    )
+    .with_contract_verifier(verifier);
+
+    let contract = CompletionContract::PullRequest {
+        expected_repo: Some("acme/widget".to_owned()),
+        expected_head_branch: None,
+        must_be_open: true,
+    };
+    let result = lp.run(ctx_with_contract(contract)).await.unwrap();
+
+    let reason = match result {
+        LoopTermination::Failed { reason } => reason,
+        other => panic!("expected Failed with contract_not_met prefix; got {other:?}"),
+    };
+    assert!(
+        reason.starts_with("contract_not_met:"),
+        "wire contract with classify_failed_reason: reason MUST start \
+         with `contract_not_met:`. Got: {reason}"
+    );
+    // RFC §3.1: the code surfaces via `ContractRejectionCode::Display`
+    // which emits the stable snake_case wire form. `{:?}` / Debug
+    // would drift on rename and break operator dashboards — pin the
+    // wire shape.
+    assert!(
+        reason.contains("pr_not_found"),
+        "reason must name the specific rejection code in its \
+         snake_case wire form for operator logs. Got: {reason}"
+    );
+    assert!(
+        !reason.contains("PrNotFound"),
+        "reason must NOT use the Rust Debug form — that drifts on \
+         rename. Got: {reason}"
+    );
+}
+
+/// No verifier wired → contract branch is a no-op → existing gate
+/// behaviour is preserved (no contract_not_met reason shape emitted).
+/// This is the critical back-compat pin: PR-4 ships the plumbing but
+/// runs without a concrete verifier impl until PR-5 installs one. In
+/// that window, every run must behave exactly like today.
+#[tokio::test]
+async fn no_verifier_wired_preserves_pre_rfc032_gate_behaviour() {
+    use cairn_domain::completion_contracts::CompletionContract;
+
+    // Contract present in context, BUT no verifier wired.
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        ScriptedDecide::always(decide_done()),
+        ScriptedExecute {
+            signal: LoopSignal::Done,
+        },
+        LoopConfig {
+            max_iterations: 3,
+            breakers: permissive_breakers(),
+            orchestrator_strict_completion_gate: true,
+            ..Default::default()
+        },
+    );
+
+    let result = lp
+        .run(ctx_with_contract(CompletionContract::ProseNonEmpty))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, LoopTermination::Completed { .. }),
+        "without a wired verifier, contract must be a silent no-op. Got: {result:?}"
+    );
+}
+
+/// Verifier wired but no contract in ctx → same no-op outcome. Pins
+/// the other side of the two-key gate so a future refactor that
+/// treats "verifier wired" alone as sufficient to reject would fail
+/// this test.
+#[tokio::test]
+async fn verifier_without_contract_also_preserves_behaviour() {
+    let verifier = std::sync::Arc::new(StubContractVerifier {
+        outcome: StubOutcome::Reject(
+            cairn_domain::completion_contracts::ContractRejectionCode::PrNotFound,
+        ),
+    });
+
+    let lp = OrchestratorLoop::new(
+        FixedGather,
+        ScriptedDecide::always(decide_done()),
+        ScriptedExecute {
+            signal: LoopSignal::Done,
+        },
+        LoopConfig {
+            max_iterations: 3,
+            breakers: permissive_breakers(),
+            orchestrator_strict_completion_gate: true,
+            ..Default::default()
+        },
+    )
+    .with_contract_verifier(verifier);
+
+    // Default `ctx()` has `completion_contract: None`.
+    let result = lp.run(ctx()).await.unwrap();
+    assert!(
+        matches!(result, LoopTermination::Completed { .. }),
+        "verifier without contract in ctx must be a silent no-op. Got: {result:?}"
     );
 }

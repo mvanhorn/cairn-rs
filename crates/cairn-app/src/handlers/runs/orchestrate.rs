@@ -1140,6 +1140,7 @@ pub(crate) async fn drive_run_iteration(
             .unwrap_or_else(|| "orchestrator".to_owned()),
         run_started_at_ms: now_ms,
         working_dir: working_dir.clone(),
+        completion_contract: None,
         run_mode: body.mode.clone().or(default_run_mode).unwrap_or_default(),
         discovered_tool_names: vec![],
         step_history: seeded_steps,

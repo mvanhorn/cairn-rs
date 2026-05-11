@@ -24,6 +24,11 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # and the three prohibited anti-patterns.
 regex = "1"
 once_cell = "1"
+# RFC 032 PR-4: `goal_hash()` hashes a goal string into a 16-hex-char
+# stable identifier so re-inference can detect mid-run goal changes.
+# Version pinned to match the rest of the workspace (cairn-github,
+# cairn-runtime, cairn-app).
+sha2 = "0.10"
 # `Zeroizing<Vec<u8>>` for credential ciphertext in read models (#579).
 # Matches the version pinned by `cairn-runtime` and re-exports
 # `Zeroize{OnDrop}` for consistent handling across crates. The `serde`

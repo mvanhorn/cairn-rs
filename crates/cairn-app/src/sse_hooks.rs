@@ -475,6 +475,7 @@ mod sse_orchestrator_tests {
             agent_type: "orchestrator".to_owned(),
             run_started_at_ms: 0,
             working_dir: PathBuf::from("."),
+            completion_contract: None,
             run_mode: cairn_domain::decisions::RunMode::Direct,
             discovered_tool_names: vec![],
             step_history: vec![],

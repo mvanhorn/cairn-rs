@@ -694,6 +694,7 @@ async fn plan_mode_never_receives_stuck_nudge() {
         agent_type: "planner".to_owned(),
         run_started_at_ms: 0,
         working_dir: PathBuf::from("/tmp"),
+        completion_contract: None,
         run_mode: cairn_domain::decisions::RunMode::Plan,
         discovered_tool_names: vec![],
         step_history: (0..5)

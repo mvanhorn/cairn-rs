@@ -470,6 +470,7 @@ async fn system_prompt_does_not_gate_complete_run_behind_forced_action() {
         agent_type: "orchestrator".to_owned(),
         run_started_at_ms: 0,
         working_dir: PathBuf::from("/tmp"),
+        completion_contract: None,
         run_mode: Default::default(),
         discovered_tool_names: vec![],
         step_history: vec![],

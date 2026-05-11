@@ -752,6 +752,46 @@ pub enum ContractRejectionCode {
     NotImplemented,
 }
 
+impl ContractRejectionCode {
+    /// Snake_case wire identifier matching the serde
+    /// `rename_all = "snake_case"` discriminator. Stable: operators
+    /// and LLMs key on these strings (RFC §3.1). Prefer this over
+    /// `{:?}` (Debug) when formatting codes into reason strings,
+    /// step_history diagnostics, or log fields — Debug drifts on a
+    /// rename, this doesn't.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProseEmpty => "prose_empty",
+            Self::ProseTooShort => "prose_too_short",
+            Self::ProseInsufficientCitations => "prose_insufficient_citations",
+            Self::ProseCitationUnresolvable => "prose_citation_unresolvable",
+            Self::FileMissing => "file_missing",
+            Self::FileSymlinkTraversal => "file_symlink_traversal",
+            Self::FileExceedsMaxBytes => "file_exceeds_max_bytes",
+            Self::FileRegexNoMatch => "file_regex_no_match",
+            Self::PrNotInProjectAllowlist => "pr_not_in_project_allowlist",
+            Self::PrUrlMalformed => "pr_url_malformed",
+            Self::PrUrlMissing => "pr_url_missing",
+            Self::PrNotFound => "pr_not_found",
+            Self::PrRepoMismatch => "pr_repo_mismatch",
+            Self::PrHeadBranchMismatch => "pr_head_branch_mismatch",
+            Self::PrNotOpen => "pr_not_open",
+            Self::StructuredParseError => "structured_parse_error",
+            Self::StructuredSchemaMismatch => "structured_schema_mismatch",
+            Self::ExternalStateNotConfirmed => "external_state_not_confirmed",
+            Self::VerifierTimeout => "verifier_timeout",
+            Self::VerifierUnavailable => "verifier_unavailable",
+            Self::NotImplemented => "not_implemented",
+        }
+    }
+}
+
+impl std::fmt::Display for ContractRejectionCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// RFC 032 §2.3: how a [`CompletionContract`] arrived at a run.
 /// Surfaced on `RuntimeEvent::CompletionContractResolved` so the
 /// operator timeline distinguishes inferred contracts from
@@ -771,6 +811,103 @@ pub enum ContractSource {
     /// on a re-orchestrate). Only fires when `source` was
     /// previously `Inferred`; explicit contracts stay pinned.
     ReInferredOnGoalChange,
+}
+
+// ── RFC 032 PR-4: contract inference ────────────────────────────────────────
+
+/// Pure function mapping goal text to a default [`CompletionContract`].
+/// Called by the gate (PR-5 handler) at first-orchestrate boot when the
+/// operator supplied no explicit contract. Re-runs when the goal text
+/// changes mid-run (§2.3).
+///
+/// The trigger table is deliberately narrow (RFC §2.3). Adding a new
+/// trigger is a public contract change — each new row must be justified
+/// by a dogfood observation, not speculation. Biases toward
+/// false-positive on ambiguous goals; operators with conditional goals
+/// ("research, and if you find something, open a PR") should declare
+/// the contract explicitly rather than rely on inference.
+///
+/// Returns `ProseNonEmpty` when no trigger matches — matches today's
+/// effective gate behaviour on goals that didn't go through this path.
+///
+/// Implementation uses pre-compiled regexes via `once_cell::sync::Lazy`
+/// (workspace MSRV 1.78 predates `std::sync::LazyLock`'s 1.80
+/// stabilization) so the expensive compile happens once per process.
+pub fn infer_contract(goal: &str) -> CompletionContract {
+    use once_cell::sync::Lazy;
+
+    // PR long-form: `(open|create|ship|submit) <=80 non-period chars> pull request`.
+    static PR_LONG_RX: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::RegexBuilder::new(r"\b(open|create|ship|submit)\b[^.]{0,80}\bpull request\b")
+            .case_insensitive(true)
+            .build()
+            .expect("PR long-form trigger regex must compile")
+    });
+
+    // PR short-form: `(open|ship)` within 20 non-period chars of `PR` —
+    // disambiguates against "PR" as public relations.
+    static PR_SHORT_RX: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::RegexBuilder::new(r"\b(open|ship)\b[^.]{0,20}\bPR\b")
+            .case_insensitive(true)
+            .build()
+            .expect("PR short-form trigger regex must compile")
+    });
+
+    // Prose: \b(research|compare|audit|investigate)\b — word-anchored.
+    static PROSE_RX: Lazy<regex::Regex> = Lazy::new(|| {
+        regex::RegexBuilder::new(r"\b(research|compare|audit|investigate)\b")
+            .case_insensitive(true)
+            .build()
+            .expect("prose trigger regex must compile")
+    });
+
+    if PR_LONG_RX.is_match(goal) || PR_SHORT_RX.is_match(goal) {
+        return CompletionContract::PullRequest {
+            expected_repo: None,
+            expected_head_branch: None,
+            must_be_open: true,
+        };
+    }
+    if PROSE_RX.is_match(goal) {
+        return CompletionContract::Prose {
+            min_chars: 500,
+            min_citations: 2,
+        };
+    }
+    CompletionContract::ProseNonEmpty
+}
+
+/// RFC 032 §2.3: stable 16-hex-char hash of a goal string. Persisted as
+/// `run:<run_id>:contract_source_goal_hash` so the re-inference guard
+/// can detect mid-run goal changes without comparing full goal text.
+/// First 8 bytes of SHA-256 are plenty for the equality check —
+/// collisions are irrelevant (the handler reads BOTH hashes; a
+/// hypothetical collision still resolves to the same inferred
+/// contract, which is the behaviour we want).
+pub fn goal_hash(goal: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(goal.as_bytes());
+    let digest = hasher.finalize();
+    // First 8 bytes → 16 hex chars. Hex-encode inline to avoid a
+    // crate dep (hex) for 16 bytes of output.
+    let mut out = String::with_capacity(16);
+    for b in &digest[..8] {
+        let hi = b >> 4;
+        let lo = b & 0x0f;
+        out.push(hex_digit(hi));
+        out.push(hex_digit(lo));
+    }
+    out
+}
+
+#[inline]
+fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + nibble - 10) as char,
+        _ => unreachable!("nibble > 15 by construction"),
+    }
 }
 
 // ── tests for PR-2 domain types ──────────────────────────────────────────────
@@ -1080,6 +1217,33 @@ mod pr2_tests {
     // ContractRejectionCode serde
 
     #[test]
+    fn contract_rejection_code_as_str_matches_serde_tag() {
+        // RFC §3.1 + PR-4 review: the wire-stable snake_case form
+        // is what operators and LLMs key on. `as_str()` and the
+        // serde discriminator must agree — drift here turns a
+        // rename into a silent break for every downstream consumer.
+        for code in [
+            ContractRejectionCode::ProseEmpty,
+            ContractRejectionCode::FileSymlinkTraversal,
+            ContractRejectionCode::PrNotFound,
+            ContractRejectionCode::PrRepoMismatch,
+            ContractRejectionCode::StructuredSchemaMismatch,
+            ContractRejectionCode::NotImplemented,
+        ] {
+            let serde_form = serde_json::to_string(&code)
+                .unwrap()
+                .trim_matches('"')
+                .to_owned();
+            assert_eq!(
+                code.as_str(),
+                serde_form,
+                "as_str() / serde tag drift on {code:?}"
+            );
+            assert_eq!(format!("{code}"), serde_form, "Display must match as_str");
+        }
+    }
+
+    #[test]
     fn contract_rejection_code_round_trips_snake_case() {
         let cases = [
             (ContractRejectionCode::ProseEmpty, r#""prose_empty""#),
@@ -1190,5 +1354,145 @@ mod pr2_tests {
         let wire = r#"{"kind":"file","paths":[{"path":"src/x","contains_regex":"(unclosed"}]}"#;
         let err: Result<CompletionContract, _> = serde_json::from_str(wire);
         assert!(err.is_err(), "invalid regex must not deserialize");
+    }
+
+    // ── RFC 032 PR-4: infer_contract + goal_hash ──────────────────────────
+
+    fn matches_pr(c: &CompletionContract) -> bool {
+        matches!(c, CompletionContract::PullRequest { .. })
+    }
+    fn matches_prose(c: &CompletionContract) -> bool {
+        matches!(c, CompletionContract::Prose { .. })
+    }
+
+    #[test]
+    fn infer_contract_detects_open_pull_request() {
+        let cases = [
+            "Please open a pull request that fixes the login bug.",
+            "create a pull request for the orchestrator retry logic",
+            "Ship a pull request closing issue #42.",
+            "submit a pull request with the changes.",
+        ];
+        for goal in cases {
+            let c = infer_contract(goal);
+            assert!(
+                matches_pr(&c),
+                "expected PullRequest contract for goal: {goal:?}; got {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_contract_detects_short_pr_with_verb() {
+        // Short-form "PR" requires `open` or `ship` within 20 chars —
+        // rules out "PR as public relations".
+        let c = infer_contract("Open a PR for the auth service cleanup");
+        assert!(matches_pr(&c));
+
+        let c = infer_contract("ship the PR once CI is green");
+        assert!(matches_pr(&c));
+    }
+
+    #[test]
+    fn infer_contract_rejects_pr_as_public_relations() {
+        // "PR" absent from verb context (and no "pull request" long
+        // form) falls through to the prose / fallback path.
+        let c =
+            infer_contract("Write a PR-focused communication strategy for the product launch team");
+        // Not a PullRequest contract — either Prose (if a prose
+        // trigger matched) or ProseNonEmpty. The important invariant:
+        // NOT PullRequest.
+        assert!(
+            !matches_pr(&c),
+            "`PR` without verb proximity must not infer PullRequest; got {c:?}"
+        );
+    }
+
+    #[test]
+    fn infer_contract_detects_research_triggers() {
+        let cases = [
+            "Research the top three distributed-lock libraries for Rust.",
+            "Compare the tradeoffs of gRPC vs REST for our internal services.",
+            "Audit the auth module for missing error handling.",
+            "Investigate why the memory crate's retrieval latency spiked.",
+        ];
+        for goal in cases {
+            let c = infer_contract(goal);
+            assert!(
+                matches_prose(&c),
+                "expected Prose contract for goal: {goal:?}; got {c:?}"
+            );
+            if let CompletionContract::Prose {
+                min_chars,
+                min_citations,
+            } = c
+            {
+                assert_eq!(min_chars, 500);
+                assert_eq!(min_citations, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn infer_contract_falls_through_to_prose_non_empty() {
+        // No trigger → permissive floor. Matches today's effective
+        // gate behaviour on goals that didn't go through this path.
+        let c = infer_contract("Summarise the current release status.");
+        assert!(matches!(c, CompletionContract::ProseNonEmpty));
+    }
+
+    #[test]
+    fn infer_contract_pr_trigger_beats_prose_trigger_when_both_present() {
+        // Ambiguous conditional goal. Inference picks PR (first match
+        // in the trigger order). Operators with conditional goals
+        // should declare the contract explicitly per the RFC's
+        // "bias toward false-positive" note — this test pins the
+        // bias direction so a future refactor doesn't silently flip.
+        let c = infer_contract(
+            "Research the memory crate performance and open a pull request if you find a fix.",
+        );
+        assert!(matches_pr(&c));
+    }
+
+    #[test]
+    fn infer_contract_case_insensitive_triggers() {
+        assert!(matches_pr(&infer_contract("OPEN A PULL REQUEST now")));
+        assert!(matches_prose(&infer_contract("RESEARCH this topic")));
+    }
+
+    #[test]
+    fn goal_hash_is_stable_across_calls() {
+        let a = goal_hash("my goal");
+        let b = goal_hash("my goal");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn goal_hash_differs_on_content_change() {
+        let a = goal_hash("open a PR for the login fix");
+        let b = goal_hash("research the cache design");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn goal_hash_differs_on_whitespace_difference() {
+        // Whitespace differences are real goal changes — trailing
+        // newline, added space before punctuation, etc. Inference
+        // may still return the same contract, but the hash is a
+        // change-detector; it must notice every textual delta.
+        assert_ne!(goal_hash("do x"), goal_hash("do x "));
+        assert_ne!(goal_hash("do x"), goal_hash("do  x"));
+    }
+
+    #[test]
+    fn goal_hash_is_lowercase_hex_16() {
+        let h = goal_hash("sample goal for hex shape");
+        assert_eq!(h.len(), 16);
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "goal_hash must be lowercase hex: {h}"
+        );
     }
 }

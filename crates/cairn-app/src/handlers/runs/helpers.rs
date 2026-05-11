@@ -107,6 +107,17 @@ pub(super) fn classify_failed_reason(reason: &str) -> cairn_domain::FailureClass
     if lower.starts_with("model_reported_failure") {
         cairn_domain::FailureClass::ModelReportedFailure
     }
+    // RFC 032 PR-4: the completion-contract verifier rejected the
+    // claimed deliverable `MAX_COMPLETION_GATE_REJECTIONS` times in
+    // a row. Prefix is a wire contract with
+    // `cairn-orchestrator::loop_runner::OrchestratorLoop::run_inner`
+    // — a rename there breaks the classification here. Match BEFORE
+    // `verification_rejected` so the contract-specific class wins
+    // for reasons carrying the contract prefix even if a future
+    // refactor concatenates both strings.
+    else if lower.starts_with("contract_not_met") {
+        cairn_domain::FailureClass::ContractNotMet
+    }
     // #660: the strict completion gate emits a reason string that
     // starts with the literal `verification_rejected:` prefix (see
     // `crates/cairn-orchestrator/src/loop_runner.rs` — the LoopConfig
@@ -243,6 +254,45 @@ mod tests {
     /// that into `FailureClass::VerificationRejected` so operators can
     /// filter failed runs by class without re-parsing free-form reason
     /// text.
+    /// RFC 032 PR-4: the completion-contract verifier emits a reason
+    /// string prefixed `contract_not_met:` when the claimed
+    /// deliverable fails verification `MAX_COMPLETION_GATE_REJECTIONS`
+    /// times. The handler must translate that into
+    /// `FailureClass::ContractNotMet` — distinct from
+    /// `VerificationRejected` so operator dashboards can
+    /// distinguish "agent lied / admitted" from "agent's claimed
+    /// deliverable does not exist".
+    #[test]
+    fn classify_failed_reason_matches_contract_not_met_prefix() {
+        use cairn_domain::FailureClass;
+        // Sample reason uses the stable snake_case wire form of
+        // `ContractRejectionCode::PrNotFound` per RFC §3.1. The
+        // classifier only keys off the `contract_not_met:` prefix;
+        // the code payload is for operator logs / LLM diagnostics.
+        let reason = "contract_not_met: 3 complete_run attempts rejected by \
+                      completion-contract verifier (code: pr_not_found). See \
+                      operator logs for details.";
+        assert_eq!(
+            classify_failed_reason(reason),
+            FailureClass::ContractNotMet,
+            "RFC 032 PR-4: `contract_not_met:` prefix is the wire contract \
+             between the loop runner and this classifier"
+        );
+    }
+
+    /// RFC 032 PR-4: contract_not_met classification beats
+    /// verification_rejected when both prefixes appear — the
+    /// earlier prefix in the match chain wins, and contract_not_met
+    /// is declared first (RFC §3 order).
+    #[test]
+    fn classify_failed_reason_contract_not_met_case_insensitive() {
+        use cairn_domain::FailureClass;
+        assert_eq!(
+            classify_failed_reason("Contract_Not_Met: code=pr_not_found"),
+            FailureClass::ContractNotMet,
+        );
+    }
+
     #[test]
     fn classify_failed_reason_matches_verification_rejected_prefix() {
         use cairn_domain::FailureClass;

@@ -356,6 +356,44 @@ pub struct OrchestratorLoop<G, D, E> {
     /// approval service then treats as a duplicate and auto-approves
     /// without re-dispatch, looping forever).
     approval_reader: Option<Arc<dyn cairn_runtime::tool_call_approvals::ToolCallApprovalReader>>,
+    /// RFC 032 PR-4: optional verifier for
+    /// [`cairn_domain::completion_contracts::CompletionContract`].
+    ///
+    /// Wired by PR-5's handler with a real implementation that
+    /// bridges to `cairn_orchestrator::contract_verifier::verify_contract`
+    /// using the run's project repo access + (optional) cairn-github
+    /// client. When `None`, the gate's contract-check branch is a
+    /// no-op and the pre-RFC-032 behaviour is preserved.
+    ///
+    /// The indirection keeps cairn-orchestrator free of
+    /// cairn-app-level concerns (AppState, GitHubClient construction):
+    /// the crate declares the shape of what it needs, the caller
+    /// provides it.
+    contract_verifier: Option<Arc<dyn ContractVerifier>>,
+}
+
+/// RFC 032 PR-4: gate-side callback for contract verification.
+/// The orchestrator loop calls this once per `complete_run`
+/// proposal, BEFORE the existing gate branches' pass decision but
+/// AFTER the error-bucket / sentinel / FailRun checks — per the
+/// RFC §3 ordering. Implementations route to
+/// [`crate::contract_verifier::verify_contract`] with the right
+/// tenant-scoping + GitHub client wired from AppState.
+///
+/// Separated from the underlying `verify_contract` function so the
+/// orchestrator crate stays decoupled from AppState wiring concerns;
+/// PR-5 ships the concrete impl.
+#[async_trait::async_trait]
+pub trait ContractVerifier: Send + Sync {
+    async fn verify(
+        &self,
+        contract: &cairn_domain::completion_contracts::CompletionContract,
+        ctx: &crate::context::OrchestrationContext,
+        final_answer: &str,
+    ) -> Result<
+        cairn_domain::completion_contracts::ContractVerifiedOutput,
+        crate::contract_verifier::VerifierRejection,
+    >;
 }
 
 impl<G, D, E> OrchestratorLoop<G, D, E>
@@ -377,7 +415,19 @@ where
             emitter: Arc::new(NoOpEmitter),
             task_sink: Arc::new(NoOpTaskSink),
             approval_reader: None,
+            contract_verifier: None,
         }
+    }
+
+    /// RFC 032 PR-4: install the completion-contract verifier.
+    /// PR-5's orchestrate handler constructs the concrete impl
+    /// (see cairn-app/src/contract_verifier_adapter.rs in PR-5) and
+    /// calls this once at loop construction. Without it, contract
+    /// verification is a no-op — the gate runs its pre-RFC-032
+    /// checks only.
+    pub fn with_contract_verifier(mut self, verifier: Arc<dyn ContractVerifier>) -> Self {
+        self.contract_verifier = Some(verifier);
+        self
     }
 
     /// F25 drain: install the tool-call approval reader so the loop
@@ -1559,10 +1609,68 @@ where
                         crate::completion_verification::detect_self_reported_failure(&p.description)
                     });
 
+                // RFC 032 PR-4: completion-contract verification.
+                // Fires on every `CompleteRun` proposal when both
+                // (a) the handler populated `ctx.completion_contract`
+                // with a resolved contract, AND (b) a
+                // `contract_verifier` is wired on this loop
+                // (PR-5 ships the concrete impl; PR-4 ships the
+                // plumbing). Skipped when the pre-existing gate
+                // would ALREADY reject on errors / sentinel — those
+                // checks are cheaper and more actionable (RFC §3
+                // ordering), so we don't burn a verifier call
+                // re-confirming what a $0 check just caught. But
+                // `stalled_since_rejection` does NOT skip the
+                // verifier: the stalled signal fires on the 2nd/3rd
+                // retry after the model failed to produce work
+                // between attempts, and the verifier must still run
+                // so the terminal reason keeps the `contract_not_met:`
+                // prefix through the rejection loop (the model may
+                // still be attempting to satisfy a contract it
+                // cannot, and the operator dashboard needs to see
+                // that diagnosis).
+                let contract_rejection: Option<
+                    cairn_domain::completion_contracts::ContractRejectionCode,
+                > = if proposes_complete_run && !has_new_errors && self_reported_failure.is_none() {
+                    if let (Some(verifier), Some(contract), Some(proposal)) = (
+                        self.contract_verifier.as_ref(),
+                        ctx.completion_contract.as_ref(),
+                        complete_run_proposal,
+                    ) {
+                        match verifier.verify(contract, ctx, &proposal.description).await {
+                            Ok(_verified_output) => {
+                                // PR-5 will thread the extracted
+                                // `ContractVerifiedOutput` into the
+                                // child's `StepSummary.verified_output`
+                                // so a parent aggregate contract can
+                                // inspect it. PR-4 just confirms the
+                                // accept path runs to completion.
+                                None
+                            }
+                            Err(rejection) => {
+                                tracing::warn!(
+                                    run_id         = %ctx.run_id,
+                                    iteration      = ctx.iteration,
+                                    contract_kind  = %contract.kind(),
+                                    rejection_code = ?rejection.code,
+                                    operator_trace = %rejection.operator_trace,
+                                    "RFC 032: completion-contract verifier rejecting complete_run"
+                                );
+                                Some(rejection.code)
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 let gate_would_reject = proposes_complete_run
                     && (has_new_errors
                         || stalled_since_rejection
-                        || self_reported_failure.is_some());
+                        || self_reported_failure.is_some()
+                        || contract_rejection.is_some());
 
                 if gate_would_reject {
                     let error_count = verification_acc.errors_since_baseline();
@@ -1594,7 +1702,28 @@ where
                         // `FailureClass::VerificationRejected` terminal
                         // state. Keep the literal prefix stable — it's a
                         // contract with `crates/cairn-app/src/handlers/runs/helpers.rs`.
-                        let reason = if let Some(sentinel) = self_reported_failure {
+                        let reason = if let Some(code) = contract_rejection {
+                            // RFC 032 PR-4: completion-contract
+                            // verifier rejected the claimed deliverable
+                            // `MAX_COMPLETION_GATE_REJECTIONS` times.
+                            // `contract_not_met:` prefix is a wire
+                            // contract with cairn-app's
+                            // `classify_failed_reason` → maps to
+                            // `FailureClass::ContractNotMet`. The
+                            // snake_case `code` (via Display) surfaces
+                            // the specific rejection (pr_not_found,
+                            // file_missing, prose_insufficient_citations,
+                            // etc) so operator dashboards show why.
+                            // `{code}` uses the Display impl which
+                            // returns the stable snake_case wire
+                            // form — never `{:?}` / Debug (drifts on
+                            // rename; Copilot review #860).
+                            format!(
+                                "contract_not_met: {completion_gate_rejections} \
+                                 complete_run attempts rejected by completion-contract \
+                                 verifier (code: {code}). See operator logs for details."
+                            )
+                        } else if let Some(sentinel) = self_reported_failure {
                             // #830: the model kept calling complete_run
                             // with a failure-admission summary even
                             // after 3 rejections telling it to use
@@ -1644,7 +1773,26 @@ where
                     // `decide_impl::build_user_message`). Marked
                     // `succeeded=false` so the model reads it as a
                     // failure signal, not a completed action.
-                    let rejection_summary = if let Some(sentinel) = self_reported_failure {
+                    let rejection_summary = if let Some(code) = contract_rejection {
+                        // RFC 032 PR-4 §3.1: structured, code-based
+                        // LLM-visible diagnostic. Operator-only
+                        // context (paths, PR URLs, HTTP status) is
+                        // logged at `tracing::warn!` with
+                        // `operator_trace` as the payload; the LLM
+                        // sees only the stable snake_case code. The
+                        // model learns the codes over time the same
+                        // way it learned the FailRun verb.
+                        // `{code}` → Display → snake_case wire form
+                        // (not `{:?}` / Debug per Copilot #860).
+                        format!(
+                            "complete_run refused by completion-contract verifier: \
+                             code={code}. Your claimed deliverable does not exist \
+                             or does not match the declared contract. Produce the \
+                             deliverable and retry complete_run, OR call `fail_run` \
+                             if you cannot (attempt {completion_gate_rejections} of {}).",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                        )
+                    } else if let Some(sentinel) = self_reported_failure {
                         // #830: the model's final_answer opens with a
                         // failure-admission phrase — it knows the run
                         // isn't done but called complete_run anyway.

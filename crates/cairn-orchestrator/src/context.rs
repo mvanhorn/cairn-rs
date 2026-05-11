@@ -40,6 +40,24 @@ pub struct OrchestrationContext {
     pub run_started_at_ms: u64,
     /// Working directory used for filesystem and process-oriented tools.
     pub working_dir: PathBuf,
+    /// RFC 032 PR-4: the definition-of-done the gate grades this
+    /// run's `complete_run` against. Populated by the orchestrate
+    /// handler (PR-5) from three possible sources:
+    ///
+    /// * Operator-declared via `completion_contract` on `POST /v1/runs`
+    ///   (source = `ExplicitCreate`).
+    /// * Orchestrator-declared via `spawn_subagent`
+    ///   (source = `ExplicitSpawn`).
+    /// * Inferred by `cairn_domain::completion_contracts::infer_contract`
+    ///   from goal text at first orchestrate boot
+    ///   (source = `Inferred` or `ReInferredOnGoalChange`).
+    ///
+    /// `None` means no contract resolved — the gate falls through
+    /// to its pre-RFC-032 behaviour (error bucket + sentinel scan +
+    /// FailRun only). PR-4 leaves this field `None` in every
+    /// construction site; PR-5 wires the orchestrate handler to
+    /// populate it from the persisted run default.
+    pub completion_contract: Option<cairn_domain::completion_contracts::CompletionContract>,
     /// Execution mode for this run (RFC 018).
     ///
     /// - `Direct` — all tools visible, agent acts freely.

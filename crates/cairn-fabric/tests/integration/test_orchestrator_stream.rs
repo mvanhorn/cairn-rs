@@ -146,6 +146,7 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
         // trip the §1 timeout check before iteration 0 ran.
         run_started_at_ms: now_ms,
         working_dir: PathBuf::from("/tmp"),
+        completion_contract: None,
         run_mode: RunMode::Direct,
         discovered_tool_names: Vec::new(),
         step_history: Vec::new(),

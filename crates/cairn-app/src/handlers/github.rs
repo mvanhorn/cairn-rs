@@ -632,6 +632,7 @@ pub(crate) async fn webhook_trigger_orchestration(
         agent_type: "github_agent".to_owned(),
         run_started_at_ms: now_ms,
         working_dir,
+        completion_contract: None,
         run_mode: cairn_domain::decisions::RunMode::default(),
         discovered_tool_names: vec![],
         step_history: vec![],

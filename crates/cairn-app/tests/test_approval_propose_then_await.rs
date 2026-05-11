@@ -70,6 +70,7 @@ fn ctx(run_id: &str, session_id: &str) -> OrchestrationContext {
         agent_type: "orchestrator".to_owned(),
         run_started_at_ms: 1_000_000,
         working_dir: PathBuf::from("."),
+        completion_contract: None,
         run_mode: RunMode::Direct,
         discovered_tool_names: vec![],
         step_history: vec![],
