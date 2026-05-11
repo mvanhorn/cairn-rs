@@ -469,6 +469,35 @@ pub(crate) async fn process_webhook_orchestrate(
             "failed to persist run goal default; auto-resume will lose the PR-review objective"
         );
     }
+    // Persist the integration binding so `/orchestrate` can rebuild the
+    // integration tool registry (`prepare_tool_registry`) on F49 resume.
+    // Without this, every resume kick registers only the core builtins
+    // and strips `github_api.review_pr` + `GhApi*` tools — the agent
+    // can explore the diff on iteration 0 but can't post the review on
+    // iteration N>0. The four keys reconstruct the minimal `WorkItem`
+    // that the GitHub integration's `prepare_tool_registry` reads.
+    // `external_id` (issue/PR number) is persisted too so the reconstructed
+    // `WorkItem` carries the full read-persist-recover envelope.
+    for (suffix, value) in [
+        ("integration_id", "github".to_owned()),
+        ("integration_source_id", installation_id.to_string()),
+        ("integration_repo", repo_full.to_owned()),
+        (
+            "integration_external_id",
+            issue_number.map(|n| n.to_string()).unwrap_or_default(),
+        ),
+    ] {
+        if let Err(err) =
+            crate::persist_run_string_default(state, &project, &run.run_id, suffix, &value).await
+        {
+            tracing::warn!(
+                run_id = %run_id_str,
+                suffix,
+                error = %err,
+                "failed to persist integration binding default; auto-resume will lose the integration tool registry"
+            );
+        }
+    }
     let webhook_cfg = webhook_loop_config_from_env();
     if let Err(err) = crate::persist_run_u32_default(
         state,
@@ -1407,6 +1436,20 @@ pub(crate) async fn orchestrate_single_issue(
         crate::persist_run_string_default(state, &run.project, &run.run_id, "goal", &goal).await
     {
         tracing::warn!(run_id = %run.run_id, error = %err, "failed to persist run goal default; auto-resume will lose the issue-resolution objective");
+    }
+    // Persist integration binding — see the webhook path for rationale.
+    for (suffix, value) in [
+        ("integration_id", "github".to_owned()),
+        ("integration_source_id", entry.installation_id.to_string()),
+        ("integration_repo", entry.repo.clone()),
+        ("integration_external_id", entry.issue_number.to_string()),
+    ] {
+        if let Err(err) =
+            crate::persist_run_string_default(state, &run.project, &run.run_id, suffix, &value)
+                .await
+        {
+            tracing::warn!(run_id = %run.run_id, suffix, error = %err, "failed to persist integration binding default");
+        }
     }
     let webhook_cfg = webhook_loop_config_from_env();
     if let Err(err) = crate::persist_run_u32_default(

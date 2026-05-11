@@ -1599,6 +1599,75 @@ pub(crate) async fn drive_run_iteration(
         )
     };
 
+    // Integration-tool rebuild: a run that entered through the GitHub
+    // integration (webhook or scan-queue) needs the integration's
+    // `prepare_tool_registry` called on every resume — not just on
+    // iteration 0 — so tools like `github_api.review_pr` stay live
+    // across approval cycles. Only GitHub persists the
+    // `integration_*` defaults today; extending this to other
+    // integrations (Linear / Notion / Obsidian / local_fs) is a
+    // follow-up on their entry paths.
+    //
+    // We issue four individual `resolve_run_string_default` lookups
+    // here instead of a bulk read. The defaults service has no batch
+    // API today, and this path is called once per orchestrate POST
+    // (typically once per approval cycle, so ~10-20x per run) — well
+    // below the threshold where a batch read would pay for the
+    // service-level API design work. If that changes, `DefaultsService`
+    // is the right place to add a batch resolver.
+    let registry = {
+        let integration_id =
+            resolve_run_string_default(state.as_ref(), &run.project, &run.run_id, "integration_id")
+                .await;
+        let integration_source_id = resolve_run_string_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "integration_source_id",
+        )
+        .await;
+        let integration_repo = resolve_run_string_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "integration_repo",
+        )
+        .await;
+        let integration_external_id = resolve_run_string_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "integration_external_id",
+        )
+        .await
+        .unwrap_or_default();
+        match (integration_id, integration_source_id, integration_repo) {
+            (Some(iid), Some(src), Some(repo)) => {
+                let item = cairn_integrations::WorkItem {
+                    integration_id: iid.clone(),
+                    source_id: src,
+                    external_id: integration_external_id,
+                    repo,
+                    // Derive title from goal's first line — same shape
+                    // the webhook handler uses at entry so the
+                    // reconstructed `WorkItem` matches its sibling on
+                    // iteration 0 exactly.
+                    title: goal_value.lines().next().unwrap_or("").to_owned(),
+                    body: goal_value.clone(),
+                    run_id: run.run_id.as_str().to_owned(),
+                    session_id: run.session_id.as_str().to_owned(),
+                    status: cairn_integrations::WorkItemStatus::Processing,
+                };
+                if let Some(integration) = state.integrations.get(&iid).await {
+                    integration.prepare_tool_registry(&registry, &item).await
+                } else {
+                    registry
+                }
+            }
+            _ => registry,
+        }
+    };
+
     // ── Compose the RoutedGenerationService (F17) ────────────────────────
     // Cross-binding axis: every active provider connection for this tenant
     // becomes a `RoutedBinding`, with the binding that supports `model_id`
