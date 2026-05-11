@@ -22,6 +22,7 @@ pub(crate) mod breakers;
 pub mod completion_verification;
 pub mod content_tool_scan;
 pub mod context;
+pub mod contract_verifier;
 pub mod decide;
 pub mod decide_impl;
 pub mod echo_detector;

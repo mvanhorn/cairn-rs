@@ -728,6 +728,14 @@ pub enum ContractRejectionCode {
     PrUrlMalformed,
     PrUrlMissing,
     PrNotFound,
+    /// The PR's `owner/repo` does not match the contract's
+    /// `expected_repo`. Distinct from
+    /// [`Self::PrNotInProjectAllowlist`]: the repo IS in the run's
+    /// allowlist (no cross-tenant concern) but the operator pinned a
+    /// specific repo and the PR lives in a different one. Also
+    /// distinct from [`Self::PrHeadBranchMismatch`]: the branch name
+    /// has its own dedicated code.
+    PrRepoMismatch,
     PrHeadBranchMismatch,
     PrNotOpen,
 
