@@ -317,10 +317,22 @@ pub(crate) async fn process_webhook_orchestrate(
 
     let run_id_str = format!("{}-run-{}", session_id_str, event.delivery_id);
     let run_id = RunId::new(&run_id_str);
+    // Bind the run to `github_agent` persistently so that after an
+    // approval-gate / watchdog / checkpoint resume, the orchestrator
+    // rebuilds its `OrchestrationContext.agent_type` from the run
+    // projection's `agent_role_id` instead of defaulting to the
+    // built-in `"orchestrator"` cascade. Without this, a custom
+    // webhook-bound role is only in effect for iteration 0.
     let run = state
         .runtime
         .runs
-        .start(&project, &session_id, run_id.clone(), None)
+        .start_with_role(
+            &project,
+            &session_id,
+            run_id,
+            None,
+            Some("github_agent".to_owned()),
+        )
         .await
         .map_err(|e| e.to_string())?;
 

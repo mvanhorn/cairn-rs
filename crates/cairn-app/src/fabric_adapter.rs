@@ -1254,6 +1254,32 @@ impl RunService for FabricRunServiceAdapter {
             .map_err(fabric_err_to_runtime)
     }
 
+    /// Override the default trait impl. Fabric path threads the role
+    /// onto `BridgeEvent::ExecutionCreated` → `RunCreated.agent_role_id`
+    /// so the resume path reads it from the run projection.
+    ///
+    /// Paired with integration webhook handlers that pick a
+    /// per-event agent role — e.g. a GitHub `pull_request.opened`
+    /// webhook binds to a PR-reviewer role. On first orchestrator
+    /// iteration, the context's `agent_type` comes from the handler;
+    /// on every *subsequent* iteration (post-suspend-resume), the
+    /// orchestrator rebuilds context from the run row — which must
+    /// therefore carry the role persistently, not just in memory.
+    async fn start_with_role(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+        run_id: RunId,
+        parent_run_id: Option<RunId>,
+        agent_role_id: Option<String>,
+    ) -> Result<RunRecord, RuntimeError> {
+        self.fabric
+            .runs
+            .start_with_role(project, session_id, run_id, parent_run_id, agent_role_id)
+            .await
+            .map_err(fabric_err_to_runtime)
+    }
+
     async fn get(&self, run_id: &RunId) -> Result<Option<RunRecord>, RuntimeError> {
         let record = match resolve_run_scope(&self.store, run_id).await? {
             Some(r) => r,
@@ -3135,6 +3161,41 @@ mod tests {
             "override must pass the correlation_id down to \
              fabric.runs.start_with_correlation — delegating to plain \
              `fabric.runs.start()` would still drop it",
+        );
+    }
+
+    /// Sibling guard for `start_with_role`. Same rationale as
+    /// `start_with_correlation`: the trait's default impl silently
+    /// drops the role, so a refactor that accidentally deletes this
+    /// override would compile fine and silently regress the GitHub
+    /// webhook path (`handlers/github.rs::process_webhook_orchestrate`
+    /// passes the role through the trait) — the custom role would
+    /// only be in effect for iteration 0, and every resume after
+    /// approval / watchdog / checkpoint would fall back to the
+    /// default `orchestrator` cascade.
+    #[test]
+    fn fabric_run_adapter_overrides_start_with_role() {
+        let src = include_str!("fabric_adapter.rs");
+        assert!(
+            src.contains("async fn start_with_role("),
+            "FabricRunServiceAdapter must explicitly override \
+             start_with_role — default trait impl drops the \
+             agent_role_id. The GitHub webhook handler \
+             (handlers/github.rs::process_webhook_orchestrate) \
+             relies on this to persist the custom role across \
+             resume-after-approval.",
+        );
+        // Verify the override actually forwards the role to the
+        // fabric layer. A regression that passed `None` here would
+        // compile and stay silent.
+        assert!(
+            src.contains(
+                ".start_with_role(project, session_id, run_id, parent_run_id, agent_role_id)"
+            ),
+            "override must forward agent_role_id verbatim to \
+             fabric.runs.start_with_role — delegating to \
+             `fabric.runs.start()` or passing a hardcoded role would \
+             silently break webhook-bound custom-role persistence",
         );
     }
 

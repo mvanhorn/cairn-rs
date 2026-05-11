@@ -226,6 +226,39 @@ pub trait RunService: Send + Sync {
         self.start(project, session_id, run_id, parent_run_id).await
     }
 
+    /// Start a run with an agent-role binding.
+    ///
+    /// The role id is tagged on the emitted `RunCreated` event as
+    /// `agent_role_id`, so resume paths (approval-gate, checkpoint,
+    /// watchdog, sqeq) rebuild the orchestrator's
+    /// `OrchestrationContext.agent_type` from the run projection
+    /// instead of defaulting to the built-in `"orchestrator"` role.
+    ///
+    /// Without this, a top-level run created with a custom role
+    /// (typically from an integration webhook that routes on event
+    /// type → role id) loses the binding as soon as the first
+    /// orchestrator iteration suspends — the resume path has no
+    /// record that a custom role was in effect and falls through to
+    /// the default orchestrator flow, breaking custom workflows like
+    /// GitHub PR review.
+    ///
+    /// Default impl ignores the role and delegates to [`Self::start`];
+    /// the fabric adapter overrides to thread the role onto
+    /// `BridgeEvent::ExecutionCreated` via
+    /// `cairn_fabric::services::run_service::FabricRunService::start_with_role`
+    /// (plain backticks — `cairn-runtime` does not depend on
+    /// `cairn-fabric`, so the intra-doc link would not resolve).
+    async fn start_with_role(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+        run_id: RunId,
+        parent_run_id: Option<RunId>,
+        _agent_role_id: Option<String>,
+    ) -> Result<RunRecord, RuntimeError> {
+        self.start(project, session_id, run_id, parent_run_id).await
+    }
+
     /// Spawn a subagent run linked to a parent.
     ///
     /// **#670 G4 PR-1a cross-tenant + session-inheritance contract**:
