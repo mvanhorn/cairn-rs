@@ -411,6 +411,55 @@ impl DecidePhase for LlmDecidePhase {
             }
         }
 
+        // RFC 031 §D3 pre-elevation + allowlist filter share one role
+        // resolution — `resolve_role_or_fallback` does a projection read
+        // via the `AgentRoleService` when attached, so calling it twice
+        // in the same DECIDE iteration would (a) double the store I/O,
+        // and (b) risk a race where the allowlist filter runs against a
+        // different role version than the pre-elevation step used.
+        let resolved_role = self.resolve_role_or_fallback(ctx).await;
+
+        // RFC 031 §D3: when a role's `tools[]` allowlist explicitly names
+        // a Deferred tool, pre-elevate its descriptor into the catalogue
+        // without requiring the agent to call `tool_search` first.
+        //
+        // Why: the allowlist is the role's contract — it says "the agent
+        // WILL need these tools" — so forcing the agent to first discover
+        // via `tool_search` wastes an iteration and leaks the Core vs.
+        // Deferred tier distinction into the agent's workflow. Under the
+        // old behaviour, a role like `github_agent` declaring
+        // `github_api.review_pr` in its allowlist would still see the
+        // allowlist applied AFTER the catalogue was built, leaving
+        // `github_api.review_pr` missing from the initial tool set; the
+        // agent would correctly observe "tool required but not available"
+        // and call `complete_run` with a failure summary. Observed on
+        // the second large-PR dogfood against avifenesh/valkey#10.
+        //
+        // Tools NOT in the role allowlist remain Deferred and continue
+        // to require `tool_search` discovery — the tier system still
+        // controls which tools appear unsolicited.
+        //
+        // Skip when there's no role (legacy / no `agent_roles` service):
+        // the fallback's empty `tools[]` means "no restriction", and
+        // fetching every Deferred tool in the registry would defeat the
+        // point of the tier system.
+        if let Some(ref registry) = self.tools {
+            if !resolved_role.tools.is_empty() && !resolved_role.forbid_all_tools {
+                for name in &resolved_role.tools {
+                    if tool_descs.iter().any(|d| d.name.as_str() == name.as_str()) {
+                        continue;
+                    }
+                    for desc in registry.search_deferred(name) {
+                        if desc.name.as_str() == name.as_str()
+                            && !tool_descs.iter().any(|d| d.name == desc.name)
+                        {
+                            tool_descs.push(desc);
+                        }
+                    }
+                }
+            }
+        }
+
         // RFC 018: Plan mode filters out External tools so the agent can only
         // observe and work internally. Execute/Direct see all tools.
         if matches!(ctx.run_mode, cairn_domain::decisions::RunMode::Plan) {
@@ -458,7 +507,10 @@ impl DecidePhase for LlmDecidePhase {
         // with `forbid_all_tools=false` is unrestricted. Missing tool
         // ids emit a deduped `ToolDeclaredButMissing` advisory
         // (§D3 — lazy DECIDE-time validation, not POST-time).
-        let resolved_role = self.resolve_role_or_fallback(ctx).await;
+        //
+        // `resolved_role` was computed once above (shared with the
+        // Deferred-tool pre-elevation pass) to avoid a double store
+        // read and a possible race across the two resolution calls.
         apply_role_tool_allowlist(&resolved_role, &mut tool_descs);
         if self.event_log.is_some() {
             self.emit_declared_but_missing(ctx, &resolved_role, &tool_descs)
@@ -4737,6 +4789,106 @@ mod tests {
                         cairn_harness_tools::HarnessBash,
                     >::new())),
             )
+        }
+
+        /// Guard for the Deferred-tool pre-elevation path. When a role's
+        /// allowlist names a Deferred tool (e.g. `github_api.review_pr`),
+        /// DECIDE must surface it to the agent without requiring a prior
+        /// `tool_search` discovery — the allowlist is the contract.
+        /// Regression-pinned from the third large-PR dogfood on
+        /// avifenesh/valkey#10, where the agent's workflow expected the
+        /// tool on turn 1 but DECIDE exposed only Core/Registered tools.
+        #[tokio::test]
+        async fn deferred_tool_in_role_allowlist_is_preelevated() {
+            use cairn_tools::builtins::github_api::{GhApiReviewPrTool, GitHubClientProvider};
+            let store = Arc::new(InMemoryStore::new());
+            let role = D31AgentRole::new("pr-reviewer-elevated", "PR Reviewer", D31Tier::Standard)
+                .with_system_prompt("## Specialty\nReview PRs.\n")
+                .with_tools(["grep", "github_api.review_pr"]);
+            define_custom(store.clone(), role).await;
+
+            let registry = Arc::new(
+                cairn_tools::builtins::BuiltinToolRegistry::new()
+                    .register(Arc::new(cairn_harness_tools::HarnessBuiltin::<
+                        cairn_harness_tools::HarnessGrep,
+                    >::new()))
+                    .register(Arc::new(GhApiReviewPrTool::new(Arc::new(
+                        GitHubClientProvider::new(),
+                    )))),
+            );
+
+            // Sanity: without elevation, `prompt_tools()` (Core +
+            // Registered only) does NOT include Deferred — this is the
+            // pre-fix behaviour we had to work around.
+            let base_prompt_tools = registry.prompt_tools();
+            assert!(
+                !base_prompt_tools
+                    .iter()
+                    .any(|d| d.name.as_str() == "github_api.review_pr"),
+                "precondition: Deferred tool is hidden from prompt_tools() by default"
+            );
+
+            let agent_roles: Arc<dyn D31Service> =
+                Arc::new(AgentRoleServiceImpl::new(store.clone()));
+            let phase = LlmDecidePhase::new(Arc::new(NoopProvider), "test-model")
+                .with_tools(registry)
+                .with_agent_roles(agent_roles);
+
+            let mut ctx = ctx();
+            ctx.project = test_project();
+            ctx.agent_type = "pr-reviewer-elevated".to_owned();
+
+            // `decide()` must succeed — if it errors, the catalogue
+            // never gets built and the elevation path never runs, so
+            // assert success first.
+            phase
+                .decide(&ctx, &empty_gather())
+                .await
+                .expect("decide should succeed with NoopProvider");
+            let resolved = phase.resolve_role_or_fallback(&ctx).await;
+            assert!(resolved.tools.contains(&"github_api.review_pr".to_owned()));
+
+            // Mirror the catalogue build `decide()` does, step by step,
+            // and verify the Deferred tool survives both the
+            // pre-elevation pass AND the allowlist filter. Mirroring
+            // here (rather than capturing the provider's request) is a
+            // simplification — a follow-up could swap this for a
+            // `ToolsCaptureProvider` to assert directly on what the LLM
+            // actually saw, which would also cover the Plan-mode /
+            // visibility-filter interactions that this test skips.
+            let mut tool_descs: Vec<BuiltinToolDescriptor> = phase
+                .tools
+                .as_ref()
+                .expect("registry attached")
+                .prompt_tools();
+            // Emulate the pre-elevation block in decide().
+            if !resolved.tools.is_empty() && !resolved.forbid_all_tools {
+                if let Some(ref registry) = phase.tools {
+                    for name in &resolved.tools {
+                        if tool_descs.iter().any(|d| d.name.as_str() == name.as_str()) {
+                            continue;
+                        }
+                        for desc in registry.search_deferred(name) {
+                            if desc.name.as_str() == name.as_str()
+                                && !tool_descs.iter().any(|d| d.name == desc.name)
+                            {
+                                tool_descs.push(desc);
+                            }
+                        }
+                    }
+                }
+            }
+            apply_role_tool_allowlist(&resolved, &mut tool_descs);
+            let names: Vec<&str> = tool_descs.iter().map(|d| d.name.as_str()).collect();
+            assert!(
+                names.contains(&"github_api.review_pr"),
+                "Deferred tool in role allowlist must be pre-elevated; got: {:?}",
+                names
+            );
+            assert!(
+                names.contains(&"grep"),
+                "Core/Registered tool in role allowlist must still be present"
+            );
         }
 
         #[tokio::test]

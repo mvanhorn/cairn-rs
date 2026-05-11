@@ -1659,12 +1659,35 @@ pub(crate) async fn drive_run_iteration(
                     status: cairn_integrations::WorkItemStatus::Processing,
                 };
                 if let Some(integration) = state.integrations.get(&iid).await {
-                    integration.prepare_tool_registry(&registry, &item).await
+                    let rebuilt = integration.prepare_tool_registry(&registry, &item).await;
+                    tracing::info!(
+                        run_id = %run.run_id,
+                        integration = %iid,
+                        "rebuilt integration tool registry on resume"
+                    );
+                    rebuilt
                 } else {
+                    tracing::warn!(
+                        run_id = %run.run_id,
+                        integration = %iid,
+                        "integration binding present but integration not registered; skipping prepare_tool_registry"
+                    );
                     registry
                 }
             }
-            _ => registry,
+            (iid, src, repo) => {
+                // Log what was missing so we can debug resume paths that
+                // legitimately lack an integration binding vs. ones that
+                // are supposed to have one but don't.
+                tracing::debug!(
+                    run_id = %run.run_id,
+                    has_integration_id = iid.is_some(),
+                    has_source_id = src.is_some(),
+                    has_repo = repo.is_some(),
+                    "no integration binding on run defaults; skipping integration tool registry rebuild"
+                );
+                registry
+            }
         }
     };
 
