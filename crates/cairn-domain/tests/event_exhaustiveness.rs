@@ -642,6 +642,11 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
             assert_ne!(proj.tenant_id.as_str(), "_system");
             assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
         }
+        // RFC 032 PR-2: run-scoped contract resolution annotation.
+        RuntimeEvent::CompletionContractResolved(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
         // F64: run-scoped terminal-write recovery annotation.
         RuntimeEvent::TerminalRecoveryAttempted(_) => {
             assert_ne!(proj.tenant_id.as_str(), "_system");
@@ -1948,6 +1953,18 @@ fn all_variants() -> Vec<RuntimeEvent> {
             verification: cairn_domain::CompletionVerification::default(),
             occurred_at_ms: ts,
         }),
+        // RFC 032 PR-2: completion-contract resolution variant.
+        RuntimeEvent::CompletionContractResolved(
+            cairn_domain::events::CompletionContractResolved {
+                project: p(),
+                session_id: cairn_domain::SessionId::new("sess_test"),
+                run_id: cairn_domain::RunId::new("run_test"),
+                contract: cairn_domain::completion_contracts::CompletionContract::ProseNonEmpty,
+                source: cairn_domain::completion_contracts::ContractSource::Inferred,
+                goal_hash: "0123456789abcdef".to_owned(),
+                occurred_at_ms: ts,
+            },
+        ),
         // F64: terminal-write recovery loop annotation.
         RuntimeEvent::TerminalRecoveryAttempted(cairn_domain::events::TerminalRecoveryAttempted {
             project: p(),
@@ -2222,11 +2239,11 @@ fn all_runtime_event_variants_covered_count() {
     // 180 variants in the RuntimeEvent enum (176 prior +
     // RunReasoningStepRecorded #789 = 177, + RFC 031 PR-A adds
     // AgentRoleDefined / AgentRoleRetracted / ToolDeclaredButMissing
-    // = 180).
+    // = 180, + RFC 032 PR-2 adds CompletionContractResolved = 181).
     assert_eq!(
         variants.len(),
-        180,
-        "all_variants() must construct exactly 180 RuntimeEvent instances"
+        181,
+        "all_variants() must construct exactly 181 RuntimeEvent instances"
     );
 }
 

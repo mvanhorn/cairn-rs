@@ -503,6 +503,9 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::SessionAttemptCompleted(_)
             | RuntimeEvent::CircuitBreakerTripped(_)
             | RuntimeEvent::BudgetThresholdCrossed(_)
+            // RFC 032 PR-2: completion-contract resolution is a
+            // run-level observability event with no graph shape.
+            | RuntimeEvent::CompletionContractResolved(_)
             | RuntimeEvent::CheckpointPersisted(_)
             | RuntimeEvent::WorkspaceSnapshotCreated(_)
             | RuntimeEvent::WorkspaceSnapshotReaped(_)

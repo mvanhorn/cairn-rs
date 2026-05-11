@@ -87,6 +87,15 @@ pub fn failure_class_category(failure_class: FailureClass) -> &'static str {
         // and I cannot proceed"), distinct from policy refusal,
         // execution error, or operator cancel.
         FailureClass::ModelReportedFailure => "agent",
+        // RFC 032: the completion-contract verifier rejected the
+        // agent's `complete_run` because the claimed deliverable
+        // didn't exist (no PR, missing file, insufficient citations,
+        // schema mismatch). Bucketed as "policy" because the
+        // rejection comes from a cairn-level quality gate, same
+        // bucket as `VerificationRejected`. The specific
+        // `ContractRejectionCode` surfaces via the structured
+        // diagnostic in step_history, not via this category.
+        FailureClass::ContractNotMet => "policy",
     }
 }
 
@@ -110,6 +119,7 @@ pub fn failure_class_reason(failure_class: FailureClass) -> &'static str {
         FailureClass::OrphanChild => "orphan_child",
         FailureClass::AllProvidersExhausted => "all_providers_exhausted",
         FailureClass::ModelReportedFailure => "model_reported_failure",
+        FailureClass::ContractNotMet => "contract_not_met",
     }
 }
 

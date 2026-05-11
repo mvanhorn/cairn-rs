@@ -315,6 +315,20 @@ pub enum RuntimeEvent {
     /// nullable columns, so event logs written before F47 PR2 deserialize
     /// cleanly and surface `completion: None` at the REST boundary.
     RunCompletionAnnotated(RunCompletionAnnotated),
+    /// RFC 032 §2.3: emitted when a run's [`CompletionContract`]
+    /// resolves — either declared explicitly on run creation / spawn,
+    /// or inferred from goal text at first orchestrate boot, or
+    /// re-inferred after a goal-text change mid-run.
+    ///
+    /// Carries the resolved contract + source so the operator
+    /// trajectory endpoint (#794) can render "what is cairn grading
+    /// this run against" well before the gate ever fires. PR-2 lands
+    /// the variant; PR-4 wires emission.
+    ///
+    /// Ephemeral in PR-2 (no read-model table yet); PR-4 may upgrade
+    /// to `Projected` against a dedicated `completion_contracts`
+    /// table. See `projection_registry.rs`.
+    CompletionContractResolved(CompletionContractResolved),
     /// F64: emitted when the cairn-side terminal-write recovery loop
     /// runs (the bridge workaround for the FF#371 dual-door deadlock).
     /// Carries the attempts, wall-time, and outcome so operators can
@@ -492,6 +506,7 @@ impl RuntimeEvent {
             RuntimeEvent::PlanRevisionRequested(event) => &event.project,
             RuntimeEvent::DecisionRecorded(event) => &event.project,
             RuntimeEvent::RunCompletionAnnotated(event) => &event.project,
+            RuntimeEvent::CompletionContractResolved(event) => &event.project,
             RuntimeEvent::TerminalRecoveryAttempted(event) => &event.project,
             // F65 PR-1: orchestrator session redesign events are all
             // project-scoped — they route through the operator-facing
@@ -885,6 +900,9 @@ impl RuntimeEvent {
             | RuntimeEvent::DecisionRecorded(_)
             | RuntimeEvent::DecisionCacheWarmup(_) => None,
             RuntimeEvent::RunCompletionAnnotated(event) => Some(RuntimeEntityRef::Run {
+                run_id: event.run_id.clone(),
+            }),
+            RuntimeEvent::CompletionContractResolved(event) => Some(RuntimeEntityRef::Run {
                 run_id: event.run_id.clone(),
             }),
             RuntimeEvent::TerminalRecoveryAttempted(event) => Some(RuntimeEntityRef::Run {
@@ -3293,6 +3311,40 @@ pub struct RunCompletionAnnotated {
     pub summary: String,
     #[serde(default)]
     pub verification: crate::orchestrator::CompletionVerification,
+    pub occurred_at_ms: u64,
+}
+
+/// RFC 032 §2.3 event payload. Emitted when a run's
+/// [`crate::completion_contracts::CompletionContract`] resolves —
+/// explicitly on create / spawn, inferred from goal text at first
+/// orchestrate, or re-inferred after a goal change.
+///
+/// PR-2 lands the struct. PR-4 wires emission at the orchestrate
+/// handler. PR-2's projection-registry entry marks this `Ephemeral`
+/// (SSE + trajectory only, no dedicated read-model table); Phase 2
+/// may promote to `Projected` against a `completion_contracts`
+/// table if operator dashboards need structured queries on the
+/// resolved contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionContractResolved {
+    pub project: crate::tenancy::ProjectKey,
+    pub session_id: crate::ids::SessionId,
+    pub run_id: crate::ids::RunId,
+    /// The resolved contract. Serializes with its
+    /// `#[serde(tag = "kind")]` discriminator; deserialization
+    /// validates every typed newtype inside (RelPath, BoundedRegex,
+    /// ContractSchema), so a malformed contract cannot reach the
+    /// event log.
+    pub contract: crate::completion_contracts::CompletionContract,
+    /// How this contract arrived — explicit declaration, inference,
+    /// or re-inference on goal change. Operator timeline uses this
+    /// to distinguish "we inferred this" from "you declared this".
+    pub source: crate::completion_contracts::ContractSource,
+    /// Short hash of the goal text that triggered resolution. Used
+    /// by PR-4's re-inference guard to decide whether the goal has
+    /// changed since the last resolution. 16 hex chars = first 8
+    /// bytes of a sha256 over the goal string.
+    pub goal_hash: String,
     pub occurred_at_ms: u64,
 }
 

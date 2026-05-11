@@ -3408,6 +3408,9 @@ impl InMemoryStore {
             // Budget-threshold-crossed is purely observability (SSE) — no
             // projection row.
             RuntimeEvent::BudgetThresholdCrossed(_) => {}
+            // RFC 032 PR-2: completion-contract resolution event —
+            // SSE + trajectory only, no in-memory projection needed.
+            RuntimeEvent::CompletionContractResolved(_) => {}
             RuntimeEvent::CheckpointPersisted(e) => {
                 // F65 projection row (orchestrator-resumable shape).
                 // Pg/sqlite use `ON CONFLICT DO UPDATE` that preserves the

@@ -3500,6 +3500,8 @@ impl SqliteSyncProjection {
             RuntimeEvent::SessionAttemptCompleted(_) => {}
             RuntimeEvent::CircuitBreakerTripped(_) => {}
             RuntimeEvent::BudgetThresholdCrossed(_) => {}
+            // RFC 032 PR-2: see pg projections.rs for rationale.
+            RuntimeEvent::CompletionContractResolved(_) => {}
             RuntimeEvent::CheckpointPersisted(e) => {
                 let schema_version: i64 = 1;
                 // u32 → i64 is infallible.

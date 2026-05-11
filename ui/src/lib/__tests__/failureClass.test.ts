@@ -44,6 +44,7 @@ export const FAILURE_CLASS_VALUES = [
   "orphan_child",
   "all_providers_exhausted",
   "model_reported_failure",
+  "contract_not_met",
 ] as const satisfies readonly FailureClass[];
 
 // ── Compile-time coverage ────────────────────────────────────────────────────

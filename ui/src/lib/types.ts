@@ -558,7 +558,20 @@ export type FailureClass =
    * failure (missing precondition, contradictory goal, dependency not
    * met) from the other failure classes.
    */
-  | "model_reported_failure";
+  | "model_reported_failure"
+  /**
+   * RFC 032: the completion-contract verifier rejected the agent's
+   * `complete_run` because the claimed deliverable does not exist
+   * (no PR at the declared URL, file missing, prose too short +
+   * under-cited, JSON Schema mismatch). Distinct from
+   * `verification_rejected` (model lied about tool errors / admitted
+   * failure in the summary) and `model_reported_failure` (model
+   * truthfully called `fail_run`). The specific rejection reason
+   * (a stable `ContractRejectionCode` like `pr_not_found` /
+   * `file_symlink_traversal`) surfaces in the run's step_history
+   * diagnostic, not on the failure_class field.
+   */
+  | "contract_not_met";
 
 /** GET /v1/runs — array of RunRecord */
 export interface RunRecord {

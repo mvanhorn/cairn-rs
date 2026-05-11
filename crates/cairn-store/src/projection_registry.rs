@@ -626,6 +626,12 @@ pub const REGISTRY: &[ProjectionEntry] = &[
         },
     },
     ProjectionEntry {
+        variant: "CompletionContractResolved",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 032 PR-2: emitted when a run's completion contract resolves (explicit or inferred); rendered via SSE + trajectory endpoint (#794). PR-4 / Phase 2 may promote to Projected against a dedicated completion_contracts table if operator dashboards need structured queries.",
+        },
+    },
+    ProjectionEntry {
         variant: "BudgetThresholdCrossed",
         status: ProjectionStatus::Ephemeral {
             reason: "F65 observability: SSE + metrics only; no read-model table",
@@ -1697,12 +1703,16 @@ mod tests {
             projected, 143,
             "Projected count drifted; update registry + RFC"
         );
+        // RFC 032 PR-2: +1 Ephemeral (CompletionContractResolved).
+        // PR-4 / Phase 2 may promote to Projected when the
+        // completion_contracts read-model table ships; until then
+        // the event is SSE + trajectory only.
         assert_eq!(
-            ephemeral, 37,
+            ephemeral, 38,
             "Ephemeral count drifted; update registry + RFC"
         );
         assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
-        assert_eq!(projected + ephemeral + stubbed, 180);
+        assert_eq!(projected + ephemeral + stubbed, 181);
     }
 
     #[test]

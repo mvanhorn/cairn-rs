@@ -132,6 +132,23 @@ pub enum FailureClass {
     ///   specific operator input (approval, rotated credential,
     ///   clarification) and resuming IS feasible.
     ModelReportedFailure,
+    /// RFC 032: the completion-contract verifier rejected the LLM's
+    /// `complete_run` because the claimed deliverable does not exist
+    /// (no PR at the declared URL, file missing, prose too short +
+    /// under-cited, JSON Schema mismatch, etc). Distinct from
+    /// `VerificationRejected` (model lied or admitted) and
+    /// `ModelReportedFailure` (model truthfully called `fail_run`).
+    ///
+    /// The specific rejection reason (a stable snake_case code from
+    /// [`cairn_domain::completion_contracts::ContractRejectionCode`])
+    /// surfaces via the structured diagnostic threaded into
+    /// `step_history` at gate time — not on the `FailureClass`
+    /// itself, so the enum stays `Copy` + single-tag snake_case on
+    /// the wire like every other variant.
+    ///
+    /// PR-4 (gate integration) wires emission. PR-2 lands the
+    /// variant so projections + operator dashboards are ready.
+    ContractNotMet,
 }
 
 /// Canonical pause reasons in v1.
@@ -372,6 +389,21 @@ mod tests {
         );
         let decoded: FailureClass = serde_json::from_str(r#""model_reported_failure""#).unwrap();
         assert_eq!(decoded, FailureClass::ModelReportedFailure);
+    }
+
+    #[test]
+    fn failure_class_contract_not_met_serialises_snake_case() {
+        // RFC 032: `contract_not_met` is the wire shape operator
+        // dashboards use to distinguish "claimed deliverable doesn't
+        // exist" from `verification_rejected` (model lied) and
+        // `model_reported_failure` (model gave up). PR-4 emits this
+        // from the gate when the resolved contract rejects.
+        assert_eq!(
+            serde_json::to_string(&FailureClass::ContractNotMet).unwrap(),
+            r#""contract_not_met""#
+        );
+        let decoded: FailureClass = serde_json::from_str(r#""contract_not_met""#).unwrap();
+        assert_eq!(decoded, FailureClass::ContractNotMet);
     }
 
     #[test]

@@ -1490,6 +1490,8 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::RecoverySummaryEmitted(_) => "recovery_summary",
         // F47 PR2
         RuntimeEvent::RunCompletionAnnotated(_) => "run_completion_annotated",
+        // RFC 032 PR-2: completion-contract resolution event.
+        RuntimeEvent::CompletionContractResolved(_) => "completion_contract_resolved",
         // F64: terminal-write recovery loop outcome (FF#371 bridge).
         RuntimeEvent::TerminalRecoveryAttempted(_) => "terminal_recovery_attempted",
         // F65 PR-1: orchestrator session redesign foundation.
@@ -2092,6 +2094,20 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
                 e.verification.warnings.len(),
                 e.verification.errors.len(),
                 e.verification.commands.len(),
+            )
+        }
+        // RFC 032 PR-2
+        RuntimeEvent::CompletionContractResolved(e) => {
+            // `kind()` is the stable snake_case tag — matches what
+            // operator dashboards render and what `event_type_name`
+            // returns for this event. `{source:?}` is intentionally
+            // the enum's Debug (ExplicitCreate / Inferred / …) so
+            // the source surfaces legibly without another helper.
+            format!(
+                "Run {} completion contract resolved ({} via {:?})",
+                e.run_id,
+                e.contract.kind(),
+                e.source,
             )
         }
         RuntimeEvent::TaskPriorityChanged(_)

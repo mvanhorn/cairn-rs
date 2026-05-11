@@ -3657,6 +3657,12 @@ impl PgSyncProjection {
             // into the session outcome row when the trip terminates the
             // attempt. No dedicated projection table.
             RuntimeEvent::CircuitBreakerTripped(_) => {}
+            // RFC 032 PR-2: completion-contract resolution is emitted
+            // by PR-4's orchestrate handler (explicit or inferred).
+            // SSE + trajectory endpoint (#794) render it directly
+            // from the event log. No read-model table — Phase 2 may
+            // add one if operator dashboards need structured queries.
+            RuntimeEvent::CompletionContractResolved(_) => {}
             // Budget-threshold-crossed is purely observability (SSE).
             RuntimeEvent::BudgetThresholdCrossed(_) => {}
             // Orchestrator decisions are operator observability (SSE + audit).
