@@ -22,7 +22,7 @@ use cairn_domain::ProviderBindingRecord;
 use cairn_graph::in_memory::InMemoryGraphStore;
 use cairn_memory::bundles::BundleEnvelope;
 use cairn_runtime::{
-    InMemoryServices, ProviderBindingService, ProviderConnectionConfig, ProviderConnectionService,
+    ProviderBindingService, ProviderConnectionConfig, ProviderConnectionService, RuntimeServices,
 };
 use std::{future::Future, net::SocketAddr, sync::Arc};
 use tokio::{net::TcpListener, runtime::Builder};
@@ -30,8 +30,10 @@ use tower_http::cors::{Any, CorsLayer};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::bootstrap::shutdown_signal;
+use crate::knowledge_provider_routes;
 use crate::marketplace_routes;
 use crate::repo_routes;
+use crate::scoring_policy_routes;
 use crate::state::AppState;
 use crate::telemetry_routes;
 use crate::trigger_routes;
@@ -87,6 +89,42 @@ pub(crate) struct TaskRecordDoc {
     state: String,
     created_at: u64,
     updated_at: u64,
+}
+
+/// Issue #670 G1+G2: serialised `subagent_spawns` projection row.
+/// One row per `spawn_subagent` execution, carrying the LLM's
+/// delegation context (goal + role) verbatim.
+#[derive(Clone, Debug, serde::Serialize, ToSchema)]
+pub(crate) struct SubagentSpawnRowDoc {
+    child_task_id: String,
+    parent_run_id: String,
+    parent_task_id: Option<String>,
+    child_session_id: String,
+    child_run_id: Option<String>,
+    tenant_id: String,
+    workspace_id: String,
+    project_id: String,
+    goal: String,
+    role: String,
+    spawned_at_ms: u64,
+}
+
+impl From<cairn_store::projections::SubagentSpawnRecord> for SubagentSpawnRowDoc {
+    fn from(r: cairn_store::projections::SubagentSpawnRecord) -> Self {
+        Self {
+            child_task_id: r.child_task_id.to_string(),
+            parent_run_id: r.parent_run_id.to_string(),
+            parent_task_id: r.parent_task_id.map(|t| t.to_string()),
+            child_session_id: r.child_session_id.to_string(),
+            child_run_id: r.child_run_id.map(|r| r.to_string()),
+            tenant_id: r.project.tenant_id.to_string(),
+            workspace_id: r.project.workspace_id.to_string(),
+            project_id: r.project.project_id.to_string(),
+            goal: r.goal,
+            role: r.role,
+            spawned_at_ms: r.spawned_at_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, ToSchema)]
@@ -211,6 +249,7 @@ impl ProviderBindingBootstrapService for AppProviderBootstrap<'_> {
         create_task_handler,
         create_tenant_handler,
         create_workspace_handler,
+        delete_workspace_handler,
         create_project_handler,
         create_provider_connection_handler,
         list_provider_bindings_handler
@@ -264,14 +303,14 @@ impl AppBootstrap {
 
     pub async fn router_with_runtime(
         config: BootstrapConfig,
-    ) -> Result<(Router, Arc<InMemoryServices>), String> {
+    ) -> Result<(Router, Arc<RuntimeServices>), String> {
         let (router, runtime, _) = Self::router_with_runtime_and_tokens(config).await?;
         Ok((router, runtime))
     }
 
     pub async fn router_with_runtime_and_tokens(
         config: BootstrapConfig,
-    ) -> Result<(Router, Arc<InMemoryServices>, Arc<ServiceTokenRegistry>), String> {
+    ) -> Result<(Router, Arc<RuntimeServices>, Arc<ServiceTokenRegistry>), String> {
         let (router, runtime, _graph, service_tokens) =
             Self::router_with_runtime_graph_and_tokens(config).await?;
         Ok((router, runtime, service_tokens))
@@ -282,7 +321,7 @@ impl AppBootstrap {
     ) -> Result<
         (
             Router,
-            Arc<InMemoryServices>,
+            Arc<RuntimeServices>,
             Arc<InMemoryGraphStore>,
             Arc<ServiceTokenRegistry>,
         ),
@@ -302,11 +341,11 @@ impl AppBootstrap {
     ///
     /// Lets test fixtures (see `crates/cairn-app/tests/support/fake_fabric.rs`)
     /// stand up an AppState without a live Valkey by injecting the
-    /// read-only trio via `InMemoryServices::with_store_and_core` and
+    /// read-only trio via `RuntimeServices::with_store_and_core` and
     /// passing it through here.
     pub async fn router_with_injected_runtime(
         config: BootstrapConfig,
-        runtime: Arc<InMemoryServices>,
+        runtime: Arc<RuntimeServices>,
         fabric: Option<Arc<cairn_fabric::FabricServices>>,
     ) -> Result<(Router, Arc<AppState>), String> {
         let state = Arc::new(AppState::new_with_runtime(config, runtime, fabric).await?);
@@ -356,6 +395,9 @@ impl AppBootstrap {
                     }
                     (HttpMethod::Get, "/v1/settings/tls") => {
                         router.route(&path, get(get_tls_settings_handler))
+                    }
+                    (HttpMethod::Get, "/v1/settings/defaults/:scope/:scope_id/:key") => {
+                        router.route(&path, get(get_default_setting_handler))
                     }
                     (HttpMethod::Put, "/v1/settings/defaults/:scope/:scope_id/:key") => {
                         router.route(&path, put(set_default_setting_handler))
@@ -413,6 +455,19 @@ impl AppBootstrap {
                     }
                     (HttpMethod::Post, "/v1/admin/tenants/:tenant_id/workspaces") => {
                         router.route(&path, post(create_workspace_handler))
+                    }
+                    (
+                        HttpMethod::Delete,
+                        "/v1/admin/tenants/:tenant_id/workspaces/:workspace_id",
+                    ) => router.route(&path, delete(delete_workspace_handler)),
+                    (HttpMethod::Delete, "/v1/admin/tenants/:tenant_id/sessions/:session_id") => {
+                        router.route(&path, delete(delete_session_admin_handler))
+                    }
+                    // #670 G4 / RFC 027 §Orphan-child: operator recovery for
+                    // runs wedged in `Pending` because cairn-app crashed
+                    // between the child-row-create and task-submit phases.
+                    (HttpMethod::Post, "/v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan") => {
+                        router.route(&path, post(cancel_orphan_run_handler))
                     }
                     (HttpMethod::Get, "/v1/admin/tenants/:tenant_id/operator-profiles") => {
                         router.route(&path, get(list_operator_profiles_handler))
@@ -583,6 +638,9 @@ impl AppBootstrap {
                     (HttpMethod::Get, "/v1/runs/:id/interventions") => {
                         router.route(&path, get(list_run_interventions_handler))
                     }
+                    (HttpMethod::Get, "/v1/runs/:id/telemetry") => {
+                        router.route(&path, get(get_run_telemetry_handler))
+                    }
                     (HttpMethod::Get, "/v1/costs") => {
                         router.route(&path, get(list_tenant_costs_handler))
                     }
@@ -698,11 +756,17 @@ impl AppBootstrap {
                     (HttpMethod::Post, "/v1/evals/datasets/:id/entries") => {
                         router.route(&path, post(add_eval_dataset_entry_handler))
                     }
+                    (HttpMethod::Get, "/v1/evals/baselines") => {
+                        router.route(&path, get(list_eval_baselines_handler))
+                    }
                     (HttpMethod::Post, "/v1/evals/baselines") => {
                         router.route(&path, post(create_eval_baseline_handler))
                     }
                     (HttpMethod::Get, "/v1/evals/baselines/:id") => {
                         router.route(&path, get(get_eval_baseline_handler))
+                    }
+                    (HttpMethod::Get, "/v1/evals/rubrics") => {
+                        router.route(&path, get(list_eval_rubrics_handler))
                     }
                     (HttpMethod::Post, "/v1/evals/rubrics") => {
                         router.route(&path, post(create_eval_rubric_handler))
@@ -764,8 +828,11 @@ impl AppBootstrap {
                     (HttpMethod::Get, "/v1/sources/:id") => {
                         router.route(&path, get(get_source_handler))
                     }
-                    (HttpMethod::Put, "/v1/sources/:id") => {
-                        router.route(&path, put(update_source_handler))
+                    // #426: PATCH replaces PUT. Pre-release, no deprecation
+                    // alias — partial-update semantics are correct, and PUT
+                    // would imply full replacement per RFC 7231 §4.3.4.
+                    (HttpMethod::Patch, "/v1/sources/:id") => {
+                        router.route(&path, patch(patch_source_handler))
                     }
                     (HttpMethod::Delete, "/v1/sources/:id") => {
                         router.route(&path, delete(delete_source_handler))
@@ -828,8 +895,17 @@ impl AppBootstrap {
                         router.route(&path, get(graph_trace_preserved_handler))
                     }
                     (HttpMethod::Get, "/v1/skills") => {
-                        router.route(&path, get(list_skills_preserved_handler))
+                        router.route(&path, get(list_skills_handler))
                     }
+                    // `/v1/skills/:id` is registered in the dynamic-param
+                    // `.route()` chain below — matchit 0.7 rejects the
+                    // `{id}` literal produced by `catalog_path_to_axum`.
+                    // Skip the fold without registering a no-op 501
+                    // shadow; returning `router` unchanged leaves the
+                    // dynamic-chain registration as the authoritative
+                    // binding. The catalog entry still contributes to
+                    // OpenAPI discovery because it's iterated directly.
+                    (HttpMethod::Get, "/v1/skills/:id") => router,
                     (HttpMethod::Get, "/v1/memory/search") => {
                         router.route(&path, get(memory_search_handler))
                     }
@@ -969,6 +1045,20 @@ impl AppBootstrap {
             )
             .route("/v1/sessions/:id", get(get_session_handler))
             .route("/v1/sessions/:id/cost", get(get_session_cost_handler))
+            // F65 PR-5: admin snapshot reap. Admin-only per Q4 locked.
+            .route(
+                "/v1/sessions/:id/snapshots",
+                delete(delete_session_snapshots_handler),
+            )
+            // F29 CD-2: project / workspace cost rollups for the observability panel.
+            .route(
+                "/v1/projects/:tenant/:workspace/:project/costs",
+                get(get_project_costs_handler),
+            )
+            .route(
+                "/v1/workspaces/:tenant/:workspace/costs",
+                get(get_workspace_costs_handler),
+            )
             .route(
                 "/v1/sessions/:id/activity",
                 get(get_session_activity_handler),
@@ -981,6 +1071,12 @@ impl AppBootstrap {
             .route("/v1/runs", post(create_run_handler))
             .route("/v1/runs/:id/audit", get(get_run_audit_trail_handler))
             .route("/v1/runs/:id/cost", get(get_run_cost_handler))
+            .route("/v1/runs/:id/telemetry", get(get_run_telemetry_handler))
+            // #789: per-run reasoning trajectory for post-mortem replay.
+            .route("/v1/runs/:id/trajectory", get(get_run_trajectory_handler))
+            // #789: live fleet view of every active agent in the
+            // caller's tenant + their current action.
+            .route("/v1/admin/agents/live", get(get_live_agents_handler))
             .route("/v1/runs/:id/recover", post(recover_run_handler))
             .route("/v1/runs/:id/events", get(list_run_events_handler))
             .route("/v1/runs/:id/replay", get(replay_run_handler))
@@ -1002,6 +1098,10 @@ impl AppBootstrap {
             )
             .route("/v1/runs/:id/spawn", post(spawn_subagent_run_handler))
             .route("/v1/runs/:id/children", get(list_child_runs_handler))
+            .route(
+                "/v1/runs/:id/subagent-spawns",
+                get(list_subagent_spawns_handler),
+            )
             .route("/v1/runs/:id/orchestrate", post(orchestrate_run_handler))
             .route(
                 "/v1/plugins/:id/capabilities",
@@ -1137,7 +1237,14 @@ impl AppBootstrap {
                 "/v1/admin/audit-log/:resource_type/:resource_id",
                 get(list_audit_log_for_resource_handler),
             )
-            .route("/v1/admin/tenants/:id", get(get_tenant_handler))
+            // RFC 026 PR-A2: tenant PATCH edit. `TenantAdminGuard` on
+            // the PATCH handler scopes the write to the target tenant
+            // even when the god-token bypasses the guard for cross-
+            // tenant bootstrap.
+            .route(
+                "/v1/admin/tenants/:id",
+                get(get_tenant_handler).patch(patch_tenant_handler),
+            )
             .route(
                 "/v1/admin/tenants/:id/overview",
                 get(get_tenant_overview_handler),
@@ -1153,6 +1260,18 @@ impl AppBootstrap {
             .route(
                 "/v1/admin/tenants/:tenant_id/operator-profiles",
                 get(list_operator_profiles_handler),
+            )
+            // RFC 026 PR-A4: list an operator's tenant-role grants.
+            // Tenant-scoped under `:tenant_id` so `TenantAdminGuard`
+            // authorizes on the URL's tenant; cross-tenant operator ids
+            // return 404 so presence of foreign-tenant operators is
+            // never revealed. Body lists grants on *all* tenants the
+            // operator holds a record for — revokes still require admin
+            // on each target tenant, so read-surface breadth does not
+            // enable escalation.
+            .route(
+                "/v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles",
+                get(list_operator_tenant_roles_handler),
             )
             .route(
                 "/v1/admin/tenants/:tenant_id/workspaces",
@@ -1192,8 +1311,33 @@ impl AppBootstrap {
                 post(create_workspace_handler),
             )
             .route(
+                "/v1/admin/tenants/:tenant_id/workspaces/:workspace_id",
+                delete(delete_workspace_handler),
+            )
+            .route(
+                "/v1/admin/tenants/:tenant_id/sessions/:session_id",
+                delete(delete_session_admin_handler),
+            )
+            // #670 G4 / RFC 027 §Orphan-child: operator recovery path
+            // for child runs that leaked into `Pending` when cairn-app
+            // crashed between Phase-1 (child row created) and Phase-2
+            // (task submitted). Transitions to `Failed(OrphanChild)`.
+            .route(
+                "/v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan",
+                post(cancel_orphan_run_handler),
+            )
+            .route(
                 "/v1/admin/tenants/:tenant_id/operator-profiles",
                 post(create_operator_profile_handler),
+            )
+            // RFC 026 PR-A2: operator-profile PATCH edit. Tenant-scoped
+            // so `TenantAdminGuard` authorizes on the URL's tenant_id
+            // without a pre-lookup; the handler rejects cross-tenant
+            // ids with 404 so a tenant-admin on T cannot reach an
+            // operator that belongs to T'.
+            .route(
+                "/v1/admin/tenants/:tenant_id/operator-profiles/:id",
+                patch(patch_operator_profile_handler),
             )
             .route(
                 "/v1/admin/tenants/:tenant_id/credentials",
@@ -1227,21 +1371,53 @@ impl AppBootstrap {
                 "/v1/admin/operators/:id/notifications",
                 post(set_operator_notifications_handler),
             )
+            // RFC 026 PR-A0: tenant-admin role grants.
+            .route(
+                "/v1/admin/operators/:id/tenant-roles/:tenant/promote",
+                post(promote_tenant_role_handler),
+            )
+            .route(
+                "/v1/admin/operators/:id/tenant-roles/:tenant",
+                delete(revoke_tenant_role_handler),
+            )
             .route(
                 "/v1/admin/notifications/:id/retry",
                 post(retry_notification_handler),
             )
             // ── Model pricing admin (CRUD) ────────────────────────────────────────────
             .route("/v1/admin/models", get(list_models_handler))
+            // #493: per-route body cap of 1_000_000 bytes (≈ 0.95 MiB,
+            // so call it 1 MB decimal — matches what a customer would
+            // type in a size-limit UI). Overrides the 10 MiB workspace
+            // default (the global `DefaultBodyLimit` layer still reads
+            // "10 MB" in that sense too — the two caps live at different
+            // binary/decimal edges, this route's is strictly tighter).
+            // LiteLLM's full catalog is ~120 KB; anything near the cap
+            // is attacker-crafted. Combined with the parse-once handler,
+            // an oversized POST is rejected by Axum with 413 before it
+            // reaches user code.
             .route(
                 "/v1/admin/models/import-litellm",
-                post(import_litellm_handler),
+                post(import_litellm_handler).layer(DefaultBodyLimit::max(1_000_000)),
             )
             .route(
                 "/v1/admin/models/:id",
                 get(get_model_handler)
                     .put(set_model_handler)
                     .delete(delete_model_handler),
+            )
+            // ── Public model catalog (read-only, filter + paginate) ───────────────────
+            // Read-only projection of the bundled LiteLLM catalog + TOML overlay +
+            // any admin overrides. Callable by any authenticated operator — the UI
+            // provider wizard and cost calculator read from here so the operator
+            // doesn't have to hand-type model IDs.
+            .route(
+                "/v1/models/catalog",
+                get(crate::handlers::model_catalog::list_model_catalog_handler),
+            )
+            .route(
+                "/v1/models/catalog/providers",
+                get(crate::handlers::model_catalog::list_catalog_providers_handler),
             )
             // ── Settings ──────────────────────────────────────────────────────────────
             .route("/v1/settings/defaults/all", get(list_all_defaults_handler))
@@ -1251,9 +1427,12 @@ impl AppBootstrap {
             )
             .route(
                 "/v1/settings/defaults/:scope/:scope_id/:key",
-                put(set_default_setting_handler).delete(clear_default_setting_handler),
+                get(get_default_setting_handler)
+                    .put(set_default_setting_handler)
+                    .delete(clear_default_setting_handler),
             )
             // ── Approvals ─────────────────────────────────────────────────────────────
+            .route("/v1/approvals/:id", get(get_approval_handler))
             .route("/v1/approvals/:id/approve", post(approve_approval_handler))
             .route("/v1/approvals/:id/deny", post(deny_approval_handler))
             .route(
@@ -1261,6 +1440,26 @@ impl AppBootstrap {
                 post(delegate_approval_handler),
             )
             .route("/v1/approvals/:id/reject", post(reject_approval_handler))
+            .route("/v1/approvals/:id/amend", patch(amend_approval_handler))
+            // ── Deprecated `/v1/tool-call-approvals/*` (F45) ──────────────────────────
+            //
+            // Unified under `/v1/approvals/*`. Pre-F45 paths 308-redirect
+            // so existing clients keep working while they migrate. 308
+            // preserves method + body across redirect.
+            .route("/v1/tool-call-approvals", get(redirect_list))
+            .route("/v1/tool-call-approvals/:call_id", get(redirect_get))
+            .route(
+                "/v1/tool-call-approvals/:call_id/approve",
+                post(redirect_approve),
+            )
+            .route(
+                "/v1/tool-call-approvals/:call_id/reject",
+                post(redirect_reject),
+            )
+            .route(
+                "/v1/tool-call-approvals/:call_id/amend",
+                patch(redirect_amend),
+            )
             // ── Decisions (RFC 019) ───────────────────────────────────────────────────
             // All decision routes use nest() to avoid static/dynamic path conflicts.
             .nest("/v1/decisions", {
@@ -1302,7 +1501,7 @@ impl AppBootstrap {
             )
             .route(
                 "/v1/prompts/releases/:id/request-approval",
-                post(request_approval_handler),
+                post(request_prompt_release_approval_handler),
             )
             // ── Feed ──────────────────────────────────────────────────────────────────
             .route("/v1/feed/:id/read", post(mark_feed_item_read_handler))
@@ -1310,6 +1509,8 @@ impl AppBootstrap {
                 "/v1/telemetry/usage",
                 get(telemetry_routes::get_usage_telemetry_handler),
             )
+            // ── Skills ────────────────────────────────────────────────────────────────
+            .route("/v1/skills/:id", get(get_skill_handler))
             // ── Runs ──────────────────────────────────────────────────────────────────
             .route("/v1/runs/:id", get(get_run_handler))
             .route("/v1/runs/:id/cost-alert", post(set_run_cost_alert_handler))
@@ -1371,7 +1572,14 @@ impl AppBootstrap {
             )
             .route("/v1/evals/baselines/:id", get(get_eval_baseline_handler))
             .route("/v1/evals/rubrics/:id", get(get_eval_rubric_handler))
-            .route("/v1/evals/runs/:id", get(get_eval_run_handler))
+            // Issue #244: GET + DELETE share the dynamic-param chain because
+            // the catalog-fold arm never fires for `/v1/evals/runs/:id`
+            // (no catalog entry). Attaching `.delete()` here puts both verbs
+            // on the same matchit node so axum can route DELETE correctly.
+            .route(
+                "/v1/evals/runs/:id",
+                get(get_eval_run_handler).delete(delete_eval_run_handler),
+            )
             .route(
                 "/v1/evals/runs/:id/score-rubric",
                 post(score_eval_run_with_rubric_handler),
@@ -1381,6 +1589,12 @@ impl AppBootstrap {
                 post(compare_eval_run_baseline_handler),
             )
             .route("/v1/evals/scorecard/:asset_id", get(get_scorecard_handler))
+            // Issue #244: scorecard summary list for the EvalsPage picker.
+            // Registered here directly rather than through the catalog fold;
+            // `/v1/evals/scorecards` is a distinct static route from
+            // `/v1/evals/scorecard/:asset_id` (different second segment, no
+            // ordering dependency).
+            .route("/v1/evals/scorecards", get(list_scorecards_handler))
             .route(
                 "/v1/evals/assets/:asset_id/report",
                 get(get_eval_asset_report_handler),
@@ -1398,10 +1612,14 @@ impl AppBootstrap {
                 get(get_eval_asset_export_handler),
             )
             // ── Sources / Ingest ──────────────────────────────────────────────────────
+            // #426: `/v1/sources/:id` — PATCH replaces PUT. The handler
+            // has partial-update semantics (absent fields keep their
+            // existing value), so PUT was a verb-contract violation per
+            // RFC 7231 §4.3.4. Pre-release; no compatibility alias.
             .route(
                 "/v1/sources/:id",
                 get(get_source_handler)
-                    .put(update_source_handler)
+                    .patch(patch_source_handler)
                     .delete(delete_source_handler),
             )
             .route("/v1/sources/:id/chunks", get(list_source_chunks_handler))
@@ -1431,6 +1649,10 @@ impl AppBootstrap {
             .route(
                 "/v1/sessions/:id/llm-traces",
                 get(get_session_llm_traces_handler),
+            )
+            .route(
+                "/v1/sessions/:session_id/llm-traces/:trace_id/body",
+                get(get_session_llm_trace_body_handler),
             )
             // ── Graph ─────────────────────────────────────────────────────────────────
             .route(
@@ -1541,6 +1763,57 @@ impl AppBootstrap {
                 post(marketplace_routes::enable_plugin_handler)
                     .delete(marketplace_routes::disable_plugin_handler),
             )
+            // RFC 029: configure the project's knowledge provider.
+            .route(
+                "/v1/projects/:project/knowledge-provider",
+                put(knowledge_provider_routes::configure_knowledge_provider_handler),
+            )
+            // RFC 030 PR-E: configure the project's memory provider.
+            .route(
+                "/v1/projects/:project/memory-provider",
+                put(memory_provider_routes::configure_memory_provider_handler),
+            )
+            // RFC 030 PR-E: atomic read of both provider slots +
+            // resolved snapshots.
+            .route(
+                "/v1/projects/:project/providers",
+                get(providers_routes::get_providers_handler),
+            )
+            // RFC 030 PR-E: cross-family ingest-job listing backed by
+            // the `{Memory,Knowledge}Ingest*` event stream, optionally
+            // filtered by family=memory|knowledge|all.
+            .route(
+                "/v1/projects/:project/ingest-jobs",
+                get(providers_routes::get_ingest_jobs_handler),
+            )
+            // RFC 030 PR-E: legacy scoring-policy endpoint → 308 redirect
+            // to the knowledge variant. Preserves request method + body so
+            // operator CLIs from the pre-PR-E world still work without
+            // breaking in-flight automation.
+            .route(
+                "/v1/projects/:project/scoring-policy",
+                put(scoring_policy_routes::legacy_scoring_policy_redirect_handler),
+            )
+            // RFC 030 PR-E: per-family scoring-policy PUT + GET +
+            // valid-dimensions.
+            .route(
+                "/v1/projects/:project/memory-scoring-policy",
+                get(scoring_policy_routes::get_memory_scoring_policy_handler)
+                    .put(scoring_policy_routes::configure_memory_scoring_policy_handler),
+            )
+            .route(
+                "/v1/projects/:project/knowledge-scoring-policy",
+                get(scoring_policy_routes::get_knowledge_scoring_policy_handler)
+                    .put(scoring_policy_routes::configure_knowledge_scoring_policy_handler),
+            )
+            .route(
+                "/v1/projects/:project/memory-scoring-policy/valid-dimensions",
+                get(scoring_policy_routes::get_memory_valid_dimensions_handler),
+            )
+            .route(
+                "/v1/projects/:project/knowledge-scoring-policy/valid-dimensions",
+                get(scoring_policy_routes::get_knowledge_valid_dimensions_handler),
+            )
             .route(
                 "/v1/projects/:project/repos",
                 get(repo_routes::list_project_repos_handler)
@@ -1552,8 +1825,44 @@ impl AppBootstrap {
                     .delete(repo_routes::delete_project_repo_handler),
             )
             .route(
+                "/v1/projects/:project/local-paths",
+                axum::routing::delete(repo_routes::delete_project_local_path_handler),
+            )
+            .route(
                 "/v1/plugins/:id/uninstall",
                 delete(marketplace_routes::uninstall_plugin_handler),
+            )
+            // ── Agent roles (RFC 031) ────────────────────────────────────────
+            // 128 KiB body cap on writes (§D4 total-body ceiling). Axum
+            // rejects oversized bodies with `PAYLOAD_TOO_LARGE` before
+            // they reach the handler; the handler layers additional
+            // per-field caps for nicer error messages when the body is
+            // small overall but one field blows a sub-limit.
+            .route(
+                "/v1/projects/:project/agent-roles",
+                get(list_agent_roles_handler)
+                    .post(create_agent_role_handler)
+                    .layer(DefaultBodyLimit::max(131_072)),
+            )
+            .route(
+                "/v1/projects/:project/agent-roles/:role_id",
+                get(get_agent_role_handler)
+                    .patch(patch_agent_role_handler)
+                    .delete(delete_agent_role_handler)
+                    .layer(DefaultBodyLimit::max(131_072)),
+            )
+            // RFC 031 PR-D3 §History panel — per-role event log.
+            .route(
+                "/v1/projects/:project/agent-roles/:role_id/history",
+                get(get_agent_role_history_handler),
+            )
+            // #799 — per-project tool-id listing powering the RFC 031
+            // role-editor tool-allowlist autocomplete. Cross-cutting read;
+            // any authenticated operator whose tenant scope covers the
+            // target project.
+            .route(
+                "/v1/projects/:project/tools",
+                get(list_project_tools_handler),
             )
             // ── Triggers (RFC 022) ────────────────────────────────────────────
             .route(
@@ -1625,6 +1934,10 @@ impl AppBootstrap {
                 put(set_queue_concurrency_handler),
             )
             // ── Integration Plugin Registry (runtime CRUD) ─────────────────────
+            .route(
+                "/v1/integrations/github/verify-installation",
+                post(verify_github_installation_handler),
+            )
             .route(
                 "/v1/integrations",
                 get(list_integrations_handler).post(register_integration_handler),
@@ -1736,10 +2049,18 @@ impl AppBootstrap {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
-            .await
-            .map_err(|err| format!("axum server failed: {err}"))
+        // `into_make_service_with_connect_info::<SocketAddr>()` populates
+        // `ConnectInfo<SocketAddr>` in each request's extensions. The
+        // rate-limit middleware (`resolved_client_ip`) reads that
+        // extension when `X-Forwarded-For` is absent so localhost
+        // traffic can be identified and exempted. Closes #649.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(|err| format!("axum server failed: {err}"))
     }
 
     async fn serve_with_tls_shutdown<F>(
@@ -1763,9 +2084,13 @@ impl AppBootstrap {
             shutdown_handle.graceful_shutdown(None);
         });
 
+        // Match the non-TLS path: install `ConnectInfo<SocketAddr>` so
+        // the rate-limit middleware can resolve the client IP and
+        // apply the loopback exemption (#649) uniformly across both
+        // transports.
         axum_server::bind_rustls(addr, tls_config)
             .handle(handle)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .map_err(|err| format!("axum TLS server failed: {err}"))
     }

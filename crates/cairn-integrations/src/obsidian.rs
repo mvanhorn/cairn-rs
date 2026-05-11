@@ -207,6 +207,10 @@ Append your results to the output folder specified in the task.";
 
 #[async_trait]
 impl Integration for ObsidianPlugin {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &str {
         "obsidian"
     }

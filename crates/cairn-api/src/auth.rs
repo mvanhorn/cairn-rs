@@ -89,6 +89,27 @@ impl ServiceTokenRegistry {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
+
+    /// Return the token for the first registered `ServiceAccount` whose
+    /// `name` matches. Used by the #636 auto-resume worker to pull the
+    /// current admin token out of the registry on every kick without
+    /// walking every entry. The lookup still scans the map but short-
+    /// circuits on the first match and avoids allocating the full
+    /// `Vec<(String, AuthPrincipal)>` that `all_entries` produces.
+    ///
+    /// `None` when no matching account is registered.
+    pub fn find_service_token_by_name(&self, name: &str) -> Option<String> {
+        self.tokens
+            .read()
+            .unwrap()
+            .iter()
+            .find_map(|(token, principal)| match principal {
+                AuthPrincipal::ServiceAccount {
+                    name: entry_name, ..
+                } if entry_name == name => Some(token.clone()),
+                _ => None,
+            })
+    }
 }
 
 /// `Authenticator` implementation backed by a `ServiceTokenRegistry`.

@@ -1,7 +1,7 @@
 //! Cairn-native mirror types for the [`ControlPlaneBackend`] trait.
 //!
 //! These mirror the FF wire types that budget/quota/rotation/worker
-//! services used to surface directly from FF (`ff_core::contracts::*`).
+//! services used to surface directly from FF (`flowfabric::core::contracts::*`).
 //! They exist so the [`ControlPlaneBackend`] trait boundary does not
 //! leak FF-specific enums through to cairn services; when FF renames a
 //! variant or reshapes the wire format, the mirror absorbs the change
@@ -9,7 +9,7 @@
 //!
 //! Phase D PR 1 introduces these alongside the trait. A small
 //! conversion in `ValkeyControlPlane` translates FF's enum variants
-//! (`ff_core::contracts::ReportUsageResult`, etc.) into the mirrors.
+//! (`flowfabric::core::contracts::ReportUsageResult`, etc.) into the mirrors.
 //!
 //! [`ControlPlaneBackend`]: super::control_plane::ControlPlaneBackend
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use std::collections::HashMap;
 /// Result of a budget spend via
 /// [`ControlPlaneBackend::record_spend`](super::control_plane::ControlPlaneBackend::record_spend).
 ///
-/// Mirror of `ff_core::contracts::ReportUsageResult` with cairn-native
+/// Mirror of `flowfabric::core::contracts::ReportUsageResult` with cairn-native
 /// variant names. `SoftBreach` and `HardBreach` distinguish whether
 /// the increment applied (`Soft` = applied + warning; `Hard` =
 /// rejected).
@@ -114,10 +114,30 @@ pub struct RotationFailure {
 /// caller can log or surface it without re-reading.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkerRegistration {
-    pub worker_id: ff_core::types::WorkerId,
-    pub instance_id: ff_core::types::WorkerInstanceId,
+    pub worker_id: flowfabric::core::types::WorkerId,
+    pub instance_id: flowfabric::core::types::WorkerInstanceId,
     pub capabilities: Vec<String>,
     pub registered_at_ms: u64,
+}
+
+/// Row returned by
+/// [`Engine::list_workers`](super::Engine::list_workers).
+///
+/// Mirror of FF 0.14's `WorkerInfo` reduced to the fields cairn's
+/// operator surfaces consume. Keeps the PG/Valkey return shapes
+/// identical so dashboards render without a backend branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerSummary {
+    pub worker_id: flowfabric::core::types::WorkerId,
+    pub instance_id: flowfabric::core::types::WorkerInstanceId,
+    pub namespace: flowfabric::core::types::Namespace,
+    pub lanes: std::collections::BTreeSet<flowfabric::core::types::LaneId>,
+    pub capabilities: std::collections::BTreeSet<String>,
+    /// Last heartbeat or registration-refresh timestamp, epoch millis.
+    pub last_heartbeat_ms: i64,
+    pub liveness_ttl_ms: u64,
+    /// Initial registration timestamp, epoch millis.
+    pub registered_at_ms: i64,
 }
 
 // ── Phase D PR 2a: run / session / claim lifecycle mirrors ──────────────
@@ -171,9 +191,9 @@ pub enum FlowCancelOutcome {
 /// tests / debug logs only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimGrantOutcome {
-    pub lease_id: ff_core::types::LeaseId,
-    pub lease_epoch: ff_core::types::LeaseEpoch,
-    pub attempt_index: ff_core::types::AttemptIndex,
+    pub lease_id: flowfabric::core::types::LeaseId,
+    pub lease_epoch: flowfabric::core::types::LeaseEpoch,
+    pub attempt_index: flowfabric::core::types::AttemptIndex,
 }
 
 // ── Input structs ───────────────────────────────────────────────────────
@@ -186,22 +206,90 @@ pub struct ClaimGrantOutcome {
 /// Snapshot fields a lifecycle FCALL needs (lease triple + attempt
 /// pointer + lane + worker identity). Populated by the service from
 /// an `ExecutionSnapshot` before the FCALL.
+///
+/// # Fence-triple invariant (RFC #58.5)
+///
+/// FF's terminal FCALLs (`ff_complete_execution`, `ff_fail_execution`)
+/// accept the `(lease_id, lease_epoch, attempt_id)` tokens only in two
+/// shapes:
+///
+/// * **All three set** → FF validates the caller against the stored
+///   lease. Normal happy path — claim is still live.
+/// * **All three empty** → FF resolves the fence server-side from
+///   `exec_core` and proceeds only when `source == "operator_override"`.
+///   Used when the lease has expired or the caller is the authoritative
+///   writer (cairn's orchestrator on the completion path).
+///
+/// Any *partial* triple (e.g. empty `lease_id` + set `lease_epoch`) is
+/// rejected with `partial_fence_triple`. Both lease-context builders —
+/// `FabricRunService::resolve_lease_context` and
+/// `FabricTaskService::resolve_lease_context` — enforce the invariant:
+/// either all three are populated from a live `current_lease` + current
+/// attempt, or all three are cleared and `source` is set to
+/// `"operator_override"` so FF accepts the unfenced path.
 #[derive(Clone, Debug)]
 pub struct ExecutionLeaseContext {
-    pub lane_id: ff_core::types::LaneId,
-    pub attempt_index: ff_core::types::AttemptIndex,
+    pub lane_id: flowfabric::core::types::LaneId,
+    pub attempt_index: flowfabric::core::types::AttemptIndex,
     pub lease_id: String,
     pub lease_epoch: String,
     pub attempt_id: String,
-    pub worker_instance_id: ff_core::types::WorkerInstanceId,
+    pub worker_instance_id: flowfabric::core::types::WorkerInstanceId,
+    /// `source` ARGV for terminal FCALLs. `"operator_override"` when the
+    /// fence triple is empty (unfenced mode); empty string when the
+    /// triple is fully populated (FF validates normally).
+    pub source: String,
+}
+
+impl ExecutionLeaseContext {
+    /// Build the unfenced (all-fence-tokens-empty +
+    /// `source="operator_override"`) shape used when an execution has no
+    /// active lease. Shared between `FabricRunService` and
+    /// `FabricTaskService` so the invariant is enforced in exactly one
+    /// place (F37). See the struct-level doc for the fence-triple
+    /// contract.
+    ///
+    /// # Safe for cancel too
+    ///
+    /// `ff_cancel_execution` also takes `lease_epoch` as an ARGV, which
+    /// might look like it needs a non-empty default. It does not, as
+    /// long as `source == "operator_override"`: the Lua active-phase
+    /// branch wraps its `lease_id` / `lease_epoch` checks in
+    /// `if A.source ~= "operator_override" then …`, so the whole lease
+    /// block is skipped when the caller signals authoritative intent
+    /// (see `flowfabric.lua` around `ff_cancel_execution`'s active path,
+    /// lines 2011-2021 in ff-script 0.3.4). Cairn's `cancel` callers
+    /// all route through `resolve_lease_context`, so they get this
+    /// unfenced shape and cleanly skip the lease gate.
+    // Consumed by `services::run_service` + `services::task_service`
+    // on the cancel/operator-override path — both gated behind
+    // `fabric-valkey`. Silence the dead-code lint under
+    // `--no-default-features` so the backend-agnostic crate compiles
+    // clean; the item itself stays available for any future backend
+    // (PR-C Postgres, etc.) that wires those services.
+    #[cfg_attr(not(feature = "fabric-valkey"), allow(dead_code))]
+    pub(crate) fn unfenced(
+        lane_id: flowfabric::core::types::LaneId,
+        attempt_index: flowfabric::core::types::AttemptIndex,
+    ) -> Self {
+        Self {
+            lane_id,
+            attempt_index,
+            lease_id: String::new(),
+            lease_epoch: String::new(),
+            attempt_id: String::new(),
+            worker_instance_id: flowfabric::core::types::WorkerInstanceId::new("cairn"),
+            source: "operator_override".to_owned(),
+        }
+    }
 }
 
 /// Input to `create_run_execution`.
 #[derive(Clone, Debug)]
 pub struct CreateRunExecutionInput {
-    pub execution_id: ff_core::types::ExecutionId,
-    pub namespace: ff_core::types::Namespace,
-    pub lane_id: ff_core::types::LaneId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub namespace: flowfabric::core::types::Namespace,
+    pub lane_id: flowfabric::core::types::LaneId,
     /// `cairn.*` tags to stamp on `exec_tags`. Caller owns the full
     /// set (run_id / session_id / project / instance_id / optional
     /// parent + correlation).
@@ -213,24 +301,24 @@ pub struct CreateRunExecutionInput {
 /// Input to `complete_run_execution`.
 #[derive(Clone, Debug)]
 pub struct CompleteRunInput {
-    pub execution_id: ff_core::types::ExecutionId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
     pub lease: ExecutionLeaseContext,
 }
 
 /// Input to `cancel_run_execution`.
 #[derive(Clone, Debug)]
 pub struct CancelRunInput {
-    pub execution_id: ff_core::types::ExecutionId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
     pub lease: ExecutionLeaseContext,
     /// Current waitpoint id on the execution, if any. Empty means no
     /// active waitpoint (FF's cancel tolerates a default/empty id).
-    pub current_waitpoint: Option<ff_core::types::WaitpointId>,
+    pub current_waitpoint: Option<flowfabric::core::types::WaitpointId>,
 }
 
 /// Input to `fail_run_execution`.
 #[derive(Clone, Debug)]
 pub struct FailRunInput {
-    pub execution_id: ff_core::types::ExecutionId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
     pub lease: ExecutionLeaseContext,
     pub reason: String,
     pub category: String,
@@ -239,37 +327,30 @@ pub struct FailRunInput {
     pub retry_policy_json: String,
 }
 
-/// A suspension request built by the caller from a `SuspensionParams`.
-///
-/// The service assembles the resume-condition / resume-policy JSON +
-/// timeout-at calculations; the trait impl only wires them into the
-/// `ff_suspend_execution` KEYS/ARGV layout.
-#[derive(Clone, Debug)]
-pub struct SuspendRunInput {
-    pub execution_id: ff_core::types::ExecutionId,
-    pub lease: ExecutionLeaseContext,
-    pub reason_code: String,
-    pub timeout_at: String,
-    pub resume_condition_json: String,
-    pub resume_policy_json: String,
-    pub timeout_behavior: String,
-}
+// `SuspendRunInput` retired in CG-c (2026-04-26, FF#322). The
+// service-layer suspend path now builds a typed `SuspendArgs` +
+// `LeaseFence` and calls `EngineBackend::suspend_by_triple` directly —
+// see `crate::suspension::suspend_by_triple`. The Lua-ARGV JSON blobs
+// (`resume_condition_json`, `resume_policy_json`,
+// `timeout_behavior` wire-string) that this struct carried are no
+// longer assembled on cairn's side; the FF 0.10 trait accepts the
+// typed inputs and does its own validation + serialisation.
 
 /// Input to `resume_run_execution`.
 #[derive(Clone, Debug)]
 pub struct ResumeRunInput {
-    pub execution_id: ff_core::types::ExecutionId,
-    pub lane_id: ff_core::types::LaneId,
-    pub waitpoint_id: Option<ff_core::types::WaitpointId>,
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub lane_id: flowfabric::core::types::LaneId,
+    pub waitpoint_id: Option<flowfabric::core::types::WaitpointId>,
     pub resume_source: String,
 }
 
 /// Input to `deliver_approval_signal`.
 #[derive(Clone, Debug)]
 pub struct DeliverApprovalSignalInput {
-    pub execution_id: ff_core::types::ExecutionId,
-    pub lane_id: ff_core::types::LaneId,
-    pub waitpoint_id: ff_core::types::WaitpointId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub lane_id: flowfabric::core::types::LaneId,
+    pub waitpoint_id: flowfabric::core::types::WaitpointId,
     pub signal_name: String,
     pub idempotency_suffix: String,
     pub signal_dedup_ttl_ms: u64,
@@ -280,15 +361,15 @@ pub struct DeliverApprovalSignalInput {
 /// Input to `create_flow`.
 #[derive(Clone, Debug)]
 pub struct CreateFlowInput {
-    pub flow_id: ff_core::types::FlowId,
+    pub flow_id: flowfabric::core::types::FlowId,
     pub flow_kind: String,
-    pub namespace: ff_core::types::Namespace,
+    pub namespace: flowfabric::core::types::Namespace,
 }
 
 /// Input to `cancel_flow`.
 #[derive(Clone, Debug)]
 pub struct CancelFlowInput {
-    pub flow_id: ff_core::types::FlowId,
+    pub flow_id: flowfabric::core::types::FlowId,
     pub reason: String,
     pub cancel_mode: String,
 }
@@ -296,9 +377,193 @@ pub struct CancelFlowInput {
 /// Input to `issue_grant_and_claim`.
 #[derive(Clone, Debug)]
 pub struct IssueGrantAndClaimInput {
-    pub execution_id: ff_core::types::ExecutionId,
-    pub lane_id: ff_core::types::LaneId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub lane_id: flowfabric::core::types::LaneId,
     pub lease_duration_ms: u64,
+}
+
+// ── #710: FF 0.15 reclaim-grant path ─────────────────────────────────────
+//
+// The R11/R12 dogfood exposed that cairn's F62/F64 terminal-write
+// recovery loop walks the pre-FF-0.15 `issue_grant_and_claim` path
+// that FF#371 documented as unrecoverable when the execution's
+// lifecycle_phase drifted to post-tool / pre-next-claim.
+//
+// FF 0.15 shipped the RFC-024 §3.2 reclaim-grant primitive as a new
+// pair of EngineBackend methods (ff-core 0.15 `engine_backend.rs:354`
+// + `:371`):
+//
+//   - `issue_reclaim_grant(args) -> IssueReclaimGrantOutcome`
+//   - `reclaim_execution(args)   -> ReclaimExecutionOutcome`
+//
+// Admits `lease_expired_reclaimable` / `lease_revoked` executions
+// into a fresh attempt with a new lease, bypassing the
+// `execution_not_eligible` wall the old path hit.
+//
+// These cairn-level input/output structs wrap the FF args so the
+// `ControlPlaneBackend` trait stays ff-agnostic in its signature
+// shape (cairn never exports ff-core types through its public
+// surface — see the established pattern for `IssueGrantAndClaimInput`
+// + `ClaimGrantOutcome`). The backend impl translates into the
+// `ff_core::contracts::*` types at the trait boundary.
+
+/// Input to `issue_reclaim_grant`.
+///
+/// Worker identity is cairn-supplied. Control-plane callers pass
+/// a synthetic worker identity (`"cairn-control-plane"` + per-process
+/// instance id) so FF's worker-identity validation accepts the
+/// reclaim without cairn having to become a durable worker. This is
+/// the control-plane carve-out RFC-024 §4.4 anticipates ("consumer
+/// flow" — the consumer need not be a worker provided the identity
+/// is stable across the grant + reclaim pair).
+#[derive(Clone, Debug)]
+pub struct IssueReclaimGrantInput {
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub lane_id: flowfabric::core::types::LaneId,
+    pub worker_id: flowfabric::core::types::WorkerId,
+    pub worker_instance_id: flowfabric::core::types::WorkerInstanceId,
+    /// Grant TTL in milliseconds — how long the returned grant
+    /// stays valid before the consumer must use it. Short values
+    /// (1-5 s) are appropriate for the F64 recovery loop because
+    /// the grant-then-reclaim pair runs in one atomic sequence.
+    pub grant_ttl_ms: u64,
+    /// Optional capability-hash token, stored verbatim on the
+    /// grant for audit. `None` leaves empty.
+    pub capability_hash: Option<String>,
+}
+
+/// Outcome of `issue_reclaim_grant` — cairn-level wrapper over
+/// `ff_core::contracts::IssueReclaimGrantOutcome`.
+///
+/// Construction surface: backends produce variants, consumers match.
+/// The `Granted` variant's body is intentionally opaque (carries the
+/// backend's typed `ReclaimGrant` via `ReclaimGrantHandle`) — cairn
+/// does not persist or inspect grant internals; it hands the handle
+/// straight back to `reclaim_execution`.
+///
+/// Derives match `ClaimGrantOutcome` / `ReclaimExecutionOutcome` in
+/// this file — `Clone + PartialEq + Eq` enables structural
+/// comparison in tests and lets contains-this-outcome types stay
+/// symmetric.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssueReclaimGrantOutcome {
+    /// Grant issued. Hand the carried handle to
+    /// `ControlPlaneBackend::reclaim_execution` to mint a fresh
+    /// attempt.
+    Granted(ReclaimGrantHandle),
+    /// Execution is not in a reclaimable state (not
+    /// `lease_expired_reclaimable` / `lease_revoked`). Typically
+    /// means the deadlock cleared between the lease-expired
+    /// rejection and the grant attempt — cairn should re-try the
+    /// original terminal FCALL without a reclaim.
+    NotReclaimable { detail: String },
+    /// `max_reclaim_count` exceeded. FF transitioned the execution
+    /// to terminal_failed. Cairn surfaces this to the operator —
+    /// no more reclaim attempts possible.
+    ReclaimCapExceeded { reclaim_count: u32 },
+}
+
+/// Opaque wrapper over `ff_core::contracts::ReclaimGrant`. Kept opaque
+/// at the cairn trait boundary so cairn code never handles ff-core
+/// contract types directly.
+///
+/// `inner` is `pub(crate)` because the backend impls in follow-up PRs
+/// unwrap it to build `ff_core::contracts::ReclaimExecutionArgs`. The
+/// dead-code allow is intentional: the scaffold PR lands the type so
+/// the trait signatures compile, with no consumers until the Valkey
+/// backend body lands in the follow-up.
+///
+/// Derives (`Clone`, `PartialEq`, `Eq`) match the containing
+/// outcome/input types so the wrappers can stay symmetric with the
+/// rest of this file. Safe: `ff_core::contracts::ReclaimGrant`
+/// derives the same set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimGrantHandle {
+    #[allow(dead_code)]
+    pub(crate) inner: flowfabric::core::contracts::ReclaimGrant,
+}
+
+/// Input to `reclaim_execution`.
+///
+/// Consumes a `ReclaimGrantHandle` (issued by `issue_reclaim_grant`)
+/// and the fresh-lease parameters. Cairn supplies the same
+/// worker identity pair it used on the grant (FF validates
+/// `grant.worker_id == args.worker_id`, RFC-024 §4.4) plus the
+/// cairn-minted `attempt_id` and fresh `lease_id` / TTL for the
+/// reclaim attempt.
+///
+/// `Clone` added for consistency with every other `*Input` struct in
+/// this file — callers that build an input once and retry into the
+/// same trait method shouldn't need to reconstruct it.
+#[derive(Clone, Debug)]
+pub struct ReclaimExecutionInput {
+    pub grant: ReclaimGrantHandle,
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub lane_id: flowfabric::core::types::LaneId,
+    pub worker_id: flowfabric::core::types::WorkerId,
+    pub worker_instance_id: flowfabric::core::types::WorkerInstanceId,
+    pub old_worker_instance_id: flowfabric::core::types::WorkerInstanceId,
+    pub attempt_id: flowfabric::core::types::AttemptId,
+    pub current_attempt_index: flowfabric::core::types::AttemptIndex,
+    pub lease_id: flowfabric::core::types::LeaseId,
+    pub lease_ttl_ms: u64,
+    /// JSON-encoded attempt policy. Empty string → backend applies
+    /// its default.
+    pub attempt_policy_json: String,
+    /// Optional cap override. `None` → FF applies its Rust-surface
+    /// default of 1000 (RFC-024 §4.6).
+    pub max_reclaim_count: Option<u32>,
+    pub capability_hash: Option<String>,
+}
+
+/// Opaque wrapper over `ff_core::backend::Handle` returned by
+/// `reclaim_execution`. Mirrors how [`ReclaimGrantHandle`] wraps
+/// `ff_core::contracts::ReclaimGrant` — cairn code never handles
+/// ff-core's `Handle` directly.
+///
+/// FF returns the new attempt's lease triple as opaque
+/// `HandleOpaque` bytes; the canonical lease identity for cairn's
+/// recovery loop comes from re-reading `exec_core` via
+/// [`super::Engine::describe_execution`] before the next terminal
+/// FCALL (see [`ExecutionLeaseContext`] doc + the `f64_terminal_recovery_loop`
+/// rewrite in #710 PR-5). This type is therefore intentionally
+/// opaque: it carries the freshness signal ("you have a new
+/// attempt") without committing cairn to a specific cache shape.
+///
+/// `inner` is `pub(crate)` so the Valkey/PG/SQLite backend impls
+/// can produce one; consumers match on the enclosing variant only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimedHandle {
+    #[allow(dead_code)]
+    pub(crate) inner: flowfabric::core::backend::Handle,
+}
+
+/// Outcome of `reclaim_execution` — cairn-level wrapper over
+/// `ff_core::contracts::ReclaimExecutionOutcome`.
+///
+/// Mirrors all four FF variants. `GrantNotFound` is the
+/// grant-TTL-elapsed / grant-already-consumed case — the F64
+/// recovery loop will hit this in real outages because grant TTLs
+/// are intentionally short (1-5s) and a slow Valkey can absolutely
+/// drop the grant between `issue_reclaim_grant` and
+/// `reclaim_execution`. Caller's response: re-issue the grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReclaimExecutionOutcome {
+    /// Fresh attempt minted with a new lease. The recovery loop can
+    /// now retry the terminal FCALL — it re-reads the lease triple
+    /// from `exec_core` rather than reading it off the handle.
+    Claimed(ReclaimedHandle),
+    /// Execution is not in a reclaimable state. Same semantics as
+    /// `IssueReclaimGrantOutcome::NotReclaimable` — treat as
+    /// "retry the original terminal FCALL without a reclaim".
+    NotReclaimable { detail: String },
+    /// Reclaim cap exceeded. FF transitioned execution to
+    /// terminal_failed.
+    ReclaimCapExceeded { reclaim_count: u32 },
+    /// Grant was not found / already consumed / expired between
+    /// `issue_reclaim_grant` and `reclaim_execution`. Caller's
+    /// response: re-issue the grant via `issue_reclaim_grant`.
+    GrantNotFound,
 }
 
 // ── Phase D PR 2b: task lifecycle mirrors ───────────────────────────────
@@ -315,9 +580,9 @@ pub struct IssueGrantAndClaimInput {
 /// the policy per-tenant later without trait churn.
 #[derive(Clone, Debug)]
 pub struct SubmitTaskInput {
-    pub execution_id: ff_core::types::ExecutionId,
-    pub namespace: ff_core::types::Namespace,
-    pub lane_id: ff_core::types::LaneId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub namespace: flowfabric::core::types::Namespace,
+    pub lane_id: flowfabric::core::types::LaneId,
     pub priority: u32,
     /// `cairn.*` tags. Caller supplies the full set
     /// (`cairn.task_id`, `cairn.project`, `cairn.instance_id`, and
@@ -336,9 +601,9 @@ pub struct SubmitTaskInput {
 /// the key-building.
 #[derive(Clone, Debug)]
 pub struct AddExecutionToFlowInput {
-    pub flow_id: ff_core::types::FlowId,
-    pub execution_id: ff_core::types::ExecutionId,
-    pub namespace: ff_core::types::Namespace,
+    pub flow_id: flowfabric::core::types::FlowId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
+    pub namespace: flowfabric::core::types::Namespace,
     /// Flow kind stamped by the create step. Cairn uses
     /// `"cairn_session"`.
     pub flow_kind: String,
@@ -347,10 +612,10 @@ pub struct AddExecutionToFlowInput {
 /// Input to `stage_dependency_edge`.
 #[derive(Clone, Debug)]
 pub struct StageDependencyEdgeInput {
-    pub flow_id: ff_core::types::FlowId,
-    pub edge_id: ff_core::types::EdgeId,
-    pub upstream_execution_id: ff_core::types::ExecutionId,
-    pub downstream_execution_id: ff_core::types::ExecutionId,
+    pub flow_id: flowfabric::core::types::FlowId,
+    pub edge_id: flowfabric::core::types::EdgeId,
+    pub upstream_execution_id: flowfabric::core::types::ExecutionId,
+    pub downstream_execution_id: flowfabric::core::types::ExecutionId,
     /// FF edge kind. Currently always `"success_only"`.
     pub dependency_kind: String,
     /// Caller-supplied opaque ref. Empty means "no data passing ref".
@@ -396,11 +661,11 @@ pub enum StageDependencyOutcome {
 /// Input to `apply_dependency_to_child`.
 #[derive(Clone, Debug)]
 pub struct ApplyDependencyToChildInput {
-    pub downstream_execution_id: ff_core::types::ExecutionId,
-    pub flow_id: ff_core::types::FlowId,
-    pub upstream_execution_id: ff_core::types::ExecutionId,
-    pub edge_id: ff_core::types::EdgeId,
-    pub lane_id: ff_core::types::LaneId,
+    pub downstream_execution_id: flowfabric::core::types::ExecutionId,
+    pub flow_id: flowfabric::core::types::FlowId,
+    pub upstream_execution_id: flowfabric::core::types::ExecutionId,
+    pub edge_id: flowfabric::core::types::EdgeId,
+    pub lane_id: flowfabric::core::types::LaneId,
     pub graph_revision: u64,
     pub dependency_kind: String,
     pub data_passing_ref: String,
@@ -423,7 +688,7 @@ pub enum EligibilityResult {
 /// Input to `renew_task_lease`.
 #[derive(Clone, Debug)]
 pub struct RenewLeaseInput {
-    pub execution_id: ff_core::types::ExecutionId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
     pub lease: ExecutionLeaseContext,
     pub lease_extension_ms: u64,
 }
@@ -435,6 +700,6 @@ pub struct RenewLeaseInput {
 /// lease_expiry scanner handles reclaim server-side).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpiredLease {
-    pub execution_id: ff_core::types::ExecutionId,
+    pub execution_id: flowfabric::core::types::ExecutionId,
     pub expires_at_ms: u64,
 }

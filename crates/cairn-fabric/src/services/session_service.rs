@@ -5,22 +5,26 @@ use cairn_domain::lifecycle::SessionState;
 use cairn_domain::tenancy::ProjectKey;
 use cairn_domain::SessionId;
 use cairn_store::projections::SessionRecord;
-use ff_core::types::{FlowId, Namespace, TimestampMs};
+use flowfabric::core::types::{FlowId, Namespace, TimestampMs};
 
-use crate::boot::FabricRuntime;
 use crate::engine::ControlPlaneBackend;
 use crate::error::FabricError;
 use crate::event_bridge::{BridgeEvent, EventBridge};
 use crate::helpers::try_parse_project_key;
 use crate::id_map;
+use crate::runtime_handle::FabricRuntimeHandle;
 
 pub struct FabricSessionService {
     /// Retained for API parity with the other fabric services. Not
     /// read directly from this service anymore — all FF-state reads
     /// go through `engine` and all FCALL-dispatch goes through
     /// `control_plane`.
+    ///
+    /// PR-C4c: lifted from `Arc<FabricRuntime>` to
+    /// `Arc<dyn FabricRuntimeHandle>` so the Postgres runtime can
+    /// satisfy the constructor.
     #[allow(dead_code)]
-    runtime: Arc<FabricRuntime>,
+    runtime: Arc<dyn FabricRuntimeHandle>,
     bridge: Arc<EventBridge>,
     engine: Arc<dyn crate::engine::Engine>,
     control_plane: Arc<dyn ControlPlaneBackend>,
@@ -28,7 +32,7 @@ pub struct FabricSessionService {
 
 impl FabricSessionService {
     pub fn new(
-        runtime: Arc<FabricRuntime>,
+        runtime: Arc<dyn FabricRuntimeHandle>,
         bridge: Arc<EventBridge>,
         engine: Arc<dyn crate::engine::Engine>,
         control_plane: Arc<dyn ControlPlaneBackend>,
@@ -133,6 +137,14 @@ impl FabricSessionService {
             version: 0,
             created_at: now_ms,
             updated_at: now_ms,
+            // F65 PR-1: additive fields on SessionRecord. PR-2 wires
+            // operator-supplied goal / budget / attempt-cap plumbing; until
+            // then fresh sessions get the same defaults serde would apply
+            // on legacy-shape replay.
+            goal_title: None,
+            issue_budget: None,
+            max_attempts: cairn_store::projections::session::DEFAULT_MAX_ATTEMPTS,
+            attempts_used: 0,
         })
     }
 
@@ -256,6 +268,14 @@ fn build_session_record(
         version: snapshot.graph_revision,
         created_at: snapshot.created_at.0 as u64,
         updated_at: snapshot.last_mutation_at.0 as u64,
+        // F65 PR-1: FF snapshots have no goal / budget / attempt state yet.
+        // PR-2 will read these from FF flow tags (once the orchestrator
+        // writes them); until then mirror the defaults applied on replay
+        // so the fabric read-through matches the in-memory projection.
+        goal_title: None,
+        issue_budget: None,
+        max_attempts: cairn_store::projections::session::DEFAULT_MAX_ATTEMPTS,
+        attempts_used: 0,
     }
 }
 

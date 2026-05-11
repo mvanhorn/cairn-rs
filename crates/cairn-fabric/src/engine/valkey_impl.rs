@@ -11,22 +11,26 @@
 //! service continues talking to the [`Engine`] trait without source
 //! changes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ff_core::keys::{self, ExecKeyContext, FlowKeyContext};
-use ff_core::partition::{execution_partition, flow_partition};
-use ff_core::types::{
-    AttemptId, AttemptIndex, EdgeId, ExecutionId, FlowId, LeaseEpoch, LeaseId, Namespace,
+use flowfabric::core::contracts::{
+    ExecutionInfo, HeartbeatWorkerArgs, HeartbeatWorkerOutcome, ListExpiredLeasesArgs,
+    ListWorkersArgs, MarkWorkerDeadArgs, RegisterWorkerArgs, RegisterWorkerOutcome,
+};
+use flowfabric::core::keys::{ExecKeyContext, FlowKeyContext};
+use flowfabric::core::partition::{execution_partition, flow_partition};
+use flowfabric::core::types::{
+    AttemptId, AttemptIndex, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId, Namespace,
     TimestampMs, WaitpointId, WorkerId, WorkerInstanceId,
 };
 
 use crate::boot::FabricRuntime;
 use crate::error::FabricError;
-use crate::helpers::{now_ms, parse_string_array};
+use crate::helpers::parse_string_array;
 
-use super::control_plane_types::WorkerRegistration;
+use super::control_plane_types::{WorkerRegistration, WorkerSummary};
 use super::snapshots::{
     AttemptSummary, EdgeSnapshot, EdgeState, ExecutionSnapshot, FlowSnapshot, LeaseSummary,
 };
@@ -207,6 +211,18 @@ impl Engine for ValkeyEngine {
         Ok(value.filter(|s| !s.is_empty()))
     }
 
+    async fn get_execution_lane_id(&self, id: &ExecutionId) -> Result<Option<LaneId>, FabricError> {
+        let partition = execution_partition(id, &self.runtime.partition_config);
+        let ctx = ExecKeyContext::new(&partition, id);
+        let value: Option<String> = self
+            .runtime
+            .client
+            .hget(&ctx.core(), "lane_id")
+            .await
+            .map_err(|e| FabricError::Internal(format!("valkey HGET exec_core.lane_id: {e}")))?;
+        Ok(value.filter(|s| !s.is_empty()).map(LaneId::new))
+    }
+
     async fn set_execution_tag(
         &self,
         id: &ExecutionId,
@@ -276,119 +292,140 @@ impl Engine for ValkeyEngine {
         Ok(())
     }
 
-    // ── Worker registry (Phase D PR 1) ──────────────────────────────────
+    // ── Worker registry (RFC-025 — routed through EngineBackend 0.14) ──
+    //
+    // FF 0.14 landed the full worker-pool lifecycle + list_expired_leases
+    // + list_workers on the `EngineBackend` trait (FF#473 / RFC-025 §9).
+    // Cairn delegates verbatim — the bespoke HSET/SADD/ZRANGEBYSCORE
+    // commands cairn previously used against the legacy `ff:worker:*`
+    // key shape are gone, replaced by the namespace-scoped
+    // `ff:worker:{ns}:{inst}:*` keys the FF trait-body now writes. See
+    // `docs/CONSUMER_MIGRATION_0.14_worker_registry.md` in the FF repo.
 
     async fn register_worker(
         &self,
         worker_id: &WorkerId,
         instance_id: &WorkerInstanceId,
-        capabilities: &[String],
+        namespace: &Namespace,
+        lanes: &BTreeSet<LaneId>,
+        capabilities: &BTreeSet<String>,
+        liveness_ttl_ms: u64,
     ) -> Result<WorkerRegistration, FabricError> {
-        let worker_key = keys::worker_key(instance_id);
-        let now = now_ms();
-        let now_str = now.to_string();
-
-        self.runtime
-            .client
-            .cmd("HSET")
-            .arg(&worker_key)
-            .arg("worker_id")
-            .arg(worker_id.to_string())
-            .arg("instance_id")
-            .arg(instance_id.to_string())
-            .arg("capabilities")
-            .arg(capabilities.join(","))
-            .arg("last_heartbeat_ms")
-            .arg(&now_str)
-            .arg("is_alive")
-            .arg("true")
-            .arg("registered_at_ms")
-            .arg(&now_str)
-            .execute::<u64>()
-            .await
-            .map_err(|e| FabricError::Valkey(format!("HSET {worker_key}: {e}")))?;
-
-        // TTL-based expiry: dead workers auto-expire if heartbeats stop.
-        // `mark_worker_dead` is the explicit opt-out; this is the safety net.
-        let ttl_ms = self.runtime.config.lease_ttl_ms * 3;
-        // Valkey's PEXPIRE returns 1 (true) on success, 0 (false) when
-        // the key does not exist. ferriskey typechecks the reply as
-        // boolean — not u64 — so we must decode into `bool` here.
-        let _: bool = self
+        let now = TimestampMs::now();
+        let args = RegisterWorkerArgs::new(
+            worker_id.clone(),
+            instance_id.clone(),
+            lanes.clone(),
+            capabilities.clone(),
+            liveness_ttl_ms,
+            namespace.clone(),
+            now,
+        );
+        let outcome = self
             .runtime
-            .client
-            .cmd("PEXPIRE")
-            .arg(&worker_key)
-            .arg(ttl_ms.to_string())
-            .execute()
+            .backend
+            .register_worker(args)
             .await
-            .map_err(|e| FabricError::Valkey(format!("PEXPIRE {worker_key}: {e}")))?;
-
-        let workers_index = keys::workers_index_key();
-        self.runtime
-            .client
-            .cmd("SADD")
-            .arg(workers_index)
-            .arg(instance_id.to_string())
-            .execute::<u64>()
-            .await
-            .map_err(|e| FabricError::Valkey(format!("SADD workers index: {e}")))?;
-
-        for cap in capabilities {
-            if let Some((k, v)) = cap.split_once('=') {
-                let cap_key = keys::workers_capability_key(k, v);
-                self.runtime
-                    .client
-                    .cmd("SADD")
-                    .arg(cap_key)
-                    .arg(instance_id.to_string())
-                    .execute::<u64>()
-                    .await
-                    .map_err(|e| FabricError::Valkey(format!("SADD cap index: {e}")))?;
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        // Both `Registered` and `Refreshed` are success from cairn's
+        // view — one-shot callers don't distinguish fresh vs hot-reload.
+        // `RegisterWorkerOutcome` is `#[non_exhaustive]`; fail loud on a
+        // future FF variant so the cairn mapping is audited rather than
+        // silently dropped.
+        match outcome {
+            RegisterWorkerOutcome::Registered | RegisterWorkerOutcome::Refreshed => {
+                Ok(WorkerRegistration {
+                    worker_id: worker_id.clone(),
+                    instance_id: instance_id.clone(),
+                    capabilities: capabilities.iter().cloned().collect(),
+                    registered_at_ms: now.0.max(0) as u64,
+                })
             }
+            other => Err(FabricError::Internal(format!(
+                "unhandled RegisterWorkerOutcome variant (post-FF 0.14 addition): {other:?}"
+            ))),
         }
-
-        Ok(WorkerRegistration {
-            worker_id: worker_id.clone(),
-            instance_id: instance_id.clone(),
-            capabilities: capabilities.to_vec(),
-            registered_at_ms: now,
-        })
     }
 
-    async fn heartbeat_worker(&self, instance_id: &WorkerInstanceId) -> Result<(), FabricError> {
-        let worker_key = keys::worker_key(instance_id);
-        let now = now_ms().to_string();
-        let _: i64 = self
+    async fn heartbeat_worker(
+        &self,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+    ) -> Result<(), FabricError> {
+        let args =
+            HeartbeatWorkerArgs::new(instance_id.clone(), namespace.clone(), TimestampMs::now());
+        let outcome = self
             .runtime
-            .client
-            .hset(&worker_key, "last_heartbeat_ms", &now)
+            .backend
+            .heartbeat_worker(args)
             .await
-            .map_err(|e| FabricError::Valkey(format!("HSET heartbeat: {e}")))?;
-
-        let ttl_ms = self.runtime.config.lease_ttl_ms * 3;
-        let _: bool = self
-            .runtime
-            .client
-            .cmd("PEXPIRE")
-            .arg(&worker_key)
-            .arg(ttl_ms.to_string())
-            .execute()
-            .await
-            .map_err(|e| FabricError::Valkey(format!("PEXPIRE heartbeat: {e}")))?;
-
-        Ok(())
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        match outcome {
+            HeartbeatWorkerOutcome::Refreshed { .. } => Ok(()),
+            // FF treats the TTL-expired race as a transparent "not
+            // registered" signal — the caller should re-register
+            // rather than continue heartbeating. Surface as a typed
+            // Validation so the service layer can branch.
+            HeartbeatWorkerOutcome::NotRegistered => Err(FabricError::Validation {
+                reason: format!(
+                    "worker instance {instance_id} liveness key absent — re-register required"
+                ),
+            }),
+            other => Err(FabricError::Internal(format!(
+                "unhandled HeartbeatWorkerOutcome variant (post-FF 0.14 addition): {other:?}"
+            ))),
+        }
     }
 
-    async fn mark_worker_dead(&self, instance_id: &WorkerInstanceId) -> Result<(), FabricError> {
-        let worker_key = keys::worker_key(instance_id);
-        let _: i64 = self
-            .runtime
-            .client
-            .hset(&worker_key, "is_alive", "false")
+    async fn mark_worker_dead(
+        &self,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+        reason: &str,
+    ) -> Result<(), FabricError> {
+        let args = MarkWorkerDeadArgs::new(
+            instance_id.clone(),
+            namespace.clone(),
+            reason.to_owned(),
+            TimestampMs::now(),
+        );
+        // FF returns `Marked` or `NotRegistered`; both are success on
+        // cairn's side — marking an already-absent worker is idempotent
+        // per RFC-025 §9.
+        self.runtime
+            .backend
+            .mark_worker_dead(args)
             .await
-            .map_err(|e| FabricError::Valkey(format!("HSET is_alive: {e}")))?;
-        Ok(())
+            .map(|_| ())
+            .map_err(|e| FabricError::Engine(Box::new(e)))
+    }
+
+    async fn list_workers(
+        &self,
+        namespace: Option<&Namespace>,
+    ) -> Result<Vec<WorkerSummary>, FabricError> {
+        let mut args = ListWorkersArgs::new();
+        args.namespace = namespace.cloned();
+        let result = self
+            .runtime
+            .backend
+            .list_workers(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        Ok(result
+            .entries
+            .into_iter()
+            .map(|w| WorkerSummary {
+                worker_id: w.worker_id,
+                instance_id: w.worker_instance_id,
+                namespace: w.namespace,
+                lanes: w.lanes,
+                capabilities: w.capabilities,
+                last_heartbeat_ms: w.last_heartbeat_ms.0,
+                liveness_ttl_ms: w.liveness_ttl_ms,
+                registered_at_ms: w.registered_at_ms.0,
+            })
+            .collect())
     }
 
     async fn list_expired_leases(
@@ -396,84 +433,46 @@ impl Engine for ValkeyEngine {
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<super::control_plane_types::ExpiredLease>, FabricError> {
-        use ff_core::keys::IndexKeys;
-        use ff_core::partition::{Partition, PartitionFamily};
+        // FF 0.14 routes `list_expired_leases` through `EngineBackend`;
+        // all three in-tree backends (Valkey, Postgres, SQLite) ship a
+        // body. FF's ZRANGEBYSCORE fan-out across execution partitions
+        // now lives server-side, so cairn just asks for a page.
+        let mut args = ListExpiredLeasesArgs::new(TimestampMs::from_millis(now_ms as i64));
+        // Cap `limit` at FF's documented ceiling (10_000) to match the
+        // trait contract. `as u32` is safe after the min().
+        args.limit = Some(
+            limit.min(flowfabric::core::contracts::LIST_EXPIRED_LEASES_MAX_LIMIT as usize) as u32,
+        );
+        let result = self
+            .runtime
+            .backend
+            .list_expired_leases(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        Ok(result
+            .entries
+            .into_iter()
+            .map(|e| super::control_plane_types::ExpiredLease {
+                execution_id: e.execution_id,
+                expires_at_ms: e.expires_at_ms.0.max(0) as u64,
+            })
+            .collect())
+    }
 
-        // Exec and flow share a slot under the `num_flow_partitions`
-        // budget post-RFC-011; the execution lease_expiry index is
-        // stamped on the flow-partition fan-out.
-        let num_partitions = self.runtime.partition_config.num_flow_partitions;
-        let mut out: Vec<super::control_plane_types::ExpiredLease> = Vec::new();
-        let remaining_limit = limit;
-        let score_max = now_ms.to_string();
-
-        for index in 0..num_partitions {
-            if out.len() >= remaining_limit {
-                break;
-            }
-            let partition = Partition {
-                family: PartitionFamily::Execution,
-                index,
-            };
-            let idx = IndexKeys::new(&partition);
-            let zset_key = idx.lease_expiry();
-            let batch_cap = (remaining_limit - out.len()).min(512);
-
-            // ZRANGEBYSCORE <key> 0 <now_ms> WITHSCORES LIMIT 0 <cap>
-            let raw: ferriskey::Value = self
-                .runtime
-                .client
-                .cmd("ZRANGEBYSCORE")
-                .arg(zset_key.as_str())
-                .arg("0")
-                .arg(score_max.as_str())
-                .arg("WITHSCORES")
-                .arg("LIMIT")
-                .arg("0")
-                .arg(batch_cap.to_string().as_str())
-                .execute()
-                .await
-                .map_err(|e| FabricError::Valkey(format!("ZRANGEBYSCORE lease_expiry: {e}")))?;
-
-            // Reply shape: Array of alternating [member, score, member, score, ...].
-            if let ferriskey::Value::Array(items) = raw {
-                let mut it = items.into_iter();
-                while let (Some(m), Some(s)) = (it.next(), it.next()) {
-                    let Ok(m) = m else { continue };
-                    let Ok(s) = s else { continue };
-                    let Some(member) = crate::helpers::value_to_string(&m) else {
-                        continue;
-                    };
-                    let Some(score) = crate::helpers::value_to_string(&s) else {
-                        continue;
-                    };
-                    let Ok(eid) = ExecutionId::parse(&member) else {
-                        // Malformed member — skip rather than fail the whole scan.
-                        continue;
-                    };
-                    // Skip malformed scores rather than coercing to 0: a 0
-                    // fallback would surface the row as "expired at epoch",
-                    // a false-positive that would confuse operator dashboards.
-                    let Ok(expires_at_ms) = score.parse::<u64>() else {
-                        tracing::warn!(
-                            execution_id = %eid,
-                            raw_score = %score,
-                            "lease_expiry score unparseable; skipping row",
-                        );
-                        continue;
-                    };
-                    out.push(super::control_plane_types::ExpiredLease {
-                        execution_id: eid,
-                        expires_at_ms,
-                    });
-                    if out.len() >= remaining_limit {
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(out)
+    async fn read_execution_info(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ExecutionInfo>, FabricError> {
+        // FF 0.15 ships `read_execution_info` on `EngineBackend` with
+        // a concrete Valkey body that HGETALLs `exec_core` and parses
+        // the 7-dimension state vector. We forward verbatim — the
+        // parse lives server-side so cairn never sees the raw hash
+        // fields (issue #666).
+        self.runtime
+            .backend
+            .read_execution_info(id)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))
     }
 }
 
@@ -534,8 +533,8 @@ fn parse_execution_snapshot(
     let lane_id = core
         .get("lane_id")
         .filter(|s| !s.is_empty())
-        .map(ff_core::types::LaneId::new)
-        .unwrap_or_else(|| ff_core::types::LaneId::new("cairn"));
+        .map(flowfabric::core::types::LaneId::new)
+        .unwrap_or_else(|| flowfabric::core::types::LaneId::new("cairn"));
     let namespace = core
         .get("namespace")
         .filter(|s| !s.is_empty())
@@ -582,22 +581,34 @@ fn parse_execution_snapshot(
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0),
             );
-            let owner = core
-                .get("current_worker_instance_id")
-                .cloned()
-                .unwrap_or_default();
+            let worker_instance_id = flowfabric::core::types::WorkerInstanceId::new(
+                core.get("current_worker_instance_id")
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             let expires_at = TimestampMs::from_millis(
                 core.get("lease_expires_at")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0),
             );
-            Some(LeaseSummary {
-                lease_id,
-                epoch,
-                attempt_index,
-                owner,
-                expires_at,
-            })
+            // Upstream LeaseSummary (FF#278) is `#[non_exhaustive]` —
+            // use the `new` + `with_*` builder chain rather than struct
+            // literal. `last_heartbeat_at` is the FF#278-added field;
+            // cairn surfaces it from `lease_last_renewed_at` on
+            // exec_core when populated (backends that don't emit
+            // per-renewal ticks leave the field empty, which we map to
+            // `None`).
+            let mut summary = LeaseSummary::new(epoch, worker_instance_id, expires_at)
+                .with_lease_id(lease_id)
+                .with_attempt_index(attempt_index);
+            if let Some(ts) = core
+                .get("lease_last_renewed_at")
+                .and_then(|s| s.parse::<i64>().ok())
+                .filter(|ms| *ms > 0)
+            {
+                summary = summary.with_last_heartbeat_at(TimestampMs::from_millis(ts));
+            }
+            Some(summary)
         }
         None => None,
     };

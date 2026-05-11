@@ -86,7 +86,9 @@ pub(crate) struct CreatePromptVersionRequest {
     pub(crate) tenant_id: Option<String>,
     pub(crate) workspace_id: Option<String>,
     pub(crate) project_id: Option<String>,
-    pub(crate) prompt_version_id: String,
+    /// Optional — server mints `pv_<uuid>` when absent or empty.
+    #[serde(default)]
+    pub(crate) prompt_version_id: Option<String>,
     pub(crate) content_hash: String,
     pub(crate) content: Option<String>,
     pub(crate) template_vars: Option<Vec<PromptTemplateVar>>,
@@ -107,7 +109,9 @@ pub(crate) struct CreatePromptReleaseRequest {
     pub(crate) tenant_id: Option<String>,
     pub(crate) workspace_id: Option<String>,
     pub(crate) project_id: Option<String>,
-    pub(crate) prompt_release_id: String,
+    /// Optional — server mints `rel_<uuid>` when absent or empty.
+    #[serde(default)]
+    pub(crate) prompt_release_id: Option<String>,
     pub(crate) prompt_asset_id: String,
     pub(crate) prompt_version_id: String,
 }
@@ -184,25 +188,24 @@ pub(crate) async fn list_prompt_assets_handler(
             .as_deref()
             .unwrap_or(DEFAULT_WORKSPACE_ID),
     );
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .prompt_assets
         .list_by_workspace(
             &cairn_domain::TenantId::new(workspace.tenant_id.as_str()),
             &cairn_domain::WorkspaceId::new(workspace.workspace_id.as_str()),
-            query.limit(),
+            limit + 1,
             query.offset(),
         )
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -236,20 +239,19 @@ pub(crate) async fn list_prompt_versions_handler(
     Path(id): Path<String>,
     Query(query): Query<OptionalProjectScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .prompt_versions
-        .list_by_asset(&PromptAssetId::new(id), query.limit(), query.offset())
+        .list_by_asset(&PromptAssetId::new(id), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -259,7 +261,11 @@ pub(crate) async fn create_prompt_version_handler(
     Path(id): Path<String>,
     Json(body): Json<CreatePromptVersionRequest>,
 ) -> impl IntoResponse {
-    let version_id_str = body.prompt_version_id.clone();
+    let version_id_str = body
+        .prompt_version_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("pv_{}", uuid::Uuid::new_v4().simple()));
     let content = body.content.clone().unwrap_or_default();
     let template_vars = body.template_vars.clone().unwrap_or_default();
 
@@ -272,7 +278,7 @@ pub(crate) async fn create_prompt_version_handler(
                 body.workspace_id.as_deref().unwrap_or(DEFAULT_WORKSPACE_ID),
                 body.project_id.as_deref().unwrap_or(DEFAULT_PROJECT_ID),
             ),
-            PromptVersionId::new(body.prompt_version_id),
+            PromptVersionId::new(version_id_str.clone()),
             PromptAssetId::new(id),
             body.content_hash,
         )
@@ -406,20 +412,19 @@ pub(crate) async fn list_prompt_releases_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<OptionalProjectScopedQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .prompt_releases
-        .list_by_project(&query.project(), query.limit(), query.offset())
+        .list_by_project(&query.project(), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -428,12 +433,17 @@ pub(crate) async fn create_prompt_release_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreatePromptReleaseRequest>,
 ) -> impl IntoResponse {
+    let release_id = body
+        .prompt_release_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("rel_{}", uuid::Uuid::new_v4().simple()));
     match state
         .runtime
         .prompt_releases
         .create(
             &body.project(),
-            PromptReleaseId::new(body.prompt_release_id),
+            PromptReleaseId::new(release_id),
             PromptAssetId::new(body.prompt_asset_id),
             PromptVersionId::new(body.prompt_version_id),
         )

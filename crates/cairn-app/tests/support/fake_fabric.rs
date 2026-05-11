@@ -52,7 +52,7 @@ fn readonly(method: &'static str) -> RuntimeError {
 
 /// Build a trio of read-only trait objects backed by the same in-memory store.
 ///
-/// Wire into `InMemoryServices::with_store_and_core(store, runs, tasks, sessions)`
+/// Wire into `RuntimeServices::with_store_and_core(store, runs, tasks, sessions)`
 /// to stand up an AppState without a live Valkey.
 pub fn build_fake_fabric(
     store: Arc<InMemoryStore>,
@@ -88,7 +88,30 @@ impl SessionService for FakeFabricSessions {
         Err(readonly("sessions.create"))
     }
 
-    async fn get(&self, session_id: &SessionId) -> Result<Option<SessionRecord>, RuntimeError> {
+    async fn get(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionRecord>, RuntimeError> {
+        // Scope-checked path (issue #439): fetch the stored record and
+        // compare projects; a mismatch is indistinguishable from an
+        // unknown id so non-admin callers cannot enumerate foreign ids.
+        let Some(record) = SessionReadModel::get(self.store.as_ref(), session_id).await? else {
+            return Ok(None);
+        };
+        if record.project != *project {
+            return Ok(None);
+        }
+        Ok(Some(record))
+    }
+
+    async fn lookup_any_admin(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionRecord>, RuntimeError> {
+        // Admin-only cross-tenant lookup (issue #439). Caller is
+        // responsible for the admin-role gate; the test harness
+        // mirrors the fabric adapter's plain lookup shape.
         Ok(SessionReadModel::get(self.store.as_ref(), session_id).await?)
     }
 
@@ -101,7 +124,11 @@ impl SessionService for FakeFabricSessions {
         Ok(SessionReadModel::list_by_project(self.store.as_ref(), project, limit, offset).await?)
     }
 
-    async fn archive(&self, _session_id: &SessionId) -> Result<SessionRecord, RuntimeError> {
+    async fn archive(
+        &self,
+        _project: &ProjectKey,
+        _session_id: &SessionId,
+    ) -> Result<SessionRecord, RuntimeError> {
         Err(readonly("sessions.archive"))
     }
 }
@@ -191,6 +218,28 @@ impl RunService for FakeFabricRuns {
         _run_id: &RunId,
     ) -> Result<RunRecord, RuntimeError> {
         Err(readonly("runs.claim"))
+    }
+
+    async fn ensure_active(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<RunRecord, RuntimeError> {
+        // In-memory fake has no lease concept — the projection is the
+        // source of truth. Return the current record so orchestrate-path
+        // tests that run against this fake don't trip the default
+        // `claim`-delegation behavior (which would surface as a 500).
+        match RunReadModel::get(self.store.as_ref(), run_id).await? {
+            Some(record) if &record.session_id == session_id => Ok(record),
+            Some(_) => Err(RuntimeError::NotFound {
+                entity: "run",
+                id: run_id.to_string(),
+            }),
+            None => Err(RuntimeError::NotFound {
+                entity: "run",
+                id: run_id.to_string(),
+            }),
+        }
     }
 
     async fn enter_waiting_approval(

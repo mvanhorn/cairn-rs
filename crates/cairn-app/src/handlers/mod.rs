@@ -1,7 +1,9 @@
 pub(crate) mod admin;
+pub(crate) mod agent_roles;
 pub(crate) mod approvals;
 pub(crate) mod auth_tokens;
 pub(crate) mod bundles_handlers;
+pub(crate) mod costs;
 #[cfg(feature = "debug-endpoints")]
 pub(crate) mod debug;
 pub(crate) mod decisions;
@@ -12,16 +14,20 @@ pub(crate) mod graph;
 pub(crate) mod health;
 pub(crate) mod integrations;
 pub(crate) mod memory;
+pub(crate) mod model_catalog;
 pub(crate) mod plugins;
+pub(crate) mod project_tools;
 pub(crate) mod prompts;
 pub(crate) mod providers;
 pub(crate) mod runs;
 pub(crate) mod sessions;
 pub(crate) mod signals;
+pub(crate) mod skills;
 pub(crate) mod sqeq;
 // T6c-C1: `sse` is `pub` so the binary-side WS handler in
 // `bin_websocket.rs` can re-use `ws_event_tenant_id` for tenant filtering.
 pub mod sse;
 pub(crate) mod tasks;
+pub(crate) mod tool_call_approvals;
 pub(crate) mod tools;
 pub(crate) mod workers;

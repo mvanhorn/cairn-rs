@@ -2,23 +2,41 @@ import { useState, type FormEvent, useId } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   RefreshCw, ServerCrash, Loader2, Plus, Trash2, ChevronDown, ChevronRight,
-  HardDrive, Zap, XCircle, Pencil,
+  HardDrive, Zap, XCircle, Pencil, Search,
   Globe, Server, Check, X, Settings, Tag,
 } from "lucide-react";
 import { clsx } from "clsx";
 import { StatCard } from "../components/StatCard";
-import { defaultApi } from "../lib/api";
+import { Badge } from "../components/Badge";
+import { Drawer } from "../components/Drawer";
+import { defaultApi, ApiError, unwrapList } from "../lib/api";
 import { useToast } from "../components/Toast";
 import { sectionLabel } from "../lib/design-system";
 import { useScope } from "../hooks/useScope";
 import type { ProviderConnectionRecord, ProviderHealthEntry } from "../lib/types";
+import { ModelCatalogPicker } from "../components/ModelCatalogPicker";
+import { EmptyScopeHint } from "../components/EmptyScopeHint";
+import { RoutingPreview } from "../components/RoutingPreview";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
+
+// ── Test-connection result ────────────────────────────────────────────────────
+
+interface TestConnectionResult {
+  connection_id: string;
+  ok: boolean;
+  latency_ms: number;
+  status: number;
+  provider: string;
+  detail: string;
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type ProviderKind =
   | "openai" | "anthropic" | "ollama" | "deepseek" | "xai" | "google"
   | "groq" | "azure-openai" | "openrouter" | "minimax" | "bedrock" | "bedrock-compat"
-  | "openai-compatible";
+  | "openai-compatible" | "zai" | "zai-coding";
 
 interface ProviderKindMeta {
   label: string;
@@ -148,6 +166,48 @@ const PROVIDER_KINDS: Record<ProviderKind, ProviderKindMeta> = {
     defaultUrl: "",
     defaultModel: "",
   },
+  "zai-coding": {
+    label: "Z.ai (GLM Coding Plan)",
+    description: "GLM 4.7 / 5 / 5.1 via the coding-plan endpoint. Native adapter with thinking-mode + cached-token accounting.",
+    icon: <Zap size={16} />,
+    defaultFamily: "zai",
+    // Coding-plan connections must register with adapter_type="zai-coding"
+    // so the backend resolves Backend::ZaiCoding (→ ZaiConfig::CODING).
+    // Previously this used "zai", which silently routed to the general
+    // tier and broke the coding-tier defaults. Copilot review on #280.
+    defaultAdapter: "zai-coding",
+    defaultUrl: "https://api.z.ai/api/coding/paas/v4",
+    defaultModel: "glm-4.7",
+  },
+  zai: {
+    label: "Z.ai (General)",
+    description: "Pay-as-you-go GLM models via api.z.ai. Native adapter.",
+    icon: <Zap size={16} />,
+    defaultFamily: "zai",
+    defaultAdapter: "zai",
+    defaultUrl: "https://api.z.ai/api/paas/v4",
+    defaultModel: "glm-4.7",
+  },
+};
+
+// Map a provider-wizard "kind" to the LiteLLM catalog's `provider` tag so
+// the picker pre-filters to relevant models. An empty string (or missing
+// entry) leaves the provider dropdown unlocked, which is the right default
+// for generic adapters (openai-compatible, azure, bedrock-compat) that can
+// host models from any vendor.
+const KIND_TO_PROVIDER_FILTER: Partial<Record<ProviderKind, string>> = {
+  openai:     "openai",
+  anthropic:  "anthropic",
+  ollama:     "ollama",
+  deepseek:   "deepseek",
+  xai:        "xai",
+  google:     "vertex_ai",
+  groq:       "groq",
+  openrouter: "openrouter",
+  bedrock:    "bedrock",
+  minimax:    "minimax",
+  zai:          "zai",
+  "zai-coding": "zai",
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -404,19 +464,25 @@ function ConnectionRow({
   even,
   onDelete,
   onUpdated,
+  onTestResult,
 }: {
   record: ProviderConnectionRecord;
   health?: ProviderHealthEntry;
   even: boolean;
   onDelete: (id: string) => void;
   onUpdated: () => void;
+  onTestResult: (r: TestConnectionResult) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editFamily, setEditFamily] = useState(record.provider_family);
   const [editAdapter, setEditAdapter] = useState(record.adapter_type);
-  const [editModels, setEditModels] = useState(record.supported_models.join(", "));
+  const [editModels, setEditModels] = useState<string[]>(record.supported_models);
   const [editEndpoint, setEditEndpoint] = useState("");
+  // Escape hatch: freeform ID input for models not in the catalog
+  // (local ollama tags, private openrouter IDs, pre-release model
+  // names that haven't made it into LiteLLM yet).
+  const [editManualModel, setEditManualModel] = useState("");
   const [saving, setSaving] = useState(false);
   const isHealthy = health?.healthy ?? null;
   const toast = useToast();
@@ -424,9 +490,18 @@ function ConnectionRow({
   const startEdit = () => {
     setEditFamily(record.provider_family);
     setEditAdapter(record.adapter_type);
-    setEditModels(record.supported_models.join(", "));
+    setEditModels(record.supported_models);
     setEditEndpoint("");
+    setEditManualModel("");
     setEditing(true);
+  };
+
+  const addEditManualModel = () => {
+    const v = editManualModel.trim();
+    if (v && !editModels.includes(v)) {
+      setEditModels(prev => [...prev, v]);
+    }
+    setEditManualModel("");
   };
 
   const saveEdit = async () => {
@@ -435,7 +510,7 @@ function ConnectionRow({
       await defaultApi.updateProviderConnection(record.provider_connection_id, {
         provider_family: editFamily.trim(),
         adapter_type: editAdapter.trim(),
-        supported_models: editModels.split(",").map(m => m.trim()).filter(Boolean),
+        supported_models: editModels.map(m => m.trim()).filter(Boolean),
         ...(editEndpoint.trim() ? { endpoint_url: editEndpoint.trim() } : {}),
       });
       toast.success(`Updated ${record.provider_connection_id}`);
@@ -450,14 +525,25 @@ function ConnectionRow({
 
   const testConn = useMutation({
     mutationFn: () => defaultApi.testConnection(record.provider_connection_id),
-    onSuccess: (r) => {
-      if (r.ok) {
-        toast.success(`${record.provider_connection_id} — reachable (${r.latency_ms}ms)`);
-      } else {
-        toast.error(`${record.provider_connection_id} — ${r.detail} (HTTP ${r.status})`);
-      }
+    onMutate: () => {
+      // Fire a transient "testing…" toast so the operator sees immediate
+      // feedback; the full structured result lands in the right-hand
+      // drawer a moment later.
+      toast.info(`Testing ${record.provider_connection_id}…`);
     },
-    onError: () => toast.error(`Failed to test ${record.provider_connection_id}`),
+    onSuccess: (r) => {
+      onTestResult({ connection_id: record.provider_connection_id, ...r });
+    },
+    onError: (e) => {
+      onTestResult({
+        connection_id: record.provider_connection_id,
+        ok: false,
+        latency_ms: 0,
+        status: 0,
+        provider: record.provider_family,
+        detail: e instanceof Error ? e.message : "connection test failed",
+      });
+    },
   });
 
   const discoverConn = useMutation({
@@ -612,7 +698,7 @@ function ConnectionRow({
       {editing && (
         <tr className="border-b border-indigo-500/30 bg-indigo-950/10">
           <td colSpan={6} className="px-4 py-3">
-            <div className="grid grid-cols-4 gap-3">
+            <div className="grid grid-cols-3 gap-3">
               <label className="block">
                 <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">Family</span>
                 <input value={editFamily} onChange={e => setEditFamily(e.target.value)}
@@ -624,16 +710,75 @@ function ConnectionRow({
                   className="mt-1 w-full rounded bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 px-2 py-1.5 text-xs text-gray-800 dark:text-zinc-200 focus:outline-none focus:border-indigo-500" />
               </label>
               <label className="block">
-                <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">Models (comma-sep)</span>
-                <input value={editModels} onChange={e => setEditModels(e.target.value)}
-                  className="mt-1 w-full rounded bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 px-2 py-1.5 text-xs text-gray-800 dark:text-zinc-200 focus:outline-none focus:border-indigo-500" />
-              </label>
-              <label className="block">
                 <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">Endpoint URL</span>
                 <input value={editEndpoint} onChange={e => setEditEndpoint(e.target.value)}
                   placeholder="leave blank to keep current"
                   className="mt-1 w-full rounded bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 px-2 py-1.5 text-xs text-gray-800 dark:text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500" />
               </label>
+            </div>
+            <div className="mt-3">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">Models</div>
+                <div className="text-[10px] text-gray-400 dark:text-zinc-500">
+                  {editModels.length} selected
+                </div>
+              </div>
+              <ModelCatalogPicker
+                selected={editModels}
+                onChange={setEditModels}
+                // Follow the edit-family input so retargeting a connection
+                // (say, openai → openrouter) re-filters the picker in
+                // real time. KIND_TO_PROVIDER_FILTER returns undefined for
+                // unknown families, which unlocks the picker — the right
+                // default for custom / self-hosted adapters.
+                lockProvider={KIND_TO_PROVIDER_FILTER[editFamily.trim() as ProviderKind]}
+              />
+              {/* Escape hatch: manual ID entry for models not in the
+                  bundled catalog (local ollama tags, private openrouter
+                  slugs, pre-release names). Kept as a collapsible hint
+                  so the picker remains the primary affordance. */}
+              <details className="mt-2">
+                <summary className="text-[10px] text-gray-400 dark:text-zinc-500 cursor-pointer hover:text-gray-600 dark:hover:text-zinc-300">
+                  Model not in catalog? Add a custom ID
+                </summary>
+                <div className="flex gap-2 mt-2">
+                  <input
+                    value={editManualModel}
+                    onChange={e => setEditManualModel(e.target.value)}
+                    onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addEditManualModel(); } }}
+                    placeholder="e.g. llama3.2:custom-tag"
+                    className="flex-1 rounded bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 px-2 py-1 text-[11px] font-mono text-gray-800 dark:text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-indigo-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={addEditManualModel}
+                    disabled={!editManualModel.trim()}
+                    className="px-2 py-1 rounded bg-gray-100 dark:bg-zinc-800 hover:bg-gray-200 dark:hover:bg-zinc-700 disabled:opacity-40 text-[11px] font-medium text-gray-700 dark:text-zinc-300"
+                  >
+                    Add
+                  </button>
+                </div>
+              </details>
+              {/* Show any currently-selected custom IDs (not present in
+                  the catalog) as chips so the operator can see + remove
+                  them even when the picker filters them out. */}
+              {editModels.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {editModels.map(m => (
+                    <span key={m} className="flex items-center gap-1 text-[10px] font-mono text-gray-700 dark:text-zinc-300 bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded px-1.5 py-0.5">
+                      {m}
+                      <button
+                        type="button"
+                        onClick={() => setEditModels(prev => prev.filter(x => x !== m))}
+                        className="text-gray-400 dark:text-zinc-500 hover:text-red-400"
+                        aria-label={`Remove ${m}`}
+                      >
+                        <X size={9} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
             <div className="flex items-center gap-2 mt-3">
               <button onClick={saveEdit} disabled={saving}
@@ -723,15 +868,85 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
 
   const removeModel = (m: string) => setModels(prev => prev.filter(x => x !== m));
 
+  // Discover-preview mutation — probes the provider for its model catalog
+  // BEFORE registration so the operator can see what they'll get instead
+  // of hoping auto-discovery fires on create. Populates `models` on success.
+  const previewDiscover = useMutation({
+    mutationFn: async () => {
+      const adapter_type = adapter.trim().toLowerCase() === "ollama" ? "ollama" : "openai_compat";
+      const r = await defaultApi.discoverModelsPreview({
+        adapter_type,
+        endpoint_url: baseUrl.trim() || undefined,
+        api_key:      apiKey.trim() || undefined,
+      });
+      return r.models.map(m => m.model_id);
+    },
+    onSuccess: (ids) => {
+      if (ids.length === 0) {
+        toast.warning("Provider returned no models — add IDs manually.");
+        return;
+      }
+      // Merge with any manually-entered IDs so the operator doesn't lose work.
+      setModels(prev => {
+        const merged = [...prev];
+        for (const id of ids) if (!merged.includes(id)) merged.push(id);
+        return merged;
+      });
+      // Clear the manual input — models are already added as chips.
+      // (Previously we dumped a comma-separated list into the input, but
+      // Enter on that field calls addModel() which treats the whole
+      // string as one model_id.)
+      setModelInput("");
+      toast.success(`Discovered ${ids.length} model${ids.length === 1 ? "" : "s"}.`);
+    },
+    onError: (e) =>
+      toast.error(`Discover preview failed: ${e instanceof Error ? e.message : "error"}`),
+  });
+
   const createMutation = useMutation({
     mutationFn: async () => {
       let credentialId: string | undefined;
       if (apiKey.trim()) {
-        const stored = await defaultApi.storeCredential(scope.tenant_id, {
-          provider_id: connectionId.trim(),
-          plaintext_value: apiKey,
-        });
-        credentialId = stored.id;
+        try {
+          const stored = await defaultApi.storeCredential(scope.tenant_id, {
+            provider_id: connectionId.trim(),
+            plaintext_value: apiKey,
+          });
+          credentialId = stored.id;
+        } catch (e) {
+          // Re-use an existing credential on 409 (retry after a partial
+          // failure). Copilot flagged that we previously left credentialId
+          // undefined here, which silently registered a connection without
+          // a linked credential. Fix: fetch the active credential for this
+          // (tenant, provider_id) and attach its ID. If we can't find it
+          // (lookup fails, no active match), surface a warning and proceed
+          // without the link rather than block registration.
+          if (e instanceof ApiError && e.status === 409) {
+            try {
+              const creds = await defaultApi.getCredentials(scope.tenant_id, { limit: 200 });
+              // #425: shared list-shape normalizer (was `creds.items.find(...)`)
+              const match = unwrapList<import("../lib/types").CredentialSummary>(creds).find(
+                c => c.provider_id === connectionId.trim() && c.active,
+              );
+              if (match) {
+                credentialId = match.id;
+                toast.warning(
+                  `Credential for "${connectionId}" already exists — re-using id ${match.id}.`,
+                );
+              } else {
+                toast.warning(
+                  `Credential for "${connectionId}" already exists but is revoked — connection will register without a linked key.`,
+                );
+              }
+            } catch {
+              toast.warning(
+                `Credential for "${connectionId}" already exists — registering connection without linking (could not look up existing id).`,
+              );
+            }
+          } else {
+            throw e;
+          }
+        }
       }
 
       const created = await defaultApi.createProviderConnection({
@@ -779,7 +994,16 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
       onCreated();
       onClose();
     },
-    onError: (e) => toast.error(`Failed: ${e instanceof Error ? e.message : "error"}`),
+    onError: (e) => {
+      // Defensive: surface every non-2xx with a visible red toast so the
+      // modal never fails silently (the #251 bug was a submission that
+      // appeared to do nothing because the onError path only surfaced a
+      // generic string and the button stayed enabled).
+      const msg = e instanceof ApiError
+        ? `${e.status} ${e.message}`
+        : e instanceof Error ? e.message : "Unknown error";
+      toast.error(`Failed to register "${connectionId}": ${msg}`);
+    },
   });
 
   const steps = ["Type", "Connection", "Models"];
@@ -842,7 +1066,14 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
               {(Object.entries(PROVIDER_KINDS) as [ProviderKind, ProviderKindMeta][]).map(([k, m]) => (
                 <button
                   key={k}
-                  onClick={() => { selectKind(k); setStep(1); }}
+                  data-testid={`provider-kind-${k}`}
+                  // Tile click ONLY selects the kind. Advancing to the
+                  // Connection step is done by "Next →" in the footer.
+                  // Previously the tile also called `setStep(1)`, which
+                  // made every subsequent "Next →" click skip straight
+                  // over the Connection step (Type → Connection → Models
+                  // looked like Type → Models to the operator). See #634.
+                  onClick={() => selectKind(k)}
                   className={clsx(
                     "flex items-start gap-2 p-3 rounded-lg border text-left transition-colors",
                     kind === k
@@ -904,9 +1135,13 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
 
               {kind !== "ollama" && (
                 <label className="block">
-                  <span className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">API Key</span>
+                  <span className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">
+                    API Key <span className="text-red-400">*</span>
+                  </span>
                   <input
                     type="password"
+                    data-testid="provider-api-key"
+                    required
                     value={apiKey}
                     onChange={e => setApiKey(e.target.value)}
                     placeholder="sk-… or $ENV_VAR_NAME"
@@ -914,7 +1149,7 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
                     className="mt-1.5 w-full rounded-md bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-700 px-3 py-2 text-xs text-gray-800 dark:text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
                   />
                   <p className="mt-1 text-[10px] text-gray-400 dark:text-zinc-600">
-                    Paste a key directly, or prefix with <code className="text-[10px] font-mono text-indigo-400">$</code> to reference an env var (e.g. <code className="text-[10px] font-mono text-indigo-400">$BEDROCK_API_KEY</code>).
+                    Required. Paste a key directly, or prefix with <code className="text-[10px] font-mono text-indigo-400">$</code> to reference an env var (e.g. <code className="text-[10px] font-mono text-indigo-400">$BEDROCK_API_KEY</code>). Ollama is the only provider that can register without a key.
                   </p>
                 </label>
               )}
@@ -944,12 +1179,17 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
 
           {/* ── Step 2: Model discovery / manual entry ── */}
           {step === 2 && (
-            <div className="space-y-4">
+            <form
+              id={`${formId}-models-form`}
+              onSubmit={(e: FormEvent) => { e.preventDefault(); createMutation.mutate(); }}
+              className="space-y-4"
+            >
               <div>
                 <p className="text-[12px] text-gray-700 dark:text-zinc-300 font-medium">Add models</p>
                 <p className="text-[11px] text-gray-400 dark:text-zinc-500 mt-1 leading-relaxed">
-                  Enter the model IDs served through this connection, or leave this blank
-                  — we will call the provider&apos;s <code className="text-gray-500 dark:text-zinc-400 font-mono text-[10px]">/models</code> endpoint right after registration and fill it in automatically.
+                  Enter the model IDs served through this connection, or click
+                  <strong className="text-gray-700 dark:text-zinc-300"> Discover </strong>
+                  to probe the provider&apos;s <code className="text-gray-500 dark:text-zinc-400 font-mono text-[10px]">/models</code> endpoint right now.
                 </p>
               </div>
 
@@ -979,12 +1219,52 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
                 </button>
               </div>
 
-              {/* Discovery notice */}
-              <div className="flex items-center gap-2 px-3 py-2 rounded-md bg-gray-50/60 dark:bg-zinc-900/60 border border-gray-200/60 dark:border-zinc-800/60 border-dashed">
-                <Zap size={12} className="text-emerald-400 shrink-0" />
-                <span className="text-[11px] text-gray-500 dark:text-zinc-400">
-                  Auto-discovery runs on registration when this list is empty — calls{" "}
-                  <code className="text-gray-400 dark:text-zinc-500 font-mono text-[10px]">GET /v1/providers/connections/:id/discover-models</code>.
+              {/* ── Browse the bundled LiteLLM catalog ─────────────────── */}
+              {/* Operator picks models from the known pricing + capability
+                  registry instead of guessing at IDs. The manual entry box
+                  above stays as the escape hatch for IDs not yet in the
+                  catalog (local ollama tags, private OpenRouter models). */}
+              <div className="rounded-md border border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-3">
+                <div className="flex items-center justify-between mb-2">
+                  <div>
+                    <p className="text-[11px] font-medium text-gray-700 dark:text-zinc-300">Or pick from the catalog</p>
+                    <p className="text-[10px] text-gray-400 dark:text-zinc-500 mt-0.5">
+                      {KIND_TO_PROVIDER_FILTER[kind]
+                        ? `Showing ${KIND_TO_PROVIDER_FILTER[kind]} models`
+                        : "Filter by provider to narrow the list"}
+                    </p>
+                  </div>
+                </div>
+                <ModelCatalogPicker
+                  selected={models}
+                  onChange={setModels}
+                  lockProvider={KIND_TO_PROVIDER_FILTER[kind]}
+                />
+              </div>
+
+              {/* Discover-preview button — probes the provider WITHOUT
+                  registering a connection yet, so the operator can cancel
+                  the wizard without leaving a stale connection record. */}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  data-testid="discover-preview-btn"
+                  onClick={() => previewDiscover.mutate()}
+                  disabled={previewDiscover.isPending || (!baseUrl.trim() && kind !== "ollama")}
+                  className="flex items-center gap-1.5 px-3 h-8 rounded-md bg-emerald-600/90 hover:bg-emerald-500 disabled:opacity-40 text-white text-[11px] font-medium transition-colors"
+                  title={
+                    !baseUrl.trim() && kind !== "ollama"
+                      ? "Set a base URL on the previous step first"
+                      : "Probe the provider for its model catalog right now"
+                  }
+                >
+                  {previewDiscover.isPending
+                    ? <Loader2 size={11} className="animate-spin" />
+                    : <Search size={11} />}
+                  {previewDiscover.isPending ? "Discovering…" : "Discover models"}
+                </button>
+                <span className="text-[11px] text-gray-400 dark:text-zinc-500">
+                  Fills the list by calling <code className="font-mono text-[10px]">POST /v1/providers/connections/discover-preview</code>.
                 </span>
               </div>
 
@@ -1016,7 +1296,7 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
                   You can register models later from the connection row.
                 </p>
               )}
-            </div>
+            </form>
           )}
         </div>
 
@@ -1040,7 +1320,9 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
             </button>
           ) : (
             <button
-              onClick={() => createMutation.mutate()}
+              type="submit"
+              form={`${formId}-models-form`}
+              data-testid="register-provider-btn"
               disabled={createMutation.isPending}
               className="flex items-center gap-1.5 px-4 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-100 dark:bg-zinc-800 disabled:text-gray-400 dark:text-zinc-600 text-white text-[12px] font-medium transition-colors"
             >
@@ -1059,7 +1341,13 @@ function AddProviderModal({ onClose, onCreated }: AddProviderModalProps) {
 
 // ── Connections section ───────────────────────────────────────────────────────
 
-function ConnectionsSection({ onAdd }: { onAdd: () => void }) {
+function ConnectionsSection({
+  onAdd,
+  onTestResult,
+}: {
+  onAdd: () => void;
+  onTestResult: (r: TestConnectionResult) => void;
+}) {
   const toast = useToast();
   const qc = useQueryClient();
 
@@ -1075,7 +1363,8 @@ function ConnectionsSection({ onAdd }: { onAdd: () => void }) {
     refetchInterval: 20_000,
   });
 
-  const entries: ProviderConnectionRecord[] = data?.items ?? [];
+  // #425: shape-flip-safe normalizer.
+  const entries: ProviderConnectionRecord[] = unwrapList<ProviderConnectionRecord>(data);
   const healthMap = new Map<string, ProviderHealthEntry>(
     (Array.isArray(healthData) ? healthData : []).map(h => [h.connection_id, h])
   );
@@ -1172,6 +1461,7 @@ function ConnectionsSection({ onAdd }: { onAdd: () => void }) {
             >
               <Plus size={11} /> Add your first provider
             </button>
+            <EmptyScopeHint empty className="max-w-lg mx-auto text-left" />
           </div>
         ) : (
           <table className="w-full">
@@ -1184,6 +1474,7 @@ function ConnectionsSection({ onAdd }: { onAdd: () => void }) {
                   even={i % 2 === 0}
                   onDelete={handleDelete}
                   onUpdated={refetch}
+                  onTestResult={onTestResult}
                 />
               ))}
             </tbody>
@@ -1213,6 +1504,7 @@ function ConnectionsSection({ onAdd }: { onAdd: () => void }) {
 export function ProvidersPage() {
   const qc = useQueryClient();
   const [showAddModal, setShowAddModal] = useState(false);
+  const [testResult, setTestResult] = useState<TestConnectionResult | null>(null);
 
   const handleCreated = () => {
     void qc.invalidateQueries({ queryKey: ["provider-connections"] });
@@ -1225,13 +1517,20 @@ export function ProvidersPage() {
         <p className={clsx(sectionLabel, "mb-0")}>
           Providers
         </p>
-        <p className="text-[12px] text-gray-500 dark:text-zinc-400">
+        <EntityExplainer>{ENTITY_EXPLAINERS.provider}</EntityExplainer>
+        <p className="text-[11px] text-gray-400 dark:text-zinc-600">
           Only real provider connections registered for the current scope appear here.
         </p>
       </div>
 
+      {/* F29 CE — Routing Preview. Shows which connection serves brain/
+          generate roles for the active tenant. Highest-priority CE
+          feature — replaces the curl-debug workflow that blocked
+          dogfood earlier. */}
+      <RoutingPreview />
+
       {/* User-created connections with Add Provider button */}
-      <ConnectionsSection onAdd={() => setShowAddModal(true)} />
+      <ConnectionsSection onAdd={() => setShowAddModal(true)} onTestResult={setTestResult} />
 
       {/* Add Provider slide-over */}
       {showAddModal && (
@@ -1240,7 +1539,69 @@ export function ProvidersPage() {
           onCreated={handleCreated}
         />
       )}
+
+      {/* Test-connection result drawer */}
+      <TestConnectionDrawer
+        result={testResult}
+        onClose={() => setTestResult(null)}
+      />
     </div>
+  );
+}
+
+// ── Test-connection result drawer ─────────────────────────────────────────────
+
+function TestConnectionDrawer({
+  result,
+  onClose,
+}: {
+  result: TestConnectionResult | null;
+  onClose: () => void;
+}) {
+  return (
+    <Drawer
+      open={!!result}
+      onClose={onClose}
+      title={result ? `Test: ${result.connection_id}` : "Test connection"}
+      width="w-96"
+    >
+      {result && (
+        <div className="p-5 space-y-4" data-testid="test-connection-drawer">
+          <div className="flex items-center gap-2">
+            {result.ok ? (
+              <Badge variant="success" dot compact>Reachable</Badge>
+            ) : (
+              <Badge variant="danger" dot compact>Failed</Badge>
+            )}
+            <span className="text-[11px] font-mono text-gray-400 dark:text-zinc-500">
+              HTTP {result.status || "—"}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-zinc-500">Latency</p>
+              <p className="text-[13px] font-mono text-gray-800 dark:text-zinc-200">
+                {result.latency_ms > 0 ? `${result.latency_ms} ms` : "—"}
+              </p>
+            </div>
+            <div>
+              <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-zinc-500">Provider</p>
+              <p className="text-[13px] font-mono text-gray-800 dark:text-zinc-200">
+                {result.provider || "—"}
+              </p>
+            </div>
+          </div>
+
+          <div>
+            <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-zinc-500 mb-1">Detail</p>
+            <pre className="text-[11px] font-mono whitespace-pre-wrap break-words text-gray-700 dark:text-zinc-300 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded p-2 max-h-64 overflow-auto">
+              {result.detail || (result.ok ? "(no detail)" : "Connection failed.")}
+            </pre>
+          </div>
+        </div>
+      )}
+    </Drawer>
   );
 }
 

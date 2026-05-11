@@ -38,6 +38,28 @@ pub(crate) struct RunRecordView {
     pub(crate) sandbox_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sandbox_path: Option<String>,
+    /// #661: subagents this run has spawned. Computed at GET time
+    /// from `RunReadModel::list_by_parent_run(run_id)` — we don't
+    /// add a counter to the `RunRecord` projection because the
+    /// child-run rows already carry the lineage and a read-time
+    /// walk is O(fan-out) per run (typically 0-5). Omitted from
+    /// list responses to keep the batch shape flat; populated only
+    /// by `build_run_record_view_with_subagents` which the detail
+    /// handler calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagents_spawned: Option<u32>,
+    /// #661: subagents that reached `Completed` terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagents_completed: Option<u32>,
+    /// #661: subagents that reached `Failed` or `Canceled` terminal
+    /// state.  `Canceled` is counted as failed for operator-facing
+    /// delegation-effectiveness reporting: an operator who canceled
+    /// a child run saw the delegation attempt as unsuccessful, and
+    /// the alternative (a separate `_canceled` field) splits a
+    /// signal that's already small (typical run spawns 0-3
+    /// children).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) subagents_failed: Option<u32>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -88,6 +110,53 @@ pub(crate) struct DiagnosisReport {
 // Run helpers
 // ---------------------------------------------------------------------------
 
+/// Pure decision: given the GitHub allowlist and local_fs allowlist for a
+/// project, pick the source for a run's working directory.
+///
+/// Matches the write side's two-bucket model: `POST /v1/projects/:p/repos`
+/// with `host=github` lands in `ProjectRepoAccessService`, and `host=local_fs`
+/// lands in `ProjectLocalPaths`. The resolver checks BOTH buckets — anything
+/// less is dogfood issue #637, where a successful local_fs attach looked like
+/// a no-op because `working_dir_for_run` only read the github bucket and
+/// routed every run to `/tmp/cairn-runs/...`.
+///
+/// Precedence when both buckets are populated: github wins (it's the
+/// primary-path primitive with sandbox semantics; local_fs is the escape
+/// hatch for operator-owned working directories). We still emit a `warn!` at
+/// the call site if both are populated so the operator sees they've
+/// overconfigured a project.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WorkingDirSource {
+    /// GitHub repo — resolver will clone + sandbox.
+    RepoSandbox { repo_id: cairn_workspace::RepoId },
+    /// Operator-attached local filesystem path — used directly as cwd.
+    LocalPath { path: PathBuf },
+    /// Neither bucket populated — resolver will mint an ephemeral
+    /// `/tmp/cairn-runs/<run_id>` directory.
+    Ephemeral,
+}
+
+pub(crate) fn select_working_dir_source(
+    mut repo_ids: Vec<cairn_workspace::RepoId>,
+    mut local_paths: Vec<String>,
+) -> WorkingDirSource {
+    // `list_for_project` and `ProjectLocalPaths::list` already return
+    // sorted data; re-sort defensively so this pure helper doesn't depend
+    // on callers preserving ordering.
+    repo_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    local_paths.sort();
+
+    if let Some(repo_id) = repo_ids.into_iter().next() {
+        return WorkingDirSource::RepoSandbox { repo_id };
+    }
+    if let Some(path) = local_paths.into_iter().next() {
+        return WorkingDirSource::LocalPath {
+            path: PathBuf::from(path),
+        };
+    }
+    WorkingDirSource::Ephemeral
+}
+
 pub(crate) async fn working_dir_for_run(
     state: &AppState,
     run: &RunRecord,
@@ -96,59 +165,142 @@ pub(crate) async fn working_dir_for_run(
         project: run.project.clone(),
     };
     let repo_ids = state.project_repo_access.list_for_project(&repo_ctx).await;
-    let Some(repo_id) = repo_ids.first().cloned() else {
-        // No repo allowlisted — create an isolated ephemeral directory for
-        // this run.  This is expected for API-driven orchestration where the
-        // agent works on external systems (APIs, infra) and doesn't need a
-        // repo checkout.  We NEVER fall back to the server process CWD
-        // because that would expose cairn's own filesystem to agent tools.
-        let ephemeral = std::env::temp_dir()
-            .join("cairn-runs")
-            .join(run.run_id.as_str());
-        if let Err(e) = std::fs::create_dir_all(&ephemeral) {
-            tracing::warn!(
-                run_id = %run.run_id,
-                path = %ephemeral.display(),
-                error = %e,
-                "failed to create ephemeral run directory; falling back to temp root"
-            );
-            return Ok(std::env::temp_dir().join("cairn-runs"));
-        }
-        tracing::debug!(
-            run_id = %run.run_id,
-            path = %ephemeral.display(),
-            "no repo allowlisted for project; using ephemeral run directory"
-        );
-        return Ok(ephemeral);
-    };
+    let local_paths = state.project_local_paths.list(&run.project);
 
-    if repo_ids.len() > 1 {
+    let repo_count = repo_ids.len();
+    let local_count = local_paths.len();
+    let source = select_working_dir_source(repo_ids, local_paths);
+
+    if repo_count > 0 && local_count > 0 {
+        // The two buckets aren't additive — the resolver picks one source.
+        // Surface both counts so an operator who has attached both a github
+        // repo and a local_fs path can see why their local_fs attach
+        // "didn't take effect".
         tracing::warn!(
             run_id = %run.run_id,
             project = ?run.project,
-            selected_repo = %repo_id,
-            repo_count = repo_ids.len(),
-            "multiple repos allowlisted for run; provisioning sandbox from the first sorted repo"
+            repo_count,
+            local_path_count = local_count,
+            "project has both github repos and local_fs paths allowlisted; github repo takes precedence"
         );
     }
 
-    state
-        .repo_clone_cache
-        .ensure_cloned(&run.project.tenant_id, &repo_id)
-        .await?;
+    match source {
+        WorkingDirSource::RepoSandbox { repo_id } => {
+            if repo_count > 1 {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    project = ?run.project,
+                    selected_repo = %repo_id,
+                    repo_count,
+                    "multiple repos allowlisted for run; provisioning sandbox from the first sorted repo"
+                );
+            }
 
-    state
-        .sandbox_service
-        .provision_or_reconnect(
-            &run.run_id,
-            None,
-            run.project.clone(),
-            default_repo_sandbox_policy(repo_id),
-        )
-        .await?;
+            state
+                .repo_clone_cache
+                .ensure_cloned(&run.project.tenant_id, &repo_id)
+                .await?;
 
-    let sandbox = state.sandbox_service.activate(&run.run_id, None).await?;
-    Ok(sandbox.path)
+            state
+                .sandbox_service
+                .provision_or_reconnect(
+                    &run.run_id,
+                    None,
+                    run.project.clone(),
+                    default_repo_sandbox_policy(repo_id),
+                )
+                .await?;
+
+            let sandbox = state.sandbox_service.activate(&run.run_id, None).await?;
+            Ok(sandbox.path)
+        }
+        WorkingDirSource::LocalPath { path } => {
+            // Operator-attached local directory. The path was validated as
+            // absolute + existing + a directory at attach time; verify it
+            // hasn't been deleted out-of-band before handing it to the
+            // orchestrator. On drift, surface it and degrade to ephemeral
+            // so a stale local_fs entry can't silently route every run to
+            // a missing path. Use `tokio::fs::metadata` so the stat call
+            // doesn't block the tokio worker thread under high orchestrate
+            // concurrency — per Gemini review on #648.
+            let is_dir = tokio::fs::metadata(&path)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    project = ?run.project,
+                    path = %path.display(),
+                    "local_fs path allowlisted for project is no longer a directory on disk; falling back to ephemeral run directory"
+                );
+                return Ok(ephemeral_run_dir(&run.run_id));
+            }
+            if local_count > 1 {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    project = ?run.project,
+                    selected_path = %path.display(),
+                    local_path_count = local_count,
+                    "multiple local_fs paths allowlisted for run; using the first sorted path"
+                );
+            }
+            tracing::info!(
+                run_id = %run.run_id,
+                project = ?run.project,
+                path = %path.display(),
+                "using local_fs working directory from project allowlist"
+            );
+            Ok(path)
+        }
+        WorkingDirSource::Ephemeral => {
+            // Neither bucket populated — create an isolated ephemeral
+            // directory for this run. This is expected for API-driven
+            // orchestration where the agent works on external systems
+            // (APIs, infra) and doesn't need a repo checkout. We NEVER
+            // fall back to the server process CWD because that would
+            // expose cairn's own filesystem to agent tools.
+            Ok(ephemeral_run_dir(&run.run_id))
+        }
+    }
+}
+
+fn ephemeral_run_dir(run_id: &RunId) -> PathBuf {
+    let ephemeral = std::env::temp_dir()
+        .join("cairn-runs")
+        .join(run_id.as_str());
+    if let Err(e) = std::fs::create_dir_all(&ephemeral) {
+        tracing::warn!(
+            run_id = %run_id,
+            path = %ephemeral.display(),
+            error = %e,
+            "failed to create ephemeral run directory; falling back to temp root"
+        );
+        return std::env::temp_dir().join("cairn-runs");
+    }
+    // #819 (R24 dogfood): operators routinely register a repo and
+    // expect runs to operate on it, but a registration keyed against
+    // the wrong ProjectKey silently no-ops here — the resolver falls
+    // through to ephemeral and the executor lands in an empty dir.
+    // Pre-#819 this log was at DEBUG and operators missed it. INFO
+    // is the right level: every run that lands here is one of two
+    // shapes — (a) intentional API-driven orchestration with no repo
+    // (correct, expected) or (b) a registration-misroute (the bug).
+    // Naming the path operators can fix the typo from a quick
+    // `journalctl -u cairn` instead of waiting for the run to fail.
+    tracing::info!(
+        run_id = %run_id,
+        path = %ephemeral.display(),
+        "no repo or local_fs path allowlisted for project; using ephemeral run directory"
+    );
+    tracing::debug!(
+        run_id = %run_id,
+        "If you registered a repo and expected the run to operate on it, verify the \
+         registration's project segment matches the run's (tenant_id, workspace_id, \
+         project_id) — see #819."
+    );
+    ephemeral
 }
 
 pub(crate) fn run_default_key(run_id: &RunId, suffix: &str) -> String {
@@ -207,6 +359,235 @@ pub(crate) async fn persist_run_mode_default(
         .map(|_| ())
 }
 
+/// F42: persist a run's per-run string default (e.g. "goal",
+/// "agent_role"). The sibling `resolve_run_string_default` reads these
+/// back during `POST /v1/runs/:id/orchestrate` so an operator-supplied
+/// `prompt` on run creation is routed into the orchestrator's
+/// `## Goal` user-message section.
+pub(crate) async fn persist_run_string_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: &str,
+) -> Result<(), cairn_runtime::RuntimeError> {
+    state
+        .runtime
+        .defaults
+        .set(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            serde_json::Value::String(value.to_owned()),
+        )
+        .await
+        .map(|_| ())
+}
+
+/// #651: read a run's per-run u32 default. Used to recover
+/// `max_iterations` on the empty-body auto-resume POST so the first
+/// operator-chosen cap survives every subsequent kick.
+pub(crate) async fn resolve_run_u32_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+) -> Option<u32> {
+    let key = run_default_key(run_id, suffix);
+    state
+        .runtime
+        .defaults
+        .resolve(project, &key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+/// #651: persist a run's per-run u32 default (currently only
+/// `max_iterations`). Mirrors `persist_run_string_default` — stored in
+/// the same `defaults` projection under the `run:<id>:<suffix>` key.
+pub(crate) async fn persist_run_u32_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: u32,
+) -> Result<(), cairn_runtime::RuntimeError> {
+    state
+        .runtime
+        .defaults
+        .set(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            serde_json::Value::Number(serde_json::Number::from(value)),
+        )
+        .await
+        .map(|_| ())
+}
+
+/// Read a run's per-run u64 default. Used to recover `timeout_ms` on
+/// the empty-body auto-resume POST so the first operator-chosen
+/// timeout survives every subsequent kick (same shape as
+/// [`resolve_run_u32_default`] for `max_iterations`).
+pub(crate) async fn resolve_run_u64_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+) -> Option<u64> {
+    let key = run_default_key(run_id, suffix);
+    state
+        .runtime
+        .defaults
+        .resolve(project, &key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_u64())
+}
+
+/// Persist a run's per-run u64 default (currently `timeout_ms`).
+/// Mirrors [`persist_run_u32_default`] — stored in the same `defaults`
+/// projection under the `run:<id>:<suffix>` key.
+pub(crate) async fn persist_run_u64_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: u64,
+) -> Result<(), cairn_runtime::RuntimeError> {
+    state
+        .runtime
+        .defaults
+        .set(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            serde_json::Value::Number(serde_json::Number::from(value)),
+        )
+        .await
+        .map(|_| ())
+}
+
+/// #660: read a run's per-run boolean default. Accepts either a native
+/// JSON bool or a string spelling (`"true"`, `"false"`, `"1"`, `"0"`,
+/// `"yes"`, `"no"`) so operators flipping the flag via a curl one-liner
+/// against `PUT /v1/settings/defaults/project/<proj>/run:<id>:<suffix>`
+/// (which currently stringifies JSON primitives to strings) get the
+/// behaviour they expect.
+///
+/// Returns `None` when the key is absent or the value is a shape we
+/// cannot cleanly coerce — callers then fall back to their own default.
+pub(crate) async fn resolve_run_bool_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+) -> Option<bool> {
+    let key = run_default_key(run_id, suffix);
+    let value = state
+        .runtime
+        .defaults
+        .resolve(project, &key)
+        .await
+        .ok()
+        .flatten()?;
+    if let Some(b) = value.as_bool() {
+        return Some(b);
+    }
+    if let Some(s) = value.as_str() {
+        let trimmed = s.trim().to_ascii_lowercase();
+        return match trimmed.as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// #660: persist a run's per-run boolean default. Stored as a native
+/// JSON bool so the read path can route through
+/// [`resolve_run_bool_default`] without extra coercion.
+pub(crate) async fn persist_run_bool_default(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: bool,
+) -> Result<(), cairn_runtime::RuntimeError> {
+    state
+        .runtime
+        .defaults
+        .set(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            serde_json::Value::Bool(value),
+        )
+        .await
+        .map(|_| ())
+}
+
+/// RFC 032 PR-5: persist a typed struct under a per-run defaults key
+/// via [`cairn_runtime::DefaultsService::set_struct`]. Enforces the
+/// 64 KiB [`cairn_runtime::TYPED_DEFAULT_MAX_BYTES`] cap before the
+/// write, so an oversized contract (or similarly-shaped typed default)
+/// never reaches the event log.
+///
+/// Wraps the typed-defaults path used for
+/// `CompletionContract` + `ContractSource` + any future typed run-scope
+/// default. Untyped string / bool / u32 / u64 helpers stay on their
+/// existing paths — those serialize to a single JSON primitive without
+/// a round-trip through typed serialization.
+pub(crate) async fn persist_run_struct_default<T>(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: &T,
+) -> Result<(), cairn_runtime::TypedDefaultError>
+where
+    T: serde::Serialize + Send + Sync + ?Sized,
+{
+    state
+        .runtime
+        .defaults
+        .set_struct(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            value,
+        )
+        .await
+        .map(|_| ())
+}
+
+/// RFC 032 PR-5: read a typed struct from a per-run defaults key via
+/// [`cairn_runtime::DefaultsService::get_struct`]. `Ok(None)` when no
+/// value is present at any layer; `Err(TypedDefaultError::Corrupt)`
+/// when a value exists but does not deserialize into `T` (caller
+/// decides whether to fall back or propagate — the orchestrate handler
+/// logs + treats it as "no contract resolved").
+pub(crate) async fn resolve_run_struct_default<T>(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+) -> Result<Option<T>, cairn_runtime::TypedDefaultError>
+where
+    T: serde::de::DeserializeOwned + Send,
+{
+    state
+        .runtime
+        .defaults
+        .get_struct(project, &run_default_key(run_id, suffix))
+        .await
+}
+
 /// Resolve a task's session_id.
 ///
 /// Returns the `session_id` already persisted on the task record when present.
@@ -262,71 +643,181 @@ pub(crate) async fn build_run_record_view(state: &AppState, run: RunRecord) -> R
         created_by_trigger_id,
         sandbox_id,
         sandbox_path,
+        subagents_spawned: None,
+        subagents_completed: None,
+        subagents_failed: None,
     }
 }
 
+/// #661: like [`build_run_record_view`] but also populates the
+/// subagent lineage counters. Computed from
+/// `RunReadModel::list_by_parent_run` — the child-run projection
+/// rows are the canonical source for the parent→child relationship
+/// (minted by `TaskServiceImpl::spawn_subagent`). We walk up to
+/// 500 children per scrape; a run that spawned more is either a
+/// runaway (operators want to see that) or malformed. `limit` is
+/// generous enough that the cap won't fire in normal operation
+/// while keeping the worst-case read bounded.
+///
+/// Used by `GET /v1/runs/:id` where the counts are operator-visible
+/// signal on the delegation-effectiveness loop from #661. The list
+/// handler (`GET /v1/runs`) continues to call the cheap
+/// `build_run_record_view`: fan-out per run per scrape is the wrong
+/// cost to pay on a list endpoint.
+pub(crate) async fn build_run_record_view_with_subagents(
+    state: &AppState,
+    run: RunRecord,
+) -> RunRecordView {
+    let mut view = build_run_record_view(state, run).await;
+    let (spawned, completed, failed) = count_subagents_for_run(state, &view.run.run_id).await;
+    view.subagents_spawned = Some(spawned);
+    view.subagents_completed = Some(completed);
+    view.subagents_failed = Some(failed);
+    view
+}
+
+/// #661: walk the child-run lineage of `parent_run_id` and tally
+/// terminal states. Returns `(spawned, completed, failed_or_canceled)`
+/// where `spawned` is the total count of child runs observed
+/// (includes non-terminal), `completed` is `RunState::Completed`,
+/// and `failed_or_canceled` is `RunState::Failed + RunState::Canceled`.
+///
+/// On store error: logs at `warn!` and returns zeroed counts. A GET
+/// on `/v1/runs/:id` that partially fails to resolve subagent
+/// counts should surface a zero rather than 500 the whole detail
+/// request — the counts are operator signal, not load-bearing on
+/// the run itself.
+///
+/// # Cost (Gemini review on #664)
+///
+/// `RunReadModel::list_by_parent_run` returns full `RunRecord`
+/// rows. We only read `state`, so the row body (including large
+/// fields like `completion_summary` + `completion_verification`)
+/// is deserialised-then-discarded on every `GET /v1/runs/:id`.
+/// Acceptable today because:
+///
+/// - The typical orchestrator run spawns 0-3 children, so the
+///   fan-out is bounded by `0..=5` rows for the vast majority of
+///   runs.
+/// - `MAX_CHILDREN = 500` caps the worst case; a run hitting that
+///   ceiling is a separate operator-visible issue (runaway
+///   delegation) dashboards already surface via
+///   `cairn_orchestrator_subagent_spawn_total`.
+/// - The detail endpoint is not on the hot path. List + stream
+///   are; neither populates these fields.
+///
+/// A dedicated `RunReadModel` method like
+/// `count_states_by_parent_run` that runs a
+/// `SELECT state, COUNT(*) GROUP BY state` at the storage layer
+/// would be lighter. Deferred until a real run spawns >50
+/// children and scrape latency starts to matter — the current
+/// semantics + call sites are unchanged by that optimisation, so
+/// the follow-up is pure replacement-in-place of this helper.
+pub(crate) async fn count_subagents_for_run(
+    state: &AppState,
+    parent_run_id: &RunId,
+) -> (u32, u32, u32) {
+    use cairn_domain::lifecycle::RunState;
+    // 500 is a deliberately generous cap: the typical orchestrator
+    // run spawns 0-3 children. A run hitting this ceiling is a
+    // separate operator-visible issue (runaway delegation) that
+    // dashboards based on `cairn_orchestrator_subagent_spawn_total`
+    // will already surface.
+    const MAX_CHILDREN: usize = 500;
+    match RunReadModel::list_by_parent_run(
+        state.runtime.store.as_ref(),
+        parent_run_id,
+        MAX_CHILDREN,
+    )
+    .await
+    {
+        Ok(children) => {
+            let mut completed = 0u32;
+            let mut failed = 0u32;
+            for child in &children {
+                match child.state {
+                    RunState::Completed => completed = completed.saturating_add(1),
+                    RunState::Failed | RunState::Canceled => {
+                        failed = failed.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            // `children.len()` bounded by MAX_CHILDREN (500) which
+            // fits a u32 trivially — but use `saturating` conversion
+            // in case MAX_CHILDREN grows in a future patch.
+            let spawned = u32::try_from(children.len()).unwrap_or(u32::MAX);
+            (spawned, completed, failed)
+        }
+        Err(err) => {
+            tracing::warn!(
+                parent_run_id = %parent_run_id,
+                error = %err,
+                "failed to list child runs for subagent counts — reporting zero"
+            );
+            (0, 0, 0)
+        }
+    }
+}
+
+/// Read-path entry point for single-run lookups.
+///
+/// FIX-F31: This reads from the cairn-store `RunReadModel` projection — the
+/// **same source** `GET /v1/runs` uses via `list_runs_filtered`. Earlier we
+/// routed through `state.runtime.runs.get(run_id)` which (for the Fabric
+/// adapter) reads FF's `describe_execution` snapshot. FF's execution state
+/// is updated by explicit lifecycle FCALLs (`complete`, `fail`, `cancel`,
+/// `pause`, `resume`); any path that emits `RunStateChanged` events without
+/// calling those FCALLs leaves FF on a stale snapshot while the projection
+/// advances. The result was two read paths for the same entity disagreeing
+/// (e.g. list says `running`, detail says `pending, version=0`).
+///
+/// There is ONE canonical projection of run state: the event-sourced
+/// `RunReadModel` in cairn-store. Both `/v1/runs` and `/v1/runs/:id` now
+/// read from it. The event-log replay fallback is gone — if the projection
+/// doesn't have the run, the run doesn't exist.
 pub(crate) async fn load_run_visible_to_tenant(
     state: &AppState,
     tenant_scope: &TenantScope,
     run_id: &RunId,
 ) -> Result<Option<RunRecord>, axum::response::Response> {
-    match state.runtime.runs.get(run_id).await {
+    match RunReadModel::get(state.runtime.store.as_ref(), run_id).await {
         Ok(Some(run))
             if tenant_scope.is_admin || run.project.tenant_id == *tenant_scope.tenant_id() =>
         {
-            return Ok(Some(run));
+            Ok(Some(run))
         }
-        Ok(Some(_)) => return Ok(None),
-        Ok(None) => {}
-        Err(err) => return Err(runtime_error_response(err)),
+        Ok(_) => Ok(None),
+        Err(err) => Err(store_error_response(err)),
     }
+}
 
-    let events = match state
-        .runtime
-        .store
-        .read_by_entity(&EntityRef::Run(run_id.clone()), None, 1_000)
-        .await
-    {
-        Ok(events) => events,
-        Err(err) => return Err(store_error_response(err)),
-    };
-
-    let mut reconstructed: Option<RunRecord> = None;
-    for stored in events {
-        match stored.envelope.payload {
-            RuntimeEvent::RunCreated(created) if created.run_id == *run_id => {
-                reconstructed = Some(RunRecord {
-                    run_id: created.run_id.clone(),
-                    session_id: created.session_id.clone(),
-                    parent_run_id: created.parent_run_id.clone(),
-                    project: created.project.clone(),
-                    state: RunState::Pending,
-                    prompt_release_id: created.prompt_release_id.clone(),
-                    agent_role_id: created.agent_role_id.clone(),
-                    failure_class: None,
-                    pause_reason: None,
-                    resume_trigger: None,
-                    version: 1,
-                    created_at: stored.stored_at,
-                    updated_at: stored.stored_at,
-                });
-            }
-            RuntimeEvent::RunStateChanged(change) if change.run_id == *run_id => {
-                if let Some(run) = reconstructed.as_mut() {
-                    run.state = change.transition.to;
-                    run.failure_class = change.failure_class;
-                    run.pause_reason = change.pause_reason;
-                    run.resume_trigger = change.resume_trigger;
-                    run.version += 1;
-                    run.updated_at = stored.stored_at;
-                }
-            }
-            _ => {}
+/// Return the `EvalRunRecord` when it exists AND is visible to the
+/// caller. Mirrors [`load_run_visible_to_tenant`] for evals, closing
+/// the cross-tenant-mutation gap called out in #405 (the `#337` bug
+/// shape applied to eval runs).
+///
+/// The projection is the canonical source of the run's `ProjectKey`
+/// (the in-memory `EvalService` only carries `project_id`, without
+/// tenant/workspace). Handlers that use this must have a
+/// `TenantScope` in scope and should return 404 `not_found` when the
+/// result is `Ok(None)` — never leak "exists but forbidden" across
+/// the tenant boundary.
+pub(crate) async fn load_eval_run_visible_to_tenant(
+    state: &AppState,
+    tenant_scope: &TenantScope,
+    eval_run_id: &cairn_domain::EvalRunId,
+) -> Result<Option<cairn_store::projections::EvalRunRecord>, axum::response::Response> {
+    use cairn_store::projections::EvalRunReadModel;
+    match EvalRunReadModel::get(state.runtime.store.as_ref(), eval_run_id).await {
+        Ok(Some(rec))
+            if tenant_scope.is_admin || rec.project.tenant_id == *tenant_scope.tenant_id() =>
+        {
+            Ok(Some(rec))
         }
+        Ok(_) => Ok(None),
+        Err(err) => Err(store_error_response(err)),
     }
-
-    Ok(reconstructed
-        .filter(|run| tenant_scope.is_admin || run.project.tenant_id == *tenant_scope.tenant_id()))
 }
 
 // ---------------------------------------------------------------------------
@@ -920,6 +1411,10 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ApprovalRequested(_) => "approval_requested",
         RuntimeEvent::ApprovalResolved(_) => "approval_resolved",
         RuntimeEvent::ApprovalDelegated(_) => "approval_delegated",
+        RuntimeEvent::ToolCallProposed(_) => "tool_call_proposed",
+        RuntimeEvent::ToolCallApproved(_) => "tool_call_approved",
+        RuntimeEvent::ToolCallRejected(_) => "tool_call_rejected",
+        RuntimeEvent::ToolCallAmended(_) => "tool_call_amended",
         RuntimeEvent::AuditLogEntryRecorded(_) => "audit_log_entry_recorded",
         RuntimeEvent::ApprovalPolicyCreated(_) => "approval_policy_created",
         RuntimeEvent::CheckpointRecorded(_) => "checkpoint_recorded",
@@ -979,14 +1474,19 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::EvalBaselineLocked(_) => "eval_baseline_locked",
         RuntimeEvent::EvalRunStarted(_) => "eval_run_started",
         RuntimeEvent::EvalRunCompleted(_) => "eval_run_completed",
+        RuntimeEvent::EvalRunArchived(_) => "eval_run_archived",
+        RuntimeEvent::EvalRunScored(_) => "eval_run_scored",
+        RuntimeEvent::EvalRubricScored(_) => "eval_rubric_scored",
         RuntimeEvent::PromptAssetCreated(_) => "prompt_asset_created",
         RuntimeEvent::PromptVersionCreated(_) => "prompt_version_created",
         RuntimeEvent::PromptReleaseCreated(_) => "prompt_release_created",
         RuntimeEvent::PromptReleaseTransitioned(_) => "prompt_release_transitioned",
         RuntimeEvent::TenantCreated(_) => "tenant_created",
+        RuntimeEvent::TenantUpdated(_) => "tenant_updated",
         RuntimeEvent::TenantQuotaSet(_) => "tenant_quota_set",
         RuntimeEvent::TenantQuotaViolated(_) => "tenant_quota_violated",
         RuntimeEvent::WorkspaceCreated(_) => "workspace_created",
+        RuntimeEvent::WorkspaceArchived(_) => "workspace_archived",
         RuntimeEvent::WorkspaceMemberAdded(_) => "workspace_member_added",
         RuntimeEvent::WorkspaceMemberRemoved(_) => "workspace_member_removed",
         RuntimeEvent::DefaultSettingSet(_) => "default_setting_set",
@@ -997,12 +1497,15 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::ProjectCreated(_) => "project_created",
         RuntimeEvent::OperatorProfileCreated(_) => "operator_profile_created",
         RuntimeEvent::OperatorProfileUpdated(_) => "operator_profile_updated",
+        RuntimeEvent::TenantRoleGranted(_) => "tenant_role_granted",
+        RuntimeEvent::TenantRoleRevoked(_) => "tenant_role_revoked",
         RuntimeEvent::CredentialStored(_) => "credential_stored",
         RuntimeEvent::CredentialRevoked(_) => "credential_revoked",
         RuntimeEvent::CredentialKeyRotated(_) => "credential_key_rotated",
         RuntimeEvent::GuardrailPolicyCreated(_) => "guardrail_policy_created",
         RuntimeEvent::GuardrailPolicyEvaluated(_) => "guardrail_policy_evaluated",
         RuntimeEvent::ProviderConnectionRegistered(_) => "provider_connection_registered",
+        RuntimeEvent::ProviderConnectionDeleted(_) => "provider_connection_deleted",
         RuntimeEvent::ProviderBindingCreated(_) => "provider_binding_created",
         RuntimeEvent::ProviderBindingStateChanged(_) => "provider_binding_state_changed",
         RuntimeEvent::ProviderHealthChecked(_) => "provider_health_checked",
@@ -1017,6 +1520,8 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::RoutePolicyUpdated(_) => "route_policy_updated",
         RuntimeEvent::RouteDecisionMade(_) => "route_decision_made",
         RuntimeEvent::ProviderCallCompleted(_) => "provider_call_completed",
+        RuntimeEvent::LlmCompletionRecorded(_) => "llm_completion_recorded",
+        RuntimeEvent::RunReasoningStepRecorded(_) => "run_reasoning_step_recorded",
         RuntimeEvent::ProviderModelRegistered(_) => "provider_model_registered",
         RuntimeEvent::RunCostAlertSet(_) => "run_cost_alert_set",
         RuntimeEvent::RunCostAlertTriggered(_) => "run_cost_alert_triggered",
@@ -1039,6 +1544,44 @@ pub fn event_type_name(event: &RuntimeEvent) -> &'static str {
         RuntimeEvent::DecisionCacheWarmup(_) => "decision_cache_warmup",
         // RFC 020 Track 4
         RuntimeEvent::RecoverySummaryEmitted(_) => "recovery_summary",
+        // F47 PR2
+        RuntimeEvent::RunCompletionAnnotated(_) => "run_completion_annotated",
+        // RFC 032 PR-2: completion-contract resolution event.
+        RuntimeEvent::CompletionContractResolved(_) => "completion_contract_resolved",
+        // F64: terminal-write recovery loop outcome (FF#371 bridge).
+        RuntimeEvent::TerminalRecoveryAttempted(_) => "terminal_recovery_attempted",
+        // F65 PR-1: orchestrator session redesign foundation.
+        RuntimeEvent::SessionAttemptStarted(_) => "session_attempt_started",
+        RuntimeEvent::SessionAttemptCompleted(_) => "session_attempt_completed",
+        RuntimeEvent::CircuitBreakerTripped(_) => "circuit_breaker_tripped",
+        RuntimeEvent::BudgetThresholdCrossed(_) => "budget_threshold_crossed",
+        RuntimeEvent::CheckpointPersisted(_) => "checkpoint_persisted",
+        RuntimeEvent::WorkspaceSnapshotCreated(_) => "workspace_snapshot_created",
+        RuntimeEvent::WorkspaceSnapshotReaped(_) => "workspace_snapshot_reaped",
+        RuntimeEvent::SessionOutcomeEmitted(_) => "session_outcome_emitted",
+        RuntimeEvent::OrchestratorDecisionMade(_) => "orchestrator_decision_made",
+        RuntimeEvent::SummarizerFallback(_) => "summarizer_fallback",
+        RuntimeEvent::WorkspaceBackendDegraded(_) => "workspace_backend_degraded",
+        RuntimeEvent::SandboxCrashRecovered(_) => "sandbox_crash_recovered",
+        RuntimeEvent::KnowledgeProviderConfigured(_) => "knowledge_provider_configured",
+        RuntimeEvent::KnowledgeProviderUnavailable(_) => "knowledge_provider_unavailable",
+        RuntimeEvent::KnowledgeProviderCapabilityChanged(_) => {
+            "knowledge_provider_capability_changed"
+        }
+        RuntimeEvent::KnowledgeIngestSubmitted(_) => "knowledge_ingest_submitted",
+        RuntimeEvent::KnowledgeIngestRejected(_) => "knowledge_ingest_rejected",
+        RuntimeEvent::KnowledgeIngestStatusUpdated(_) => "knowledge_ingest_status_updated",
+        RuntimeEvent::MemoryProviderConfigured(_) => "memory_provider_configured",
+        RuntimeEvent::MemoryProviderUnavailable(_) => "memory_provider_unavailable",
+        RuntimeEvent::MemoryProviderCapabilityChanged(_) => "memory_provider_capability_changed",
+        RuntimeEvent::MemoryIngestSubmitted(_) => "memory_ingest_submitted",
+        RuntimeEvent::MemoryIngestRejected(_) => "memory_ingest_rejected",
+        RuntimeEvent::MemoryIngestStatusUpdated(_) => "memory_ingest_status_updated",
+        RuntimeEvent::KnowledgeProviderFamilyMismatch(_) => "knowledge_provider_family_mismatch",
+        RuntimeEvent::MemoryProviderFamilyMismatch(_) => "memory_provider_family_mismatch",
+        RuntimeEvent::AgentRoleDefined(_) => "agent_role_defined",
+        RuntimeEvent::AgentRoleRetracted(_) => "agent_role_retracted",
+        RuntimeEvent::ToolDeclaredButMissing(_) => "tool_declared_but_missing",
     }
 }
 
@@ -1118,6 +1661,30 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
             format!(
                 "Approval {} delegated to {}",
                 delegated.approval_id, delegated.delegated_to
+            )
+        }
+        RuntimeEvent::ToolCallProposed(event) => {
+            format!(
+                "Tool call {} ({}) proposed for approval",
+                event.call_id, event.tool_name
+            )
+        }
+        RuntimeEvent::ToolCallApproved(event) => {
+            format!(
+                "Tool call {} approved by {}",
+                event.call_id, event.operator_id
+            )
+        }
+        RuntimeEvent::ToolCallRejected(event) => {
+            format!(
+                "Tool call {} rejected by {}",
+                event.call_id, event.operator_id
+            )
+        }
+        RuntimeEvent::ToolCallAmended(event) => {
+            format!(
+                "Tool call {} amended by {}",
+                event.call_id, event.operator_id
             )
         }
         RuntimeEvent::AuditLogEntryRecorded(entry) => {
@@ -1328,6 +1895,18 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         RuntimeEvent::EvalRunCompleted(eval_run) => {
             format!("Eval run {} completed", eval_run.eval_run_id)
         }
+        RuntimeEvent::EvalRunArchived(eval_run) => {
+            format!("Eval run {} archived", eval_run.eval_run_id)
+        }
+        RuntimeEvent::EvalRunScored(eval_run) => {
+            format!("Eval run {} scored", eval_run.eval_run_id)
+        }
+        RuntimeEvent::EvalRubricScored(eval_run) => {
+            format!(
+                "Eval run {} rubric-scored against {}",
+                eval_run.eval_run_id, eval_run.rubric_id
+            )
+        }
         RuntimeEvent::PromptAssetCreated(asset) => {
             format!("Prompt asset {} created", asset.prompt_asset_id)
         }
@@ -1346,6 +1925,9 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         RuntimeEvent::TenantCreated(tenant) => {
             format!("Tenant {} created", tenant.tenant_id)
         }
+        RuntimeEvent::TenantUpdated(tenant) => {
+            format!("Tenant {} updated", tenant.tenant_id)
+        }
         RuntimeEvent::TenantQuotaSet(quota) => {
             format!("Tenant quota set for {}", quota.tenant_id)
         }
@@ -1357,6 +1939,9 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         }
         RuntimeEvent::WorkspaceCreated(workspace) => {
             format!("Workspace {} created", workspace.workspace_id)
+        }
+        RuntimeEvent::WorkspaceArchived(workspace) => {
+            format!("Workspace {} archived", workspace.workspace_id)
         }
         RuntimeEvent::WorkspaceMemberAdded(member) => {
             format!("Workspace member {} added", member.member_id)
@@ -1394,6 +1979,18 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         RuntimeEvent::OperatorProfileUpdated(profile) => {
             format!("Operator profile {} updated", profile.profile_id)
         }
+        RuntimeEvent::TenantRoleGranted(e) => {
+            format!(
+                "Tenant role {:?} granted to operator {} on tenant {} by {}",
+                e.role, e.operator_id, e.tenant_id, e.granted_by
+            )
+        }
+        RuntimeEvent::TenantRoleRevoked(e) => {
+            format!(
+                "Tenant role revoked from operator {} on tenant {} by {}",
+                e.operator_id, e.tenant_id, e.revoked_by
+            )
+        }
         RuntimeEvent::CredentialStored(credential) => {
             format!("Credential {} stored", credential.credential_id)
         }
@@ -1412,6 +2009,12 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         RuntimeEvent::ProviderConnectionRegistered(connection) => {
             format!(
                 "Provider connection {} registered",
+                connection.provider_connection_id
+            )
+        }
+        RuntimeEvent::ProviderConnectionDeleted(connection) => {
+            format!(
+                "Provider connection {} deleted",
                 connection.provider_connection_id
             )
         }
@@ -1472,6 +2075,15 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         RuntimeEvent::ProviderCallCompleted(call) => {
             format!("Provider call {} completed", call.provider_call_id)
         }
+        RuntimeEvent::LlmCompletionRecorded(e) => {
+            format!("LLM completion body recorded for trace {}", e.trace_id)
+        }
+        RuntimeEvent::RunReasoningStepRecorded(e) => {
+            format!(
+                "Reasoning step recorded for run {} iteration {}",
+                e.run_id, e.iteration
+            )
+        }
         RuntimeEvent::ApprovalPolicyCreated(policy) => {
             format!("Approval policy {} created", policy.policy_id)
         }
@@ -1530,6 +2142,30 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
                 warmup.cached, warmup.expired_and_dropped
             )
         }
+        // F47 PR2
+        RuntimeEvent::RunCompletionAnnotated(e) => {
+            format!(
+                "Run {} annotated ({} warnings, {} errors, {} commands)",
+                e.run_id,
+                e.verification.warnings.len(),
+                e.verification.errors.len(),
+                e.verification.commands.len(),
+            )
+        }
+        // RFC 032 PR-2
+        RuntimeEvent::CompletionContractResolved(e) => {
+            // `kind()` is the stable snake_case tag — matches what
+            // operator dashboards render and what `event_type_name`
+            // returns for this event. `{source:?}` is intentionally
+            // the enum's Debug (ExplicitCreate / Inferred / …) so
+            // the source surfaces legibly without another helper.
+            format!(
+                "Run {} completion contract resolved ({} via {:?})",
+                e.run_id,
+                e.contract.kind(),
+                e.source,
+            )
+        }
         RuntimeEvent::TaskPriorityChanged(_)
         | RuntimeEvent::TaskLeaseExpired(_)
         | RuntimeEvent::ProviderModelRegistered(_)
@@ -1546,11 +2182,229 @@ pub(crate) fn event_message(event: &RuntimeEvent) -> String {
         | RuntimeEvent::SpendAlertTriggered(_)
         | RuntimeEvent::OutcomeRecorded(_)
         | RuntimeEvent::ScheduledTaskCreated(_)
-        | RuntimeEvent::PlanProposed(_)
-        | RuntimeEvent::PlanApproved(_)
-        | RuntimeEvent::PlanRejected(_)
-        | RuntimeEvent::PlanRevisionRequested(_)
         | RuntimeEvent::RecoverySummaryEmitted(_) => "unknown".to_string(),
+        RuntimeEvent::PlanProposed(p) => {
+            format!("Plan proposed for run {}", p.plan_run_id)
+        }
+        RuntimeEvent::PlanApproved(p) => {
+            format!(
+                "Plan {} approved by {}",
+                p.plan_run_id,
+                sanitize_for_event_message(p.approved_by.as_str())
+            )
+        }
+        RuntimeEvent::PlanRejected(p) => {
+            format!(
+                "Plan {} rejected by {}: {}",
+                p.plan_run_id,
+                sanitize_for_event_message(p.rejected_by.as_str()),
+                sanitize_for_event_message(&p.reason)
+            )
+        }
+        RuntimeEvent::PlanRevisionRequested(p) => {
+            format!(
+                "Plan revision requested for run {} (new run {})",
+                p.original_plan_run_id, p.new_plan_run_id
+            )
+        }
+        // F64: terminal-write recovery outcome breadcrumb for SSE / audit.
+        RuntimeEvent::TerminalRecoveryAttempted(e) => {
+            format!(
+                "Terminal-write recovery ({}) for run {}: {} after {} attempts in {} ms",
+                sanitize_for_event_message(&e.fcall),
+                e.run_id,
+                sanitize_for_event_message(&e.outcome),
+                e.attempts,
+                e.wall_time_ms,
+            )
+        }
+        // F65 PR-1: orchestrator session redesign breadcrumbs.
+        RuntimeEvent::SessionAttemptStarted(e) => format!(
+            "Session {} attempt {}/{} started",
+            e.session_id, e.attempt_number, e.max_attempts
+        ),
+        RuntimeEvent::SessionAttemptCompleted(e) => format!(
+            "Session {} attempt completed ({})",
+            e.session_id,
+            sanitize_for_event_message(&e.outcome_kind),
+        ),
+        RuntimeEvent::CircuitBreakerTripped(e) => format!(
+            "Circuit breaker {} tripped on run {} (measured {}, limit {})",
+            // Use the serde snake_case rendering (matches the enum
+            // discriminator operators see in the event stream) rather
+            // than Debug's PascalCase for consistency with other
+            // messages in this module.
+            sanitize_for_event_message(&breaker_kind_label(e.trip.which)),
+            e.run_id,
+            e.trip.measured,
+            e.trip.limit
+        ),
+        RuntimeEvent::BudgetThresholdCrossed(e) => format!(
+            "Budget threshold crossed on run {}: {} at {} / {}",
+            e.run_id,
+            sanitize_for_event_message(&breaker_kind_label(e.which_breaker)),
+            e.measured,
+            e.limit
+        ),
+        RuntimeEvent::CheckpointPersisted(e) => format!(
+            "Checkpoint {} persisted for session {} iteration {}",
+            e.checkpoint_id, e.session_id, e.iteration
+        ),
+        RuntimeEvent::WorkspaceSnapshotCreated(e) => format!(
+            "Workspace snapshot {} created for workspace {}",
+            e.snapshot_id, e.workspace_id
+        ),
+        RuntimeEvent::WorkspaceSnapshotReaped(e) => {
+            format!("Workspace snapshot {} reaped", e.snapshot_id)
+        }
+        RuntimeEvent::SessionOutcomeEmitted(e) => {
+            format!("Session {} outcome emitted", e.session_id)
+        }
+        RuntimeEvent::OrchestratorDecisionMade(e) => format!(
+            "Orchestrator decision {} for session {}",
+            sanitize_for_event_message(&e.decision),
+            e.session_id
+        ),
+        RuntimeEvent::SummarizerFallback(e) => format!(
+            "Summarizer fallback ({}) for session {}",
+            sanitize_for_event_message(&e.reason),
+            e.session_id
+        ),
+        RuntimeEvent::WorkspaceBackendDegraded(e) => format!(
+            "Workspace backend degraded to {} for session {} ({})",
+            sanitize_for_event_message(&e.backend),
+            e.session_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::SandboxCrashRecovered(e) => format!(
+            "Crash-recovery unmounted dangling overlay for session {} (run {})",
+            e.session_id, e.run_id
+        ),
+        RuntimeEvent::KnowledgeProviderConfigured(e) => format!(
+            "Knowledge provider {} configured for project {}",
+            e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::KnowledgeProviderUnavailable(e) => format!(
+            "Knowledge provider {} unavailable for project {} ({})",
+            e.provider_ref,
+            e.project.project_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::KnowledgeProviderCapabilityChanged(e) => format!(
+            "Knowledge provider {} capability changed for project {}",
+            e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::KnowledgeIngestSubmitted(e) => format!(
+            "Knowledge ingest submitted: document {} via {} for project {}",
+            e.document_id, e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::KnowledgeIngestRejected(e) => format!(
+            "Knowledge ingest rejected by {} for project {} ({})",
+            e.provider_ref,
+            e.project.project_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::KnowledgeIngestStatusUpdated(e) => format!(
+            "Knowledge ingest {} → {} for project {}",
+            e.document_id,
+            sanitize_for_event_message(&e.status),
+            e.project.project_id
+        ),
+        RuntimeEvent::MemoryProviderConfigured(e) => format!(
+            "Memory provider {} configured for project {}{}",
+            e.provider_ref,
+            e.project.project_id,
+            if e.is_bootstrap { " (bootstrap)" } else { "" }
+        ),
+        RuntimeEvent::MemoryProviderUnavailable(e) => format!(
+            "Memory provider {} unavailable for project {} ({})",
+            e.provider_ref,
+            e.project.project_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::MemoryProviderCapabilityChanged(e) => format!(
+            "Memory provider {} capability changed for project {}",
+            e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::MemoryIngestSubmitted(e) => format!(
+            "Memory ingest submitted: document {} via {} for project {}",
+            e.document_id, e.provider_ref, e.project.project_id
+        ),
+        RuntimeEvent::MemoryIngestRejected(e) => format!(
+            "Memory ingest rejected by {} for project {} ({})",
+            e.provider_ref,
+            e.project.project_id,
+            sanitize_for_event_message(&e.reason)
+        ),
+        RuntimeEvent::MemoryIngestStatusUpdated(e) => format!(
+            "Memory ingest {} → {} for project {}",
+            e.document_id,
+            sanitize_for_event_message(&e.status),
+            e.project.project_id
+        ),
+        RuntimeEvent::KnowledgeProviderFamilyMismatch(e) => format!(
+            "Provider {} on knowledge slot declared family {} at handshake (project {})",
+            e.provider_ref,
+            sanitize_for_event_message(&e.observed_family),
+            e.project.project_id
+        ),
+        RuntimeEvent::MemoryProviderFamilyMismatch(e) => format!(
+            "Provider {} on memory slot declared family {} at handshake (project {})",
+            e.provider_ref,
+            sanitize_for_event_message(&e.observed_family),
+            e.project.project_id
+        ),
+        // RFC 031 PR-A: operator-defined agent roles.
+        RuntimeEvent::AgentRoleDefined(e) => format!(
+            "Agent role {} defined on project {} by {}{}",
+            e.role.role_id,
+            e.project.project_id,
+            e.defined_by,
+            e.shadows_builtin
+                .as_deref()
+                .map(|b| format!(" (shadows built-in {b})"))
+                .unwrap_or_default(),
+        ),
+        RuntimeEvent::AgentRoleRetracted(e) => format!(
+            "Agent role {} retracted on project {} by {}",
+            e.role_id, e.project.project_id, e.retracted_by
+        ),
+        RuntimeEvent::ToolDeclaredButMissing(e) => format!(
+            "Role {} on run {} declared tool {} which is not registered (project {})",
+            e.role_id, e.run_id, e.tool_id, e.project.project_id
+        ),
+    }
+}
+
+/// F65: render a [`cairn_domain::BreakerKind`] as its `serde` snake_case
+/// label so event-message text matches the over-the-wire discriminator
+/// operators see on the event stream.
+fn breaker_kind_label(kind: cairn_domain::BreakerKind) -> String {
+    match kind {
+        cairn_domain::BreakerKind::Round => "round",
+        cairn_domain::BreakerKind::Tokens => "tokens",
+        cairn_domain::BreakerKind::NoToolUseConsecutive => "no_tool_use_consecutive",
+        cairn_domain::BreakerKind::WallClock => "wall_clock",
+    }
+    .to_owned()
+}
+
+/// Sanitize a user / operator-provided string before embedding it into a
+/// one-line SSE / audit-facing `event_message`. CR/LF are replaced with
+/// spaces to prevent log-line injection, and the result is truncated to
+/// keep SSE frames bounded. We do not need HTML-escape here — downstream
+/// consumers (UI, CLI) treat the message as plain text.
+fn sanitize_for_event_message(s: &str) -> String {
+    const MAX_LEN: usize = 200;
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= MAX_LEN {
+        cleaned
+    } else {
+        let truncated: String = cleaned.chars().take(MAX_LEN).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -1673,5 +2527,497 @@ pub(crate) fn runtime_event_to_activity_entry(
             description: format!("Signal {} received from {}", e.signal_id, e.source),
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_domain::{PlanApproved, PlanProposed, PlanRejected, PlanRevisionRequested, RunId};
+
+    fn project_key() -> cairn_domain::tenancy::ProjectKey {
+        cairn_domain::tenancy::ProjectKey {
+            tenant_id: cairn_domain::TenantId::new("t"),
+            workspace_id: cairn_domain::WorkspaceId::new("w"),
+            project_id: cairn_domain::ProjectId::new("p"),
+        }
+    }
+
+    /// Dogfood issue #637 regression: after an operator attaches a
+    /// local_fs path via `POST /v1/projects/:p/repos` with
+    /// `host=local_fs`, the resolver must hand the run a `LocalPath`
+    /// working-directory source — not fall through to `Ephemeral`.
+    /// Before the fix the allowlist was split into two buckets
+    /// (`ProjectRepoAccessService` for github, `ProjectLocalPaths` for
+    /// local_fs) and the resolver only read the first, so every
+    /// orchestrate call logged "no repo allowlisted" and wrote to
+    /// `/tmp/cairn-runs/...` regardless of what the operator had
+    /// attached.
+    #[test]
+    fn select_working_dir_source_prefers_github_then_local_then_ephemeral() {
+        use cairn_workspace::RepoId;
+
+        // Neither bucket populated → ephemeral.
+        assert_eq!(
+            select_working_dir_source(vec![], vec![]),
+            WorkingDirSource::Ephemeral
+        );
+
+        // local_fs only → LocalPath (dogfood #637 fix).
+        let path = "/home/ubuntu/cairn-dogfood-roguelike-v3".to_owned();
+        assert_eq!(
+            select_working_dir_source(vec![], vec![path.clone()]),
+            WorkingDirSource::LocalPath {
+                path: PathBuf::from(&path),
+            }
+        );
+
+        // github only → RepoSandbox.
+        let repo_id = RepoId::parse("owner/repo".to_owned()).unwrap();
+        assert_eq!(
+            select_working_dir_source(vec![repo_id.clone()], vec![]),
+            WorkingDirSource::RepoSandbox {
+                repo_id: repo_id.clone()
+            }
+        );
+
+        // Both populated → github wins (primary-path primitive with
+        // sandbox semantics). The call site emits a warn! so the
+        // operator sees the conflict; the resolver itself picks one.
+        assert_eq!(
+            select_working_dir_source(vec![repo_id.clone()], vec![path.clone()]),
+            WorkingDirSource::RepoSandbox { repo_id }
+        );
+    }
+
+    /// Multiple local_fs paths sort lexicographically; the first one
+    /// wins. Matches `ProjectLocalPaths::list`'s sort + the github path
+    /// tiebreaker ("first sorted repo"), so an operator who attaches
+    /// `/a` and `/b` gets the same deterministic ordering either way.
+    #[test]
+    fn select_working_dir_source_local_paths_sort_stably() {
+        let result =
+            select_working_dir_source(vec![], vec!["/b/later".to_owned(), "/a/first".to_owned()]);
+        assert_eq!(
+            result,
+            WorkingDirSource::LocalPath {
+                path: PathBuf::from("/a/first"),
+            }
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_crlf_and_truncates() {
+        let s = "hello\r\nworld\nattacker";
+        assert_eq!(sanitize_for_event_message(s), "hello  world attacker");
+
+        let long: String = "a".repeat(300);
+        let out = sanitize_for_event_message(&long);
+        // 200 chars + "…"
+        assert_eq!(out.chars().count(), 201);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn plan_events_render_concrete_messages() {
+        let proposed = RuntimeEvent::PlanProposed(PlanProposed {
+            project: project_key(),
+            plan_run_id: RunId::new("run_plan_0"),
+            session_id: cairn_domain::SessionId::new("sess_0"),
+            plan_markdown: "# plan".to_owned(),
+            proposed_at: 0,
+        });
+        assert_eq!(event_message(&proposed), "Plan proposed for run run_plan_0");
+
+        let approved = RuntimeEvent::PlanApproved(PlanApproved {
+            project: project_key(),
+            plan_run_id: RunId::new("run_plan_1"),
+            approved_by: cairn_domain::OperatorId::new("alice"),
+            reviewer_comments: None,
+            approved_at: 0,
+        });
+        assert_eq!(
+            event_message(&approved),
+            "Plan run_plan_1 approved by alice"
+        );
+
+        let rejected = RuntimeEvent::PlanRejected(PlanRejected {
+            project: project_key(),
+            plan_run_id: RunId::new("run_plan_2"),
+            rejected_by: cairn_domain::OperatorId::new("bob"),
+            reason: "out of scope".to_owned(),
+            rejected_at: 0,
+        });
+        assert_eq!(
+            event_message(&rejected),
+            "Plan run_plan_2 rejected by bob: out of scope"
+        );
+
+        let revision = RuntimeEvent::PlanRevisionRequested(PlanRevisionRequested {
+            project: project_key(),
+            original_plan_run_id: RunId::new("run_plan_2"),
+            new_plan_run_id: RunId::new("run_plan_3"),
+            reviewer_comments: "tighten scope".to_owned(),
+            requested_at: 0,
+        });
+        assert_eq!(
+            event_message(&revision),
+            "Plan revision requested for run run_plan_2 (new run run_plan_3)"
+        );
+
+        // Injection attempt: CR/LF in reason (and rejected_by) is neutralized.
+        let injected = RuntimeEvent::PlanRejected(PlanRejected {
+            project: project_key(),
+            plan_run_id: RunId::new("run_plan_4"),
+            rejected_by: cairn_domain::OperatorId::new("bob"),
+            reason: "bad\nFAKE_LOG_LINE".to_owned(),
+            rejected_at: 0,
+        });
+        assert!(!event_message(&injected).contains('\n'));
+
+        // Sentinel: none of these fall through to "unknown".
+        for ev in [&proposed, &approved, &rejected, &revision, &injected] {
+            assert_ne!(event_message(ev), "unknown");
+        }
+    }
+
+    /// F65 PR-1: event-message mappings for the new session-orchestration
+    /// variants. Covers snake_case rendering of `BreakerKind` and basic
+    /// non-empty formatting so we do not silently fall back to `"unknown"`.
+    #[test]
+    fn f65_event_messages_render_in_snake_case() {
+        use cairn_domain::events::{
+            BudgetThresholdCrossed, CheckpointPersisted, CircuitBreakerTripped,
+            OrchestratorDecisionMade, SessionAttemptCompleted, SessionAttemptStarted,
+            SessionOutcomeEmitted, SummarizerFallback, WorkspaceBackendDegraded,
+            WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
+        };
+        use cairn_domain::session_orchestration::{
+            BreakerKind, CircuitBreakerTrip, SessionOutcome, TerminationReason,
+        };
+        use cairn_domain::{CheckpointId, RunId, SessionId, WorkspaceId, WorkspaceSnapshotId};
+
+        let project = project_key();
+        let session_id = SessionId::new("s_msg");
+        let run_id = RunId::new("r_msg");
+        let ws = WorkspaceId::new("w_msg");
+
+        let started = RuntimeEvent::SessionAttemptStarted(SessionAttemptStarted {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            root_run_id: run_id.clone(),
+            attempt_number: 2,
+            max_attempts: 5,
+            at_ms: 0,
+        });
+        assert_eq!(event_message(&started), "Session s_msg attempt 2/5 started");
+
+        let completed = RuntimeEvent::SessionAttemptCompleted(SessionAttemptCompleted {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            root_run_id: run_id.clone(),
+            outcome_kind: "complete_run".to_owned(),
+            at_ms: 0,
+        });
+        assert_eq!(
+            event_message(&completed),
+            "Session s_msg attempt completed (complete_run)"
+        );
+
+        // BreakerKind renders as its serde snake_case label, not PascalCase.
+        let tripped = RuntimeEvent::CircuitBreakerTripped(CircuitBreakerTripped {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            trip: CircuitBreakerTrip {
+                which: BreakerKind::NoToolUseConsecutive,
+                measured: 10,
+                limit: 5,
+                at_iteration: 9,
+            },
+            at_ms: 0,
+        });
+        let tripped_msg = event_message(&tripped);
+        assert!(
+            tripped_msg.contains("no_tool_use_consecutive"),
+            "expected snake_case label, got {tripped_msg}"
+        );
+        assert!(
+            !tripped_msg.contains("NoToolUseConsecutive"),
+            "unexpected PascalCase label in {tripped_msg}"
+        );
+
+        let budget = RuntimeEvent::BudgetThresholdCrossed(BudgetThresholdCrossed {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            which_breaker: BreakerKind::Tokens,
+            measured: 80_000,
+            limit: 100_000,
+            ratio_bps: 8_000,
+            at_ms: 0,
+        });
+        let budget_msg = event_message(&budget);
+        assert!(budget_msg.contains("tokens"), "got {budget_msg}");
+        assert!(!budget_msg.contains("Tokens"), "got {budget_msg}");
+
+        let ckpt = RuntimeEvent::CheckpointPersisted(CheckpointPersisted {
+            project: project.clone(),
+            checkpoint_id: CheckpointId::new("ckpt_msg"),
+            session_id: session_id.clone(),
+            root_run_id: run_id.clone(),
+            iteration: 4,
+            at_ms: 0,
+        });
+        assert_eq!(
+            event_message(&ckpt),
+            "Checkpoint ckpt_msg persisted for session s_msg iteration 4"
+        );
+
+        let snap_created = RuntimeEvent::WorkspaceSnapshotCreated(WorkspaceSnapshotCreated {
+            project: project.clone(),
+            snapshot_id: WorkspaceSnapshotId::new("snap_msg"),
+            workspace_id: ws.clone(),
+            session_id: session_id.clone(),
+            at_ms: 0,
+            bytes: 0,
+            reflink_used: false,
+            parent_snapshot_id: None,
+        });
+        assert_eq!(
+            event_message(&snap_created),
+            "Workspace snapshot snap_msg created for workspace w_msg"
+        );
+
+        let snap_reaped = RuntimeEvent::WorkspaceSnapshotReaped(WorkspaceSnapshotReaped {
+            project: project.clone(),
+            snapshot_id: WorkspaceSnapshotId::new("snap_msg"),
+            at_ms: 0,
+        });
+        assert_eq!(
+            event_message(&snap_reaped),
+            "Workspace snapshot snap_msg reaped"
+        );
+
+        let outcome = RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            root_run_id: run_id.clone(),
+            outcome: SessionOutcome {
+                session_id: session_id.clone(),
+                root_run_id: run_id.clone(),
+                project: project.clone(),
+                checkpoint_id: CheckpointId::new("ckpt_msg"),
+                workspace_snapshot_id: None,
+                termination_reason: TerminationReason::CompleteRun,
+                compacted_summary: String::new(),
+                next_step_hint: None,
+                cost_micros: 0,
+                emitted_at: 0,
+            },
+            at_ms: 0,
+        });
+        assert_eq!(event_message(&outcome), "Session s_msg outcome emitted");
+
+        // Injection defense: reason/decision/backend/ CR-LF neutralized.
+        let decision = RuntimeEvent::OrchestratorDecisionMade(OrchestratorDecisionMade {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            decision: "retry\nFAKE".to_owned(),
+            at_ms: 0,
+        });
+        assert!(!event_message(&decision).contains('\n'));
+
+        let fallback = RuntimeEvent::SummarizerFallback(SummarizerFallback {
+            project: project.clone(),
+            session_id: session_id.clone(),
+            reason: "provider_unavailable\rEVIL".to_owned(),
+            at_ms: 0,
+        });
+        assert!(!event_message(&fallback).contains('\r'));
+
+        let degraded = RuntimeEvent::WorkspaceBackendDegraded(WorkspaceBackendDegraded {
+            project,
+            session_id,
+            backend: "ext4_copy\nBAD".to_owned(),
+            reason: "overlayfs_unavailable".to_owned(),
+            at_ms: 0,
+        });
+        let degraded_msg = event_message(&degraded);
+        assert!(!degraded_msg.contains('\n'));
+
+        // Sentinel: none of these fall through to "unknown".
+        for ev in [
+            &started,
+            &completed,
+            &tripped,
+            &budget,
+            &ckpt,
+            &snap_created,
+            &snap_reaped,
+            &outcome,
+            &decision,
+            &fallback,
+            &degraded,
+        ] {
+            assert_ne!(event_message(ev), "unknown");
+        }
+    }
+
+    /// F65 PR-1: event_type_name returns stable snake_case strings for
+    /// every new variant. Lets operator dashboards filter by event kind
+    /// without drift between the enum discriminator and the label.
+    #[test]
+    fn f65_event_type_names_stable_snake_case() {
+        use cairn_domain::events::{
+            BudgetThresholdCrossed, CheckpointPersisted, CircuitBreakerTripped,
+            OrchestratorDecisionMade, SessionAttemptCompleted, SessionAttemptStarted,
+            SessionOutcomeEmitted, SummarizerFallback, WorkspaceBackendDegraded,
+            WorkspaceSnapshotCreated, WorkspaceSnapshotReaped,
+        };
+        use cairn_domain::session_orchestration::{
+            BreakerKind, CircuitBreakerTrip, SessionOutcome, TerminationReason,
+        };
+        use cairn_domain::{CheckpointId, RunId, SessionId, WorkspaceId, WorkspaceSnapshotId};
+
+        let project = project_key();
+        let session_id = SessionId::new("s");
+        let run_id = RunId::new("r");
+
+        let pairs: [(RuntimeEvent, &str); 11] = [
+            (
+                RuntimeEvent::SessionAttemptStarted(SessionAttemptStarted {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    root_run_id: run_id.clone(),
+                    attempt_number: 1,
+                    max_attempts: 5,
+                    at_ms: 0,
+                }),
+                "session_attempt_started",
+            ),
+            (
+                RuntimeEvent::SessionAttemptCompleted(SessionAttemptCompleted {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    root_run_id: run_id.clone(),
+                    outcome_kind: "complete_run".to_owned(),
+                    at_ms: 0,
+                }),
+                "session_attempt_completed",
+            ),
+            (
+                RuntimeEvent::CircuitBreakerTripped(CircuitBreakerTripped {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    trip: CircuitBreakerTrip {
+                        which: BreakerKind::Round,
+                        measured: 1,
+                        limit: 1,
+                        at_iteration: 0,
+                    },
+                    at_ms: 0,
+                }),
+                "circuit_breaker_tripped",
+            ),
+            (
+                RuntimeEvent::BudgetThresholdCrossed(BudgetThresholdCrossed {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    which_breaker: BreakerKind::Tokens,
+                    measured: 0,
+                    limit: 0,
+                    ratio_bps: 0,
+                    at_ms: 0,
+                }),
+                "budget_threshold_crossed",
+            ),
+            (
+                RuntimeEvent::CheckpointPersisted(CheckpointPersisted {
+                    project: project.clone(),
+                    checkpoint_id: CheckpointId::new("ckpt"),
+                    session_id: session_id.clone(),
+                    root_run_id: run_id.clone(),
+                    iteration: 0,
+                    at_ms: 0,
+                }),
+                "checkpoint_persisted",
+            ),
+            (
+                RuntimeEvent::WorkspaceSnapshotCreated(WorkspaceSnapshotCreated {
+                    project: project.clone(),
+                    snapshot_id: WorkspaceSnapshotId::new("snap"),
+                    workspace_id: WorkspaceId::new("w"),
+                    session_id: session_id.clone(),
+                    at_ms: 0,
+                    bytes: 0,
+                    reflink_used: false,
+                    parent_snapshot_id: None,
+                }),
+                "workspace_snapshot_created",
+            ),
+            (
+                RuntimeEvent::WorkspaceSnapshotReaped(WorkspaceSnapshotReaped {
+                    project: project.clone(),
+                    snapshot_id: WorkspaceSnapshotId::new("snap"),
+                    at_ms: 0,
+                }),
+                "workspace_snapshot_reaped",
+            ),
+            (
+                RuntimeEvent::SessionOutcomeEmitted(SessionOutcomeEmitted {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    root_run_id: run_id.clone(),
+                    outcome: SessionOutcome {
+                        session_id: session_id.clone(),
+                        root_run_id: run_id.clone(),
+                        project: project.clone(),
+                        checkpoint_id: CheckpointId::new("ckpt"),
+                        workspace_snapshot_id: None,
+                        termination_reason: TerminationReason::CompleteRun,
+                        compacted_summary: String::new(),
+                        next_step_hint: None,
+                        cost_micros: 0,
+                        emitted_at: 0,
+                    },
+                    at_ms: 0,
+                }),
+                "session_outcome_emitted",
+            ),
+            (
+                RuntimeEvent::OrchestratorDecisionMade(OrchestratorDecisionMade {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    decision: "retry".to_owned(),
+                    at_ms: 0,
+                }),
+                "orchestrator_decision_made",
+            ),
+            (
+                RuntimeEvent::SummarizerFallback(SummarizerFallback {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    reason: "x".to_owned(),
+                    at_ms: 0,
+                }),
+                "summarizer_fallback",
+            ),
+            (
+                RuntimeEvent::WorkspaceBackendDegraded(WorkspaceBackendDegraded {
+                    project,
+                    session_id,
+                    backend: "ext4".to_owned(),
+                    reason: "y".to_owned(),
+                    at_ms: 0,
+                }),
+                "workspace_backend_degraded",
+            ),
+        ];
+        for (ev, expected) in &pairs {
+            assert_eq!(event_type_name(ev), *expected, "{expected}");
+        }
     }
 }

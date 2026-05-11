@@ -12,10 +12,7 @@
  * Requires cairn-app on :3000 with a live LLM provider (Bedrock).
  */
 import { test, expect, type Page, type APIRequestContext } from "@playwright/test";
-
-const TOKEN = "dev-admin-token";
-const BASE = "http://localhost:3000";
-const HDR = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+import { BASE, TOKEN, HDR } from "./helpers";
 const scope = { tenant_id: "default_tenant", workspace_id: "default_workspace", project_id: "default_project" };
 
 async function post(r: APIRequestContext, path: string, data: object) {
@@ -88,17 +85,29 @@ test.setTimeout(90_000);
 //             is meaningful, tokens were counted, and events were recorded
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Local-only: gated on PLAYWRIGHT_LIVE_LLM=1. CI deliberately does not
+// run this — burning provider tokens on every PR is both costly and
+// noisy. Local run:
+//   CAIRN_BRAIN_URL=https://api.z.ai/api/coding/paas/v4/ \
+//   CAIRN_BRAIN_KEY=$ZAI_API_KEY CAIRN_BRAIN_MODEL=glm-4.7 \
+//   PLAYWRIGHT_LIVE_LLM=1 npx playwright test real-scenarios
 test("S1: Orchestrate with real LLM → meaningful response + token accounting + events", async ({ request }) => {
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
   const sid = `s1_sess_${uid()}`, rid = `s1_run_${uid()}`;
 
   // Create session + run
   await post(request, "/v1/sessions", { session_id: sid, ...scope });
   await post(request, "/v1/runs", { run_id: rid, session_id: sid, ...scope });
 
-  // Orchestrate with a real prompt that has a verifiable answer
+  // Orchestrate with a real prompt that has a verifiable answer.
+  // cairn-app's OrchestrateRequest uses `goal` (the task description)
+  // and `max_iterations` (the loop cap), NOT `input` / `max_steps` —
+  // serde silently drops unknown fields so earlier revisions with those
+  // fields ran the orchestrator with no user prompt at all, which made
+  // the model ask for clarification instead of answering.
   const orch = await post(request, `/v1/runs/${rid}/orchestrate`, {
-    input: "What is 2 + 2? Reply with just the number.",
-    max_steps: 1,
+    goal: "What is 2 + 2? Reply with just the number.",
+    max_iterations: 1,
   });
 
   if (orch.status === 200) {
@@ -157,7 +166,9 @@ test("S2: Generate → real tokens counted, latency measured", async ({ request 
 //             Verify the model's response references the ingested knowledge.
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Local-only: gated on PLAYWRIGHT_LIVE_LLM=1 — see S1 above for the run command.
 test("S3: Memory-augmented orchestration — model uses ingested knowledge", async ({ request }) => {
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
   const secret = `cairn-secret-${uid()}`;
 
   // Ingest a document with a unique fact
@@ -181,8 +192,8 @@ test("S3: Memory-augmented orchestration — model uses ingested knowledge", asy
   await post(request, "/v1/runs", { run_id: rid, session_id: sid, ...scope });
 
   const orch = await post(request, `/v1/runs/${rid}/orchestrate`, {
-    input: `What is the secret project codename? Search memory for it.`,
-    max_steps: 2,
+    goal: `What is the secret project codename? Search memory for it.`,
+    max_iterations: 2,
   });
 
   if (orch.status === 200) {
@@ -238,13 +249,13 @@ test("S5: Multi-run session — two runs with independent event trails", async (
   // Run A: orchestrate
   await post(request, "/v1/runs", { run_id: ridA, session_id: sid, ...scope });
   const orchA = await post(request, `/v1/runs/${ridA}/orchestrate`, {
-    input: "Say hello.", max_steps: 1,
+    goal: "Say hello.", max_iterations: 1,
   });
 
   // Run B: orchestrate with different prompt
   await post(request, "/v1/runs", { run_id: ridB, session_id: sid, ...scope });
   const orchB = await post(request, `/v1/runs/${ridB}/orchestrate`, {
-    input: "Say goodbye.", max_steps: 1,
+    goal: "Say goodbye.", max_iterations: 1,
   });
 
   // REAL EXPECTATION: both runs have events, and they don't cross-contaminate
@@ -278,6 +289,19 @@ test("S6: Dynamic provider routing — create → route → delete → fallback"
   const connId = `s6_conn_${uid()}`;
   const testModel = `s6-model-${uid()}`;
 
+  // #634: openai-compatible now requires a credential binding at
+  // registration. Mint one so the POST below doesn't 422 on a
+  // contract-agnostic routing test. The credential value is unused —
+  // this test doesn't actually call upstream — but the binding is
+  // mandatory for non-ollama/non-bedrock adapters.
+  const credResp = await post(request, `/v1/admin/tenants/${scope.tenant_id}/credentials`, {
+    provider_id: connId,
+    plaintext_value: `sk-s6-stub-${uid()}`,
+  });
+  expect(credResp.status).toBeLessThan(300);
+  const credentialId = credResp.body?.id as string;
+  expect(credentialId).toBeTruthy();
+
   // Create a provider connection
   const createResp = await post(request, "/v1/providers/connections", {
     ...scope,
@@ -285,6 +309,7 @@ test("S6: Dynamic provider routing — create → route → delete → fallback"
     provider_family: "openai-compatible",
     adapter_type: "openai-compatible",
     supported_models: [testModel],
+    credential_id: credentialId,
   });
   expect(createResp.status).toBeLessThan(300);
 
@@ -313,7 +338,9 @@ test("S6: Dynamic provider routing — create → route → delete → fallback"
 //             verify the generate endpoint picks up the new default
 // ═════════════════════════════════════════════════════════════════════════════
 
+// Local-only: gated on PLAYWRIGHT_LIVE_LLM=1 — see S1 above for the run command.
 test("S7: Hot-reload settings — change default model, verify resolution", async ({ request }) => {
+  test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
   const originalModel = "original-model-before";
   const newModel = "hot-reloaded-model-after";
 
@@ -361,8 +388,8 @@ test("S8: Full agent workflow through UI with real LLM", async ({ page, request 
 
   // Real orchestration
   const orch = await post(request, `/v1/runs/${rid}/orchestrate`, {
-    input: "What is the capital of France? Answer in one word.",
-    max_steps: 1,
+    goal: "What is the capital of France? Answer in one word.",
+    max_iterations: 1,
   });
 
   if (orch.status === 200) {
@@ -596,8 +623,8 @@ test("S13: THE FULL MONTY — complete product lifecycle with real LLM", async (
 
   // ── 6. Orchestrate with real LLM ──
   const orch = await post(request, `/v1/runs/${rid}/orchestrate`, {
-    input: "What is the capital of France? One word answer.",
-    max_steps: 1,
+    goal: "What is the capital of France? One word answer.",
+    max_iterations: 1,
   });
 
   let llmWorked = false;

@@ -16,7 +16,7 @@ use axum::{
 use cairn_api::auth::AuthPrincipal;
 use cairn_runtime::DecisionService;
 
-use crate::errors::{bad_request_response, AppApiError};
+use crate::errors::{validation_error_response, AppApiError};
 use crate::handlers::admin::audit_actor_id;
 use crate::state::AppState;
 
@@ -96,7 +96,7 @@ pub(crate) async fn evaluate_decision_handler(
     // and integration tests). We try the strict shape first.
     let kind_val = match body.get("kind") {
         Some(k) => k.clone(),
-        None => return bad_request_response("missing 'kind' field"),
+        None => return validation_error_response("missing 'kind' field"),
     };
     let kind: DecisionKind = match &kind_val {
         serde_json::Value::String(disc) => {
@@ -125,14 +125,14 @@ pub(crate) async fn evaluate_decision_handler(
             let tagged = serde_json::json!({ "kind": disc, "data": data });
             match serde_json::from_value(tagged) {
                 Ok(k) => k,
-                Err(e) => return bad_request_response(format!("invalid 'kind' payload: {e}")),
+                Err(e) => return validation_error_response(format!("invalid 'kind' payload: {e}")),
             }
         }
         serde_json::Value::Object(_) => match serde_json::from_value(kind_val) {
             Ok(k) => k,
-            Err(e) => return bad_request_response(format!("invalid 'kind': {e}")),
+            Err(e) => return validation_error_response(format!("invalid 'kind': {e}")),
         },
-        _ => return bad_request_response("'kind' must be a string or object"),
+        _ => return validation_error_response("'kind' must be a string or object"),
     };
 
     // ── principal ────────────────────────────────────────────────────────
@@ -144,7 +144,7 @@ pub(crate) async fn evaluate_decision_handler(
     let principal: Principal = match body.get("principal") {
         Some(p) => match serde_json::from_value(p.clone()) {
             Ok(p) => p,
-            Err(e) => return bad_request_response(format!("invalid 'principal': {e}")),
+            Err(e) => return validation_error_response(format!("invalid 'principal': {e}")),
         },
         None => match &principal_auth {
             AuthPrincipal::Operator { operator_id, .. } => Principal::Operator {
@@ -158,7 +158,7 @@ pub(crate) async fn evaluate_decision_handler(
     let subject: DecisionSubject = match body.get("subject") {
         Some(s) => match serde_json::from_value(s.clone()) {
             Ok(s) => s,
-            Err(e) => return bad_request_response(format!("invalid 'subject': {e}")),
+            Err(e) => return validation_error_response(format!("invalid 'subject': {e}")),
         },
         None => match &kind {
             DecisionKind::ToolInvocation { tool_name, .. } => DecisionSubject::ToolCall {
@@ -375,11 +375,11 @@ pub(crate) async fn bulk_invalidate_decisions_handler(
         Some(s) => match serde_json::from_value(s.clone()) {
             Ok(scope) => scope,
             Err(e) => {
-                return bad_request_response(format!("invalid scope: {e}"));
+                return validation_error_response(format!("invalid scope: {e}"));
             }
         },
         None => {
-            return bad_request_response("missing 'scope' field");
+            return validation_error_response("missing 'scope' field");
         }
     };
     let kind_filter = body
@@ -423,7 +423,7 @@ pub(crate) async fn invalidate_by_rule_handler(
     let rule_id = match body.get("rule_id").and_then(|v| v.as_str()) {
         Some(id) => PolicyId::new(id),
         None => {
-            return bad_request_response("missing 'rule_id' field");
+            return validation_error_response("missing 'rule_id' field");
         }
     };
     let reason = body

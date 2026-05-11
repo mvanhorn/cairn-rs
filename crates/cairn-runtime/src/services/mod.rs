@@ -2,53 +2,104 @@
 //!
 //! Each service accepts command parameters, validates state transitions,
 //! emits events through the EventLog, and returns the updated projection.
+//!
+//! # Module layout
+//!
+//! Modules are grouped by domain-responsibility banners. Public
+//! re-exports at the bottom stay flat, so call sites `use
+//! cairn_runtime::services::Foo` continue to compile unchanged; the
+//! banners are purely navigational. Audit #477.
+//!
+//! ## Domain areas
+//!
+//! - **Lifecycle & core flow** — session / run / task / recovery /
+//!   checkpoint / mailbox / orchestrator / tool invocation.
+//! - **Governance & policy** — approvals, tool-call approvals, quota,
+//!   retention, guardrail, budget, license, audit, workspace
+//!   membership & quotas, channel / notification / signal routing,
+//!   operator profile, voice, ingest, trigger, marketplace.
+//! - **Provider routing** — provider binding / connection / health /
+//!   model / pool / router / model-chain / routed-generation / route
+//!   policy + resolver / ollama adapters / observability.
+//! - **Prompt & evals** — prompt asset / version / release +
+//!   release-pipeline, eval run, research/digest, confidence
+//!   calibrator, defaults.
+//! - **Tenancy & identity** — tenant / project / workspace /
+//!   credential / resource sharing.
+//! - **Skill & plugin** — skill catalog, plugin health monitor /
+//!   capability registry / host / event router.
+//! - **Infra helpers** — event helpers, run cost alert, run SLA.
 
+// ── Lifecycle & core flow ────────────────────────────────────────────────
+pub mod checkpoint_impl;
+pub mod external_worker_impl;
+pub mod mailbox_impl;
+pub mod orchestrator;
+pub mod recovery_impl;
+pub mod tool_invocation_impl;
+
+// ── Governance & policy ──────────────────────────────────────────────────
+pub mod agent_roles_impl;
 pub mod approval_impl;
 pub mod approval_policy_impl;
 pub mod audit_impl;
 pub mod budget_impl;
 pub mod channel_impl;
-pub mod checkpoint_impl;
-pub mod confidence_calibrator;
-pub mod credential_impl;
-pub mod defaults_impl;
-pub mod eval_run_impl;
-pub mod event_helpers;
-pub mod external_worker_impl;
 pub mod guardrail_impl;
 pub mod ingest_job_impl;
+pub mod knowledge_provider_impl;
 pub mod license_impl;
-pub mod mailbox_impl;
+pub mod memory_provider_impl;
 pub mod notification_impl;
-pub mod observability_impl;
 pub mod operator_profile_impl;
-pub mod orchestrator;
-pub mod project_impl;
-pub mod prompt_asset_impl;
-pub mod prompt_release_impl;
-pub mod prompt_version_impl;
+pub mod quota_impl;
+pub mod retention_impl;
+pub mod signal_impl;
+pub mod signal_router_impl;
+pub mod tenant_role_impl;
+pub mod tool_call_approval_impl;
+pub mod tool_call_approval_reader_adapter;
+pub mod voice_impl;
+
+// ── Provider routing ─────────────────────────────────────────────────────
+pub mod observability_impl;
 pub mod provider_binding_impl;
 pub mod provider_connection_impl;
 pub mod provider_health_impl;
 pub mod provider_model_impl;
 pub mod provider_pool_impl;
-pub mod quota_impl;
-pub mod recovery_impl;
-pub mod research_impl;
-pub mod retention_impl;
 pub mod route_policy_impl;
 pub mod route_resolver_impl;
-pub mod run_cost_alert_impl;
-pub mod run_sla_impl;
-pub mod signal_impl;
-pub mod signal_router_impl;
-pub mod skill_catalog_impl;
+
+// ── Prompt & evals ───────────────────────────────────────────────────────
+pub mod confidence_calibrator;
+pub mod defaults_impl;
+pub mod eval_run_impl;
+pub mod prompt_asset_impl;
+pub mod prompt_release_impl;
+pub mod prompt_version_impl;
+pub mod research_impl;
+
+// ── Tenancy & identity ───────────────────────────────────────────────────
+pub mod credential_impl;
+pub mod project_impl;
 pub mod tenant_impl;
-pub mod tool_invocation_impl;
-pub mod voice_impl;
 pub mod workspace_impl;
 pub mod workspace_membership_impl;
 
+// ── Skill & plugin ───────────────────────────────────────────────────────
+pub mod skill_catalog_impl;
+
+// ── Infra helpers ────────────────────────────────────────────────────────
+pub mod event_helpers;
+pub mod run_cost_alert_impl;
+pub mod run_sla_impl;
+
+// ── Re-exports (flat, kept stable; group banners above are
+//    navigational only — call sites `use services::Foo` unchanged) ──────
+pub use agent_roles_impl::{
+    AgentRoleService, AgentRoleServiceImpl, ResolvedRole, RoleSource, SourceFilter,
+};
 pub use approval_impl::ApprovalServiceImpl;
 pub use approval_policy_impl::ApprovalPolicyServiceImpl;
 pub use checkpoint_impl::CheckpointServiceImpl;
@@ -57,7 +108,13 @@ pub use eval_run_impl::EvalRunServiceImpl;
 pub use event_helpers::make_envelope;
 pub use external_worker_impl::{parse_outcome, ExternalWorkerService, ExternalWorkerServiceImpl};
 pub use ingest_job_impl::IngestJobServiceImpl;
+pub use knowledge_provider_impl::{
+    handle_configure_knowledge_provider, KnowledgeProviderService, KnowledgeProviderServiceImpl,
+};
 pub use mailbox_impl::MailboxServiceImpl;
+pub use memory_provider_impl::{
+    handle_configure_memory_provider, MemoryProviderService, MemoryProviderServiceImpl,
+};
 pub use observability_impl::LlmObservabilityServiceImpl;
 pub use project_impl::ProjectServiceImpl;
 pub use prompt_asset_impl::PromptAssetServiceImpl;
@@ -67,6 +124,8 @@ pub use route_resolver_impl::SimpleRouteResolver;
 pub use signal_impl::SignalServiceImpl;
 pub use skill_catalog_impl::SkillCatalogServiceImpl;
 pub use tenant_impl::TenantServiceImpl;
+pub use tool_call_approval_impl::ToolCallApprovalServiceImpl;
+pub use tool_call_approval_reader_adapter::ToolCallApprovalReaderAdapter;
 pub use tool_invocation_impl::{ToolInvocationService, ToolInvocationServiceImpl};
 pub use voice_impl::InMemoryVoiceService;
 pub use workspace_impl::WorkspaceServiceImpl;
@@ -74,7 +133,10 @@ pub use workspace_impl::WorkspaceServiceImpl;
 pub use audit_impl::AuditServiceImpl;
 pub use budget_impl::BudgetServiceImpl;
 pub use channel_impl::ChannelServiceImpl;
-pub use credential_impl::CredentialServiceImpl;
+pub use credential_impl::{
+    decrypt_credential_record, scan_legacy_ciphertexts, CredentialServiceImpl, LegacyCredential,
+    MasterKey, MasterKeyError,
+};
 pub use defaults_impl::DefaultsServiceImpl;
 pub use guardrail_impl::GuardrailServiceImpl;
 pub use license_impl::LicenseServiceImpl;
@@ -96,11 +158,14 @@ pub use route_policy_impl::RoutePolicyServiceImpl;
 pub use run_cost_alert_impl::RunCostAlertServiceImpl;
 pub use run_sla_impl::RunSlaServiceImpl;
 pub use signal_router_impl::SignalRouterServiceImpl;
+pub use tenant_role_impl::TenantRoleServiceImpl;
 pub use workspace_membership_impl::WorkspaceMembershipServiceImpl;
 
+// ── Tenancy & identity (extras) ──────────────────────────────────────────
 pub mod resource_sharing_impl;
 pub use resource_sharing_impl::ResourceSharingServiceImpl;
 
+// ── Provider routing (extras) ────────────────────────────────────────────
 pub mod ollama_provider;
 pub use ollama_provider::{OllamaModel, OllamaProvider, OllamaTagsResponse};
 
@@ -110,13 +175,14 @@ pub use ollama_embedding::OllamaEmbeddingProvider;
 pub mod provider_health_tracker;
 pub use provider_health_tracker::ProviderHealthTracker;
 
+// ── Skill & plugin (marketplace + trigger + plugin host) ─────────────────
 pub mod marketplace_service;
 pub use marketplace_service::{
-    catalog_entry_to_descriptor, is_plugin_tool_visible, is_signal_allowed, resolve_capture_policy,
-    CredentialKind, CredentialScopeHint, CredentialScopeKey, CredentialSpec, CredentialValue,
-    DescriptorSource, GraphNodeId, HealthCheckSpec, MarketplaceCommand, MarketplaceError,
-    MarketplaceEvent, MarketplaceRecord, MarketplaceService, MarketplaceState, PluginDescriptor,
-    PluginEnablement, ResolvedCapturePolicy,
+    catalog_entry_to_descriptor, is_plugin_tool_visible, is_signal_allowed, is_tool_visible,
+    resolve_capture_policy, CredentialKind, CredentialScopeHint, CredentialScopeKey,
+    CredentialSpec, CredentialValue, DescriptorSource, GraphNodeId, HealthCheckSpec,
+    MarketplaceCommand, MarketplaceError, MarketplaceEvent, MarketplaceRecord, MarketplaceService,
+    MarketplaceState, PluginDescriptor, PluginEnablement, ResolvedCapturePolicy, GATABLE_BUILTINS,
 };
 
 pub mod trigger_service;
@@ -139,17 +205,32 @@ pub use plugin_host::{PluginError, PluginHost, PluginState};
 pub mod plugin_event_router;
 pub use plugin_event_router::{DeliveryFailure, PluginEventRouter};
 
+// ── Provider routing (router + chain + routed-generation) ────────────────
 pub mod provider_router;
 pub use provider_router::{
     DispatchEntry, ProviderRouter, RoutableProvider, RoutingConfig, RoutingOutcome,
 };
 
+pub mod model_chain;
+pub use model_chain::{
+    format_attempt_summary, CooldownMap, FallbackAttempt, FallbackOutcome, ModelChain,
+    DEFAULT_RATE_LIMIT_COOLDOWN,
+};
+
+pub mod routed_generation;
+pub use routed_generation::{
+    single_model_service, RoutedBinding, RoutedGenerationError, RoutedGenerationService,
+    RoutedGenerationSuccess,
+};
+
+// ── Prompt & evals (release pipeline) ────────────────────────────────────
 pub mod prompt_release_pipeline;
 pub use prompt_release_pipeline::{
     DiffKind, DiffLine, PromptReleasePipeline, RolloutState, RolloutStatus, RoutingDecision,
     VersionDiff,
 };
 
+// ── Tenancy & identity (workspace quota) ─────────────────────────────────
 pub mod workspace_quota;
 pub use workspace_quota::{
     IsolationViolation, QuotaViolation, TenantAccessPolicy, WorkspaceQuotaManager,

@@ -60,6 +60,12 @@ export interface DataTableProps<T> {
   onRowClick?:   (row: T, index: number) => void;
   /** Derive a stable string key from a row (required when selectedIds is set). */
   getRowId?:     (row: T) => string;
+  /**
+   * Extra class applied to every `<tr>`. Opt-in; keeps the shared DataTable
+   * free of implicit Tailwind scopes. Pass `"group"` (or a named group) when
+   * the row contains children that rely on `group-hover:*` reveal patterns.
+   */
+  rowClassName?: string;
 }
 
 type SortDir = 'asc' | 'desc';
@@ -112,6 +118,7 @@ export function DataTable<T>({
   selectedIds,
   onRowClick,
   getRowId,
+  rowClassName,
 }: DataTableProps<T>) {
   const [query,      setQuery]      = useState('');
   const [sortKey,    setSortKey]    = useState<string | null>(null);
@@ -260,14 +267,15 @@ export function DataTable<T>({
                   onClick={() => onRowClick?.(row, absIdx)}
                   className={clsx(
                     'border-b border-gray-200/50 dark:border-zinc-800/50 last:border-0 transition-colors',
+                    rowClassName,
                     onRowClick ? 'cursor-pointer' : '',
                     isActive
-                      ? 'bg-zinc-700/70 ring-1 ring-inset ring-zinc-500/60'
+                      ? 'bg-gray-200 dark:bg-zinc-700/70 ring-1 ring-inset ring-indigo-400/60 dark:ring-zinc-500/60 text-gray-900 dark:text-zinc-100'
                       : isSelected
-                        ? 'bg-indigo-950/40 hover:bg-indigo-950/60'
+                        ? 'bg-indigo-600/15 dark:bg-indigo-950/40 hover:bg-indigo-600/20 dark:hover:bg-indigo-950/60 text-gray-900 dark:text-zinc-100'
                         : i % 2 === 0
-                          ? 'bg-gray-50 dark:bg-zinc-900 hover:bg-white/5'
-                          : 'bg-gray-50/50 dark:bg-zinc-900/50 hover:bg-white/5',
+                          ? 'bg-gray-50 dark:bg-zinc-900 hover:bg-gray-100 dark:hover:bg-zinc-800/70 text-gray-700 dark:text-zinc-300 hover:text-gray-900 dark:hover:text-zinc-100'
+                          : 'bg-gray-50/50 dark:bg-zinc-900/50 hover:bg-gray-100 dark:hover:bg-zinc-800/70 text-gray-700 dark:text-zinc-300 hover:text-gray-900 dark:hover:text-zinc-100',
                   )}
                 >
                   {columns.map(col => (

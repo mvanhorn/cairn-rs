@@ -8,6 +8,7 @@
  */
 
 import type {
+  ApprovalMatchPolicy,
   ApprovalRecord,
   CostSummary,
   DashboardOverview,
@@ -17,9 +18,13 @@ import type {
   RunRecord,
   SessionRecord,
   SystemStatus,
+  ToolCallApprovalRecord,
+  ToolCallApprovalState,
+  UnifiedApproval,
 } from "./types";
 import { getStoredScope } from "../hooks/useScope";
 import { DEFAULT_SCOPE } from "./scope";
+import { redactSecrets } from "./redact";
 
 type RunModeRequest =
   | { type: "direct" }
@@ -46,8 +51,18 @@ export interface ApiClientConfig {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
-  constructor(status: number, code: string, message: string) {
-    super(message);
+  constructor(status: number, code: string, message: unknown) {
+    // SECURITY: final belt-and-suspenders redaction. The backend is the
+    // primary defence (see crates/cairn-providers/src/redact.rs), but any
+    // error text that reaches a user-visible toast flows through here
+    // first. Redacting at construction means every consumer of
+    // `ApiError.message` is safe by default.
+    //
+    // Coerce to string before redacting: some legacy handlers return
+    // `{ message: {...} }` or `{ error: <array> }` as the error body,
+    // and `redactSecrets` would crash calling `.replace` on a non-string.
+    // String() is safe for every JS value (null/undefined/object/array).
+    super(redactSecrets(typeof message === "string" ? message : String(message)));
     this.name = "ApiError";
     this.status = status;
     this.code = code;
@@ -83,14 +98,19 @@ async function apiFetch<T>(
     let message = `HTTP ${response.status}`;
     try {
       const err = await response.json();
-      code = err.code ?? code;
-      // Cairn handlers use two body shapes for errors:
-      //   1. `{ code, message }`    — used by most handlers.
-      //   2. `{ error: string }`    — used by repo_routes, credentials, and
+      // Cairn handlers use THREE body shapes for errors:
+      //   1. `{ code, message }`          — unified envelope (majority).
+      //   2. `{ error: string }`          — repo_routes, credentials, and
       //      a handful of older handlers that predate the unified envelope.
-      // Prefer `message` when present, fall back to `error` so UI toasts
-      // surface the real backend reason instead of a generic `HTTP 400`.
-      message = err.message ?? err.error ?? message;
+      //   3. `{ error_code, hint, ... }`  — RFC-026 PR-A0 structured 403
+      //      for `tenant_role_missing`. The body diverges from (1) on
+      //      purpose so the UI `<AdminGate>` wrapper can distinguish
+      //      "admin role not present, but operator exists" from a
+      //      generic 403. See `crates/cairn-app/src/errors.rs`.
+      // Resolution order for `code`:  code → error_code.
+      // Resolution order for `message`: message → hint → error.
+      code    = err.code  ?? err.error_code ?? code;
+      message = err.message ?? err.hint ?? err.error ?? message;
     } catch {
       // ignore JSON parse failure — use defaults above
     }
@@ -103,13 +123,60 @@ async function apiFetch<T>(
   return JSON.parse(text) as T;
 }
 
+/**
+ * RFC 031 PR-D: variant of `apiFetch` that returns the parsed body AND
+ * the raw `Response` so callers can read response headers (notably the
+ * `ETag` emitted on agent-role GET/POST/PATCH 2xx responses). Reuses
+ * the same auth + error-envelope semantics as `apiFetch`.
+ */
+async function apiFetchWithResponse<T>(
+  config: ApiClientConfig,
+  path: string,
+  options: RequestInit = {},
+): Promise<{ body: T; response: Response }> {
+  const url = `${config.baseUrl}${path}`;
+  const headers: HeadersInit = {
+    Authorization: `Bearer ${config.token}`,
+    ...(options.body ? { "Content-Type": "application/json" } : {}),
+    ...options.headers,
+  };
+  const response = await fetch(url, { ...options, headers });
+  if (!response.ok) {
+    let code = "unknown_error";
+    let message = `HTTP ${response.status}`;
+    try {
+      const err = await response.json();
+      code = err.code ?? err.error_code ?? code;
+      message = err.message ?? err.hint ?? err.error ?? message;
+    } catch {
+      /* keep defaults */
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  const text = await response.text();
+  // Trim before the emptiness check so whitespace-only responses
+  // (e.g. a server that sends `"\n"` for 204-ish bodies) skip the
+  // JSON.parse call that would otherwise throw. Mirrors the
+  // defensive shape the canonical `apiFetch` already uses.
+  const body = text.trim() ? (JSON.parse(text) as T) : (undefined as T);
+  return { body, response };
+}
+
 // ── List response unwrapper ───────────────────────────────────────────────────
 
 /**
  * The server may return list endpoints as either a plain `T[]` array or wrapped
  * in `{ items: T[] }`.  This helper normalises both shapes into a plain array.
+ *
+ * **#425:** exported for pages that already hold a list payload (e.g. a
+ * TanStack-Query cached object with `items` AND `has_more`) and just need to
+ * unwrap safely. Pages that DON'T need the `has_more` flag should instead
+ * reach for `client.<method>()` that internally routes through `getList()` —
+ * that's the canonical path. This helper exists as a narrow
+ * escape-hatch/migration aid so sites re-implementing it inline can drop the
+ * copy (DecisionsPage:51-52, DashboardPage:355-356 pre-#425).
  */
-function unwrapList<T>(data: unknown): T[] {
+export function unwrapList<T>(data: unknown): T[] {
   if (Array.isArray(data)) return data as T[];
   if (data && typeof data === 'object' && 'items' in data && Array.isArray((data as { items: unknown }).items)) {
     return (data as { items: T[] }).items;
@@ -133,13 +200,34 @@ function unwrapRun(data: unknown): RunRecord {
 /**
  * Parse Prometheus exposition format text into a MetricsSnapshot object.
  *
- * The cairn backend emits lines like:
- *   http_requests_total{method="GET",path="/v1/runs",status="200"} 42
- *   http_request_duration_ms_sum{method="GET",path="/v1/runs"} 1234
- *   http_request_duration_ms_count{method="GET",path="/v1/runs"} 42
- *   http_request_duration_ms_bucket{method="GET",path="/v1/runs",le="100"} 40
- *   active_runs_total 3
- *   active_tasks_total 7
+ * The parser recognises two distinct metric families:
+ *
+ * 1. **`/v1/metrics/prometheus` (the cairn-app handler — primary path).**
+ *    Emits direct gauges computed from the live latency reservoir and
+ *    per-path / per-status counters. No histogram buckets.
+ *      cairn_http_requests_total                                 42
+ *      cairn_http_requests_by_path_total{path="/v1/runs"}        42
+ *      cairn_http_latency_ms{quantile="0.50"}                    12
+ *      cairn_http_latency_ms{quantile="0.95"}                    85
+ *      cairn_http_latency_ms{quantile="0.99"}                   140
+ *      cairn_http_latency_ms{quantile="avg"}                     18
+ *      cairn_http_error_rate                                      0.004
+ *      cairn_http_errors_by_status{status="500"}                  2
+ *
+ * 2. **Standard Prometheus histogram + generic counters (defensive
+ *    fallback).** Kept so the parser still works against any upstream
+ *    `text/plain` scrape that emits classical histogram buckets — e.g. a
+ *    future hardening of the endpoint or a proxy that re-exports buckets.
+ *      http_requests_total{method="GET",path="/v1/runs",status="200"} 42
+ *      http_request_duration_ms_sum{method="GET",path="/v1/runs"}   1234
+ *      http_request_duration_ms_count{method="GET",path="/v1/runs"}   42
+ *      http_request_duration_ms_bucket{method="GET",path="/v1/runs",le="100"} 40
+ *      active_runs_total                                              3
+ *      active_tasks_total                                             7
+ *
+ * Both forms accept an optional `cairn_` prefix (see #131). When both a
+ * direct quantile gauge and a bucket series are present, the direct
+ * gauge wins — the reservoir is authoritative.
  */
 function parsePrometheusMetrics(text: string): {
   total_requests: number;
@@ -163,6 +251,17 @@ function parsePrometheusMetrics(text: string): {
 
   // Histogram buckets keyed by path: { le_value => cumulative_count }
   const bucketsByPath: Record<string, { le: number; count: number }[]> = {};
+
+  // Direct quantile/gauge values emitted by `/v1/metrics/prometheus`
+  // (cairn_http_latency_ms{quantile="0.50|0.95|0.99|avg"}). These take
+  // precedence over histogram-bucket-derived percentiles when present —
+  // the Rust handler computes them from the live reservoir and doesn't
+  // emit `*_bucket` series.
+  let quantileP50: number | null = null;
+  let quantileP95: number | null = null;
+  let quantileP99: number | null = null;
+  let quantileAvg: number | null = null;
+  let directErrorRate: number | null = null;
 
   function parseLabels(labelsStr: string | undefined): Record<string, string> {
     const labels: Record<string, string> = {};
@@ -234,6 +333,39 @@ function parsePrometheusMetrics(text: string): {
     if (metricName === 'active_tasks_total' || metricName === 'cairn_active_tasks_total') {
       requestsByPath['active_tasks (gauge)'] = value;
     }
+
+    // cairn_http_latency_ms{quantile="0.50|0.95|0.99|avg"} — direct gauges
+    // from the `/v1/metrics/prometheus` handler (no histogram buckets).
+    if (metricName === 'cairn_http_latency_ms' || metricName === 'http_latency_ms') {
+      if (labels.quantile === '0.50') quantileP50 = value;
+      else if (labels.quantile === '0.95') quantileP95 = value;
+      else if (labels.quantile === '0.99') quantileP99 = value;
+      else if (labels.quantile === 'avg')  quantileAvg = value;
+    }
+
+    // cairn_http_requests_by_path_total{path="…"} — per-path request counts
+    // (the handler keeps this separate from the unlabelled `*_requests_total`).
+    if (metricName === 'cairn_http_requests_by_path_total' ||
+        metricName === 'http_requests_by_path_total') {
+      if (labels.path) {
+        requestsByPath[labels.path] = (requestsByPath[labels.path] ?? 0) + value;
+      }
+    }
+
+    // cairn_http_error_rate — gauge, fraction in [0,1].
+    if (metricName === 'cairn_http_error_rate' || metricName === 'http_error_rate') {
+      directErrorRate = value;
+    }
+
+    // cairn_http_errors_by_status{status="…"} — counters.
+    if (metricName === 'cairn_http_errors_by_status' ||
+        metricName === 'http_errors_by_status') {
+      if (labels.status) {
+        errorsByStatus[labels.status] =
+          (errorsByStatus[labels.status] ?? 0) + value;
+        totalErrors += value;
+      }
+    }
   }
 
   // Compute avg latency from sum/count.
@@ -263,16 +395,20 @@ function parsePrometheusMetrics(text: string): {
     return sortedLe[sortedLe.length - 1] ?? 0;
   }
 
-  const p50 = percentileFromBuckets(0.5);
-  const p95 = percentileFromBuckets(0.95);
-  const p99 = percentileFromBuckets(0.99);
+  // Prefer directly-emitted quantile gauges (from `/v1/metrics/prometheus`)
+  // over bucket-derived approximations when both are available.
+  const p50 = quantileP50 ?? percentileFromBuckets(0.5);
+  const p95 = quantileP95 ?? percentileFromBuckets(0.95);
+  const p99 = quantileP99 ?? percentileFromBuckets(0.99);
+  const avgLatencyFinal = quantileAvg ?? avgLatency;
 
-  const errorRate = totalRequests > 0 ? totalErrors / totalRequests : 0;
+  const errorRate = directErrorRate ??
+    (totalRequests > 0 ? totalErrors / totalRequests : 0);
 
   return {
     total_requests: totalRequests,
     requests_by_path: requestsByPath,
-    avg_latency_ms: avgLatency,
+    avg_latency_ms: avgLatencyFinal,
     p50_latency_ms: p50,
     p95_latency_ms: p95,
     p99_latency_ms: p99,
@@ -317,6 +453,12 @@ export function createApiClient(config: ApiClientConfig) {
   const put  = <T>(path: string, body?: unknown) =>
     apiFetch<T>(config, path, {
       method: "PUT",
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  // PATCH is used for partial-update endpoints (#426: /v1/sources/:id).
+  const patch = <T>(path: string, body?: unknown) =>
+    apiFetch<T>(config, path, {
+      method: "PATCH",
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   const del  = <T>(path: string) => apiFetch<T>(config, path, { method: "DELETE" });
@@ -396,22 +538,34 @@ export function createApiClient(config: ApiClientConfig) {
 
     // ── Runs ──────────────────────────────────────────────────────────────────
 
-    /** GET /v1/runs — list runs (filtered by project if params supplied). */
+    /** GET /v1/runs — list runs (filtered by project if params supplied).
+     *
+     *  `status` and `agent_role_id` narrow the server-side scan:
+     *  - `status` = run-state wire name (`pending`, `running`,
+     *    `waiting_approval`, …). Unknown values produce 422.
+     *  - `agent_role_id` exact-matches the run's `agent_role_id`;
+     *    runs without a role set never match (RFC 031 PR-D3). Used
+     *    by the retract-confirmation modal to probe in-flight-run
+     *    count before the operator commits. */
     getRuns: (params?: {
       tenant_id?: string;
       workspace_id?: string;
       project_id?: string;
+      status?: string;
+      agent_role_id?: string;
       limit?: number;
       offset?: number;
       inherit_scope?: boolean;
     }): Promise<RunRecord[]> => {
       const merged = params?.inherit_scope === false ? (params ?? {}) : withScope(params);
       const qs = new URLSearchParams();
-      if (merged.tenant_id)             qs.set("tenant_id",    merged.tenant_id);
-      if (merged.workspace_id)          qs.set("workspace_id", merged.workspace_id);
-      if (merged.project_id)            qs.set("project_id",   merged.project_id);
-      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
-      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      if (merged.tenant_id)                qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id)             qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)               qs.set("project_id",   merged.project_id);
+      if (params?.status)                  qs.set("status",        params.status);
+      if (params?.agent_role_id)           qs.set("agent_role_id", params.agent_role_id);
+      if (params?.limit  !== undefined)    qs.set("limit",         String(params.limit));
+      if (params?.offset !== undefined)    qs.set("offset",        String(params.offset));
       const query = qs.toString() ? `?${qs}` : "";
       return getList(`/v1/runs${query}`);
     },
@@ -436,6 +590,81 @@ export function createApiClient(config: ApiClientConfig) {
       return unwrapRun(raw);
     },
 
+    /**
+     * GET /v1/runs/:id — full envelope form used by the run detail page.
+     * F47 PR2 ships `{ run, tasks, completion }`; older servers still return
+     * bare `RunRecord`. Normalize both into the envelope shape so callers
+     * can branch on `completion === null` without feature-detecting the wire
+     * format.
+     */
+    getRunDetail: async (runId: string): Promise<{
+      run: RunRecord;
+      tasks?: import("./types").TaskRecord[];
+      completion: import("./types").RunCompletion | null;
+    }> => {
+      const raw = await get<
+        RunRecord | {
+          run: RunRecord;
+          tasks?: import("./types").TaskRecord[];
+          completion?: import("./types").RunCompletion | null;
+        }
+      >(`/v1/runs/${encodeURIComponent(runId)}`);
+      if (raw && typeof raw === "object" && "run" in raw) {
+        const env = raw as {
+          run: RunRecord;
+          tasks?: import("./types").TaskRecord[];
+          completion?: import("./types").RunCompletion | null;
+        };
+        return {
+          run: env.run,
+          tasks: env.tasks,
+          completion: env.completion ?? null,
+        };
+      }
+      return { run: raw as RunRecord, completion: null };
+    },
+
+    // ── Tenants (scope discovery) ────────────────────────────────────────────
+
+    /** GET /v1/admin/tenants — list all tenants visible to the admin token.
+     *
+     *  Used by the scope picker and the first-login starter flow to discover
+     *  what tenants exist before forcing the operator to type an ID. */
+    listTenants: (
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").TenantRecord[]> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return getList(`/v1/admin/tenants${q}`);
+    },
+
+    /** POST /v1/admin/tenants — create a tenant from the scope picker / starter. */
+    createTenant: (body: { tenant_id: string; name: string }): Promise<import("./types").TenantRecord> =>
+      post("/v1/admin/tenants", body),
+
+    // ── Projects (scope discovery) ───────────────────────────────────────────
+
+    /** GET /v1/admin/workspaces/:workspace_id/projects — list projects for a workspace. */
+    listProjects: (
+      workspaceId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ProjectRecord[]> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return getList(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/projects${q}`);
+    },
+
+    /** POST /v1/admin/workspaces/:workspace_id/projects — create a project. */
+    createProject: (
+      workspaceId: string,
+      body: { project_id: string; name: string },
+    ): Promise<import("./types").ProjectRecord> =>
+      post(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/projects`, body),
+
     // ── Workspaces ────────────────────────────────────────────────────────────
 
     /** GET /v1/admin/tenants/:tenant_id/workspaces — list persisted workspaces for one tenant. */
@@ -456,6 +685,286 @@ export function createApiClient(config: ApiClientConfig) {
       body: { workspace_id: string; name: string },
     ): Promise<import("./types").WorkspaceRecord> =>
       post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/workspaces`, body),
+
+    /**
+     * DELETE /v1/admin/tenants/:tenant_id/workspaces/:workspace_id — soft-delete
+     * a workspace (issue #218). The record is preserved on the backend with
+     * `archived_at` set so audit trails remain intact; by default the workspace
+     * drops out of `getWorkspaces`. Pass `include_archived: true` on a GET to
+     * surface archived workspaces again.
+     */
+    deleteWorkspace: (tenantId: string, workspaceId: string): Promise<void> =>
+      del<void>(
+        `/v1/admin/tenants/${encodeURIComponent(tenantId)}/workspaces/${encodeURIComponent(workspaceId)}`,
+      ),
+
+    // ── Admin: tenants (RFC-026 PR-A1) ───────────────────────────────────────
+
+    /** GET /v1/admin/tenants/:id — single tenant record. */
+    getTenant: (tenantId: string): Promise<import("./types").TenantRecord> =>
+      get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}`),
+
+    /**
+     * GET /v1/admin/tenants/:id/overview — per-workspace roll-up of members,
+     * projects, and active runs for the tenant. Used by the RFC-026 admin UI
+     * to populate the per-tenant summary without N+1 fetches.
+     */
+    getTenantOverview: (tenantId: string): Promise<import("./types").TenantOverview> =>
+      get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/overview`),
+
+    /**
+     * PATCH /v1/admin/tenants/:id — edit tenant metadata (RFC-026 PR-A2).
+     * Every field is optional; omit fields you don't want to change. An
+     * all-`undefined` body is rejected server-side with 422 `empty_patch`.
+     * Guard: caller must hold `TenantRole::Admin` on the target tenant,
+     * or use the deployment `CAIRN_ADMIN_TOKEN` (god-token).
+     */
+    updateTenant: (
+      tenantId: string,
+      body: { name?: string },
+    ): Promise<import("./types").TenantRecord> =>
+      patch(`/v1/admin/tenants/${encodeURIComponent(tenantId)}`, body),
+
+    /**
+     * PATCH /v1/admin/tenants/:tenant_id/operator-profiles/:id — edit an
+     * operator profile's display_name, email, or WorkspaceRole (RFC-026
+     * PR-A2). Omitted fields are preserved. A non-admin operator targeting
+     * another tenant's operator gets 404, not 403, to avoid leaking the
+     * existence of cross-tenant ids.
+     */
+    updateOperatorProfile: (
+      tenantId: string,
+      operatorId: string,
+      body: {
+        display_name?: string;
+        email?: string;
+        role?: "owner" | "admin" | "member" | "viewer";
+      },
+    ): Promise<import("./types").OperatorProfile> =>
+      patch(
+        `/v1/admin/tenants/${encodeURIComponent(tenantId)}/operator-profiles/${encodeURIComponent(operatorId)}`,
+        body,
+      ),
+
+    // ── Admin: quotas (RFC-026 PR-A1) ────────────────────────────────────────
+
+    /** GET /v1/admin/tenants/:tenant_id/quota — current concurrent/session/task limits + live usage. */
+    getTenantQuota: (tenantId: string): Promise<import("./types").TenantQuota> =>
+      get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/quota`),
+
+    /** POST /v1/admin/tenants/:tenant_id/quota — set tenant quota limits. */
+    setTenantQuota: (
+      tenantId: string,
+      body: import("./types").SetTenantQuotaRequest,
+    ): Promise<import("./types").TenantQuota> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/quota`, body),
+
+    // ── Admin: retention (RFC-026 PR-A1) ─────────────────────────────────────
+
+    /** GET /v1/admin/tenants/:tenant_id/retention-policy — fetch retention policy. */
+    getRetentionPolicy: (tenantId: string): Promise<import("./types").RetentionPolicy> =>
+      get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/retention-policy`),
+
+    /** POST /v1/admin/tenants/:tenant_id/retention-policy — set retention policy. */
+    setRetentionPolicy: (
+      tenantId: string,
+      body: import("./types").SetRetentionPolicyRequest,
+    ): Promise<import("./types").RetentionPolicy> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/retention-policy`, body),
+
+    /**
+     * POST /v1/admin/tenants/:tenant_id/apply-retention — trigger retention
+     * sweep now. Returns a count of events pruned and entities affected.
+     */
+    applyRetention: (tenantId: string): Promise<import("./types").RetentionResult> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/apply-retention`, {}),
+
+    // ── Admin: workspace members (RFC-026 PR-A1) ─────────────────────────────
+
+    /**
+     * POST /v1/admin/workspaces/:workspace_id/members — add an operator as a
+     * workspace member with a `WorkspaceRole`.
+     */
+    addWorkspaceMember: (
+      workspaceId: string,
+      body: import("./types").AddWorkspaceMemberRequest,
+    ): Promise<import("./types").WorkspaceMember> =>
+      post(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members`, body),
+
+    /**
+     * GET /v1/admin/workspaces/:workspace_id/members — list current members.
+     * Backend returns `{items, hasMore}` (camelCase via the `ListResponse<T>`
+     * contract); we keep the envelope so callers can surface "load more"
+     * controls.
+     */
+    listWorkspaceMembers: (
+      workspaceId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").WorkspaceMember>> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return get(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members${q}`);
+    },
+
+    /** DELETE /v1/admin/workspaces/:workspace_id/members/:member_id — remove a member. */
+    removeWorkspaceMember: (
+      workspaceId: string,
+      memberId: string,
+    ): Promise<{ ok: boolean }> =>
+      del(
+        `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(memberId)}`,
+      ),
+
+    // ── Admin: workspace shares (RFC-026 PR-A1) ──────────────────────────────
+
+    /** POST /v1/admin/workspaces/:workspace_id/shares — create a cross-workspace share. */
+    createWorkspaceShare: (
+      workspaceId: string,
+      body: import("./types").CreateWorkspaceShareRequest,
+    ): Promise<import("./types").WorkspaceShare> =>
+      post(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/shares`, body),
+
+    /** GET /v1/admin/workspaces/:workspace_id/shares — list shares originating from a workspace. */
+    listWorkspaceShares: (
+      workspaceId: string,
+      params: { tenant_id: string; limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").WorkspaceShare>> => {
+      const qs = new URLSearchParams();
+      qs.set("tenant_id", params.tenant_id);
+      if (params.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params.offset !== undefined) qs.set("offset", String(params.offset));
+      return get(`/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/shares?${qs}`);
+    },
+
+    /** DELETE /v1/admin/workspaces/:workspace_id/shares/:share_id — revoke a share. */
+    revokeWorkspaceShare: (
+      workspaceId: string,
+      shareId: string,
+    ): Promise<{ ok: boolean }> =>
+      del(
+        `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/shares/${encodeURIComponent(shareId)}`,
+      ),
+
+    // ── Admin: operator profiles (RFC-026 PR-A1) ─────────────────────────────
+
+    /**
+     * POST /v1/admin/tenants/:tenant_id/operator-profiles — create a new
+     * operator profile scoped to a tenant, with an initial workspace role.
+     */
+    createOperatorProfile: (
+      tenantId: string,
+      body: import("./types").CreateOperatorProfileRequest,
+    ): Promise<import("./types").OperatorProfile> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/operator-profiles`, body),
+
+    /**
+     * GET /v1/admin/tenants/:tenant_id/operator-profiles — list operator
+     * profiles within a tenant. Admin-only: operator rosters are sensitive
+     * metadata so even same-tenant non-admins receive 403.
+     */
+    listOperatorProfiles: (
+      tenantId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").OperatorProfile>> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/operator-profiles${q}`);
+    },
+
+    // ── Admin: tenant-role grants (RFC-026 PR-A0) ────────────────────────────
+    //
+    // PR-A0 added these endpoints; PR-A1 wires them into the client so the
+    // UI can promote/demote operators onto a tenant-admin role without
+    // shelling curl with the god token.
+
+    /**
+     * POST /v1/admin/operators/:id/tenant-roles/:tenant/promote — grant
+     * `role` on `tenant` to operator `:id`. Used by RFC-026 admin UI to
+     * delegate tenant administration from one tenant-admin to another
+     * operator.
+     */
+    promoteOperatorTenantRole: (
+      operatorId: string,
+      tenantId: string,
+      role: import("./types").TenantRole,
+    ): Promise<import("./types").TenantRoleGrant> =>
+      post(
+        `/v1/admin/operators/${encodeURIComponent(operatorId)}/tenant-roles/${encodeURIComponent(tenantId)}/promote`,
+        { role },
+      ),
+
+    /**
+     * DELETE /v1/admin/operators/:id/tenant-roles/:tenant — soft-revoke an
+     * operator's tenant-scope role. The projection row is retained with
+     * `revoked_at_ms` + `revoked_by` populated for audit.
+     */
+    revokeOperatorTenantRole: (
+      operatorId: string,
+      tenantId: string,
+    ): Promise<import("./types").TenantRoleGrant> =>
+      del(
+        `/v1/admin/operators/${encodeURIComponent(operatorId)}/tenant-roles/${encodeURIComponent(tenantId)}`,
+      ),
+
+    /**
+     * GET /v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles
+     * — list every tenant-role grant the operator holds (active + soft-
+     * revoked). Tenant-scoped so `TenantAdminGuard` authorizes on
+     * `:tenant_id`; cross-tenant operator ids return 404. RFC-026 PR-A4.
+     *
+     * Note: the response cross-cuts tenants (an operator on home tenant
+     * T can be surfaced as also holding roles on T' / T'' in the list)
+     * — revoke still requires admin on each target tenant, so the
+     * broader read surface does not enable escalation.
+     */
+    listOperatorTenantRoles: (
+      tenantId: string,
+      operatorId: string,
+    ): Promise<import("./types").ListResponse<import("./types").TenantRoleGrant>> =>
+      get(
+        `/v1/admin/tenants/${encodeURIComponent(tenantId)}/operators/${encodeURIComponent(operatorId)}/tenant-roles`,
+      ),
+
+    // ── Admin: snapshots + event-log compaction (RFC-026 PR-A1) ──────────────
+
+    /** POST /v1/admin/tenants/:id/snapshot — create a point-in-time snapshot. */
+    createSnapshot: (tenantId: string): Promise<import("./types").Snapshot> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/snapshot`, {}),
+
+    /** GET /v1/admin/tenants/:id/snapshots — list snapshots for a tenant. */
+    listSnapshots: (
+      tenantId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").Snapshot>> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return get(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/snapshots${q}`);
+    },
+
+    /**
+     * POST /v1/admin/tenants/:id/restore — restore the tenant's state from
+     * the latest snapshot. Returns an opaque report object whose shape
+     * varies per backend — consumers display the serialised JSON.
+     */
+    restoreSnapshot: (tenantId: string): Promise<import("./types").RestoreSnapshotReport> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/restore`, {}),
+
+    /**
+     * POST /v1/admin/tenants/:id/compact-event-log — compact the tenant's
+     * event log, retaining only the most recent `retain_last_n` events per
+     * entity. Response shape is backend-specific.
+     */
+    compactEventLog: (
+      tenantId: string,
+      body: import("./types").CompactEventLogRequest,
+    ): Promise<import("./types").CompactEventLogReport> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/compact-event-log`, body),
 
     /** GET /v1/runs/:id/events — event timeline for a run. */
     getRunEvents: async (runId: string, limit = 100): Promise<import("./types").RunEventSummary[]> => {
@@ -559,14 +1068,122 @@ export function createApiClient(config: ApiClientConfig) {
       unwrapRun(await post<RunRecord | { run: RunRecord }>(`/v1/runs/${encodeURIComponent(runId)}/cancel`, {})),
 
     /** POST /v1/runs/:id/pause — pause a running run. */
-    pauseRun: async (runId: string, detail?: string): Promise<RunRecord> =>
-      unwrapRun(await post<RunRecord | { run: RunRecord }>(`/v1/runs/${encodeURIComponent(runId)}/pause`, { detail })),
+    pauseRun: async (runId: string, body?: import("./types").PauseRunRequest): Promise<RunRecord> =>
+      unwrapRun(await post<RunRecord | { run: RunRecord }>(`/v1/runs/${encodeURIComponent(runId)}/pause`, body ?? {})),
 
     /** POST /v1/runs/:id/resume — resume a paused run. */
-    resumeRun: async (runId: string): Promise<RunRecord> =>
-      unwrapRun(await post<RunRecord | { run: RunRecord }>(`/v1/runs/${encodeURIComponent(runId)}/resume`, {})),
+    resumeRun: async (runId: string, body?: import("./types").ResumeRunRequest): Promise<RunRecord> =>
+      unwrapRun(await post<RunRecord | { run: RunRecord }>(`/v1/runs/${encodeURIComponent(runId)}/resume`, body ?? {})),
 
-    /** POST /v1/runs — start a new run in a session. */
+    /**
+     * POST /v1/runs/:id/recover — legacy no-op kept for back-compat.
+     * Recovery is driven by FlowFabric scanners; this endpoint simply
+     * confirms the run exists and returns 202. The UI surfaces it so
+     * operators have a "nudge" affordance that matches Go-sdk parity.
+     */
+    recoverRun: (runId: string): Promise<import("./types").RecoverRunResponse> =>
+      post(`/v1/runs/${encodeURIComponent(runId)}/recover`),
+
+    /**
+     * Replay a run.
+     *
+     *  - `GET /v1/runs/:id/replay` — summary replay (optionally windowed
+     *    by `from_position` / `to_position`).
+     *  - `POST /v1/runs/:id/replay-to-checkpoint?checkpoint_id=…` —
+     *    replay up to a specific checkpoint.
+     */
+    replayRun: (
+      runId: string,
+      query?: { from_position?: number; to_position?: number; checkpoint_id?: string },
+    ): Promise<import("./types").ReplayResult> => {
+      if (query?.checkpoint_id) {
+        const qs = new URLSearchParams({ checkpoint_id: query.checkpoint_id }).toString();
+        return post(`/v1/runs/${encodeURIComponent(runId)}/replay-to-checkpoint?${qs}`);
+      }
+      const params = new URLSearchParams();
+      if (query?.from_position !== undefined) params.set("from_position", String(query.from_position));
+      if (query?.to_position !== undefined) params.set("to_position", String(query.to_position));
+      const qs = params.toString();
+      return get(`/v1/runs/${encodeURIComponent(runId)}/replay${qs ? `?${qs}` : ""}`);
+    },
+
+    /** POST /v1/runs/:id/claim — operator claim (inspection lock). */
+    claimRun: async (runId: string): Promise<RunRecord> =>
+      unwrapRun(await post<RunRecord | { run: RunRecord }>(`/v1/runs/${encodeURIComponent(runId)}/claim`)),
+
+    /** POST /v1/runs/:id/spawn — spawn a subagent run. */
+    spawnSubagentRun: (
+      runId: string,
+      body: import("./types").SpawnSubagentRequest,
+    ): Promise<import("./types").SpawnSubagentResponse> =>
+      post(`/v1/runs/${encodeURIComponent(runId)}/spawn`, body),
+
+    /** GET /v1/runs/:id/children — list subagent runs spawned by this run. */
+    listChildRuns: (runId: string, limit = 50): Promise<RunRecord[]> =>
+      getList(`/v1/runs/${encodeURIComponent(runId)}/children?limit=${limit}`),
+
+    /** POST /v1/runs/:id/orchestrate — drive the GATHER/DECIDE/EXECUTE loop.
+     *
+     * Cairn picks the model from the tenant's configured provider bindings;
+     * the caller describes the task. Any `model_id` field sent by older
+     * callers is ignored by the server.
+     *
+     * #433: sends an `Idempotency-Key` HTTP header so a retry after a
+     * 502 gateway timeout replays the first response instead of firing
+     * a second orchestration loop. The key is a fresh `crypto.randomUUID()`
+     * per call; callers that want to retry a specific submission should
+     * capture the returned key from network logs and resend it manually,
+     * or pass `idempotencyKey` explicitly.
+     */
+    orchestrateRun: (
+      runId: string,
+      body?: {
+        goal?: string;
+        max_iterations?: number;
+        timeout_ms?: number;
+        approval_timeout_ms?: number;
+        mode?: RunModeRequest;
+      },
+      idempotencyKey?: string,
+    ): Promise<import("./types").OrchestrateResult> =>
+      apiFetch<import("./types").OrchestrateResult>(
+        config,
+        `/v1/runs/${encodeURIComponent(runId)}/orchestrate`,
+        {
+          method: "POST",
+          body: JSON.stringify(body ?? {}),
+          headers: {
+            "Idempotency-Key":
+              idempotencyKey ??
+              (typeof crypto !== "undefined" && "randomUUID" in crypto
+                ? crypto.randomUUID()
+                : `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`),
+          },
+        },
+      ),
+
+    /** POST /v1/runs/:id/diagnose — return a diagnosis report for a stuck run. */
+    diagnoseRun: (runId: string): Promise<import("./types").DiagnoseResult> =>
+      post(`/v1/runs/${encodeURIComponent(runId)}/diagnose`),
+
+    /** POST /v1/runs/:id/intervene — operator intervention. */
+    interveneRun: (
+      runId: string,
+      body: import("./types").InterveneRequest,
+    ): Promise<import("./types").InterveneResponse> =>
+      post(`/v1/runs/${encodeURIComponent(runId)}/intervene`, body),
+
+    /** GET /v1/runs/:id/interventions — list interventions on this run. */
+    listRunInterventions: (runId: string, limit = 50): Promise<import("./types").InterventionRecord[]> =>
+      getList(`/v1/runs/${encodeURIComponent(runId)}/interventions?limit=${limit}`),
+
+    /** POST /v1/runs — start a new run in a session.
+     *
+     * `prompt` is the operator-supplied natural-language objective.
+     * When present, cairn persists it as the run's default goal so the
+     * orchestrator hands it to the LLM as the user-message `## Goal`
+     * section (see F42). Omit when the caller will supply `goal` on a
+     * subsequent `/orchestrate` body instead. */
     createRun: (body: {
       tenant_id?: string;
       workspace_id?: string;
@@ -575,6 +1192,10 @@ export function createApiClient(config: ApiClientConfig) {
       run_id?: string;
       parent_run_id?: string;
       mode?: RunModeRequest;
+      prompt?: string;
+      /** RFC 032: optional operator-declared contract. Omitted → cairn
+       *  infers from `prompt` at the first orchestrate boot. */
+      completion_contract?: import("./types").CompletionContract;
     }): Promise<RunRecord> => post("/v1/runs", withScope(body)),
 
     /** POST /v1/runs/batch — create multiple runs at once. */
@@ -620,12 +1241,201 @@ export function createApiClient(config: ApiClientConfig) {
       return getList(`/v1/approvals${query}`);
     },
 
-    /** POST /v1/approvals/:id/resolve — approve or reject. */
-    resolveApproval: (
+    /** @deprecated F45 — use `approveApproval(id)` / `rejectApproval(id)`.
+     *  Kept as a thin wrapper so pre-F45 call sites compile. Delegates to
+     *  the unified approve/reject paths rather than hitting `/resolve`
+     *  directly — the `/resolve` handler is retained on the server for
+     *  legacy scripts, but every client path inside the UI now goes
+     *  through the unified surface. */
+    resolveApproval: async (
       approvalId: string,
-      decision: "approved" | "rejected"
-    ): Promise<ApprovalRecord> =>
-      post(`/v1/approvals/${approvalId}/resolve`, { decision }),
+      decision: "approved" | "rejected",
+    ): Promise<ApprovalRecord> => {
+      const unified =
+        decision === "approved"
+          ? await post<UnifiedApproval>(`/v1/approvals/${encodeURIComponent(approvalId)}/approve`, {})
+          : await post<UnifiedApproval>(`/v1/approvals/${encodeURIComponent(approvalId)}/reject`, {});
+      return unified as ApprovalRecord;
+    },
+
+    // ── Unified approvals (F45) ──────────────────────────────────────────────
+    //
+    // One HTTP surface at `/v1/approvals/*` covers both plan approvals
+    // (`ApprovalRecord`) and tool-call approvals (`ToolCallApprovalRecord`).
+    // The legacy `/v1/tool-call-approvals/*` paths 308-redirect here; the
+    // client always speaks the unified surface so the redirect is never
+    // exercised in normal operation.
+
+    /** GET /v1/approvals — merged list of plan + tool-call approvals.
+     *
+     *  Filter by `kind` to narrow to one of the two, or by `state`,
+     *  `run_id`, `session_id`, or the project triple. Returns items only;
+     *  use `listApprovalsPage()` if the caller needs `hasMore`. */
+    listApprovals: (params?: {
+      kind?: "plan" | "tool_call";
+      run_id?: string;
+      session_id?: string;
+      state?: ToolCallApprovalState;
+      limit?: number;
+      offset?: number;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<UnifiedApproval[]> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      if (merged.tenant_id)    qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)   qs.set("project_id",   merged.project_id);
+      if (params?.kind)        qs.set("kind",         params.kind);
+      if (params?.run_id)      qs.set("run_id",       params.run_id);
+      if (params?.session_id)  qs.set("session_id",   params.session_id);
+      if (params?.state)       qs.set("state",        params.state);
+      if (params?.limit != null)  qs.set("limit",  String(params.limit));
+      if (params?.offset != null) qs.set("offset", String(params.offset));
+      const query = qs.toString() ? `?${qs}` : "";
+      return getList(`/v1/approvals${query}`);
+    },
+
+    /** Paginated variant of `listApprovals`. */
+    listApprovalsPage: (params?: {
+      kind?: "plan" | "tool_call";
+      run_id?: string;
+      session_id?: string;
+      state?: ToolCallApprovalState;
+      limit?: number;
+      offset?: number;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<{ items: UnifiedApproval[]; hasMore: boolean }> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      if (merged.tenant_id)    qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)   qs.set("project_id",   merged.project_id);
+      if (params?.kind)        qs.set("kind",         params.kind);
+      if (params?.run_id)      qs.set("run_id",       params.run_id);
+      if (params?.session_id)  qs.set("session_id",   params.session_id);
+      if (params?.state)       qs.set("state",        params.state);
+      if (params?.limit != null)  qs.set("limit",  String(params.limit));
+      if (params?.offset != null) qs.set("offset", String(params.offset));
+      const query = qs.toString() ? `?${qs}` : "";
+      return get<{ items: UnifiedApproval[]; hasMore: boolean }>(`/v1/approvals${query}`);
+    },
+
+    /** GET /v1/approvals/:id — fetch by id across both kinds. */
+    getApproval: (id: string): Promise<UnifiedApproval> =>
+      get(`/v1/approvals/${encodeURIComponent(id)}`),
+
+    /** POST /v1/approvals/:id/approve.
+     *
+     *  For tool-call approvals, `scope` is required:
+     *   - `{ type: "once" }` — apply to this call only.
+     *   - `{ type: "session", match_policy? }` — widen to future matching
+     *     calls in the same session. Omit `match_policy` to inherit the
+     *     match policy captured on the proposal.
+     *  `approved_tool_args` overrides any prior amendment.
+     *  For plan approvals the body is unused (pass `{}`). */
+    approveApproval: (
+      id: string,
+      body: {
+        scope?: { type: "once" } | { type: "session"; match_policy?: ApprovalMatchPolicy };
+        approved_tool_args?: unknown;
+      } = {},
+    ): Promise<UnifiedApproval> =>
+      post(`/v1/approvals/${encodeURIComponent(id)}/approve`, body),
+
+    /** POST /v1/approvals/:id/reject. */
+    rejectApproval: (
+      id: string,
+      body: { reason?: string } = {},
+    ): Promise<UnifiedApproval> =>
+      post(`/v1/approvals/${encodeURIComponent(id)}/reject`, body),
+
+    /** PATCH /v1/approvals/:id/amend — tool-call only; preview-edit
+     *  tool arguments without resolving. Returns 422 for plan approvals. */
+    amendApproval: (
+      id: string,
+      body: { new_tool_args: unknown },
+    ): Promise<UnifiedApproval> =>
+      apiFetch(config, `/v1/approvals/${encodeURIComponent(id)}/amend`, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      }),
+
+    // ── Legacy tool-call aliases (delegate to the unified surface) ──────────
+    //
+    // Kept so existing call sites compile; new code should call the
+    // unified methods above. These wrappers cast the unified response
+    // back to the narrower `ToolCallApprovalRecord` shape — safe because
+    // they only operate on tool-call ids.
+
+    /** @deprecated Use `listApprovals({ kind: "tool_call", ... })`. */
+    listToolCallApprovals: async (params?: {
+      run_id?: string;
+      session_id?: string;
+      state?: ToolCallApprovalState;
+      limit?: number;
+      offset?: number;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<ToolCallApprovalRecord[]> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      qs.set("kind", "tool_call");
+      if (merged.tenant_id)    qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)   qs.set("project_id",   merged.project_id);
+      if (params?.run_id)      qs.set("run_id",       params.run_id);
+      if (params?.session_id)  qs.set("session_id",   params.session_id);
+      if (params?.state)       qs.set("state",        params.state);
+      if (params?.limit != null)  qs.set("limit",  String(params.limit));
+      if (params?.offset != null) qs.set("offset", String(params.offset));
+      const items = await getList<UnifiedApproval>(`/v1/approvals?${qs}`);
+      return items as ToolCallApprovalRecord[];
+    },
+
+    /** @deprecated Use `getApproval(id)`. */
+    getToolCallApproval: async (callId: string): Promise<ToolCallApprovalRecord> =>
+      (await get<UnifiedApproval>(
+        `/v1/approvals/${encodeURIComponent(callId)}`,
+      )) as ToolCallApprovalRecord,
+
+    /** @deprecated Use `approveApproval(id, body)`. */
+    approveToolCallApproval: async (
+      callId: string,
+      body: {
+        scope: { type: "once" } | { type: "session"; match_policy?: ApprovalMatchPolicy };
+        approved_tool_args?: unknown;
+      },
+    ): Promise<ToolCallApprovalRecord> =>
+      (await post<UnifiedApproval>(
+        `/v1/approvals/${encodeURIComponent(callId)}/approve`,
+        body,
+      )) as ToolCallApprovalRecord,
+
+    /** @deprecated Use `rejectApproval(id, body)`. */
+    rejectToolCallApproval: async (
+      callId: string,
+      body: { reason?: string },
+    ): Promise<ToolCallApprovalRecord> =>
+      (await post<UnifiedApproval>(
+        `/v1/approvals/${encodeURIComponent(callId)}/reject`,
+        body,
+      )) as ToolCallApprovalRecord,
+
+    /** @deprecated Use `amendApproval(id, body)`. */
+    amendToolCallApproval: async (
+      callId: string,
+      body: { new_tool_args: unknown },
+    ): Promise<ToolCallApprovalRecord> =>
+      (await apiFetch<UnifiedApproval>(
+        config,
+        `/v1/approvals/${encodeURIComponent(callId)}/amend`,
+        { method: "PATCH", body: JSON.stringify(body) },
+      )) as ToolCallApprovalRecord,
 
     // ── Costs ─────────────────────────────────────────────────────────────────
 
@@ -635,11 +1445,43 @@ export function createApiClient(config: ApiClientConfig) {
      *  `summariseCostItems` to get a `CostSummary` for stat-card rendering. */
     getCosts: (): Promise<import("./types").CostListResponse> => get("/v1/costs"),
 
+    // ── Decisions (policy allow/deny audit) ─────────────────────────────────
+    //
+    // Centralised in defaultApi so that DecisionsPage no longer reads the auth
+    // token directly from localStorage (issue #387) and so every call goes
+    // through `apiFetch`, which dispatches the `cairn:auth-expired` event on
+    // 401 and applies the global retry/error conventions.
+
+    /** GET /v1/decisions — recent policy decisions (allow/deny outcomes). */
+    listDecisions: (): Promise<import("./types").Decision[]> =>
+      getList("/v1/decisions"),
+
+    /** GET /v1/decisions/cache — cached decision rules. */
+    listDecisionsCache: (): Promise<import("./types").DecisionCacheEntry[]> =>
+      getList("/v1/decisions/cache"),
+
+    /** POST /v1/decisions/:id/invalidate — invalidate a single cache entry. */
+    invalidateDecision: (
+      decisionId: string,
+      reason = "operator-invalidated",
+    ): Promise<unknown> =>
+      post(`/v1/decisions/${encodeURIComponent(decisionId)}/invalidate`, { reason }),
+
+    /** POST /v1/decisions/invalidate — bulk-invalidate the decision cache. */
+    bulkInvalidateDecisions: (
+      reason = "operator-bulk-clear",
+    ): Promise<unknown> =>
+      post("/v1/decisions/invalidate", { reason }),
+
     // ── API metrics ──────────────────────────────────────────────────────────
 
-    /** GET /v1/metrics — rolling request metrics from the tracing middleware.
-     *  The backend may return JSON or Prometheus text/plain format.
-     *  This method handles both and normalises into a MetricsSnapshot object.
+    /** GET /v1/metrics/prometheus — rolling request metrics in Prometheus
+     *  text exposition format. This endpoint emits direct quantile gauges
+     *  (`cairn_http_latency_ms{quantile="0.50|0.95|0.99|avg"}`) plus per-path
+     *  and per-status counters, so the UI can render p50/p95/p99 latency —
+     *  which the JSON `/v1/metrics` endpoint does not provide. The response
+     *  is always `text/plain`, but the JSON fallback below is kept as
+     *  defensive compatibility.
      */
     getMetrics: async (): Promise<{
       total_requests:   number;
@@ -651,7 +1493,7 @@ export function createApiClient(config: ApiClientConfig) {
       error_rate:       number;
       errors_by_status: Record<string, number>;
     }> => {
-      const url = `${config.baseUrl}/v1/metrics`;
+      const url = `${config.baseUrl}/v1/metrics/prometheus`;
       const response = await fetch(url, {
         method: "GET",
         headers: { Authorization: `Bearer ${config.token}` },
@@ -768,6 +1610,28 @@ export function createApiClient(config: ApiClientConfig) {
       }>;
     }> => get(`/v1/providers/connections/${encodeURIComponent(id)}/discover-models`),
 
+    /** POST /v1/providers/connections/discover-preview — ad-hoc discovery BEFORE
+     *  a connection record exists. Accepts the same fields the registration
+     *  form collects (adapter_type, endpoint_url, optional api_key/api_key_ref)
+     *  and returns discovered models without persisting a connection. */
+    discoverModelsPreview: (body: {
+      adapter_type?: "ollama" | "openai_compat";
+      endpoint_url?: string;
+      api_key?: string;
+      api_key_ref?: string;
+    }): Promise<{
+      provider: string;
+      endpoint: string;
+      models: Array<{
+        model_id: string;
+        name: string;
+        parameter_size?: string;
+        quantization?: string;
+        capabilities: string[];
+        context_window_tokens?: number;
+      }>;
+    }> => post(`/v1/providers/connections/discover-preview`, body),
+
     /** Convenience wrapper: return only the model IDs from `discoverModels`. */
     discoverModelIds: async (id: string): Promise<string[]> => {
       const r = await get<{ models: Array<{ model_id: string }> }>(
@@ -801,9 +1665,30 @@ export function createApiClient(config: ApiClientConfig) {
 
     // ── LLM Traces ───────────────────────────────────────────────────────────
 
-    /** GET /v1/traces — all recent LLM call traces (operator view). */
-    getTraces: (limit = 500): Promise<import("./types").TracesResponse> =>
-      get(`/v1/traces?limit=${limit}`),
+    /** GET /v1/traces — all recent LLM call traces (operator view).
+     *
+     * Scope params are folded in via `withScope()` so the request URL
+     * carries the current tenant/workspace/project for
+     * forward-compatible backend filtering. Callers that want their
+     * React-Query cache to invalidate on scope change must also
+     * include scope in their `queryKey` (see `TracesPage`).
+     */
+    getTraces: (
+      params?: {
+        limit?: number;
+        tenant_id?: string;
+        workspace_id?: string;
+        project_id?: string;
+      },
+    ): Promise<import("./types").TracesResponse> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      qs.set("limit", String(merged.limit ?? 500));
+      if (merged.tenant_id)    qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)   qs.set("project_id",   merged.project_id);
+      return get(`/v1/traces?${qs}`);
+    },
 
     /** GET /v1/sessions/:id/llm-traces — traces for one session. */
     getSessionTraces: (sessionId: string, limit = 200): Promise<import("./types").TracesResponse> =>
@@ -828,7 +1713,11 @@ export function createApiClient(config: ApiClientConfig) {
       return { items, has_more: raw.has_more ?? raw.hasMore ?? false };
     },
 
-    /** POST /v1/evals/runs — create a new eval run. */
+    /** POST /v1/evals/runs — create a new eval run.
+     *  Real eval contract: dataset_id / rubric_id / baseline_id are validated
+     *  against tenant state at create time (404 if dangling). prompt_release_id
+     *  ties the run to the subject under test when subject_kind is
+     *  `prompt_release`. */
     createEvalRun: (body: {
       eval_run_id: string;
       subject_kind: string;
@@ -836,7 +1725,78 @@ export function createApiClient(config: ApiClientConfig) {
       tenant_id?: string;
       workspace_id?: string;
       project_id?: string;
+      dataset_id?: string;
+      rubric_id?: string;
+      baseline_id?: string;
+      prompt_release_id?: string;
+      prompt_asset_id?: string;
+      prompt_version_id?: string;
+      created_by?: string;
     }): Promise<import("./types").EvalRunRecord> => post("/v1/evals/runs", withScope(body)),
+
+    /** GET /v1/evals/datasets — list datasets scoped to the active tenant. */
+    listEvalDatasets: async (): Promise<import("./types").EvalDatasetRecord[]> => {
+      const merged = withScope();
+      const qs = new URLSearchParams();
+      if (merged.tenant_id) qs.set("tenant_id", merged.tenant_id);
+      return getList<import("./types").EvalDatasetRecord>(`/v1/evals/datasets${qs.toString() ? `?${qs}` : ""}`);
+    },
+
+    /** GET /v1/evals/rubrics — list rubrics scoped to the active tenant. */
+    listEvalRubrics: async (): Promise<import("./types").EvalRubricRecord[]> => {
+      const merged = withScope();
+      const qs = new URLSearchParams();
+      if (merged.tenant_id) qs.set("tenant_id", merged.tenant_id);
+      return getList<import("./types").EvalRubricRecord>(`/v1/evals/rubrics${qs.toString() ? `?${qs}` : ""}`);
+    },
+
+    /** GET /v1/evals/baselines — list baselines scoped to the active tenant. */
+    listEvalBaselines: async (): Promise<import("./types").EvalBaselineRecord[]> => {
+      const merged = withScope();
+      const qs = new URLSearchParams();
+      if (merged.tenant_id) qs.set("tenant_id", merged.tenant_id);
+      return getList<import("./types").EvalBaselineRecord>(`/v1/evals/baselines${qs.toString() ? `?${qs}` : ""}`);
+    },
+
+    /** GET /v1/evals/compare?run_ids=a,b — side-by-side metric comparison. */
+    getEvalComparison: (runIds: string[]): Promise<import("./types").EvalCompareResponse> => {
+      const qs = new URLSearchParams();
+      qs.set("run_ids", runIds.join(","));
+      return get(`/v1/evals/compare?${qs}`);
+    },
+
+    /**
+     * GET /v1/evals/scorecards — scorecard summaries for the active project
+     * scope (issue #244). Populates the EvalsPage scorecard picker so
+     * operators can pre-select a scorecard at eval-run create time instead
+     * of having to guess prompt asset ids up front. Returned sorted by
+     * `best_task_success_rate` descending.
+     */
+    listEvalScorecards: async (): Promise<import("./types").ScorecardSummary[]> => {
+      const merged = withScope();
+      const qs = new URLSearchParams();
+      if (merged.tenant_id)    qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)   qs.set("project_id",   merged.project_id);
+      return getList<import("./types").ScorecardSummary>(
+        `/v1/evals/scorecards${qs.toString() ? `?${qs}` : ""}`,
+      );
+    },
+
+    /**
+     * DELETE /v1/evals/runs/:id — soft-delete an eval run (issue #244).
+     * The backend archives via `EvalRunArchived`; list queries exclude
+     * archived rows by default. Idempotent: re-deleting an already-archived
+     * run still returns 204.
+     */
+    deleteEvalRun: async (evalRunId: string): Promise<void> => {
+      const merged = withScope();
+      const qs = new URLSearchParams();
+      if (merged.tenant_id)    qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id)   qs.set("project_id",   merged.project_id);
+      await del(`/v1/evals/runs/${encodeURIComponent(evalRunId)}${qs.toString() ? `?${qs}` : ""}`);
+    },
 
     // ── Audit Log ────────────────────────────────────────────────────────────
 
@@ -858,13 +1818,14 @@ export function createApiClient(config: ApiClientConfig) {
       agent_role: string; approval_policy: string;
     }> => post(`/v1/agent-templates/${encodeURIComponent(templateId)}/instantiate`, withScope(body)),
 
-    listSkills: async (): Promise<import("./types").SkillsResponse> => {
+    listSkills: async (params?: { tag?: string }): Promise<import("./types").SkillsResponse> => {
+      const qs = params?.tag ? `?tag=${encodeURIComponent(params.tag)}` : "";
       const raw = await get<{
         items?: import("./types").SkillRecord[];
         summary?: import("./types").SkillsSummary;
         currentlyActive?: string[];
         currently_active?: string[];
-      }>("/v1/skills");
+      }>(`/v1/skills${qs}`);
       return {
         items: raw.items ?? [],
         summary: raw.summary ?? { total: 0, enabled: 0, disabled: 0 },
@@ -872,11 +1833,46 @@ export function createApiClient(config: ApiClientConfig) {
       };
     },
 
+    getSkill: (skillId: string): Promise<import("./types").SkillDetail> =>
+      get(`/v1/skills/${encodeURIComponent(skillId)}`),
+
     getChangelog: (): Promise<import("./types").ChangelogEntry[]> =>
       get('/v1/changelog'),
 
-    getAuditLog: (limit = 100): Promise<import("./types").AuditLogResponse> =>
-      get(`/v1/admin/audit-log?limit=${limit}`),
+    getAuditLog: (params?: {
+      limit?: number;
+      /** Inclusive lower bound on `occurred_at_ms`. */
+      since_ms?: number;
+      /** Exclusive upper bound on `occurred_at_ms` — cursor for older pages. */
+      before_ms?: number;
+    }): Promise<import("./types").AuditLogResponse> => {
+      const qs = new URLSearchParams();
+      qs.set("limit", String(params?.limit ?? 100));
+      if (params?.since_ms  !== undefined) qs.set("since_ms",  String(params.since_ms));
+      if (params?.before_ms !== undefined) qs.set("before_ms", String(params.before_ms));
+      return get(`/v1/admin/audit-log?${qs}`);
+    },
+
+    /**
+     * GET /v1/admin/audit-log/:resource_type/:resource_id — audit entries
+     * scoped to a single resource (e.g. one run, one tenant, one
+     * credential). Tenant-scoped: the caller only sees rows whose tenant
+     * matches the authenticated principal unless they are the admin
+     * service account.
+     */
+    listAuditLogForResource: (
+      resourceType: string,
+      resourceId: string,
+      params?: { limit?: number; offset?: number },
+    ): Promise<import("./types").ListResponse<import("./types").AuditRecord>> => {
+      const qs = new URLSearchParams();
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      const q = qs.toString() ? `?${qs}` : "";
+      return get(
+        `/v1/admin/audit-log/${encodeURIComponent(resourceType)}/${encodeURIComponent(resourceId)}${q}`,
+      );
+    },
 
     // ── Memory / Knowledge ───────────────────────────────────────────────────
 
@@ -914,6 +1910,62 @@ export function createApiClient(config: ApiClientConfig) {
       return get(`/v1/graph/trace?${qs}`);
     },
 
+    /** GET /v1/graph/execution-trace/:run_id — execution subgraph rooted at a run. */
+    getGraphExecutionTrace: (params: {
+      run_id: string;
+      max_depth?: number;
+    }): Promise<import("./types").GraphTraceResponse> => {
+      const qs = new URLSearchParams();
+      if (params.max_depth !== undefined) qs.set("max_depth", String(params.max_depth));
+      return get(`/v1/graph/execution-trace/${encodeURIComponent(params.run_id)}?${qs}`);
+    },
+
+    /**
+     * GET /v1/graph/dependency-path/:run_id — downstream dependency path.
+     *
+     * The backend path-param is named `:run_id` but the handler treats it
+     * as a generic `node_id` (it is fed straight into
+     * `GraphQuery::DependencyPath { node_id }`), so any graph node works.
+     * Direction is fixed to `downstream` on the server today; there is no
+     * upstream toggle exposed by this route.
+     */
+    getGraphDependencyPath: (params: {
+      node_id: string;
+      max_depth?: number;
+    }): Promise<import("./types").GraphTraceResponse> => {
+      const qs = new URLSearchParams();
+      if (params.max_depth !== undefined) qs.set("max_depth", String(params.max_depth));
+      return get(`/v1/graph/dependency-path/${encodeURIComponent(params.node_id)}?${qs}`);
+    },
+
+    /** GET /v1/graph/retrieval-provenance/:run_id — answer → chunk → document → source lineage. */
+    getGraphRetrievalProvenance: (params: {
+      run_id: string;
+    }): Promise<import("./types").GraphTraceResponse> => {
+      return get(`/v1/graph/retrieval-provenance/${encodeURIComponent(params.run_id)}`);
+    },
+
+    /** GET /v1/graph/prompt-provenance/:release_id — prompt release lineage. */
+    getGraphPromptProvenance: (params: {
+      release_id: string;
+    }): Promise<import("./types").GraphTraceResponse> => {
+      return get(`/v1/graph/prompt-provenance/${encodeURIComponent(params.release_id)}`);
+    },
+
+    /** GET /v1/graph/multi-hop/:node_id — generic BFS traversal. */
+    getGraphMultiHop: (params: {
+      node_id: string;
+      max_hops?: number;
+      min_confidence?: number;
+      direction?: "upstream" | "downstream";
+    }): Promise<import("./types").GraphTraceResponse> => {
+      const qs = new URLSearchParams();
+      if (params.max_hops !== undefined) qs.set("max_hops", String(params.max_hops));
+      if (params.min_confidence !== undefined) qs.set("min_confidence", String(params.min_confidence));
+      if (params.direction) qs.set("direction", params.direction);
+      return get(`/v1/graph/multi-hop/${encodeURIComponent(params.node_id)}?${qs}`);
+    },
+
     /** GET /v1/sources — list registered signal sources. */
     getSources: (params?: {
       tenant_id?: string;
@@ -932,6 +1984,157 @@ export function createApiClient(config: ApiClientConfig) {
     /** GET /v1/sources/:id/quality — quality metrics for a single source. */
     getSourceQuality: (sourceId: string): Promise<import("./types").SourceQualityRecord> =>
       get(`/v1/sources/${encodeURIComponent(sourceId)}/quality`),
+
+    /** POST /v1/memory/ingest — ingest a single document into a source. */
+    ingestMemory: (body: {
+      source_id: string;
+      document_id: string;
+      content: string;
+      source_type?: string;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<import("./types").MemoryIngestResponse> => {
+      const merged = withScope(body);
+      return post("/v1/memory/ingest", {
+        tenant_id:    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id,
+        workspace_id: merged.workspace_id ?? DEFAULT_SCOPE.workspace_id,
+        project_id:   merged.project_id   ?? DEFAULT_SCOPE.project_id,
+        source_id:    body.source_id,
+        document_id:  body.document_id,
+        content:      body.content,
+        ...(body.source_type ? { source_type: body.source_type } : {}),
+      });
+    },
+
+    /** POST /v1/sources — register a new source. */
+    createSource: (body: {
+      source_id: string;
+      name?: string;
+      description?: string;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<import("./types").SourceRecord> => {
+      const merged = withScope(body);
+      return post("/v1/sources", {
+        tenant_id:    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id,
+        workspace_id: merged.workspace_id ?? DEFAULT_SCOPE.workspace_id,
+        project_id:   merged.project_id   ?? DEFAULT_SCOPE.project_id,
+        source_id:    body.source_id,
+        ...(body.name        ? { name: body.name }               : {}),
+        ...(body.description ? { description: body.description } : {}),
+      });
+    },
+
+    /** GET /v1/sources/:id — detailed source view. */
+    getSource: (sourceId: string, params?: {
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<import("./types").SourceDetailResponse> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      qs.set("tenant_id",    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id);
+      qs.set("workspace_id", merged.workspace_id ?? DEFAULT_SCOPE.workspace_id);
+      qs.set("project_id",   merged.project_id   ?? DEFAULT_SCOPE.project_id);
+      return get(`/v1/sources/${encodeURIComponent(sourceId)}?${qs}`);
+    },
+
+    /** PATCH /v1/sources/:id — partial-update source metadata (#426).
+     *
+     * Switched from PUT to PATCH because absent fields preserve the
+     * existing value — PUT would imply full replacement per RFC 7231.
+     * Fields the caller doesn't pass are omitted from the body (no
+     * more `null`-to-clear; use an explicit empty string if that is
+     * the intent).
+     */
+    updateSource: (sourceId: string, body: {
+      name?: string;
+      description?: string;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<import("./types").SourceDetailResponse> => {
+      const merged = withScope(body);
+      const payload: Record<string, unknown> = {
+        tenant_id:    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id,
+        workspace_id: merged.workspace_id ?? DEFAULT_SCOPE.workspace_id,
+        project_id:   merged.project_id   ?? DEFAULT_SCOPE.project_id,
+      };
+      if (body.name !== undefined) payload.name = body.name;
+      if (body.description !== undefined) payload.description = body.description;
+      return patch(`/v1/sources/${encodeURIComponent(sourceId)}`, payload);
+    },
+
+    /** DELETE /v1/sources/:id — deactivate a source. */
+    deleteSource: (sourceId: string, params?: {
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<{ ok: boolean }> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      qs.set("tenant_id",    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id);
+      qs.set("workspace_id", merged.workspace_id ?? DEFAULT_SCOPE.workspace_id);
+      qs.set("project_id",   merged.project_id   ?? DEFAULT_SCOPE.project_id);
+      return del(`/v1/sources/${encodeURIComponent(sourceId)}?${qs}`);
+    },
+
+    /** GET /v1/sources/:id/chunks — paginated chunk list for a source. */
+    getSourceChunks: (sourceId: string, params?: {
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+      limit?: number;
+      offset?: number;
+    }): Promise<import("./types").ListResponse<import("./types").SourceChunkView>> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      qs.set("tenant_id",    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id);
+      qs.set("workspace_id", merged.workspace_id ?? DEFAULT_SCOPE.workspace_id);
+      qs.set("project_id",   merged.project_id   ?? DEFAULT_SCOPE.project_id);
+      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      return get(`/v1/sources/${encodeURIComponent(sourceId)}/chunks?${qs}`);
+    },
+
+    /** GET /v1/sources/:id/refresh-schedule — current schedule, if any. */
+    getSourceRefreshSchedule: (sourceId: string, params?: {
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<import("./types").RefreshScheduleResponse> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      qs.set("tenant_id",    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id);
+      qs.set("workspace_id", merged.workspace_id ?? DEFAULT_SCOPE.workspace_id);
+      qs.set("project_id",   merged.project_id   ?? DEFAULT_SCOPE.project_id);
+      return get(`/v1/sources/${encodeURIComponent(sourceId)}/refresh-schedule?${qs}`);
+    },
+
+    /** POST /v1/sources/:id/refresh-schedule — create or update schedule. */
+    setSourceRefreshSchedule: (sourceId: string, body: {
+      interval_ms: number;
+      refresh_url?: string | null;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<import("./types").RefreshScheduleResponse> => {
+      const merged = withScope(body);
+      const qs = new URLSearchParams();
+      qs.set("tenant_id",    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id);
+      qs.set("workspace_id", merged.workspace_id ?? DEFAULT_SCOPE.workspace_id);
+      qs.set("project_id",   merged.project_id   ?? DEFAULT_SCOPE.project_id);
+      return post(`/v1/sources/${encodeURIComponent(sourceId)}/refresh-schedule?${qs}`, {
+        interval_ms:  body.interval_ms,
+        ...(body.refresh_url !== undefined ? { refresh_url: body.refresh_url } : {}),
+      });
+    },
+
+    /** POST /v1/sources/process-refresh — trigger due refresh schedules. */
+    processSourceRefresh: (): Promise<import("./types").ProcessRefreshResponse> =>
+      post("/v1/sources/process-refresh", {}),
 
     // ── Plugins ───────────────────────────────────────────────────────────────
 
@@ -1017,12 +2220,27 @@ export function createApiClient(config: ApiClientConfig) {
 
     // ── Plan Review (RFC 018) ──────────────────────────────────────────────────
 
-    /** POST /v1/runs/:id/approve — approve a plan-mode run. */
-    approvePlan: (runId: string, body: { approved_by: string; comments?: string }): Promise<unknown> =>
-      post(`/v1/runs/${encodeURIComponent(runId)}/approve`, body),
+    /** POST /v1/runs/:id/approve — approve a plan-mode run.
+     *
+     * #427 / PR #555 review (Cursor bugbot): backend now validates
+     * against `ApprovePlanRequest { reviewer_comments?: string }` with
+     * `deny_unknown_fields`. The old UI shape
+     * `{ approved_by, comments }` would 422 — `approved_by` is
+     * client-side UI chrome that never reached the typed audit row
+     * anyway (the backend stamps the reviewer from the auth
+     * principal, T6a-H7).
+     */
+    approvePlan: (runId: string, body?: { reviewer_comments?: string }): Promise<unknown> =>
+      post(`/v1/runs/${encodeURIComponent(runId)}/approve`, body ?? {}),
 
-    /** POST /v1/runs/:id/reject — reject a plan-mode run. */
-    rejectPlan: (runId: string, body: { rejected_by: string; reason: string }): Promise<unknown> =>
+    /** POST /v1/runs/:id/reject — reject a plan-mode run.
+     *
+     * #427 / PR #555 review (Cursor bugbot): backend now validates
+     * against `RejectPlanRequest { reason?: string }` with
+     * `deny_unknown_fields`. The old `rejected_by` field is dropped
+     * for the same reason as `approved_by` on approve.
+     */
+    rejectPlan: (runId: string, body: { reason: string }): Promise<unknown> =>
       post(`/v1/runs/${encodeURIComponent(runId)}/reject`, body),
 
     /** POST /v1/runs/:id/revise — request revision of a plan-mode run. */
@@ -1066,6 +2284,84 @@ export function createApiClient(config: ApiClientConfig) {
       credentialId: string,
     ): Promise<import("./types").CredentialSummary> =>
       del(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/credentials/${encodeURIComponent(credentialId)}`),
+
+    /**
+     * POST /v1/admin/tenants/:tenantId/credentials/rotate-key
+     * Rotates every credential in the tenant from `old_key_id` to
+     * `new_key_id`. Returns the audit record for the rotation.
+     */
+    rotateCredentialKey: (
+      tenantId: string,
+      body: import("./types").RotateCredentialKeyRequest,
+    ): Promise<import("./types").CredentialRotationRecord> =>
+      post(`/v1/admin/tenants/${encodeURIComponent(tenantId)}/credentials/rotate-key`, body),
+
+    // ── Runtime message channels (/v1/channels) ──────────────────────────────
+
+    /** GET /v1/channels — list runtime channels in the current project. */
+    listChannels: (params?: {
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+      limit?: number;
+      offset?: number;
+    }): Promise<import("./types").ListResponse<import("./types").Channel>> => {
+      const merged = withScope(params);
+      const qs = new URLSearchParams();
+      qs.set("tenant_id",    merged.tenant_id    ?? DEFAULT_SCOPE.tenant_id);
+      qs.set("workspace_id", merged.workspace_id ?? DEFAULT_SCOPE.workspace_id);
+      qs.set("project_id",   merged.project_id   ?? DEFAULT_SCOPE.project_id);
+      if (params?.limit !== undefined)  qs.set("limit",  String(params.limit));
+      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      return get(`/v1/channels?${qs}`);
+    },
+
+    /** POST /v1/channels — create a new runtime channel. */
+    createChannel: (
+      name: string,
+      capacity: number,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").Channel> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      return post("/v1/channels", {
+        tenant_id:    s.tenant_id,
+        workspace_id: s.workspace_id,
+        project_id:   s.project_id,
+        name,
+        capacity,
+      });
+    },
+
+    /** POST /v1/channels/:id/send — publish a message to a channel. */
+    sendToChannel: (
+      channelId: string,
+      senderId: string,
+      body: string,
+    ): Promise<import("./types").SendChannelMessageResponse> =>
+      post(`/v1/channels/${encodeURIComponent(channelId)}/send`, {
+        sender_id: senderId,
+        body,
+      }),
+
+    /** GET /v1/channels/:id/messages — list messages on a channel. */
+    getChannelMessages: (
+      channelId: string,
+      limit?: number,
+    ): Promise<import("./types").ChannelMessage[]> => {
+      const qs = new URLSearchParams();
+      if (limit !== undefined) qs.set("limit", String(limit));
+      const suffix = qs.toString().length > 0 ? `?${qs}` : "";
+      return get(`/v1/channels/${encodeURIComponent(channelId)}/messages${suffix}`);
+    },
+
+    /** POST /v1/channels/:id/consume — consume next message for consumer_id. */
+    consumeChannelMessage: (
+      channelId: string,
+      consumerId: string,
+    ): Promise<import("./types").ChannelMessage | null> =>
+      post(`/v1/channels/${encodeURIComponent(channelId)}/consume`, {
+        consumer_id: consumerId,
+      }),
 
     // ── Notification channels (RFC 007/014) ──────────────────────────────────
 
@@ -1150,36 +2446,52 @@ export function createApiClient(config: ApiClientConfig) {
       return get(`/v1/prompts/assets/${encodeURIComponent(assetId)}/versions${q}`);
     },
 
-    /** POST /v1/prompts/assets/:id/versions — create a new version. */
+    /** POST /v1/prompts/assets/:id/versions — create a new version. Server mints `pv_<uuid>` when `prompt_version_id` is omitted. */
     createPromptVersion: (assetId: string, body: {
-      prompt_version_id: string;
+      prompt_version_id?: string;
       content_hash: string;
       content?: string;
       template_vars?: import("./types").PromptTemplateVar[];
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
     }): Promise<import("./types").PromptVersionRecord> =>
-      post(`/v1/prompts/assets/${encodeURIComponent(assetId)}/versions`, body),
+      post(`/v1/prompts/assets/${encodeURIComponent(assetId)}/versions`, withScope(body)),
 
     /** GET /v1/prompts/assets/:id/versions/:vid/diff — diff two versions. */
     getVersionDiff: (assetId: string, versionId: string, compareTo: string): Promise<import("./types").PromptVersionDiff> =>
       get(`/v1/prompts/assets/${encodeURIComponent(assetId)}/versions/${encodeURIComponent(versionId)}/diff?compare_to=${encodeURIComponent(compareTo)}`),
 
-    /** GET /v1/prompts/releases — list all releases. */
-    getPromptReleases: (params?: { limit?: number; offset?: number }): Promise<import("./types").ListResponse<import("./types").PromptReleaseRecord>> => {
+    /** GET /v1/prompts/releases — list releases scoped to the active project. */
+    getPromptReleases: (params?: {
+      limit?: number;
+      offset?: number;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
+    }): Promise<import("./types").ListResponse<import("./types").PromptReleaseRecord>> => {
+      const merged = withScope(params);
       const qs = new URLSearchParams();
-      if (params?.limit  !== undefined) qs.set("limit",  String(params.limit));
-      if (params?.offset !== undefined) qs.set("offset", String(params.offset));
+      if (merged.limit        !== undefined) qs.set("limit",        String(merged.limit));
+      if (merged.offset       !== undefined) qs.set("offset",       String(merged.offset));
+      if (merged.tenant_id    !== undefined) qs.set("tenant_id",    merged.tenant_id);
+      if (merged.workspace_id !== undefined) qs.set("workspace_id", merged.workspace_id);
+      if (merged.project_id   !== undefined) qs.set("project_id",   merged.project_id);
       const q = qs.toString() ? `?${qs}` : "";
       return get(`/v1/prompts/releases${q}`);
     },
 
-    /** POST /v1/prompts/releases — create a release from a version. */
+    /** POST /v1/prompts/releases — create a release from a version. Server mints `rel_<uuid>` when `prompt_release_id` is omitted. */
     createPromptRelease: (body: {
-      prompt_release_id: string;
+      prompt_release_id?: string;
       prompt_asset_id: string;
       prompt_version_id: string;
       release_tag?: string;
+      tenant_id?: string;
+      workspace_id?: string;
+      project_id?: string;
     }): Promise<import("./types").PromptReleaseRecord> =>
-      post("/v1/prompts/releases", body),
+      post("/v1/prompts/releases", withScope(body)),
 
     /** POST /v1/prompts/releases/:id/activate — activate a release. */
     activatePromptRelease: (releaseId: string): Promise<import("./types").PromptReleaseRecord> =>
@@ -1191,14 +2503,17 @@ export function createApiClient(config: ApiClientConfig) {
 
     /** POST /v1/prompts/releases/:id/request-approval — request approval gate. */
     requestPromptReleaseApproval: (releaseId: string): Promise<unknown> =>
-      post(`/v1/prompts/releases/${encodeURIComponent(releaseId)}/request-approval`, {}),
+      post(`/v1/prompts/releases/${encodeURIComponent(releaseId)}/request-approval`, withScope()),
 
     /** POST /v1/prompts/releases/:id/rollback — roll back to a previous release. */
     rollbackPromptRelease: (releaseId: string, targetReleaseId: string): Promise<import("./types").PromptReleaseRecord> =>
       post(`/v1/prompts/releases/${encodeURIComponent(releaseId)}/rollback`, { target_release_id: targetReleaseId }),
 
     /** POST /v1/prompts/releases/:id/transition — generic state transition. */
-    transitionPromptRelease: (releaseId: string, toState: string): Promise<import("./types").PromptReleaseRecord> =>
+    transitionPromptRelease: (
+      releaseId: string,
+      toState: import("./types").PromptReleaseState,
+    ): Promise<import("./types").PromptReleaseRecord> =>
       post(`/v1/prompts/releases/${encodeURIComponent(releaseId)}/transition`, { to_state: toState }),
 
     // ── Request logs ─────────────────────────────────────────────────────────
@@ -1210,10 +2525,13 @@ export function createApiClient(config: ApiClientConfig) {
     getRequestLogs: (params?: {
       limit?: number;
       level?: string;
+      /** Lower bound on entry timestamp in Unix-ms (for "last hour" filter). */
+      since_ms?: number;
     }): Promise<import("./types").RequestLogsResponse> => {
       const qs = new URLSearchParams();
-      if (params?.limit  !== undefined) qs.set("limit", String(params.limit));
-      if (params?.level)               qs.set("level", params.level);
+      if (params?.limit    !== undefined) qs.set("limit",    String(params.limit));
+      if (params?.level)                  qs.set("level",    params.level);
+      if (params?.since_ms !== undefined) qs.set("since_ms", String(params.since_ms));
       const q = qs.toString() ? `?${qs}` : "";
       return get(`/v1/admin/logs${q}`);
     },
@@ -1231,6 +2549,13 @@ export function createApiClient(config: ApiClientConfig) {
     /** POST /v1/sessions/import — re-create a session from an export file. */
     importSession: (exportData: unknown): Promise<import("./types").SessionRecord> =>
       post("/v1/sessions/import", exportData),
+
+    /** DELETE /v1/sessions/:id/snapshots — F65 PR-5 admin-only reap of all
+     * workspace snapshots for a session. Returns `{reaped, at_ms}`. */
+    deleteSessionSnapshots: (
+      sessionId: string,
+    ): Promise<import("./types").SnapshotReapResponse> =>
+      del(`/v1/sessions/${encodeURIComponent(sessionId)}/snapshots`),
 
     // ── Notifications ─────────────────────────────────────────────────────────
 
@@ -1289,6 +2614,11 @@ export function createApiClient(config: ApiClientConfig) {
     retryGitHubIssue: (issue: number): Promise<{ status: string }> =>
       post(`/v1/webhooks/github/queue/${issue}/retry`, {}),
 
+    /** PUT /v1/webhooks/github/queue/concurrency — set max concurrent processing (1..=20).
+     *  Returns the applied value (server clamps to 1..=20) and the previous value. */
+    setGitHubQueueConcurrency: (maxConcurrent: number): Promise<{ max_concurrent: number; previous: number }> =>
+      put("/v1/webhooks/github/queue/concurrency", { max_concurrent: maxConcurrent }),
+
     // ── Project repos (RFC 016) ─────────────────────────────────────────────
     //
     // The backend (`crates/cairn-app/src/repo_routes.rs`) parses `:project`
@@ -1311,15 +2641,55 @@ export function createApiClient(config: ApiClientConfig) {
       return raw.repos ?? [];
     },
 
-    /** POST /v1/projects/:project/repos — attach a repo to a project. */
+    /** POST /v1/projects/:project/repos — attach a repo to a project.
+     *  `host` defaults to "github" backend-side; pass "local_fs" with
+     *  `repo_id` set to an absolute path to attach a local directory.
+     *  "gitlab"/"gitea"/"confluence" return 501 (recognised but not
+     *  implemented). */
     attachProjectRepo: (
-      body: { repo_id: string },
+      body: { repo_id: string; host?: string },
       scope?: import("./scope").ProjectScope,
     ): Promise<import("./types").ProjectRepoMutation> => {
       const s = scope ?? config.scope ?? DEFAULT_SCOPE;
       const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
       return post(`/v1/projects/${path}/repos`, body);
     },
+
+    /** DELETE /v1/projects/:project/local-paths — detach a local_fs path.
+     *  Separate from `detachProjectRepo` because local_fs paths can't
+     *  be path-segmented into `:owner/:repo`. */
+    detachProjectLocalPath: (
+      path: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<void> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const projectPath = encodeURIComponent(
+        `${s.tenant_id}/${s.workspace_id}/${s.project_id}`,
+      );
+      // DELETE-with-body — the `del` helper above doesn't take one, so
+      // call apiFetch directly. Shape mirrors `DeleteLocalPathRequest`
+      // in `crates/cairn-app/src/repo_routes.rs`.
+      return apiFetch(config, `/v1/projects/${projectPath}/local-paths`, {
+        method: "DELETE",
+        body: JSON.stringify({ path }),
+      });
+    },
+
+    /** POST /v1/integrations/github/verify-installation — verify a
+     *  GitHub App install without mutating server state. Returns
+     *  `{verified, owner, repo_count, expires_at}` on success; throws
+     *  `ApiError` with `github_api_error` / `invalid_private_key` /
+     *  `invalid_request` codes on failure. */
+    verifyGitHubInstallation: (body: {
+      app_id: number;
+      private_key: string;
+      installation_id: number;
+    }): Promise<{
+      verified: boolean;
+      owner: string;
+      repo_count: number;
+      expires_at: string;
+    }> => post(`/v1/integrations/github/verify-installation`, body),
 
     /** GET /v1/projects/:project/repos/:owner/:repo — repo detail. */
     getProjectRepo: (
@@ -1341,6 +2711,363 @@ export function createApiClient(config: ApiClientConfig) {
       const s = scope ?? config.scope ?? DEFAULT_SCOPE;
       const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
       return del(`/v1/projects/${path}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
+    },
+
+    // ── Triggers & run templates (RFC 022) ────────────────────────────────────
+    //
+    // Same slash-path scope contract as project repos / plugins above: the
+    // backend parses `:project` as "tenant_id/workspace_id/project_id" and
+    // silently falls back to DEFAULT_* when it cannot split on `/`. Always
+    // send the full scope, percent-encoded. See PR #132 (TriggersPage) and
+    // issue #154 for the raw-fetch regression this closes.
+
+    /** GET /v1/projects/:project/triggers — list triggers for a project.
+     *  Callers provide their own row type; shapes live in TriggersPage. */
+    listTriggers: <T = unknown>(
+      scope?: import("./scope").ProjectScope,
+    ): Promise<T[]> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return getList<T>(`/v1/projects/${path}/triggers`);
+    },
+
+    /** GET /v1/projects/:project/run-templates — list run templates for a project. */
+    listRunTemplates: <T = unknown>(
+      scope?: import("./scope").ProjectScope,
+    ): Promise<T[]> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return getList<T>(`/v1/projects/${path}/run-templates`);
+    },
+
+    /** POST /v1/projects/:project/triggers/:id/enable — enable a trigger. */
+    enableTrigger: (
+      triggerId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<unknown> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return post(`/v1/projects/${path}/triggers/${encodeURIComponent(triggerId)}/enable`);
+    },
+
+    /** POST /v1/projects/:project/triggers/:id/disable — disable a trigger. */
+    disableTrigger: (
+      triggerId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<unknown> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return post(`/v1/projects/${path}/triggers/${encodeURIComponent(triggerId)}/disable`);
+    },
+
+    /** DELETE /v1/projects/:project/triggers/:id — delete a trigger. */
+    deleteTrigger: (
+      triggerId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<unknown> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return del(`/v1/projects/${path}/triggers/${encodeURIComponent(triggerId)}`);
+    },
+
+    // ── Model catalog (read-only) ────────────────────────────────────────────
+    // Bundled LiteLLM catalog + cairn TOML overlay + operator overrides.
+    // Exposed via GET /v1/models/catalog so the UI doesn't have to hard-code
+    // model IDs or prices. See ui/src/components/ModelCatalogPicker.tsx for
+    // the primary consumer.
+
+    /** GET /v1/models/catalog — filtered, paginated model list. */
+    listModelCatalog: (
+      params?: import("./types").ModelCatalogQuery,
+    ): Promise<import("./types").ModelCatalogResponse> => {
+      const qs = new URLSearchParams();
+      if (params?.provider)                           qs.set("provider",           params.provider);
+      if (params?.tier)                               qs.set("tier",               params.tier);
+      if (params?.search)                             qs.set("search",             params.search);
+      if (params?.supports_tools     !== undefined)   qs.set("supports_tools",     String(params.supports_tools));
+      if (params?.supports_json_mode !== undefined)   qs.set("supports_json_mode", String(params.supports_json_mode));
+      if (params?.reasoning          !== undefined)   qs.set("reasoning",          String(params.reasoning));
+      if (params?.max_cost_per_1m    !== undefined)   qs.set("max_cost_per_1m",    String(params.max_cost_per_1m));
+      if (params?.free_only          !== undefined)   qs.set("free_only",          String(params.free_only));
+      if (params?.limit              !== undefined)   qs.set("limit",              String(params.limit));
+      if (params?.offset             !== undefined)   qs.set("offset",             String(params.offset));
+      const query = qs.toString() ? `?${qs}` : "";
+      return get(`/v1/models/catalog${query}`);
+    },
+
+    /** GET /v1/models/catalog/providers — unique providers with counts. */
+    listCatalogProviders: (): Promise<import("./types").ModelCatalogProvidersResponse> =>
+      get("/v1/models/catalog/providers"),
+
+    // ── Admin: model registry CRUD (RFC-026 PR-A1) ──────────────────────────
+    //
+    // Mutations of the runtime ModelRegistry. Distinct from the read-only
+    // `/v1/models/catalog` above — these endpoints back the "bring-your-own
+    // model" admin UI where operators override costs, tiers, and
+    // capabilities for bespoke providers (private LLM endpoints, etc.).
+
+    /** GET /v1/admin/models — list every registered model entry. */
+    listModels: (): Promise<import("./types").ModelEntry[]> =>
+      get("/v1/admin/models"),
+
+    /** GET /v1/admin/models/:id — fetch one model entry by id. */
+    getModel: (id: string): Promise<import("./types").ModelEntry> =>
+      get(`/v1/admin/models/${encodeURIComponent(id)}`),
+
+    /**
+     * PUT /v1/admin/models/:id — create-or-update a model entry. The
+     * backend overwrites the body's `id` field with the path param, so
+     * callers do not need to set it on `entry`.
+     */
+    setModel: (
+      id: string,
+      entry: import("./types").ModelEntry,
+    ): Promise<import("./types").ModelEntry> =>
+      put(`/v1/admin/models/${encodeURIComponent(id)}`, entry),
+
+    /** DELETE /v1/admin/models/:id — remove a model entry from the registry. */
+    deleteModel: (id: string): Promise<import("./types").ModelEntry> =>
+      del(`/v1/admin/models/${encodeURIComponent(id)}`),
+
+    /**
+     * POST /v1/admin/models/import-litellm — bulk-import entries from a
+     * LiteLLM-shaped catalog object. Request body is the raw LiteLLM JSON
+     * (top-level object keyed by model id).
+     */
+    importLiteLLM: (
+      catalog: Record<string, unknown>,
+    ): Promise<import("./types").ImportLiteLLMResponse> =>
+      post("/v1/admin/models/import-litellm", catalog),
+
+    // ── Admin: waitpoint HMAC rotation (RFC-026 PR-A1) ──────────────────────
+
+    /**
+     * POST /v1/admin/rotate-waitpoint-hmac — rotate the waitpoint HMAC
+     * signing kid across every execution partition. Returns a
+     * per-partition outcome breakdown. Idempotent on the same
+     * (new_kid, new_secret_hex) pair.
+     */
+    rotateWaitpointHmac: (
+      body: import("./types").RotateWaitpointHmacRequest,
+    ): Promise<import("./types").RotateWaitpointHmacResponse> =>
+      post("/v1/admin/rotate-waitpoint-hmac", body),
+
+    // ── F29 CE: Telemetry, stalled runs, settings-GET, cost rollups ─────────
+
+    /** GET /v1/sessions/:id/cost — per-session cumulative cost rollup.
+     *  Returns a flattened `SessionCostRecord` plus a per-run breakdown.
+     *  Returns `null` on 404 so call sites can render a "not available"
+     *  placeholder without crashing — real pg/sqlite data lands with
+     *  PR CD-2, the in-memory store is already populated. */
+    getSessionCost: async (
+      sessionId: string,
+    ): Promise<import("./types").SessionCostResponse | null> => {
+      try {
+        return await get<import("./types").SessionCostResponse>(
+          `/v1/sessions/${encodeURIComponent(sessionId)}/cost`,
+        );
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) return null;
+        throw e;
+      }
+    },
+
+    /** GET /v1/runs/:id/telemetry — live-aggregated per-run telemetry
+     *  (provider calls + tool invocations + totals + stuck flag).
+     *
+     *  Consumers should poll with `refetchInterval` only while the run
+     *  is in a non-terminal state (`pending`/`running`). See the
+     *  RunTelemetryPanel for the canonical polling pattern. */
+    getRunTelemetry: (runId: string): Promise<import("./types").RunTelemetry> =>
+      get(`/v1/runs/${encodeURIComponent(runId)}/telemetry`),
+
+    /** GET /v1/runs/stalled — diagnosis reports for runs that have been
+     *  Pending or Running longer than `minutes`, default 30.
+     *
+     *  Returns `{ items, has_more }`. Scope filtering is done server-side
+     *  via the tenant scope on the auth token, so no scope query is
+     *  needed here. */
+    getStalledRuns: async (
+      opts?: { minutes?: number },
+    ): Promise<import("./types").StuckRunReport[]> => {
+      const qs = new URLSearchParams();
+      if (opts?.minutes !== undefined) qs.set("minutes", String(opts.minutes));
+      const query = qs.toString() ? `?${qs}` : "";
+      return getList(`/v1/runs/stalled${query}`);
+    },
+
+    /** GET /v1/settings/defaults/:scope/:scope_id/:key — exact-lookup for a
+     *  single stored default. Returns `null` on 404 (not set) so call sites
+     *  don't have to special-case. */
+    getSettingsDefault: async (
+      scope: import("./types").SettingsScope,
+      scopeId: string,
+      key: string,
+    ): Promise<import("./types").SettingDefault | null> => {
+      try {
+        return await get<import("./types").SettingDefault>(
+          `/v1/settings/defaults/${encodeURIComponent(scope)}/${encodeURIComponent(scopeId)}/${encodeURIComponent(key)}`,
+        );
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) return null;
+        throw e;
+      }
+    },
+
+    /** GET /v1/projects/:tenant/:workspace/:project/costs — project-wide cost
+     *  rollup (PR CD-2). Returns `null` when the endpoint is not deployed
+     *  yet (404) or no costs have been recorded yet, so the UI can render
+     *  a "not available" placeholder without crashing. */
+    getProjectCosts: async (
+      scope: import("./scope").ProjectScope,
+    ): Promise<import("./types").ProjectCostSummary | null> => {
+      try {
+        return await get<import("./types").ProjectCostSummary>(
+          `/v1/projects/${encodeURIComponent(scope.tenant_id)}/${encodeURIComponent(scope.workspace_id)}/${encodeURIComponent(scope.project_id)}/costs`,
+        );
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) return null;
+        throw e;
+      }
+    },
+
+    /** GET /v1/workspaces/:tenant/:workspace/costs — workspace-wide rollup
+     *  (PR CD-2). Same 404 semantics as `getProjectCosts`. */
+    getWorkspaceCosts: async (
+      tenantId: string,
+      workspaceId: string,
+    ): Promise<import("./types").WorkspaceCostSummary | null> => {
+      try {
+        return await get<import("./types").WorkspaceCostSummary>(
+          `/v1/workspaces/${encodeURIComponent(tenantId)}/${encodeURIComponent(workspaceId)}/costs`,
+        );
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 404) return null;
+        throw e;
+      }
+    },
+
+    // ── RFC 031: operator-defined agent roles ─────────────────────────────────
+
+    /** GET /v1/projects/:project/agent-roles — list merged built-in +
+     *  operator-defined roles for the caller's active project scope.
+     *  Optional `source` filter narrows by provenance. */
+    listAgentRoles: async (
+      source?: import("./types").AgentRoleSource | "all",
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").AgentRoleListResponse> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      const query = source && source !== "all" ? `?source=${source}` : "";
+      return get(`/v1/projects/${path}/agent-roles${query}`);
+    },
+
+    /** GET /v1/projects/:project/agent-roles/:id — fetch one role.
+     *  Returns the record + the `ETag` header value so the editor can
+     *  thread it into `If-Match` on PATCH. `etag` is null when the
+     *  response doesn't carry the header (built-in fallback rows). */
+    getAgentRole: async (
+      roleId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<{
+      item: import("./types").AgentRoleListItem;
+      etag: string | null;
+    }> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      const { body, response } = await apiFetchWithResponse<
+        import("./types").AgentRoleListItem
+      >(config, `/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}`, {
+        method: "GET",
+      });
+      return { item: body, etag: response.headers.get("ETag") };
+    },
+
+    /** POST /v1/projects/:project/agent-roles — create a role. 201 on
+     *  success (including re-POST after retract per §D6); 409 on
+     *  active-id collision; 422 on structural validation failure; 413
+     *  on §D4 size overflow. */
+    createAgentRole: async (
+      body: import("./types").CreateAgentRoleRequest,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<{
+      result: import("./types").DefineAgentRoleResponse;
+      etag: string | null;
+    }> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      const { body: result, response } = await apiFetchWithResponse<
+        import("./types").DefineAgentRoleResponse
+      >(config, `/v1/projects/${path}/agent-roles`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      return { result, etag: response.headers.get("ETag") };
+    },
+
+    /** PATCH /v1/projects/:project/agent-roles/:id — JSON Merge Patch
+     *  update. `ifMatch` supplies the `If-Match` header; a stale value
+     *  surfaces as ApiError(412). Pass `null` to opt out of the
+     *  lost-update check (the §PATCH semantics make If-Match optional). */
+    patchAgentRole: async (
+      roleId: string,
+      body: import("./types").PatchAgentRoleRequest,
+      ifMatch: string | null,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<{
+      result: import("./types").DefineAgentRoleResponse;
+      etag: string | null;
+    }> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      const headers: HeadersInit = ifMatch ? { "If-Match": ifMatch } : {};
+      const { body: result, response } = await apiFetchWithResponse<
+        import("./types").DefineAgentRoleResponse
+      >(config, `/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}`, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+        headers,
+      });
+      return { result, etag: response.headers.get("ETag") };
+    },
+
+    /** DELETE /v1/projects/:project/agent-roles/:id — retract a role.
+     *  Idempotent per §D7: a repeat DELETE returns the original
+     *  `retracted_at` with no new event. */
+    retractAgentRole: async (
+      roleId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").RetractAgentRoleResponse> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return del(`/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}`);
+    },
+
+    /** GET /v1/projects/:project/agent-roles/:id/history — RFC 031
+     *  PR-D3 §History panel. Returns every `AgentRoleDefined` /
+     *  `AgentRoleRetracted` event for `(project, role_id)` oldest
+     *  first. Unknown role ids return an empty list (200, not 404). */
+    getAgentRoleHistory: async (
+      roleId: string,
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").AgentRoleHistoryResponse> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return get(
+        `/v1/projects/${path}/agent-roles/${encodeURIComponent(roleId)}/history`,
+      );
+    },
+
+    /** GET /v1/projects/:project/tools — #799 per-project tool
+     *  inventory. Powers the RFC 031 role-editor tool autocomplete.
+     *  Returns every built-in + every plugin-exposed tool honouring
+     *  the project's enablement allowlists, sorted alphabetically. */
+    listProjectTools: async (
+      scope?: import("./scope").ProjectScope,
+    ): Promise<import("./types").ProjectToolsResponse> => {
+      const s = scope ?? config.scope ?? DEFAULT_SCOPE;
+      const path = encodeURIComponent(`${s.tenant_id}/${s.workspace_id}/${s.project_id}`);
+      return get(`/v1/projects/${path}/tools`);
     },
   };
 }

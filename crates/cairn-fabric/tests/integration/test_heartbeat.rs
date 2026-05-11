@@ -20,9 +20,9 @@
 
 use cairn_domain::lifecycle::TaskState;
 use cairn_fabric::fcall::{claim::build_renew_lease, names::FF_RENEW_LEASE};
-use ff_core::keys::{ExecKeyContext, IndexKeys};
-use ff_core::partition::execution_partition;
-use ff_core::types::AttemptIndex;
+use flowfabric::core::keys::{ExecKeyContext, IndexKeys};
+use flowfabric::core::partition::execution_partition;
+use flowfabric::core::types::AttemptIndex;
 
 use crate::TestHarness;
 
@@ -201,8 +201,7 @@ async fn test_heartbeat_with_stale_epoch_is_rejected() {
     // epoch check, and we wouldn't be proving what we claim to be proving.
     let attempt_id: String = {
         let v: Option<String> = h
-            .fabric
-            .runtime
+            .valkey_runtime()
             .client
             .hget(&ctx.core(), "current_attempt_id")
             .await
@@ -211,8 +210,7 @@ async fn test_heartbeat_with_stale_epoch_is_rejected() {
     };
     let lease_id: String = {
         let v: Option<String> = h
-            .fabric
-            .runtime
+            .valkey_runtime()
             .client
             .hget(&ctx.core(), "current_lease_id")
             .await
@@ -238,18 +236,18 @@ async fn test_heartbeat_with_stale_epoch_is_rejected() {
         &bogus_epoch,
         30_000,
     );
-    let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
     // The wire call itself returns Ok(Value::Array([b"err", b"stale_lease", ...])) — Lua-level
     // errors are encoded in the returned Value, not as a Valkey-level error.
     // `check_fcall_success` is what turns those into a FabricError; we use it
     // here to mirror the service-layer error path and assert the message
     // surfaces `stale_lease`.
+    //
+    // `FabricRuntime::fcall` accepts `&[String]` directly since #501 —
+    // no Vec<&str> rebuild needed.
     let raw = h
         .fabric
         .runtime
-        .fcall(FF_RENEW_LEASE, &key_refs, &arg_refs)
+        .fcall(FF_RENEW_LEASE, &keys, &args)
         .await
         .expect("fcall transport must succeed; stale_lease is a Lua-level err value");
 

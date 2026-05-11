@@ -27,14 +27,30 @@ use crate::adapter::HarnessTool;
 use crate::error::map_harness;
 use crate::sensitive::default_sensitive_patterns;
 
-/// Per-session write-ledger cache.
+/// Per-run write-ledger cache.
 ///
-/// Keyed by `(tenant_id, workspace_id, project_id, session_id.unwrap_or(""))`
-/// so cross-tenant + cross-run ledger pollution is impossible.
+/// Keyed by `(tenant_id, workspace_id, project_id, session_id, run_id)`
+/// so cross-tenant + cross-session + cross-run ledger pollution is
+/// impossible. Missing identifiers are substituted with empty strings
+/// at key-build time so unit-test call sites using
+/// `ToolContext::default()` still function (rather than panicking) —
+/// those keys collide onto a single shared bucket within a given
+/// project, which is acceptable for tests but never produced by
+/// orchestrator-driven production paths (which always populate both
+/// `session_id` and `run_id` before dispatching).
+///
+/// Entries are dropped by `crate::evict_run` when the orchestrator
+/// observes a terminal `RunStateChanged`, bounding the cache to the
+/// number of live runs.
 static LEDGERS: Lazy<Mutex<HashMap<String, Arc<dyn Ledger>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn ledger_key(ctx: &ToolContext, project: &ProjectKey) -> String {
+    // Empty-string fallback matches the pre-#606 behaviour: unit-test
+    // paths using `ToolContext::default()` share a single bucket per
+    // project. Production orchestrator paths always populate both ids
+    // (see `cairn-orchestrator/src/execute_impl.rs`, where the tool
+    // context is built from `OrchestrationContext.{session_id, run_id}`).
     format!(
         "{}/{}/{}/{}/{}",
         project.tenant_id,
@@ -51,11 +67,10 @@ fn ledger_key(ctx: &ToolContext, project: &ProjectKey) -> String {
 /// the inner map instead of propagating — tool calls should not fail
 /// because of an unrelated panic in a different task.
 ///
-/// **TODO**: the map grows unbounded with accumulated runs. Follow-up
-/// work: evict the ledger when the orchestrator finalizes a run
-/// (complete / fail / cancel). For typical single-run cairn-app lifetimes
-/// this is not urgent; for long-lived server processes with many runs
-/// per hour it needs an eviction hook.
+/// Eviction is driven by the orchestrator via `crate::evict_run` when a
+/// run reaches a terminal state. The cache is therefore bounded to the
+/// number of currently-live runs rather than the full history of runs
+/// over the process lifetime.
 pub(crate) fn ledger_for(ctx: &ToolContext, project: &ProjectKey) -> Arc<dyn Ledger> {
     let key = ledger_key(ctx, project);
     let mut guard = LEDGERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -63,6 +78,32 @@ pub(crate) fn ledger_for(ctx: &ToolContext, project: &ProjectKey) -> Arc<dyn Led
         .entry(key)
         .or_insert_with(|| Arc::new(InMemoryLedger::default()) as Arc<dyn Ledger>)
         .clone()
+}
+
+/// Drop the ledger cached for this `(project, session, run)` tuple, if
+/// any. Idempotent — `HashMap::remove` returns the evicted value on
+/// the first call and `None` on every subsequent call for the same
+/// key, so repeated eviction is a safe no-op. Invoked by
+/// `crate::evict_run` when the orchestrator observes a terminal
+/// `RunStateChanged`.
+pub(crate) fn evict_run_ledger(ctx: &ToolContext, project: &ProjectKey) {
+    let key = ledger_key(ctx, project);
+    let mut guard = LEDGERS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.remove(&key);
+}
+
+/// Test-only: check whether a specific `(project, ctx)` tuple has a
+/// cached ledger entry.
+///
+/// Scoped to a single key so parallel-test execution doesn't race on
+/// the process-global `LEDGERS` map. Per-entry lookup is all the
+/// eviction contract asserts — a size-based helper would need cross-
+/// test locking that we deliberately avoid.
+#[doc(hidden)]
+pub fn __cache_contains_for_tests(ctx: &ToolContext, project: &ProjectKey) -> bool {
+    let key = ledger_key(ctx, project);
+    let guard = LEDGERS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.contains_key(&key)
 }
 
 /// Record a successful read in the session's write-tool ledger.

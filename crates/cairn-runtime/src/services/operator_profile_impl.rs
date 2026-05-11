@@ -10,7 +10,7 @@ use cairn_store::EventLog;
 
 use super::event_helpers::make_envelope;
 use crate::error::RuntimeError;
-use crate::operator_profiles::OperatorProfileService;
+use crate::operator_profiles::{OperatorProfilePatch, OperatorProfileService};
 
 fn record_to_profile(r: OperatorProfileRecord) -> OperatorProfile {
     OperatorProfile {
@@ -124,6 +124,7 @@ where
                 profile_id: profile_id.clone(),
                 display_name: Some(display_name),
                 email: Some(email),
+                role: None,
             },
         ));
         self.store.append(&[event]).await?;
@@ -133,6 +134,43 @@ where
             .map(record_to_profile)
             .ok_or_else(|| {
                 RuntimeError::Internal("operator profile not found after update".to_owned())
+            })
+    }
+
+    async fn patch_profile(
+        &self,
+        profile_id: &OperatorId,
+        patch: OperatorProfilePatch,
+    ) -> Result<OperatorProfile, RuntimeError> {
+        if patch.is_empty() {
+            return Err(RuntimeError::Validation {
+                reason: "empty_patch".to_owned(),
+            });
+        }
+
+        let existing = OperatorProfileReadModel::get(self.store.as_ref(), profile_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound {
+                entity: "operator_profile",
+                id: profile_id.to_string(),
+            })?;
+
+        let event = make_envelope(RuntimeEvent::OperatorProfileUpdated(
+            OperatorProfileUpdated {
+                tenant_id: existing.tenant_id.clone(),
+                profile_id: profile_id.clone(),
+                display_name: patch.display_name,
+                email: patch.email,
+                role: patch.role,
+            },
+        ));
+        self.store.append(&[event]).await?;
+
+        OperatorProfileReadModel::get(self.store.as_ref(), profile_id)
+            .await?
+            .map(record_to_profile)
+            .ok_or_else(|| {
+                RuntimeError::Internal("operator profile not found after patch".to_owned())
             })
     }
 
@@ -157,6 +195,7 @@ where
                 profile_id: profile_id.clone(),
                 display_name: Some(existing.display_name.clone()),
                 email: existing.email.clone(),
+                role: None,
             },
         ));
         self.store.append(&[event]).await?;

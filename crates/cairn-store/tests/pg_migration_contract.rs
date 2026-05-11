@@ -99,7 +99,7 @@ fn migration_count_matches_expected() {
         "must have at least 17 migrations (V001–V017); got {count}"
     );
     assert!(
-        count <= 25,
+        count <= 80,
         "unexpected large migration count {count} — a migration may have been added without updating this test"
     );
 }
@@ -220,6 +220,38 @@ fn v016_prompt_routing_creates_prompt_tables() {
     assert!(
         sql.contains("prompt_assets"),
         "V016 SQL must reference 'prompt_assets' table"
+    );
+}
+
+/// Regression gate for issue #578 — the `workspaces.archived_at` column
+/// was introduced as an orphan migration file under the legacy
+/// `crates/cairn-store/migrations/` directory (PR #225) and never
+/// wired into this registry. Fresh Postgres installs therefore lacked
+/// the column, and `UPDATE workspaces SET archived_at = …` in the
+/// projection layer would fail. V050 renumbers + moves the migration
+/// under `crates/cairn-store/src/pg/migrations/` and adds it to the
+/// registry. (Shifted V045 → V050 after Phase 2a.2 + 2b.2 published
+/// V045-V049 during this PR's review cycle.) This test fails if
+/// anyone drops the wiring again.
+#[test]
+fn v050_adds_workspace_archived_at_column() {
+    let migrations = registered_migrations();
+    let v050 = migrations
+        .iter()
+        .find(|(v, _, _)| *v == 50)
+        .expect("V050 add_workspace_archived_at must exist");
+    assert_eq!(
+        v050.1, "add_workspace_archived_at",
+        "V050 must carry the stable migration name",
+    );
+    let sql = v050.2;
+    assert!(
+        sql.contains("ALTER TABLE workspaces"),
+        "V050 SQL must ALTER the workspaces table: {sql}"
+    );
+    assert!(
+        sql.contains("archived_at"),
+        "V050 SQL must add the archived_at column: {sql}"
     );
 }
 

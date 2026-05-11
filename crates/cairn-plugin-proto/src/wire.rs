@@ -79,6 +79,11 @@ pub mod methods {
     pub const POLICY_EVALUATE: &str = "policy.evaluate";
     pub const EVAL_SCORE: &str = "eval.score";
     pub const CANCEL: &str = "cancel";
+    // RFC 029: Knowledge provider host -> plugin methods.
+    pub const KNOWLEDGE_QUERY: &str = "knowledge.query";
+    pub const KNOWLEDGE_INGEST: &str = "knowledge.ingest";
+    pub const KNOWLEDGE_INGEST_STATUS: &str = "knowledge.ingest_status";
+    pub const KNOWLEDGE_LIST_SOURCES: &str = "knowledge.list_sources";
 }
 
 /// Canonical plugin -> host notification methods per RFC 007.
@@ -86,6 +91,8 @@ pub mod notifications {
     pub const LOG_EMIT: &str = "log.emit";
     pub const PROGRESS_UPDATE: &str = "progress.update";
     pub const EVENT_EMIT: &str = "event.emit";
+    // RFC 029: Knowledge provider plugin -> host notification.
+    pub const KNOWLEDGE_SOURCES_CHANGED: &str = "knowledge.sources.changed";
 }
 
 /// `initialize` request params.

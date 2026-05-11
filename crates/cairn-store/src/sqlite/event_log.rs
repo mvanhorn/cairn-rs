@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, SqlitePool};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cairn_domain::{EventEnvelope, RuntimeEvent};
@@ -7,6 +7,18 @@ use cairn_domain::{EventEnvelope, RuntimeEvent};
 use super::projections::SqliteSyncProjection;
 use crate::error::StoreError;
 use crate::event_log::{EntityRef, EventLog, EventPosition, StoredEvent};
+
+/// Maximum events per multi-row `INSERT`. SQLite caps host parameters
+/// at 32766 on modern builds (≥ 3.32.0) but historically at 999. With
+/// 8 columns per event, 100 events × 8 = 800 parameters — safely under
+/// the legacy limit and trivially under the modern one, so the same
+/// number ports across every SQLite build cairn-rs might run on.
+///
+/// For typical bursts (≤ 100 events — a checkpoint flush, a tool-result
+/// fanout) this is still one statement per call. Larger bursts loop
+/// the statement inside the existing transaction; durability and
+/// projection atomicity are unchanged.
+const BATCH_INSERT_CHUNK: usize = 100;
 
 /// SQLite-backed append-only event log for local-mode.
 ///
@@ -38,55 +50,164 @@ impl EventLog for SqliteEventLog {
             .unwrap_or_default()
             .as_millis() as i64;
 
+        // Pre-serialize JSON columns outside the transaction. SQLite stores
+        // these as TEXT, not JSONB, so the sqlx bind is just a string.
+        struct Row<'a> {
+            event_id: &'a str,
+            source_type: &'static str,
+            source_meta: String,
+            ownership: String,
+            causation_id: Option<&'a str>,
+            correlation_id: Option<&'a str>,
+            payload: String,
+        }
+
+        // Reject duplicate event_ids *before* touching the database so the
+        // caller gets a clear domain error instead of a cryptic
+        // `UNIQUE constraint failed` from SQLite. The schema's
+        // `event_id TEXT NOT NULL UNIQUE` (sqlite::schema) is the
+        // ultimate guard — this check is a defense in depth that also
+        // prevents the client-side reorder HashMap (below) from aliasing
+        // two input slots to the same position when an upstream bug
+        // somehow produces a duplicate.
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(events.len());
+        for event in events {
+            if !seen.insert(event.event_id.as_str()) {
+                return Err(StoreError::Internal(format!(
+                    "duplicate event_id {} in single append batch",
+                    event.event_id.as_str()
+                )));
+            }
+        }
+
+        let mut rows: Vec<Row<'_>> = Vec::with_capacity(events.len());
+        for event in events {
+            rows.push(Row {
+                event_id: event.event_id.as_str(),
+                source_type: source_type_str(&event.source),
+                source_meta: serde_json::to_string(&event.source)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?,
+                ownership: serde_json::to_string(&event.ownership)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?,
+                causation_id: event.causation_id.as_ref().map(|id| id.as_str()),
+                correlation_id: event.correlation_id.as_deref(),
+                payload: serde_json::to_string(&event.payload)
+                    .map_err(|e| StoreError::Serialization(e.to_string()))?,
+            });
+        }
+
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| StoreError::Connection(e.to_string()))?;
 
+        // ── Batched multi-row INSERT ──────────────────────────────────────
+        //
+        // Invariants enforced by this block (mirrors the Pg backend):
+        //
+        // 1. **One transaction per call.** All chunks commit together;
+        //    partial batches must never be observable.
+        // 2. **Portable SQL shape.** `INSERT ... VALUES (…),(…),… RETURNING
+        //    position, event_id` (SQLite ≥ 3.35). The same shape works
+        //    on Postgres — required by the "no DB-specific features"
+        //    rule.
+        // 3. **Client-side reorder via `event_id`.** The SQL spec does
+        //    not guarantee RETURNING row order; we re-map against each
+        //    input event's event_id to stay correct even if a future
+        //    engine returns rows out of insertion order.
+        // 4. **Chunk size ≤ `BATCH_INSERT_CHUNK`.** Keeps the host-
+        //    parameter count below the legacy SQLite 999 cap (and
+        //    trivially below Postgres 65535). All chunks share the
+        //    enclosing transaction; projection atomicity is unchanged.
+        // 5. **WAL-friendly.** One batched INSERT per call replaces N
+        //    per-event statements, collapsing N fsync points into one
+        //    on `synchronous=FULL` and reducing page-lock contention
+        //    under `synchronous=NORMAL`.
+        let mut all_returned: Vec<(i64, String)> = Vec::with_capacity(events.len());
+
+        for chunk in rows.chunks(BATCH_INSERT_CHUNK) {
+            let mut builder: QueryBuilder<'_, sqlx::Sqlite> = QueryBuilder::new(
+                "INSERT INTO event_log (event_id, source_type, source_meta, ownership, causation_id, correlation_id, payload, stored_at) ",
+            );
+            builder.push_values(chunk.iter(), |mut b, row| {
+                b.push_bind(row.event_id)
+                    .push_bind(row.source_type)
+                    .push_bind(&row.source_meta)
+                    .push_bind(&row.ownership)
+                    .push_bind(row.causation_id)
+                    .push_bind(row.correlation_id)
+                    .push_bind(&row.payload)
+                    .push_bind(now);
+            });
+            builder.push(" RETURNING position, event_id");
+
+            let returned: Vec<(i64, String)> = builder
+                .build_query_as()
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| StoreError::Internal(e.to_string()))?;
+
+            if returned.len() != chunk.len() {
+                return Err(StoreError::Internal(format!(
+                    "event_log batch INSERT returned {} rows for {} events in chunk",
+                    returned.len(),
+                    chunk.len()
+                )));
+            }
+
+            all_returned.extend(returned);
+        }
+
+        if all_returned.len() != events.len() {
+            return Err(StoreError::Internal(format!(
+                "event_log batch INSERT returned {} rows for {} events",
+                all_returned.len(),
+                events.len()
+            )));
+        }
+
+        // Re-order returned (position, event_id) to match the input event
+        // order. SQLite's RETURNING clause currently returns rows in the
+        // order rows were inserted (same as PG), but the SQL spec does not
+        // mandate it. Pay O(N) hashmap once rather than ever debug a
+        // flaky projection order. Input uniqueness is verified above, so
+        // every input event_id maps to exactly one entry here.
+        let mut by_event_id: std::collections::HashMap<&str, i64> =
+            std::collections::HashMap::with_capacity(all_returned.len());
+        for (pos, eid) in &all_returned {
+            by_event_id.insert(eid.as_str(), *pos);
+        }
+
         let mut positions = Vec::with_capacity(events.len());
-
         for event in events {
-            let event_id = event.event_id.as_str();
-            let source_type = source_type_str(&event.source);
-            let source_meta = serde_json::to_string(&event.source)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let ownership = serde_json::to_string(&event.ownership)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
-            let payload = serde_json::to_string(&event.payload)
-                .map_err(|e| StoreError::Serialization(e.to_string()))?;
+            let pos = by_event_id.get(event.event_id.as_str()).ok_or_else(|| {
+                StoreError::Internal(format!(
+                    "event_log batch INSERT did not return event_id {}",
+                    event.event_id.as_str()
+                ))
+            })?;
+            positions.push(EventPosition(*pos as u64));
+        }
 
-            let row: (i64,) = sqlx::query_as(
-                "INSERT INTO event_log (event_id, source_type, source_meta, ownership, causation_id, correlation_id, payload, stored_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                 RETURNING position",
-            )
-            .bind(event_id)
-            .bind(source_type)
-            .bind(&source_meta)
-            .bind(&ownership)
-            .bind(event.causation_id.as_ref().map(|id| id.as_str()))
-            .bind(event.correlation_id.as_deref())
-            .bind(&payload)
-            .bind(now)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| StoreError::Internal(e.to_string()))?;
-
-            let pos = EventPosition(row.0 as u64);
-
-            // Apply synchronous projections within the same transaction.
-            // Pre-T2-C1 this call was missing and every SQLite-backed
-            // projection table stayed empty in production — see audit queue
-            // at .claude/audit-state/review-queue.md §T2-C1.
-            let stored = StoredEvent {
-                position: pos,
-                envelope: event.clone(),
-                stored_at: now as u64,
-            };
-            SqliteSyncProjection::apply_async(&mut tx, &stored).await?;
-
-            positions.push(pos);
+        // Apply synchronous projections within the same transaction so
+        // current-state tables stay consistent with the event log —
+        // reads can never observe a position that has not been
+        // projected. `apply_async` takes `&EventEnvelope` so no clone
+        // of the potentially large payload is needed on the hot path.
+        //
+        // (Pre-T2-C1 this call was missing and every SQLite-backed
+        // projection table stayed empty in production — retained as a
+        // regression-origin pointer to .claude/audit-state/review-queue.md
+        // §T2-C1 per project convention.)
+        //
+        // `event_time_ms` matches the `stored_at` column bound above so
+        // rebuild replays produce the same `pause_schedules` row as
+        // the original live append. Copilot #595.
+        let event_time_ms = u64::try_from(now).unwrap_or(0);
+        for event in events {
+            SqliteSyncProjection::apply_async(&mut tx, event, event_time_ms).await?;
         }
 
         tx.commit()

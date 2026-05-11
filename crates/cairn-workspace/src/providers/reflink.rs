@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,6 +22,141 @@ const STRATEGY_FILE: &str = "strategy";
 const META_FILE: &str = "meta.json";
 const ROOT_DIR: &str = "root";
 const EMPTY_BASE_DIR: &str = "base.empty";
+
+/// F65 PR-4: outcome of a reflink-or-copy tree walk.
+///
+/// `reflink_used == false` means the FICLONE ioctl returned `EOPNOTSUPP` on
+/// the host filesystem and cairn fell back to a byte-level copy.
+/// `SandboxService` uses this signal to emit a one-shot
+/// `WorkspaceBackendDegraded { reason: "ext4-fallback-full-copy" }` event
+/// per session, keyed off the `degraded_flag: &AtomicBool` passed in by the
+/// caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReflinkOutcome {
+    pub files_copied: u64,
+    pub bytes_copied: u64,
+    pub reflink_used: bool,
+}
+
+/// Walk `src` and reflink-copy every file to `dst`, falling back to
+/// `std::fs::copy` on `EOPNOTSUPP`. On first fallback the caller's
+/// `degraded_flag` is flipped from `false` to `true` via `compare_exchange`
+/// — the caller can then emit `WorkspaceBackendDegraded` exactly once per
+/// session.
+///
+/// Returns the aggregate outcome. On any error other than `EOPNOTSUPP`, the
+/// walk is aborted with the first error. Symlinks are cloned as symlinks
+/// (not dereferenced). Directories are created on the destination side.
+pub fn reflink_tree_with_fallback(
+    src: &Path,
+    dst: &Path,
+    degraded_flag: &AtomicBool,
+) -> std::io::Result<ReflinkOutcome> {
+    let mut outcome = ReflinkOutcome {
+        files_copied: 0,
+        bytes_copied: 0,
+        reflink_used: true,
+    };
+    copy_one(src, dst, degraded_flag, &mut outcome)?;
+    Ok(outcome)
+}
+
+fn copy_one(
+    src: &Path,
+    dst: &Path,
+    degraded: &AtomicBool,
+    outcome: &mut ReflinkOutcome,
+) -> std::io::Result<()> {
+    let md = fs::symlink_metadata(src)?;
+    let file_type = md.file_type();
+    if file_type.is_symlink() {
+        let target = fs::read_link(src)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, dst)?;
+        #[cfg(windows)]
+        {
+            // Copilot caught this: silently dropping symlinks would be
+            // data loss. Match the behavior of SystemReflinkCloneDriver
+            // (elsewhere in this file) by creating the appropriate
+            // symlink kind on Windows.
+            let is_dir = fs::metadata(src).map(|m| m.is_dir()).unwrap_or(false);
+            if is_dir {
+                std::os::windows::fs::symlink_dir(&target, dst)?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, dst)?;
+            }
+        }
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        fs::create_dir_all(dst)?;
+        // Collect entries up-front, explicitly dropping the ReadDir iterator
+        // (and therefore the underlying DIR fd) BEFORE we recurse. Without
+        // this, long recursions hold nested DIR fds open simultaneously —
+        // plus, any intermediate reflink/copy ioctl that returns unexpected
+        // errno values is diagnosed in isolation rather than racing against
+        // the outer iterator's destructor.
+        let entries: Vec<(PathBuf, std::ffi::OsString)> = {
+            let iter = fs::read_dir(src)?;
+            iter.map(|e| {
+                let e = e?;
+                Ok((e.path(), e.file_name()))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?
+        };
+        for (path, name) in entries {
+            copy_one(&path, &dst.join(name), degraded, outcome)?;
+        }
+        return Ok(());
+    }
+
+    // Regular file. Try reflink first; fall back to byte copy on EOPNOTSUPP.
+    match reflink_copy::reflink(src, dst) {
+        Ok(()) => {
+            outcome.files_copied += 1;
+            outcome.bytes_copied += md.len();
+            Ok(())
+        }
+        Err(err)
+            if err.raw_os_error() == Some(libc_eopnotsupp())
+                || err.raw_os_error() == Some(libc_einval()) =>
+        {
+            // Flip the degraded flag once; only the first thread to
+            // succeed at compare_exchange(false, true) gets to log.
+            let _ = degraded.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+            let bytes = fs::copy(src, dst)?;
+            outcome.files_copied += 1;
+            outcome.bytes_copied += bytes;
+            outcome.reflink_used = false;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn libc_eopnotsupp() -> i32 {
+    libc::EOPNOTSUPP
+}
+
+#[cfg(not(target_os = "linux"))]
+fn libc_eopnotsupp() -> i32 {
+    // Fallback constant when libc isn't linked. ENOTSUP on BSDs == 45 is
+    // typical but the callers only pattern-match against equal, so a value
+    // that never matches is fine — on non-Linux the reflink code path isn't
+    // exercised in production.
+    95
+}
+
+#[cfg(target_os = "linux")]
+fn libc_einval() -> i32 {
+    libc::EINVAL
+}
+
+#[cfg(not(target_os = "linux"))]
+fn libc_einval() -> i32 {
+    22
+}
 
 pub trait ReflinkCloneDriver: Send + Sync + 'static {
     fn clone_tree(&self, src: &Path, dst: &Path) -> Result<(), String>;

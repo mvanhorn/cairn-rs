@@ -68,7 +68,10 @@ pub mod soul_guard;
 pub mod startup;
 pub mod tasks;
 pub mod telemetry;
+pub mod tenant_role_backfill;
+pub mod tenant_roles;
 pub mod tenants;
+pub mod tool_call_approvals;
 pub mod voice;
 pub mod workspace_memberships;
 pub mod workspaces;
@@ -106,35 +109,46 @@ pub use prompt_versions::PromptVersionService;
 pub use routing::RouteResolverService;
 pub use runs::RunService;
 pub use runtime_config::{
-    RuntimeConfig, KEY_BRAIN_MODEL, KEY_BRAIN_URL, KEY_EMBED_MODEL, KEY_GENERATE_MODEL,
-    KEY_MAX_TOKENS, KEY_OLLAMA_EMBED_MODEL, KEY_STREAM_MODEL, KEY_THINKING_MODEL_PREFIXES,
-    KEY_WORKER_URL,
+    RuntimeConfig, DEFAULT_ORCHESTRATOR_NO_TOOL_USE_STREAK, DEFAULT_ORCHESTRATOR_ROUND_CAP,
+    DEFAULT_ORCHESTRATOR_TOKEN_CAP, DEFAULT_ORCHESTRATOR_WALL_CLOCK_MS, KEY_BRAIN_MODEL,
+    KEY_BRAIN_URL, KEY_EMBED_MODEL, KEY_GENERATE_MODEL, KEY_MAX_TOKENS, KEY_OLLAMA_EMBED_MODEL,
+    KEY_ORCHESTRATOR_NO_TOOL_USE_STREAK, KEY_ORCHESTRATOR_ROUND_CAP, KEY_ORCHESTRATOR_TOKEN_CAP,
+    KEY_ORCHESTRATOR_WALL_CLOCK_MS, KEY_STREAM_MODEL, KEY_THINKING_MODEL_PREFIXES, KEY_WORKER_URL,
 };
 pub use services::{
-    AllowlistRevokedRun, ApprovalPolicyServiceImpl, ApprovalServiceImpl, BaseRevisionDriftRun,
-    CheckpointServiceImpl, EvalRunServiceImpl, ExternalWorkerService, ExternalWorkerServiceImpl,
-    IngestJobServiceImpl, LlmObservabilityServiceImpl, MailboxServiceImpl, ProjectServiceImpl,
-    PromptAssetServiceImpl, PromptReleaseServiceImpl, PromptVersionServiceImpl, RecoveryService,
-    RecoveryServiceImpl, SandboxLostRun, SandboxReattachedRun, SignalServiceImpl,
-    SimpleRouteResolver, TenantServiceImpl, ToolInvocationService, ToolInvocationServiceImpl,
-    WorkspaceServiceImpl,
+    decrypt_credential_record, scan_legacy_ciphertexts, AllowlistRevokedRun,
+    ApprovalPolicyServiceImpl, ApprovalServiceImpl, BaseRevisionDriftRun, CheckpointServiceImpl,
+    CredentialServiceImpl, EvalRunServiceImpl, ExternalWorkerService, ExternalWorkerServiceImpl,
+    IngestJobServiceImpl, LegacyCredential, LlmObservabilityServiceImpl, MailboxServiceImpl,
+    MasterKey, MasterKeyError, ProjectServiceImpl, PromptAssetServiceImpl,
+    PromptReleaseServiceImpl, PromptVersionServiceImpl, RecoveryService, RecoveryServiceImpl,
+    SandboxLostRun, SandboxReattachedRun, SignalServiceImpl, SimpleRouteResolver,
+    TenantServiceImpl, ToolCallApprovalReaderAdapter, ToolCallApprovalServiceImpl,
+    ToolInvocationService, ToolInvocationServiceImpl, WorkspaceServiceImpl,
 };
 pub use sessions::SessionService;
 pub use signals::SignalService;
 pub use soul_guard::SoulGuard;
 pub use tasks::TaskService;
-pub use tenants::TenantService;
+pub use tenant_role_backfill::{run_tenant_role_backfill, TenantRoleBackfillReport};
+pub use tenant_roles::TenantRoleService;
+pub use tenants::{TenantService, TenantUpdatePatch};
+pub use tool_call_approvals::{
+    AllowRule, ApprovalDecision as ToolCallApprovalDecision, ApprovedProposal, OperatorDecision,
+    StoredProposal, StoredProposalState, ToolCallApprovalReader, ToolCallApprovalService,
+    ToolCallProposal,
+};
 pub use workspaces::WorkspaceService;
 // Service trait exports
 pub use audits::AuditService;
 pub use budgets::BudgetService;
 pub use channels::ChannelService;
 pub use credentials::CredentialService;
-pub use defaults::DefaultsService;
+pub use defaults::{DefaultsService, TypedDefaultError, TYPED_DEFAULT_MAX_BYTES};
 pub use guardrails::GuardrailService;
 pub use licenses::LicenseService;
 pub use notification_prefs::NotificationService;
-pub use operator_profiles::OperatorProfileService;
+pub use operator_profiles::{OperatorProfilePatch, OperatorProfileService};
 pub use provider_bindings::ProviderBindingService;
 pub use provider_connections::{ProviderConnectionConfig, ProviderConnectionService};
 pub use provider_health::ProviderHealthService;
@@ -154,7 +168,7 @@ pub use signal_routing::SignalRouterService;
 pub use voice::{SpeechToTextService, TextToSpeechService};
 pub use workspace_memberships::WorkspaceMembershipService;
 
-pub use aggregate::InMemoryServices;
+pub use aggregate::RuntimeServices;
 pub use services::confidence_calibrator::{CalibrationAdjustment, ConfidenceCalibrator};
 pub use services::event_helpers::seed_event_counter;
 
@@ -175,6 +189,13 @@ pub use services::{
 pub use services::{
     DispatchEntry, ProviderHealthTracker, ProviderRouter, RoutableProvider, RoutingConfig,
     RoutingOutcome,
+};
+
+// ── Model chain + composed routed generation ─────────────────────────────────
+pub use services::{
+    format_attempt_summary, single_model_service, CooldownMap, FallbackAttempt, FallbackOutcome,
+    ModelChain, RoutedBinding, RoutedGenerationError, RoutedGenerationService,
+    RoutedGenerationSuccess, DEFAULT_RATE_LIMIT_COOLDOWN,
 };
 
 // ── RFC 007: Plugin lifecycle management ─────────────────────────────────────

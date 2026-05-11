@@ -1,8 +1,8 @@
 //! API seam audit: proves MemoryEndpoints and FeedEndpoints calls
 //! flow through real cairn-memory services, not route-local shaping.
 
-use cairn_api::feed::{FeedEndpoints, FeedItem, FeedQuery};
-use cairn_api::memory_api::MemorySearchQuery;
+use cairn_api_contracts::feed::{FeedEndpoints, FeedItem, FeedQuery};
+use cairn_api_contracts::memory_api::MemorySearchQuery;
 use cairn_domain::ProjectKey;
 use cairn_memory::api_impl::MemoryApiImpl;
 use cairn_memory::feed_impl::FeedStore;
@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// to the real retrieval backend sharing the same document store.
 #[tokio::test]
 async fn memory_search_flows_through_real_retrieval_service() {
-    use cairn_api::memory_api::{CreateMemoryRequest, MemoryEndpoints};
+    use cairn_api_contracts::memory_api::{CreateMemoryRequest, MemoryEndpoints};
 
     let store = Arc::new(InMemoryDocumentStore::new());
     let project = ProjectKey::new("t", "w", "p");

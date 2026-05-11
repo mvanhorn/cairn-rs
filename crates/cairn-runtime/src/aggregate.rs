@@ -1,4 +1,4 @@
-//! `InMemoryServices` — the bundled runtime service aggregate for cairn-app.
+//! `RuntimeServices` — the bundled runtime service aggregate for cairn-app.
 //!
 //! Provides a single injectable struct that wires all runtime services against
 //! a shared `InMemoryStore`. cairn-app constructs one instance at startup and
@@ -11,21 +11,23 @@ use cairn_store::InMemoryStore;
 
 use crate::runs::RunService;
 use crate::services::resource_sharing_impl::ResourceSharingServiceImpl;
+use crate::services::tool_call_approval_impl::ToolCallApprovalServiceImpl;
 use crate::services::ToolInvocationServiceImpl;
 use crate::services::{
-    ApprovalPolicyServiceImpl, ApprovalServiceImpl, AuditServiceImpl, BudgetServiceImpl,
-    ChannelServiceImpl, CheckpointServiceImpl, CredentialServiceImpl, DefaultsServiceImpl,
-    EvalRunServiceImpl, ExternalWorkerServiceImpl, GuardrailServiceImpl, IngestJobServiceImpl,
-    LicenseServiceImpl, LlmObservabilityServiceImpl, MailboxServiceImpl, NotificationServiceImpl,
-    OperatorProfileServiceImpl, ProjectServiceImpl, PromptAssetServiceImpl,
-    PromptReleaseServiceImpl, PromptVersionServiceImpl, ProviderBindingServiceImpl,
-    ProviderConnectionPoolServiceImpl, ProviderConnectionServiceImpl, ProviderHealthServiceImpl,
-    QuotaServiceImpl, RetentionServiceImpl, RoutePolicyServiceImpl, RunCostAlertServiceImpl,
-    RunSlaServiceImpl, SignalRouterServiceImpl, SignalServiceImpl, TenantServiceImpl,
-    WorkspaceMembershipServiceImpl, WorkspaceServiceImpl,
+    AgentRoleServiceImpl, ApprovalPolicyServiceImpl, ApprovalServiceImpl, AuditServiceImpl,
+    BudgetServiceImpl, ChannelServiceImpl, CheckpointServiceImpl, CredentialServiceImpl,
+    DefaultsServiceImpl, EvalRunServiceImpl, ExternalWorkerServiceImpl, GuardrailServiceImpl,
+    IngestJobServiceImpl, LicenseServiceImpl, LlmObservabilityServiceImpl, MailboxServiceImpl,
+    NotificationServiceImpl, OperatorProfileServiceImpl, ProjectServiceImpl,
+    PromptAssetServiceImpl, PromptReleaseServiceImpl, PromptVersionServiceImpl,
+    ProviderBindingServiceImpl, ProviderConnectionPoolServiceImpl, ProviderConnectionServiceImpl,
+    ProviderHealthServiceImpl, QuotaServiceImpl, RetentionServiceImpl, RoutePolicyServiceImpl,
+    RunCostAlertServiceImpl, RunSlaServiceImpl, SignalRouterServiceImpl, SignalServiceImpl,
+    TenantRoleServiceImpl, TenantServiceImpl, WorkspaceMembershipServiceImpl, WorkspaceServiceImpl,
 };
 use crate::sessions::SessionService;
 use crate::tasks::TaskService;
+use crate::tool_call_approvals::ToolCallApprovalService;
 use crate::ProviderRegistry;
 
 /// Bundled runtime services backed by `InMemoryStore`.
@@ -35,7 +37,7 @@ use crate::ProviderRegistry;
 /// — that is the only production path. All other fields remain concrete
 /// `*ServiceImpl<InMemoryStore>` and back non-execution surfaces
 /// (approvals, evals, provider bindings, etc.) that FF does not manage.
-pub struct InMemoryServices {
+pub struct RuntimeServices {
     /// The shared append-only event log + synchronous projections.
     pub store: Arc<InMemoryStore>,
 
@@ -52,10 +54,24 @@ pub struct InMemoryServices {
     pub workspaces: WorkspaceServiceImpl<InMemoryStore>,
     pub projects: ProjectServiceImpl<InMemoryStore>,
 
+    // ── Agent roles (RFC 031) ─────────────────────────────────────────────
+    /// Operator-defined per-project agent roles. PR-A skeleton: the
+    /// trait is wired, `define` / `retract` append `AgentRole*` events,
+    /// `resolve` / `list` currently fall through to
+    /// `default_roles()` (projection reader ships in PR-B alongside
+    /// the HTTP handlers). RFC 031 §D14 — no cross-node cache; the
+    /// per-run `list` snapshot lives on `OrchestrationContext`.
+    pub agent_roles: AgentRoleServiceImpl<InMemoryStore>,
+
     // ── Approvals & checkpoints ────────────────────────────────────────────
     pub approvals: ApprovalServiceImpl<InMemoryStore>,
     pub approval_policies: ApprovalPolicyServiceImpl<InMemoryStore>,
     pub checkpoints: CheckpointServiceImpl<InMemoryStore>,
+    /// Tool-call approval flow (BP-v2 wave). Owns proposal cache +
+    /// operator decision path for the `ToolCall*` events. Backed by the
+    /// shared `InMemoryStore` as both event log and projection reader
+    /// (blanket `ToolCallApprovalReader for T: ToolCallApprovalReadModel`).
+    pub tool_call_approvals: Arc<dyn ToolCallApprovalService>,
 
     // ── Prompts ────────────────────────────────────────────────────────────
     pub prompt_assets: PromptAssetServiceImpl<InMemoryStore>,
@@ -118,6 +134,10 @@ pub struct InMemoryServices {
     // ── Notifications & operators ─────────────────────────────────────────
     pub notifications: NotificationServiceImpl<InMemoryStore>,
     pub operator_profiles: OperatorProfileServiceImpl<InMemoryStore>,
+    /// RFC 026 PR-A0: tenant-scope admin role service. Emits
+    /// `TenantRoleGranted` / `TenantRoleRevoked` and backs the
+    /// `TenantAdminGuard` extractor in cairn-app.
+    pub tenant_roles: TenantRoleServiceImpl<InMemoryStore>,
     pub workspace_memberships: WorkspaceMembershipServiceImpl<InMemoryStore>,
     pub audits: AuditServiceImpl<InMemoryStore>,
     pub tool_invocations: crate::services::ToolInvocationServiceImpl<InMemoryStore>,
@@ -143,7 +163,7 @@ pub struct InMemoryServices {
     pub runtime_config: std::sync::Arc<crate::runtime_config::RuntimeConfig>,
 }
 
-impl InMemoryServices {
+impl RuntimeServices {
     /// Create a bundle wired to an existing store with caller-supplied core
     /// services.
     ///
@@ -156,6 +176,29 @@ impl InMemoryServices {
         runs: Arc<dyn RunService>,
         tasks: Arc<dyn TaskService>,
         sessions: Arc<dyn SessionService>,
+    ) -> Self {
+        // Tests that construct the aggregate directly use an ephemeral
+        // deterministic master key. Production callers use
+        // [`with_store_core_and_key`] so the operator-configured
+        // `CAIRN_CREDENTIAL_KEY` is honored end-to-end.
+        let master_key = Arc::new(crate::services::MasterKey::from_bytes([0u8; 32]));
+        Self::with_store_core_and_key(store, runs, tasks, sessions, master_key)
+    }
+
+    /// Build a runtime aggregate with an operator-supplied master key.
+    ///
+    /// This is the production path — cairn-app's `AppState::new` loads the
+    /// key from `CAIRN_CREDENTIAL_KEY`/`CAIRN_CREDENTIAL_KEY_FILE` and passes
+    /// it here. The single [`MasterKey`](crate::services::MasterKey)
+    /// is shared between the `CredentialServiceImpl` (encrypt/decrypt path)
+    /// and the `ProviderRegistry` (decrypt-on-read path) so there is exactly
+    /// one key material instance per deployment.
+    pub fn with_store_core_and_key(
+        store: Arc<InMemoryStore>,
+        runs: Arc<dyn RunService>,
+        tasks: Arc<dyn TaskService>,
+        sessions: Arc<dyn SessionService>,
+        master_key: Arc<crate::services::MasterKey>,
     ) -> Self {
         // RFC 020 §"Decision Cache Survival": wire the shared event log
         // into the decision service so cached decisions are persisted
@@ -174,9 +217,14 @@ impl InMemoryServices {
             tenants: TenantServiceImpl::new(store.clone()),
             workspaces: WorkspaceServiceImpl::new(store.clone()),
             projects: ProjectServiceImpl::new(store.clone()),
+            agent_roles: AgentRoleServiceImpl::new(store.clone()),
             approvals: ApprovalServiceImpl::new(store.clone()),
             approval_policies: ApprovalPolicyServiceImpl::new(store.clone()),
             checkpoints: CheckpointServiceImpl::new(store.clone()),
+            tool_call_approvals: Arc::new(ToolCallApprovalServiceImpl::new(
+                store.clone(),
+                store.clone(),
+            )) as Arc<dyn ToolCallApprovalService>,
             prompt_assets: PromptAssetServiceImpl::new(store.clone()),
             prompt_releases: PromptReleaseServiceImpl::new(store.clone()),
             prompt_versions: PromptVersionServiceImpl::new(store.clone()),
@@ -192,8 +240,11 @@ impl InMemoryServices {
             provider_connections: ProviderConnectionServiceImpl::new(store.clone()),
             provider_health: ProviderHealthServiceImpl::new(store.clone()),
             provider_pools: ProviderConnectionPoolServiceImpl::new(store.clone()),
-            provider_registry: std::sync::Arc::new(ProviderRegistry::new(store.clone())),
-            credentials: CredentialServiceImpl::new(store.clone()),
+            provider_registry: std::sync::Arc::new(ProviderRegistry::new(
+                store.clone(),
+                master_key.clone(),
+            )),
+            credentials: CredentialServiceImpl::new(store.clone(), master_key.clone()),
             defaults: DefaultsServiceImpl::new(store.clone()),
             licenses: LicenseServiceImpl::new(store.clone()),
             guardrails: GuardrailServiceImpl::new(store.clone()),
@@ -205,6 +256,7 @@ impl InMemoryServices {
             budgets: BudgetServiceImpl::new(store.clone()),
             notifications: NotificationServiceImpl::new(store.clone()),
             operator_profiles: OperatorProfileServiceImpl::new(store.clone()),
+            tenant_roles: TenantRoleServiceImpl::new(store.clone()),
             workspace_memberships: WorkspaceMembershipServiceImpl::new(store.clone()),
             audits: AuditServiceImpl::new(store.clone()),
             tool_invocations: ToolInvocationServiceImpl::new(store.clone()),

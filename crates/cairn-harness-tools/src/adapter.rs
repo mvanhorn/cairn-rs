@@ -74,6 +74,26 @@ pub trait HarnessTool: Send + Sync + 'static {
         hook: PermissionHook,
     ) -> Self::Session;
 
+    /// Pre-call gate. Runs after `build_session` and before `call`.
+    /// Default returns `Ok(())`. Tools with role-scoped policy
+    /// (e.g. `HarnessBash` enforcing the orchestrator verb
+    /// allowlist) override this to inspect `args` + `ctx.agent_role_id()`
+    /// and reject at the boundary rather than letting the command
+    /// proceed to the upstream crate.
+    ///
+    /// Returning `Err` short-circuits the `execute_with_context`
+    /// pipeline: the error is mapped to `ToolResult` via the caller
+    /// so the model sees a structured rejection on the next DECIDE
+    /// turn and can correct course (e.g. pivot to `spawn_subagent`
+    /// with an executor role).
+    fn pre_call_check(
+        _ctx: &ToolContext,
+        _project: &ProjectKey,
+        _args: &Value,
+    ) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     /// Invoke the upstream async entrypoint.
     async fn call(args: Value, session: &Self::Session) -> Self::Result;
 
@@ -163,6 +183,7 @@ impl<H: HarnessTool> ToolHandler for HarnessBuiltin<H> {
     ) -> Result<ToolResult, ToolError> {
         let hook = crate::hook::build_cairn_hook();
         let session = H::build_session(ctx, project, hook);
+        H::pre_call_check(ctx, project, &args)?;
         let result = H::call(args, &session).await;
         H::result_to_tool_result(result, ctx, project)
     }

@@ -16,8 +16,9 @@
 //! 2. Explicit `.route("/path", method(handler))` calls in
 //!    `crates/cairn-app/src/router.rs` — the library router's non-catalog
 //!    handlers chained after the fold.
-//! 3. Explicit `.route(...)` calls in `crates/cairn-app/src/bin_router.rs` —
-//!    production binary-specific routes merged over the catalog router.
+//! 3. Explicit `.route(...)` calls in
+//!    `crates/cairn-app/src/bin_main/bin_router.rs` — production binary-
+//!    specific routes merged over the catalog router.
 //!
 //! ## What to do on drift
 //!
@@ -100,7 +101,7 @@ fn collect_real_routes() -> BTreeSet<(String, String)> {
     }
 
     let lib = parse_route_file(&repo_file("crates/cairn-app/src/router.rs"));
-    let bin = parse_route_file(&repo_file("crates/cairn-app/src/bin_router.rs"));
+    let bin = parse_route_file(&repo_file("crates/cairn-app/src/bin_main/bin_router.rs"));
     for ParsedRoute { method, path } in lib.into_iter().chain(bin) {
         set.insert((method, path));
     }

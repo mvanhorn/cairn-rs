@@ -52,7 +52,7 @@ pub enum ToolEffect {
     /// Writes to cairn-owned state only (scratch pad, memory, sandbox FS,
     /// cairn task queue). Never touches external systems.
     ///
-    /// Examples: `scratch_pad`, `memory_store`, `file_write`, `create_task`.
+    /// Examples: `scratch_pad`, `memory_store`, `file_write`.
     Internal,
 
     /// Touches systems outside cairn's boundary — outbound API calls, shell

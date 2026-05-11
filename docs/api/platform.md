@@ -4,7 +4,7 @@ Deployment-wide settings, operator configuration, assistant/chat, bundles (impor
 
 Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes.tsv). Drift from this table against the live router is enforced by `cargo test -p cairn-api --test compat_catalog_sync`.
 
-**Routes: 51**
+**Routes: 52**
 
 | Method | Path | Classification | Notes |
 |---|---|---|---|
@@ -46,11 +46,13 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `POST` | `/v1/poll/run` | Preserve | { ok } |
 | `GET` | `/v1/settings` | Preserve | deployment settings |
 | `DELETE` | `/v1/settings/defaults/:scope/:scope_id/:key` | Preserve |  |
+| `GET` | `/v1/settings/defaults/:scope/:scope_id/:key` | Preserve | F29 CD; exact-lookup GET returning `{scope, scope_id, key, value, source}` or 404 |
 | `PUT` | `/v1/settings/defaults/:scope/:scope_id/:key` | Preserve |  |
 | `GET` | `/v1/settings/defaults/all` | Preserve |  |
 | `GET` | `/v1/settings/defaults/resolve/:key` | Preserve |  |
 | `GET` | `/v1/settings/tls` | Preserve | TLS config |
-| `GET` | `/v1/skills` | Preserve | { items, summary, currentlyActive? } |
+| `GET` | `/v1/skills` | Preserve | { items, summary, currently_active, currentlyActive } |
+| `GET` | `/v1/skills/:id` | Preserve | full `Skill` detail (entry_point, required_permissions, status) or 404 |
 | `GET` | `/v1/soul` | Transitional | current singleton asset wrapper |
 | `PUT` | `/v1/soul` | Transitional | body: { content }; { ok, sha } |
 | `GET` | `/v1/soul/history` | Transitional | { items } |
@@ -59,5 +61,6 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `GET` | `/v1/templates/:id` | Preserve |  |
 | `POST` | `/v1/templates/:id/apply` | Preserve |  |
 | `POST` | `/v1/test/webhook` | Preserve |  |
+| `GET` | `/v1/workspaces/:tenant/:workspace/costs` | Preserve | F29 CD-2: lifetime cost rollup across every project in the workspace. |
 
 <!-- TODO: contract bodies (tracked as follow-up) -->

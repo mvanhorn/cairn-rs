@@ -6,6 +6,24 @@ use cairn_domain::{OperatorId, TenantId, WorkspaceRole};
 
 use crate::error::RuntimeError;
 
+/// Patch payload for `OperatorProfileService::patch_profile`. Each
+/// field uses PATCH semantics: `None` means "leave the stored value
+/// alone", `Some(v)` means "replace with v". RFC 026 PR-A2.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OperatorProfilePatch {
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub role: Option<WorkspaceRole>,
+}
+
+impl OperatorProfilePatch {
+    /// True when the patch carries no field updates. Handlers convert
+    /// an empty patch to a 422 instead of emitting a no-op event.
+    pub fn is_empty(&self) -> bool {
+        self.display_name.is_none() && self.email.is_none() && self.role.is_none()
+    }
+}
+
 #[async_trait]
 pub trait OperatorProfileService: Send + Sync {
     async fn create(
@@ -30,6 +48,18 @@ pub trait OperatorProfileService: Send + Sync {
         profile_id: &OperatorId,
         display_name: String,
         email: String,
+    ) -> Result<OperatorProfile, RuntimeError>;
+
+    /// RFC 026 PR-A2: apply a PATCH edit to an operator profile.
+    /// Unlike `update`, every field is optional and the caller may
+    /// also edit `role`. `None` fields leave their stored values
+    /// alone; at least one field must be `Some(..)` or the service
+    /// returns `RuntimeError::Validation { reason: "empty_patch" }`.
+    /// 404 when the operator id has no profile.
+    async fn patch_profile(
+        &self,
+        profile_id: &OperatorId,
+        patch: OperatorProfilePatch,
     ) -> Result<OperatorProfile, RuntimeError>;
 
     /// RFC 008: update ergonomic/presentation preferences for an operator.

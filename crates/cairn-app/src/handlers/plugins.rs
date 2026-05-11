@@ -18,6 +18,7 @@ use cairn_tools::{
 };
 
 use crate::errors::AppApiError;
+use crate::extractors::AdminRoleGuard;
 use crate::state::AppState;
 use crate::{DEFAULT_PROJECT_ID, DEFAULT_TENANT_ID, DEFAULT_WORKSPACE_ID};
 
@@ -84,20 +85,28 @@ pub(crate) struct PluginEvalScoreRequest {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-pub(crate) async fn list_plugins_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let items = state.plugin_registry.list_all();
-    (
-        StatusCode::OK,
-        Json(ListResponse {
-            items,
-            has_more: false,
-        }),
-    )
-        .into_response()
+pub(crate) async fn list_plugins_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<crate::handlers::admin::PaginationQuery>,
+) -> impl IntoResponse {
+    // #422: the registry returns every registered plugin. Paginate
+    // in-memory with honest `has_more` so the UI plugin catalog can
+    // page through a large install base.
+    let all = state.plugin_registry.list_all();
+    let total = all.len();
+    let offset = query.offset();
+    let limit = query.limit();
+    let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(items.len()) < total;
+    (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
 }
 
 pub(crate) async fn create_plugin_handler(
     State(state): State<Arc<AppState>>,
+    // #453 — plugin install runs subprocess code server-side. Gate on
+    // `AdminRoleGuard`: non-admin operators must get a 403, not the ability
+    // to drop attacker-controlled binaries into the global registry.
+    _role: AdminRoleGuard,
     Json(manifest): Json<PluginManifest>,
 ) -> impl IntoResponse {
     if let Err(err) = state.plugin_registry.register(manifest.clone()) {
@@ -171,6 +180,10 @@ pub(crate) async fn get_plugin_handler(
 
 pub(crate) async fn delete_plugin_handler(
     State(state): State<Arc<AppState>>,
+    // #454 — unregistering a plugin shuts it down for every tenant that
+    // depends on it (DoS). Gate on `AdminRoleGuard` so non-admins can't
+    // uninstall plugins they don't own.
+    _role: AdminRoleGuard,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.plugin_registry.get(&id).is_none() {
@@ -238,15 +251,20 @@ pub(crate) async fn plugin_logs_handler(
     Path(id): Path<String>,
     Query(query): Query<PluginLogListQuery>,
 ) -> impl IntoResponse {
-    match state.plugin_registry.list_logs(&id, query.limit()) {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse::<PluginLogEntry> {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+    // #422: fetch `limit + 1` rows to compute `has_more` honestly. The
+    // log tail endpoint does not yet accept offset — callers that need
+    // older entries must raise `limit`.
+    let limit = query.limit();
+    match state.plugin_registry.list_logs(&id, limit + 1) {
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (
+                StatusCode::OK,
+                Json(ListResponse::<PluginLogEntry> { items, has_more }),
+            )
+                .into_response()
+        }
         Err(_) => {
             AppApiError::new(StatusCode::NOT_FOUND, "not_found", "plugin not found").into_response()
         }
@@ -258,18 +276,19 @@ pub(crate) async fn plugin_pending_signals_handler(
     Path(id): Path<String>,
     Query(query): Query<PluginLogListQuery>,
 ) -> impl IntoResponse {
-    match state
-        .plugin_registry
-        .list_pending_signals(&id, query.limit())
-    {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse::<cairn_domain::SignalRecord> {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+    // #422: same pattern as plugin_logs — fetch `limit + 1`, derive
+    // `has_more`.
+    let limit = query.limit();
+    match state.plugin_registry.list_pending_signals(&id, limit + 1) {
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (
+                StatusCode::OK,
+                Json(ListResponse::<cairn_domain::SignalRecord> { items, has_more }),
+            )
+                .into_response()
+        }
         Err(_) => {
             AppApiError::new(StatusCode::NOT_FOUND, "not_found", "plugin not found").into_response()
         }
@@ -497,9 +516,13 @@ pub(crate) async fn plugin_tools_search_handler(
 /// Unregister a plugin -- shuts down its host process and removes it from the
 /// registry. Identical to `delete_plugin_handler`; this is the semantic alias
 /// used by the route catalog.
+///
+/// #454: the admin-role guard is applied here too because this is the alias
+/// that the app_routes() table binds at `/v1/plugins/:id` (see router.rs).
 pub(crate) async fn unregister_plugin_handler(
     state: State<Arc<AppState>>,
+    role: AdminRoleGuard,
     path: Path<String>,
 ) -> impl IntoResponse {
-    delete_plugin_handler(state, path).await
+    delete_plugin_handler(state, role, path).await
 }

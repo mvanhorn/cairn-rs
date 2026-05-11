@@ -7,29 +7,46 @@
 //!   cairn-app --addr 0.0.0.0          # bind all interfaces
 
 pub mod bootstrap;
+pub mod child_run_driver;
+pub mod contract_verifier_adapter;
+pub mod credential_env_scrub;
 pub mod errors;
 pub mod extractors;
 pub mod fabric_adapter;
 pub mod handlers;
 pub mod helpers;
+pub mod idempotency;
+pub mod knowledge_provider_routes;
+pub mod lease_keeper;
+pub mod main_bridges;
 pub mod marketplace_routes;
+pub mod memory_provider_routes;
 pub mod metrics;
 #[cfg(feature = "metrics-otel")]
 pub mod metrics_otel;
 #[cfg(any(feature = "metrics-core", feature = "metrics-providers"))]
 pub mod metrics_tap;
 pub mod middleware;
+pub mod openapi_spec;
+pub mod parent_auto_resume_impl;
+pub mod provider_boot_scan;
+pub mod providers_routes;
 pub mod repo_routes;
 pub mod router;
 pub mod sandbox;
+pub mod sandbox_f65_bridges;
+pub mod scoring_policy_routes;
 pub mod sse_hooks;
 pub mod state;
+pub mod subagent_steps;
 pub mod telemetry_routes;
 pub mod tokens;
 pub mod tool_impls;
+pub(crate) mod tracing_emitter;
 pub mod trigger_routes;
 pub mod triggers;
 pub mod validate;
+pub mod webhook_validation;
 
 // Re-exports for backward compatibility
 pub use bootstrap::{parse_args, parse_args_from, run_bootstrap};
@@ -75,12 +92,9 @@ pub use router::AppBootstrap;
 pub(crate) use router::*;
 #[allow(unused_imports)]
 pub(crate) use sandbox::*;
+pub use state::AppState;
 #[allow(unused_imports)]
 pub(crate) use state::*;
-pub use state::{
-    AppState, GitHubEventAction, GitHubIntegration, IssueQueueEntry, IssueQueueStatus,
-    WebhookAction,
-};
 #[allow(unused_imports)]
 pub(crate) use tokens::*;
 #[allow(unused_imports)]
@@ -93,11 +107,15 @@ pub(crate) use cairn_tools::cancel_plugin_invocation;
 #[allow(unused_imports)]
 pub(crate) use handlers::admin::*;
 #[allow(unused_imports)]
+pub(crate) use handlers::agent_roles::*;
+#[allow(unused_imports)]
 pub(crate) use handlers::approvals::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::auth_tokens::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::bundles_handlers::*;
+#[allow(unused_imports)]
+pub(crate) use handlers::costs::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::decisions::*;
 #[allow(unused_imports)]
@@ -117,6 +135,8 @@ pub(crate) use handlers::memory::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::plugins::*;
 #[allow(unused_imports)]
+pub(crate) use handlers::project_tools::*;
+#[allow(unused_imports)]
 pub(crate) use handlers::prompts::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::providers::*;
@@ -127,11 +147,15 @@ pub(crate) use handlers::sessions::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::signals::*;
 #[allow(unused_imports)]
+pub(crate) use handlers::skills::*;
+#[allow(unused_imports)]
 pub(crate) use handlers::sqeq::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::sse::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::tasks::*;
+#[allow(unused_imports)]
+pub(crate) use handlers::tool_call_approvals::*;
 #[allow(unused_imports)]
 pub(crate) use handlers::tools::*;
 #[allow(unused_imports)]

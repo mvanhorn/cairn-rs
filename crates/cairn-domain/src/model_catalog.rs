@@ -484,14 +484,24 @@ pub fn builtin_catalog() -> Vec<ModelEntry> {
 /// }
 /// ```
 pub fn import_litellm_json(json: &str) -> Vec<ModelEntry> {
-    let map: std::collections::HashMap<String, serde_json::Value> = match serde_json::from_str(json)
-    {
+    let map: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(json) {
         Ok(m) => m,
         Err(_) => return Vec::new(),
     };
+    import_litellm_map(&map)
+}
 
+/// Build entries from an already-parsed LiteLLM map. Callers that have
+/// the payload in memory as a `serde_json::Value::Object` (e.g. Axum
+/// handlers using `Json<Value>`) should prefer this over
+/// [`import_litellm_json`] so the body is not re-parsed. Closes #493.
+///
+/// Takes `&serde_json::Map` rather than `&HashMap` so callers holding a
+/// `Value::Object` can pass the inner map by reference without an
+/// intermediate `HashMap` allocation (Gemini review on PR #548).
+pub fn import_litellm_map(map: &serde_json::Map<String, serde_json::Value>) -> Vec<ModelEntry> {
     let mut entries = Vec::new();
-    for (key, val) in &map {
+    for (key, val) in map {
         // Skip the metadata key that LiteLLM includes
         if key == "sample_spec" || !val.is_object() {
             continue;

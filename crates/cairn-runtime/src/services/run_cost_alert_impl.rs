@@ -89,8 +89,16 @@ where
     async fn list_triggered_by_tenant(
         &self,
         tenant_id: &TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<RunCostAlert>, RuntimeError> {
-        Ok(RunCostAlertReadModel::list_triggered_by_tenant(self.store.as_ref(), tenant_id).await?)
+        Ok(RunCostAlertReadModel::list_triggered_by_tenant(
+            self.store.as_ref(),
+            tenant_id,
+            limit,
+            offset,
+        )
+        .await?)
     }
 }
 
@@ -154,7 +162,10 @@ mod tests {
         assert!(alert.triggered_at_ms > 0);
 
         // list_triggered_by_tenant should include it.
-        let alerts = svc.list_triggered_by_tenant(&tenant_id).await.unwrap();
+        let alerts = svc
+            .list_triggered_by_tenant(&tenant_id, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].run_id, run_id);
     }

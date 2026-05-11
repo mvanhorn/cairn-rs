@@ -360,3 +360,180 @@ async fn zero_cost_call_increments_count_without_inflating_totals() {
     );
     assert_eq!(rec.provider_calls, 2, "call count includes zero-cost call");
 }
+
+// ── #727: RunCostReadModel::list_by_session is session-scoped ───────────────
+
+/// Pre-fix, `list_by_session` returned ALL run_costs rows regardless
+/// of session (and `_session_id` was even a `_`-prefixed unused arg
+/// on PG/SQLite). Codex's PR #727 closes this on all three backends.
+///
+/// Threat model: the `GET /v1/sessions/:id/cost` handler first
+/// confirms tenant ownership of the session, then calls
+/// `list_by_session(session_id)` and trusts the result. Pre-fix,
+/// that result included other tenants' run costs (any session_id
+/// would return everything). Post-fix, only run-cost rows whose
+/// `run_id` resolves through the `runs` projection to the requested
+/// session_id are returned.
+///
+/// Pre/post differ on this test:
+///   pre-fix:  list_by_session(session_1) returns BOTH run_a and
+///             run_b's costs → assertion `len() == 1` fails.
+///   post-fix: returns only run_a's cost → passes.
+#[tokio::test]
+async fn run_cost_list_by_session_filters_to_requested_session() {
+    use cairn_domain::{RunCreated, SessionCreated};
+
+    let store = Arc::new(InMemoryStore::new());
+    let session_a = SessionId::new("sess_a");
+    let session_b = SessionId::new("sess_b");
+    let run_a = RunId::new("run_in_session_a");
+    let run_b = RunId::new("run_in_session_b");
+
+    // Seed sessions + runs so the in-memory `state.runs` lookup
+    // finds both rows. Each run is tied to a different session.
+    store
+        .append(&[
+            EventEnvelope::for_runtime_event(
+                EventId::new("evt_sess_a"),
+                EventSource::Runtime,
+                RuntimeEvent::SessionCreated(SessionCreated {
+                    project: project(),
+                    session_id: session_a.clone(),
+                }),
+            ),
+            EventEnvelope::for_runtime_event(
+                EventId::new("evt_sess_b"),
+                EventSource::Runtime,
+                RuntimeEvent::SessionCreated(SessionCreated {
+                    project: project(),
+                    session_id: session_b.clone(),
+                }),
+            ),
+            EventEnvelope::for_runtime_event(
+                EventId::new("evt_run_a"),
+                EventSource::Runtime,
+                RuntimeEvent::RunCreated(RunCreated {
+                    project: project(),
+                    session_id: session_a.clone(),
+                    run_id: run_a.clone(),
+                    parent_run_id: None,
+                    prompt_release_id: None,
+                    agent_role_id: None,
+                }),
+            ),
+            EventEnvelope::for_runtime_event(
+                EventId::new("evt_run_b"),
+                EventSource::Runtime,
+                RuntimeEvent::RunCreated(RunCreated {
+                    project: project(),
+                    session_id: session_b.clone(),
+                    run_id: run_b.clone(),
+                    parent_run_id: None,
+                    prompt_release_id: None,
+                    agent_role_id: None,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    // Cost calls on both runs.
+    store
+        .append(&[
+            EventEnvelope::for_runtime_event(
+                EventId::new("evt_pcc_a"),
+                EventSource::Runtime,
+                RuntimeEvent::ProviderCallCompleted(ProviderCallCompleted {
+                    project: project(),
+                    provider_call_id: ProviderCallId::new("call_a"),
+                    route_decision_id: RouteDecisionId::new("rd_a"),
+                    route_attempt_id: RouteAttemptId::new("ra_a"),
+                    provider_binding_id: ProviderBindingId::new("binding_1"),
+                    provider_connection_id: ProviderConnectionId::new("conn"),
+                    provider_model_id: ProviderModelId::new("gpt-4o"),
+                    operation_kind: OperationKind::Generate,
+                    status: ProviderCallStatus::Succeeded,
+                    latency_ms: Some(100),
+                    input_tokens: Some(50),
+                    output_tokens: Some(20),
+                    cost_micros: Some(1_000),
+                    completed_at: 1_000,
+                    session_id: Some(session_a.clone()),
+                    run_id: Some(run_a.clone()),
+                    error_class: None,
+                    raw_error_message: None,
+                    retry_count: 0,
+                    task_id: None,
+                    prompt_release_id: None,
+                    fallback_position: 0,
+                    started_at: 0,
+                    finished_at: 0,
+                }),
+            ),
+            EventEnvelope::for_runtime_event(
+                EventId::new("evt_pcc_b"),
+                EventSource::Runtime,
+                RuntimeEvent::ProviderCallCompleted(ProviderCallCompleted {
+                    project: project(),
+                    provider_call_id: ProviderCallId::new("call_b"),
+                    route_decision_id: RouteDecisionId::new("rd_b"),
+                    route_attempt_id: RouteAttemptId::new("ra_b"),
+                    provider_binding_id: ProviderBindingId::new("binding_1"),
+                    provider_connection_id: ProviderConnectionId::new("conn"),
+                    provider_model_id: ProviderModelId::new("gpt-4o"),
+                    operation_kind: OperationKind::Generate,
+                    status: ProviderCallStatus::Succeeded,
+                    latency_ms: Some(100),
+                    input_tokens: Some(50),
+                    output_tokens: Some(20),
+                    cost_micros: Some(2_000),
+                    completed_at: 2_000,
+                    session_id: Some(session_b.clone()),
+                    run_id: Some(run_b.clone()),
+                    error_class: None,
+                    raw_error_message: None,
+                    retry_count: 0,
+                    task_id: None,
+                    prompt_release_id: None,
+                    fallback_position: 0,
+                    started_at: 0,
+                    finished_at: 0,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    // list_by_session(session_a) returns ONLY run_a's cost.
+    let a_costs = RunCostReadModel::list_by_session(store.as_ref(), &session_a)
+        .await
+        .expect("list_by_session(session_a)");
+    assert_eq!(
+        a_costs.len(),
+        1,
+        "session_a must see exactly its own run cost; got {a_costs:?}"
+    );
+    assert_eq!(a_costs[0].run_id, run_a);
+    assert_eq!(a_costs[0].total_cost_micros, 1_000);
+
+    // list_by_session(session_b) returns ONLY run_b's cost.
+    let b_costs = RunCostReadModel::list_by_session(store.as_ref(), &session_b)
+        .await
+        .expect("list_by_session(session_b)");
+    assert_eq!(
+        b_costs.len(),
+        1,
+        "session_b must see exactly its own run cost; got {b_costs:?}"
+    );
+    assert_eq!(b_costs[0].run_id, run_b);
+    assert_eq!(b_costs[0].total_cost_micros, 2_000);
+
+    // Sanity: an unknown session returns empty (not all rows).
+    let unknown = RunCostReadModel::list_by_session(store.as_ref(), &SessionId::new("nope"))
+        .await
+        .expect("list_by_session(unknown)");
+    assert!(
+        unknown.is_empty(),
+        "unknown session must return empty; got {unknown:?}",
+    );
+}

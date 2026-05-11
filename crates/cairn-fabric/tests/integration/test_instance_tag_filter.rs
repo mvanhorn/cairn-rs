@@ -24,8 +24,8 @@ use cairn_fabric::test_harness::valkey_endpoint;
 use cairn_fabric::{id_map, CairnWorker, FabricConfig, FabricServices};
 use cairn_store::projections::{FfLeaseHistoryCursorStore, TaskReadModel};
 use cairn_store::InMemoryStore;
-use ff_core::keys::{ExecKeyContext, IndexKeys};
-use ff_core::partition::execution_partition;
+use flowfabric::core::keys::{ExecKeyContext, IndexKeys};
+use flowfabric::core::partition::execution_partition;
 
 /// Spin one FabricServices instance with its own in-memory event log
 /// and cursor store. `instance_suffix` differentiates each instance's
@@ -35,6 +35,25 @@ struct TestInstance {
     event_log: Arc<InMemoryStore>,
     project: ProjectKey,
     config: FabricConfig,
+}
+
+impl TestInstance {
+    /// Convenience accessor for the Valkey-concrete runtime. This
+    /// test file spawns Valkey-only fabrics, so the
+    /// `valkey_runtime` slot is always `Some(_)`. Introduced in
+    /// PR-C4c when `FabricServices::runtime` became the trait
+    /// object `Arc<dyn FabricRuntimeHandle>`.
+    fn valkey_runtime(&self) -> &Arc<cairn_fabric::FabricRuntime> {
+        self.fabric
+            .valkey_runtime
+            .as_ref()
+            .expect("TestInstance is Valkey-only; valkey_runtime must be Some")
+    }
+
+    /// Borrow the trait-object partition config — backend-agnostic.
+    fn partition_config(&self) -> &flowfabric::core::partition::PartitionConfig {
+        self.fabric.runtime.partition_config()
+    }
 }
 
 async fn spawn_instance(instance_suffix: &str) -> TestInstance {
@@ -55,16 +74,15 @@ async fn spawn_instance(instance_suffix: &str) -> TestInstance {
     let _ = instance_suffix;
 
     let config = FabricConfig {
-        valkey_host: host,
-        valkey_port: port,
-        tls: false,
-        cluster: false,
+        backend: flowfabric::core::backend::BackendConfig::valkey(host, port),
         lane_id,
-        worker_id: ff_core::types::WorkerId::new(format!("w-{instance_suffix}-{suffix}")),
-        worker_instance_id: ff_core::types::WorkerInstanceId::new(format!(
+        worker_id: flowfabric::core::types::WorkerId::new(format!("w-{instance_suffix}-{suffix}")),
+        worker_instance_id: flowfabric::core::types::WorkerInstanceId::new(format!(
             "instance-{instance_suffix}-{suffix}"
         )),
-        namespace: ff_core::types::Namespace::new(format!("ns-{instance_suffix}-{suffix}")),
+        namespace: flowfabric::core::types::Namespace::new(format!(
+            "ns-{instance_suffix}-{suffix}"
+        )),
         lease_ttl_ms: 30_000,
         grant_ttl_ms: 5_000,
         max_concurrent_tasks: 4,
@@ -75,6 +93,8 @@ async fn spawn_instance(instance_suffix: &str) -> TestInstance {
             "00000000000000000000000000000000000000000000000000000000000000aa".into(),
         ),
         waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+        waitpoint_hmac_bootstrap_kid_reset: false,
+        backend_kind: cairn_fabric::config::BackendKind::Valkey,
     };
 
     let event_log = Arc::new(InMemoryStore::default());
@@ -142,7 +162,7 @@ async fn create_and_expire_task_lease(inst: &TestInstance) -> (SessionId, TaskId
         .await
         .expect("claim_from_grant");
 
-    let partition_config = inst.fabric.runtime.partition_config;
+    let partition_config = *inst.partition_config();
     let eid = id_map::session_task_to_execution_id(
         &inst.project,
         &session_id,
@@ -154,8 +174,7 @@ async fn create_and_expire_task_lease(inst: &TestInstance) -> (SessionId, TaskId
     let idx = IndexKeys::new(&partition);
 
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .cmd("HSET")
         .arg(ctx.core())
@@ -166,8 +185,7 @@ async fn create_and_expire_task_lease(inst: &TestInstance) -> (SessionId, TaskId
         .expect("HSET lease_expires_at");
 
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .fcall(
             "ff_mark_lease_expired_if_due",
@@ -181,6 +199,37 @@ async fn create_and_expire_task_lease(inst: &TestInstance) -> (SessionId, TaskId
         )
         .await
         .expect("ff_mark_lease_expired_if_due");
+
+    // FF 0.10 `subscribe_lease_history` reads the partition-aggregate
+    // stream `ff:part:{fp:0}:lease_history`; a Lua producer that
+    // mirrors per-exec events to it is on the FF roadmap but not yet
+    // shipped (see CG-c migration plan §Deferred). Synthesise the
+    // frame here so the subscriber's adoption tests exercise the
+    // typed end-to-end path.
+    let flow_partition_0 = flowfabric::core::partition::Partition {
+        family: flowfabric::core::partition::PartitionFamily::Flow,
+        index: 0,
+    };
+    let partition_stream_key = format!("ff:part:{}:lease_history", flow_partition_0.hash_tag());
+    let _: ferriskey::Value = inst
+        .valkey_runtime()
+        .client
+        .cmd("XADD")
+        .arg(partition_stream_key.as_str())
+        .arg("*")
+        .arg("event")
+        .arg("expired")
+        .arg("execution_id")
+        .arg(eid.as_str())
+        .arg("lease_id")
+        .arg(uuid::Uuid::nil().to_string().as_str())
+        .arg("worker_instance_id")
+        .arg(inst.config.worker_instance_id.as_str())
+        .arg("ts")
+        .arg("1700000000000")
+        .execute()
+        .await
+        .expect("XADD synthetic partition-level lease_history event");
 
     (session_id, task_id)
 }
@@ -209,21 +258,57 @@ async fn wait_for_expiry(inst: &TestInstance, task_id: &TaskId) {
     }
 }
 
-/// Assert the foreign instance's projection DID NOT see the task.
-/// Wait a generous full subscriber cycle (1s poll + margin) before
-/// concluding foreign visibility is absent — otherwise we risk passing
-/// the test during the gap between frame emission and subscriber poll.
-async fn assert_foreign_instance_never_sees(inst: &TestInstance, task_id: &TaskId) {
-    // Two full subscriber cycles + margin. The subscriber polls every
-    // 1000ms; giving it 3s to not emit is comfortably outside that
-    // window while keeping the suite snappy.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let rec = TaskReadModel::get(inst.event_log.as_ref(), task_id)
+/// Assert that `foreign_task_id` NEVER lands in `foreign_inst`'s
+/// projection, using a fence-based positive proof rather than a
+/// bare-timeout negative proof.
+///
+/// Why positive fence: `assert_foreign_instance_never_sees` used to
+/// sleep 3 seconds then peek the projection. Per audit #408 that
+/// pattern proves only "didn't happen within 3s," not "won't happen"
+/// — a filter bug that delayed the foreign write 4s would pass the
+/// test. The fence closes that hole with a finite, deterministic
+/// synchronisation point.
+///
+/// Protocol:
+///
+///   1. `foreign_inst` emits its OWN lease-expiry frame onto the
+///      shared `ff:part:{fp:0}:lease_history` stream via the standard
+///      claim → HSET lease_expires_at=0 → FCALL path.
+///   2. We poll `foreign_inst`'s projection for that fence task to
+///      land in `RetryableFailed` — proves the subscriber has
+///      advanced past every prior frame on the partition stream,
+///      including any foreign frame from the prior step.
+///   3. Only THEN do we assert the foreign task is still absent.
+///
+/// The invariant this actually proves: for any frame F_foreign that
+/// `foreign_inst`'s subscriber was going to filter-drop, and any
+/// fence F_own that `foreign_inst` emitted AFTER F_foreign on the
+/// same partition stream, visibility of F_own in the projection
+/// implies F_foreign has already been processed (and filter-dropped
+/// if the filter is correct; filter-accepted and absent only if it
+/// leaked — which is what we assert against). The partition stream
+/// is FIFO per FF's `XADD`+`subscribe_lease_history` contract, so
+/// order is total across instances.
+async fn assert_foreign_filter_drops_task(foreign_inst: &TestInstance, foreign_task_id: &TaskId) {
+    // Emit and drain a fence lease-expiry on `foreign_inst`. This is
+    // the same create → claim → expire shape as
+    // `create_and_expire_task_lease`, just anchored on the foreign
+    // side. When the fence task's `RetryableFailed/LeaseExpired` is
+    // visible here, the subscriber has passed every prior partition-
+    // stream frame.
+    let (_fence_session, fence_task_id) = create_and_expire_task_lease(foreign_inst).await;
+    wait_for_expiry(foreign_inst, &fence_task_id).await;
+
+    // Synchronous after the fence: the subscriber is past the
+    // foreign frame. If it leaked, the foreign task would be in the
+    // projection now.
+    let rec = TaskReadModel::get(foreign_inst.event_log.as_ref(), foreign_task_id)
         .await
         .expect("TaskReadModel::get");
     assert!(
         rec.is_none(),
-        "foreign instance saw task {task_id:?} in its event log: {rec:?}",
+        "foreign instance saw task {foreign_task_id:?} in its event log \
+         despite the fence task {fence_task_id:?} having been drained: {rec:?}",
     );
 }
 
@@ -236,8 +321,9 @@ async fn instance_a_lease_expiry_invisible_to_instance_b() {
 
     // The owner must observe its own expiry…
     wait_for_expiry(&inst_a, &task_id).await;
-    // …and the foreign instance must not.
-    assert_foreign_instance_never_sees(&inst_b, &task_id).await;
+    // …and the foreign instance must not, proven by a fence landing
+    // strictly AFTER the foreign frame on the shared partition stream.
+    assert_foreign_filter_drops_task(&inst_b, &task_id).await;
 
     inst_a.fabric.shutdown().await;
     inst_b.fabric.shutdown().await;
@@ -246,14 +332,15 @@ async fn instance_a_lease_expiry_invisible_to_instance_b() {
 #[tokio::test]
 async fn instance_b_lease_expiry_invisible_to_instance_a() {
     // Mirror direction: the filter must be symmetric. If instance B
-    // creates + expires, instance A must stay blind.
+    // creates + expires, instance A must stay blind — and we prove it
+    // via A's own fence, not by waiting.
     let inst_a = spawn_instance("a2").await;
     let inst_b = spawn_instance("b2").await;
 
     let (_session, task_id) = create_and_expire_task_lease(&inst_b).await;
 
     wait_for_expiry(&inst_b, &task_id).await;
-    assert_foreign_instance_never_sees(&inst_a, &task_id).await;
+    assert_foreign_filter_drops_task(&inst_a, &task_id).await;
 
     inst_a.fabric.shutdown().await;
     inst_b.fabric.shutdown().await;
@@ -285,7 +372,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
         .await
         .expect("submit task");
 
-    let partition_config = inst.fabric.runtime.partition_config;
+    let partition_config = *inst.partition_config();
     let eid = id_map::session_task_to_execution_id(
         &inst.project,
         &session_id,
@@ -299,8 +386,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
     // Strip the tag — simulates a pre-filter execution surviving into
     // the new binary.
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .cmd("HDEL")
         .arg(ctx.tags())
@@ -311,7 +397,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
 
     // Run the backfill — it should re-stamp the tag.
     let outcome = cairn_fabric::instance_tag_backfill::backfill_instance_tag(
-        &inst.fabric.runtime.client,
+        &inst.valkey_runtime().client,
         inst.config.worker_instance_id.as_str(),
     )
     .await
@@ -323,8 +409,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
 
     // Confirm the tag is now present on the exec.
     let tag: Option<String> = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .hget(&ctx.tags(), "cairn.instance_id")
         .await
@@ -363,8 +448,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
         .expect("claim_from_grant");
 
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .cmd("HSET")
         .arg(ctx.core())
@@ -374,8 +458,7 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
         .await
         .expect("HSET lease_expires_at");
     let _: ferriskey::Value = inst
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .fcall(
             "ff_mark_lease_expired_if_due",
@@ -389,6 +472,33 @@ async fn backfill_restores_visibility_for_pre_upgrade_execs() {
         )
         .await
         .expect("ff_mark_lease_expired_if_due");
+
+    // FF 0.10 partition-aggregate stream (see
+    // `create_and_expire_task_lease` — same producer shim).
+    let flow_partition_0 = flowfabric::core::partition::Partition {
+        family: flowfabric::core::partition::PartitionFamily::Flow,
+        index: 0,
+    };
+    let partition_stream_key = format!("ff:part:{}:lease_history", flow_partition_0.hash_tag());
+    let _: ferriskey::Value = inst
+        .valkey_runtime()
+        .client
+        .cmd("XADD")
+        .arg(partition_stream_key.as_str())
+        .arg("*")
+        .arg("event")
+        .arg("expired")
+        .arg("execution_id")
+        .arg(eid.as_str())
+        .arg("lease_id")
+        .arg(uuid::Uuid::nil().to_string().as_str())
+        .arg("worker_instance_id")
+        .arg(inst.config.worker_instance_id.as_str())
+        .arg("ts")
+        .arg("1700000000000")
+        .execute()
+        .await
+        .expect("XADD synthetic partition-level lease_history event");
 
     wait_for_expiry(&inst, &task_id).await;
 
@@ -419,7 +529,7 @@ async fn run_lease_expiry_honours_instance_tag_filter() {
         .await
         .expect("run start");
 
-    let partition_config = inst_a.fabric.runtime.partition_config;
+    let partition_config = *inst_a.partition_config();
     let eid = id_map::session_run_to_execution_id(
         &inst_a.project,
         &session_id,
@@ -430,9 +540,9 @@ async fn run_lease_expiry_honours_instance_tag_filter() {
     let ctx = ExecKeyContext::new(&partition, &eid);
 
     // Confirm the instance_id tag was written on run create.
+    // PR-C4c: route through `valkey_runtime()` helper.
     let tag: Option<String> = inst_a
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .hget(&ctx.tags(), "cairn.instance_id")
         .await

@@ -530,8 +530,14 @@ mod tests {
                 task_id: TaskId::new("task_dependency_legacy"),
                 depends_on: TaskId::new("task_upstream"),
                 added_at_ms: 456,
-                dependent_task_id: TaskId::default(),
-                depends_on_task_id: TaskId::default(),
+                // Legacy-shape fixture: these alias fields match what
+                // deserialising an older event payload would yield —
+                // empty-string placeholders produced by the
+                // cairn-domain serde default helper for the
+                // task-id alias fields on
+                // `TaskDependencyAdded`. Audit #473.
+                dependent_task_id: TaskId::new(""),
+                depends_on_task_id: TaskId::new(""),
                 dependency_kind: cairn_domain::DependencyKind::SuccessOnly,
                 data_passing_ref: None,
             }),

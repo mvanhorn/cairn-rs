@@ -19,7 +19,7 @@ import {
   KeyRound, Lock, Eye, EyeOff, AlertTriangle,
 } from 'lucide-react';
 import { clsx } from 'clsx';
-import { defaultApi } from '../lib/api';
+import { defaultApi, unwrapList } from '../lib/api';
 import { useScope } from '../hooks/useScope';
 import { DEFAULT_SCOPE } from '../lib/scope';
 import { useFocusTrap } from '../hooks/useFocusTrap';
@@ -28,6 +28,9 @@ import { Badge } from '../components/Badge';
 import { FormField, fieldInputMono } from '../components/FormField';
 import { StatCard } from '../components/StatCard';
 import { ds } from '../lib/design-system';
+import { useToast } from '../components/Toast';
+import { EntityExplainer } from '../components/EntityExplainer';
+import { ENTITY_EXPLAINERS } from '../lib/entityExplainers';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -96,6 +99,7 @@ function DeleteDialog({
   return (
     <div className={ds.modal.backdrop} onClick={onCancel}>
       <div
+        data-testid="credential-revoke-dialog"
         className={clsx(ds.modal.container, "w-full max-w-md mx-4 shadow-2xl")}
         ref={trapRef}
         role="dialog"
@@ -125,6 +129,8 @@ function DeleteDialog({
             Cancel
           </button>
           <button
+            data-testid="credential-revoke-confirm-btn"
+            data-pending={isPending ? "true" : "false"}
             onClick={onConfirm}
             disabled={isPending}
             className="px-3 py-1.5 rounded bg-red-600 text-white text-[12px] hover:bg-red-500 disabled:opacity-50 transition-colors flex items-center gap-1.5"
@@ -158,6 +164,7 @@ function AddCredentialModal({
   onCreated: () => void;
 }) {
   const formId = useId();
+  const toast = useToast();
 
   const [form, setForm] = useState<AddCredentialFormState>({
     tenant_id:       initialTenantId,
@@ -172,10 +179,16 @@ function AddCredentialModal({
   const { mutate, isPending, error: mutErr } = useMutation({
     mutationFn: ({ tenantId, body }: { tenantId: string; body: StoreCredentialRequest }) =>
       defaultApi.storeCredential(tenantId, body),
-    onSuccess: () => {
+    onSuccess: (_data, { body }) => {
+      // Issue #384: storing a credential is a security-positive action —
+      // surface an explicit success toast so the operator knows their
+      // credential landed. Matches the revoke success toast above
+      // (ChannelsPage / SourcesPage / SessionsPage share the same pattern).
+      toast.success(`Credential ${body.provider_id} stored.`);
       onCreated();
       onClose();
     },
+    onError: (e: unknown) => toast.error(e instanceof Error ? e.message : 'Failed to store credential.'),
   });
 
   function set<K extends keyof AddCredentialFormState>(key: K, value: AddCredentialFormState[K]) {
@@ -246,7 +259,7 @@ function AddCredentialModal({
               type="text"
               value={form.tenant_id}
               onChange={e => set('tenant_id', e.target.value)}
-              placeholder="default"
+              placeholder={DEFAULT_SCOPE.tenant_id}
               className={clsx(
                 fieldInputMono,
                 fieldErr.tenant_id && 'border-red-500/60 focus:border-red-500',
@@ -393,12 +406,14 @@ function CredentialRow({
         </span>
       </div>
 
-      {/* Encrypted indicator */}
+      {/* Encrypted indicator — both variants use a leading dot so the
+          visual weight matches, preventing the "one has a dot, the other
+          doesn't" inconsistency flagged in #251. */}
       <div className="w-24 shrink-0 px-2 flex items-center gap-1.5">
         {encrypted ? (
           <Badge variant="success" dot compact>Encrypted</Badge>
         ) : (
-          <Badge variant="warning" compact>Plaintext</Badge>
+          <Badge variant="warning" dot compact>Plaintext</Badge>
         )}
       </div>
 
@@ -409,17 +424,31 @@ function CredentialRow({
         </span>
       </div>
 
-      {/* Last rotated */}
-      <div className="w-28 shrink-0 px-2">
-        <span className="text-[11px] text-gray-400 dark:text-zinc-600 tabular-nums">
-          {fmtRelative(cred.revoked_at_ms ?? (encrypted ? cred.encrypted_at_ms : null))}
-        </span>
+      {/* Rotated / revoked — two distinct timestamps. Pre-fix the column
+          conflated `revoked_at_ms` with `encrypted_at_ms` so a revoked
+          credential would show a misleading "rotation" time. Now each is
+          rendered only when its timestamp is set. */}
+      <div className="w-28 shrink-0 px-2 flex flex-col gap-0.5">
+        {encrypted && cred.encrypted_at_ms && (
+          <span className="text-[11px] text-gray-400 dark:text-zinc-500 tabular-nums" title="Last time the credential was encrypted or rotated">
+            Rotated: {fmtRelative(cred.encrypted_at_ms)}
+          </span>
+        )}
+        {cred.revoked_at_ms && (
+          <span className="text-[11px] text-red-400 tabular-nums" title="Time the credential was revoked">
+            Revoked: {fmtRelative(cred.revoked_at_ms)}
+          </span>
+        )}
+        {!cred.encrypted_at_ms && !cred.revoked_at_ms && (
+          <span className="text-[11px] text-gray-300 dark:text-zinc-600">—</span>
+        )}
       </div>
 
       {/* Actions */}
       <div className="w-20 shrink-0 px-2 flex justify-end">
         {cred.active && (
           <button
+            data-testid={`credential-revoke-btn-${cred.id}`}
             onClick={() => onRevoke(cred)}
             title="Revoke credential"
             className="flex items-center gap-1 px-2 py-1 rounded text-[11px] text-red-500/70 hover:bg-red-500/10 hover:text-red-400 transition-colors"
@@ -440,6 +469,7 @@ export function CredentialsPage() {
   const [showAdd,     setShowAdd]     = useState(false);
   const [revokeTarget, setRevokeTarget] = useState<CredentialSummary | null>(null);
   const queryClient = useQueryClient();
+  const toast = useToast();
 
   useEffect(() => {
     setTenantId(scope.tenant_id || DEFAULT_SCOPE.tenant_id);
@@ -451,16 +481,44 @@ export function CredentialsPage() {
     refetchInterval: 60_000,
   });
 
+  // Issue #375: revoke was silent on HTTP error. A 403/404/500 used to
+  // close the confirmation dialog on success-only and invalidate the
+  // query — the operator then saw the credential still listed and would
+  // assume a UI bug while the credential stayed ACTIVE. That is a
+  // security regression for a revocation path. Surface a toast on both
+  // outcomes and leave `revokeTarget` set on error so the DeleteDialog
+  // stays open and the operator can retry without reopening the dialog.
+  //
+  // Invalidation lives in `onSettled` (mirrors WorkspacesPage.deleteWorkspace):
+  // it runs on both success AND failure. This closes the partial-success
+  // window where the backend applied the revoke but the client received a
+  // network error — we still refetch, so either the credential is gone
+  // (server won) or still active (operator can retry), and the cache never
+  // drifts from reality. For a security-critical revoke path this is the
+  // correct invariant.
+  //
+  // Invalidate using the mutation's `variables.tenant_id` — NOT the
+  // component-state `tenantId` — because the operator can switch
+  // tenants via the selector while the revoke is in flight. Keying the
+  // invalidation to the tenant that was ACTUALLY revoked ensures the
+  // right cache entry refetches even if the UI scope has moved on.
+  // (Copilot review #532.)
   const { mutate: revoke, isPending: isRevoking } = useMutation({
     mutationFn: (cred: CredentialSummary) =>
       defaultApi.revokeCredential(cred.tenant_id, cred.id),
     onSuccess: () => {
+      toast.success('Credential revoked.');
       setRevokeTarget(null);
-      queryClient.invalidateQueries({ queryKey: ['credentials', tenantId] });
+    },
+    onError: (e: unknown) =>
+      toast.error(`Failed to revoke credential: ${e instanceof Error ? e.message : 'try again.'}`),
+    onSettled: (_data, _err, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['credentials', variables.tenant_id] });
     },
   });
 
-  const creds      = data?.items ?? [];
+  // #425: shared normalizer — absent items or bare-array shape safe.
+  const creds      = unwrapList<import("../lib/types").CredentialSummary>(data);
   const active     = creds.filter(c => c.active);
   const encrypted  = active.filter(c => !!c.encrypted_at_ms);
   const typeSet    = new Set(active.map(c => c.credential_type));
@@ -521,6 +579,11 @@ export function CredentialsPage() {
         </button>
       </div>
 
+      {/* F32 — inline entity explainer. */}
+      <div className="px-5 py-1.5 border-b border-gray-200 dark:border-zinc-800 shrink-0">
+        <EntityExplainer>{ENTITY_EXPLAINERS.credential}</EntityExplainer>
+      </div>
+
       {/* Stat strip */}
       {!isLoading && (
         <div className={clsx(ds.spacing.statGrid3, "px-5 py-3 border-b border-gray-200 dark:border-zinc-800 shrink-0")}>
@@ -574,7 +637,7 @@ export function CredentialsPage() {
                 <span className="text-[10px] text-gray-400 dark:text-zinc-600 uppercase tracking-wider">Created</span>
               </div>
               <div className="w-28 shrink-0 px-2">
-                <span className="text-[10px] text-gray-400 dark:text-zinc-600 uppercase tracking-wider">Last Rotated</span>
+                <span className="text-[10px] text-gray-400 dark:text-zinc-600 uppercase tracking-wider">Rotated / Revoked</span>
               </div>
               <div className="w-20 shrink-0 px-2" />
             </div>

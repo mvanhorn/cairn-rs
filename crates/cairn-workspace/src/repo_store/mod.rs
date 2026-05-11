@@ -1,4 +1,5 @@
 pub mod access_service;
+pub mod allowlist_persistence;
 pub mod clone_cache;
 pub mod facade;
 pub mod sweep;
@@ -12,6 +13,9 @@ use cairn_domain::{ActorRef, ProjectKey, TenantId};
 use crate::sandbox::RepoId;
 
 pub use access_service::ProjectRepoAccessService;
+pub use allowlist_persistence::{
+    AllowlistPersistence, AllowlistPersistenceError, JsonFileAllowlistStore,
+};
 pub use clone_cache::{RefreshOutcome, RepoCloneCache};
 pub use facade::RepoStore;
 pub use sweep::{

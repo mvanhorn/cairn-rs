@@ -1,7 +1,10 @@
 import {
+  Archive,
   Bell,
+  Building2,
   Cable,
   Cpu,
+  Gauge,
   GitBranch,
   Calculator,
   Coins,
@@ -26,6 +29,7 @@ import {
   Terminal,
   TestTube,
   User,
+  Users,
   BarChart2,
   Waves,
   Scale,
@@ -33,16 +37,22 @@ import {
   CheckSquare,
   Bot,
   FolderGit2,
+  Radio,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useQuery } from '@tanstack/react-query';
 import { clearStoredToken, defaultApi } from '../lib/api';
 import { usePresence, type PresenceEntry } from '../hooks/usePresence';
+import { useIsTenantAdmin } from './AdminGate';
 import type { ReactNode } from 'react';
 
 export type NavPage =
   | 'dashboard'
   | 'workspaces'
+  | 'tenants'
+  | 'operators'
+  | 'quotas'
+  | 'retention'
   | 'sessions'
   | 'runs'
   | 'tasks'
@@ -51,6 +61,7 @@ export type NavPage =
   | 'approvals'
   | 'prompts'
   | 'agent-templates'
+  | 'agents'
   | 'traces'
   | 'memory'
   | 'costs'
@@ -62,6 +73,7 @@ export type NavPage =
   | 'skills'
   | 'credentials'
   | 'channels'
+  | 'notifications'
   | 'playground'
   | 'audit-log'
   | 'logs'
@@ -88,6 +100,10 @@ interface NavItem {
 interface NavGroup {
   label: string;
   items: NavItem[];
+  /** When true, the whole group is hidden unless the current operator
+   *  holds `TenantRole::Admin` on the active scope's tenant. Server-side
+   *  guards remain authoritative — this is purely nav-hiding UX. */
+  adminOnly?: boolean;
 }
 
 const NAV_GROUPS: NavGroup[] = [
@@ -111,6 +127,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'decisions',        label: 'Decisions',        icon: Scale       },
       { id: 'prompts',          label: 'Prompts',          icon: FileText    },
       { id: 'agent-templates',  label: 'Agent Templates',  icon: Bot         },
+      { id: 'agents',           label: 'Agent Roles',      icon: Users       },
     ],
   },
   {
@@ -138,11 +155,25 @@ const NAV_GROUPS: NavGroup[] = [
       { id: 'deployment',   label: 'Deployment',   icon: ServerCrash  },
       { id: 'integrations',  label: 'Integrations',  icon: Cable    },
       { id: 'project-repos', label: 'Project Repos', icon: FolderGit2 },
-      { id: 'channels',     label: 'Channels',     icon: Bell     },
+      { id: 'channels',     label: 'Channels',     icon: Radio    },
+      { id: 'notifications', label: 'Notifications', icon: Bell   },
       { id: 'playground',    label: 'Playground',    icon: Terminal  },
       { id: 'test-harness',  label: 'Test Harness',  icon: TestTube  },
       { id: 'api-docs',    label: 'API Docs',    icon: BookOpen },
       { id: 'settings',    label: 'Settings',    icon: Settings },
+    ],
+  },
+  {
+    // RFC-026 PR-A3+. Hidden unless the operator holds TenantRole::Admin
+    // on the active scope's tenant. Server-side `TenantAdminGuard` is the
+    // authoritative gate — this is UX only.
+    label: 'Admin',
+    adminOnly: true,
+    items: [
+      { id: 'tenants',   label: 'Tenants',   icon: Building2 },
+      { id: 'operators', label: 'Operators', icon: Users     },
+      { id: 'quotas',    label: 'Quotas',    icon: Gauge     },
+      { id: 'retention', label: 'Retention', icon: Archive   },
     ],
   },
 ];
@@ -216,6 +247,17 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
     retry: false,
   });
 
+  // RFC-026 PR-A3 — probe whether the operator holds TenantRole::Admin
+  // on the active scope's tenant. While the probe is pending we hide
+  // admin groups by default; this avoids a flash of admin links for
+  // non-admins that disappear a tick later. The tradeoff is a one-tick
+  // delay for real admins — fine since admin pages are not the first
+  // surface an operator lands on.
+  const adminState = useIsTenantAdmin();
+  const showAdminGroups = adminState.isAdmin;
+
+  const visibleGroups = NAV_GROUPS.filter(g => !g.adminOnly || showAdminGroups);
+
   return (
     <>
       {/* Mobile backdrop */}
@@ -268,9 +310,15 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
           </div>
         </div>
 
-        {/* Navigation — grouped */}
-        <nav role="navigation" aria-label="Main navigation" className="flex-1 overflow-y-auto py-2 px-2 space-y-4">
-          {NAV_GROUPS.map((group) => (
+        {/* Navigation — grouped. `min-h-0` enables flex-shrink so
+            `overflow-y: auto` actually activates on short viewports (#633). */}
+        <nav
+          role="navigation"
+          aria-label="Main navigation"
+          data-testid="sidebar-nav"
+          className="flex-1 min-h-0 overflow-y-auto py-2 px-2 space-y-4"
+        >
+          {visibleGroups.map((group) => (
             <div key={group.label}>
               <p className="px-3 pb-1 text-[10px] font-medium text-gray-400 dark:text-zinc-500 uppercase tracking-wider">
                 {group.label}
@@ -282,11 +330,12 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
                   return (
                     <button
                       key={id}
+                      data-testid={`nav-${id}`}
                       onClick={() => onNavigate(id)}
                       aria-current={active ? 'page' : undefined}
                       aria-label={label}
                       className={clsx(
-                        'w-full flex items-center gap-2.5 px-3 py-1.5 rounded text-[13px] font-medium transition-colors relative',
+                        'w-full flex items-center gap-2.5 px-3 py-1.5 rounded text-[13px] font-medium transition-colors relative scroll-my-2',
                         active
                           ? 'bg-gray-100 dark:bg-zinc-800/80 text-gray-900 dark:text-zinc-100'
                           : 'text-gray-600 dark:text-zinc-400 hover:bg-gray-100 dark:hover:bg-zinc-800/50 hover:text-gray-900 dark:hover:text-zinc-100',
@@ -323,8 +372,8 @@ export function Sidebar({ current, onNavigate, mobileOpen = false, onMobileClose
           ))}
         </nav>
 
-        {/* Footer */}
-        <div className="px-3 py-3 border-t border-gray-200 dark:border-zinc-800 space-y-1">
+        {/* Footer — `shrink-0` keeps account/sign-out pinned (#633). */}
+        <div className="shrink-0 px-3 py-3 border-t border-gray-200 dark:border-zinc-800 space-y-1">
           <div className="flex items-center justify-between px-1">
             <p className="text-[11px] text-gray-400 dark:text-zinc-600 font-mono truncate" title={server}>
               {server}

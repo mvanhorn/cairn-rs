@@ -6,8 +6,9 @@
 use std::path::PathBuf;
 
 use cairn_domain::{
-    decisions::RunMode, ActionProposal, ApprovalId, DefaultSetting, ProjectKey, RunId, SessionId,
-    TaskId, ToolInvocationId,
+    contexts::VisibilityContext, decisions::RunMode, session_orchestration::CircuitBreakerTrip,
+    ActionProposal, ApprovalId, CompletionVerification, DefaultSetting, ProjectKey, RunId,
+    SessionId, TaskId, ToolInvocationId,
 };
 use cairn_graph::GraphNode;
 use cairn_memory::retrieval::RetrievalResult;
@@ -39,6 +40,24 @@ pub struct OrchestrationContext {
     pub run_started_at_ms: u64,
     /// Working directory used for filesystem and process-oriented tools.
     pub working_dir: PathBuf,
+    /// RFC 032 PR-4: the definition-of-done the gate grades this
+    /// run's `complete_run` against. Populated by the orchestrate
+    /// handler (PR-5) from three possible sources:
+    ///
+    /// * Operator-declared via `completion_contract` on `POST /v1/runs`
+    ///   (source = `ExplicitCreate`).
+    /// * Orchestrator-declared via `spawn_subagent`
+    ///   (source = `ExplicitSpawn`).
+    /// * Inferred by `cairn_domain::completion_contracts::infer_contract`
+    ///   from goal text at first orchestrate boot
+    ///   (source = `Inferred` or `ReInferredOnGoalChange`).
+    ///
+    /// `None` means no contract resolved — the gate falls through
+    /// to its pre-RFC-032 behaviour (error bucket + sentinel scan +
+    /// FailRun only). PR-4 leaves this field `None` in every
+    /// construction site; PR-5 wires the orchestrate handler to
+    /// populate it from the persisted run default.
+    pub completion_contract: Option<cairn_domain::completion_contracts::CompletionContract>,
     /// Execution mode for this run (RFC 018).
     ///
     /// - `Direct` — all tools visible, agent acts freely.
@@ -70,6 +89,137 @@ pub struct OrchestrationContext {
     /// Defaults to `false` for fresh (non-recovered) runs. Set only for the
     /// first post-recovery iteration; subsequent iterations use `false`.
     pub is_recovery: bool,
+
+    /// Maximum wall-clock the execute phase will wait on an operator
+    /// approval before auto-rejecting the proposal. Threaded from
+    /// `OrchestrateRequest.approval_timeout_ms` (HTTP) or defaulted to
+    /// 24h when the caller didn't provide one.
+    ///
+    /// `None` means "never set" — downstream defaults to 24h. We keep the
+    /// field `Option<Duration>` so `Default` / `Clone`-constructed contexts
+    /// continue to work without having to pick a sentinel value here.
+    pub approval_timeout: Option<std::time::Duration>,
+
+    /// RFC 029 PR-B1: resolved tool-visibility snapshot for this run.
+    ///
+    /// Populated by `build_visibility_context_for_run` at run start time
+    /// so the decide phase can filter the prompt-tool list. `None` on
+    /// legacy / test-construction paths; treated as "cairn-default and
+    /// no plugin overrides" — every built-in stays visible.
+    pub visibility: Option<VisibilityContext>,
+
+    /// #775: optional freeform context threaded from the parent run
+    /// at spawn time. Surfaced verbatim in the child's first DECIDE
+    /// user message under a `## Parent context` section, between the
+    /// `## Goal` and the per-iteration footer.
+    ///
+    /// Populated from `SubagentSpawned.parent_context` when the child
+    /// run is created. `None` on root runs and on legacy test-
+    /// construction paths.
+    pub parent_context: Option<String>,
+
+    /// RFC 031 §Runtime Resolution Delta: per-run dedup set for
+    /// `ToolDeclaredButMissing` emission at the allowlist-filter site
+    /// (PR-C site 1). The first time the orchestrator sees a
+    /// `(role_id, tool_id)` pair where the declared tool isn't
+    /// registered, it emits the advisory event and records the pair
+    /// here; subsequent DECIDE iterations in the same run skip
+    /// re-emit.
+    ///
+    /// Field is `Arc<Mutex<...>>` because:
+    /// 1. `OrchestrationContext` derives `Clone` (rebuilt per
+    ///    iteration on resume). A bare `Mutex` would break the derive
+    ///    (Mutex: !Clone) and — worse — per-iteration clones would
+    ///    get disconnected copies, defeating dedup across iterations.
+    /// 2. `Arc` lets clones share one backing set. Interior mutability
+    ///    via `Mutex` lets the execute/decide phase insert-if-absent
+    ///    without needing `&mut OrchestrationContext`.
+    ///
+    /// **Lock convention** (load-bearing for PR-C's emission site):
+    /// * Use `std::sync::Mutex` semantics — **NEVER hold the lock
+    ///   across an `.await`** (this is a sync `Mutex`, not
+    ///   `tokio::sync::Mutex`; holding across await would deadlock).
+    ///   The emission site must: acquire lock, check-and-insert, drop
+    ///   lock, THEN emit the event (event append is async).
+    /// * Recover from poison via
+    ///   `.lock().unwrap_or_else(|e| e.into_inner())` — matches the
+    ///   repo convention in `cairn-app/src/metrics_tap.rs` and
+    ///   `cairn-app/src/child_run_driver.rs`. A poisoned lock here
+    ///   means a previous thread panicked while holding it; the
+    ///   protected data (a HashSet of string pairs) is still safe to
+    ///   read/mutate, and losing dedup state would be worse than
+    ///   picking it up mid-state.
+    ///
+    /// PR-A: field added + default-initialised. Emission site lands in
+    /// PR-C (when the allowlist filter gains the advisory path).
+    pub declared_but_missing:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+
+    /// RFC 031 §D14 layer 2: per-run snapshot of the project's
+    /// spawnable role list. Filled on the first DECIDE by
+    /// `AgentRoleService::list`; reused for the rest of the run by
+    /// `spawn_subagent_tool_def` (PR-C site 5).
+    ///
+    /// `Arc<OnceCell<...>>` for the same reasons as
+    /// `declared_but_missing` above — `OnceCell` is `!Clone` and the
+    /// context derives Clone; `Arc` gives clones a shared backing
+    /// cell so "fill once" means "fill once per run" rather than
+    /// "fill once per iteration".
+    ///
+    /// PR-A: field added + default-initialised to an empty cell.
+    /// Fill site lands in PR-C (when `spawn_subagent_tool_def`
+    /// retires its process-lifetime `OnceLock` and threads the
+    /// project through).
+    pub agent_role_list_cache:
+        std::sync::Arc<tokio::sync::OnceCell<Vec<cairn_runtime::services::ResolvedRole>>>,
+}
+
+impl OrchestrationContext {
+    /// RFC 031 PR-A convenience: fresh empty dedup set for
+    /// `declared_but_missing`. Call-site ergonomics for the 15+
+    /// `OrchestrationContext { ... }` constructors scattered across
+    /// the workspace — they can write
+    /// `declared_but_missing: OrchestrationContext::empty_declared_but_missing()`
+    /// instead of inlining the full `Arc<Mutex<HashSet<...>>>` shape.
+    pub fn empty_declared_but_missing(
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    /// RFC 031 PR-A convenience: fresh empty role-list cache. See
+    /// [`OrchestrationContext::empty_declared_but_missing`] for the
+    /// call-site rationale.
+    pub fn empty_agent_role_list_cache(
+    ) -> std::sync::Arc<tokio::sync::OnceCell<Vec<cairn_runtime::services::ResolvedRole>>> {
+        std::sync::Arc::new(tokio::sync::OnceCell::new())
+    }
+
+    /// Build a `ToolContext` from this orchestration context.
+    ///
+    /// Populates `session_id`, `run_id`, `working_dir`, and leaves the
+    /// remaining fields at their `Default` (tenant/workspace/project
+    /// stay as the orchestrator doesn't thread tenant IDs through —
+    /// the harness tools key their caches on `(session, run)` inside
+    /// the supplied `ProjectKey`, which is passed separately).
+    ///
+    /// Used by the loop runner's `#606` cache-eviction hook and by
+    /// tests that need a `ToolContext` matching an
+    /// `OrchestrationContext`.
+    pub fn tool_context(&self) -> cairn_tools::builtins::ToolContext {
+        let mut tool_ctx = cairn_tools::builtins::ToolContext::default();
+        tool_ctx.session_id = Some(self.session_id.to_string());
+        tool_ctx.run_id = Some(self.run_id.to_string());
+        tool_ctx.working_dir = self.working_dir.clone();
+        // #702 follow-up: record the run's agent role on the context so
+        // role-scoped tool policies (e.g. the orchestrator bash verb
+        // allowlist in `cairn-harness-tools::ShellPolicy`) can look it
+        // up. `agent_type` is the orchestration-loop's role handle —
+        // it matches `AgentRole::role_id` for registered roles.
+        if !self.agent_type.is_empty() {
+            tool_ctx.set_agent_role_id(self.agent_type.clone());
+        }
+        tool_ctx
+    }
 }
 
 // ── GatherOutput ─────────────────────────────────────────────────────────────
@@ -114,6 +264,24 @@ pub struct StepSummary {
     pub summary: String,
     /// Whether the step succeeded, failed, or is still pending.
     pub succeeded: bool,
+    /// RFC 032 PR-1: structured evidence a sub-agent carried past its
+    /// own completion contract. Populated only for
+    /// `action_kind = "subagent_complete"` steps whose child run
+    /// terminated with `state = Completed` under a resolved
+    /// `CompletionContract`. `None` otherwise, including for all
+    /// steps predating RFC 032 or generated by sub-agents without a
+    /// contract — the field is serde-defaulted so historical
+    /// `StepSummary` records continue to deserialize.
+    ///
+    /// Populated by `cairn-app::subagent_steps::build_subagent_complete_steps`
+    /// in PR-5 once verifiers run and carry their extracted shape
+    /// back through the G7 rollup. Rendered into the parent's
+    /// user-message `## Step history` section alongside the prose
+    /// `summary` so parent-level aggregate contracts
+    /// (e.g. "all 3 children shipped PRs") have structured input,
+    /// not prose parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_output: Option<cairn_domain::ContractVerifiedOutput>,
 }
 
 // ── DecideOutput ─────────────────────────────────────────────────────────────
@@ -138,6 +306,65 @@ pub struct DecideOutput {
     pub input_tokens: Option<u32>,
     /// Output (completion) token count from the provider response.
     pub output_tokens: Option<u32>,
+    /// Issue #668: system prompt the LLM received for this decide
+    /// iteration. Retained so the orchestrator's post-decide tracing
+    /// can persist the full round-trip body for operator audit (see
+    /// `LlmCompletionRecorded`). Pre-redaction — the emit site runs
+    /// `cairn_providers::redact::redact_secrets` before persisting.
+    pub system_prompt: String,
+    /// Issue #668: JSON-serialised `Vec<Message>` (role + content) the
+    /// orchestrator sent to the provider. Serialised rather than typed
+    /// so the wire shape evolves with the provider library without
+    /// forcing a domain-layer migration. Pre-redaction.
+    pub messages_json: String,
+    /// Issue #668: JSON-serialised `Vec<ToolCall>` the model returned
+    /// via native tool calling, or `[]` if the model went through the
+    /// legacy JSON-array text path. Pre-redaction.
+    pub tool_calls_json: String,
+    /// Dogfood R7 follow-up: JSON-serialised `Vec<ToolDef>` the
+    /// orchestrator shipped TO the provider in the `tools[]` array
+    /// of the chat-completion request. This is the complete tool
+    /// surface the model had available at decision time — persisting
+    /// it closes the diagnostic gap that blocked #702 ("did the
+    /// model have `complete_run` available when it chose to re-spawn
+    /// the same subagent?"). Pre-redaction. Empty JSON array when
+    /// no native tools were advertised.
+    pub tool_defs_json: String,
+}
+
+impl DecideOutput {
+    /// Number of proposals that count as "forward progress" for the
+    /// NoToolUseConsecutive circuit breaker. A proposal counts if it
+    /// either carries a concrete tool name OR targets a terminal /
+    /// operator-gated action (complete_run / escalate_to_operator /
+    /// spawn_subagent). The carve-out prevents a legitimate
+    /// `complete_run` from tripping the streak breaker BEFORE the
+    /// execute phase dispatches it (Cursor Bugbot HIGH on PR #348).
+    ///
+    /// `create_memory` is intentionally NOT in the terminal set —
+    /// memorising a thought is not forward progress the user asked for.
+    ///
+    /// **Perf note (#510)**: today `proposals` is small (≤5 per DECIDE
+    /// in production traces) so the O(n) walk costs tens of ns. This
+    /// helper exists so that when DECIDE later emits batched tool
+    /// bursts (50+ proposals), the count can be memoised on
+    /// `DecideOutput` construction or routed through a provider-side
+    /// segmented count without touching call sites.
+    pub fn tool_or_terminal_count(&self) -> usize {
+        self.proposals
+            .iter()
+            .filter(|p| {
+                p.tool_name.is_some()
+                    || matches!(
+                        p.action_type,
+                        cairn_domain::ActionType::CompleteRun
+                            | cairn_domain::ActionType::FailRun
+                            | cairn_domain::ActionType::EscalateToOperator
+                            | cairn_domain::ActionType::SpawnSubagent
+                    )
+            })
+            .count()
+    }
 }
 
 // ── ExecuteOutcome ────────────────────────────────────────────────────────────
@@ -239,7 +466,18 @@ impl LoopSignal {
 #[derive(Clone, Debug)]
 pub enum LoopTermination {
     /// Agent declared itself done; run has been completed.
-    Completed { summary: String },
+    ///
+    /// `verification` is the F47 PR1 sidecar: an extractor-produced summary
+    /// of warning/error lines and per-command exit codes distilled from the
+    /// tool_result frames observed during the run. The field is always
+    /// populated (even for runs with no tool calls, in which case it is
+    /// `CompletionVerification::default()` with `tool_results_scanned = 0`)
+    /// so downstream consumers — SSE emitters, dashboards, PR2 persistence
+    /// — can rely on a stable shape without optional plumbing.
+    Completed {
+        summary: String,
+        verification: CompletionVerification,
+    },
     /// Agent or runtime hit an unrecoverable error; run has been failed.
     Failed { reason: String },
     /// Iteration cap reached; run has been failed with `MaxIterations`.
@@ -255,6 +493,39 @@ pub enum LoopTermination {
     /// Plan-mode run completed with a plan artifact (RFC 018).
     /// The run is Completed with outcome `plan_proposed`.
     PlanProposed { plan_markdown: String },
+    /// F65 PR-3: a circuit breaker tripped and terminated the loop.
+    ///
+    /// The `trip` payload (`BreakerKind`, measured, limit, at_iteration) is
+    /// carried through to the HTTP response body, the SSE `orchestrate_finished`
+    /// frame, and the `RuntimeEvent::CircuitBreakerTripped` event that the
+    /// loop appends via the emitter before returning this termination.
+    BreakerTripped { trip: CircuitBreakerTrip },
+}
+
+impl LoopTermination {
+    /// Whether this termination drives the run to a terminal
+    /// `RunState` (`Completed` / `Failed` / `Canceled`).
+    ///
+    /// `WaitingApproval` and `WaitingSubagent` are suspension points,
+    /// not terminals — the run persists across cairn-app restarts and
+    /// resumes via a second `run()` call. Every other variant ends the
+    /// run for good.
+    ///
+    /// Used by the loop runner to fire run-terminal side effects (e.g.
+    /// evicting harness-tools caches, see cairn-rs #606).
+    pub fn drives_run_to_terminal(&self) -> bool {
+        match self {
+            LoopTermination::WaitingApproval { .. } | LoopTermination::WaitingSubagent { .. } => {
+                false
+            }
+            LoopTermination::Completed { .. }
+            | LoopTermination::Failed { .. }
+            | LoopTermination::MaxIterationsReached
+            | LoopTermination::TimedOut
+            | LoopTermination::PlanProposed { .. }
+            | LoopTermination::BreakerTripped { .. } => true,
+        }
+    }
 }
 
 // ── LoopConfig ───────────────────────────────────────────────────────────────
@@ -270,15 +541,183 @@ pub struct LoopConfig {
     pub checkpoint_every_n_tool_calls: u32,
     /// Context compaction settings (RFC 018).
     pub compaction: CompactionConfig,
+    /// F65 PR-3: circuit-breaker caps enforced by `OrchestratorLoop`.
+    pub breakers: BreakerConfig,
+    /// Issue #660: platform-level gate on `complete_run`.
+    ///
+    /// When `true` (default), the loop consults the incremental F47
+    /// `VerificationAccumulator` before dispatching any
+    /// `CompleteRun` proposal. If the accumulator reports at least one
+    /// error line (cargo/rustc/clippy `error:` or `error[EXXXX]:`),
+    /// the `CompleteRun` is refused — the loop synthesises a rejection
+    /// `StepSummary` carrying the first few error excerpts, re-enters
+    /// DECIDE, and gives the model another turn to fix the build.
+    /// After three consecutive rejections the loop terminates with
+    /// `LoopTermination::Failed { reason = "verification_rejected: …" }`
+    /// so the run moves to the terminal [`FailureClass::VerificationRejected`]
+    /// state (see `cairn_domain::lifecycle::FailureClass`).
+    ///
+    /// When `false`, the loop keeps the pre-#660 behaviour: the LLM's
+    /// `CompleteRun` flows through to execute regardless of the
+    /// verification sidecar. Intended for runs that want to surface a
+    /// partial/best-effort summary without blocking on a red build.
+    ///
+    /// Operators override via the per-run defaults projection under
+    /// `run:<id>:orchestrator_strict_completion_gate` (stored as the
+    /// string `"true"` / `"false"`). The HTTP orchestrate handler
+    /// resolves the key with the same 3-layer helper used for
+    /// `max_iterations` + `goal`.
+    pub orchestrator_strict_completion_gate: bool,
 }
+
+/// Default iteration cap for a run's orchestrator loop. Extracted
+/// from the magic number embedded in `LoopConfig::default` so other
+/// callers (child-run driver in RFC 027 §Child resource budgets) can
+/// reference the cairn-wide default by name rather than duplicating
+/// the literal. Operator override continues to flow through the
+/// per-run / per-project / per-system `max_iterations` default.
+///
+/// Bumped from 20 to 50 (R21 dogfood, #797). Typical procedural
+/// sub-agent goals (clone repo, branch, write file, cargo check,
+/// commit, push, `gh pr create`) need 9 to 12 distinct DECIDE
+/// turns, and each tool call requiring approval is a separate
+/// iteration. 20 was sized for a Q&A-shaped run; 50 fits a real
+/// procedural delivery without having to override per-run.
+pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 20,
+            max_iterations: DEFAULT_MAX_ITERATIONS,
             timeout_ms: 5 * 60 * 1_000, // 5 minutes
             checkpoint_every_n_tool_calls: 1,
             compaction: CompactionConfig::default(),
+            breakers: BreakerConfig::default(),
+            // #660: belt-and-suspenders with the role-prompt completion gate.
+            // Default on; flip to false per run to accept partial completions.
+            orchestrator_strict_completion_gate: true,
+        }
+    }
+}
+
+/// Issue #660: hard cap on consecutive `complete_run` rejections before
+/// the loop gives up and terminates with [`FailureClass::VerificationRejected`].
+///
+/// Chosen as 3 so the model gets at least one "fix" turn after its first
+/// reject + re-attempt (three rejects = three passes where the build still
+/// failed). Lower values would terminate legit self-correcting runs; higher
+/// values would let a broken model burn the full `max_iterations` budget
+/// on rejection ping-pong.
+pub const MAX_COMPLETION_GATE_REJECTIONS: u32 = 3;
+
+/// Issue #660: how many error lines the rejection `StepSummary` should
+/// carry back to DECIDE. The model only needs a few concrete lines to
+/// re-plan; more than three is context pollution.
+pub const COMPLETION_GATE_ERROR_PREVIEW: usize = 3;
+
+/// Issue #689 R2-A: hard cap on consecutive malformed `spawn_subagent`
+/// proposals before the loop gives up and terminates with
+/// `LoopTermination::Failed { reason = "malformed_spawn_proposal: …" }`.
+///
+/// Chosen as 3 to mirror `MAX_COMPLETION_GATE_REJECTIONS`: the LLM gets
+/// one free retry after seeing the rejection in `step_history`, a second
+/// retry if the first correction was still wrong, and a third before the
+/// loop assumes the model is permanently broken. Lower values would kill
+/// runs where one rogue LLM emission slipped through a rubric drift;
+/// higher values would let a stuck model burn iterations against the
+/// same rejection message.
+///
+/// The counter is reset whenever a non-malformed action completes
+/// (including a valid spawn, a tool call, or any other successful
+/// proposal) so transient flakes don't accumulate across an otherwise-
+/// healthy run.
+pub const MAX_CONSECUTIVE_MALFORMED_SPAWNS: u32 = 3;
+
+// ── BreakerConfig ────────────────────────────────────────────────────────────
+
+/// F65 PR-3: circuit-breaker caps enforced inside `OrchestratorLoop`.
+///
+/// Each field is a hard upper bound; when the measured value reaches or
+/// exceeds the cap the loop emits `RuntimeEvent::CircuitBreakerTripped` and
+/// terminates with `LoopTermination::BreakerTripped`.
+///
+/// Hardcoded defaults: `round_cap = 30`, `token_cap = 200_000`,
+/// `no_tool_use_streak = 3`, `wall_clock_ms = 900_000` (15 minutes).
+///
+/// Defaults are resolved via the `RuntimeConfig` 3-layer fallback
+/// (store → env → default) by the HTTP handler; request bodies may tighten
+/// (but never loosen) these caps per-run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BreakerConfig {
+    /// Maximum orchestrator iterations before the `Round` breaker trips.
+    ///
+    /// Enforced at the top of each loop iteration BEFORE gather. Trips
+    /// when `iteration >= round_cap` so a `round_cap` of 5 allows
+    /// iterations 0..=4 and trips entering iteration 5.
+    pub round_cap: u32,
+    /// Maximum cumulative LLM tokens (input + output) before the `Tokens`
+    /// breaker trips. Counted after each DECIDE phase using
+    /// `DecideOutput.input_tokens` + `DecideOutput.output_tokens`.
+    pub token_cap: u64,
+    /// Maximum consecutive DECIDE rounds with no forward progress
+    /// before the `NoToolUseConsecutive` breaker trips.
+    ///
+    /// A "forward-progress" round is one whose proposals contain at
+    /// least one of:
+    ///   * a proposal with a concrete `tool_name: Some(_)` (invoke_tool),
+    ///   * an `ActionType::CompleteRun` proposal (intentional terminal),
+    ///   * an `ActionType::FailRun` proposal (intentional terminal, #825),
+    ///   * an `ActionType::EscalateToOperator` proposal (intentional gate),
+    ///   * an `ActionType::SpawnSubagent` proposal (intentional delegation).
+    ///
+    /// Rounds that contain only narration-shaped proposals (e.g.
+    /// `create_memory`, `send_notification`) are treated as zero-
+    /// progress and increment the streak; any forward-progress round
+    /// resets the streak to zero. The carve-out for CompleteRun et al.
+    /// prevents the streak breaker from tripping immediately before
+    /// execute dispatches an intentional terminal action (regression
+    /// caught on PR #348 review).
+    ///
+    /// A streak equal to this value trips the breaker (e.g. `3` trips
+    /// after the third consecutive zero-progress round).
+    pub no_tool_use_streak: u32,
+    /// Wall-clock milliseconds from loop start before the `WallClock`
+    /// breaker trips. Measured with a monotonic `std::time::Instant`
+    /// captured at loop entry.
+    pub wall_clock_ms: u64,
+    /// Basis-point threshold that fires the once-per-run
+    /// `BudgetThresholdCrossed` warning. `10_000` = 100 %; `8_000` = 80 %.
+    /// Default `8_000` matches the historical const before #479 promoted
+    /// it to a tunable. Set `>= 10_000` to suppress the warning (it will
+    /// never fire before the trip path runs).
+    ///
+    /// Only Round / WallClock / Tokens participate in the warning —
+    /// `NoToolUseConsecutive` skips it by design (see rustdoc on
+    /// `no_tool_use_streak` + arch-doc §4.1).
+    pub warn_ratio_bps: u32,
+}
+
+impl Default for BreakerConfig {
+    fn default() -> Self {
+        Self {
+            // #797: bumped from 30 → 60 to stay above the new
+            // DEFAULT_MAX_ITERATIONS (50). If round_cap < max_iterations,
+            // the breaker fires before the iteration cap and operators
+            // see a confusing "round breaker tripped" message instead
+            // of a clean "max iterations reached" termination — Gemini
+            // PR #798 review caught this. The 60 leaves headroom above
+            // the 50-iteration cap for any iteration-count slack.
+            round_cap: 60,
+            token_cap: 200_000,
+            // #797: bumped from 3 → 12 to mirror the
+            // STUCK_ITERATION_THRESHOLD bump in decide_impl.rs. The
+            // breaker fires when N consecutive iterations have no
+            // tool use; on a procedural goal the model legitimately
+            // alternates between tool calls and deliberation, so 3
+            // was way too tight and tripped on the dogfood norm.
+            no_tool_use_streak: 12,
+            wall_clock_ms: 15 * 60 * 1_000, // 15 minutes
+            warn_ratio_bps: 8_000,          // 80 %
         }
     }
 }
@@ -321,5 +760,107 @@ impl Default for CompactionConfig {
             summary_token_budget: 2000,
             cooldown_iterations: 5,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_domain::{ActionProposal, ActionType};
+
+    fn empty_decide(proposals: Vec<ActionProposal>) -> DecideOutput {
+        DecideOutput {
+            raw_response: String::new(),
+            proposals,
+            calibrated_confidence: 1.0,
+            requires_approval: false,
+            model_id: "test".into(),
+            latency_ms: 0,
+            input_tokens: None,
+            output_tokens: None,
+            system_prompt: String::new(),
+            messages_json: "[]".to_owned(),
+            tool_calls_json: "[]".to_owned(),
+            tool_defs_json: "[]".to_owned(),
+        }
+    }
+
+    fn proposal(action_type: ActionType, tool_name: Option<&str>) -> ActionProposal {
+        ActionProposal {
+            action_type,
+            description: String::new(),
+            confidence: 1.0,
+            tool_name: tool_name.map(str::to_owned),
+            tool_args: None,
+            requires_approval: false,
+        }
+    }
+
+    #[test]
+    fn tool_or_terminal_count_empty() {
+        let d = empty_decide(vec![]);
+        assert_eq!(d.tool_or_terminal_count(), 0);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_counts_tool_name() {
+        // `InvokeTool` with a concrete tool_name counts.
+        let d = empty_decide(vec![
+            proposal(ActionType::InvokeTool, Some("shell")),
+            proposal(ActionType::InvokeTool, Some("read")),
+        ]);
+        assert_eq!(d.tool_or_terminal_count(), 2);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_counts_complete_run_without_tool_name() {
+        // Terminal action with no tool_name still counts — the
+        // carve-out Cursor Bugbot added to keep `complete_run` from
+        // tripping the NoToolUseConsecutive breaker.
+        let d = empty_decide(vec![proposal(ActionType::CompleteRun, None)]);
+        assert_eq!(d.tool_or_terminal_count(), 1);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_counts_escalate_and_subagent() {
+        let d = empty_decide(vec![
+            proposal(ActionType::EscalateToOperator, None),
+            proposal(ActionType::SpawnSubagent, None),
+        ]);
+        assert_eq!(d.tool_or_terminal_count(), 2);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_counts_fail_run_without_tool_name() {
+        // #825: fail_run is an intentional terminal just like
+        // complete_run — the NoToolUseConsecutive breaker must not
+        // treat it as a zero-progress round right before execute
+        // dispatches the terminal.
+        let d = empty_decide(vec![proposal(ActionType::FailRun, None)]);
+        assert_eq!(d.tool_or_terminal_count(), 1);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_excludes_pure_narration_and_memory() {
+        // create_memory / send_notification without a tool_name is
+        // deliberately NOT counted — memorising a thought or pinging
+        // Slack is not forward progress the user asked for.
+        let d = empty_decide(vec![
+            proposal(ActionType::CreateMemory, None),
+            proposal(ActionType::SendNotification, None),
+        ]);
+        assert_eq!(d.tool_or_terminal_count(), 0);
+    }
+
+    #[test]
+    fn tool_or_terminal_count_mixed_proposal_set() {
+        let d = empty_decide(vec![
+            proposal(ActionType::SendNotification, None),
+            proposal(ActionType::InvokeTool, Some("grep")),
+            proposal(ActionType::CreateMemory, None),
+            proposal(ActionType::CompleteRun, None),
+        ]);
+        // grep + complete_run count; notification + create_memory do not.
+        assert_eq!(d.tool_or_terminal_count(), 2);
     }
 }

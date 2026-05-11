@@ -19,9 +19,9 @@ use cairn_domain::lifecycle::{
 use cairn_domain::policy::ApprovalDecision;
 use cairn_domain::RuntimeEvent;
 use cairn_store::event_log::EventLog;
-use ff_core::keys::ExecKeyContext;
-use ff_core::partition::execution_partition;
-use ff_sdk::task::SignalOutcome;
+use flowfabric::core::keys::ExecKeyContext;
+use flowfabric::core::partition::execution_partition;
+use flowfabric::sdk::task::SignalOutcome;
 
 use crate::TestHarness;
 
@@ -79,8 +79,7 @@ async fn read_exec_core_for_run(
     let partition = execution_partition(&eid, h.partition_config());
     let ctx = ExecKeyContext::new(&partition, &eid);
     let fields: HashMap<String, String> = h
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .hgetall(&ctx.core())
         .await
@@ -286,18 +285,28 @@ async fn test_signal_delivery_resumes_waiter() {
 }
 
 /// Dedup: goes directly through `SignalBridge` so the waitpoint id is
-/// passed explicitly — `runs.resolve_approval` clears
-/// `current_waitpoint_id` on the first call, so a second resolve would
-/// error before hitting the idempotency guard.
+/// passed explicitly.
 ///
-/// Uses `deliver_tool_result_signal` because its signal_name
-/// `tool_result:<inv_id>` does NOT match the approval waitpoint's
-/// `approval_granted|rejected` matchers. The first delivery records a
-/// no-op and the waitpoint stays open; the second delivery with the same
-/// idempotency_key trips the SET NX in signal.lua and returns
+/// Uses a `ToolRequestedSuspension` pause — the waitpoint's typed
+/// resume condition is `Single { matcher: ByName("tool_result:<inv_a>") }`
+/// — and delivers a DIFFERENT invocation's signal (`tool_result:<inv_b>`)
+/// twice. The first delivery lands on the matcher-failed branch
+/// (waitpoint stays open), and the second delivery with the same
+/// idempotency_key trips FF's SET NX dedup and returns
 /// `SignalOutcome::Duplicate`.
+///
+/// Why not reuse an approval waitpoint: cairn's FF 0.10 approval
+/// waitpoint uses `SignalMatcher::Wildcard` (the typed trait cannot
+/// express "OR of two ByName matchers" on a single waitpoint
+/// without Pattern-3 multi-binding). A non-matching signal to a
+/// Wildcard waitpoint still resumes it, which would close the
+/// waitpoint before the idempotency check could run on the second
+/// delivery. The tool-result waitpoint preserves the "signal name
+/// must match to resume" semantic this idempotency test depends on.
 #[tokio::test]
 async fn test_signal_delivery_is_idempotent() {
+    use cairn_domain::{PauseReason, PauseReasonKind};
+
     let h = TestHarness::setup().await;
     let session_id = h.unique_session_id();
     let run_id = h.unique_run_id();
@@ -314,21 +323,33 @@ async fn test_signal_delivery_is_idempotent() {
         .await
         .expect("runs.claim failed");
 
+    // Pause the run on a ToolRequestedSuspension waitpoint — resume
+    // condition is `Single { matcher: ByName("tool_result:<inv_a>") }`.
+    let invocation_a = format!("inv_{}", uuid::Uuid::new_v4());
     h.fabric
         .runs
-        .enter_waiting_approval(&h.project, &session_id, &run_id)
+        .pause(
+            &h.project,
+            &session_id,
+            &run_id,
+            PauseReason {
+                kind: PauseReasonKind::ToolRequestedSuspension,
+                detail: Some(invocation_a.clone()),
+                resume_after_ms: None,
+                actor: None,
+            },
+        )
         .await
-        .expect("enter_waiting_approval failed");
+        .expect("pause on tool-requested suspension failed");
 
-    // Read the active waitpoint id from exec_core (populated by
-    // ff_suspend_execution at lua/suspension.lua:199).
     let core = read_exec_core_for_run(&h, &session_id, &run_id).await;
     let wp_id_str = core
         .get("current_waitpoint_id")
         .cloned()
         .filter(|s| !s.is_empty())
-        .expect("current_waitpoint_id must be set after enter_waiting_approval");
-    let wp_id = ff_core::types::WaitpointId::parse(&wp_id_str).expect("waitpoint_id must parse");
+        .expect("current_waitpoint_id must be set after pause");
+    let wp_id =
+        flowfabric::core::types::WaitpointId::parse(&wp_id_str).expect("waitpoint_id must parse");
     let eid = cairn_fabric::id_map::session_run_to_execution_id(
         &h.project,
         &session_id,
@@ -336,31 +357,31 @@ async fn test_signal_delivery_is_idempotent() {
         h.partition_config(),
     );
 
-    let invocation_id = format!("inv_{}", uuid::Uuid::new_v4());
-
-    // First delivery: records signal, no matcher hit, no_op. Waitpoint
-    // stays open because `tool_result:<inv_id>` is not in the matcher set
-    // for an approval waitpoint.
+    // Deliver a DIFFERENT invocation's tool_result signal. This
+    // fails the waitpoint's ByName(tool_result:<inv_a>) matcher so
+    // the waitpoint stays open, but the idempotency key is still
+    // written.
+    let invocation_b = format!("inv_{}", uuid::Uuid::new_v4());
     let first = h
         .fabric
         .signals
-        .deliver_tool_result_signal(&eid, &wp_id, &invocation_id, None)
+        .deliver_tool_result_signal(&eid, &wp_id, &invocation_b, None)
         .await
         .expect("first tool_result signal delivery failed");
     assert!(
         matches!(first, SignalOutcome::Accepted { .. }),
-        "first delivery must be Accepted (not Duplicate), got {:?}",
+        "first delivery of non-matching tool_result must be Accepted (not TriggeredResume), got {:?}",
         first,
     );
 
-    // Second delivery with SAME invocation_id → same idempotency_key
-    // (`tool_result:<inv_id>`). FF signal.lua:117-124 reads the idem_key,
-    // finds it present, returns `ok_duplicate(existing)` → parsed to
-    // SignalOutcome::Duplicate by ff-sdk.
+    // Second delivery with SAME invocation_b → same idempotency_key
+    // (`tool_result:<inv_b>`). FF signal.lua:117-124 reads the
+    // idem_key, finds it present, returns `ok_duplicate(existing)` →
+    // parsed to SignalOutcome::Duplicate by ff-sdk.
     let second = h
         .fabric
         .signals
-        .deliver_tool_result_signal(&eid, &wp_id, &invocation_id, None)
+        .deliver_tool_result_signal(&eid, &wp_id, &invocation_b, None)
         .await
         .expect("second tool_result signal delivery must return Duplicate, not error");
     assert!(
@@ -604,6 +625,109 @@ async fn task_pause_and_resume_emit_state_changed() {
          FabricTaskService::resume must emit BridgeEvent::TaskStateChanged after FF_RESUME_EXECUTION \
          succeeds, otherwise SSE subscribers never see task resume transitions. \
          See docs/design/bridge-event-audit.md §3.1.",
+    );
+
+    h.teardown().await;
+}
+
+/// Regression guard for issue #591: `BridgeEvent::ExecutionSuspended`
+/// must thread `pause_reason` (including `resume_after_ms`) through to
+/// the `RunStateChanged` event log entry, and `ExecutionResumed` must
+/// thread `resume_trigger`.
+///
+/// Pre-fix: the bridge converter hard-coded `pause_reason: None` and
+/// `resume_trigger: None` for both variants, so the service path could
+/// not populate the `pause_schedules` projection — timer-fired resumes
+/// were invisible to `list_due` (#592).
+///
+/// Post-fix: a `runs.pause` with a non-None `resume_after_ms` lands in
+/// the event log carrying the same value, and the matching
+/// `runs.resume` records the trigger classification.
+#[tokio::test]
+async fn run_pause_and_resume_thread_pause_reason_and_resume_trigger() {
+    use cairn_domain::lifecycle::RunState;
+
+    let h = TestHarness::setup().await;
+    let session_id = h.unique_session_id();
+    let run_id = h.unique_run_id();
+
+    h.fabric
+        .runs
+        .start(&h.project, &session_id, run_id.clone(), None)
+        .await
+        .expect("start failed");
+
+    // FF requires `lifecycle_phase=active` before ff_suspend_execution.
+    h.fabric
+        .runs
+        .claim(&h.project, &session_id, &run_id)
+        .await
+        .expect("runs.claim failed");
+
+    // Pause with a structured reason carrying `resume_after_ms`. The
+    // bridge must forward the entire PauseReason into
+    // RunStateChanged.pause_reason — not drop it on the floor.
+    let operator = "integration-test-591";
+    let detail = "scheduled-handoff";
+    let resume_after_ms: u64 = 60_000;
+    let pause_reason = PauseReason {
+        kind: PauseReasonKind::OperatorPause,
+        detail: Some(detail.to_owned()),
+        resume_after_ms: Some(resume_after_ms),
+        actor: Some(operator.to_owned()),
+    };
+    h.fabric
+        .runs
+        .pause(&h.project, &session_id, &run_id, pause_reason.clone())
+        .await
+        .expect("runs.pause failed");
+
+    // Assert the RunStateChanged(→Paused) event carries the exact
+    // PauseReason we passed in. `wait_for_event` returns on the first
+    // match, but bridge emission is async so we wait up to 2s.
+    let expected_run = run_id.clone();
+    let expected_reason = pause_reason.clone();
+    wait_for_event(&h, Duration::from_secs(2), move |event| {
+        matches!(event, RuntimeEvent::RunStateChanged(e)
+            if e.run_id == expected_run
+                && e.transition.to == RunState::Paused
+                && e.pause_reason.as_ref() == Some(&expected_reason))
+    })
+    .await
+    .expect(
+        "RunStateChanged(Paused) with pause_reason not observed — #591 regressed. \
+         bridge_event_to_runtime_event must forward BridgeEvent::ExecutionSuspended.pause_reason \
+         into RunStateChanged.pause_reason. A `None` value here means resume_after_ms is dropped, \
+         which breaks the pause_schedules projection / list_due path.",
+    );
+
+    // Resume with OperatorResume — must surface on the
+    // RunStateChanged.resume_trigger column.
+    h.fabric
+        .runs
+        .resume(
+            &h.project,
+            &session_id,
+            &run_id,
+            ResumeTrigger::OperatorResume,
+            cairn_domain::lifecycle::RunResumeTarget::Running,
+        )
+        .await
+        .expect("runs.resume failed");
+
+    let expected_run = run_id.clone();
+    wait_for_event(&h, Duration::from_secs(2), move |event| {
+        matches!(event, RuntimeEvent::RunStateChanged(e)
+            if e.run_id == expected_run
+                && e.transition.to == RunState::Running
+                && e.resume_trigger == Some(ResumeTrigger::OperatorResume))
+    })
+    .await
+    .expect(
+        "RunStateChanged(Running) with resume_trigger not observed — #591 regressed. \
+         bridge_event_to_runtime_event must forward BridgeEvent::ExecutionResumed.resume_trigger \
+         into RunStateChanged.resume_trigger. A `None` here means audit / operator UI cannot \
+         distinguish timer-fired resumes from operator-initiated ones.",
     );
 
     h.teardown().await;

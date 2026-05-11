@@ -16,6 +16,15 @@ use cairn_domain::audit::AuditOutcome;
 use cairn_domain::commercial::ProductTier;
 use cairn_domain::errors::RuntimeEntityRef;
 use cairn_domain::events::StateTransition;
+use cairn_domain::events::{
+    KnowledgeIngestRejected, KnowledgeIngestStatusUpdated, KnowledgeIngestSubmitted,
+    KnowledgeProviderCapabilityChanged, KnowledgeProviderConfigured,
+    KnowledgeProviderFamilyMismatch, KnowledgeProviderUnavailable, MemoryIngestRejected,
+    MemoryIngestStatusUpdated, MemoryIngestSubmitted, MemoryProviderCapabilityChanged,
+    MemoryProviderConfigured, MemoryProviderFamilyMismatch, MemoryProviderUnavailable,
+    ResolvedProviderSnapshot,
+};
+use cairn_domain::ids::{DocumentId, KnowledgeDocumentId, ProviderRef};
 use cairn_domain::lifecycle::{RunState, SessionState, TaskState};
 use cairn_domain::policy::{ApprovalRequirement, GuardrailDecisionKind, GuardrailSubjectType};
 use cairn_domain::providers::{
@@ -32,18 +41,19 @@ use cairn_domain::{
     CheckpointRecorded, CheckpointRestored, CheckpointStrategySet, CredentialId,
     CredentialKeyRotated, CredentialRevoked, CredentialStored, DecisionId, DefaultSettingCleared,
     DefaultSettingSet, EntitlementOverrideSet, EvalBaselineLocked, EvalBaselineSet,
-    EvalDatasetCreated, EvalDatasetEntryAdded, EvalRubricCreated, EvalRunCompleted, EvalRunId,
-    EvalRunStarted, EventEnvelope, EventId, EventLogCompacted, EventSource, ExecutionClass,
-    ExternalWorkerReactivated, ExternalWorkerRegistered, ExternalWorkerReported,
-    ExternalWorkerSuspended, GuardrailPolicyCreated, GuardrailPolicyEvaluated, IngestJobCompleted,
-    IngestJobId, IngestJobStarted, LicenseActivated, MailboxMessageAppended, MailboxMessageId,
-    NotificationPreferenceSet, NotificationSent, OperatorId, OperatorIntervention,
-    OperatorProfileCreated, OperatorProfileUpdated, PauseScheduled, PermissionDecisionRecorded,
-    ProjectCreated, ProjectKey, PromptAssetCreated, PromptAssetId, PromptReleaseCreated,
-    PromptReleaseId, PromptReleaseTransitioned, PromptRolloutStarted, PromptVersionCreated,
-    PromptVersionId, ProviderBindingCreated, ProviderBindingId, ProviderBindingStateChanged,
-    ProviderBudgetAlertTriggered, ProviderBudgetExceeded, ProviderBudgetSet, ProviderCallCompleted,
-    ProviderCallId, ProviderConnectionId, ProviderConnectionRegistered, ProviderHealthChecked,
+    EvalDatasetCreated, EvalDatasetEntryAdded, EvalRubricCreated, EvalRunArchived,
+    EvalRunCompleted, EvalRunId, EvalRunStarted, EventEnvelope, EventId, EventLogCompacted,
+    EventSource, ExecutionClass, ExternalWorkerReactivated, ExternalWorkerRegistered,
+    ExternalWorkerReported, ExternalWorkerSuspended, GuardrailPolicyCreated,
+    GuardrailPolicyEvaluated, IngestJobCompleted, IngestJobId, IngestJobStarted, LicenseActivated,
+    MailboxMessageAppended, MailboxMessageId, NotificationPreferenceSet, NotificationSent,
+    OperatorId, OperatorIntervention, OperatorProfileCreated, OperatorProfileUpdated,
+    PauseScheduled, PermissionDecisionRecorded, ProjectCreated, ProjectKey, PromptAssetCreated,
+    PromptAssetId, PromptReleaseCreated, PromptReleaseId, PromptReleaseTransitioned,
+    PromptRolloutStarted, PromptVersionCreated, PromptVersionId, ProviderBindingCreated,
+    ProviderBindingId, ProviderBindingStateChanged, ProviderBudgetAlertTriggered,
+    ProviderBudgetExceeded, ProviderBudgetSet, ProviderCallCompleted, ProviderCallId,
+    ProviderConnectionId, ProviderConnectionRegistered, ProviderHealthChecked,
     ProviderHealthScheduleSet, ProviderHealthScheduleTriggered, ProviderMarkedDegraded,
     ProviderModelId, ProviderModelRegistered, ProviderPoolConnectionAdded,
     ProviderPoolConnectionRemoved, ProviderPoolCreated, ProviderRecovered, ProviderRetryPolicySet,
@@ -129,6 +139,9 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::RunStateChanged(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
         }
+        RuntimeEvent::RunReasoningStepRecorded(_) => {
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
         RuntimeEvent::TaskCreated(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::Task { .. })));
         }
@@ -146,6 +159,24 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         }
         RuntimeEvent::ApprovalResolved(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::Approval { .. })));
+        }
+        // PR BP-1: tool-call approval foundation events — project-scoped,
+        // entity_ref = None (ToolCallId is not yet in RuntimeEntityRef).
+        RuntimeEvent::ToolCallProposed(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::ToolCallApproved(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::ToolCallRejected(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::ToolCallAmended(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
         }
         RuntimeEvent::CheckpointRecorded(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::Checkpoint { .. })));
@@ -222,6 +253,15 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::EvalRunCompleted(_) => {
             assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
         }
+        RuntimeEvent::EvalRunArchived(_) => {
+            assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
+        }
+        RuntimeEvent::EvalRunScored(_) => {
+            assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
+        }
+        RuntimeEvent::EvalRubricScored(_) => {
+            assert!(matches!(eref, Some(RuntimeEntityRef::EvalRun { .. })));
+        }
 
         // ── Entity-scoped: project() real, entity_ref = None or conditional ─
         RuntimeEvent::RecoveryAttempted(_) => {
@@ -246,7 +286,13 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::TenantCreated(_) => {
             assert!(eref.is_none());
         }
+        RuntimeEvent::TenantUpdated(_) => {
+            assert!(eref.is_none());
+        }
         RuntimeEvent::WorkspaceCreated(_) => {
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::WorkspaceArchived(_) => {
             assert!(eref.is_none());
         }
         RuntimeEvent::ProjectCreated(_) => {
@@ -259,6 +305,9 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
             assert!(eref.is_none());
         }
         RuntimeEvent::ProviderCallCompleted(_) => {
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::LlmCompletionRecorded(_) => {
             assert!(eref.is_none());
         }
         RuntimeEvent::SoulPatchProposed(_) => {
@@ -443,6 +492,12 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::OperatorProfileUpdated(_) => {
             assert!(eref.is_none());
         }
+        RuntimeEvent::TenantRoleGranted(_) => {
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::TenantRoleRevoked(_) => {
+            assert!(eref.is_none());
+        }
         RuntimeEvent::PauseScheduled(_) => {
             assert!(eref.is_none());
         }
@@ -456,6 +511,9 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
             assert!(eref.is_none());
         }
         RuntimeEvent::ProviderConnectionRegistered(_) => {
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::ProviderConnectionDeleted(_) => {
             assert!(eref.is_none());
         }
         RuntimeEvent::ProviderHealthChecked(_) => {
@@ -579,6 +637,122 @@ fn assert_all_variants_covered(event: &RuntimeEvent) {
         RuntimeEvent::RecoverySummaryEmitted(_) => {
             assert_eq!(eref, None);
         }
+        // F47 PR2: run-scoped annotation with Run entity_ref.
+        RuntimeEvent::RunCompletionAnnotated(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
+        // RFC 032 PR-2: run-scoped contract resolution annotation.
+        RuntimeEvent::CompletionContractResolved(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
+        // F64: run-scoped terminal-write recovery annotation.
+        RuntimeEvent::TerminalRecoveryAttempted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
+        // F65 PR-1: orchestrator session redesign foundation.
+        // Session-lifecycle events resolve back to the session.
+        RuntimeEvent::SessionAttemptStarted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::SessionAttemptCompleted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        // Breaker / budget events drill down to the active run.
+        RuntimeEvent::CircuitBreakerTripped(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
+        RuntimeEvent::BudgetThresholdCrossed(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Run { .. })));
+        }
+        RuntimeEvent::CheckpointPersisted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Checkpoint { .. })));
+        }
+        // Workspace snapshots have no RuntimeEntityRef variant yet — the
+        // entity lands in PR-2 when the projection table is introduced.
+        RuntimeEvent::WorkspaceSnapshotCreated(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::WorkspaceSnapshotReaped(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::SessionOutcomeEmitted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::OrchestratorDecisionMade(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::SummarizerFallback(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::WorkspaceBackendDegraded(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        RuntimeEvent::SandboxCrashRecovered(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(eref, Some(RuntimeEntityRef::Session { .. })));
+        }
+        // RFC 029 knowledge-provider lifecycle events are project-scoped
+        // (config / audit on `project_knowledge_providers`) with no
+        // session/run entity attached.
+        RuntimeEvent::KnowledgeProviderConfigured(_)
+        | RuntimeEvent::KnowledgeProviderUnavailable(_)
+        | RuntimeEvent::KnowledgeProviderCapabilityChanged(_)
+        | RuntimeEvent::KnowledgeIngestSubmitted(_)
+        | RuntimeEvent::KnowledgeIngestRejected(_)
+        | RuntimeEvent::KnowledgeIngestStatusUpdated(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        // RFC 030 memory-provider lifecycle events — same shape as the
+        // knowledge-family variants: project-scoped config/audit rows on
+        // `project_memory_providers` + `memory_ingest_jobs`, no session or
+        // run entity attached.
+        RuntimeEvent::MemoryProviderConfigured(_)
+        | RuntimeEvent::MemoryProviderUnavailable(_)
+        | RuntimeEvent::MemoryProviderCapabilityChanged(_)
+        | RuntimeEvent::MemoryIngestSubmitted(_)
+        | RuntimeEvent::MemoryIngestRejected(_)
+        | RuntimeEvent::MemoryIngestStatusUpdated(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        // RFC 030 finalize: family-mismatch audit events are
+        // project-scoped (keyed on the offending slot's project) with
+        // no run/session entity.
+        RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
+        | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        // RFC 031 PR-A: operator-defined agent roles are project-
+        // scoped. `AgentRoleDefined` / `AgentRoleRetracted` are
+        // role-lifecycle events with no run/session anchor.
+        // `ToolDeclaredButMissing` is run-scoped (carries run_id).
+        RuntimeEvent::AgentRoleDefined(_) | RuntimeEvent::AgentRoleRetracted(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(eref.is_none());
+        }
+        RuntimeEvent::ToolDeclaredButMissing(_) => {
+            assert_ne!(proj.tenant_id.as_str(), "_system");
+            assert!(matches!(
+                eref,
+                Some(cairn_domain::RuntimeEntityRef::Run { .. })
+            ));
+        }
     }
 }
 
@@ -617,6 +791,21 @@ fn all_variants() -> Vec<RuntimeEvent> {
             failure_class: None,
             pause_reason: None,
             resume_trigger: None,
+        }),
+        RuntimeEvent::RunReasoningStepRecorded(cairn_domain::events::RunReasoningStep {
+            project: p(),
+            run_id: run(),
+            session_id: sess(),
+            iteration: 0,
+            recorded_at_ms: 0,
+            model_id: "test".to_owned(),
+            reasoning_compact: "".to_owned(),
+            proposed_action: cairn_domain::events::ProposedActionSummary::Other {
+                action_type: "none".to_owned(),
+            },
+            proposal_count: 1,
+            step_history_snapshot: "".to_owned(),
+            confidence: 0.0,
         }),
         RuntimeEvent::TaskCreated(TaskCreated {
             project: p(),
@@ -664,6 +853,43 @@ fn all_variants() -> Vec<RuntimeEvent> {
             approval_id: ApprovalId::new("a1"),
             decision: cairn_domain::policy::ApprovalDecision::Approved,
         }),
+        // PR BP-1: tool-call approval foundation events.
+        RuntimeEvent::ToolCallProposed(cairn_domain::ToolCallProposed {
+            project: p(),
+            call_id: cairn_domain::ToolCallId::new("tc_exh_1"),
+            session_id: sess(),
+            run_id: run(),
+            tool_name: "read_file".to_owned(),
+            tool_args: serde_json::json!({"path": "/tmp/x"}),
+            display_summary: "Read /tmp/x".to_owned(),
+            match_policy: cairn_domain::ApprovalMatchPolicy::Exact,
+            proposed_at_ms: ts,
+        }),
+        RuntimeEvent::ToolCallApproved(cairn_domain::ToolCallApproved {
+            project: p(),
+            call_id: cairn_domain::ToolCallId::new("tc_exh_1"),
+            session_id: sess(),
+            operator_id: OperatorId::new("op1"),
+            scope: cairn_domain::ApprovalScope::Once,
+            approved_tool_args: None,
+            approved_at_ms: ts,
+        }),
+        RuntimeEvent::ToolCallRejected(cairn_domain::ToolCallRejected {
+            project: p(),
+            call_id: cairn_domain::ToolCallId::new("tc_exh_2"),
+            session_id: sess(),
+            operator_id: OperatorId::new("op1"),
+            reason: Some("unsafe path".to_owned()),
+            rejected_at_ms: ts,
+        }),
+        RuntimeEvent::ToolCallAmended(cairn_domain::ToolCallAmended {
+            project: p(),
+            call_id: cairn_domain::ToolCallId::new("tc_exh_3"),
+            session_id: sess(),
+            operator_id: OperatorId::new("op1"),
+            new_tool_args: serde_json::json!({"path": "/tmp/y"}),
+            amended_at_ms: ts,
+        }),
         RuntimeEvent::CheckpointRecorded(CheckpointRecorded {
             project: p(),
             run_id: run(),
@@ -707,6 +933,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             prompt_release_id: None,
             requested_at_ms: ts,
             started_at_ms: ts,
+            args_json: None,
         }),
         RuntimeEvent::ToolInvocationCompleted(ToolInvocationCompleted {
             project: p(),
@@ -717,6 +944,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             outcome: ToolInvocationOutcomeKind::Success,
             tool_call_id: None,
             result_json: None,
+            output_preview: None,
         }),
         RuntimeEvent::ToolInvocationFailed(ToolInvocationFailed {
             project: p(),
@@ -726,6 +954,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             finished_at_ms: ts,
             outcome: ToolInvocationOutcomeKind::PermanentFailure,
             error_message: Some("denied".to_owned()),
+            output_preview: None,
         }),
         RuntimeEvent::ToolInvocationCacheHit(cairn_domain::ToolInvocationCacheHit {
             project: p(),
@@ -792,6 +1021,9 @@ fn all_variants() -> Vec<RuntimeEvent> {
             child_task_id: task(),
             child_session_id: sess(),
             child_run_id: None,
+            goal: "exhaustiveness-sample-goal".to_owned(),
+            role: "executor".to_owned(),
+            parent_context: None,
         }),
         RuntimeEvent::RecoveryAttempted(RecoveryAttempted {
             project: p(),
@@ -839,6 +1071,9 @@ fn all_variants() -> Vec<RuntimeEvent> {
             prompt_version_id: None,
             prompt_release_id: None,
             created_by: None,
+            dataset_id: None,
+            rubric_id: None,
+            baseline_id: None,
         }),
         RuntimeEvent::EvalRunCompleted(EvalRunCompleted {
             project: p(),
@@ -847,6 +1082,25 @@ fn all_variants() -> Vec<RuntimeEvent> {
             error_message: None,
             subject_node_id: None,
             completed_at: ts,
+        }),
+        RuntimeEvent::EvalRunArchived(EvalRunArchived {
+            project: p(),
+            eval_run_id: EvalRunId::new("er1"),
+            archived_at: ts,
+        }),
+        RuntimeEvent::EvalRunScored(cairn_domain::EvalRunScored {
+            project: p(),
+            eval_run_id: EvalRunId::new("er1"),
+            metrics: cairn_domain::EvalMetrics::default(),
+            recorded_at_ms: ts,
+        }),
+        RuntimeEvent::EvalRubricScored(cairn_domain::EvalRubricScored {
+            project: p(),
+            eval_run_id: EvalRunId::new("er1"),
+            rubric_id: "ru1".to_owned(),
+            dimension_scores: vec![],
+            overall: 0.0,
+            recorded_at_ms: ts,
         }),
         RuntimeEvent::OutcomeRecorded(cairn_domain::OutcomeRecorded {
             project: p(),
@@ -923,12 +1177,25 @@ fn all_variants() -> Vec<RuntimeEvent> {
             name: "T".to_owned(),
             created_at: ts,
         }),
+        RuntimeEvent::TenantUpdated(cairn_domain::TenantUpdated {
+            project: p(),
+            tenant_id: tid(),
+            name: Some("T (updated)".to_owned()),
+            updated_by: "op_admin".to_owned(),
+            updated_at_ms: ts,
+        }),
         RuntimeEvent::WorkspaceCreated(WorkspaceCreated {
             project: p(),
             workspace_id: WorkspaceId::new("w_exh"),
             tenant_id: tid(),
             name: "W".to_owned(),
             created_at: ts,
+        }),
+        RuntimeEvent::WorkspaceArchived(cairn_domain::WorkspaceArchived {
+            project: p(),
+            workspace_id: WorkspaceId::new("w_exh"),
+            tenant_id: tid(),
+            archived_at: ts,
         }),
         RuntimeEvent::ProjectCreated(ProjectCreated {
             project: p(),
@@ -970,6 +1237,19 @@ fn all_variants() -> Vec<RuntimeEvent> {
             fallback_position: 0,
             started_at: 0,
             finished_at: 0,
+        }),
+        RuntimeEvent::LlmCompletionRecorded(cairn_domain::events::LlmCompletionRecorded {
+            project: p(),
+            trace_id: "trace_exhaust".to_owned(),
+            session_id: SessionId::new("sess_exhaust"),
+            run_id: None,
+            model_id: "gpt-4o".to_owned(),
+            system_prompt: "you are an agent".to_owned(),
+            messages_json: "[]".to_owned(),
+            response_text: "ok".to_owned(),
+            tool_calls_json: "[]".to_owned(),
+            tool_defs_json: "[]".to_owned(),
+            recorded_at_ms: ts,
         }),
         RuntimeEvent::SoulPatchProposed(SoulPatchProposed {
             project: p(),
@@ -1153,6 +1433,7 @@ fn all_variants() -> Vec<RuntimeEvent> {
             approval_id: ApprovalId::new("a1"),
             delegated_to: "op2".to_owned(),
             delegated_at_ms: ts,
+            delegation_id: "deleg_a1_0_1".to_owned(),
         }),
         RuntimeEvent::AuditLogEntryRecorded(AuditLogEntryRecorded {
             entry_id: "ae1".to_owned(),
@@ -1261,6 +1542,20 @@ fn all_variants() -> Vec<RuntimeEvent> {
             profile_id: OperatorId::new("op1"),
             display_name: None,
             email: None,
+            role: None,
+        }),
+        RuntimeEvent::TenantRoleGranted(cairn_domain::TenantRoleGranted {
+            tenant_id: tid(),
+            operator_id: OperatorId::new("op1"),
+            role: cairn_domain::tenancy::TenantRole::Admin,
+            granted_by: "system".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::TenantRoleRevoked(cairn_domain::TenantRoleRevoked {
+            tenant_id: tid(),
+            operator_id: OperatorId::new("op1"),
+            revoked_by: "op_admin".to_owned(),
+            at_ms: ts,
         }),
         RuntimeEvent::PauseScheduled(PauseScheduled {
             task_id: task(),
@@ -1313,6 +1608,11 @@ fn all_variants() -> Vec<RuntimeEvent> {
             supported_models: vec![],
             status: ProviderConnectionStatus::Active,
             registered_at: ts,
+        }),
+        RuntimeEvent::ProviderConnectionDeleted(cairn_domain::events::ProviderConnectionDeleted {
+            tenant: tkey(),
+            provider_connection_id: ProviderConnectionId::new("conn1"),
+            deleted_at: ts,
         }),
         RuntimeEvent::ProviderHealthChecked(ProviderHealthChecked {
             tenant_id: tid(),
@@ -1644,6 +1944,290 @@ fn all_variants() -> Vec<RuntimeEvent> {
             startup_ms: 0,
             summary_at_ms: ts,
         }),
+        // F47 PR2: completion annotation variant.
+        RuntimeEvent::RunCompletionAnnotated(cairn_domain::RunCompletionAnnotated {
+            project: p(),
+            session_id: cairn_domain::SessionId::new("sess_test"),
+            run_id: cairn_domain::RunId::new("run_test"),
+            summary: "done".to_owned(),
+            verification: cairn_domain::CompletionVerification::default(),
+            occurred_at_ms: ts,
+        }),
+        // RFC 032 PR-2: completion-contract resolution variant.
+        RuntimeEvent::CompletionContractResolved(
+            cairn_domain::events::CompletionContractResolved {
+                project: p(),
+                session_id: cairn_domain::SessionId::new("sess_test"),
+                run_id: cairn_domain::RunId::new("run_test"),
+                contract: cairn_domain::completion_contracts::CompletionContract::ProseNonEmpty,
+                source: cairn_domain::completion_contracts::ContractSource::Inferred,
+                goal_hash: "0123456789abcdef".to_owned(),
+                occurred_at_ms: ts,
+            },
+        ),
+        // F64: terminal-write recovery loop annotation.
+        RuntimeEvent::TerminalRecoveryAttempted(cairn_domain::events::TerminalRecoveryAttempted {
+            project: p(),
+            run_id: cairn_domain::RunId::new("run_test"),
+            fcall: "complete".to_owned(),
+            attempts: 2,
+            wall_time_ms: 6_000,
+            outcome: "recovered".to_owned(),
+            occurred_at_ms: ts,
+        }),
+        // F65 PR-1: orchestrator session redesign foundation. One row per
+        // new RuntimeEvent variant so the exhaustiveness matrix stays
+        // tight against the enum.
+        RuntimeEvent::SessionAttemptStarted(cairn_domain::events::SessionAttemptStarted {
+            project: p(),
+            session_id: sess(),
+            root_run_id: run(),
+            attempt_number: 1,
+            max_attempts: 5,
+            at_ms: ts,
+        }),
+        RuntimeEvent::SessionAttemptCompleted(cairn_domain::events::SessionAttemptCompleted {
+            project: p(),
+            session_id: sess(),
+            root_run_id: run(),
+            outcome_kind: "complete_run".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::CircuitBreakerTripped(cairn_domain::events::CircuitBreakerTripped {
+            project: p(),
+            session_id: sess(),
+            run_id: run(),
+            trip: cairn_domain::session_orchestration::CircuitBreakerTrip {
+                which: cairn_domain::session_orchestration::BreakerKind::Round,
+                measured: 60,
+                limit: 50,
+                at_iteration: 59,
+            },
+            at_ms: ts,
+        }),
+        RuntimeEvent::BudgetThresholdCrossed(cairn_domain::events::BudgetThresholdCrossed {
+            project: p(),
+            session_id: sess(),
+            run_id: run(),
+            which_breaker: cairn_domain::session_orchestration::BreakerKind::Tokens,
+            measured: 80_000,
+            limit: 100_000,
+            ratio_bps: 8_000,
+            at_ms: ts,
+        }),
+        RuntimeEvent::CheckpointPersisted(cairn_domain::events::CheckpointPersisted {
+            project: p(),
+            checkpoint_id: cairn_domain::CheckpointId::new("ckpt_exh"),
+            session_id: sess(),
+            root_run_id: run(),
+            iteration: 3,
+            at_ms: ts,
+        }),
+        RuntimeEvent::WorkspaceSnapshotCreated(cairn_domain::events::WorkspaceSnapshotCreated {
+            project: p(),
+            snapshot_id: cairn_domain::WorkspaceSnapshotId::new("snap_exh"),
+            workspace_id: WorkspaceId::new("w_exh"),
+            session_id: sess(),
+            at_ms: ts,
+            bytes: 0,
+            reflink_used: false,
+            parent_snapshot_id: None,
+        }),
+        RuntimeEvent::WorkspaceSnapshotReaped(cairn_domain::events::WorkspaceSnapshotReaped {
+            project: p(),
+            snapshot_id: cairn_domain::WorkspaceSnapshotId::new("snap_exh"),
+            at_ms: ts,
+        }),
+        RuntimeEvent::SessionOutcomeEmitted(cairn_domain::events::SessionOutcomeEmitted {
+            project: p(),
+            session_id: sess(),
+            root_run_id: run(),
+            outcome: cairn_domain::session_orchestration::SessionOutcome {
+                session_id: sess(),
+                root_run_id: run(),
+                project: p(),
+                checkpoint_id: cairn_domain::CheckpointId::new("ckpt_exh"),
+                workspace_snapshot_id: None,
+                termination_reason:
+                    cairn_domain::session_orchestration::TerminationReason::CompleteRun,
+                compacted_summary: String::new(),
+                next_step_hint: None,
+                cost_micros: 0,
+                emitted_at: ts,
+            },
+            at_ms: ts,
+        }),
+        RuntimeEvent::OrchestratorDecisionMade(cairn_domain::events::OrchestratorDecisionMade {
+            project: p(),
+            session_id: sess(),
+            decision: "retry".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::SummarizerFallback(cairn_domain::events::SummarizerFallback {
+            project: p(),
+            session_id: sess(),
+            reason: "provider_unavailable".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::WorkspaceBackendDegraded(cairn_domain::events::WorkspaceBackendDegraded {
+            project: p(),
+            session_id: sess(),
+            backend: "ext4_copy".to_owned(),
+            reason: "overlayfs_unavailable".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::SandboxCrashRecovered(cairn_domain::events::SandboxCrashRecovered {
+            project: p(),
+            session_id: sess(),
+            run_id: run(),
+            at_ms: ts,
+        }),
+        // RFC 029 knowledge-provider lifecycle events.
+        RuntimeEvent::KnowledgeProviderConfigured(KnowledgeProviderConfigured {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            configured_by: OperatorId::new("op_exh"),
+            is_bootstrap: false,
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeProviderUnavailable(KnowledgeProviderUnavailable {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            reason: "handshake timeout".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeProviderCapabilityChanged(KnowledgeProviderCapabilityChanged {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            prior: ResolvedProviderSnapshot {
+                provider_id: "mem0".to_owned(),
+                ingest_capable: true,
+                retrieval_modes: vec!["vector_only".to_owned()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".to_owned()],
+                auto_extract: None,
+            },
+            current: ResolvedProviderSnapshot {
+                provider_id: "mem0".to_owned(),
+                ingest_capable: false,
+                retrieval_modes: vec!["vector_only".to_owned()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".to_owned()],
+                auto_extract: None,
+            },
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeIngestSubmitted(KnowledgeIngestSubmitted {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            document_id: KnowledgeDocumentId::new("doc_exh"),
+            source_type: "markdown".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeIngestRejected(KnowledgeIngestRejected {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:bedrock-kb"),
+            reason: "provider ingest_capable = false".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::KnowledgeIngestStatusUpdated(KnowledgeIngestStatusUpdated {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            document_id: KnowledgeDocumentId::new("doc_exh"),
+            status: "completed".to_owned(),
+            at_ms: ts,
+        }),
+        // RFC 030 memory-provider lifecycle events.
+        RuntimeEvent::MemoryProviderConfigured(MemoryProviderConfigured {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            configured_by: OperatorId::new("op_exh"),
+            is_bootstrap: true,
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryProviderUnavailable(MemoryProviderUnavailable {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            reason: "handshake timeout".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryProviderCapabilityChanged(MemoryProviderCapabilityChanged {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            prior: ResolvedProviderSnapshot {
+                provider_id: "mem0".to_owned(),
+                ingest_capable: true,
+                retrieval_modes: vec!["vector_only".to_owned()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".to_owned()],
+                auto_extract: Some(true),
+            },
+            current: ResolvedProviderSnapshot {
+                provider_id: "mem0".to_owned(),
+                ingest_capable: false,
+                retrieval_modes: vec!["vector_only".to_owned()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".to_owned()],
+                auto_extract: Some(true),
+            },
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryIngestSubmitted(MemoryIngestSubmitted {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            document_id: DocumentId::new("mem_exh"),
+            source_type: "plain_text".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryIngestRejected(MemoryIngestRejected {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            reason: "auto_extract provider — memory_store suppressed".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryIngestStatusUpdated(MemoryIngestStatusUpdated {
+            project: p(),
+            provider_ref: ProviderRef::new("cairn-default"),
+            document_id: DocumentId::new("mem_exh"),
+            status: "completed".to_owned(),
+            at_ms: ts,
+        }),
+        // RFC 030 finalize: family-mismatch audit events.
+        RuntimeEvent::KnowledgeProviderFamilyMismatch(KnowledgeProviderFamilyMismatch {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:mem0"),
+            observed_family: "memory_provider".to_owned(),
+            configured_slot: "knowledge_provider".to_owned(),
+            at_ms: ts,
+        }),
+        RuntimeEvent::MemoryProviderFamilyMismatch(MemoryProviderFamilyMismatch {
+            project: p(),
+            provider_ref: ProviderRef::new("plugin:bedrock-kb"),
+            observed_family: "knowledge_provider".to_owned(),
+            configured_slot: "memory_provider".to_owned(),
+            at_ms: ts,
+        }),
+        // RFC 031 PR-A: operator-defined agent role lifecycle.
+        RuntimeEvent::AgentRoleDefined(cairn_domain::AgentRoleDefined {
+            project: p(),
+            role: cairn_domain::agent_roles::AgentRole::new(
+                "pr-reviewer-exh",
+                "Exhaustiveness test role",
+                cairn_domain::agent_roles::AgentRoleTier::Standard,
+            ),
+            shadows_builtin: None,
+            defined_by: cairn_domain::OperatorId::new("op-exh"),
+            at_ms: ts,
+        }),
+        RuntimeEvent::AgentRoleRetracted(cairn_domain::AgentRoleRetracted {
+            project: p(),
+            role_id: "pr-reviewer-exh".to_owned(),
+            retracted_by: cairn_domain::OperatorId::new("op-exh"),
+            at_ms: ts,
+        }),
+        RuntimeEvent::ToolDeclaredButMissing(cairn_domain::ToolDeclaredButMissing {
+            project: p(),
+            run_id: cairn_domain::RunId::new("run_exh"),
+            role_id: "pr-reviewer-exh".to_owned(),
+            tool_id: "post_inline_commment".to_owned(),
+            at_ms: ts,
+        }),
     ]
 }
 
@@ -1652,14 +2236,14 @@ fn all_variants() -> Vec<RuntimeEvent> {
 #[test]
 fn all_runtime_event_variants_covered_count() {
     let variants = all_variants();
-    // 135 variants in the RuntimeEvent enum (130 baseline + RFC 020 Track 3:
-    // ToolInvocationCacheHit, ToolRecoveryPaused + RFC 020 decision-cache
-    // survival pair from PR #85: DecisionRecorded, DecisionCacheWarmup +
-    // RFC 020 Track 4: RecoverySummaryEmitted).
+    // 180 variants in the RuntimeEvent enum (176 prior +
+    // RunReasoningStepRecorded #789 = 177, + RFC 031 PR-A adds
+    // AgentRoleDefined / AgentRoleRetracted / ToolDeclaredButMissing
+    // = 180, + RFC 032 PR-2 adds CompletionContractResolved = 181).
     assert_eq!(
         variants.len(),
-        135,
-        "all_variants() must construct exactly 135 RuntimeEvent instances"
+        181,
+        "all_variants() must construct exactly 181 RuntimeEvent instances"
     );
 }
 

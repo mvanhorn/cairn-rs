@@ -27,6 +27,71 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # ── 1b. Projection stub guard (RFC-025 Phase 0) ───────────────────────────
+  # CI mirror of .githooks/pre-commit: reject PRs that add new log_stub()
+  # sites to pg/sqlite projection appliers. log_stub is a silent no-op —
+  # the event commits to the event log but no read-model table is
+  # written, producing silently-empty reads on persistent backends.
+  #
+  # Contributors who skip `./scripts/install-hooks.sh` locally still hit
+  # this gate before merge, so the Phase 0 invariant cannot be bypassed.
+  projection-stub-guard:
+    name: projection-stub-guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the merge-base commit to diff against on pull_request
+          # events. `fetch-depth: 0` grabs full history; the step below
+          # narrows to the diff window.
+          fetch-depth: 0
+      - name: no new log_stub() sites
+        env:
+          # GitHub Actions does NOT expose `github.event.before` as an
+          # automatic env var; we have to pipe it through explicitly.
+          # On pull_request events it's empty (the base ref comparison
+          # below handles that case).
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # Pick the diff range.
+          # - On pull_request events: diff against the PR base ref.
+          # - On push events: diff against `github.event.before` — the
+          #   previous tip of the branch *before* this push landed, so
+          #   multi-commit pushes still surface stubs in every commit
+          #   of the push window, not just the final one.
+          # Fall back to HEAD~1 only if `github.event.before` is empty
+          # AND the base ref is also empty (e.g. a first push to a new
+          # branch that the repo has never seen). That fallback is
+          # rare and intentionally narrow.
+          if [ -n "${GITHUB_BASE_REF:-}" ]; then
+            base="origin/${GITHUB_BASE_REF}"
+            git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}"
+          elif [ -n "${EVENT_BEFORE:-}" ] && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            base="${EVENT_BEFORE}"
+          else
+            base="HEAD~1"
+          fi
+          echo "diff range: ${base}...HEAD"
+          added_stubs=$(
+            git diff "${base}...HEAD" --unified=0 -- \
+              'crates/cairn-store/src/pg/projections.rs' \
+              'crates/cairn-store/src/sqlite/projections.rs' \
+              2>/dev/null \
+              | grep -E '^\+' \
+              | grep -v -E '^\+\+\+' \
+              | grep -c 'log_stub(' \
+              || true
+          )
+          if [ "${added_stubs:-0}" -gt 0 ]; then
+            echo "::error::RFC-025: ${added_stubs} new log_stub() site(s) added to pg/sqlite projections."
+            echo "log_stub is a silent no-op. Add a real projection OR declare the variant" >&2
+            echo "ProjectionStatus::Ephemeral in crates/cairn-store/src/projection_registry.rs." >&2
+            echo "See docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md" >&2
+            exit 1
+          fi
+          echo "✓ no new log_stub() sites"
+
   # ── 2. Check ─────────────────────────────────────────────────────────────────
   check:
     name: check
@@ -106,13 +171,28 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
           RUSTFLAGS: "-C debuginfo=0"
-      - name: integration tests (store + api + memory + tools + graph + agent + workspace + integrations)
+      - name: integration tests (api + memory + tools + graph + agent + workspace + integrations)
         # These crates ship integration tests under `tests/` that
         # `--workspace --lib` does not execute. All crates listed here
         # run in-process with no external services (no Postgres/Valkey/
         # network), so they belong in the plain `test` job rather than
-        # `fabric-integration`.
-        run: cargo test --tests -p cairn-store -p cairn-api -p cairn-memory -p cairn-tools -p cairn-graph -p cairn-agent -p cairn-workspace -p cairn-integrations
+        # `fabric-integration`. cairn-store runs in its own step below
+        # with `--features sqlite,postgres` so feature-gated tests
+        # actually execute.
+        run: cargo test --tests -p cairn-api -p cairn-memory -p cairn-tools -p cairn-graph -p cairn-agent -p cairn-workspace -p cairn-integrations
+        timeout-minutes: 15
+        env:
+          CARGO_BUILD_JOBS: "2"
+          RUSTFLAGS: "-C debuginfo=0"
+      - name: integration tests (cairn-store with sqlite + postgres features)
+        # cairn-store's backend-specific tests (FK ordering, prompt-schema
+        # hardening, migration contract) are behind `#[cfg(feature = ...)]`
+        # gates. Without the features enabled, copilot #282 flagged that
+        # none of those assertions execute in CI. SQLite tests run live
+        # against `SqliteAdapter::in_memory()`; Postgres tests are
+        # static-SQL assertions against embedded migrations and need no
+        # live database.
+        run: cargo test --tests -p cairn-store --features sqlite,postgres
         timeout-minutes: 15
         env:
           CARGO_BUILD_JOBS: "2"
@@ -126,7 +206,8 @@ jobs:
   fabric-integration:
     name: fabric-integration
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Job cap must exceed the sum of step timeouts below (15 + 18 + cache/overhead)
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -142,8 +223,34 @@ jobs:
             ${{ runner.os }}-cargo-fabric-
             ${{ runner.os }}-cargo-
       - name: cargo test --test integration (default — parallel)
-        run: cargo test -p cairn-fabric --test integration
-        timeout-minutes: 10
+        # `--features test-harness` required: PR-B (#583) split
+        # cairn-fabric's test targets so the live-Valkey `integration`
+        # binary only compiles when test-harness is enabled. The
+        # sibling `backend_agnostic` binary carries no required-features
+        # so it runs under every feature configuration.
+        run: cargo test -p cairn-fabric --test integration --features test-harness
+        timeout-minutes: 15
+      - name: cargo test --test backend_agnostic (PR-B proof point)
+        # The `backend_agnostic` binary asserts that cairn-fabric's
+        # public surface stays referenceable without the Valkey
+        # runtime — it imports only always-on symbols (FabricError,
+        # FabricConfig, Engine + ControlPlaneBackend traits, id_map,
+        # state_map, fcall ARGV builders, helpers). Runs here so a
+        # regression (e.g. a ferriskey type leaking into an always-on
+        # module signature) trips CI before merge.
+        run: cargo test -p cairn-fabric --test backend_agnostic
+        timeout-minutes: 5
+      - name: cargo test --test waitpoint_hmac_kid_reset_boot (#743 Part B)
+        # Standalone test binary deliberately separated from the
+        # parallel `--test integration` suite above: this test
+        # rotates FF's `waitpoint_hmac_secrets:{p:N}` partition state
+        # globally per-Valkey-instance, which would race with sibling
+        # tests that boot under a different kid. Cargo runs each
+        # `tests/<file>.rs` in its own process — that gives this test
+        # a dedicated Valkey container and natural isolation. See the
+        # module docstring for the full rationale.
+        run: cargo test -p cairn-fabric --test waitpoint_hmac_kid_reset_boot --features test-harness
+        timeout-minutes: 5
       # HTTP-lifecycle integration tests: launch the real cairn-app
       # binary per harness on an ephemeral port, drive via reqwest,
       # share the Valkey testcontainer. Same runtime constraints as
@@ -153,9 +260,85 @@ jobs:
       # so test_rfc011_colocation can assert partition placement.
       # Production/release builds MUST NOT enable this feature; see
       # SECURITY.md for the threat model.
+      #
+      # Timeout raised from 10 to 18 minutes — see #357. Observation on
+      # recent main runs: cargo finishes compiling + runs ~15 test
+      # binaries and gets SIGKILLed at exactly 10:00 while a final test
+      # binary is still mid-execution (test_rfc020_readiness on the
+      # 2026-04-28 main run). Tests themselves are healthy — it's raw
+      # compile + serial run time that spills past the cap.
+      #
+      # `RUSTFLAGS: "-C debuginfo=0"` matches the three sibling
+      # integration-test steps above in the `test` job. Without it,
+      # the ~16 cairn-app test binaries carry full debuginfo and
+      # push `target/` past the ~14 GB of runner free space that
+      # remains after this job's cached FF artifacts land — observed
+      # on the FF 0.11 → 0.13 bump (PR #598) where invalidating the
+      # lockfile-hashed cache forces a full FF recompile that leaves
+      # too little room for debuginfo-laden cairn-app test binaries
+      # to link. Matches the same hygiene the `test` job applies to
+      # its larger integration-test steps.
       - name: cargo test -p cairn-app --tests --features debug-endpoints
         run: cargo test -p cairn-app --tests --features debug-endpoints --
-        timeout-minutes: 10
+        timeout-minutes: 18
+        env:
+          CARGO_BUILD_JOBS: "2"
+          RUSTFLAGS: "-C debuginfo=0"
+
+  # ── 5b. Fabric integration — Postgres backend (testcontainers) ─────────────
+  # Parallel to `fabric-integration` above. Drives
+  # `crates/cairn-fabric/tests/postgres_control_plane_live.rs`: a live
+  # Postgres 16 testcontainer (spun up by `testcontainers-modules` inside
+  # the test binary — not a GitHub Actions service container, matching
+  # the Valkey pattern) exercises every bucket-A, bucket-B, and bucket-C
+  # method on `PostgresControlPlane`. Closes cairn-rs #346 + #347.
+  #
+  # Why a separate job:
+  # - Different feature flag (`fabric-postgres` vs. implicit Valkey)
+  #   produces a different cargo compilation unit graph; running it in
+  #   the same job as the Valkey suite would double the compile-time
+  #   ceiling on a single runner.
+  # - Separate cache key so feature-specific artifacts don't invalidate
+  #   the Valkey cache when only one side changes.
+  # - Scoped timeout matches the Valkey job's `timeout-minutes: 40`
+  #   overall cap + 15-minute per-step cap for the test binary itself.
+  fabric-integration-postgres:
+    name: fabric-integration-postgres
+    runs-on: ubuntu-latest
+    # Matches the Valkey sibling's cap; PG compile graph + testcontainer
+    # spin-up is similar in order of magnitude.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # Distinct cache key from the Valkey job — feature-gated deps
+          # (ff-backend-postgres, sqlx, testcontainers-modules/postgres)
+          # aren't in the Valkey compile unit, so sharing the `fabric`
+          # cache would serve stale artifacts on lockfile changes that
+          # only touch PG deps.
+          key: ${{ runner.os }}-cargo-fabric-pg-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fabric-pg-
+            ${{ runner.os }}-cargo-fabric-
+            ${{ runner.os }}-cargo-
+      - name: cargo test --test postgres_control_plane_live
+        # `--features fabric-postgres,test-harness` required:
+        # - `fabric-postgres` gates `PostgresControlPlane` +
+        #   `ff_backend_postgres::PostgresBackend::connect`.
+        # - `test-harness` gates `testcontainers-modules::postgres`
+        #   (never linked in production builds).
+        # Both are required-features on the `[[test]]` target, so a
+        # missing flag would skip the binary entirely — an explicit
+        # invocation keeps CI green/red semantics legible.
+        run: cargo test --tests -p cairn-fabric --features fabric-postgres,test-harness
+        timeout-minutes: 15
 
   # ── 6. UI Build + Type Check + Component Tests ──────────────────────────────
   ui:
@@ -178,3 +361,217 @@ jobs:
         run: npm run build
       - name: vitest
         run: npx vitest run
+
+  # ── 6b. UI E2E (Playwright) ─────────────────────────────────────────────────
+  # Runs the Playwright suite under `ui/e2e/` against a live cairn-app.
+  # Matters because RFC-026 PR-A0a's multi-operator fixtures +
+  # `admin-cross-tenant-isolation.spec.ts` prove the server-side
+  # `TenantAdminGuard` rejects cross-tenant requests — if this job doesn't
+  # run, a regression could silently collapse multi-tenant isolation and
+  # ship unnoticed.
+  #
+  # The managed `webServer` in `ui/playwright.config.ts` launches
+  # `./target/debug/cairn-app --port $BASE_PORT` in local mode + in-memory
+  # store; no Valkey / Postgres / HMAC sidecars required. BEDROCK_* env
+  # shims match the same config — they're placeholders the binary accepts
+  # without exercising the provider (no LLM calls in these specs).
+  ui-e2e:
+    name: ui-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      # FabricServices::start() is called unconditionally during AppState
+      # construction (see crates/cairn-app/src/state.rs#build_runtime_with_optional_fabric)
+      # even in local mode — the "optional" in the name describes the
+      # `Option<Arc<FabricServices>>` field, not a mode-conditional skip.
+      # Without a reachable Valkey, boot fatals with "valkey: timed out".
+      # Same service-container pattern as the smoke job.
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping || redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-ui-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ui-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Build cairn-app debug binary
+        # The managed Playwright webServer runs `./target/debug/cairn-app`.
+        # Building up-front means the per-test `webServer.timeout` (15 s)
+        # doesn't also have to cover an 8+ minute compile.
+        run: cargo build -p cairn-app --bin cairn-app
+        timeout-minutes: 15
+
+      - name: npm install
+        working-directory: ui
+        run: npm install
+
+      - name: Install Playwright Chromium
+        # Cache the browser install separately from node_modules so npm
+        # cache churn doesn't also invalidate browser downloads.
+        working-directory: ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright
+        working-directory: ui
+        # The Playwright webServer launches cairn-app with
+        # `--allow-missing-sandbox-primitives`, so these env vars flow
+        # through to the child process and satisfy FabricServices::start's
+        # boot contract. Secrets are per-run random (HMAC scoped to this
+        # CI cycle) so a leaked log never unlocks a later run.
+        env:
+          CAIRN_FABRIC_URL: valkey://127.0.0.1:6379
+          CAIRN_FABRIC_WAITPOINT_HMAC_KID: ci-ui-e2e
+          CAIRN_CREDENTIAL_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+        run: |
+          export CAIRN_FABRIC_WAITPOINT_HMAC_SECRET="$(openssl rand -hex 32)"
+          npx playwright test
+        timeout-minutes: 10
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: ui/playwright-report/
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ── 7. Smoke (release gatekeeper) ───────────────────────────────────────────
+  # The HTTP smoke suite at `scripts/smoke-test.sh` is CLAUDE.md's named
+  # "release gatekeeper" — 95 end-to-end checks against a running cairn-app.
+  # This job enforces the gate on every PR so a smoke regression blocks
+  # merge the same way a failing `cargo test` does.
+  #
+  # Architecture:
+  # - Valkey 8 runs as a GitHub Actions service container (NOT testcontainers;
+  #   the smoke gate drives the production `cairn-app` binary, not a test
+  #   binary, so it needs a sidecar rather than an in-process harness).
+  # - `cairn-app` is built in release mode + backgrounded on 127.0.0.1:3000.
+  # - `/health/ready` is polled until 200, then `scripts/smoke-test.sh`
+  #   runs with `CAIRN_TOKEN` + `CAIRN_URL` pointed at the live binary.
+  # - On failure, the backgrounded binary's stdout/stderr is uploaded as a
+  #   workflow artifact so operators can diagnose without re-running CI.
+  smoke:
+    name: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping || redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-smoke-
+            ${{ runner.os }}-cargo-
+
+      - name: Build cairn-app + smoke_worker (release)
+        # Release mode matches what `scripts/smoke-test.sh`'s claim-then-
+        # operate fixture expects — it auto-detects `target/release/smoke_worker`
+        # and falls back to `cargo run` only if neither release nor debug is
+        # built. Building both binaries up front keeps the launch step fast.
+        run: cargo build -p cairn-app --release --bin cairn-app --bin smoke_worker
+        timeout-minutes: 15
+
+      - name: Launch cairn-app
+        # Team mode exercises the full Fabric boot path (HMAC seed, FCALL
+        # registration, lease-history subscriber); local mode would short-
+        # circuit those and miss regressions the gatekeeper must catch.
+        # `--db memory` avoids needing a Postgres sidecar; the in-memory
+        # store is the same backing that Fabric's EventBridge writes to
+        # when running with the non-durable backend, so projection reads
+        # stay coherent for the full smoke surface.
+        run: |
+          set -euo pipefail
+          export CAIRN_ADMIN_TOKEN="dev-admin-token"
+          # META #461: team mode requires CAIRN_CREDENTIAL_KEY at boot. Smoke
+          # needs a real 32-byte key since the bootstrap path rejects unset in
+          # team mode. Use a per-run random hex key so ciphertexts in this
+          # smoke cycle can only be read by this cycle.
+          export CAIRN_CREDENTIAL_KEY="$(openssl rand -hex 32)"
+          export CAIRN_FABRIC_WAITPOINT_HMAC_SECRET="$(openssl rand -hex 32)"
+          export CAIRN_FABRIC_WAITPOINT_HMAC_KID="ci-smoke"
+          export CAIRN_FABRIC_URL="valkey://127.0.0.1:6379"
+          export RUST_LOG="warn"
+          nohup ./target/release/cairn-app \
+            --addr 127.0.0.1 --port 3000 \
+            --mode team --db memory \
+            --allow-missing-sandbox-primitives \
+            > /tmp/cairn-rs-smoke.log 2>&1 &
+          echo $! > /tmp/cairn-rs-smoke.pid
+          echo "cairn-app launched (pid=$(cat /tmp/cairn-rs-smoke.pid))"
+
+      - name: Wait for /health/ready
+        # 60s total — release build boots in <5s on GH runners; the buffer
+        # covers Fabric seed (FF_ROTATE_WAITPOINT_HMAC_SECRET RTT) plus
+        # projection warmup. Fail fast if the process died before ready
+        # rather than wait out the full timeout.
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            pid="$(cat /tmp/cairn-rs-smoke.pid 2>/dev/null || echo '')"
+            if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::cairn-app exited before /health/ready returned 200"
+              tail -n 120 /tmp/cairn-rs-smoke.log || true
+              exit 1
+            fi
+            code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/health/ready || echo 000)"
+            if [ "$code" = "200" ]; then
+              echo "ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::cairn-app did not reach /health/ready within 60s"
+          tail -n 120 /tmp/cairn-rs-smoke.log || true
+          exit 1
+
+      - name: Run smoke-test.sh
+        env:
+          CAIRN_TOKEN: dev-admin-token
+          CAIRN_URL: http://127.0.0.1:3000
+        run: ./scripts/smoke-test.sh
+
+      - name: Upload cairn-app log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cairn-app-smoke-log
+          path: /tmp/cairn-rs-smoke.log
+          if-no-files-found: warn

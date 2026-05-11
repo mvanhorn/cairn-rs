@@ -17,12 +17,14 @@ import {
 } from "lucide-react";
 import { clsx } from "clsx";
 import { Card } from "../components/Card";
-import { defaultApi, summariseCostItems } from "../lib/api";
+import { defaultApi, summariseCostItems, unwrapList } from "../lib/api";
 import { sectionLabel } from "../lib/design-system";
 import { EventLog } from "../components/EventLog";
 import { StatCard } from "../components/StatCard";
 import { MiniChart } from "../components/MiniChart";
 import type { RunRecord, RunState, TaskRecord } from "../lib/types";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 import { useScope } from "../hooks/useScope";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -139,6 +141,11 @@ function TaskRing({ tasks }: { tasks: TaskRecord[] }) {
 
 // ── Scope selector ────────────────────────────────────────────────────────────
 
+/**
+ * ScopeSelector — dropdown-based tenant/workspace override for this
+ * project dashboard. Matches the global TenantSelector UX (PR #279) —
+ * operators pick from discovered options instead of typing IDs.
+ */
 function ScopeSelector({
   tenantId, workspaceId,
   onTenantChange, onWorkspaceChange,
@@ -147,20 +154,51 @@ function ScopeSelector({
   onTenantChange: (v: string) => void;
   onWorkspaceChange: (v: string) => void;
 }) {
+  const tenantsQ = useQuery({
+    queryKey: ['proj-dashboard-tenants'],
+    queryFn:  () => defaultApi.listTenants(),
+    staleTime: 60_000,
+  });
+  const wsQ = useQuery({
+    queryKey: ['proj-dashboard-workspaces', tenantId],
+    queryFn:  () => defaultApi.getWorkspaces(tenantId),
+    enabled:  !!tenantId,
+    staleTime: 60_000,
+  });
+
+  const cls =
+    'h-6 w-32 bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 ' +
+    'rounded px-2 font-mono text-gray-700 dark:text-zinc-300 ' +
+    'focus:outline-none focus:border-indigo-500 transition-colors text-[11px] appearance-none';
+
   return (
     <div className="flex items-center gap-2 text-[11px]">
       <span className="text-gray-400 dark:text-zinc-600">Tenant:</span>
-      <input
+      <select
         value={tenantId}
-        onChange={e => onTenantChange(e.target.value || "default")}
-        className="h-6 w-24 bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded px-2 font-mono text-gray-700 dark:text-zinc-300 focus:outline-none focus:border-indigo-500 transition-colors text-[11px]"
-      />
+        onChange={(e) => onTenantChange(e.target.value)}
+        className={cls}
+      >
+        {!(tenantsQ.data ?? []).some((t) => t.tenant_id === tenantId) && (
+          <option value={tenantId}>{tenantId}</option>
+        )}
+        {(tenantsQ.data ?? []).map((t) => (
+          <option key={t.tenant_id} value={t.tenant_id}>{t.tenant_id}</option>
+        ))}
+      </select>
       <span className="text-gray-400 dark:text-zinc-600">Workspace:</span>
-      <input
+      <select
         value={workspaceId}
-        onChange={e => onWorkspaceChange(e.target.value || "default")}
-        className="h-6 w-24 bg-gray-100 dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 rounded px-2 font-mono text-gray-700 dark:text-zinc-300 focus:outline-none focus:border-indigo-500 transition-colors text-[11px]"
-      />
+        onChange={(e) => onWorkspaceChange(e.target.value)}
+        className={cls}
+      >
+        {!(wsQ.data ?? []).some((w) => w.workspace_id === workspaceId) && (
+          <option value={workspaceId}>{workspaceId}</option>
+        )}
+        {(wsQ.data ?? []).map((w) => (
+          <option key={w.workspace_id} value={w.workspace_id}>{w.workspace_id}</option>
+        ))}
+      </select>
     </div>
   );
 }
@@ -203,6 +241,13 @@ export function ProjectDashboardPage({ projectId }: ProjectDashboardPageProps) {
     refetchInterval: 15_000,
   });
 
+  // `/v1/costs` is tenant-scoped on the backend (SessionCostRecord has
+  // tenant_id but no project_id/workspace_id — see
+  // `SessionCostReadModel::list_by_tenant`). The handler derives the tenant
+  // from the authenticated bearer token (`TenantScope`), NOT from any query
+  // param. The UI's `tenantId` state is purely for runs/tasks/approvals
+  // scoping — it does not influence `/v1/costs`. Labels below call this out
+  // as "authenticated tenant" and "not project-scoped" (issue #144).
   const { data: costsList, isLoading: costsLoading } = useQuery({
     queryKey: ["proj-costs"],
     queryFn:  () => defaultApi.getCosts(),
@@ -210,12 +255,26 @@ export function ProjectDashboardPage({ projectId }: ProjectDashboardPageProps) {
   });
   // `/v1/costs` returns `{items, has_more}` — fold into the flat shape the
   // dashboard stat cards expect (issue #158).
-  const costs = summariseCostItems(costsList?.items ?? []);
+  // #425: unwrapList handles a future bare-array flip.
+  const costs = summariseCostItems(
+    unwrapList<import("../lib/types").SessionCostRecord>(costsList),
+  );
 
   const { data: recentEvents } = useQuery({
     queryKey: ["proj-events"],
     queryFn:  () => defaultApi.getRecentEvents(50),
     staleTime: 30_000,
+    retry: false,
+  });
+
+  // F29 CE — Project-scoped cost rollup (PR CD-2). Returns `null` on 404
+  // when the endpoint hasn't been deployed yet, which is how the UI
+  // degrades cleanly pre-CD-2 — the card simply doesn't render and the
+  // tenant-scoped stat cards above stay as the primary cost surface.
+  const { data: projectCostRollup } = useQuery({
+    queryKey: ["proj-costs-rollup", tenantId, workspaceId, projectId],
+    queryFn:  () => defaultApi.getProjectCosts(scope),
+    refetchInterval: 60_000,
     retry: false,
   });
 
@@ -273,6 +332,7 @@ export function ProjectDashboardPage({ projectId }: ProjectDashboardPageProps) {
               <p className="text-[12px] text-gray-400 dark:text-zinc-500 mt-1 font-mono">
                 {tenantId} / {workspaceId} / {projectId}
               </p>
+              <EntityExplainer className="mt-1">{ENTITY_EXPLAINERS.project}</EntityExplainer>
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <button
@@ -350,18 +410,50 @@ export function ProjectDashboardPage({ projectId }: ProjectDashboardPageProps) {
             loading={isLoading}
           />
           <StatCard
-            label="Total Spend"
+            label="Tenant Spend"
             value={fmtMicros(costs.total_cost_micros)}
-            description="server-wide (no project filter)"
+            description="authenticated tenant — not project-scoped"
             loading={costsLoading}
           />
           <StatCard
-            label="Provider Calls"
+            label="Tenant Provider Calls"
             value={costs.total_provider_calls.toLocaleString()}
-            description="server-wide"
+            description="authenticated tenant — not project-scoped"
             loading={costsLoading}
           />
         </div>
+
+        {/* F29 CE — Project-scoped cost rollup (lands with PR CD-2). Only
+            renders when the new endpoint returns data; pre-CD-2 the
+            tenant-scoped cards above stay as the authoritative surface. */}
+        {projectCostRollup && (
+          <div
+            className="grid grid-cols-2 gap-3 lg:grid-cols-4"
+            data-testid="project-cost-rollup"
+          >
+            <StatCard
+              label="Project Spend"
+              value={fmtMicros(projectCostRollup.total_cost_micros)}
+              description="project-scoped lifetime"
+              variant="info"
+            />
+            <StatCard
+              label="Project Provider Calls"
+              value={projectCostRollup.provider_calls.toLocaleString()}
+              description="project-scoped"
+            />
+            <StatCard
+              label="Project Tokens in"
+              value={projectCostRollup.total_tokens_in.toLocaleString()}
+              description="project-scoped"
+            />
+            <StatCard
+              label="Project Tokens out"
+              value={projectCostRollup.total_tokens_out.toLocaleString()}
+              description="project-scoped"
+            />
+          </div>
+        )}
 
         {/* Run trend + task breakdown */}
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -534,7 +626,7 @@ export function ProjectDashboardPage({ projectId }: ProjectDashboardPageProps) {
                 { icon: Layers,    label: "Runs",      value: allRuns.length,     sub: `${activeRuns.length} active`      },
                 { icon: ListChecks, label: "Tasks",    value: allTasks.length,    sub: `${activeTasks.length} active`     },
                 { icon: AlertTriangle, label: "Approvals", value: allApprovals.length, sub: "pending" },
-                { icon: Coins,     label: "Spend",     value: fmtMicros(costs.total_cost_micros), sub: "server-wide" },
+                { icon: Coins,     label: "Spend",     value: fmtMicros(costs.total_cost_micros), sub: "tenant-wide" },
                 { icon: Clock,     label: "Oldest run", value: allRuns.length > 0
                     ? fmtAge(Math.min(...allRuns.map(r => r.created_at)))
                     : "—",

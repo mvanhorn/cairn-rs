@@ -328,13 +328,55 @@ impl cairn_orchestrator::OrchestratorEventEmitter for SseOrchestratorEmitter {
         }));
     }
 
+    async fn on_breaker_tripped(
+        &self,
+        ctx: &cairn_orchestrator::OrchestrationContext,
+        trip: &cairn_domain::session_orchestration::CircuitBreakerTrip,
+    ) {
+        self.emit(serde_json::json!({
+            "event":        "breaker_tripped",
+            "run_id":       ctx.run_id,
+            "iteration":    trip.at_iteration,
+            "which":        trip.which,
+            "measured":     trip.measured,
+            "limit":        trip.limit,
+        }));
+    }
+
+    async fn on_budget_threshold_crossed(
+        &self,
+        ctx: &cairn_orchestrator::OrchestrationContext,
+        which: cairn_domain::session_orchestration::BreakerKind,
+        measured: u64,
+        limit: u64,
+        ratio_bps: u32,
+    ) {
+        self.emit(serde_json::json!({
+            "event":        "budget_threshold_crossed",
+            "run_id":       ctx.run_id,
+            "iteration":    ctx.iteration,
+            "which":        which,
+            "measured":     measured,
+            "limit":        limit,
+            "ratio_bps":    ratio_bps,
+        }));
+    }
+
     async fn on_finished(
         &self,
         ctx: &cairn_orchestrator::OrchestrationContext,
         termination: &cairn_orchestrator::LoopTermination,
     ) {
+        // F47 PR1: capture the verification sidecar for the SSE payload.
+        // Only Completed runs carry one; other terminations serialise
+        // without the field (via serde skip_serializing_if).
+        let mut verification: Option<&cairn_domain::CompletionVerification> = None;
         let (term_str, detail) = match termination {
-            cairn_orchestrator::LoopTermination::Completed { summary } => {
+            cairn_orchestrator::LoopTermination::Completed {
+                summary,
+                verification: v,
+            } => {
+                verification = Some(v);
                 ("completed", Some(summary.as_str()))
             }
             cairn_orchestrator::LoopTermination::Failed { reason } => {
@@ -351,13 +393,60 @@ impl cairn_orchestrator::OrchestratorEventEmitter for SseOrchestratorEmitter {
                 ("waiting_subagent", None)
             }
             cairn_orchestrator::LoopTermination::PlanProposed { .. } => ("plan_proposed", None),
+            // F65 PR-3: breaker-trip terminations carry a structured
+            // payload on the domain side (`RuntimeEvent::CircuitBreakerTripped`);
+            // the SSE `orchestrate_finished` frame surfaces only the
+            // coarse termination string so dashboards can render a
+            // distinct badge. `detail` is `None` so it serialises as
+            // `"detail": null` on the wire (matching non-completed
+            // terminations such as `max_iterations_reached` /
+            // `timed_out`); dashboards that need the structured trip
+            // payload should consume the dedicated `breaker_tripped`
+            // SSE event emitted a few frames earlier via
+            // `on_breaker_tripped`.
+            cairn_orchestrator::LoopTermination::BreakerTripped { .. } => ("breaker_tripped", None),
         };
-        self.emit(serde_json::json!({
+        // `detail` serialises as `null` when the termination carries
+        // no human-readable summary (e.g. `max_iterations_reached`,
+        // `timed_out`, `breaker_tripped`) and as a string otherwise
+        // (completed-with-summary, failed-with-reason, etc.). The
+        // `completion_verification` field below uses a conditional
+        // insert so it stays ABSENT (not null) for non-Completed
+        // terminations — matching the `skip_serializing_if` contract
+        // on `OrchestratorEvent::Finished`.
+        let mut payload = serde_json::json!({
             "event":       "orchestrate_finished",
             "run_id":      ctx.run_id,
             "termination": term_str,
             "detail":      detail,
-        }));
+        });
+        if let Some(v) = verification {
+            if let Some(obj) = payload.as_object_mut() {
+                // Copilot review on #312: don't silently fall back to
+                // `null` on a serialisation failure — emitting
+                // `completion_verification: null` would contradict the
+                // "field absent" wire contract for non-Completed frames
+                // and could mask a real bug. `CompletionVerification`
+                // has no non-serialisable fields (all `String` / `Vec` /
+                // `usize` / `u32` / `Option<i32>`), so this path is
+                // unreachable in practice; log-and-skip if it ever
+                // fires rather than corrupting the wire shape.
+                match serde_json::to_value(v) {
+                    Ok(value) => {
+                        obj.insert("completion_verification".to_owned(), value);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            run_id = %ctx.run_id,
+                            error = %e,
+                            "failed to serialise completion_verification — \
+                             omitting from SSE frame rather than emitting null"
+                        );
+                    }
+                }
+            }
+        }
+        self.emit(payload);
     }
 }
 
@@ -386,10 +475,18 @@ mod sse_orchestrator_tests {
             agent_type: "orchestrator".to_owned(),
             run_started_at_ms: 0,
             working_dir: PathBuf::from("."),
+            completion_contract: None,
             run_mode: cairn_domain::decisions::RunMode::Direct,
             discovered_tool_names: vec![],
             step_history: vec![],
             is_recovery: false,
+            approval_timeout: None,
+            visibility: None,
+            parent_context: None,
+            declared_but_missing:
+                cairn_orchestrator::OrchestrationContext::empty_declared_but_missing(),
+            agent_role_list_cache:
+                cairn_orchestrator::OrchestrationContext::empty_agent_role_list_cache(),
         }
     }
 
@@ -449,6 +546,7 @@ mod sse_orchestrator_tests {
                 &ctx(),
                 &LoopTermination::Completed {
                     summary: "all done".to_owned(),
+                    verification: Default::default(),
                 },
             )
             .await;

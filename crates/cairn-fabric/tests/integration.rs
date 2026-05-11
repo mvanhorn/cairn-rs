@@ -4,7 +4,7 @@
 // (one container per `cargo test` invocation, shared across every test in
 // the binary through a `tokio::sync::OnceCell`). `FabricServices::start`
 // runs against the container's host:port, and FF's Lua library is loaded
-// on first boot via `ff_script::loader::ensure_library`.
+// on first boot via `flowfabric::script::loader::ensure_library`.
 //
 // **Parallel-safe key isolation.** There is NO `FLUSHDB` between tests.
 // Running `FLUSHDB` on a shared container concurrently is destructive —
@@ -32,10 +32,12 @@ mod integration {
     pub mod test_control_plane;
     pub mod test_engine;
     pub mod test_event_emission;
+    pub mod test_handle_codec_compat;
     pub mod test_heartbeat;
     pub mod test_instance_tag_filter;
     pub mod test_lease_history_subscriber;
     pub mod test_orchestrator_stream;
+    pub mod test_reclaim_grant;
     pub mod test_run_lifecycle;
     pub mod test_scanner_filter_perf;
     pub mod test_scanner_filter_upstream;
@@ -86,16 +88,13 @@ impl TestHarness {
         let lane_id = cairn_fabric::id_map::project_to_lane(&project);
 
         let config = FabricConfig {
-            valkey_host: host,
-            valkey_port: port,
-            tls: false,
-            cluster: false,
+            backend: flowfabric::core::backend::BackendConfig::valkey(host, port),
             lane_id,
-            worker_id: ff_core::types::WorkerId::new("test-worker"),
-            worker_instance_id: ff_core::types::WorkerInstanceId::new(
+            worker_id: flowfabric::core::types::WorkerId::new("test-worker"),
+            worker_instance_id: flowfabric::core::types::WorkerInstanceId::new(
                 uuid::Uuid::new_v4().to_string(),
             ),
-            namespace: ff_core::types::Namespace::new("test"),
+            namespace: flowfabric::core::types::Namespace::new("test"),
             lease_ttl_ms: 30_000,
             grant_ttl_ms: 5_000,
             max_concurrent_tasks: 4,
@@ -132,6 +131,8 @@ impl TestHarness {
                 "00000000000000000000000000000000000000000000000000000000000000aa".into(),
             ),
             waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+            waitpoint_hmac_bootstrap_kid_reset: false,
+            backend_kind: cairn_fabric::config::BackendKind::Valkey,
         };
 
         let event_log = Arc::new(InMemoryStore::default());
@@ -154,8 +155,26 @@ impl TestHarness {
     /// etc., so every ExecutionId minted inside a test lands in the same
     /// partition scheme the runtime enforces (see id_map.rs's
     /// partition-count stability contract).
-    pub fn partition_config(&self) -> &ff_core::partition::PartitionConfig {
-        &self.fabric.runtime.partition_config
+    pub fn partition_config(&self) -> &flowfabric::core::partition::PartitionConfig {
+        // PR-C4c: `FabricServices::runtime` is now the trait object
+        // `Arc<dyn FabricRuntimeHandle>`; expose the partition
+        // config via the trait accessor. Works on both Valkey and
+        // Postgres backends.
+        self.fabric.runtime.partition_config()
+    }
+
+    /// Borrow the concrete Valkey runtime. Convenience accessor for
+    /// tests that need Valkey-specific primitives (`ferriskey::Client`,
+    /// `FabricConfig` struct fields). Panics if the fabric is on a
+    /// non-Valkey backend — `TestHarness` is Valkey-only by
+    /// construction, so this is a load-bearing invariant rather than a
+    /// surprise. PR-C4c introduced the accessor when the aggregate
+    /// stopped carrying `Arc<FabricRuntime>` directly.
+    pub fn valkey_runtime(&self) -> &std::sync::Arc<cairn_fabric::FabricRuntime> {
+        self.fabric
+            .valkey_runtime
+            .as_ref()
+            .expect("TestHarness is Valkey-only; valkey_runtime must be Some")
     }
 
     pub fn unique_run_id(&self) -> RunId {

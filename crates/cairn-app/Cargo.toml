@@ -62,7 +62,7 @@ metrics-otel = ["dep:opentelemetry-proto", "dep:prost"]
 #
 # Default: OFF. CI integration tests build with this feature; release
 # artefacts do not. See SECURITY.md for the full threat-model summary.
-debug-endpoints = ["dep:ff-core"]
+debug-endpoints = ["dep:flowfabric"]
 
 [dependencies]
 cairn-api = { path = "../cairn-api" }
@@ -78,7 +78,9 @@ cairn-store = { path = "../cairn-store", features = ["postgres", "sqlite"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite"], optional = false }
 cairn-domain = { path = "../cairn-domain" }
 cairn-tools = { path = "../cairn-tools" }
+cairn-plugin-proto = { path = "../cairn-plugin-proto" }
 cairn-harness-tools = { path = "../cairn-harness-tools" }
+cairn-skills = { path = "../cairn-skills" }
 cairn-github = { path = "../cairn-github" }
 cairn-integrations = { path = "../cairn-integrations" }
 axum = { version = "0.7", features = ["ws"] }
@@ -109,8 +111,14 @@ chrono = { version = "0.4", features = ["serde", "clock"], default-features = fa
 dotenvy = "0.15"
 aes-gcm = "0.10"
 sha2 = "0.10"
+# Percent-encoding is used by the deprecated /v1/tool-call-approvals/*
+# redirect handlers (F45) to safely embed the :call_id in the Location
+# header of the 308 response. Dev-dep entry below is kept for the
+# existing test-only use of source_id encoding.
+percent-encoding = "2"
 
-# metrics-otel: OTLP HTTP/protobuf transport. `opentelemetry-proto`
+# metrics-otel: OTLP HTTP/protobuf transport.
+# Placeholder comment preserved for next-block semantic continuity. `opentelemetry-proto`
 # gives us the generated prost structs (ExportTraceServiceRequest +
 # transitive span types); `prost` supplies the encode/decode traits.
 # Both optional — only compiled when `metrics-otel` is enabled.
@@ -118,13 +126,36 @@ opentelemetry-proto = { version = "0.31", features = ["gen-tonic-messages", "tra
 prost = { version = "0.14", optional = true }
 # Optional: only compiled when `debug-endpoints` feature is enabled.
 # Used by the RFC-011 debug endpoint to compute partition placement.
-# Must track cairn-fabric's ff-core version so debug.rs's types match
+# Must track cairn-fabric's flowfabric version so debug.rs's types match
 # FabricServices.runtime.partition_config.
-ff-core = { version = "0.3", optional = true }
+flowfabric = { version = "0.15", optional = true }
+
+# F65 PR-4 sandboxed-agent mode: thin helpers for the confined child binary
+# path. Only pulled in on Linux — non-Linux builds of cairn-app cannot enter
+# sandboxed-agent mode (the confinement primitives don't exist).
+[target.'cfg(target_os = "linux")'.dependencies]
+# nix features required by `bin_sandboxed_agent`:
+#   socket — recv/send on the tool-bridge fd
+#   mount  — probe_mount (compound EPERM check)
+#   fs     — fstat (probe_inherited_fd close_range assertion)
+#   process — getpid (probe_getpid seccomp allow assertion)
+#   ptrace — probe_ptrace_me (the seccomp-specific canary; PTRACE_TRACEME
+#            normally succeeds for any UID so a returned EPERM comes
+#            uniquely from the seccomp deny list)
+# cairn-workspace already asks for all of these through cargo feature
+# unification, but declaring them here too keeps the build honest if
+# someone drops that dependency.
+nix = { version = "0.29", features = ["socket", "mount", "fs", "process", "ptrace"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util"] }
 http-body-util = "0.1"
+command-fds = "0.3"
+# Opt in to the F30 test-hook module so
+# `tests/test_f30_orchestrator_termination.rs` can reach the crate-
+# private prompt builders without those symbols leaking into the
+# production `cairn-app` binary build.
+cairn-orchestrator = { path = "../cairn-orchestrator", features = ["test-hooks"] }
 # Chaos test only: `libc::kill` to deliver SIGSTOP/SIGCONT to the live
 # cairn-app subprocess without pulling `nix`. std's `Child::kill` only
 # sends SIGKILL; a raw libc FFI call is the minimal portable shim for
@@ -134,7 +165,22 @@ libc = "0.2"
 # tests under `tests/integration/` can point the spawned cairn-app
 # subprocess at a shared live Valkey.
 cairn-fabric = { path = "../cairn-fabric", features = ["test-harness"] }
+# `test_666_rapid_auto_resume_keeper.rs` builds a `FabricConfig` via
+# struct literal against the shared Valkey testcontainer, which
+# requires `flowfabric::core::backend::BackendConfig::valkey(...)` +
+# the typed `WorkerId`/`WorkerInstanceId`/`Namespace`/`LaneId`
+# constructors. Version pin must match cairn-fabric's flowfabric
+# version or the re-exported types from `cairn_fabric::engine::*`
+# won't line up with locally-constructed equivalents.
+flowfabric = { version = "0.15", default-features = false, features = ["valkey"] }
 uuid = { version = "1", features = ["v4", "v7"] }
 # Full-binary HTTP driver for LiveHarness — tests launch the real
 # `cairn-app` binary on an ephemeral port and drive it via reqwest.
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# `stream` is required by the F47 integration test to consume SSE frames
+# incrementally (the `/v1/streams/runtime` endpoint never EOFs).
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+# Robust percent-encoding for source_id (and future IDs that may contain
+# spaces, hashes, etc.) in path segments. Mirrors encodeURIComponent on
+# the UI side so tests stay honest against arbitrary operator input.
+percent-encoding = "2"
+tempfile = "3"

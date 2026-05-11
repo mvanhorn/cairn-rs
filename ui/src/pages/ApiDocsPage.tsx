@@ -89,6 +89,7 @@ const DOMAINS: DomainGroup[] = [
         pathParams: [{ name: "id", type: "string", description: "Session ID", example: "sess_..." }],
         responseDesc: '{ version, type: "session_export", exported_at, data: { session, runs, tasks, events } }',
       },
+      { id: "list-session-runs", method: "GET", path: "/v1/sessions/:id/runs", description: "List runs that belong to a session, most recent first.", pathParams: [{ name: "id", type: "string", description: "Session ID (percent-encode if it contains reserved chars)", example: "sess_..." }], queryParams: [{ name: "limit", type: "number", description: "Max results", example: "100" }, { name: "offset", type: "number", description: "Pagination offset", example: "0" }], responseDesc: "Array of RunRecord" },
     ],
   },
   {
@@ -110,6 +111,36 @@ const DOMAINS: DomainGroup[] = [
       { id: "export-run",    method: "GET",  path: "/v1/runs/:id/export",       description: "Export run + tasks + events as a JSON bundle.", pathParams: [{ name: "id", type: "string", description: "Run ID", example: "run_..." }], responseDesc: '{ version, type: "run_export", data: { run, tasks, events } }' },
       { id: "pause-run",     method: "POST", path: "/v1/runs/:id/pause",        description: "Pause a running run.", pathParams: [{ name: "id", type: "string", description: "Run ID", example: "run_..." }], bodyExample: '{ "detail": "Manual pause" }', responseDesc: "Updated RunRecord" },
       { id: "resume-run",    method: "POST", path: "/v1/runs/:id/resume",       description: "Resume a paused run.", pathParams: [{ name: "id", type: "string", description: "Run ID", example: "run_..." }], bodyExample: '{}', responseDesc: "Updated RunRecord" },
+      { id: "orchestrate-run", method: "POST", path: "/v1/runs/:id/orchestrate", description: "Kick the GATHER→DECIDE→EXECUTE orchestrator loop. Cairn owns model selection — the control plane picks from the tenant's configured provider bindings and walks the cross-binding × per-binding fallback chain on retryable errors.", pathParams: [{ name: "id", type: "string", description: "Run ID (percent-encode if it contains reserved chars)", example: "run_..." }], bodyFields: [{ name: "goal", type: "string", description: "Optional run goal override" }, { name: "max_iterations", type: "number", description: "Optional iteration cap" }, { name: "timeout_ms", type: "number", description: "Optional timeout in ms" }, { name: "mode", type: "string", description: "Optional execution mode (RFC 018)" }, { name: "approval_timeout_ms", type: "number", description: "Optional per-tool-call approval wait budget in ms (default: 24h)" }], bodyExample: '{}', responseDesc: "LoopTermination payload (200 OK on terminal outcome, 202 Accepted on waiting_approval/waiting_subagent)" },
+      { id: "diagnose-run",  method: "POST", path: "/v1/runs/:id/diagnose",     description: "Trigger a diagnose pass on a stuck run.", pathParams: [{ name: "id", type: "string", description: "Run ID (percent-encode if it contains reserved chars)", example: "run_..." }], bodyExample: '{}', responseDesc: "Diagnosis summary" },
+      { id: "intervene-run", method: "POST", path: "/v1/runs/:id/intervene",    description: "Operator intervention on a run: force-complete, force-fail, force-restart, or inject a message.", pathParams: [{ name: "id", type: "string", description: "Run ID (percent-encode if it contains reserved chars)", example: "run_..." }], bodyFields: [{ name: "action", type: "string", required: true, description: "force_complete | force_fail | force_restart | inject_message" }, { name: "reason", type: "string", required: true, description: "Operator-supplied justification (audit)" }, { name: "message_body", type: "string", description: "Required when action=inject_message" }], bodyExample: '{ "action": "inject_message", "reason": "prefer other provider", "message_body": "switch to anthropic" }', responseDesc: 'RunInterventionResponse (camelCase) — { ok, run?, messageId? }' },
+      { id: "spawn-subagent", method: "POST", path: "/v1/runs/:id/spawn",       description: "Spawn a subagent run beneath a parent run.", pathParams: [{ name: "id", type: "string", description: "Parent run ID (percent-encode if it contains reserved chars)", example: "run_..." }], bodyFields: [{ name: "session_id", type: "string", required: true, description: "Child session (must belong to the parent's project)" }, { name: "child_run_id", type: "string", description: "Override auto-generated child run ID" }, { name: "child_task_id", type: "string", description: "Override auto-generated child task ID" }], bodyExample: '{ "session_id": "sess_..." }', responseDesc: "201 Created · SpawnSubagentRunResponse — { parent_run_id, child_run_id }" },
+      { id: "list-children", method: "GET",  path: "/v1/runs/:id/children",     description: "List direct child runs spawned from this run.", pathParams: [{ name: "id", type: "string", description: "Parent run ID (percent-encode if it contains reserved chars)", example: "run_..." }], responseDesc: "ListResponse — { items: RunRecord[], has_more }" },
+      { id: "replay-run",    method: "GET",  path: "/v1/runs/:id/replay",       description: "Replay a run's event log for deterministic playback / debugging.", pathParams: [{ name: "id", type: "string", description: "Run ID (percent-encode if it contains reserved chars)", example: "run_..." }], responseDesc: "Ordered replay event stream" },
+      { id: "replay-to-ckpt",method: "POST", path: "/v1/runs/:id/replay-to-checkpoint", description: "Replay a run's events up to a specific checkpoint position. Takes checkpoint_id as a query parameter (no body).", pathParams: [{ name: "id", type: "string", description: "Run ID (percent-encode if it contains reserved chars)", example: "run_..." }], queryParams: [{ name: "checkpoint_id", type: "string", required: true, description: "Checkpoint to replay up to", example: "ckpt_..." }], responseDesc: "Same replay result shape as GET /v1/runs/:id/replay" },
+    ],
+  },
+  {
+    id: "workers", label: "Workers & Fleet", dot: "bg-cyan-500",
+    endpoints: [
+      { id: "list-workers",  method: "GET", path: "/v1/workers",      description: "List all registered workers with current status and lease info.", queryParams: [{ name: "limit", type: "number", description: "Max results", example: "100" }, { name: "offset", type: "number", description: "Pagination offset", example: "0" }], responseDesc: "ListResponse — { items: WorkerRecord[], has_more }" },
+      { id: "get-worker",    method: "GET", path: "/v1/workers/:id",  description: "Fetch a single worker by ID.", pathParams: [{ name: "id", type: "string", description: "Worker ID (percent-encode if it contains reserved chars)", example: "worker_..." }], responseDesc: "WorkerRecord" },
+      { id: "get-fleet",     method: "GET", path: "/v1/fleet",        description: "Fleet-wide operator view: aggregated worker health, load, and lease state.", responseDesc: "FleetReport" },
+    ],
+  },
+  {
+    id: "repos", label: "Repos", dot: "bg-fuchsia-500",
+    endpoints: [
+      { id: "list-repos",    method: "GET",    path: "/v1/projects/:project/repos", description: "List allowlisted repos for a project.", pathParams: [{ name: "project", type: "string", description: "Project key — a single path segment; must be URL-encoded if it contains `/` (e.g. tenant/workspace/project composites)", example: "default" }], responseDesc: '{ project, repos: RepoAllowlistEntry[] }' },
+      { id: "add-repo",      method: "POST",   path: "/v1/projects/:project/repos", description: "Add a repo to the project allowlist.", pathParams: [{ name: "project", type: "string", description: "Project key — URL-encode if it contains reserved chars", example: "default" }], bodyExample: '{ "owner": "avifenesh", "repo": "cairn" }', responseDesc: "RepoAllowlistEntry" },
+      { id: "get-repo",      method: "GET",    path: "/v1/projects/:project/repos/:owner/:repo", description: "Get a single repo allowlist entry.", pathParams: [{ name: "project", type: "string", description: "Project key — URL-encode if it contains reserved chars", example: "default" }, { name: "owner", type: "string", description: "Repo owner", example: "avifenesh" }, { name: "repo", type: "string", description: "Repo name", example: "cairn" }], responseDesc: "RepoAllowlistEntry" },
+      { id: "remove-repo",   method: "DELETE", path: "/v1/projects/:project/repos/:owner/:repo", description: "Remove a repo from the project allowlist.", pathParams: [{ name: "project", type: "string", description: "Project key — URL-encode if it contains reserved chars", example: "default" }, { name: "owner", type: "string", description: "Repo owner", example: "avifenesh" }, { name: "repo", type: "string", description: "Repo name", example: "cairn" }], responseDesc: "204 No Content" },
+    ],
+  },
+  {
+    id: "skills", label: "Skills", dot: "bg-lime-500",
+    endpoints: [
+      { id: "list-skills", method: "GET", path: "/v1/skills", description: "List skills available in the catalog.", responseDesc: '{ items: SkillRecord[], summary: { total, enabled, disabled }, currentlyActive: string[], currently_active: string[] }' },
     ],
   },
   {
@@ -148,6 +179,7 @@ const DOMAINS: DomainGroup[] = [
       { id: "get-costs",     method: "GET", path: "/v1/costs",     description: "Aggregate token and cost totals.", responseDesc: "CostSummary" },
       { id: "get-dashboard", method: "GET", path: "/v1/dashboard", description: "Operator overview: runs, tasks, approvals, cost, health.", responseDesc: "DashboardOverview" },
       { id: "get-stats",     method: "GET", path: "/v1/stats",     description: "Real-time system-wide counters.", responseDesc: "SystemStats — { total_events, active_runs, pending_approvals, uptime_seconds }" },
+      { id: "metrics-prom",  method: "GET", path: "/v1/metrics/prometheus", description: "Prometheus-format metrics scrape endpoint. Exposes direct quantile gauges (p50/p95/p99) for latency — not histogram buckets.", responseDesc: "text/plain (Prometheus exposition format)" },
     ],
   },
   {
@@ -571,8 +603,24 @@ function EndpointRow({ ep }: { ep: Endpoint }) {
       "rounded-lg border transition-colors",
       expanded ? "border-gray-200 dark:border-zinc-700 bg-gray-50/60 dark:bg-zinc-900/60" : "border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-900 hover:border-gray-200 dark:border-zinc-700",
     )}>
-      <button onClick={() => setExpanded(v => !v)}
-        className="w-full flex items-center gap-3 px-4 py-3 text-left group">
+      {/* Outer row is a `div role="button"` (not `<button>`) so the nested
+          CopyButton `<button>` remains valid HTML — React/Vite warns on
+          `<button>` inside `<button>`. */}
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onClick={() => setExpanded(v => !v)}
+        onKeyDown={e => {
+          // Only toggle on direct keyboard interaction with the row itself;
+          // ignore Enter/Space bubbling up from the nested CopyButton etc.
+          if (e.target !== e.currentTarget) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setExpanded(v => !v);
+          }
+        }}
+        className="w-full flex items-center gap-3 px-4 py-3 text-left group cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:ring-offset-1 focus-visible:ring-offset-transparent rounded-lg">
         <MethodBadge method={ep.method} />
         <code className="flex-1 text-[13px] font-mono text-gray-800 dark:text-zinc-200 truncate">{ep.path}</code>
         {ep.sse && <span className="text-[10px] font-medium text-sky-400 bg-sky-950/60 border border-sky-800/40 rounded px-1.5 py-0.5 shrink-0">SSE</span>}
@@ -584,7 +632,7 @@ function EndpointRow({ ep }: { ep: Endpoint }) {
         />
         <span className="text-[12px] text-gray-400 dark:text-zinc-500 truncate max-w-xs hidden md:block">{ep.description}</span>
         {expanded ? <ChevronDown size={13} className="text-gray-400 dark:text-zinc-500 shrink-0" /> : <ChevronRight size={13} className="text-gray-400 dark:text-zinc-600 shrink-0" />}
-      </button>
+      </div>
 
       {expanded && (
         <div className="px-4 pb-4 space-y-4 border-t border-gray-200 dark:border-zinc-800">

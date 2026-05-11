@@ -5,28 +5,16 @@ use cairn_store::error::StoreError;
 use cairn_store::projections::{
     ApprovalRecord, RunRecord, SessionRecord, TaskRecord, ToolInvocationRecord,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::http::ListResponse;
 
 /// Query parameters for list endpoints.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ListQuery {
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
-    pub status: Option<String>,
-    pub category: Option<String>,
-}
-
-impl ListQuery {
-    pub fn effective_limit(&self) -> usize {
-        self.limit.unwrap_or(50).min(200)
-    }
-
-    pub fn effective_offset(&self) -> usize {
-        self.offset.unwrap_or(0)
-    }
-}
+///
+/// Moved to `cairn-api-contracts` in #440 so downstream implementor
+/// crates (cairn-memory, cairn-feed, …) can consume it without
+/// inverting the layer ordering. Re-exported here at the historical
+/// module path for callers that still resolve `cairn_api::endpoints::ListQuery`.
+pub use cairn_api_contracts::endpoints::ListQuery;
 
 /// Handler boundary for runtime read endpoints.
 ///

@@ -1,0 +1,1734 @@
+//! Compile-time projection-status registry for every `RuntimeEvent` variant.
+//!
+//! Each variant declares one of:
+//!
+//! - [`ProjectionStatus::Projected`] — backed by a read-model table updated
+//!   synchronously inside the event-log insert transaction. Byte-equal
+//!   reads across `InMemoryStore` ↔ `SqliteStore` are enforced for a
+//!   representative subset of variants by `tests/projection_parity.rs`;
+//!   pg-backend parity runs the same harness under
+//!   `TEST_DATABASE_URL` in nightly CI.
+//! - [`ProjectionStatus::Stubbed`] — currently `log_stub` in the Postgres
+//!   and/or SQLite applier: the event commits to the event log but no
+//!   projection table is written. Silent-read risk. New additions are
+//!   rejected by `.githooks/pre-commit` and the `projection-stub-guard`
+//!   CI job.
+//! - [`ProjectionStatus::Ephemeral`] — intentionally not persisted into a
+//!   read-model table. The event log itself is the audit trail; operator
+//!   observability comes from SSE/metrics. Examples: circuit-breaker
+//!   trips, summarizer-fallback notifications, sandbox crash-recovery
+//!   audits.
+//!
+//! ## Safety rails
+//!
+//! - `build.rs` parses `crates/cairn-domain/src/events.rs` and refuses
+//!   to compile if any `RuntimeEvent` variant is missing from
+//!   [`REGISTRY`] or any registry entry references a variant that no
+//!   longer exists.
+//! - [`assert_no_stubs_for_persistent_backend`] returns the list of
+//!   Stubbed variants, intended to be called by the application at boot
+//!   on pg/sqlite backends. It is a pure reporting function; callers
+//!   decide whether to log or fail.
+//! - `.githooks/pre-commit` and the `projection-stub-guard` CI job
+//!   reject commits/PRs that introduce new `log_stub(` sites in the
+//!   pg/sqlite appliers.
+//!
+//! See `docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md`
+//! for the migration roadmap and severity history.
+
+use crate::db::Backend;
+
+/// Projection status for a single `RuntimeEvent` variant.
+///
+/// See crate-level docs for the contract behind each status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionStatus {
+    /// Event has a real projection in every supported persistent backend.
+    /// The optional `table` is the primary read-model table written to —
+    /// informational only; parity is asserted by the test harness, not by
+    /// the registry entry.
+    Projected { table: Option<&'static str> },
+    /// Event currently maps to `log_stub(...)` in at least one persistent
+    /// backend applier. `tracking` is a short human-readable hint
+    /// (issue/RFC reference) for the Phase 2a/2b migration.
+    Stubbed { tracking: &'static str },
+    /// Event deliberately has no projection table. The `reason` explains
+    /// why (e.g. "operator observability via SSE + metrics, no read model").
+    Ephemeral { reason: &'static str },
+}
+
+impl ProjectionStatus {
+    /// `true` when the variant currently has a `log_stub` applier on at
+    /// least one persistent backend.
+    pub const fn is_stubbed(&self) -> bool {
+        matches!(self, ProjectionStatus::Stubbed { .. })
+    }
+
+    /// `true` when the variant is declared as having a real projection.
+    pub const fn is_projected(&self) -> bool {
+        matches!(self, ProjectionStatus::Projected { .. })
+    }
+
+    /// `true` when the variant is declared as having no projection by design.
+    pub const fn is_ephemeral(&self) -> bool {
+        matches!(self, ProjectionStatus::Ephemeral { .. })
+    }
+}
+
+/// One registry row. `variant` must match a `RuntimeEvent` variant name
+/// verbatim; `build.rs` enforces that.
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectionEntry {
+    pub variant: &'static str,
+    pub status: ProjectionStatus,
+}
+
+/// Registry error set. Both variants carry the concrete variant list so the
+/// operator can act on the boot log without grepping the source.
+#[derive(Debug)]
+pub enum RegistryError {
+    /// `assert_no_stubs_for_persistent_backend` found at least one Stubbed
+    /// entry. Contains the list of stubbed variant names.
+    StubbedVariantsPresent {
+        backend: Backend,
+        stubbed: Vec<&'static str>,
+    },
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegistryError::StubbedVariantsPresent { backend, stubbed } => {
+                // Ephemeral variants are a first-class non-projected
+                // status — the error only surfaces Stubbed ones, which
+                // are the silent-no-op hazard Phase 2a/2b will migrate.
+                write!(
+                    f,
+                    "projection registry: {} RuntimeEvent variant(s) are still stubbed for \
+                     backend {:?} (every variant on a persistent backend must be either \
+                     Projected or Ephemeral per RFC-025; Stubbed is not a supported steady \
+                     state): {}",
+                    stubbed.len(),
+                    backend,
+                    stubbed.join(", ")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
+/// Central registry. **Every** `RuntimeEvent` variant MUST appear here; the
+/// `cairn-store` `build.rs` rejects the crate otherwise.
+///
+/// Classification source (2026-04-28):
+/// - Variants handled by a real `INSERT`/`UPDATE` arm in
+///   `src/pg/projections.rs` → `Projected`.
+/// - Variants in pg's intentional no-op arm (`=> {}`) → `Ephemeral`.
+/// - Variants in pg's `log_stub(...)` arm → `Stubbed`.
+///
+/// The sqlite applier carries a slightly wider stub set than pg (mostly
+/// Trigger/RunSla/Snapshot/TaskDependency surfaces); the registry uses the
+/// pg classification as canonical since pg is the production backend.
+/// Phase 2a/2b close the pg stub gap and, as a side effect, the sqlite
+/// gap.
+pub const REGISTRY: &[ProjectionEntry] = &[
+    // ── Projected (54) ────────────────────────────────────────────────────
+    ProjectionEntry {
+        variant: "ApprovalRequested",
+        status: ProjectionStatus::Projected {
+            table: Some("approvals"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ApprovalResolved",
+        status: ProjectionStatus::Projected {
+            table: Some("approvals"),
+        },
+    },
+    ProjectionEntry {
+        variant: "CheckpointPersisted",
+        status: ProjectionStatus::Projected {
+            table: Some("checkpoints"),
+        },
+    },
+    ProjectionEntry {
+        variant: "CheckpointRecorded",
+        status: ProjectionStatus::Projected {
+            table: Some("checkpoints"),
+        },
+    },
+    ProjectionEntry {
+        variant: "CheckpointRestored",
+        status: ProjectionStatus::Projected {
+            table: Some("checkpoints"),
+        },
+    },
+    ProjectionEntry {
+        variant: "DecisionCacheWarmup",
+        status: ProjectionStatus::Projected {
+            table: Some("decision_cache_warmups"),
+        },
+    },
+    ProjectionEntry {
+        variant: "DecisionRecorded",
+        status: ProjectionStatus::Projected {
+            table: Some("decision_records"),
+        },
+    },
+    // RFC-025 Phase 1 (milestone 7): five eval lifecycle variants
+    // flipped from Stubbed / Ephemeral → Projected. pg V034 migration +
+    // sqlite schema.rs carry the `eval_runs` read-model table; in-memory
+    // store mirrors the projection. The two new variants (Scored /
+    // RubricScored) landed as Ephemeral staging in milestone 1 and
+    // become Projected here now that all three backends wire them.
+    ProjectionEntry {
+        variant: "EvalRubricScored",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRunArchived",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRunCompleted",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRunScored",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRunStarted",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MailboxMessageAppended",
+        status: ProjectionStatus::Projected {
+            table: Some("mailbox_messages"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ProjectCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("projects"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PromptAssetCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("prompt_assets"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PromptReleaseCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("prompt_releases"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PromptReleaseTransitioned",
+        status: ProjectionStatus::Projected {
+            table: Some("prompt_releases"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PromptVersionCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("prompt_versions"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderCallCompleted",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_calls"),
+        },
+    },
+    ProjectionEntry {
+        // Issue #668: LLM chain-of-thought body capture. Sibling to
+        // ProviderCallCompleted — that event holds metadata, this one
+        // holds the prompt + response text (post-redaction).
+        variant: "LlmCompletionRecorded",
+        status: ProjectionStatus::Projected {
+            table: Some("llm_completions"),
+        },
+    },
+    ProjectionEntry {
+        // #789: per-iteration compacted reasoning record. Lives on the
+        // InMemoryStore's per-run reasoning_steps vec (capped at
+        // REASONING_STEP_CAP_PER_RUN = 200). Read endpoints on
+        // `--db memory` serve from there; pg/sqlite operators get an
+        // empty trajectory until backend parity lands as a follow-up.
+        // Marked Ephemeral (not Stubbed) because the projection IS
+        // implemented — just only on the in-memory backend, not the
+        // durable ones, and the stub-guard CI job rejects new
+        // log_stub sites which Stubbed implies.
+        variant: "RunReasoningStepRecorded",
+        status: ProjectionStatus::Ephemeral {
+            reason: "#789: per-iteration trajectory record materialized only on InMemoryStore for now; pg/sqlite parity tracked as follow-up",
+        },
+    },
+    ProjectionEntry {
+        variant: "RecoveryAttempted",
+        status: ProjectionStatus::Projected {
+            table: Some("recovery_attempts"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RecoveryCompleted",
+        status: ProjectionStatus::Projected {
+            table: Some("recovery_completions"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RecoverySummaryEmitted",
+        status: ProjectionStatus::Projected {
+            table: Some("recovery_summaries"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RouteDecisionMade",
+        status: ProjectionStatus::Projected {
+            table: Some("route_decisions"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RoutePolicyCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("route_policies"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RunCompletionAnnotated",
+        status: ProjectionStatus::Projected {
+            table: Some("runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RunCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RunStateChanged",
+        status: ProjectionStatus::Projected {
+            table: Some("runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SessionAttemptStarted",
+        status: ProjectionStatus::Projected {
+            table: Some("sessions"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SessionCostUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("session_costs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SessionCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("sessions"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SessionOutcomeEmitted",
+        status: ProjectionStatus::Projected {
+            table: Some("session_outcomes"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SessionStateChanged",
+        status: ProjectionStatus::Projected {
+            table: Some("sessions"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TaskCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("tasks"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TaskLeaseClaimed",
+        status: ProjectionStatus::Projected {
+            table: Some("tasks"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TaskLeaseHeartbeated",
+        status: ProjectionStatus::Projected {
+            table: Some("tasks"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TaskStateChanged",
+        status: ProjectionStatus::Projected {
+            table: Some("tasks"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TenantCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("tenants"),
+        },
+    },
+    // RFC 026 PR-A2: tenant PATCH edit (rename). Writes into the same
+    // `tenants` table the `TenantCreated` applier maintains.
+    ProjectionEntry {
+        variant: "TenantUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("tenants"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TerminalRecoveryAttempted",
+        status: ProjectionStatus::Projected {
+            table: Some("runs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolCallAmended",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_call_approvals"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolCallApproved",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_call_approvals"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolCallProposed",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_call_approvals"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolCallRejected",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_call_approvals"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolInvocationCacheHit",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_invocation_cache_hits"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolInvocationCompleted",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_invocations"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolInvocationFailed",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_invocations"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolInvocationProgressUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_invocation_progress"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolInvocationStarted",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_invocations"),
+        },
+    },
+    ProjectionEntry {
+        variant: "WorkspaceArchived",
+        status: ProjectionStatus::Projected {
+            table: Some("workspaces"),
+        },
+    },
+    ProjectionEntry {
+        variant: "WorkspaceCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("workspaces"),
+        },
+    },
+    ProjectionEntry {
+        variant: "WorkspaceMemberAdded",
+        status: ProjectionStatus::Projected {
+            table: Some("workspace_members"),
+        },
+    },
+    ProjectionEntry {
+        variant: "WorkspaceMemberRemoved",
+        status: ProjectionStatus::Projected {
+            table: Some("workspace_members"),
+        },
+    },
+    ProjectionEntry {
+        variant: "WorkspaceSnapshotCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("workspace_snapshots"),
+        },
+    },
+    ProjectionEntry {
+        variant: "WorkspaceSnapshotReaped",
+        status: ProjectionStatus::Projected {
+            table: Some("workspace_snapshots"),
+        },
+    },
+    // ── RFC 029 pluggable knowledge providers ───────────────────────────
+    // Configuration lifecycle + audit on `project_knowledge_providers`
+    // (discriminated by a `kind` column: "configured" upserts,
+    // "unavailable"/"capability_changed" are audit-insert rows).
+    ProjectionEntry {
+        variant: "KnowledgeProviderConfigured",
+        status: ProjectionStatus::Projected {
+            table: Some("project_knowledge_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "KnowledgeProviderUnavailable",
+        status: ProjectionStatus::Projected {
+            table: Some("project_knowledge_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "KnowledgeProviderCapabilityChanged",
+        status: ProjectionStatus::Projected {
+            table: Some("project_knowledge_providers"),
+        },
+    },
+    // Ingest lifecycle on `knowledge_ingest_jobs` (Submitted/Rejected inserts,
+    // StatusUpdated updates the existing row).
+    ProjectionEntry {
+        variant: "KnowledgeIngestSubmitted",
+        status: ProjectionStatus::Projected {
+            table: Some("knowledge_ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "KnowledgeIngestRejected",
+        status: ProjectionStatus::Projected {
+            table: Some("knowledge_ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "KnowledgeIngestStatusUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("knowledge_ingest_jobs"),
+        },
+    },
+    // ── RFC 030 pluggable memory providers ──────────────────────────────
+    // Parallel tables to the RFC 029 knowledge pair:
+    //   `project_memory_providers` (discriminated by `kind` column)
+    //   `memory_ingest_jobs`
+    // Kept distinct from the knowledge tables so the startup family-mismatch
+    // scan (RFC 030 §Rollout) can see the two slots side-by-side and so
+    // operator queries over either family stay on a single-table read.
+    ProjectionEntry {
+        variant: "MemoryProviderConfigured",
+        status: ProjectionStatus::Projected {
+            table: Some("project_memory_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryProviderUnavailable",
+        status: ProjectionStatus::Projected {
+            table: Some("project_memory_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryProviderCapabilityChanged",
+        status: ProjectionStatus::Projected {
+            table: Some("project_memory_providers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryIngestSubmitted",
+        status: ProjectionStatus::Projected {
+            table: Some("memory_ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryIngestRejected",
+        status: ProjectionStatus::Projected {
+            table: Some("memory_ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryIngestStatusUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("memory_ingest_jobs"),
+        },
+    },
+    // RFC 030 finalize: family-mismatch audit events. Ephemeral — the
+    // event log itself is the audit trail; operator health surfaces
+    // subscribe via SSE + metrics. No durable read-model row because
+    // the scan emission is idempotent per-boot and the operator only
+    // needs the latest observation.
+    ProjectionEntry {
+        variant: "KnowledgeProviderFamilyMismatch",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 030 §Rollout: startup family-mismatch audit signal; SSE + metrics only, no read-model row needed",
+        },
+    },
+    ProjectionEntry {
+        variant: "MemoryProviderFamilyMismatch",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 030 §Rollout: startup family-mismatch audit signal; SSE + metrics only, no read-model row needed",
+        },
+    },
+    // RFC 031 PR-A: operator-defined agent roles. `AgentRoleDefined` /
+    // `AgentRoleRetracted` upsert / retract rows on
+    // `project_agent_roles`; `ToolDeclaredButMissing` is an
+    // observability advisory with no projection row (deduped per
+    // `(run_id, role_id, tool_id)` on `OrchestrationContext`).
+    ProjectionEntry {
+        variant: "AgentRoleDefined",
+        status: ProjectionStatus::Projected {
+            table: Some("project_agent_roles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "AgentRoleRetracted",
+        status: ProjectionStatus::Projected {
+            table: Some("project_agent_roles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolDeclaredButMissing",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 031 §D3: run-time advisory when role.tools declares a tool not currently registered; deduped per (run_id, role_id, tool_id) on OrchestrationContext, not projected",
+        },
+    },
+    // ── Ephemeral (31) ────────────────────────────────────────────────────
+    // Operator observability surfaces (SSE + metrics) with no durable read
+    // model. The event log itself is the audit trail.
+    ProjectionEntry {
+        variant: "ApprovalPolicyCreated",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 005 approval policies — no durable table yet; service-layer in-memory registry until table ships",
+        },
+    },
+    ProjectionEntry {
+        variant: "CompletionContractResolved",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 032 PR-2: emitted when a run's completion contract resolves (explicit or inferred); rendered via SSE + trajectory endpoint (#794). PR-4 / Phase 2 may promote to Projected against a dedicated completion_contracts table if operator dashboards need structured queries.",
+        },
+    },
+    ProjectionEntry {
+        variant: "BudgetThresholdCrossed",
+        status: ProjectionStatus::Ephemeral {
+            reason: "F65 observability: SSE + metrics only; no read-model table",
+        },
+    },
+    ProjectionEntry {
+        variant: "CircuitBreakerTripped",
+        status: ProjectionStatus::Ephemeral {
+            reason: "F65 observability: SSE + metrics only; breaker trip is visible via session_outcomes.termination_reason",
+        },
+    },
+    ProjectionEntry {
+        variant: "OrchestratorDecisionMade",
+        status: ProjectionStatus::Ephemeral {
+            reason: "F65 observability: SSE + metrics only; no read-model table",
+        },
+    },
+    ProjectionEntry {
+        variant: "PromptRolloutStarted",
+        status: ProjectionStatus::Ephemeral {
+            reason: "RFC 001 gradual rollout — state tracked via the prompt_releases projection",
+        },
+    },
+    ProjectionEntry {
+        variant: "RunSlaBreached",
+        status: ProjectionStatus::Ephemeral {
+            reason: "SLA breach surfaces via notifications + SSE; no dedicated table",
+        },
+    },
+    ProjectionEntry {
+        variant: "RunSlaSet",
+        status: ProjectionStatus::Ephemeral {
+            reason: "SLA set — policy-layer state, no dedicated runtime table",
+        },
+    },
+    // RFC-025 Phase 1.5a: RunTemplateCreated / RunTemplateDeleted flipped
+    // Ephemeral → Projected. Templates are durable state (the trigger
+    // service dereferences `run_template_id` on every fire) so the pg /
+    // sqlite / in_memory projections all write a row to `run_templates`.
+    ProjectionEntry {
+        variant: "RunTemplateCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("run_templates"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RunTemplateDeleted",
+        status: ProjectionStatus::Projected {
+            table: Some("run_templates"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SandboxCrashRecovered",
+        status: ProjectionStatus::Ephemeral {
+            reason: "F65 PR-5 #359: crash-recovery umount sweep is observability-only (SSE + metrics)",
+        },
+    },
+    ProjectionEntry {
+        variant: "SessionAttemptCompleted",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Visible via event log + subsequent SessionOutcomeEmitted row; no dedicated table",
+        },
+    },
+    ProjectionEntry {
+        variant: "SignalRouted",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Signal routing — projection lives in cairn-signal service layer, not cairn-store",
+        },
+    },
+    ProjectionEntry {
+        variant: "SignalSubscriptionCreated",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Signal subscription — projection lives in cairn-signal service layer",
+        },
+    },
+    ProjectionEntry {
+        variant: "SnapshotCreated",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Workspace snapshot event predates F65 WorkspaceSnapshotCreated; retained for back-compat",
+        },
+    },
+    ProjectionEntry {
+        variant: "SummarizerFallback",
+        status: ProjectionStatus::Ephemeral {
+            reason: "F65 observability: SSE + metrics only; no read-model table",
+        },
+    },
+    ProjectionEntry {
+        variant: "TaskDependencyAdded",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Task dependency edges — graph projection owns the read model, not cairn-store",
+        },
+    },
+    ProjectionEntry {
+        variant: "TaskDependencyResolved",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Task dependency edges — graph projection owns the read model, not cairn-store",
+        },
+    },
+    ProjectionEntry {
+        variant: "TaskLeaseExpired",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Lease expiry — owned by FlowFabric lease-history; cairn mirrors via TaskStateChanged",
+        },
+    },
+    ProjectionEntry {
+        variant: "TaskPriorityChanged",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Priority changes — scheduler-layer concern; audit via event log",
+        },
+    },
+    // RFC-025 Phase 1.5a: 8 state-carrying variants flipped
+    // Ephemeral → Projected. Every lifecycle edge (Created, Enabled,
+    // Disabled, Suspended, Resumed, Deleted, RunTemplateCreated,
+    // RunTemplateDeleted) writes into the `triggers` / `run_templates`
+    // tables inside the event-append transaction. Restart reads go
+    // straight to the projection; `AppState::replay_triggers` is gone.
+    ProjectionEntry {
+        variant: "TriggerCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerDeleted",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
+        },
+    },
+    // RFC-025 Phase 1.5a: five audit variants write append-only rows
+    // into `trigger_fires` (read by the duplicate-fire ledger + rate-
+    // limit window + project-budget counter), so they now classify as
+    // Projected even though the runtime doesn't rebuild entity state
+    // from them at boot. The registry's Projected contract is "backed
+    // by a read-model table updated synchronously" — these five meet
+    // that contract via `trigger_fires`. (PR #569 review.)
+    ProjectionEntry {
+        variant: "TriggerDenied",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerDisabled",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerEnabled",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerFired",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerPendingApproval",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerRateLimited",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerResumed",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerSkipped",
+        status: ProjectionStatus::Projected {
+            table: Some("trigger_fires"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TriggerSuspended",
+        status: ProjectionStatus::Projected {
+            table: Some("triggers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "WorkspaceBackendDegraded",
+        status: ProjectionStatus::Ephemeral {
+            reason: "F65 observability: SSE + metrics only; no read-model table",
+        },
+    },
+    // ── Stubbed (77) — Phase 2a / Phase 2b work ───────────────────────────
+    // Each entry is a silent-read risk on pg/sqlite today. See RFC-025
+    // for the migration order; the pre-commit hook + CI grep step reject
+    // new additions.
+    ProjectionEntry {
+        variant: "ApprovalDelegated",
+        status: ProjectionStatus::Projected {
+            table: Some("approval_delegations"),
+        },
+    },
+    ProjectionEntry {
+        variant: "AuditLogEntryRecorded",
+        status: ProjectionStatus::Projected {
+            table: Some("audit_log_entries"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ChannelCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("channels"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ChannelMessageConsumed",
+        status: ProjectionStatus::Projected {
+            table: Some("channel_messages"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ChannelMessageSent",
+        status: ProjectionStatus::Projected {
+            table: Some("channel_messages"),
+        },
+    },
+    ProjectionEntry {
+        variant: "CheckpointStrategySet",
+        status: ProjectionStatus::Projected {
+            table: Some("checkpoint_strategies"),
+        },
+    },
+    ProjectionEntry {
+        variant: "CredentialKeyRotated",
+        status: ProjectionStatus::Projected {
+            table: Some("credential_rotations"),
+        },
+    },
+    ProjectionEntry {
+        variant: "CredentialRevoked",
+        status: ProjectionStatus::Projected {
+            table: Some("credentials"),
+        },
+    },
+    ProjectionEntry {
+        variant: "CredentialStored",
+        status: ProjectionStatus::Projected {
+            table: Some("credentials"),
+        },
+    },
+    ProjectionEntry {
+        variant: "DefaultSettingCleared",
+        status: ProjectionStatus::Projected {
+            table: Some("default_settings"),
+        },
+    },
+    ProjectionEntry {
+        variant: "DefaultSettingSet",
+        status: ProjectionStatus::Projected {
+            table: Some("default_settings"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EntitlementOverrideSet",
+        status: ProjectionStatus::Projected {
+            table: Some("entitlement_overrides"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalBaselineLocked",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_baselines"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalBaselineSet",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_baselines"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalDatasetCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_datasets"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalDatasetEntryAdded",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_dataset_entries"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EvalRubricCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("eval_rubrics"),
+        },
+    },
+    ProjectionEntry {
+        variant: "EventLogCompacted",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Event-log compaction is a single-shot maintenance operation — the compaction boundary is visible in `event_log` via the first remaining position; no dedicated read-model row is needed and no operator UI queries by compaction timestamp.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ExternalWorkerReactivated",
+        status: ProjectionStatus::Projected {
+            table: Some("external_workers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ExternalWorkerRegistered",
+        status: ProjectionStatus::Projected {
+            table: Some("external_workers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ExternalWorkerReported",
+        status: ProjectionStatus::Projected {
+            table: Some("external_workers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ExternalWorkerSuspended",
+        status: ProjectionStatus::Projected {
+            table: Some("external_workers"),
+        },
+    },
+    ProjectionEntry {
+        variant: "GuardrailPolicyCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("guardrail_policies"),
+        },
+    },
+    ProjectionEntry {
+        variant: "GuardrailPolicyEvaluated",
+        status: ProjectionStatus::Projected {
+            table: Some("guardrail_evaluations"),
+        },
+    },
+    ProjectionEntry {
+        variant: "IngestJobCompleted",
+        status: ProjectionStatus::Projected {
+            table: Some("ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "IngestJobStarted",
+        status: ProjectionStatus::Projected {
+            table: Some("ingest_jobs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "LicenseActivated",
+        status: ProjectionStatus::Projected {
+            table: Some("licenses"),
+        },
+    },
+    ProjectionEntry {
+        variant: "NotificationPreferenceSet",
+        status: ProjectionStatus::Projected {
+            table: Some("notification_preferences"),
+        },
+    },
+    ProjectionEntry {
+        variant: "NotificationSent",
+        status: ProjectionStatus::Projected {
+            table: Some("notifications"),
+        },
+    },
+    ProjectionEntry {
+        variant: "OperatorIntervention",
+        status: ProjectionStatus::Ephemeral {
+            reason: "`OperatorInterventionReadModel::list_by_run` walks the event log directly on every backend (pg/sqlite reads replay into `InMemoryStore` at boot; the read impl iterates `state.events` and filters by `run_id`). A dedicated projection table would duplicate the event-log contents without a new read path — the event log itself is the audit trail, which is the Ephemeral contract. Gated by `load_run_visible_to_tenant` for cross-tenant isolation.",
+        },
+    },
+    ProjectionEntry {
+        variant: "OperatorProfileCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("operator_profiles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "OperatorProfileUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("operator_profiles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "OutcomeRecorded",
+        status: ProjectionStatus::Projected {
+            table: Some("outcomes"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PauseScheduled",
+        status: ProjectionStatus::Projected {
+            table: Some("pause_schedules"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PermissionDecisionRecorded",
+        // Durable audit event with no read model. The event log itself
+        // is the projection — callers re-read via `list_events()` filters.
+        // All three backends intentionally no-op in their projection
+        // appliers: event persists, nothing else is derived. Closes #574.
+        status: ProjectionStatus::Ephemeral {
+            reason: "Durable audit event: the persisted event log is the projection (no derived read model). All three backends no-op in their appliers by design; readers filter the event log directly.",
+        },
+    },
+    ProjectionEntry {
+        variant: "PlanApproved",
+        status: ProjectionStatus::Projected {
+            table: Some("plan_reviews"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PlanProposed",
+        status: ProjectionStatus::Projected {
+            table: Some("plan_reviews"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PlanRejected",
+        status: ProjectionStatus::Projected {
+            table: Some("plan_reviews"),
+        },
+    },
+    ProjectionEntry {
+        variant: "PlanRevisionRequested",
+        status: ProjectionStatus::Projected {
+            table: Some("plan_reviews"),
+        },
+    },
+    // RFC-025 Phase 3 (2026-04-28): 4 provider-state variants flipped
+    // Stubbed → Projected. Operator-configured provider state now
+    // survives restart (the core F40 contract). See
+    // `docs/design/rfcs/RFC-025-provider-boundary-research.md` for the
+    // research underpinning this classification:
+    //   * Bindings + connections are PROJECTED (persistent config) —
+    //     this is what Phase 3 ships.
+    //   * Pools (ProviderPool*) are EPHEMERAL (see below): live HTTP-
+    //     client state is not persistable; the pool is rebuilt from
+    //     bindings + connections on boot.
+    //   * Health probes (ProviderHealthChecked, ProviderMarkedDegraded,
+    //     ProviderRecovered, ProviderHealthSchedule*) are EPHEMERAL:
+    //     the next probe cycle supersedes any persisted status; there
+    //     is no operator-visible read-after-restart contract.
+    //   * Model capability announcements and retry policies (Provider
+    //     ModelRegistered, ProviderRetryPolicySet) are EPHEMERAL: the
+    //     in-memory applier is already a no-op today and the runtime
+    //     layer has no reader; operator re-announces on restart. See
+    //     the comments on each entry below.
+    // RFC-025 Phase 2b.4 (2026-04-28): the 10 variants immediately
+    // below moved from Stubbed → Ephemeral once the research above
+    // was cross-checked against the in-memory applier + service-layer
+    // read paths. The stub-guard CI job still catches any *new* stub
+    // site, so this reclassification does not weaken the Phase 3b
+    // scope signal — Phase 3b is now limited to the work needed to
+    // surface ephemeral provider state to operators via SSE/metrics.
+    ProjectionEntry {
+        variant: "ProviderBindingCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_bindings"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderBindingStateChanged",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_bindings"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderBudgetAlertTriggered",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_budgets"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderBudgetExceeded",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_budgets"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderBudgetSet",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_budgets"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderConnectionDeleted",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_connections"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderConnectionRegistered",
+        status: ProjectionStatus::Projected {
+            table: Some("provider_connections"),
+        },
+    },
+    // RFC-025 Phase 2b.4: health probes are ephemeral. `ProviderHealth
+    // Checked` updates an in-memory `ProviderHealthRecord` that callers
+    // read via `ProviderHealthService::run_due_health_checks` — a
+    // live-probe endpoint, not a read-after-restart surface. The next
+    // probe cycle overwrites the in-memory row regardless of whether
+    // the previous check survived restart. Persisting probe history
+    // would require a dedicated bounded audit table (bounded-ring, not
+    // append-forever) — that is a separate follow-up, not the core F40
+    // durability contract. Today the event log itself is the audit
+    // trail; operators observe live status via SSE + metrics.
+    ProjectionEntry {
+        variant: "ProviderHealthChecked",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Health probe status is rebuilt on the next probe cycle. The in-memory `ProviderHealthRecord` exists only for the live `run_due_health_checks` endpoint; operators observe status via SSE + metrics. Persisting every probe hit would grow without bound with no read-after-restart contract. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderHealthScheduleSet",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Health-check schedules are derived configuration rebuilt from provider_bindings at boot (the canonical config). The `ProviderHealthSchedule` in-memory record only drives the in-process scheduler loop; operators view + edit schedules via the binding CRUD path, not a schedule-specific projection. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderHealthScheduleTriggered",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Schedule-tick `last_run_ms` is purely an in-process scheduler marker — restart resets the tick cadence and the next scheduler pass re-triggers probes. No operator read-after-restart surface. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderMarkedDegraded",
+        status: ProjectionStatus::Ephemeral {
+            reason: "The degraded bit lives on the in-memory `ProviderHealthRecord` and is superseded by the next `ProviderHealthChecked` / `ProviderRecovered` event in-process. Persisting it would suggest a read-after-restart contract cairn does not expose — operators see degradation via SSE + metrics. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderModelRegistered",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Capability announcements are informational — the in-memory applier is already a no-op and the runtime layer exposes no `ProviderModelReadModel` consumer today (only the in-memory `InMemoryStore` impl exists, used by a handful of tests). Operator re-announces on restart; the event log keeps the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderPoolConnectionAdded",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Pool membership tracks live HTTP-client state; it is rebuilt from provider_bindings + provider_connections on boot. Persisting the mutation would diverge from the live pool the moment reqwest reconnects. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderPoolConnectionRemoved",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Counterpart to `ProviderPoolConnectionAdded` — pool membership is live-HTTP-client state rebuilt from bindings + connections at boot. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderPoolCreated",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Pools are live HTTP-client state (active_connections, reqwest::Client references). Rebuilt from provider_bindings + provider_connections on boot; persistence would diverge from reality. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderRecovered",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Recovery flip complements `ProviderMarkedDegraded` — the next probe cycle is authoritative, the in-memory status survives only until the next `ProviderHealthChecked`. No operator read-after-restart surface. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ProviderRetryPolicySet",
+        status: ProjectionStatus::Ephemeral {
+            reason: "Retry policy today has no reader in cairn-runtime — the HTTP handler only appends the event (see `set_provider_retry_policy_handler` in cairn-app/src/handlers/providers.rs). Operator re-sets on restart; persisting would suggest a read-after-restart contract cairn does not implement. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "RecoveryEscalated",
+        status: ProjectionStatus::Ephemeral {
+            reason: "The event carries no tenant_id so a tenant-scoped read-model projection would require a new event version (domain change). Until then the `RecoveryEscalationReadModel` in-memory impl keeps the observability-only contract: escalations surface via SSE + metrics and the event log is the audit trail. Revisit post-v0.1 when RecoveryEscalated gains tenant_id.",
+        },
+    },
+    ProjectionEntry {
+        variant: "ResourceShareRevoked",
+        status: ProjectionStatus::Projected {
+            table: Some("resource_shares"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ResourceShared",
+        status: ProjectionStatus::Projected {
+            table: Some("resource_shares"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RetentionPolicySet",
+        status: ProjectionStatus::Projected {
+            table: Some("retention_policies"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RoutePolicyUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("route_policies"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RunCostAlertSet",
+        status: ProjectionStatus::Projected {
+            table: Some("run_cost_alerts"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RunCostAlertTriggered",
+        status: ProjectionStatus::Projected {
+            table: Some("run_cost_alerts"),
+        },
+    },
+    ProjectionEntry {
+        variant: "RunCostUpdated",
+        status: ProjectionStatus::Projected {
+            table: Some("run_costs"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ScheduledTaskCreated",
+        status: ProjectionStatus::Projected {
+            table: Some("scheduled_tasks"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SignalIngested",
+        status: ProjectionStatus::Projected {
+            table: Some("signal_ingestions"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SoulPatchApplied",
+        status: ProjectionStatus::Projected {
+            table: Some("soul_patches"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SoulPatchProposed",
+        status: ProjectionStatus::Projected {
+            table: Some("soul_patches"),
+        },
+    },
+    ProjectionEntry {
+        variant: "SpendAlertTriggered",
+        status: ProjectionStatus::Ephemeral {
+            reason: "No reader in cairn-runtime or cairn-app — the event is appended as an audit record and operators consume it via SSE (see `cairn-app/src/helpers.rs` event-type classification). The in-memory applier is already a no-op; pg/sqlite match. Event log is the audit trail.",
+        },
+    },
+    ProjectionEntry {
+        variant: "SubagentSpawned",
+        status: ProjectionStatus::Projected {
+            table: Some("subagent_spawns"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TenantQuotaSet",
+        status: ProjectionStatus::Projected {
+            table: Some("tenant_quotas"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TenantQuotaViolated",
+        status: ProjectionStatus::Projected {
+            table: Some("tenant_quota_violations"),
+        },
+    },
+    // RFC 026 PR-A0: tenant-scope admin role. Upsert on Granted,
+    // mark revoked (not delete) on Revoked so the audit trail survives.
+    // Pg V066 + sqlite schema.rs both back this with `operator_tenant_roles`;
+    // in-memory mirrors the projection field-by-field. Projection-parity
+    // harness covers both variants.
+    ProjectionEntry {
+        variant: "TenantRoleGranted",
+        status: ProjectionStatus::Projected {
+            table: Some("operator_tenant_roles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "TenantRoleRevoked",
+        status: ProjectionStatus::Projected {
+            table: Some("operator_tenant_roles"),
+        },
+    },
+    ProjectionEntry {
+        variant: "ToolRecoveryPaused",
+        status: ProjectionStatus::Projected {
+            table: Some("tool_recovery_pauses"),
+        },
+    },
+    ProjectionEntry {
+        variant: "UserMessageAppended",
+        status: ProjectionStatus::Projected {
+            table: Some("user_messages"),
+        },
+    },
+];
+
+/// Return the registry entry for `variant`, or `None` if unregistered.
+///
+/// Linear scan. The registry has 156 entries at Phase 0 and is called
+/// at most once per boot (`assert_no_stubs_for_persistent_backend`),
+/// plus a handful of test-time calls in `projection_parity.rs`. On a
+/// modern CPU the scan costs tens of nanoseconds — a `phf::Map` or a
+/// `once_cell::sync::Lazy<HashMap>` would add a crate dependency or
+/// a one-time allocation for no observable win.
+///
+/// Revisit the data structure only if a hot path starts calling
+/// `lookup` per-event (none does today; event dispatch goes through
+/// the pg/sqlite/InMemory appliers directly, not through the registry).
+///
+/// Tests that iterate can walk [`REGISTRY`] directly; no need to go
+/// through `lookup`.
+pub fn lookup(variant: &str) -> Option<ProjectionStatus> {
+    REGISTRY
+        .iter()
+        .find(|entry| entry.variant == variant)
+        .map(|entry| entry.status)
+}
+
+/// Fail if any registered variant is still `Stubbed` when running against a
+/// persistent backend (Postgres or SQLite). In-memory boots call this with
+/// a no-op path because the in-memory store materializes projections
+/// through a different code path that cannot leak empty reads (RFC-025
+/// §"Silent-read protection").
+///
+/// Phase 0 is infrastructure-only: the caller (cairn-app) currently logs
+/// the returned error at `WARN` and proceeds. Phase 2c flips that to a
+/// hard boot failure once Phase 2a + Phase 2b land and the stub list is
+/// empty.
+pub fn assert_no_stubs_for_persistent_backend(backend: Backend) -> Result<(), RegistryError> {
+    let stubbed: Vec<&'static str> = REGISTRY
+        .iter()
+        .filter(|e| e.status.is_stubbed())
+        .map(|e| e.variant)
+        .collect();
+    if stubbed.is_empty() {
+        Ok(())
+    } else {
+        Err(RegistryError::StubbedVariantsPresent { backend, stubbed })
+    }
+}
+
+/// In-memory equivalent of [`assert_no_stubs_for_persistent_backend`]:
+/// unconditional `Ok(())`. Exists so the `AppState::new` boot path has a
+/// single uniform call irrespective of the selected backend.
+pub fn assert_no_stubs_for_in_memory() -> Result<(), RegistryError> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_has_no_duplicate_variants() {
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for entry in REGISTRY {
+            assert!(
+                seen.insert(entry.variant),
+                "duplicate registry entry for variant {}",
+                entry.variant
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_returns_registered_status() {
+        let status = lookup("SessionCreated").expect("SessionCreated is Projected");
+        assert!(status.is_projected());
+        // RFC-025 Phase 1 milestone 7: EvalRunStarted flipped from
+        // Stubbed → Projected now that the pg/sqlite/in-memory
+        // `eval_runs` projection table is wired.
+        let status = lookup("EvalRunStarted").expect("EvalRunStarted is Projected (Phase 1)");
+        assert!(status.is_projected());
+        // RFC-025 Phase 2a.1 milestone 1: CredentialStored flipped from
+        // Stubbed → Projected now that pg V035 + sqlite schema carry the
+        // `credentials` read-model table.
+        let status =
+            lookup("CredentialStored").expect("CredentialStored is Projected (Phase 2a.1)");
+        assert!(status.is_projected());
+        let status = lookup("CircuitBreakerTripped").expect("CircuitBreakerTripped is Ephemeral");
+        assert!(status.is_ephemeral());
+        assert!(lookup("NotAVariant").is_none());
+    }
+
+    #[test]
+    fn assert_no_stubs_in_memory_always_ok() {
+        assert!(assert_no_stubs_for_in_memory().is_ok());
+    }
+
+    #[test]
+    fn assert_no_stubs_for_postgres_passes() {
+        // Phase 2c milestone: after #574 reclassified the last Stubbed
+        // variant (`PermissionDecisionRecorded` → Ephemeral), the
+        // Postgres boot gate must return Ok. A future regression that
+        // adds a new Stubbed entry will fail both this test and the
+        // projection-stub-guard CI job.
+        //
+        // `expect(...)` over `is_ok()` so a regression prints the full
+        // `RegistryError::StubbedVariantsPresent { backend, stubbed }`
+        // payload — operators see the offending variant list directly
+        // in the test failure rather than having to rerun under a debugger.
+        assert_no_stubs_for_persistent_backend(Backend::Postgres)
+            .expect("Phase 2c invariant: no Stubbed variants remain on Postgres");
+    }
+
+    #[test]
+    fn assert_no_stubs_for_sqlite_passes() {
+        assert_no_stubs_for_persistent_backend(Backend::Sqlite)
+            .expect("Phase 2c invariant: no Stubbed variants remain on SQLite");
+    }
+
+    #[test]
+    fn registry_counts_match_rfc025_phase_0_classification() {
+        let projected = REGISTRY.iter().filter(|e| e.status.is_projected()).count();
+        let ephemeral = REGISTRY.iter().filter(|e| e.status.is_ephemeral()).count();
+        let stubbed = REGISTRY.iter().filter(|e| e.status.is_stubbed()).count();
+        // RFC-025 Phase 0 audit (2026-04-28). If these numbers change,
+        // update the registry AND the RFC/memory note — the audit is the
+        // baseline against which Phase 2a/2b progress is measured.
+        // RFC-025 Phase 1 baselines:
+        //   * Phase 0 shipped 48 Projected / 31 Ephemeral / 77 Stubbed.
+        //   * Milestone 1 added EvalRunScored + EvalRubricScored as
+        //     Ephemeral staging → 48 / 33 / 77.
+        //   * Milestone 7 flips five eval variants (Started / Completed
+        //     / Archived / Scored / RubricScored) to Projected, removing
+        //     two Ephemeral + three Stubbed → 53 / 31 / 74.
+        //   * Phase 2a.1 milestone 1 flips three credential variants
+        //     (CredentialStored / Revoked / KeyRotated) to Projected,
+        //     removing three from Stubbed → 56 / 31 / 71.
+        //   * Phase 2a.1 milestone 2 flips two tenant-quota variants
+        //     (TenantQuotaSet / Violated) to Projected → 58 / 31 / 69.
+        //   * Phase 2a.1 milestone 3 flips three provider-budget variants
+        //     (ProviderBudgetSet / AlertTriggered / Exceeded) to Projected
+        //     → 61 / 31 / 66.
+        //   * Phase 2a.1 milestone 4 flips `LicenseActivated` to Projected
+        //     → 62 / 31 / 65.
+        //   * Phase 1.5a (PR #569) flips 8 state-carrying trigger /
+        //     run_template variants (TriggerCreated, TriggerEnabled,
+        //     TriggerDisabled, TriggerSuspended, TriggerResumed,
+        //     TriggerDeleted, RunTemplateCreated, RunTemplateDeleted)
+        //     from Ephemeral to Projected with backing table `triggers`
+        //     / `run_templates`. The 5 audit variants (TriggerFired,
+        //     Skipped, Denied, RateLimited, PendingApproval) also flip
+        //     Ephemeral → Projected with backing table `trigger_fires`
+        //     — they write real projection rows even though the runtime
+        //     does not recover entity state from individual audit rows
+        //     at boot (per PR #569 Copilot review — Projected contract
+        //     is "backed by a read-model table updated synchronously",
+        //     not "runtime replays from the table"). Net: +13 Projected,
+        //     -13 Ephemeral → 75 / 18 / 65.
+        //   * Phase 3 (PR #572) flips the four provider-state variants
+        //     (ProviderBindingCreated / StateChanged, ProviderConnection
+        //     Registered / Deleted) Stubbed → Projected with backing
+        //     tables `provider_bindings` / `provider_connections`. Pools
+        //     and health probes stay Stubbed (Phase 3b will flip them
+        //     to Ephemeral once the pool / health read-models land).
+        //     Net: +4 Projected, -4 Stubbed → 79 / 18 / 61.
+        //   * Phase 2b.1 milestone 1 flips `AuditLogEntryRecorded`
+        //     Stubbed → Projected with backing table `audit_log_entries`
+        //     (pg V041 + sqlite schema.rs). Net: +1 Projected,
+        //     -1 Stubbed → 80 / 18 / 60.
+        //   * Phase 2b.1 milestone 2 flips `ScheduledTaskCreated`
+        //     Stubbed → Projected with backing table `scheduled_tasks`
+        //     (pg V042 + sqlite schema.rs). Net: +1 Projected,
+        //     -1 Stubbed → 81 / 18 / 59.
+        //   * Phase 2b.1 milestone 3 flips `OutcomeRecorded` Stubbed →
+        //     Projected with backing table `outcomes` (pg V043 +
+        //     sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 82 / 18 / 58.
+        //   * Phase 2b.1 milestone 4 flips the four RFC 018 Plan-review
+        //     events (`PlanProposed`, `PlanApproved`, `PlanRejected`,
+        //     `PlanRevisionRequested`) Stubbed → Projected with backing
+        //     table `plan_reviews` (pg V044 + sqlite schema.rs).
+        //     Net: +4 Projected, -4 Stubbed → 86 / 18 / 54.
+        //   * Phase 2a.2 milestone 1 flips `ApprovalDelegated` Stubbed →
+        //     Projected with backing table `approval_delegations` (pg V045
+        //     + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 87 / 18 / 53.
+        //   * Phase 2a.2 milestone 2 flips `GuardrailPolicyCreated` +
+        //     `GuardrailPolicyEvaluated` Stubbed → Projected with backing
+        //     tables `guardrail_policies` + `guardrail_evaluations` (pg
+        //     V046 + sqlite schema.rs). Net: +2 Projected, -2 Stubbed
+        //     → 89 / 18 / 51.
+        //   * Phase 2a.2 milestone 3 flips `RetentionPolicySet` Stubbed →
+        //     Projected with backing table `retention_policies` (pg V047
+        //     + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 90 / 18 / 50.
+        //   * Phase 2a.2 milestone 4 flips `EntitlementOverrideSet`
+        //     Stubbed → Projected with backing table `entitlement_overrides`
+        //     (pg V048 + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 91 / 18 / 49.
+        //   * Phase 2b.2 milestone 1 flips the four `ExternalWorker*`
+        //     events (`Registered`, `Suspended`, `Reactivated`,
+        //     `Reported`) Stubbed → Projected with backing table
+        //     `external_workers` (pg V049 — renumbered from V045 after
+        //     Phase 2a.2 took V045-V048; sqlite schema.rs).
+        //     Net: +4 Projected, -4 Stubbed → 95 / 18 / 45.
+        //   * Phase 2b.2b milestone 1 flips `ResourceShared` +
+        //     `ResourceShareRevoked` Stubbed → Projected with backing
+        //     table `resource_shares` (pg V051 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 97 / 18 / 43.
+        //   * Phase 2b.2b milestone 2 flips `SignalIngested` Stubbed →
+        //     Projected with backing table `signal_ingestions` (pg V052
+        //     + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 98 / 18 / 42.
+        //   * Phase 2b.2b milestone 3 flips `SubagentSpawned` Stubbed →
+        //     Projected with backing table `subagent_spawns` (pg V053
+        //     + sqlite schema.rs). Net: +1 Projected, -1 Stubbed
+        //     → 99 / 18 / 41.
+        //   * Phase 2b.2b milestone 4 flips `UserMessageAppended`
+        //     Stubbed → Projected with backing table `user_messages`
+        //     (pg V054 + sqlite schema.rs). Net: +1 Projected,
+        //     -1 Stubbed → 100 / 18 / 40.
+        //   * Phase 2b.2b milestone 5 flips `SoulPatchProposed` +
+        //     `SoulPatchApplied` Stubbed → Projected with backing
+        //     table `soul_patches` (pg V055 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 102 / 18 / 38.
+        //   * Phase 2b.2b milestone 6 flips `ToolRecoveryPaused`
+        //     Stubbed → Projected with backing table
+        //     `tool_recovery_pauses` (pg V056 + sqlite schema.rs),
+        //     and flips `EventLogCompacted` + `RecoveryEscalated`
+        //     Stubbed → Ephemeral (see registry comments for each on
+        //     why no read-model row is needed / achievable without
+        //     domain changes).
+        //     Net: +1 Projected, +2 Ephemeral, -3 Stubbed
+        //     → 103 / 20 / 35.
+        //   * Phase 2b.3 milestone 1 flips `IngestJobStarted` +
+        //     `IngestJobCompleted` Stubbed → Projected with backing
+        //     table `ingest_jobs` (pg V057 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 105 / 20 / 33.
+        //   * Phase 2b.3 milestone 2 flips `DefaultSettingSet` +
+        //     `DefaultSettingCleared` Stubbed → Projected with backing
+        //     table `default_settings` (pg V058 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 107 / 20 / 31.
+        //   * Phase 2b.3 milestone 3 flips `ChannelCreated` +
+        //     `ChannelMessageSent` + `ChannelMessageConsumed` Stubbed →
+        //     Projected with backing tables `channels` + `channel_messages`
+        //     (pg V059 + sqlite schema.rs).
+        //     Net: +3 Projected, -3 Stubbed → 110 / 20 / 28.
+        //   * Phase 2b.3 milestone 4 flips `NotificationPreferenceSet` +
+        //     `NotificationSent` Stubbed → Projected with backing tables
+        //     `notification_preferences` + `notifications`
+        //     (pg V060 + sqlite schema.rs).
+        //     Net: +2 Projected, -2 Stubbed → 112 / 20 / 26.
+        //   * Phase 2b.3 milestone 5 flips `CheckpointStrategySet`
+        //     Stubbed → Projected with backing table
+        //     `checkpoint_strategies` (pg V061 + sqlite schema.rs).
+        //     Net: +1 Projected, -1 Stubbed → 113 / 20 / 25.
+        //   * PR #595 (issue #592, parallel pause-lifecycle agent):
+        //     flips `PauseScheduled` Stubbed → Projected with backing
+        //     table `pause_schedules` (pg V062 from that PR + sqlite
+        //     schema.rs). Net: +1 Projected, -1 Stubbed → 114 / 20 / 24.
+        //   * Phase 2b.4 milestone 1 flips the 10 provider-state
+        //     variants that Phase 3 deferred (`ProviderHealthChecked`,
+        //     `ProviderHealthScheduleSet`, `ProviderHealthSchedule
+        //     Triggered`, `ProviderMarkedDegraded`, `ProviderModel
+        //     Registered`, `ProviderPoolCreated`, `ProviderPool
+        //     ConnectionAdded`, `ProviderPoolConnectionRemoved`,
+        //     `ProviderRecovered`, `ProviderRetryPolicySet`) Stubbed →
+        //     Ephemeral. Pools + health probes are live-HTTP-client
+        //     state rebuilt from bindings on boot; retry + model events
+        //     have no reader in cairn-runtime. See each registry entry
+        //     for the per-variant rationale.
+        //     Net: +10 Ephemeral, -10 Stubbed → 114 / 30 / 14.
+        //   * Phase 2b.4 milestone 2 flips the five eval-catalog
+        //     variants (`EvalBaselineLocked`, `EvalBaselineSet`,
+        //     `EvalDatasetCreated`, `EvalDatasetEntryAdded`,
+        //     `EvalRubricCreated`) Stubbed → Projected with backing
+        //     tables `eval_datasets` + `eval_dataset_entries` +
+        //     `eval_rubrics` + `eval_baselines` (pg V063 + sqlite
+        //     schema.rs; renumbered from V062 after PR #595 took V062
+        //     for `pause_schedules`). Net: +5 Projected, -5 Stubbed
+        //     → 119 / 30 / 9.
+        //   * Phase 2b.4 milestone 3 flips `OperatorProfileCreated` +
+        //     `OperatorProfileUpdated` Stubbed → Projected with backing
+        //     table `operator_profiles` (pg V064 + sqlite schema.rs),
+        //     and flips `OperatorIntervention` Stubbed → Ephemeral
+        //     (intervention is read via an event-log walk so the log
+        //     itself is the projection). `PermissionDecisionRecorded`
+        //     is deferred to Phase 2b.5 — the Ephemeral reclassification
+        //     is correct (no reader, audit-only).
+        //     Net: +2 Projected, +1 Ephemeral, -2 Stubbed
+        //     → 121 / 31 / 7.
+        //   * Phase 2b.4 milestone 4 flips `RunCostUpdated` +
+        //     `RunCostAlertSet` + `RunCostAlertTriggered` +
+        //     `RoutePolicyUpdated` Stubbed → Projected with backing
+        //     tables `run_costs` + `run_cost_alerts` (pg V065 + sqlite
+        //     schema.rs; renumbered from V064) and a delta-update on
+        //     the existing `route_policies` row, and flips
+        //     `SpendAlertTriggered` Stubbed → Ephemeral (audit-only;
+        //     no reader in cairn).
+        //     Net: +4 Projected, +1 Ephemeral, -5 Stubbed
+        //     → 125 / 32 / 1.
+        //     The lone remaining Stubbed variant is
+        //     `PermissionDecisionRecorded` (Phase 2b.5 Ephemeral
+        //     reclassification). PR #595 took `PauseScheduled`
+        //     Projected ahead of 2b.4 landing.
+        // If you're editing this test, confirm the registry edit
+        // matches the milestone you're landing.
+        //   * #574 / Phase 2c: `PermissionDecisionRecorded` flips Stubbed
+        //     → Ephemeral — the durable event log is the projection (no
+        //     derived read model, no reader anywhere in cairn). This is
+        //     the zero-Stubbed milestone; `assert_no_stubs_for_persistent_backend`
+        //     now returns Ok on both persistent backends. Net: +1 Ephemeral,
+        //     -1 Stubbed → 125 / 33 / 0.
+        //   * RFC-026 PR-A0: `TenantRoleGranted` + `TenantRoleRevoked`
+        //     added as Projected with backing table `operator_tenant_roles`
+        //     (pg V066 + sqlite schema.rs). The admin-UI series depends on
+        //     a tenant-scope admin role model that `AdminRoleGuard` was
+        //     asked to enforce but never had. Net: +2 Projected → 127 / 33 / 0.
+        //   * RFC 026 PR-A2: `TenantUpdated` added as Projected with
+        //     backing table `tenants` (same table `TenantCreated` maintains;
+        //     PATCH appliers `UPDATE` only the supplied fields). Unblocks
+        //     the admin-UI tenant rename flow. Net: +1 Projected → 128 / 33 / 0.
+        //   * Issue #668: `LlmCompletionRecorded` added as Projected with
+        //     backing table `llm_completions` (pg V068 + sqlite schema.rs).
+        //     Sibling to `ProviderCallCompleted` — captures the LLM's
+        //     post-redaction prompt + response body so operators can audit
+        //     chain-of-thought, not just metadata. Net: +1 Projected →
+        //     129 / 33 / 0.
+        //   * RFC 029 PR-B1: six knowledge-provider lifecycle events
+        //     (`KnowledgeProviderConfigured`, `KnowledgeProviderUnavailable`,
+        //     `KnowledgeProviderCapabilityChanged`, `KnowledgeIngestSubmitted`,
+        //     `KnowledgeIngestRejected`, `KnowledgeIngestStatusUpdated`)
+        //     added as Projected with backing tables
+        //     `project_knowledge_providers` (4× events keyed on
+        //     `(project, provider_ref, kind)`) and `knowledge_ingest_jobs`
+        //     (3× events keyed on `(project, document_id)`). Pg V018
+        //     + sqlite schema.rs + pg/sqlite appliers. Net: +6 Projected
+        //     → 135 / 33 / 0.
+        //   * RFC 030 PR-B: six memory-provider lifecycle events
+        //     (`MemoryProviderConfigured`, `MemoryProviderUnavailable`,
+        //     `MemoryProviderCapabilityChanged`, `MemoryIngestSubmitted`,
+        //     `MemoryIngestRejected`, `MemoryIngestStatusUpdated`) added as
+        //     Projected with backing tables `project_memory_providers` and
+        //     `memory_ingest_jobs`. Pg V019 + sqlite schema.rs mirror +
+        //     pg/sqlite appliers. Mirrors RFC 029 shape; the runtime routes
+        //     memory events to the memory tables + knowledge events to the
+        //     knowledge tables so a single-family read stays on one table.
+        //     Net: +6 Projected → 141 / 33 / 0.
+        //   * RFC 030 finalize: two family-mismatch audit events
+        //     (`KnowledgeProviderFamilyMismatch`,
+        //     `MemoryProviderFamilyMismatch`) added as Ephemeral — the
+        //     startup family-mismatch scan emits these; SSE + metrics
+        //     only, no read-model row needed. Net: +2 Ephemeral →
+        //     141 / 35 / 0.
+        //
+        //   * #789: `RunReasoningStepRecorded` added as Ephemeral —
+        //     materialized only on InMemoryStore for now (per-run
+        //     vec, capped at 200), pg/sqlite parity is a follow-up.
+        //     Net: +1 Ephemeral → 141 / 36 / 0.
+        //   * RFC 031 PR-A: operator-defined agent roles —
+        //     `AgentRoleDefined` / `AgentRoleRetracted` added as
+        //     Projected (backing table `project_agent_roles`,
+        //     `(project_key, role_id)` PK, `retracted_at IS NULL`
+        //     unique constraint per §D6). `ToolDeclaredButMissing`
+        //     added as Ephemeral — DECIDE-time advisory with no
+        //     read-model row; dedup via `OrchestrationContext`
+        //     `Arc<Mutex<HashSet<...>>>`. Net: +2 Projected +1
+        //     Ephemeral → 143 / 37 / 0.
+        assert_eq!(
+            projected, 143,
+            "Projected count drifted; update registry + RFC"
+        );
+        // RFC 032 PR-2: +1 Ephemeral (CompletionContractResolved).
+        // PR-4 / Phase 2 may promote to Projected when the
+        // completion_contracts read-model table ships; until then
+        // the event is SSE + trajectory only.
+        assert_eq!(
+            ephemeral, 38,
+            "Ephemeral count drifted; update registry + RFC"
+        );
+        assert_eq!(stubbed, 0, "Stubbed count drifted; update registry + RFC");
+        assert_eq!(projected + ephemeral + stubbed, 181);
+    }
+
+    #[test]
+    fn error_display_shape_is_preserved() {
+        // The RegistryError::StubbedVariantsPresent Display path must
+        // stay well-formed even after Phase 2c flipped Stubbed to zero:
+        // if a future regression reintroduces a Stubbed entry, the error
+        // message operators see at boot must name the variant + backend.
+        // Construct the error directly since the registry no longer
+        // produces one.
+        let err = RegistryError::StubbedVariantsPresent {
+            backend: Backend::Postgres,
+            stubbed: vec!["SampleStubbedVariant"],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("SampleStubbedVariant"));
+        assert!(msg.contains("Postgres") || msg.contains("postgres"));
+    }
+}

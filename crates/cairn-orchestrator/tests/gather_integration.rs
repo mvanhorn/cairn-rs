@@ -37,10 +37,16 @@ fn base_ctx() -> OrchestrationContext {
         agent_type: "orchestrator".to_owned(),
         run_started_at_ms: 1_000_000,
         working_dir: PathBuf::from("."),
+        completion_contract: None,
         run_mode: cairn_domain::decisions::RunMode::Direct,
         discovered_tool_names: vec![],
         step_history: vec![],
         is_recovery: false,
+        approval_timeout: None,
+        visibility: None,
+        parent_context: None,
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     }
 }
 

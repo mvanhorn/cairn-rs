@@ -1,7 +1,11 @@
+pub mod confinement;
 pub mod events;
+pub mod f65;
 pub mod metadata;
 pub mod policy;
 pub mod service;
+pub mod snapshot_gc;
+pub mod spawn;
 pub mod types;
 
 pub use events::{SandboxCheckpointKind, SandboxErrorKind, SandboxEvent, SandboxPolicySnapshot};
@@ -12,8 +16,23 @@ pub use policy::{
 };
 pub use service::{
     BufferedSandboxEventSink, Clock, SandboxEventSink, SandboxRecoverySummary, SandboxService,
-    SystemClock,
+    SandboxServiceApi, SystemClock,
 };
 pub use types::{
     DestroyResult, ProvisionedSandbox, SandboxCheckpoint, SandboxHandle, SandboxId, SandboxState,
+};
+
+pub use confinement::{
+    ConfinementError, ProbeError, ProbeFindings, ReflinkStatus, SandboxConfinement, Status,
+};
+
+pub use f65::{
+    BufferedF65EventSink, BufferedStamp, BufferedWorkspaceSnapshotWriter, F65SandboxEvent,
+    F65SandboxEventSink, NetworkPolicy, NoopF65EventSink, NoopWorkspaceSnapshotWriter,
+    SessionProvisionSpec, SessionSandbox, SharedF65EventSink, TerminationReason,
+    WorkspaceSnapshotWriter,
+};
+pub use snapshot_gc::{
+    NoopSnapshotGcSource, ReapReason, SnapshotGcCandidate, SnapshotGcPolicy, SnapshotGcSource,
+    SnapshotGcSweeper,
 };

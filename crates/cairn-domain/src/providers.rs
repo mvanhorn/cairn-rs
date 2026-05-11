@@ -47,6 +47,14 @@ pub enum ProviderBudgetPeriod {
     Monthly,
 }
 
+/// Default alert threshold (as a percentage of `limit_micros`) when
+/// `ProviderBudgetSet.alert_threshold_percent` is `None`. Kept in the
+/// domain layer so every projection (InMemory + pg + sqlite) pulls the
+/// same constant and a cross-backend parity test can assert a single
+/// source of truth. Bumping the default is a one-line domain change,
+/// not a six-line projection scatter.
+pub const DEFAULT_BUDGET_ALERT_THRESHOLD_PERCENT: u32 = 80;
+
 /// Tenant-level LLM spend budget record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderBudget {
@@ -242,6 +250,15 @@ pub struct ProviderCallRecord {
     #[serde(default)]
     pub cost_type: ProviderCostType,
     pub error_class: Option<ProviderCallErrorClass>,
+    /// Unix epoch ms when the call was dispatched to the provider (0 if unknown).
+    #[serde(default)]
+    pub started_at_ms: u64,
+    /// Unix epoch ms when the provider response was received (0 if unknown).
+    #[serde(default)]
+    pub finished_at_ms: u64,
+    /// Provider error message (redacted of any secrets) on failure, None on success.
+    #[serde(default)]
+    pub raw_error_message: Option<String>,
 }
 
 impl RouteDecisionRecord {
@@ -435,6 +452,36 @@ pub struct SessionCostRecord {
     pub token_out: u64,
 }
 
+/// F29 CD-2: project-scoped cost rollup record.
+///
+/// Aggregates every `SessionCostUpdated` delta that falls under the same
+/// (tenant, workspace, project) triple. Maintained lifetime-total in v1 —
+/// time-range slicing is a follow-up once a daily-buckets table lands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCostRecord {
+    pub tenant_id: TenantId,
+    pub workspace_id: String,
+    pub project_id: String,
+    /// Lifetime cost accumulated across every session in the project, µUSD.
+    pub total_cost_micros: u64,
+    pub total_tokens_in: u64,
+    pub total_tokens_out: u64,
+    pub provider_calls: u64,
+    pub updated_at_ms: u64,
+}
+
+/// F29 CD-2: workspace-scoped cost rollup record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCostRecord {
+    pub tenant_id: TenantId,
+    pub workspace_id: String,
+    pub total_cost_micros: u64,
+    pub total_tokens_in: u64,
+    pub total_tokens_out: u64,
+    pub provider_calls: u64,
+    pub updated_at_ms: u64,
+}
+
 /// Tenant-level LLM spend alert record.
 ///
 /// A `SpendAlert` is created when session cost for a tenant crosses the
@@ -550,13 +597,88 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 
 /// Errors from provider adapter calls.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ProviderAdapterError {
     TransportFailure(String),
     TimedOut,
     RateLimited,
     ProviderError(String),
     StructuredOutputInvalid(String),
+    /// Authentication/authorization failed (bad API key, expired credential).
+    /// NOT fallback-eligible — the operator must fix credentials.
+    Auth(String),
+    /// Provider rejected the request (400, bad parameters, etc.).
+    /// NOT fallback-eligible — our request is malformed; fallback won't help.
+    InvalidRequest(String),
+    /// HTTP 5xx upstream error — the provider or an upstream of the provider
+    /// (OpenRouter → "OpenInference" 503) returned a server error. Retryable
+    /// with a different model.
+    ServerError {
+        status: u16,
+        message: String,
+    },
+    /// Model returned a successful HTTP response but the completion body was
+    /// empty (zero tokens or whitespace-only text with no tool_calls).
+    /// Distinct from `StructuredOutputInvalid` which carries a non-JSON
+    /// payload; here there is nothing to parse. Fallback-eligible.
+    EmptyResponse {
+        model_id: String,
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+    },
+}
+
+impl ProviderAdapterError {
+    /// Returns `true` when the error is a retryable condition that justifies
+    /// trying a different model in the fallback chain.
+    ///
+    /// The orchestrator DECIDE fallback loop uses this to decide whether to
+    /// advance to the next model or escalate to the operator immediately.
+    ///
+    /// Fallback-eligible:
+    /// - `RateLimited` — model-specific quota; next model may be fine.
+    /// - `ServerError` — upstream 5xx; transient.
+    /// - `TransportFailure` — network hiccup; retrying on a different model
+    ///   (possibly a different provider) may route around a dead connection.
+    /// - `TimedOut` — same as transport failure.
+    /// - `EmptyResponse` / `StructuredOutputInvalid` — this particular model
+    ///   is broken for our prompt; another model may succeed.
+    /// - `ProviderError` — opaque provider error; err on the side of trying
+    ///   the next model rather than failing hard.
+    ///
+    /// NOT fallback-eligible (operator must intervene):
+    /// - `Auth` — credentials are broken; retrying with another model on the
+    ///   same connection will fail the same way. Surface immediately.
+    /// - `InvalidRequest` — our request is malformed; every model will
+    ///   reject it. Bug, not a fallback case.
+    pub fn is_fallback_eligible(&self) -> bool {
+        match self {
+            ProviderAdapterError::Auth(_) | ProviderAdapterError::InvalidRequest(_) => false,
+            ProviderAdapterError::TransportFailure(_)
+            | ProviderAdapterError::TimedOut
+            | ProviderAdapterError::RateLimited
+            | ProviderAdapterError::ProviderError(_)
+            | ProviderAdapterError::StructuredOutputInvalid(_)
+            | ProviderAdapterError::ServerError { .. }
+            | ProviderAdapterError::EmptyResponse { .. } => true,
+        }
+    }
+
+    /// Short machine-readable reason code used in `RouteDecisionRecord`
+    /// attempt tagging and operator-facing summaries.
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            ProviderAdapterError::TransportFailure(_) => "transport_failure",
+            ProviderAdapterError::TimedOut => "timed_out",
+            ProviderAdapterError::RateLimited => "rate_limited",
+            ProviderAdapterError::ProviderError(_) => "provider_error",
+            ProviderAdapterError::StructuredOutputInvalid(_) => "response_format",
+            ProviderAdapterError::Auth(_) => "auth_error",
+            ProviderAdapterError::InvalidRequest(_) => "invalid_request",
+            ProviderAdapterError::ServerError { .. } => "upstream_5xx",
+            ProviderAdapterError::EmptyResponse { .. } => "empty_response",
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderAdapterError {
@@ -569,6 +691,19 @@ impl std::fmt::Display for ProviderAdapterError {
             ProviderAdapterError::StructuredOutputInvalid(msg) => {
                 write!(f, "structured output invalid: {msg}")
             }
+            ProviderAdapterError::Auth(msg) => write!(f, "auth error: {msg}"),
+            ProviderAdapterError::InvalidRequest(msg) => write!(f, "invalid request: {msg}"),
+            ProviderAdapterError::ServerError { status, message } => {
+                write!(f, "upstream {status}: {message}")
+            }
+            ProviderAdapterError::EmptyResponse {
+                model_id,
+                prompt_tokens,
+                completion_tokens,
+            } => write!(
+                f,
+                "empty response from {model_id} (prompt_tokens={prompt_tokens:?}, completion_tokens={completion_tokens:?})"
+            ),
         }
     }
 }
@@ -758,6 +893,9 @@ mod tests {
             cost_micros: Some(9000),
             cost_type: ProviderCostType::Metered,
             error_class: None,
+            started_at_ms: 0,
+            finished_at_ms: 0,
+            raw_error_message: None,
         }];
         let decision = RouteDecisionRecord {
             route_decision_id: "route_decision_1".into(),
@@ -814,6 +952,9 @@ mod tests {
             cost_micros: Some(1000),
             cost_type: ProviderCostType::Metered,
             error_class: Some(ProviderCallErrorClass::ProviderError),
+            started_at_ms: 0,
+            finished_at_ms: 0,
+            raw_error_message: None,
         }];
         let decision = RouteDecisionRecord {
             route_decision_id: "route_decision_1".into(),
@@ -974,6 +1115,9 @@ mod rfc009_tests {
             cost_micros: Some(1200),
             cost_type: ProviderCostType::Metered,
             error_class: None,
+            started_at_ms: 0,
+            finished_at_ms: 0,
+            raw_error_message: None,
         };
 
         // RFC 009: every provider call must link to exactly one route_decision and attempt.
@@ -1124,6 +1268,9 @@ mod rfc009_tests {
             cost_micros: Some(1500),
             cost_type: ProviderCostType::Metered,
             error_class: None,
+            started_at_ms: 0,
+            finished_at_ms: 0,
+            raw_error_message: None,
         };
         assert_eq!(record.cost_type, ProviderCostType::Metered);
         assert!(!record.cost_type.is_free());
@@ -1184,7 +1331,10 @@ pub struct RunCostAlert {
     pub run_id: crate::ids::RunId,
     pub threshold_micros: u64,
     pub triggered_at_ms: u64,
-    #[serde(default)]
+    // Older event-log entries (pre-tenant-scoping) wrote this
+    // struct without `tenant_id`; deserialise those as empty and
+    // let projections back-fill from the enclosing envelope.
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: crate::ids::TenantId,
     #[serde(default)]
     pub actual_cost_micros: u64,
@@ -1196,15 +1346,26 @@ pub struct ProviderHealthSchedule {
     pub binding_id: crate::ids::ProviderBindingId,
     pub interval_ms: u64,
     pub enabled: bool,
-    #[serde(default)]
+    // Pre-tenant-aware schedules omitted `connection_id` +
+    // `tenant_id`; deserialise those as empty IDs so the projection
+    // layer can resolve them from the linked binding record rather
+    // than failing to load.
+    #[serde(default = "crate::ids::empty_provider_connection_id")]
     pub connection_id: crate::ids::ProviderConnectionId,
-    #[serde(default)]
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: crate::ids::TenantId,
     #[serde(default)]
     pub last_run_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+// Deliberately no `#[derive(Default)]` (audit #473): every caller
+// constructs this with an explicit `model_id: ProviderModelId::new(...)`
+// so a blanket `Default` that would have produced an empty-string ID
+// bought nothing and masked the zero-value hazard. Deserialisation
+// still tolerates missing optional fields via `#[serde(default)]`,
+// but `model_id` is always present in the payload (the canonical
+// primary key) so it stays without a default.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderModelCapability {
     pub model_id: crate::ids::ProviderModelId,
     #[serde(default)]
@@ -1232,7 +1393,9 @@ pub struct ProviderConnectionPool {
     pub max_connections: u32,
     #[serde(default)]
     pub active_connections: u32,
-    #[serde(default)]
+    // Pre-tenant-aware pool snapshots omitted `tenant_id`;
+    // projections back-fill from the owning binding when absent.
+    #[serde(default = "crate::ids::empty_tenant_id")]
     pub tenant_id: crate::ids::TenantId,
 }
 

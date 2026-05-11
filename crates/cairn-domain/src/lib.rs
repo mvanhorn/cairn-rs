@@ -1,6 +1,8 @@
 //! Shared domain contracts for Cairn runtime, storage, and product services.
 
 pub mod agent_roles;
+pub mod agent_roles_validation;
+pub mod approvals;
 pub mod audit;
 pub mod bandit;
 pub mod channel;
@@ -8,6 +10,7 @@ pub mod checkpoint_strategy;
 pub mod commands;
 pub mod commercial;
 pub mod compaction;
+pub mod completion_contracts;
 pub mod contexts;
 pub mod credentials;
 pub mod decisions;
@@ -35,6 +38,7 @@ pub mod research;
 pub mod resource_sharing;
 pub mod scheduled_task;
 pub mod selectors;
+pub mod session_orchestration;
 pub mod signal;
 pub mod skills;
 pub mod sla;
@@ -46,12 +50,14 @@ pub mod voice;
 pub mod workers;
 
 pub use agent_roles::*;
+pub use approvals::*;
 pub use audit::*;
 pub use channel::*;
 pub use checkpoint_strategy::*;
 pub use commands::*;
 pub use commercial::*;
 pub use compaction::*;
+pub use completion_contracts::*;
 pub use contexts::*;
 pub use credentials::*;
 pub use decisions::*;
@@ -65,7 +71,7 @@ pub use lifecycle::*;
 pub use notification_prefs::*;
 pub use observability::LlmCallTrace;
 pub use onboarding::*;
-pub use orchestrator::{ActionProposal, ActionType};
+pub use orchestrator::{ActionProposal, ActionType, CommandOutcome, CompletionVerification};
 pub use org::*;
 pub use policy::*;
 pub use prompts::*;
@@ -76,6 +82,10 @@ pub use research::*;
 pub use resource_sharing::*;
 pub use scheduled_task::*;
 pub use selectors::*;
+pub use session_orchestration::{
+    BreakerKind, Checkpoint, CircuitBreakerTrip, IssueBudget, SessionOutcome, TerminationReason,
+    WorkspaceSnapshot,
+};
 pub use signal::*;
 pub use skills::*;
 pub use sla::*;

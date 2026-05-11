@@ -210,37 +210,81 @@ pub trait TaskService: Send + Sync {
 
     /// Spawn a subagent task linked to a parent run.
     ///
-    /// Default impl submits a task with `parent_run_id = Some(parent_run_id)`
-    /// and `priority = 0`. The in-memory impl overrides with an event-log
-    /// path that emits `TaskCreated` + `SubagentSpawned` directly; the
-    /// Fabric adapter inherits the default and routes through
-    /// `FabricTaskService::submit` so FF gets the full flow.
+    /// **#670 G4 PR-1a cross-tenant contract**: this method
+    /// deliberately does NOT accept a `project` parameter. Impls
+    /// MUST derive the child's `ProjectKey` from the parent run's
+    /// row, not from a caller-supplied argument. The production
+    /// impl (`FabricTaskServiceAdapter::spawn_subagent` in
+    /// `cairn-app`) does this via `RunReadModel::get` on its
+    /// `InMemoryStore` handle. The LLM, a role resolver, or any
+    /// future caller therefore has no type-level path to override
+    /// the child's tenancy — a cross-tenant spawn requires breaking
+    /// this signature (detectable by reviewers) rather than passing
+    /// a different argument (silent).
+    ///
+    /// Production impls (the Fabric adapter) override this method
+    /// to emit `RuntimeEvent::SubagentSpawned` so the
+    /// `subagent_spawns` projection captures the parent→child
+    /// linkage + LLM delegation context.
     ///
     /// `child_session_id` / `child_run_id` are carried for the
-    /// `SubagentSpawned` linkage. The default impl ignores them because
-    /// the trait-level surface cannot emit that event without the
-    /// underlying store; impls that need the linkage override this method.
+    /// `SubagentSpawned` linkage.
+    ///
+    /// `goal` is the sub-goal the parent delegated — taken verbatim
+    /// from the LLM's `ActionProposal.tool_args["goal"]` string. `role`
+    /// is the agent role the parent delegated to (one of `executor`,
+    /// `researcher`, `reviewer`, `generic`) — taken from
+    /// `ActionProposal.tool_name`. The execute layer validates both
+    /// before calling this method (see `#670 G2`); impls MUST record
+    /// them on the emitted `SubagentSpawned` event verbatim so the
+    /// projection audit row carries the LLM's actual delegation
+    /// context.
+    ///
+    /// `parent_context` is the optional freeform string the parent
+    /// LLM supplied (#775) — typically a previous-attempt mistake to
+    /// avoid, or workspace context the child should know up front.
+    /// Threaded into the child's first DECIDE prompt under a
+    /// `## Parent context` section. `None` when the parent did not
+    /// provide one. Impls MUST record on the emitted event verbatim.
+    ///
+    /// `reuse_sandbox_from` (#844 PR-2) is the optional escape hatch
+    /// for continuing partial on-disk work across re-spawns. When
+    /// `Some(prior_sibling_run_id)`, the child inherits the named
+    /// prior run's working directory instead of getting a fresh one.
+    /// `None` keeps today's fresh-per-spawn behaviour. Impls MUST
+    /// validate that the referenced run is a **sibling under the
+    /// same root** (i.e. `root_run_id == parent.root_run_id` or
+    /// matches the parent's own id when parent is itself root) AND
+    /// lives in the same project — any other value is rejected as
+    /// `RuntimeError::Validation` so the rejection surfaces via
+    /// step_history and the LLM can correct on the next DECIDE.
+    /// No silent fallback to a fresh sandbox.
+    ///
+    /// The default impl returns an error. `TaskService` has no
+    /// built-in `RunService::get` to derive project from parent, so
+    /// there is no generic way to fulfil the contract from within
+    /// `TaskService`. Impls MUST override. This is not a regression
+    /// — the old default impl accepted a caller-supplied `project`
+    /// which was the very tenancy hole this change closes.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_subagent(
         &self,
-        project: &ProjectKey,
-        parent_run_id: RunId,
+        _parent_run_id: RunId,
         _parent_task_id: Option<TaskId>,
-        child_task_id: TaskId,
-        child_session_id: SessionId,
+        _child_task_id: TaskId,
+        _child_session_id: SessionId,
         _child_run_id: Option<RunId>,
+        _goal: String,
+        _role: String,
+        _parent_context: Option<String>,
+        _reuse_sandbox_from: Option<RunId>,
+        _completion_contract: Option<cairn_domain::completion_contracts::CompletionContract>,
     ) -> Result<TaskRecord, RuntimeError> {
-        // Subagent tasks are scoped to the parent's session so the
-        // child execution co-locates on the session's FlowId partition
-        // with the parent run.
-        self.submit(
-            project,
-            Some(&child_session_id),
-            child_task_id,
-            Some(parent_run_id),
-            None,
-            0,
-        )
-        .await
+        Err(RuntimeError::Internal(
+            "TaskService::spawn_subagent default impl called — impls must \
+             override to derive child project from parent run (#670 G4 PR-1a)"
+                .to_owned(),
+        ))
     }
 }
 

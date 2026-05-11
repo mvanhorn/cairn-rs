@@ -1,11 +1,38 @@
-use ff_script::ScriptError;
+use flowfabric::core::engine_error::{BackendError, EngineError};
+// `flowfabric::script` is re-exported only when the `valkey` or
+// `script-internals` feature is enabled on the umbrella crate. Cairn
+// gates it behind `fabric-valkey` so `--no-default-features` builds do
+// not require the FCALL-loader crate. The `Script` variant below is
+// gated symmetrically.
+#[cfg(feature = "fabric-valkey")]
+use flowfabric::script::ScriptError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FabricError {
     #[error("valkey: {0}")]
     Valkey(String),
+    /// FCALL script loader / dispatch error. Gated behind
+    /// `fabric-valkey`: `ScriptError` lives in `ff-script`, which is
+    /// only pulled in when the Valkey backend is linked.
+    #[cfg(feature = "fabric-valkey")]
     #[error("script: {0}")]
     Script(#[from] ScriptError),
+    /// FF 0.9 typed backend-transport error (FF#277 adoption). Preferred
+    /// over stringly-typed `FabricError::Valkey` for new call sites.
+    /// CG-a introduces the variant + `#[from]`; existing string-based
+    /// errors stay until CH collapses the full error surface. Boxed
+    /// because `BackendError` is ~160 bytes — inlining it triggers
+    /// clippy `result_large_err` across the 20+ functions that return
+    /// `Result<_, FabricError>`.
+    #[error("backend: {0}")]
+    Backend(#[from] Box<BackendError>),
+    /// FF 0.9 typed engine-layer error (FF#277 adoption). `prepare()`,
+    /// `seed_waitpoint_hmac_secret`, `capabilities_matrix`, and
+    /// long-term every `EngineBackend` trait method surface this
+    /// variant. CH migrates per-variant string classifiers. Boxed for
+    /// the same reason as `Backend` — see above.
+    #[error("engine: {0}")]
+    Engine(#[from] Box<EngineError>),
     #[error("config: {0}")]
     Config(String),
     #[error("bridge: {0}")]
@@ -77,6 +104,7 @@ mod tests {
         assert!(err.to_string().contains("channel closed"));
     }
 
+    #[cfg(feature = "fabric-valkey")]
     #[test]
     fn script_error_converts() {
         let script_err = ScriptError::ExecutionNotFound;

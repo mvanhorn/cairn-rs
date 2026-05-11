@@ -1,15 +1,21 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowLeft, Loader2, AlertTriangle, CheckCircle2, Inbox, Download,
+  ArrowLeft, Loader2, AlertTriangle, CheckCircle2, Inbox, Download, Plus,
 } from "lucide-react";
 import { clsx } from "clsx";
 import { StatCard } from "../components/StatCard";
 import { StateBadge } from "../components/StateBadge";
 import { CopyButton } from "../components/CopyButton";
 import { useToast } from "../components/Toast";
+import { NewRunDialog } from "../components/NewRunDialog";
 import { ApiError, defaultApi } from "../lib/api";
+import { errorMessage } from "../lib/errors";
 import { table as tablePreset } from "../lib/design-system";
-import type { RunRecord, SessionState } from "../lib/types";
+import type { RunRecord, SessionCostResponse, SessionState } from "../lib/types";
+import { formatUsd, formatTokens } from "../lib/formatters";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -109,6 +115,11 @@ interface SessionDetailPageProps {
 
 export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps) {
   const toast = useToast();
+  const qc = useQueryClient();
+  // Controls the "New Run" dialog (issue #635). Mounted inline so the
+  // component's own state (goal/iterations/planMode) resets between
+  // openings without a manual reset hook.
+  const [showNewRun, setShowNewRun] = useState(false);
 
   // Fetch session metadata from the list.
   const { data: sessions } = useQuery({
@@ -175,6 +186,38 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
   });
   const traces = tracesData?.traces ?? [];
 
+  // F29 CE — Cumulative session cost. Ships against the existing
+  // `/v1/sessions/:id/cost` endpoint; real pg/sqlite persistence lands
+  // with PR CD-2, the in-memory store is already populated. The
+  // endpoint returns 404 when no cost rows exist yet, which the client
+  // normalises to `null` so this card simply hides.
+  const { data: sessionCost } = useQuery<SessionCostResponse | null>({
+    queryKey: ["session-cost", sessionId],
+    queryFn: () => defaultApi.getSessionCost(sessionId),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    retry: false,
+  });
+
+  // #381: Export session as JSON. Previously a bare promise with no
+  // loading state — operator could double-click and fire parallel
+  // downloads while a long session serialised. Now `useMutation.isPending`
+  // gates the button. Mirrors the `exportRunMut` shape in
+  // `RunDetailPage.tsx` (#380 in this same PR).
+  const exportSessionMut = useMutation({
+    mutationFn: () => defaultApi.exportSession(sessionId),
+    onSuccess: (data) => {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `session-${sessionId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    onError: (e) => toast.error(errorMessage(e, "Export failed.")),
+  });
+
   return (
     <div className="h-full overflow-y-auto bg-gray-50 dark:bg-zinc-900">
       <div className="max-w-4xl mx-auto px-5 py-5 space-y-6">
@@ -195,6 +238,7 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
                 {sessionId}
                 <CopyButton text={sessionId} label="Copy session ID" size={12} />
               </p>
+              <EntityExplainer className="mt-1">{ENTITY_EXPLAINERS.session}</EntityExplainer>
               {session && (
                 <p className="text-[12px] text-gray-400 dark:text-zinc-500 mt-1 font-mono">
                   {session.project.tenant_id}
@@ -209,26 +253,43 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
             </div>
             <div className="flex items-center gap-3 shrink-0">
               {session && <SessionPill state={session.state} />}
+              {/* #635 — primary CTA. Disabled when the session no longer
+                  accepts new runs (terminal states) so the operator does
+                  not kick off work that will immediately fail on the
+                  session_state_gate. Hidden when the session record has
+                  not hydrated yet (fail-closed until we know the state). */}
               <button
-                onClick={() => {
-                  void defaultApi.exportSession(sessionId)
-                    .then(data => {
-                      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-                      const url  = URL.createObjectURL(blob);
-                      const a    = document.createElement('a');
-                      a.href     = url;
-                      a.download = `session-${sessionId}.json`;
-                      a.click();
-                      URL.revokeObjectURL(url);
-                    })
-                    .catch(e => toast.error(`Export failed: ${e instanceof Error ? e.message : String(e)}`));
-                }}
+                data-testid="session-new-run-btn"
+                onClick={() => setShowNewRun(true)}
+                disabled={!session || session.state !== "open"}
+                title={
+                  !session
+                    ? "Loading session…"
+                    : session.state === "open"
+                      ? "Create a new run under this session"
+                      : `Cannot create a run — session is ${session.state}.`
+                }
+                className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
+                           bg-indigo-600 hover:bg-indigo-500 text-white
+                           transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Plus size={12} />
+                New Run
+              </button>
+              <button
+                data-testid="session-export-btn"
+                data-pending={exportSessionMut.isPending ? "true" : "false"}
+                onClick={() => exportSessionMut.mutate()}
+                disabled={exportSessionMut.isPending}
                 title="Export session as JSON"
                 className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
                            border border-gray-200 dark:border-zinc-700 text-gray-500 dark:text-zinc-400 hover:text-gray-800 dark:hover:text-zinc-200 hover:border-zinc-600
-                           bg-gray-50 dark:bg-zinc-900 transition-colors"
+                           bg-gray-50 dark:bg-zinc-900 transition-colors disabled:opacity-50"
               >
-                <Download size={12} /> Export
+                {exportSessionMut.isPending
+                  ? <Loader2 size={12} className="animate-spin" />
+                  : <Download size={12} />}
+                Export
               </button>
             </div>
           </div>
@@ -260,6 +321,44 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
             )}
           />
         </div>
+
+        {/* F29 CE — Cumulative session cost.
+            NOTE: real pg/sqlite persistence lands with PR CD-2; in the
+            interim the in-memory store already populates this endpoint
+            so the card renders useful data for local dev and the
+            integration test suite. Hidden when the endpoint returns
+            404 or when no provider calls have fired yet. */}
+        {sessionCost && sessionCost.provider_calls > 0 && (
+          <div
+            className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-3 py-3 px-4 rounded-lg border border-gray-200 dark:border-zinc-800 bg-gray-50/60 dark:bg-zinc-900/60"
+            data-testid="session-cost-card"
+          >
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-zinc-600">Cumulative cost</p>
+              <p className="text-[14px] font-medium text-gray-900 dark:text-zinc-100 tabular-nums">
+                {formatUsd(sessionCost.total_cost_micros)}
+              </p>
+            </div>
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-zinc-600">Tokens in</p>
+              <p className="text-[14px] font-medium text-gray-900 dark:text-zinc-100 tabular-nums">
+                {formatTokens(sessionCost.total_tokens_in)}
+              </p>
+            </div>
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-zinc-600">Tokens out</p>
+              <p className="text-[14px] font-medium text-gray-900 dark:text-zinc-100 tabular-nums">
+                {formatTokens(sessionCost.total_tokens_out)}
+              </p>
+            </div>
+            <div>
+              <p className="text-[10px] uppercase tracking-wider text-gray-400 dark:text-zinc-600">Provider calls</p>
+              <p className="text-[14px] font-medium text-gray-900 dark:text-zinc-100 tabular-nums">
+                {sessionCost.provider_calls}
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Runs table */}
         <Section title="Runs">
@@ -297,7 +396,20 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
               </div>
             </div>
           ) : runs.length === 0 ? (
-            <p className="text-[13px] text-gray-400 dark:text-zinc-600 italic py-4">No runs in this session.</p>
+            <div className="flex flex-col items-start gap-3 py-4">
+              <p className="text-[13px] text-gray-400 dark:text-zinc-600 italic">No runs in this session yet.</p>
+              {session?.state === "open" && (
+                <button
+                  data-testid="session-new-run-empty-btn"
+                  onClick={() => setShowNewRun(true)}
+                  className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
+                             bg-indigo-600 hover:bg-indigo-500 text-white transition-colors"
+                >
+                  <Plus size={12} />
+                  Create first run
+                </button>
+              )}
+            </div>
           ) : (
             <div className="rounded-lg border border-gray-200 dark:border-zinc-800 overflow-x-auto">
               <table className="min-w-full text-[13px]">
@@ -347,6 +459,30 @@ export function SessionDetailPage({ sessionId, onBack }: SessionDetailPageProps)
             </div>
           )}
         </Section>
+
+        {/* #635 — New-run dialog. Mounted conditionally so the component's
+            local state (goal/iterations/plan-mode) resets cleanly between
+            openings. Navigation to the new run happens inside `onCreated`
+            so operators land on the detail page where orchestration
+            telemetry and logs show up live. */}
+        {showNewRun && (
+          <NewRunDialog
+            sessionId={sessionId}
+            onClose={() => setShowNewRun(false)}
+            onCreated={(run) => {
+              setShowNewRun(false);
+              // Refresh the session's runs list — the created run
+              // should appear immediately in the table above even if
+              // the operator clicks Back to session after landing on
+              // run detail. Also invalidate the global runs list so
+              // the Runs page updates if it is mounted in the
+              // background.
+              void qc.invalidateQueries({ queryKey: ["session-runs", sessionId] });
+              void qc.invalidateQueries({ queryKey: ["runs"] });
+              window.location.hash = `run/${encodeURIComponent(run.run_id)}`;
+            }}
+          />
+        )}
 
         {/* LLM Traces table */}
         <Section title={`LLM Traces${traces.length > 0 ? ` (${traces.length})` : ""}`}>

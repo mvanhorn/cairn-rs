@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use cairn_api::memory_api::{AddDocumentToCorpusRequest, CorpusEndpoints, CreateCorpusRequest};
+use cairn_api_contracts::memory_api::{
+    AddDocumentToCorpusRequest, CorpusEndpoints, CreateCorpusRequest,
+};
 use cairn_domain::{KnowledgeDocumentId, ProjectKey, SourceId};
 use cairn_memory::api_impl::CorpusApiImpl;
 use cairn_memory::in_memory::{InMemoryDocumentStore, InMemoryRetrieval};
@@ -143,7 +145,11 @@ async fn corpus_management_document_count_tracks_membership() {
         .await
         .unwrap();
 
-    let fetched = api.get_corpus(&corpus.corpus_id).await.unwrap().unwrap();
+    let fetched = api
+        .get_corpus(&project(), &corpus.corpus_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fetched.document_count, 0);
 
     for (n, doc_id) in ["doc_ct_1", "doc_ct_2", "doc_ct_3"].iter().enumerate() {
@@ -162,7 +168,11 @@ async fn corpus_management_document_count_tracks_membership() {
             .await
             .unwrap();
 
-        let updated = api.get_corpus(&corpus.corpus_id).await.unwrap().unwrap();
+        let updated = api
+            .get_corpus(&project(), &corpus.corpus_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.document_count, (n + 1) as u32);
     }
 }
@@ -218,6 +228,7 @@ async fn corpus_management_api_add_document_post_ingest() {
     assert!(before.results.is_empty(), "doc not in corpus yet");
 
     api.add_document_to_corpus(
+        &project(),
         &corpus.corpus_id,
         &AddDocumentToCorpusRequest {
             document_id: "doc_post_add".to_owned(),

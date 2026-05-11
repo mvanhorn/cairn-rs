@@ -1,0 +1,2158 @@
+//! Live-Postgres integration tests for every
+//! [`PostgresControlPlane`] trait method.
+//!
+//! # What this binary proves
+//!
+//! Every `Engine` and `ControlPlaneBackend` trait method on
+//! `PostgresControlPlane` is exercised against a real Postgres
+//! container. FF 0.14 closed the final bucket-C gaps (worker registry
+//! via FF#473; `list_incoming_edges` via FF#477), so every method has
+//! a real body and every test asserts behaviour (not a typed
+//! `Unavailable`). The assertions drive through the cairn-side trait,
+//! not the FF backend directly, so a regression on either the
+//! delegation shape or the cairn-mirror vs FF-wire conversion trips
+//! the test.
+//!
+//! # Harness
+//!
+//! - **One Postgres container per test-binary invocation**, shared
+//!   across every `#[tokio::test]` via [`shared_pg`]. The
+//!   `ContainerAsync` handle is held in an `OnceCell` so `Drop` runs
+//!   only when the binary exits.
+//! - **Schema migrations run exactly once** (inside the `OnceCell`
+//!   init) via `ff_backend_postgres::migrate::apply_migrations`.
+//! - **Per-test isolation via UUID suffixes**: every test mints a
+//!   fresh `ExecutionId` / `BudgetId` / `QuotaPolicyId` so parallel
+//!   runs never contend on the same row.
+//!
+//! # Why gated on BOTH `fabric-postgres` and `test-harness`
+//!
+//! - `fabric-postgres` gates the `PostgresControlPlane` symbol + the
+//!   `ff_backend_postgres::PostgresBackend::connect` constructor
+//!   (otherwise the crate isn't linked).
+//! - `test-harness` gates `testcontainers-modules::postgres` (we never
+//!   link the Docker client in production builds).
+//!
+//! Run with:
+//!   cargo test -p cairn-fabric --features "fabric-postgres,test-harness" \
+//!     --test postgres_control_plane_live
+
+#![cfg(all(feature = "fabric-postgres", feature = "test-harness"))]
+// The `#[allow]` on imports keeps the scaffold compilable before
+// per-cluster test bodies land; the bucket-B commits below use every
+// symbol. Delete the attribute once all clusters are wired.
+#![allow(dead_code, unused_imports)]
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+
+use cairn_fabric::engine::control_plane_types::{
+    AddExecutionToFlowInput, ApplyDependencyToChildInput, BudgetSpendOutcome, CancelFlowInput,
+    CancelRunInput, CompleteRunInput, CreateFlowInput, CreateRunExecutionInput,
+    DeliverApprovalSignalInput, EligibilityResult, ExecutionLeaseContext, FailExecutionOutcome,
+    FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput, IssueReclaimGrantInput,
+    IssueReclaimGrantOutcome, QuotaAdmission, ReclaimExecutionInput, ReclaimExecutionOutcome,
+    RenewLeaseInput, ResumeRunInput, StageDependencyEdgeInput, StageDependencyOutcome,
+    SubmitTaskInput,
+};
+use cairn_fabric::engine::{ControlPlaneBackend, Engine, PostgresControlPlane};
+use cairn_fabric::FabricError;
+use ff_backend_postgres::{apply_migrations, PgPool, PostgresBackend};
+use flowfabric::core::engine_backend::EngineBackend;
+use flowfabric::core::engine_error::EngineError;
+use flowfabric::core::partition::PartitionConfig;
+use flowfabric::core::types::{
+    AttemptId, AttemptIndex, BudgetId, EdgeId, ExecutionId, FlowId, LaneId, LeaseEpoch, LeaseId,
+    Namespace, QuotaPolicyId, WaitpointId, WorkerId, WorkerInstanceId,
+};
+use sqlx::postgres::PgPoolOptions;
+use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres as PostgresImage;
+use tokio::sync::OnceCell;
+
+// ── Harness ─────────────────────────────────────────────────────────────
+
+/// Shared Postgres container handle. `_container` is kept alive so the
+/// docker container survives the whole test-binary run; `pool` is the
+/// sqlx pool the FF backend constructs against.
+struct SharedPg {
+    _container: ContainerAsync<PostgresImage>,
+    pool: PgPool,
+    url: String,
+}
+
+static SHARED: OnceCell<Arc<SharedPg>> = OnceCell::const_new();
+
+/// Boot (or reuse) the shared Postgres container + apply FF
+/// migrations. Returns the pool for direct asserts + the full
+/// connection URL for backend `connect` calls.
+async fn shared_pg() -> Arc<SharedPg> {
+    SHARED
+        .get_or_init(|| async {
+            // testcontainers-modules ships `postgres:11-alpine` as the
+            // default tag; FF's migrations trip PG-11's `setrefs.c`
+            // range-table ceiling (`too many range table entries`,
+            // SQLSTATE 54000). Pin to PG 16-alpine, which is the
+            // baseline FF tests on and matches cairn's production
+            // target. `ImageExt::with_tag` is the supported override
+            // per the testcontainers-modules docs.
+            let container = PostgresImage::default()
+                .with_db_name("cairn_test")
+                .with_user("cairn")
+                .with_password("cairn")
+                .with_tag("16-alpine")
+                .start()
+                .await
+                .expect("failed to start postgres container");
+
+            let host = container
+                .get_host()
+                .await
+                .expect("container host unavailable");
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("container port unavailable");
+            let url = format!("postgres://cairn:cairn@{host}:{port}/cairn_test");
+
+            // One-shot pool used solely for `apply_migrations` at boot.
+            // Per-test sqlx work uses `per_test_seed_pool(...)` so each
+            // `#[tokio::test]` runtime owns its own pool's lifetime —
+            // sharing this pool across runtimes manifests as
+            // `"A Tokio 1.x context was found, but it is being shutdown"`
+            // transport errors when one test's runtime ends while
+            // another is mid-await. 4 connections is plenty for the
+            // single migration pass.
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&url)
+                .await
+                .expect("failed to connect to postgres");
+
+            // FF migrations run exactly once (per test binary run).
+            apply_migrations(&pool)
+                .await
+                .expect("failed to apply FF migrations");
+
+            Arc::new(SharedPg {
+                _container: container,
+                pool,
+                url,
+            })
+        })
+        .await
+        .clone()
+}
+
+/// Build a fresh [`PostgresControlPlane`] against the shared
+/// container. One stub per test so each test gets its own backend
+/// handle (mirrors the per-test `FabricServices::start` shape the
+/// Valkey harness uses).
+///
+/// Each test gets its OWN sqlx pool via `PostgresBackend::connect` —
+/// not a clone of the shared one — because cross-runtime pool sharing
+/// breaks tokio's runtime model: `#[tokio::test]` spins up a fresh
+/// runtime per test, and a `PgPool` carries connection-keepalive
+/// background tasks bound to whichever runtime first touched the
+/// pool. Sharing manifests as
+/// `"A Tokio 1.x context was found, but it is being shutdown"`
+/// transport errors when one test's runtime drops while another is
+/// still using the shared pool.
+async fn control_plane() -> Arc<PostgresControlPlane> {
+    let pg = shared_pg().await;
+    let cfg = flowfabric::core::backend::BackendConfig::postgres(pg.url.clone());
+    let backend = PostgresBackend::connect(cfg)
+        .await
+        .expect("PostgresBackend::connect failed");
+    Arc::new(PostgresControlPlane::new(backend))
+}
+
+/// Mint a deterministic ExecutionId co-located on the given flow's
+/// partition. Per RFC-011 §7.3 co-location: when cairn later calls
+/// `add_execution_to_flow` (or `stage_dependency_edge`, etc.), the
+/// PG backend expects the execution row to live on the flow's
+/// partition. `ExecutionId::for_flow` derives the partition from the
+/// flow; we keep the UUID seeded off the test name so parallel runs
+/// stay disjoint within a single partition.
+fn test_eid_for_flow(seed: &str, flow_id: &FlowId) -> ExecutionId {
+    let pc = PartitionConfig::default();
+    let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, seed.as_bytes());
+    ExecutionId::deterministic_for_flow(flow_id, &pc, uuid)
+}
+
+/// Mint a solo ExecutionId (no flow co-location). Use when the test
+/// does not bind the execution into a flow — i.e. bucket-A tag
+/// round-trips, lifecycle tests that operate on unbound executions.
+fn test_eid_solo(seed: &str) -> ExecutionId {
+    let pc = PartitionConfig::default();
+    let uuid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, seed.as_bytes());
+    ExecutionId::deterministic_solo(&LaneId::new("test"), &pc, uuid)
+}
+
+// ── Convenience aliases ─────────────────────────────────────────────
+
+/// Short alias around [`test_eid_solo`] for tests that don't bind to
+/// a flow.
+fn test_eid(seed: &str) -> ExecutionId {
+    test_eid_solo(seed)
+}
+
+/// Fresh flow id per test. Seeded UUID so parallel runs stay disjoint
+/// across the `seed` namespace without colliding on FF's
+/// `flow_partition` slot.
+fn test_flow_id(seed: &str) -> FlowId {
+    let uuid = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_DNS,
+        format!("flow:{seed}").as_bytes(),
+    );
+    FlowId::from_uuid(uuid)
+}
+
+fn lane() -> LaneId {
+    LaneId::new("cairn")
+}
+
+fn namespace() -> Namespace {
+    Namespace::new("cairn-test")
+}
+
+// ── Smoke — harness boots and the stub is callable ────────────────────
+
+#[tokio::test]
+async fn pg_harness_boots_and_control_plane_constructs() {
+    let cp = control_plane().await;
+    // Compile-level assertion that `cp` satisfies both trait
+    // objects (the `Arc<dyn Engine>` / `Arc<dyn ControlPlaneBackend>`
+    // casts exercised by `FabricServices::build_services`).
+    let _engine: Arc<dyn Engine> = cp.clone();
+    let _control_plane: Arc<dyn ControlPlaneBackend> = cp;
+}
+
+// ── Bucket A — direct delegate (3 methods) ─────────────────────────────
+//
+// These methods share identical shapes between cairn's `Engine` trait
+// and FF's `EngineBackend` trait. The test asserts the body routes
+// through the FF backend correctly; the cairn-side fan-out is a
+// one-liner `.map_err(FabricError::Engine(..))`.
+
+/// Set-then-get a tag on an execution: asserts
+/// `set_execution_tag` + `get_execution_tag` both route through the
+/// backend and read back byte-for-byte.
+#[tokio::test]
+async fn pg_set_and_get_execution_tag_roundtrip() {
+    let cp = control_plane().await;
+    // Co-locate the execution on the flow's partition so
+    // `add_execution_to_flow` (PG-side) finds the row under the
+    // flow's `partition_key`.
+    let flow_id = test_flow_id("bucket_a_exec_tag_roundtrip");
+    let eid = test_eid_for_flow("bucket_a_exec_tag_roundtrip", &flow_id);
+
+    // Precondition: an execution must exist in FF before
+    // `set_execution_tag` can write against it. We use the
+    // control-plane's `create_run_execution` — itself a bucket-B
+    // method — so the set-up path also exercises the trait surface.
+    let create = cp
+        .create_run_execution(CreateRunExecutionInput {
+            execution_id: eid.clone(),
+            namespace: namespace(),
+            lane_id: lane(),
+            tags: HashMap::new(),
+            policy_json: String::new(),
+        })
+        .await
+        .expect("create_run_execution precondition failed");
+    assert!(
+        create.newly_created,
+        "fresh execution id must report newly_created=true"
+    );
+
+    // Also bind the execution to a flow so FF's set_execution_tag
+    // path (which resolves flow_id from exec_core) has something to
+    // resolve against.
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("create_flow precondition failed");
+    cp.add_execution_to_flow(AddExecutionToFlowInput {
+        flow_id: flow_id.clone(),
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        flow_kind: "cairn_session".to_owned(),
+    })
+    .await
+    .expect("add_execution_to_flow precondition failed");
+
+    // ── Bucket A under test ──
+    cp.set_execution_tag(&eid, "cairn.task_id", "task-123")
+        .await
+        .expect("set_execution_tag failed");
+
+    let got = cp
+        .get_execution_tag(&eid, "cairn.task_id")
+        .await
+        .expect("get_execution_tag failed");
+    assert_eq!(
+        got.as_deref(),
+        Some("task-123"),
+        "get_execution_tag must read back the value set_execution_tag wrote",
+    );
+
+    // Regression guard: reading an unset key must return `Ok(None)`,
+    // not `Err` — matches the cairn trait contract (absence is not
+    // an error).
+    let missing = cp
+        .get_execution_tag(&eid, "cairn.never_written")
+        .await
+        .expect("get on missing tag must not error");
+    assert!(
+        missing.is_none(),
+        "missing tag must read back as Ok(None); got {missing:?}"
+    );
+}
+
+// ── Bucket B — budget / quota / rotation (7 methods) ──────────────────
+
+#[tokio::test]
+async fn pg_create_budget_roundtrip_and_status() {
+    let cp = control_plane().await;
+    let budget_id = cp
+        .create_budget(
+            "run",
+            &format!("test-run-{}", uuid::Uuid::new_v4()),
+            &["tokens", "cost"],
+            &[1000, 1_000_000],
+            &[800, 800_000],
+            3_600_000,
+            "block",
+        )
+        .await
+        .expect("create_budget failed");
+
+    let status = cp
+        .get_budget_status(&budget_id)
+        .await
+        .expect("get_budget_status failed")
+        .expect("budget must exist after create");
+    assert_eq!(status.budget_id, budget_id.to_string());
+    assert_eq!(status.scope_type, "run");
+    assert_eq!(status.enforcement_mode, "block");
+    assert_eq!(status.hard_limits.get("tokens"), Some(&1000));
+    assert_eq!(status.hard_limits.get("cost"), Some(&1_000_000));
+
+    // Regression guard: missing budget returns Ok(None), not Err.
+    let missing = cp
+        .get_budget_status(&BudgetId::new())
+        .await
+        .expect("get_budget_status on missing must not error");
+    assert!(missing.is_none());
+}
+
+#[tokio::test]
+async fn pg_create_budget_rejects_unequal_vectors() {
+    let cp = control_plane().await;
+    let err = cp
+        .create_budget(
+            "run",
+            "test-mismatch",
+            &["tokens", "cost"],
+            &[1000], // too few hard_limits
+            &[800, 800],
+            3_600_000,
+            "block",
+        )
+        .await
+        .expect_err("must reject unequal vectors");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("equal length"),
+        "expected validation error naming equal-length rule, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn pg_record_spend_roundtrip_and_idempotent_replay() {
+    let cp = control_plane().await;
+    let budget_id = cp
+        .create_budget(
+            "run",
+            &format!("test-spend-{}", uuid::Uuid::new_v4()),
+            &["tokens"],
+            &[1000],
+            &[800],
+            3_600_000,
+            "block",
+        )
+        .await
+        .expect("create_budget failed");
+    let flow_id = test_flow_id("pg_record_spend");
+    let eid = test_eid_for_flow("pg_record_spend", &flow_id);
+
+    let idem_key = format!("prc4a-spend-{}", uuid::Uuid::new_v4());
+    let outcome = cp
+        .record_spend(&budget_id, &eid, &[("tokens", 42)], &idem_key)
+        .await
+        .expect("record_spend failed");
+    assert_eq!(outcome, BudgetSpendOutcome::Ok);
+
+    // Replay with same idempotency key → AlreadyApplied (the dedup
+    // guarantee cairn #454 requires).
+    let replay = cp
+        .record_spend(&budget_id, &eid, &[("tokens", 42)], &idem_key)
+        .await
+        .expect("record_spend replay failed");
+    assert_eq!(replay, BudgetSpendOutcome::AlreadyApplied);
+}
+
+#[tokio::test]
+async fn pg_record_spend_rejects_empty_deltas() {
+    let cp = control_plane().await;
+    let budget_id = BudgetId::new();
+    let eid = test_eid("pg_record_spend_empty");
+    let err = cp
+        .record_spend(&budget_id, &eid, &[], "irrelevant")
+        .await
+        .expect_err("must reject empty dimension_deltas");
+    assert!(err.to_string().contains("at least one dimension_delta"));
+}
+
+#[tokio::test]
+async fn pg_record_spend_rejects_duplicate_dimensions() {
+    let cp = control_plane().await;
+    let budget_id = BudgetId::new();
+    let eid = test_eid("pg_record_spend_dup");
+    let err = cp
+        .record_spend(
+            &budget_id,
+            &eid,
+            &[("tokens", 10), ("tokens", 20)],
+            "irrelevant",
+        )
+        .await
+        .expect_err("must reject duplicate dims");
+    assert!(err.to_string().contains("duplicate dimension"));
+}
+
+#[tokio::test]
+async fn pg_release_budget_is_idempotent() {
+    let cp = control_plane().await;
+    let budget_id = cp
+        .create_budget(
+            "run",
+            &format!("test-release-{}", uuid::Uuid::new_v4()),
+            &["tokens"],
+            &[1000],
+            &[800],
+            3_600_000,
+            "block",
+        )
+        .await
+        .expect("create_budget failed");
+    let flow_id = test_flow_id("pg_release_budget");
+    let eid = test_eid_for_flow("pg_release_budget", &flow_id);
+
+    cp.record_spend(
+        &budget_id,
+        &eid,
+        &[("tokens", 77)],
+        &format!("prc4a-release-{}", uuid::Uuid::new_v4()),
+    )
+    .await
+    .expect("record_spend precondition failed");
+
+    cp.release_budget(&budget_id, &eid)
+        .await
+        .expect("release_budget first call failed");
+    // Release is idempotent.
+    cp.release_budget(&budget_id, &eid)
+        .await
+        .expect("release_budget replay must be idempotent");
+}
+
+#[tokio::test]
+async fn pg_create_quota_policy_and_check_admission() {
+    let cp = control_plane().await;
+    let qid = cp
+        .create_quota_policy(
+            "run",
+            &format!("test-quota-{}", uuid::Uuid::new_v4()),
+            60,
+            10,
+            5,
+        )
+        .await
+        .expect("create_quota_policy failed");
+
+    let flow_id = test_flow_id("pg_check_admission");
+    let eid = test_eid_for_flow("pg_check_admission", &flow_id);
+
+    let decision = cp
+        .check_admission(&qid, &eid, 60, 10, 5)
+        .await
+        .expect("check_admission failed");
+    // Fresh window + execution → must be Admitted.
+    assert_eq!(decision, QuotaAdmission::Admitted);
+
+    // Replay on the same execution → AlreadyAdmitted (idempotent on
+    // `(quota_policy, execution_id)`).
+    let replay = cp
+        .check_admission(&qid, &eid, 60, 10, 5)
+        .await
+        .expect("check_admission replay failed");
+    assert_eq!(replay, QuotaAdmission::AlreadyAdmitted);
+}
+
+#[tokio::test]
+async fn pg_rotate_waitpoint_hmac_rotates_and_noop_on_replay() {
+    let cp = control_plane().await;
+    // Fresh kid per test so parallel runs don't trip each other's
+    // rotation state.
+    let kid = format!("prc4a-{}", uuid::Uuid::new_v4());
+    let secret_hex = "a".repeat(64);
+    let outcome = cp.rotate_waitpoint_hmac(&kid, &secret_hex, 60_000).await;
+    assert_eq!(outcome.new_kid, kid);
+    assert!(
+        outcome.rotated >= 1,
+        "first rotation must report at least one rotated entry (PG: single global row); got {outcome:?}"
+    );
+    assert!(
+        outcome.failed.is_empty(),
+        "first rotation must have no failed entries; got {outcome:?}"
+    );
+
+    // Same kid + same secret → noop.
+    let replay = cp.rotate_waitpoint_hmac(&kid, &secret_hex, 60_000).await;
+    assert!(
+        replay.noop >= 1,
+        "exact-replay rotation must report noop; got {replay:?}"
+    );
+}
+
+// ── Bucket B — flow + execution lifecycle (run/task + flow) ──────────
+//
+// Tests that drive the create/submit/claim/complete axis end-to-end.
+// Each test builds its own flow + execution so parallel runs don't
+// collide on row state.
+
+#[tokio::test]
+async fn pg_create_flow_is_idempotent() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_create_flow_idempotent");
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("first create_flow failed");
+    // Second call with same id must not error (FF's Lua replies
+    // `AlreadySatisfied`; cairn treats as success).
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("replay create_flow must be idempotent");
+}
+
+#[tokio::test]
+async fn pg_create_run_execution_surface_callable() {
+    // FF's PG `create_execution` trait impl always returns
+    // `CreateExecutionResult::Created` on the successful row-write
+    // path (the ON CONFLICT DO NOTHING insert commits both on fresh
+    // + duplicate, and the trait wrapper doesn't expose FF's
+    // `Duplicate` variant today — `ff-backend-postgres-0.13.0/src/lib.rs`
+    // line 943). Cairn's mirror therefore surfaces
+    // `newly_created = true` on both paths. This test asserts only
+    // the first-call shape; the idempotent-replay-as-Duplicate
+    // invariant is covered by the Valkey suite (pr_c2_migrations
+    // T1-equivalent). When FF lifts the Created-vs-Duplicate
+    // distinction upstream on PG, expand this test to assert the
+    // replay path.
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_create_run_surface");
+    let eid = test_eid_for_flow("pg_create_run_surface", &flow_id);
+
+    let outcome = cp
+        .create_run_execution(CreateRunExecutionInput {
+            execution_id: eid.clone(),
+            namespace: namespace(),
+            lane_id: lane(),
+            tags: HashMap::new(),
+            policy_json: String::new(),
+        })
+        .await
+        .expect("create_run_execution failed");
+    assert!(outcome.newly_created);
+
+    // A replay does not error (the write is idempotent via ON
+    // CONFLICT DO NOTHING); we assert it succeeds but do not check
+    // the `newly_created` flag — see docstring above.
+    cp.create_run_execution(CreateRunExecutionInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: lane(),
+        tags: HashMap::new(),
+        policy_json: String::new(),
+    })
+    .await
+    .expect("create_run_execution replay must not error");
+}
+
+#[tokio::test]
+async fn pg_submit_task_execution_with_custom_priority() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_submit_task");
+    let eid = test_eid_for_flow("pg_submit_task", &flow_id);
+
+    let created = cp
+        .submit_task_execution(SubmitTaskInput {
+            execution_id: eid.clone(),
+            namespace: namespace(),
+            lane_id: lane(),
+            priority: 7,
+            tags: HashMap::new(),
+            policy_json: String::new(),
+        })
+        .await
+        .expect("submit_task_execution failed");
+    assert!(created.newly_created);
+}
+
+#[tokio::test]
+async fn pg_add_execution_to_flow_roundtrip() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_add_exec_to_flow");
+    let eid = test_eid_for_flow("pg_add_exec_to_flow", &flow_id);
+
+    cp.create_run_execution(CreateRunExecutionInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: lane(),
+        tags: HashMap::new(),
+        policy_json: String::new(),
+    })
+    .await
+    .expect("create_run_execution precondition failed");
+
+    cp.add_execution_to_flow(AddExecutionToFlowInput {
+        flow_id: flow_id.clone(),
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        flow_kind: "cairn_session".to_owned(),
+    })
+    .await
+    .expect("add_execution_to_flow failed");
+
+    // Idempotent replay.
+    cp.add_execution_to_flow(AddExecutionToFlowInput {
+        flow_id: flow_id.clone(),
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        flow_kind: "cairn_session".to_owned(),
+    })
+    .await
+    .expect("add_execution_to_flow replay must be idempotent");
+}
+
+#[tokio::test]
+async fn pg_cancel_flow_header_and_already_terminal() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_cancel_flow");
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("create_flow precondition failed");
+
+    let outcome = cp
+        .cancel_flow(CancelFlowInput {
+            flow_id: flow_id.clone(),
+            reason: "test-cancel".to_owned(),
+            cancel_mode: "cancel_flow_only".to_owned(),
+        })
+        .await
+        .expect("cancel_flow failed");
+    assert_eq!(outcome, FlowCancelOutcome::Cancelled);
+
+    // Replay → AlreadyTerminal.
+    let replay = cp
+        .cancel_flow(CancelFlowInput {
+            flow_id: flow_id.clone(),
+            reason: "test-cancel".to_owned(),
+            cancel_mode: "cancel_flow_only".to_owned(),
+        })
+        .await
+        .expect("cancel_flow replay failed");
+    assert_eq!(replay, FlowCancelOutcome::AlreadyTerminal);
+}
+
+/// End-to-end lifecycle shape: create_run_execution →
+/// issue_grant_and_claim → complete_run_execution.
+///
+/// PG's create_execution lands the row in `submitted` lifecycle phase
+/// (FF's PG scheduler promotes `submitted` → `runnable` via a
+/// background reconciler — there's no synchronous claim-eligibility
+/// bridge on the trait today). A direct `issue_grant_and_claim` on a
+/// still-`submitted` row returns
+/// `EngineError::Contention(ExecutionNotActive{...})`. This test
+/// therefore asserts the **shape** of the lifecycle delegations —
+/// the claim call dispatches correctly, surfaces a typed error that
+/// matches FF's contention variant, AND the operator-override cancel
+/// path still works against a submitted-phase row. The full
+/// runnable-to-complete happy path is covered by the Valkey-side
+/// `pr_c2_migrations` suite (T4); Postgres parity on the scheduler
+/// promotion hop is an RFC-020-Wave-9 follow-up item.
+#[tokio::test]
+async fn pg_run_lifecycle_create_claim_surface_routes() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_run_lifecycle");
+    let eid = test_eid_for_flow("pg_run_lifecycle", &flow_id);
+
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("create_flow precondition failed");
+    cp.create_run_execution(CreateRunExecutionInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: lane(),
+        tags: HashMap::new(),
+        policy_json: String::new(),
+    })
+    .await
+    .expect("create_run_execution precondition failed");
+    cp.add_execution_to_flow(AddExecutionToFlowInput {
+        flow_id: flow_id.clone(),
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        flow_kind: "cairn_session".to_owned(),
+    })
+    .await
+    .expect("add_execution_to_flow precondition failed");
+
+    // Claim — PG's scheduler promotes `submitted` → `runnable`
+    // asynchronously, so a direct claim against a just-created
+    // execution surfaces as Contention(ExecutionNotActive). Accept
+    // either success (row was promoted between our create + claim)
+    // or a typed Contention error; both prove the delegation path
+    // reaches FF's claim validator with the right args.
+    let claim_result = cp
+        .issue_grant_and_claim(IssueGrantAndClaimInput {
+            execution_id: eid.clone(),
+            lane_id: lane(),
+            lease_duration_ms: 30_000,
+        })
+        .await;
+    match claim_result {
+        Ok(grant) => {
+            assert!(grant.lease_epoch.0 >= 1);
+        }
+        Err(FabricError::Engine(e)) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("ExecutionNotActive") || msg.contains("contention"),
+                "expected ExecutionNotActive contention, got: {msg}"
+            );
+        }
+        Err(other) => panic!("unexpected non-Engine failure on claim: {other}"),
+    }
+
+    // Operator-override cancel path works regardless of lifecycle
+    // phase — FF's cancel_execution gates on the override source
+    // before lease validation.
+    let lease_ctx = ExecutionLeaseContext {
+        lane_id: lane(),
+        attempt_index: AttemptIndex::new(0),
+        lease_id: String::new(),
+        lease_epoch: String::new(),
+        attempt_id: String::new(),
+        worker_instance_id: WorkerInstanceId::new("cairn"),
+        source: "operator_override".to_owned(),
+    };
+    cp.cancel_run_execution(CancelRunInput {
+        execution_id: eid.clone(),
+        lease: lease_ctx,
+        current_waitpoint: None,
+    })
+    .await
+    .expect("operator-override cancel must succeed");
+}
+
+#[tokio::test]
+async fn pg_cancel_run_execution_via_operator_override() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_cancel_run_override");
+    let eid = test_eid_for_flow("pg_cancel_run_override", &flow_id);
+
+    cp.create_run_execution(CreateRunExecutionInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: lane(),
+        tags: HashMap::new(),
+        policy_json: String::new(),
+    })
+    .await
+    .expect("create_run_execution precondition failed");
+
+    // Empty fence triple + operator_override source → FF accepts
+    // without stale-lease validation. Matches cairn's
+    // `ExecutionLeaseContext::unfenced` pattern.
+    let lease_ctx = ExecutionLeaseContext {
+        lane_id: lane(),
+        attempt_index: AttemptIndex::new(0),
+        lease_id: String::new(),
+        lease_epoch: String::new(),
+        attempt_id: String::new(),
+        worker_instance_id: WorkerInstanceId::new("cairn"),
+        source: "operator_override".to_owned(),
+    };
+    cp.cancel_run_execution(CancelRunInput {
+        execution_id: eid.clone(),
+        lease: lease_ctx,
+        current_waitpoint: None,
+    })
+    .await
+    .expect("cancel_run_execution (operator override) failed");
+}
+
+#[tokio::test]
+async fn pg_describe_execution_reads_back_created_execution() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_describe_exec");
+    let eid = test_eid_for_flow("pg_describe_exec", &flow_id);
+
+    let mut tags = HashMap::new();
+    tags.insert("cairn.run_id".to_owned(), "run-abc".to_owned());
+    tags.insert("cairn.project".to_owned(), "proj-xyz".to_owned());
+
+    cp.create_run_execution(CreateRunExecutionInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: lane(),
+        tags,
+        policy_json: String::new(),
+    })
+    .await
+    .expect("create_run_execution precondition failed");
+
+    let snap = cp
+        .describe_execution(&eid)
+        .await
+        .expect("describe_execution failed")
+        .expect("snapshot must be present after create");
+    assert_eq!(snap.execution_id, eid);
+    assert_eq!(snap.lane_id, lane());
+    assert_eq!(snap.namespace, namespace());
+    assert!(
+        !snap.public_state.is_empty(),
+        "public_state must be populated"
+    );
+    // Tags should round-trip (FF's describe merges the tags JSON).
+    assert_eq!(
+        snap.tags.get("cairn.run_id").map(String::as_str),
+        Some("run-abc")
+    );
+    assert_eq!(
+        snap.tags.get("cairn.project").map(String::as_str),
+        Some("proj-xyz")
+    );
+
+    // Missing execution → Ok(None).
+    let ghost = test_eid_solo(&format!("ghost-{}", uuid::Uuid::new_v4()));
+    let missing = cp
+        .describe_execution(&ghost)
+        .await
+        .expect("describe on missing must not error");
+    assert!(missing.is_none());
+}
+
+#[tokio::test]
+async fn pg_describe_flow_reads_back_created_flow() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_describe_flow");
+
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("create_flow precondition failed");
+
+    let snap = cp
+        .describe_flow(&flow_id)
+        .await
+        .expect("describe_flow failed")
+        .expect("flow snapshot must be present");
+    assert_eq!(snap.flow_id, flow_id);
+    assert_eq!(snap.kind, "cairn_session");
+    assert_eq!(snap.namespace, namespace());
+}
+
+#[tokio::test]
+async fn pg_get_execution_lane_id_reads_back_lane() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_get_exec_lane");
+    let eid = test_eid_for_flow("pg_get_exec_lane", &flow_id);
+
+    cp.create_run_execution(CreateRunExecutionInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: LaneId::new("custom-lane"),
+        tags: HashMap::new(),
+        policy_json: String::new(),
+    })
+    .await
+    .expect("create_run_execution precondition failed");
+
+    let got = cp
+        .get_execution_lane_id(&eid)
+        .await
+        .expect("get_execution_lane_id failed")
+        .expect("lane must be present after create");
+    assert_eq!(got, LaneId::new("custom-lane"));
+
+    let ghost = test_eid_solo(&format!("ghost-lane-{}", uuid::Uuid::new_v4()));
+    let missing = cp
+        .get_execution_lane_id(&ghost)
+        .await
+        .expect("get on missing must not error");
+    assert!(missing.is_none());
+}
+
+// ── Bucket B — set_flow_tags bulk (loop over set_flow_tag) ────────────
+
+#[tokio::test]
+async fn pg_set_flow_tags_bulk_persists_all() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_set_flow_tags_bulk");
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("create_flow precondition failed");
+
+    let mut tags = BTreeMap::new();
+    tags.insert("cairn.project".to_owned(), "proj-1".to_owned());
+    tags.insert("cairn.session_id".to_owned(), "sess-1".to_owned());
+    cp.set_flow_tags(&flow_id, &tags)
+        .await
+        .expect("set_flow_tags failed");
+
+    // Empty map → no-op Ok(()).
+    cp.set_flow_tags(&flow_id, &BTreeMap::new())
+        .await
+        .expect("set_flow_tags on empty must no-op");
+
+    // Verify both keys persisted.
+    for (k, v) in &tags {
+        let got = cp
+            .backend
+            .get_flow_tag(&flow_id, k)
+            .await
+            .expect("get_flow_tag failed");
+        assert_eq!(got.as_deref(), Some(v.as_str()), "tag {k} must persist");
+    }
+}
+
+// ── Bucket B — dependency staging + eligibility ──────────────────────
+
+#[tokio::test]
+async fn pg_stage_and_apply_dependency_edge() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_stage_apply_dep");
+    let upstream = test_eid_for_flow("pg_dep_upstream", &flow_id);
+    let downstream = test_eid_for_flow("pg_dep_downstream", &flow_id);
+
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("create_flow precondition failed");
+    for (seed, eid) in [("up", &upstream), ("down", &downstream)] {
+        cp.create_run_execution(CreateRunExecutionInput {
+            execution_id: eid.clone(),
+            namespace: namespace(),
+            lane_id: lane(),
+            tags: HashMap::new(),
+            policy_json: String::new(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("create {seed} exec failed: {e}"));
+        cp.add_execution_to_flow(AddExecutionToFlowInput {
+            flow_id: flow_id.clone(),
+            execution_id: eid.clone(),
+            namespace: namespace(),
+            flow_kind: "cairn_session".to_owned(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("add {seed} to flow failed: {e}"));
+    }
+
+    // `graph_revision` is bumped by `add_execution_to_flow` —
+    // read the current value first so our CAS check on
+    // `stage_dependency_edge` doesn't trip the stale-revision guard.
+    let flow_snap = cp
+        .describe_flow(&flow_id)
+        .await
+        .expect("describe_flow failed")
+        .expect("flow snapshot must be present");
+    let current_rev = flow_snap.graph_revision;
+
+    let edge_id = EdgeId::new();
+    let outcome = cp
+        .stage_dependency_edge(StageDependencyEdgeInput {
+            flow_id: flow_id.clone(),
+            edge_id: edge_id.clone(),
+            upstream_execution_id: upstream.clone(),
+            downstream_execution_id: downstream.clone(),
+            dependency_kind: "success_only".to_owned(),
+            data_passing_ref: String::new(),
+            expected_graph_revision: current_rev,
+        })
+        .await
+        .expect("stage_dependency_edge failed");
+    let new_rev = match outcome {
+        StageDependencyOutcome::Staged { new_graph_revision } => new_graph_revision,
+        other => panic!("expected Staged, got {other:?}"),
+    };
+    assert!(new_rev > current_rev);
+
+    cp.apply_dependency_to_child(ApplyDependencyToChildInput {
+        downstream_execution_id: downstream.clone(),
+        flow_id: flow_id.clone(),
+        upstream_execution_id: upstream.clone(),
+        edge_id: edge_id.clone(),
+        lane_id: lane(),
+        graph_revision: new_rev,
+        dependency_kind: "success_only".to_owned(),
+        data_passing_ref: String::new(),
+    })
+    .await
+    .expect("apply_dependency_to_child failed");
+
+    // Downstream has an unsatisfied incoming edge + (on PG) may
+    // still be in the `submitted` lifecycle phase. FF's PG
+    // evaluator returns either `blocked_by_dependencies` when the
+    // scheduler has already promoted the exec out of `submitted`,
+    // or `not_runnable` (surfaced as `EligibilityResult::Other`)
+    // while the row is still in the pre-promotion phase. Both are
+    // semantically "not currently eligible to run" — accept either.
+    let eligibility = cp
+        .evaluate_flow_eligibility(&downstream)
+        .await
+        .expect("evaluate_flow_eligibility failed");
+    assert!(
+        matches!(
+            eligibility,
+            EligibilityResult::BlockedByDependencies | EligibilityResult::Other(_)
+        ) && !matches!(eligibility, EligibilityResult::Eligible),
+        "downstream with unsatisfied dep must NOT be Eligible; got {eligibility:?}"
+    );
+
+    // Re-declaring the exact same edge is caught by FF's typed
+    // reject path; cairn maps it to `AlreadyExists`.
+    let dup = cp
+        .stage_dependency_edge(StageDependencyEdgeInput {
+            flow_id: flow_id.clone(),
+            edge_id: edge_id.clone(),
+            upstream_execution_id: upstream.clone(),
+            downstream_execution_id: downstream.clone(),
+            dependency_kind: "success_only".to_owned(),
+            data_passing_ref: String::new(),
+            expected_graph_revision: new_rev,
+        })
+        .await
+        .expect("stage_dependency_edge duplicate failed");
+    // Accepted outcomes on duplicate re-stage: AlreadyExists (FF's
+    // typed reject) OR a fresh `Staged` on a revision bump. PG's
+    // idempotent reply is AlreadyExists today.
+    assert!(
+        matches!(
+            dup,
+            StageDependencyOutcome::AlreadyExists | StageDependencyOutcome::Staged { .. }
+        ),
+        "expected AlreadyExists or Staged, got {dup:?}"
+    );
+}
+
+// ── Bucket B — remaining lifecycle surfaces ──────────────────────────
+
+/// `resume_run_execution` on a just-created execution is a no-op in
+/// the FF Lua contract (execution not suspended → typed reject).
+/// Assert the delegation path reaches FF's validator with the right
+/// args — either OK (PG reconciler promoted it) or a typed state-
+/// kind error.
+#[tokio::test]
+async fn pg_resume_run_execution_surface_routes() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_resume_run");
+    let eid = test_eid_for_flow("pg_resume_run", &flow_id);
+
+    cp.create_run_execution(CreateRunExecutionInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: lane(),
+        tags: HashMap::new(),
+        policy_json: String::new(),
+    })
+    .await
+    .expect("create_run_execution precondition failed");
+
+    let result = cp
+        .resume_run_execution(ResumeRunInput {
+            execution_id: eid.clone(),
+            lane_id: lane(),
+            waitpoint_id: None,
+            resume_source: "signal".to_owned(),
+        })
+        .await;
+    // Valid outcomes: Ok (row was in suspended state) OR Err(Engine
+    // (State(ExecutionNotSuspended))) — both prove the delegation
+    // path works.
+    match result {
+        Ok(()) => {}
+        Err(FabricError::Engine(e)) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("state") || msg.contains("NotSuspended"),
+                "expected state-class reject, got: {msg}"
+            );
+        }
+        Err(other) => panic!("unexpected non-Engine failure: {other}"),
+    }
+}
+
+/// `fail_run_execution` via operator-override: empty fence + source
+/// = operator_override → FF accepts without lease validation.
+#[tokio::test]
+async fn pg_fail_run_execution_via_operator_override() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_fail_run_override");
+    let eid = test_eid_for_flow("pg_fail_run_override", &flow_id);
+
+    cp.create_run_execution(CreateRunExecutionInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: lane(),
+        tags: HashMap::new(),
+        policy_json: String::new(),
+    })
+    .await
+    .expect("create_run_execution precondition failed");
+
+    let lease_ctx = ExecutionLeaseContext {
+        lane_id: lane(),
+        attempt_index: AttemptIndex::new(0),
+        lease_id: String::new(),
+        lease_epoch: String::new(),
+        attempt_id: String::new(),
+        worker_instance_id: WorkerInstanceId::new("cairn"),
+        source: "operator_override".to_owned(),
+    };
+    // Execution lands in `submitted` on PG's async-promotion path;
+    // a fail call against an unclaimed row reaches FF's
+    // operator-override validator. Assert the specific outcome:
+    // either `TerminalFailed` (FF accepted the override) or a
+    // typed `State` / `Validation` `EngineError` — NOT a generic
+    // error, and not panics or silent success.
+    use flowfabric::core::engine_error::EngineError;
+    let result = cp
+        .fail_run_execution(FailRunInput {
+            execution_id: eid.clone(),
+            lease: lease_ctx,
+            reason: "test-fail".to_owned(),
+            category: "failed".to_owned(),
+            retry_policy_json: String::new(),
+        })
+        .await;
+    match result {
+        Ok(outcome) => {
+            assert!(
+                matches!(
+                    outcome,
+                    FailExecutionOutcome::TerminalFailed | FailExecutionOutcome::RetryScheduled
+                ),
+                "fail outcome must be typed; got {outcome:?}"
+            );
+        }
+        Err(FabricError::Engine(boxed)) => {
+            // PG returns `NotFound { entity: "attempt" }` when the
+            // override-fail hits an unclaimed execution (no attempt
+            // row exists yet). `State` / `Validation` are the other
+            // typed classes FF reserves for this path; all three
+            // are "fail reached the validator and rejected cleanly".
+            assert!(
+                matches!(
+                    boxed.as_ref(),
+                    EngineError::State(_)
+                        | EngineError::Validation { .. }
+                        | EngineError::NotFound { .. }
+                ),
+                "fail reject must be State / Validation / NotFound class; got {boxed:?}"
+            );
+        }
+        Err(other) => panic!("unexpected non-Engine failure: {other}"),
+    }
+}
+
+/// `renew_task_lease` requires a fully-populated fence triple (FF
+/// has no operator-override path on renew). Pass a synthetic triple
+/// against a just-created execution and assert the delegation path
+/// surfaces a typed fence-class reject (state: StaleLease or similar).
+#[tokio::test]
+async fn pg_renew_task_lease_surface_routes() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_renew_task");
+    let eid = test_eid_for_flow("pg_renew_task", &flow_id);
+
+    cp.submit_task_execution(SubmitTaskInput {
+        execution_id: eid.clone(),
+        namespace: namespace(),
+        lane_id: lane(),
+        priority: 0,
+        tags: HashMap::new(),
+        policy_json: String::new(),
+    })
+    .await
+    .expect("submit_task_execution precondition failed");
+
+    let lease_ctx = ExecutionLeaseContext {
+        lane_id: lane(),
+        attempt_index: AttemptIndex::new(0),
+        lease_id: LeaseId::new().to_string(),
+        lease_epoch: "1".to_owned(),
+        attempt_id: AttemptId::new().to_string(),
+        worker_instance_id: WorkerInstanceId::new("cairn"),
+        source: "lease_holder".to_owned(),
+    };
+    let result = cp
+        .renew_task_lease(RenewLeaseInput {
+            execution_id: eid.clone(),
+            lease: lease_ctx,
+            lease_extension_ms: 60_000,
+        })
+        .await;
+    // Must reject — the synthetic fence doesn't match any live
+    // lease. Assert the specific reject class: FF signals a
+    // non-matching fence on `renew_lease` as a typed
+    // `State(StaleLease)` (lease superseded), `State(LeaseExpired)`
+    // (lease TTL elapsed), `Validation` (fence_required when fence
+    // is empty), or `NotFound` (lease row doesn't exist yet). A
+    // generic `Engine` match was previously accepted; tightening
+    // here guards against a future FF change that surfaces a
+    // `Transport`-class error instead, which would hide a real
+    // regression.
+    use flowfabric::core::engine_error::EngineError;
+    match result {
+        Err(FabricError::Engine(boxed)) => {
+            assert!(
+                matches!(
+                    boxed.as_ref(),
+                    EngineError::State(_)
+                        | EngineError::Validation { .. }
+                        | EngineError::NotFound { .. }
+                ),
+                "renew_task_lease reject must be State / Validation / NotFound class; got {boxed:?}"
+            );
+        }
+        other => panic!(
+            "renew_task_lease on synthetic fence must reject with typed Engine error; got {other:?}"
+        ),
+    }
+}
+
+/// `describe_edge` on a live flow-scoped edge returns the FF edge
+/// snapshot reshaped into cairn's shape. Piggybacks on the dep-stage
+/// test setup pattern.
+#[tokio::test]
+async fn pg_describe_edge_after_stage() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("pg_describe_edge");
+    let upstream = test_eid_for_flow("pg_describe_edge_up", &flow_id);
+    let downstream = test_eid_for_flow("pg_describe_edge_down", &flow_id);
+
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("create_flow precondition failed");
+    for eid in [&upstream, &downstream] {
+        cp.create_run_execution(CreateRunExecutionInput {
+            execution_id: eid.clone(),
+            namespace: namespace(),
+            lane_id: lane(),
+            tags: HashMap::new(),
+            policy_json: String::new(),
+        })
+        .await
+        .expect("create_run_execution precondition failed");
+        cp.add_execution_to_flow(AddExecutionToFlowInput {
+            flow_id: flow_id.clone(),
+            execution_id: eid.clone(),
+            namespace: namespace(),
+            flow_kind: "cairn_session".to_owned(),
+        })
+        .await
+        .expect("add_execution_to_flow precondition failed");
+    }
+
+    let flow_snap = cp
+        .describe_flow(&flow_id)
+        .await
+        .expect("describe_flow failed")
+        .expect("flow snapshot must be present");
+
+    let edge_id = EdgeId::new();
+    cp.stage_dependency_edge(StageDependencyEdgeInput {
+        flow_id: flow_id.clone(),
+        edge_id: edge_id.clone(),
+        upstream_execution_id: upstream.clone(),
+        downstream_execution_id: downstream.clone(),
+        dependency_kind: "success_only".to_owned(),
+        data_passing_ref: "payload-ref".to_owned(),
+        expected_graph_revision: flow_snap.graph_revision,
+    })
+    .await
+    .expect("stage_dependency_edge precondition failed");
+
+    let edge = cp
+        .describe_edge(&flow_id, &edge_id)
+        .await
+        .expect("describe_edge failed")
+        .expect("edge must be present after stage");
+    assert_eq!(edge.edge_id, edge_id);
+    assert_eq!(edge.flow_id, flow_id);
+    assert_eq!(edge.upstream_execution_id, upstream);
+    assert_eq!(edge.downstream_execution_id, downstream);
+    assert_eq!(edge.kind, "success_only");
+    assert_eq!(edge.data_passing_ref.as_deref(), Some("payload-ref"));
+
+    // Missing edge → Ok(None).
+    let ghost = EdgeId::new();
+    let missing = cp
+        .describe_edge(&flow_id, &ghost)
+        .await
+        .expect("describe_edge on missing must not error");
+    assert!(missing.is_none());
+}
+
+/// `deliver_approval_signal` requires a suspended execution with an
+/// active waitpoint. Without the full suspend-flow plumbing (which
+/// requires a complete claim-suspend-deliver cycle on PG's async
+/// scheduler), this test asserts only the request-shape delegation:
+/// a call with a synthetic waitpoint id surfaces a typed
+/// NotFound / state-class reject, proving the delegation path.
+#[tokio::test]
+async fn pg_deliver_approval_signal_surface_routes() {
+    let cp = control_plane().await;
+    let eid = test_eid(&format!("pg_deliver_approval-{}", uuid::Uuid::new_v4()));
+    let waitpoint_id = WaitpointId::new();
+
+    let result = cp
+        .deliver_approval_signal(DeliverApprovalSignalInput {
+            execution_id: eid,
+            lane_id: lane(),
+            waitpoint_id,
+            signal_name: "approved".to_owned(),
+            idempotency_suffix: "test-decision".to_owned(),
+            signal_dedup_ttl_ms: 86_400_000,
+            maxlen: 10_000,
+            max_signals_per_execution: 10_000,
+        })
+        .await;
+    // Assert the specific reject class: FF's
+    // `deliver_approval_signal` server-reads the HMAC waitpoint
+    // token from `ff_waitpoint_pending`; when the waitpoint doesn't
+    // exist this surfaces as `NotFound { entity: "waitpoint" }`,
+    // `Contention(WaitpointNotFound)`, or `Validation` (malformed
+    // waitpoint id). A generic `Engine` match was previously
+    // accepted; tightening here guards against a silent fallback
+    // to a `Transport`-class error that would hide a regression in
+    // the server-side token-read path.
+    use flowfabric::core::engine_error::EngineError;
+    match result {
+        Err(FabricError::Engine(boxed)) => {
+            assert!(
+                matches!(
+                    boxed.as_ref(),
+                    EngineError::NotFound { .. }
+                        | EngineError::Contention(_)
+                        | EngineError::Validation { .. }
+                        | EngineError::State(_)
+                ),
+                "deliver_approval_signal reject on ghost waitpoint must be \
+                 NotFound / Contention / Validation / State class; got {boxed:?}"
+            );
+        }
+        other => panic!(
+            "deliver_approval_signal on ghost waitpoint must reject with typed Engine error; got {other:?}"
+        ),
+    }
+}
+
+// ── Remaining bucket-A test (flow-tag persists) ────────────────────────
+
+/// Set a tag on a flow: asserts `set_flow_tag` routes through the
+/// backend. We round-trip via FF's backend's `get_flow_tag` (the
+/// cairn `Engine` trait doesn't expose a `get_flow_tag`, but FF's
+/// trait does — that's how we observe the write).
+#[tokio::test]
+async fn pg_set_flow_tag_persists() {
+    let cp = control_plane().await;
+    let flow_id = test_flow_id("bucket_a_flow_tag");
+
+    cp.create_flow(CreateFlowInput {
+        flow_id: flow_id.clone(),
+        flow_kind: "cairn_session".to_owned(),
+        namespace: namespace(),
+    })
+    .await
+    .expect("create_flow precondition failed");
+
+    cp.set_flow_tag(&flow_id, "cairn.archived", "true")
+        .await
+        .expect("set_flow_tag failed");
+
+    // Observe via FF's backend trait — cairn's own `Engine` trait
+    // doesn't expose a `get_flow_tag` (flow tag reads happen through
+    // `describe_flow`'s `.tags` field, which we exercise separately
+    // in the bucket-B tests).
+    let got = cp
+        .backend
+        .get_flow_tag(&flow_id, "cairn.archived")
+        .await
+        .expect("get_flow_tag failed");
+    assert_eq!(
+        got.as_deref(),
+        Some("true"),
+        "get_flow_tag must read back the value set_flow_tag wrote",
+    );
+}
+
+// ── FF 0.14 — previously bucket-C methods, now real delegates ─────────
+//
+// FF 0.14 closed FF#473 (worker registry) + FF#477 (list_incoming_edges
+// composition). Every method below used to return
+// `EngineError::Unavailable { op }` on PG; now they route through the
+// EngineBackend trait with Postgres-native bodies. These tests assert
+// the delegation + cairn-mirror ↔ FF-wire conversion round-trip.
+
+/// Fresh namespace per test so parallel runs never collide on FF's
+/// namespace-scoped worker registry keys (RFC-025 §9.1).
+fn test_namespace(seed: &str) -> Namespace {
+    Namespace::new(format!("pg_test_{seed}_{}", uuid::Uuid::new_v4()))
+}
+
+/// End-to-end round-trip for the worker-registry trait surface that
+/// landed with FF 0.14 / RFC-025 (`register_worker` →
+/// `heartbeat_worker` → `list_workers` → `mark_worker_dead`). Exercises
+/// the delegation + cairn-mirror ↔ FF-wire conversion on the PG
+/// control-plane path, alongside the Valkey coverage in
+/// `crates/cairn-fabric/tests/integration/test_control_plane.rs`.
+///
+/// Un-ignored in FF 0.14.1 (FlowFabric PR #509 fixed the upstream
+/// `RETURNING (xmax = 0)` bug; cairn #508 tracked the cairn-side
+/// gap).
+#[tokio::test]
+async fn pg_register_heartbeat_mark_dead_roundtrip() {
+    let cp = control_plane().await;
+    let ns = test_namespace("register_roundtrip");
+    let wid = WorkerId::new("cairn-worker-pg");
+    let iid = WorkerInstanceId::new(format!("cairn-worker-pg-i-{}", uuid::Uuid::new_v4()));
+    let lanes: BTreeSet<LaneId> = ["default".to_owned()]
+        .into_iter()
+        .map(LaneId::new)
+        .collect();
+    let caps: BTreeSet<String> = ["gpu=true".to_owned(), "arch=x86_64".to_owned()]
+        .into_iter()
+        .collect();
+
+    // Register — must return an echo row with epoch-scale timestamp.
+    let reg = cp
+        .register_worker(&wid, &iid, &ns, &lanes, &caps, 60_000)
+        .await
+        .expect("register_worker on PG");
+    assert_eq!(reg.worker_id, wid);
+    assert_eq!(reg.instance_id, iid);
+    assert!(
+        reg.registered_at_ms > 1_700_000_000_000,
+        "registered_at_ms must be a real epoch ms, got {}",
+        reg.registered_at_ms
+    );
+    assert!(
+        reg.capabilities.contains(&"gpu=true".to_owned())
+            && reg.capabilities.contains(&"arch=x86_64".to_owned()),
+        "register must echo caps verbatim, got {:?}",
+        reg.capabilities
+    );
+
+    // Heartbeat — on a live instance must succeed.
+    cp.heartbeat_worker(&iid, &ns)
+        .await
+        .expect("heartbeat_worker on PG");
+
+    // list_workers must surface our instance.
+    let workers = cp
+        .list_workers(Some(&ns))
+        .await
+        .expect("list_workers on PG");
+    assert!(
+        workers.iter().any(|w| w.instance_id == iid),
+        "registered instance must appear in list_workers; got {:?}",
+        workers.iter().map(|w| &w.instance_id).collect::<Vec<_>>()
+    );
+
+    // Mark dead — must succeed (and be idempotent).
+    cp.mark_worker_dead(&iid, &ns, "test_shutdown")
+        .await
+        .expect("mark_worker_dead on PG");
+    cp.mark_worker_dead(&iid, &ns, "test_shutdown_replay")
+        .await
+        .expect("mark_worker_dead idempotent replay on PG");
+}
+
+/// Idempotent-refresh contract: re-registering the SAME
+/// `WorkerInstanceId` with different capabilities must succeed (not
+/// error) and must overwrite the caps on the existing row.
+/// Un-ignored in FF 0.14.1 alongside
+/// `pg_register_heartbeat_mark_dead_roundtrip`.
+#[tokio::test]
+async fn pg_register_worker_is_idempotent_on_same_instance() {
+    let cp = control_plane().await;
+    let ns = test_namespace("register_idempotent");
+    let wid = WorkerId::new("cairn-worker-pg-idem");
+    let iid = WorkerInstanceId::new(format!("cairn-worker-pg-idem-i-{}", uuid::Uuid::new_v4()));
+    let lanes: BTreeSet<LaneId> = ["default".to_owned()]
+        .into_iter()
+        .map(LaneId::new)
+        .collect();
+    let caps_v1: BTreeSet<String> = ["v=1".to_owned()].into_iter().collect();
+    let caps_v2: BTreeSet<String> = ["v=2".to_owned(), "extra=yes".to_owned()]
+        .into_iter()
+        .collect();
+
+    cp.register_worker(&wid, &iid, &ns, &lanes, &caps_v1, 60_000)
+        .await
+        .expect("register v1");
+    cp.register_worker(&wid, &iid, &ns, &lanes, &caps_v2, 60_000)
+        .await
+        .expect("register v2 must refresh, not error");
+
+    let workers = cp.list_workers(Some(&ns)).await.expect("list_workers");
+    let entry = workers
+        .iter()
+        .find(|w| w.instance_id == iid)
+        .expect("instance present after refresh");
+    assert!(
+        entry.capabilities.contains("v=2") && entry.capabilities.contains("extra=yes"),
+        "refresh must overwrite caps; got {:?}",
+        entry.capabilities
+    );
+
+    cp.mark_worker_dead(&iid, &ns, "cleanup")
+        .await
+        .expect("cleanup");
+}
+
+#[tokio::test]
+async fn pg_list_workers_is_empty_for_fresh_namespace() {
+    let cp = control_plane().await;
+    let ns = test_namespace("fresh_namespace_empty");
+    let workers = cp
+        .list_workers(Some(&ns))
+        .await
+        .expect("list_workers on a fresh namespace");
+    assert!(
+        workers.is_empty(),
+        "fresh namespace must have zero workers, got {} entries",
+        workers.len()
+    );
+}
+
+#[tokio::test]
+async fn pg_list_expired_leases_returns_empty_when_none_present() {
+    let cp = control_plane().await;
+    // as_of = 0 forces an empty scan window independent of other tests
+    // populating lease-expiry rows.
+    let expired = cp
+        .list_expired_leases(0, 16)
+        .await
+        .expect("list_expired_leases on PG");
+    assert!(
+        expired.is_empty(),
+        "zero-upper-bound scan must return empty, got {} rows",
+        expired.len()
+    );
+}
+
+#[tokio::test]
+async fn pg_list_incoming_edges_for_standalone_eid_is_empty() {
+    let cp = control_plane().await;
+    let eid = test_eid("pg_incoming_standalone");
+    // Standalone execution — no flow, therefore no incoming edges.
+    // The cairn adapter short-circuits on `resolve_execution_flow_id
+    // == None` so the call must not error even though the execution
+    // was never persisted.
+    let edges = cp
+        .list_incoming_edges(&eid)
+        .await
+        .expect("list_incoming_edges on PG for standalone eid");
+    assert!(
+        edges.is_empty(),
+        "standalone eid must have zero incoming edges, got {}",
+        edges.len()
+    );
+}
+
+// ── FF 0.15 — new admission / budget trait methods ────────────────────
+//
+// FF 0.15 added four new `EngineBackend` methods that underpin the
+// scheduler's admission path. Bodied on PG for two of the four; the
+// other two (scheduler-owned primitives) keep the default
+// `Unavailable` per the FF 0.15 migration guide. See
+// `docs/CONSUMER_MIGRATION_0.15_scheduler_agnostic.md` §Trait additions.
+
+/// `read_quota_policy_limits` on a never-created quota policy must
+/// return `Ok(None)` (absence is a well-defined "no admission
+/// configured" signal per the contract, not an error).
+///
+/// This test pins the cairn-side cast from `Arc<PostgresControlPlane>`
+/// into the `EngineBackend` trait — a regression that loses the PG
+/// body would surface as `Err(EngineError::Unavailable)` from the
+/// default impl.
+#[tokio::test]
+async fn pg_read_quota_policy_limits_absent_returns_none() {
+    use flowfabric::core::contracts::QuotaPolicyLimits;
+
+    let cp = control_plane().await;
+    // Quota policy id that has never been written.
+    let qpid = QuotaPolicyId::new();
+
+    let result: Result<Option<QuotaPolicyLimits>, _> =
+        cp.backend.read_quota_policy_limits(&qpid).await;
+
+    match result {
+        Ok(None) => { /* expected */ }
+        Ok(Some(snap)) => {
+            panic!("fresh QuotaPolicyId must return None, got limits snapshot: {snap:?}")
+        }
+        Err(e) => panic!(
+            "PG read_quota_policy_limits must have a real body post-FF-0.15, \
+             got error: {e}"
+        ),
+    }
+}
+
+/// `release_admission` on a never-admitted slot must be idempotent —
+/// the FF contract says releasing an already-released (or never-taken)
+/// slot is a no-op, returning `ReleaseAdmissionResult::Released`.
+#[tokio::test]
+async fn pg_release_admission_on_fresh_slot_is_idempotent() {
+    use flowfabric::core::contracts::{ReleaseAdmissionArgs, ReleaseAdmissionResult};
+
+    let cp = control_plane().await;
+    let qpid = QuotaPolicyId::new();
+    let eid = test_eid("pg_release_admission_fresh");
+
+    let args = ReleaseAdmissionArgs::new(qpid.clone(), eid);
+    let result = cp
+        .backend
+        .release_admission(args)
+        .await
+        .expect("PG release_admission must succeed (idempotent contract)");
+
+    assert!(
+        matches!(result, ReleaseAdmissionResult::Released),
+        "PG release_admission must return Released (idempotent), got {result:?}"
+    );
+}
+
+/// `block_execution_for_admission` keeps the default `Unavailable` on
+/// PG in FF 0.15 — it's a scheduler-owned primitive and the PG
+/// backend has no body. Pin this contract so a future FF body landing
+/// without a cairn-side integration trips the test (and prompts us to
+/// route cairn's admission-block path through it).
+#[tokio::test]
+async fn pg_block_execution_for_admission_returns_unavailable() {
+    use flowfabric::core::contracts::{BlockExecutionForAdmissionArgs, BlockingReason};
+    use flowfabric::core::partition::{Partition, PartitionFamily};
+    use flowfabric::core::types::TimestampMs;
+
+    let cp = control_plane().await;
+    let eid = test_eid("pg_block_admission_unavail");
+    let partition = Partition {
+        family: PartitionFamily::Flow,
+        index: 0,
+    };
+    let args = BlockExecutionForAdmissionArgs::new(
+        eid,
+        LaneId::new("cairn"),
+        partition,
+        BlockingReason::WaitingForQuota,
+        None,
+        TimestampMs(0),
+    );
+
+    let err = cp
+        .backend
+        .block_execution_for_admission(args)
+        .await
+        .expect_err("block_execution_for_admission is scheduler-owned; PG default is Unavailable");
+
+    match err {
+        EngineError::Unavailable { op } => {
+            assert_eq!(
+                op, "block_execution_for_admission",
+                "expected Unavailable op label to match trait method name, got {op}"
+            );
+        }
+        other => panic!(
+            "expected EngineError::Unavailable, got: {other:?}. \
+             If FF added a PG body, wire cairn's admission-block path through it."
+        ),
+    }
+}
+
+/// `read_budget_usage_and_limits` keeps the default `Unavailable` on
+/// PG in FF 0.15 — scheduler-owned primitive, no PG body yet. Same
+/// rationale as `pg_block_execution_for_admission_returns_unavailable`.
+#[tokio::test]
+async fn pg_read_budget_usage_and_limits_returns_unavailable() {
+    let cp = control_plane().await;
+    let bid = BudgetId::new();
+
+    let err = cp
+        .backend
+        .read_budget_usage_and_limits(&bid)
+        .await
+        .expect_err("read_budget_usage_and_limits is scheduler-owned; PG default is Unavailable");
+
+    match err {
+        EngineError::Unavailable { op } => {
+            assert_eq!(
+                op, "read_budget_usage_and_limits",
+                "expected Unavailable op label to match trait method name, got {op}"
+            );
+        }
+        other => panic!(
+            "expected EngineError::Unavailable, got: {other:?}. \
+             If FF added a PG body, wire cairn's budget-read path through it."
+        ),
+    }
+}
+
+// ── #710 PR-3: FF 0.15 reclaim-grant path ─────────────────────────────────
+//
+// Mirror of the Valkey-side `tests/integration/test_reclaim_grant.rs` —
+// proves the cairn translation layer between cairn's mirror types and
+// `ff_core::contracts::*` round-trips correctly across all four
+// `ReclaimExecutionOutcome` variants the recovery loop will hit in
+// production.
+//
+// Setup follows FF's own `ff-backend-postgres-0.15.0/tests/rfc024_reclaim.rs`
+// pattern: direct sqlx INSERT into `ff_exec_core` + `ff_attempt` to
+// land an execution row in the `ownership_state = "lease_expired_reclaimable"`
+// state. PG's scheduler is async (background reconciler), so there's
+// no synchronous public API to drive an execution into the reclaimable
+// state — direct seeding is the deterministic path FF uses for its own
+// PR-D backend tests, and we mirror it here. Cairn's other PG tests
+// don't use raw sqlx; this file is the exception because the reclaim
+// tests have no other way to deterministically provoke FF's
+// reclaim-eligibility gate.
+
+/// Build a per-test sqlx pool against the shared container's URL.
+/// Per-test pools — not a clone of the OnceCell's shared pool —
+/// because `#[tokio::test]` runtimes are short-lived and each pool's
+/// keepalive tasks are bound to the runtime that touched it first.
+/// Sharing across runtimes manifests as
+/// `"A Tokio 1.x context was found, but it is being shutdown"` errors
+/// when one test ends while another is still using the pool. Per-test
+/// pools cost a TCP handshake per test (~ms-scale on localhost) but
+/// keep the runtime/pool lifetimes 1:1.
+///
+/// Pool sized at 4 — each test makes at most 6 sqlx writes back-to-
+/// back through a single owner; concurrency higher than 4 is
+/// unnecessary and would spike PG connections under parallel test
+/// load.
+async fn per_test_seed_pool(pg: &Arc<SharedPg>) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&pg.url)
+        .await
+        .expect("per-test sqlx pool connect failed")
+}
+
+/// Seed a waitpoint HMAC kid into the keystore. PG's
+/// `issue_reclaim_grant_impl` stamps each grant with a signed
+/// waitpoint token, and the call fails fast with
+/// `Unavailable { op: "issue_reclaim_grant: ff_waitpoint_hmac keystore empty" }`
+/// when the keystore has no rows. The seed is idempotent across
+/// parallel tests via `ON CONFLICT (kid) DO NOTHING`. Mirrors FF's own
+/// `rfc024_reclaim.rs::setup_or_skip` keystore-seed step.
+async fn seed_waitpoint_hmac_kid(pool: &PgPool) {
+    let now_ms: i64 = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis(),
+    )
+    .expect("now_ms fits in i64 until 2262");
+    sqlx::query(
+        r#"
+        INSERT INTO ff_waitpoint_hmac (kid, secret, rotated_at_ms, active)
+        VALUES ('cairn-pr3-test', decode('0102030405060708', 'hex'), $1, true)
+        ON CONFLICT (kid) DO NOTHING
+        "#,
+    )
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .expect("seed ff_waitpoint_hmac");
+}
+
+/// Seed an execution row + first-attempt row directly in PG with caller-
+/// chosen state. Mirrors FF's own `seed_exec` test helper from
+/// `ff-backend-postgres-0.15.0/tests/rfc024_reclaim.rs` so the cairn
+/// reclaim tests can drive the state machine deterministically — PG's
+/// scheduler is async, and there is no synchronous public API to land
+/// an execution in `lease_expired_reclaimable` / `leased` / etc.
+///
+/// Returns `(partition_key, exec_uuid, lane_id)` so the caller can build
+/// a matching `ExecutionId` via [`exec_id_from_seed`].
+///
+/// `lease_expires_at_ms = NULL` keeps the seeded attempt OUT of the
+/// partial index `ix_ff_attempt_lease_expiry` (FF migration 0001:
+/// `WHERE lease_expires_at_ms IS NOT NULL`), so sibling tests that
+/// scan `list_expired_leases` won't see these synthetic reclaimable
+/// rows. The reclaim primitives don't read this column for the
+/// lease-expired-reclaimable path; they branch on `ownership_state`,
+/// set explicitly via the `ownership_state` argument.
+async fn seed_exec(
+    pool: &PgPool,
+    lane_seed: &str,
+    ownership_state: &str,
+    lifecycle_phase: &str,
+    lease_reclaim_count: i32,
+) -> (i16, uuid::Uuid, LaneId) {
+    seed_waitpoint_hmac_kid(pool).await;
+
+    let part: i16 = 0;
+    let exec_uuid = uuid::Uuid::new_v4();
+    let lane_str = format!("cairn-pr3-{lane_seed}-{}", uuid::Uuid::new_v4());
+    let now_ms: i64 = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis(),
+    )
+    .expect("now_ms fits in i64 until 2262");
+
+    sqlx::query(
+        r#"
+        INSERT INTO ff_exec_core (
+            partition_key, execution_id, flow_id, lane_id,
+            required_capabilities, attempt_index,
+            lifecycle_phase, ownership_state, eligibility_state,
+            public_state, attempt_state,
+            priority, created_at_ms, lease_reclaim_count
+        ) VALUES (
+            $1, $2, NULL, $3,
+            '{}', 0,
+            $5, $4, 'not_applicable',
+            'running', 'running_attempt',
+            0, $6, $7
+        )
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(&lane_str)
+    .bind(ownership_state)
+    .bind(lifecycle_phase)
+    .bind(now_ms)
+    .bind(lease_reclaim_count)
+    .execute(pool)
+    .await
+    .expect("seed ff_exec_core");
+
+    sqlx::query(
+        r#"
+        INSERT INTO ff_attempt (
+            partition_key, execution_id, attempt_index,
+            worker_id, worker_instance_id,
+            lease_epoch, lease_expires_at_ms, started_at_ms
+        ) VALUES ($1, $2, 0, 'w-orig', 'w-orig-1', 1, NULL, $3)
+        "#,
+    )
+    .bind(part)
+    .bind(exec_uuid)
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .expect("seed ff_attempt");
+
+    (part, exec_uuid, LaneId::new(lane_str))
+}
+
+/// Thin wrapper: most reclaim tests seed
+/// `(ownership_state="lease_expired_reclaimable", lifecycle_phase="active", lease_reclaim_count=0)`.
+async fn seed_lease_expired_reclaimable(
+    pool: &PgPool,
+    lane_seed: &str,
+) -> (i16, uuid::Uuid, LaneId) {
+    seed_exec(pool, lane_seed, "lease_expired_reclaimable", "active", 0).await
+}
+
+fn exec_id_from_seed(part: i16, exec_uuid: uuid::Uuid) -> ExecutionId {
+    ExecutionId::parse(&format!("{{fp:{part}}}:{exec_uuid}"))
+        .expect("ExecutionId::parse must accept the FF wire format")
+}
+
+/// Issue-grant input shaped for the cairn synthetic `cairn-control-plane`
+/// worker identity per RFC-024 §4.4. `worker_inst` is execution-bound
+/// to keep parallel tests isolated on FF's `ff_claim_grant` table.
+fn pg_issue_input(
+    eid: ExecutionId,
+    lane_id: LaneId,
+    worker_inst: WorkerInstanceId,
+) -> IssueReclaimGrantInput {
+    IssueReclaimGrantInput {
+        execution_id: eid,
+        lane_id,
+        worker_id: WorkerId::new("cairn-control-plane"),
+        worker_instance_id: worker_inst,
+        grant_ttl_ms: 60_000,
+        capability_hash: None,
+    }
+}
+
+/// Reclaim input that consumes a previously-issued grant. The `old_*`
+/// fields point at the seeded attempt row's worker identity ("w-orig-1")
+/// so FF's reclaim path finds the existing attempt to supersede.
+fn pg_reclaim_input(
+    eid: ExecutionId,
+    lane_id: LaneId,
+    worker_inst: WorkerInstanceId,
+    grant_carrier: &IssueReclaimGrantOutcome,
+) -> ReclaimExecutionInput {
+    let IssueReclaimGrantOutcome::Granted(grant) = grant_carrier else {
+        panic!("pg_reclaim_input requires a Granted outcome to thread the handle");
+    };
+    ReclaimExecutionInput {
+        grant: grant.clone(),
+        execution_id: eid,
+        lane_id,
+        worker_id: WorkerId::new("cairn-control-plane"),
+        worker_instance_id: worker_inst,
+        old_worker_instance_id: WorkerInstanceId::new("w-orig-1"),
+        attempt_id: AttemptId::new(),
+        current_attempt_index: AttemptIndex::new(0),
+        lease_id: LeaseId::new(),
+        lease_ttl_ms: 30_000,
+        attempt_policy_json: String::new(),
+        max_reclaim_count: None,
+        capability_hash: None,
+    }
+}
+
+/// Maps to FF's `IssueReclaimGrantOutcome::Granted` →
+/// `ReclaimExecutionOutcome::Claimed(ReclaimedHandle)` on the PG path.
+/// Proves the cairn impl forwards args, threads the grant handle, and
+/// unwraps `Claimed` into the cairn mirror.
+#[tokio::test]
+async fn pg_cairn_trait_grant_then_reclaim_mints_fresh_attempt() {
+    let pg = shared_pg().await;
+    let pool = per_test_seed_pool(&pg).await;
+    let cp = control_plane().await;
+    let (part, exec_uuid, lane_id) =
+        seed_lease_expired_reclaimable(&pool, "grant-then-reclaim").await;
+    let eid = exec_id_from_seed(part, exec_uuid);
+    let worker_inst = WorkerInstanceId::new(format!("cairn-cp-{exec_uuid}"));
+
+    let granted = cp
+        .issue_reclaim_grant(pg_issue_input(
+            eid.clone(),
+            lane_id.clone(),
+            worker_inst.clone(),
+        ))
+        .await
+        .expect("issue_reclaim_grant must succeed on lease_expired_reclaimable execution");
+
+    assert!(
+        matches!(granted, IssueReclaimGrantOutcome::Granted(_)),
+        "expected Granted, got {granted:?}",
+    );
+
+    let claimed = cp
+        .reclaim_execution(pg_reclaim_input(eid, lane_id, worker_inst, &granted))
+        .await
+        .expect("reclaim_execution must succeed on a granted handle");
+
+    assert!(
+        matches!(claimed, ReclaimExecutionOutcome::Claimed(_)),
+        "expected Claimed(ReclaimedHandle), got {claimed:?}",
+    );
+}
+
+/// Maps to FF's `IssueReclaimGrantOutcome::NotReclaimable` on PG.
+///
+/// A row in `ownership_state = "leased"` (not `lease_expired_reclaimable`
+/// or `lease_revoked`) is NOT eligible for reclaim. Cairn's recovery
+/// loop must treat this as "deadlock cleared, retry the original FCALL"
+/// — this test proves the variant lands cleanly with a non-empty
+/// diagnostic detail.
+#[tokio::test]
+async fn pg_cairn_trait_issue_grant_on_leased_returns_not_reclaimable() {
+    let pg = shared_pg().await;
+    let pool = per_test_seed_pool(&pg).await;
+    let cp = control_plane().await;
+
+    // Seed an execution in `leased` state (not reclaim-eligible).
+    // Mirrors FF's own `wrong_phase_not_reclaimable` test fixture.
+    let (part, exec_uuid, lane_id) = seed_exec(&pool, "leased", "leased", "runnable", 0).await;
+    let eid = exec_id_from_seed(part, exec_uuid);
+    let worker_inst = WorkerInstanceId::new(format!("cairn-cp-{exec_uuid}"));
+
+    let outcome = cp
+        .issue_reclaim_grant(pg_issue_input(eid, lane_id, worker_inst))
+        .await
+        .expect("issue_reclaim_grant must surface NotReclaimable, not error");
+
+    match outcome {
+        IssueReclaimGrantOutcome::NotReclaimable { detail } => {
+            assert!(
+                !detail.is_empty(),
+                "NotReclaimable must carry a non-empty detail for diagnostics; \
+                 got empty string",
+            );
+        }
+        other => panic!("expected NotReclaimable on leased exec, got {other:?}"),
+    }
+}
+
+/// Maps to FF's `IssueReclaimGrantOutcome::ReclaimCapExceeded`.
+///
+/// PG's `issue_reclaim_grant_impl` (cap-exceeded branch) compares the
+/// execution's `lease_reclaim_count` against `max_reclaim_count`
+/// (RFC-024 §4.6 default 1000). When the count has already reached
+/// the cap, FF transitions the execution to `terminal_failed` and
+/// returns `ReclaimCapExceeded { reclaim_count }`. Cairn's recovery
+/// loop (PR-5) surfaces this to the operator — no more reclaim
+/// attempts possible. Without this test, a regression in the
+/// translation `reclaim_count` field mapping would be invisible
+/// until the live recovery loop hits it in production.
+///
+/// Mirrors FF's own `issue_reclaim_grant_cap_exceeded` test:
+/// seed an execution at `lease_reclaim_count = 1000` (the default
+/// cap), call `issue_reclaim_grant` with the default `max`
+/// (resolves to 1000 inside FF), assert `ReclaimCapExceeded
+/// { reclaim_count: 1000 }`.
+#[tokio::test]
+async fn pg_cairn_trait_issue_grant_cap_exceeded() {
+    let pg = shared_pg().await;
+    let pool = per_test_seed_pool(&pg).await;
+    let cp = control_plane().await;
+
+    let (part, exec_uuid, lane_id) = seed_exec(
+        &pool,
+        "cap-exceeded",
+        "lease_expired_reclaimable",
+        "active",
+        1000,
+    )
+    .await;
+    let eid = exec_id_from_seed(part, exec_uuid);
+    let worker_inst = WorkerInstanceId::new(format!("cairn-cp-{exec_uuid}"));
+
+    let outcome = cp
+        .issue_reclaim_grant(pg_issue_input(eid, lane_id, worker_inst))
+        .await
+        .expect("issue_reclaim_grant must surface ReclaimCapExceeded, not error");
+
+    match outcome {
+        IssueReclaimGrantOutcome::ReclaimCapExceeded { reclaim_count } => {
+            // FF's cap-exceeded path returns the post-policy-resolved
+            // cap. With no per-execution policy override the default
+            // is 1000 (RFC-024 §4.6 + cairn's
+            // `IssueReclaimGrantInput::capability_hash = None` →
+            // FF resolves max_reclaim_count to its 1000 default).
+            assert_eq!(
+                reclaim_count, 1000,
+                "expected reclaim_count=1000 (RFC-024 §4.6 default cap); got {reclaim_count}",
+            );
+        }
+        other => panic!("expected ReclaimCapExceeded, got {other:?}"),
+    }
+}
+
+/// Cross-validation: `reclaim_execution` MUST reject a grant whose
+/// `execution_id` does not match the input's `execution_id`. Same
+/// contract as the Valkey-side test — defense-in-depth against a
+/// caller threading a stale handle from a previous run. Cairn surfaces
+/// it as `FabricError::Validation` before the FCALL fires.
+#[tokio::test]
+async fn pg_cairn_trait_reclaim_rejects_grant_execution_id_mismatch() {
+    let pg = shared_pg().await;
+    let pool = per_test_seed_pool(&pg).await;
+    let cp = control_plane().await;
+
+    let (part_a, uuid_a, lane_a) = seed_lease_expired_reclaimable(&pool, "mismatch-a").await;
+    let (part_b, uuid_b, lane_b) = seed_lease_expired_reclaimable(&pool, "mismatch-b").await;
+    let eid_a = exec_id_from_seed(part_a, uuid_a);
+    let eid_b = exec_id_from_seed(part_b, uuid_b);
+    let worker_inst_a = WorkerInstanceId::new(format!("cairn-cp-{uuid_a}"));
+    let worker_inst_b = WorkerInstanceId::new(format!("cairn-cp-{uuid_b}"));
+
+    let granted_a = cp
+        .issue_reclaim_grant(pg_issue_input(eid_a.clone(), lane_a, worker_inst_a))
+        .await
+        .expect("issue_reclaim_grant on execution A must succeed");
+
+    // Build a reclaim input that threads execution A's grant handle but
+    // points at execution B. cairn must reject pre-FCALL.
+    let mismatched = ReclaimExecutionInput {
+        grant: match &granted_a {
+            IssueReclaimGrantOutcome::Granted(handle) => handle.clone(),
+            _ => unreachable!("checked: issue_reclaim_grant returned Granted on a freshly-seeded reclaimable execution"),
+        },
+        execution_id: eid_b, // ← wrong
+        lane_id: lane_b,
+        worker_id: WorkerId::new("cairn-control-plane"),
+        worker_instance_id: worker_inst_b.clone(),
+        old_worker_instance_id: worker_inst_b,
+        attempt_id: AttemptId::new(),
+        current_attempt_index: AttemptIndex::new(0),
+        lease_id: LeaseId::new(),
+        lease_ttl_ms: 30_000,
+        attempt_policy_json: String::new(),
+        max_reclaim_count: None,
+        capability_hash: None,
+    };
+
+    let err = cp.reclaim_execution(mismatched).await.expect_err(
+        "reclaim_execution must reject a grant whose execution_id does not \
+             match input.execution_id",
+    );
+
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("does not match"),
+        "expected validation error mentioning 'does not match'; got: {msg}",
+    );
+}

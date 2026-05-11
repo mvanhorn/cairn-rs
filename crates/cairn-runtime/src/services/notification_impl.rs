@@ -31,6 +31,14 @@ fn now_millis() -> u64 {
 
 /// Attempt an HTTP POST to a webhook URL.
 /// The webhook feature is not enabled; returns an error indicating this.
+///
+/// SECURITY (#451, #452): when this stub is replaced with a real HTTP
+/// dispatcher, the dispatcher MUST call
+/// `cairn_app::webhook_validation::enforce_outbound_webhook_target(url,
+/// policy)` immediately before issuing the request. Registration-time
+/// validation alone is insufficient against DNS rebinding — a domain
+/// that resolved to `93.184.216.34` at registration can resolve to
+/// `169.254.169.254` at dispatch. The re-check catches that.
 async fn post_webhook(_url: &str, _body: &serde_json::Value) -> Result<(), String> {
     Err("webhook feature not enabled".to_owned())
 }

@@ -37,10 +37,12 @@ Services started:
 | `valkey` | 6379 | Valkey 8 (FlowFabric state — lease, lifecycle, eligibility) |
 
 > **Valkey / FlowFabric.** `docker compose up` now provisions Valkey 8
-> alongside Postgres and wires cairn-app at `CAIRN_FABRIC_HOST=valkey`. To
-> point at an external Valkey instead, override `CAIRN_FABRIC_HOST` /
-> `CAIRN_FABRIC_PORT` in `.env`. In-memory mode (`--db memory`) is dev-only
-> and skips Fabric entirely.
+> alongside Postgres and wires cairn-app at
+> `CAIRN_FABRIC_URL=valkey://valkey:6379`. To point at an external Valkey
+> instead, override `CAIRN_FABRIC_URL` in `.env`. `--db memory` skips
+> Postgres-backed persistence (useful for dev), but the standard
+> cairn-app runtime still requires Fabric/Valkey at boot — only the
+> FakeFabric-injected test path can run without it.
 
 ---
 
@@ -64,6 +66,238 @@ The database is created and migrated automatically on first start.
 
 ---
 
+## Minimum kernel version
+
+The upcoming sandbox confinement work (F65 PR-4) requires **Linux kernel
+5.13 or newer** on the host. Kernel 5.13 is the first release with
+Landlock LSM, the unprivileged filesystem sandbox we use to confine
+sub-agent workspace writes. Once that work lands, older kernels will
+fall back to a degraded mode on boot and refuse to run confined agents.
+
+Today cairn-rs does not yet enforce this requirement at startup — but
+the kernel target is locked so that self-hosted operators can provision
+their hosts now and avoid an upgrade churn when confinement ships.
+Verification: `uname -r` on the host.
+
+| Distro | Default kernel | Works? |
+|---|---|---|
+| Ubuntu 22.04 LTS | 5.15+ | Yes |
+| Ubuntu 24.04 LTS | 6.8+ | Yes |
+| Amazon Linux 2023 | 6.1+ | Yes |
+| Debian 12 | 6.1+ | Yes |
+| RHEL 9 | 5.14+ | Yes (5.14 includes Landlock backport) |
+| Debian 11 | 5.10 | No (upgrade or use backports kernel) |
+| Ubuntu 20.04 LTS | 5.4 | No (upgrade to 22.04 LTS) |
+| Amazon Linux 2 | 5.10 | No (migrate to AL2023) |
+
+Distro kernel versions last verified 2026-04-27.
+
+---
+
+## AppArmor on Ubuntu 24.04+
+
+Ubuntu 24.04 LTS (and Debian 13+) ship with the sysctl
+
+```
+kernel.apparmor_restrict_unprivileged_userns = 1
+```
+
+enabled by default. The kernel's AppArmor LSM transitions any
+**unconfined** binary into the `unprivileged_userns` profile when it
+calls `unshare(CLONE_NEWUSER)` — which denies `CAP_SYS_ADMIN` inside the
+new userns and therefore blocks the mount operations that follow.
+
+cairn-rs's sub-agent sandbox (RFC 016 / F65 PR-4) relies on an
+unprivileged user namespace + mount namespace to confine the sub-agent.
+On an untouched Ubuntu 24.04 host the sandbox therefore fails at boot
+with:
+
+```
+FATAL: F65 kernel probe failed: kernel primitive `mount_namespace_unshare`
+failed: ... apparmor_restrict_unprivileged_userns=1 — unprivileged userns blocked ...
+```
+
+### Pick ONE remediation
+
+Listed in order from easiest/least-secure to cleanest/most-operator-friction:
+
+#### 1. Temporary: relax the sysctl for this boot
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+This change is lost on reboot. Use for dev/CI or a quick verification.
+
+#### 2. Persistent: drop a sysctl.d file (recommended for self-hosted cairn)
+
+```bash
+sudo tee /etc/sysctl.d/60-cairn-sandbox.conf <<'EOF'
+# Required by cairn-rs sandbox (F65 PR-4).
+# See https://github.com/avifenesh/cairn-rs/issues/358
+kernel.apparmor_restrict_unprivileged_userns = 0
+EOF
+sudo sysctl --system
+```
+
+Verify:
+
+```bash
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+# -> 0
+```
+
+This is a **host-wide** relaxation — any process on the host can now
+create an unprivileged user namespace. If your threat model assumes
+other untrusted workloads run on the same host, prefer option 3.
+
+#### 3. Scoped: run cairn-app under systemd with `AmbientCapabilities=CAP_SYS_ADMIN`
+
+Keep the AppArmor sysctl at its Ubuntu default (= 1) and grant cairn-app
+the capability it needs explicitly. This leaves the rest of the host
+locked down.
+
+In `/etc/systemd/system/cairn.service`, under `[Service]`, add:
+
+```ini
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=no
+```
+
+> `NoNewPrivileges=yes` (the systemd default used in the sample unit
+> below) strips ambient capabilities during `execve(2)` and prevents
+> file-capability elevation, so `NoNewPrivileges=yes` + CAP_SYS_ADMIN
+> is not achievable via systemd ambient caps OR a setcap'd launcher.
+> Pick one of: (a) keep `NoNewPrivileges=no` here and rely on the rest
+> of the hardening in the unit file; (b) keep `NoNewPrivileges=yes`
+> and instead apply remediation 2 (relax the host sysctl) or
+> remediation 4 (ship a per-binary AppArmor profile).
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart cairn
+```
+
+cairn-app will log `F65 kernel probe: all REQUIRED primitives pass`
+on the next boot.
+
+#### 4. Distribution-packaged: ship an AppArmor profile
+
+Long-term, cairn-rs may ship `/etc/apparmor.d/cairn-app` granting
+`userns_create` + the minimum mount-related capabilities to the
+cairn-app binary only. This is the cleanest outcome — no host-wide
+sysctl change, no ambient caps — but requires distro packaging effort.
+Tracked in #358; not yet shipped.
+
+### Verify the fix worked
+
+Check the sysctl directly:
+
+```bash
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+# -> 0
+```
+
+Then restart cairn-app and watch for:
+
+```
+F65 kernel probe: all REQUIRED primitives pass (kernel 6.8.0-...)
+```
+
+in the startup log. A failed boot instead logs `FATAL: F65 kernel
+probe failed: ...` naming the offending primitive and the suggested
+remediation — cross-reference against the list above.
+
+You can also exercise the sandbox kernel probe standalone before
+starting cairn-app:
+
+```bash
+cargo run -p cairn-workspace --bin f65_kernel_probe --features kernel-probe
+```
+
+See `docs/design/f65-kernel-probe-findings.md` for the canonical output
+format.
+
+---
+
+## Filesystem choice for the sandbox workspace root
+
+cairn-rs stores per-session sandbox state under
+`$TMPDIR/cairn-workspace-sandboxes` by default, overridable via the
+`CAIRN_SANDBOX_BASE_DIR` env var. When an attempt ends, cairn takes a
+snapshot of the agent's write delta. The snapshot cost depends on the
+filesystem hosting that directory:
+
+| Filesystem | Snapshot cost | Recommended |
+|---|---|---|
+| **btrfs** | O(inodes) — ~20ms regardless of size | Yes (fast path) |
+| **XFS with reflink=1** | O(inodes) — ~20ms regardless of size | Yes (fast path, default on RHEL 8+) |
+| **bcachefs** | O(inodes) | Yes (kernel 6.7+, new on most distros) |
+| **ext4** | O(bytes) — ~100ms per 100MB of delta | Works, but slower |
+| **tmpfs** | O(bytes), memory-backed | Not recommended (state lost on restart) |
+
+### How to provision a reflink-capable EBS volume on AWS
+
+The default Amazon Linux 2023 AMI uses ext4 for the root volume. For
+production deployments you should attach a separate EBS volume formatted
+as btrfs or XFS-with-reflink and mount it at `/var/lib/cairn-workspaces`,
+then set `CAIRN_SANDBOX_BASE_DIR=/var/lib/cairn-workspaces`.
+
+Attach a 100GB gp3 EBS volume to the instance. Most modern EC2 instance
+types (e.g. `m8g`, `m7i`, `c7`, `r7`) expose EBS as NVMe devices under
+`/dev/nvme*n1`, while older Xen-based generations use `/dev/xvd*`.
+Identify the new volume with:
+
+```bash
+lsblk
+# or, for NVMe instances:
+sudo nvme list
+```
+
+Replace `$DEV` below with the block device you identified
+(e.g. `/dev/nvme1n1` or `/dev/xvdf`), then:
+
+```bash
+sudo mkfs.btrfs "$DEV"
+sudo mkdir -p /var/lib/cairn-workspaces
+sudo mount "$DEV" /var/lib/cairn-workspaces
+echo "$DEV /var/lib/cairn-workspaces btrfs defaults 0 0" | sudo tee -a /etc/fstab
+```
+
+Or for XFS with reflink:
+
+```bash
+sudo mkfs.xfs -m reflink=1 "$DEV"
+sudo mkdir -p /var/lib/cairn-workspaces
+sudo mount "$DEV" /var/lib/cairn-workspaces
+echo "$DEV /var/lib/cairn-workspaces xfs defaults 0 0" | sudo tee -a /etc/fstab
+```
+
+On Amazon Linux 2023, install the tooling with `sudo dnf install btrfs-progs xfsprogs` if it is not already present.
+
+> **Use UUIDs in `/etc/fstab` for production.** Block-device names can
+> change across reboots, especially on NVMe. Prefer
+> `UUID=<uuid> /var/lib/cairn-workspaces btrfs defaults 0 0`; get the
+> UUID from `sudo blkid "$DEV"`.
+
+### What if I stay on ext4?
+
+When reflink is unavailable, cairn is expected to detect this at runtime
+and fall back to a byte-copy snapshot. Correctness is preserved; the
+snapshot is just slower. For typical agent workloads (<100MB upper-layer
+churn per attempt) the difference is imperceptible. For heavy-build
+workloads (multi-GB diffs) the fallback can add seconds per
+attempt-termination.
+
+The `WorkspaceBackendDegraded` event type is defined in `cairn-domain`
+for this signal. Wiring the emission into the workspace provisioner is
+part of the same F65 PR-4 sandbox work and not yet live in `main`.
+
+---
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -72,8 +306,7 @@ The database is created and migrated automatically on first start.
 | `CAIRN_PORT` | `3000` | HTTP listen port (also settable with `--port`; CLI flag wins). |
 | `CAIRN_DB` | in-memory | Storage backend DSN — `memory`, `postgres://…`, `postgresql://…`, or a SQLite path. Also settable with `--db`; CLI flag wins. |
 | `CAIRN_MODE` | `local` | Deployment mode: `local` or `team` (alias: `self-hosted`). Also settable with `--mode`; CLI flag wins. |
-| `CAIRN_FABRIC_HOST` | `localhost` (bare binary) / `valkey` (compose) | Valkey hostname FlowFabric connects to for lease / lifecycle / eligibility state. |
-| `CAIRN_FABRIC_PORT` | `6379` | Valkey port. |
+| `CAIRN_FABRIC_URL` | `valkey://localhost:6379` (bare binary) / `valkey://valkey:6379` (compose) | Backend connection for FlowFabric state. Accepted schemes: `valkey://` and `rediss://` (TLS). Query params `?tls=1&cluster=1` toggle Valkey flags. Default when unset: `valkey://localhost:6379`. |
 | `CAIRN_FABRIC_WAITPOINT_HMAC_SECRET` | **required** when Fabric is enabled | 32-byte hex secret seeded into every FlowFabric execution partition. Boot fails loud when unset. Rotate at runtime via `POST /v1/admin/rotate-waitpoint-hmac`. See [SECURITY.md](../SECURITY.md). |
 | `CAIRN_FABRIC_INSTANCE_ID` | auto-UUID persisted to `/tmp` | Distinguishes this cairn-app process from others sharing the same Valkey. See [operations/cross-instance-isolation.md](./operations/cross-instance-isolation.md). |
 | `CAIRN_BACKFILL_INSTANCE_TAG` | unset | When `1`, runs a one-shot boot-time backfill that stamps `cairn.instance_id` onto pre-existing exec-tag hashes that lack it. Only needed for in-place binary swaps with in-flight runs that predate the isolation filter. |

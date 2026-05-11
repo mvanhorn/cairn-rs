@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
-use ff_core::keys::ExecKeyContext;
-use ff_core::types::{ExecutionId, SignalId, TimestampMs, WaitpointId, WaitpointToken};
-use ff_sdk::task::{Signal, SignalOutcome};
+use flowfabric::core::engine_backend::EngineBackend;
+use flowfabric::core::partition::execution_partition;
+use flowfabric::core::types::{ExecutionId, SignalId, TimestampMs, WaitpointId, WaitpointToken};
+use flowfabric::sdk::task::{Signal, SignalOutcome};
 
-use crate::boot::FabricRuntime;
 use crate::error::FabricError;
 use crate::helpers::sanitize_signal_component;
+use crate::runtime_handle::FabricRuntimeHandle;
 
-/// Read the HMAC waitpoint token from FF's waitpoint hash.
-///
-/// FF mints the token during `ff_suspend_execution` and writes it to the
-/// `waitpoint_token` field of the waitpoint hash (see lua/suspension.lua
-/// line 185). It is the ONLY source of truth — cairn never caches it.
+/// Read the HMAC waitpoint token for `waitpoint_id` via FF's
+/// `EngineBackend::read_waitpoint_token` trait method. Cairn never
+/// caches the token — FF owns it from mint (`ff_suspend_execution`)
+/// to reveal.
 ///
 /// Returns `Err(Validation)` ONLY when the field is missing or empty — i.e.
 /// the waitpoint hash has never been written, or was deleted. FF does NOT
@@ -22,16 +22,40 @@ use crate::helpers::sanitize_signal_component;
 /// state boundary where it belongs. That separation matters — mixing
 /// "waitpoint never existed" with "waitpoint is closed" at the auth layer
 /// would re-create the exact oracle FF's Lua took pains to eliminate.
+///
+/// # FF 0.14 wrappers NOT adopted (intentional)
+///
+/// FF 0.14 ships two optional consumer surfaces over this trait method:
+///
+/// * `ff_sdk::FlowFabricAdminClient::read_waitpoint_token` — HTTP-
+///   fronted wrapper. Not adopted because cairn holds the
+///   `Arc<dyn EngineBackend>` in-process and the HTTP detour would
+///   add a network hop for zero benefit.
+/// * `ff_sdk::signal_bridge::verify_and_deliver` — packages
+///   "read token → constant-time compare → forward via
+///   `FlowFabricWorker::deliver_signal`" for consumers that don't
+///   already own signal-bridge logic. Not adopted because cairn's
+///   `SignalBridge` is richer (multi-signal-type dispatch, lane-id
+///   cache, cairn-specific error enum, FCALL-direct delivery path)
+///   and already calls this primitive. Adopting FF's composite would
+///   drop cairn-specific behaviour and add a router hop.
+///
+/// Pre-PR-C2 this was a direct `ferriskey::Client::hget` against
+/// `{exec}:waitpoint:<wp>`; PR-C2 routes it through the backend trait
+/// so pg/sqlite backends answer the same shape without wire-layer
+/// Valkey coupling.
 pub(crate) async fn read_waitpoint_token(
-    client: &ferriskey::Client,
-    ctx: &ExecKeyContext,
+    backend: &dyn EngineBackend,
+    partition_config: &flowfabric::core::partition::PartitionConfig,
+    execution_id: &ExecutionId,
     waitpoint_id: &WaitpointId,
 ) -> Result<WaitpointToken, FabricError> {
-    let token_str: Option<String> = client
-        .hget(&ctx.waitpoint(waitpoint_id), "waitpoint_token")
+    let partition = execution_partition(execution_id, partition_config);
+    let token_opt = backend
+        .read_waitpoint_token(partition.into(), waitpoint_id)
         .await
-        .map_err(|e| FabricError::Valkey(format!("HGET waitpoint_token: {e}")))?;
-    match token_str {
+        .map_err(|e| FabricError::Engine(Box::new(e)))?;
+    match token_opt {
         Some(s) if !s.is_empty() => Ok(WaitpointToken::new(s)),
         _ => Err(FabricError::Validation {
             reason: format!("waitpoint {waitpoint_id} is not active (missing token)"),
@@ -40,14 +64,16 @@ pub(crate) async fn read_waitpoint_token(
 }
 
 pub struct SignalBridge {
-    runtime: Arc<FabricRuntime>,
+    /// Backend-agnostic runtime handle. Used for `partition_config()`,
+    /// `signal_dedup_ttl_ms()`, and `backend()` — the trait-routed
+    /// `EngineBackend::deliver_signal` reaches both Valkey and
+    /// Postgres without the Lua-only FCALL path.
+    runtime: Arc<dyn FabricRuntimeHandle>,
 }
 
 impl SignalBridge {
-    pub fn new(runtime: &Arc<FabricRuntime>) -> Self {
-        Self {
-            runtime: runtime.clone(),
-        }
+    pub fn new(runtime: Arc<dyn FabricRuntimeHandle>) -> Self {
+        Self { runtime }
     }
 
     pub async fn deliver_approval_signal(
@@ -74,11 +100,13 @@ impl SignalBridge {
             .into_bytes()
         });
 
-        let partition =
-            ff_core::partition::execution_partition(execution_id, &self.runtime.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let waitpoint_token =
-            read_waitpoint_token(&self.runtime.client, &ctx, waitpoint_id).await?;
+        let waitpoint_token = read_waitpoint_token(
+            self.runtime.backend().as_ref(),
+            self.runtime.partition_config(),
+            execution_id,
+            waitpoint_id,
+        )
+        .await?;
 
         let signal = Signal {
             signal_name,
@@ -109,13 +137,13 @@ impl SignalBridge {
         .into_bytes();
 
         let safe_id = sanitize_signal_component(child_task_id);
-        let partition = ff_core::partition::execution_partition(
+        let waitpoint_token = read_waitpoint_token(
+            self.runtime.backend().as_ref(),
+            self.runtime.partition_config(),
             parent_execution_id,
-            &self.runtime.partition_config,
-        );
-        let ctx = ExecKeyContext::new(&partition, parent_execution_id);
-        let waitpoint_token =
-            read_waitpoint_token(&self.runtime.client, &ctx, parent_waitpoint_id).await?;
+            parent_waitpoint_id,
+        )
+        .await?;
 
         let signal = Signal {
             signal_name: format!("child_completed:{safe_id}"),
@@ -139,11 +167,13 @@ impl SignalBridge {
         result_payload: Option<Vec<u8>>,
     ) -> Result<SignalOutcome, FabricError> {
         let safe_id = sanitize_signal_component(invocation_id);
-        let partition =
-            ff_core::partition::execution_partition(execution_id, &self.runtime.partition_config);
-        let ctx = ExecKeyContext::new(&partition, execution_id);
-        let waitpoint_token =
-            read_waitpoint_token(&self.runtime.client, &ctx, waitpoint_id).await?;
+        let waitpoint_token = read_waitpoint_token(
+            self.runtime.backend().as_ref(),
+            self.runtime.partition_config(),
+            execution_id,
+            waitpoint_id,
+        )
+        .await?;
 
         let signal = Signal {
             signal_name: format!("tool_result:{safe_id}"),
@@ -165,114 +195,81 @@ impl SignalBridge {
         waitpoint_id: &WaitpointId,
         signal: Signal,
     ) -> Result<SignalOutcome, FabricError> {
-        let partition =
-            ff_core::partition::execution_partition(execution_id, &self.runtime.partition_config);
-        let ctx = ff_core::keys::ExecKeyContext::new(&partition, execution_id);
-        let idx = ff_core::keys::IndexKeys::new(&partition);
-
-        let signal_id = SignalId::new();
+        // RFC-025 / FF 0.14 adoption: route signal delivery through the
+        // backend-agnostic `EngineBackend::deliver_signal` trait method
+        // instead of the Valkey-only `ff_deliver_signal` Lua FCALL.
+        // The PG backend's bodied `deliver_signal` performs the same
+        // suspend-table read + waitpoint-token verification + signal-
+        // stream append inside a SERIALIZABLE transaction, so cairn
+        // gets identical semantics on either backend.
+        //
+        // Historical note: `load_lane_id` and `build_deliver_signal`
+        // were required when we hand-built Lua KEYS/ARGV; the trait
+        // method takes a typed `DeliverSignalArgs` so the lane cache
+        // and the key-layout helper are no longer needed on this hot
+        // path. The helper is retained for the lane-id-bearing
+        // approval-signal call in `FabricRunService` which still goes
+        // through `ControlPlaneBackend::deliver_approval_signal` until
+        // that surface merges with this one.
+        // Capture one wall-clock sample and reuse it for `created_at`
+        // + `now` so the args represent a single dispatch moment —
+        // matches FF's own `deliver_approval_signal_impl` pattern on
+        // the Valkey backend. Gemini PR #630 review.
         let now = TimestampMs::now();
 
-        let lane_str: Option<String> = self
-            .runtime
-            .client
-            .hget(&ctx.core(), "lane_id")
-            .await
-            .map_err(|e| FabricError::Valkey(format!("HGET lane_id: {e}")))?;
-        let lane_id = ff_core::types::LaneId::new(lane_str.as_deref().unwrap_or("cairn"));
-
-        let derived_idem = format!("{}:{}:{}", execution_id, signal.signal_name, waitpoint_id);
-        let effective_idem = signal
-            .idempotency_key
-            .clone()
-            .unwrap_or_else(|| derived_idem.clone());
-        let idem_key = ctx.signal_dedup(waitpoint_id, &effective_idem);
-
-        let payload_str = signal
-            .payload
-            .as_ref()
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .unwrap_or_default();
-
-        let (keys, args) = crate::fcall::suspension::build_deliver_signal(
-            &ctx,
-            &idx,
-            &lane_id,
-            &signal_id,
-            waitpoint_id,
-            idem_key,
-            execution_id,
-            signal.signal_name,
-            signal.signal_category,
-            signal.source_type,
-            signal.source_identity,
-            payload_str,
-            effective_idem,
+        // `payload_encoding` stays `None` at this layer.
+        // `deliver_approval_signal` + `deliver_child_completed_signal`
+        // build JSON bodies and could truthfully declare `"json"`, but
+        // `deliver_tool_result_signal` takes arbitrary caller bytes —
+        // there is no shape-honest single default. FF's own
+        // `deliver_approval_signal_impl` on Valkey also passes
+        // `None`; we match that. Gemini PR #630 review.
+        let args = flowfabric::core::contracts::DeliverSignalArgs {
+            execution_id: execution_id.clone(),
+            waitpoint_id: waitpoint_id.clone(),
+            signal_id: SignalId::new(),
+            signal_name: signal.signal_name,
+            signal_category: signal.signal_category,
+            source_type: signal.source_type,
+            source_identity: signal.source_identity,
+            payload: signal.payload,
+            payload_encoding: None,
+            correlation_id: None,
+            idempotency_key: signal.idempotency_key,
+            target_scope: "waitpoint".to_owned(),
+            created_at: Some(now),
+            dedup_ttl_ms: Some(self.runtime.signal_dedup_ttl_ms()),
+            resume_delay_ms: None,
+            max_signals_per_execution: Some(
+                crate::constants::DEFAULT_MAX_SIGNALS_PER_EXECUTION_U64,
+            ),
+            signal_maxlen: Some(crate::constants::DEFAULT_SIGNAL_MAXLEN_U64),
+            waitpoint_token: signal.waitpoint_token,
             now,
-            self.runtime.config.signal_dedup_ttl_ms,
-            crate::constants::DEFAULT_SIGNAL_MAXLEN,
-            crate::constants::DEFAULT_MAX_SIGNALS_PER_EXECUTION,
-            signal.waitpoint_token.as_str(),
-        );
+        };
 
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: ferriskey::Value = self
+        let result = self
             .runtime
-            .fcall(crate::fcall::names::FF_DELIVER_SIGNAL, &key_refs, &arg_refs)
-            .await?;
+            .backend()
+            .deliver_signal(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
 
-        parse_signal_result(&raw)
+        Ok(match result {
+            flowfabric::core::contracts::DeliverSignalResult::Accepted { signal_id, effect } => {
+                if effect == "resume_condition_satisfied" {
+                    SignalOutcome::TriggeredResume { signal_id }
+                } else {
+                    SignalOutcome::Accepted { signal_id, effect }
+                }
+            }
+            flowfabric::core::contracts::DeliverSignalResult::Duplicate { existing_signal_id } => {
+                SignalOutcome::Duplicate {
+                    existing_signal_id: existing_signal_id.to_string(),
+                }
+            }
+        })
     }
-}
-
-fn parse_signal_result(raw: &ferriskey::Value) -> Result<SignalOutcome, FabricError> {
-    let arr = match raw {
-        ferriskey::Value::Array(arr) => arr,
-        _ => return Err(FabricError::Bridge("deliver_signal: expected Array".into())),
-    };
-
-    let status = match arr.first() {
-        Some(Ok(ferriskey::Value::Int(n))) => *n,
-        _ => return Err(FabricError::Bridge("deliver_signal: bad status".into())),
-    };
-
-    if status != 1 {
-        let code = extract_str(arr, 1).unwrap_or_else(|| "unknown".into());
-        return Err(FabricError::Bridge(format!(
-            "deliver_signal rejected: {code}"
-        )));
-    }
-
-    let sub = extract_str(arr, 1).unwrap_or_default();
-
-    if sub == "DUPLICATE" {
-        let existing_id = extract_str(arr, 2).unwrap_or_default();
-        return Ok(SignalOutcome::Duplicate {
-            existing_signal_id: existing_id,
-        });
-    }
-
-    let signal_id_str = extract_str(arr, 2).unwrap_or_default();
-    let effect = extract_str(arr, 3).unwrap_or_default();
-    let signal_id = ff_core::types::SignalId::parse(&signal_id_str)
-        .map_err(|e| FabricError::Bridge(format!("bad signal_id in response: {e}")))?;
-
-    if effect == "resume_condition_satisfied" {
-        Ok(SignalOutcome::TriggeredResume { signal_id })
-    } else {
-        Ok(SignalOutcome::Accepted { signal_id, effect })
-    }
-}
-
-fn extract_str(arr: &[Result<ferriskey::Value, ferriskey::Error>], idx: usize) -> Option<String> {
-    arr.get(idx).and_then(|v| match v {
-        Ok(ferriskey::Value::BulkString(b)) => Some(String::from_utf8_lossy(b).into_owned()),
-        Ok(ferriskey::Value::SimpleString(s)) => Some(s.clone()),
-        Ok(ferriskey::Value::Int(n)) => Some(n.to_string()),
-        _ => None,
-    })
 }
 
 #[cfg(test)]

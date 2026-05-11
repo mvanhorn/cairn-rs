@@ -23,27 +23,12 @@ pub(crate) struct PendingTriggeredRun {
     pub(crate) template: cairn_runtime::RunTemplate,
 }
 
-pub(crate) fn trigger_condition_values(
-    conditions: &[cairn_runtime::TriggerCondition],
-) -> Vec<serde_json::Value> {
-    conditions
-        .iter()
-        .map(|condition| serde_json::to_value(condition).unwrap_or(serde_json::Value::Null))
-        .collect()
-}
-
-pub(crate) fn trigger_conditions_from_values(
-    values: &[serde_json::Value],
-) -> Result<Vec<cairn_runtime::TriggerCondition>, String> {
-    values
-        .iter()
-        .cloned()
-        .map(|value| {
-            serde_json::from_value(value)
-                .map_err(|error| format!("invalid persisted trigger condition: {error}"))
-        })
-        .collect()
-}
+// RFC-025 Phase 1.5a: `trigger_condition_values` + `trigger_conditions_from_values`
+// deleted — the projection-backed `TriggerService` serialises conditions to
+// JSON directly inside `create_trigger` / `trigger_from_record`, so these
+// cairn-app-level helpers are no longer reachable. Conversion from the
+// domain `TriggerCondition` enum rides on its `serde::Serialize`/
+// `serde::Deserialize` impls in `cairn-runtime`.
 
 pub(crate) fn domain_trigger_skip_reason(
     reason: &cairn_runtime::SkipReason,
@@ -87,68 +72,11 @@ pub(crate) fn domain_trigger_suspension_reason(
     }
 }
 
-pub(crate) fn runtime_trigger_suspension_reason(
-    reason: &cairn_domain::events::TriggerSuspensionReason,
-) -> cairn_runtime::SuspensionReason {
-    match reason {
-        cairn_domain::events::TriggerSuspensionReason::RateLimitExceeded => {
-            cairn_runtime::SuspensionReason::RateLimitExceeded
-        }
-        cairn_domain::events::TriggerSuspensionReason::BudgetExceeded => {
-            cairn_runtime::SuspensionReason::BudgetExceeded
-        }
-        cairn_domain::events::TriggerSuspensionReason::RepeatedFailures { failure_count } => {
-            cairn_runtime::SuspensionReason::RepeatedFailures {
-                failure_count: *failure_count,
-            }
-        }
-        cairn_domain::events::TriggerSuspensionReason::OperatorPaused => {
-            cairn_runtime::SuspensionReason::OperatorPaused
-        }
-    }
-}
-
-pub(crate) fn runtime_event_for_run_template_created(
-    template: &cairn_runtime::RunTemplate,
-) -> RuntimeEvent {
-    RuntimeEvent::RunTemplateCreated(cairn_domain::events::RunTemplateCreated {
-        project: template.project.clone(),
-        template_id: template.id.clone(),
-        name: template.name.clone(),
-        description: template.description.clone(),
-        default_mode: template.default_mode.clone(),
-        system_prompt: template.system_prompt.clone(),
-        initial_user_message: template.initial_user_message.clone(),
-        plugin_allowlist: template.plugin_allowlist.clone(),
-        tool_allowlist: template.tool_allowlist.clone(),
-        budget_max_tokens: template.budget.max_tokens,
-        budget_max_wall_clock_ms: template.budget.max_wall_clock_ms,
-        budget_max_iterations: template.budget.max_iterations,
-        budget_exploration_budget_share: template.budget.exploration_budget_share,
-        sandbox_hint: template.sandbox_hint.clone(),
-        required_fields: template.required_fields.clone(),
-        created_by: template.created_by.clone(),
-        created_at: template.created_at,
-    })
-}
-
-pub(crate) fn runtime_event_for_trigger_created(trigger: &cairn_runtime::Trigger) -> RuntimeEvent {
-    RuntimeEvent::TriggerCreated(cairn_domain::events::TriggerCreated {
-        project: trigger.project.clone(),
-        trigger_id: trigger.id.clone(),
-        name: trigger.name.clone(),
-        description: trigger.description.clone(),
-        signal_type: trigger.signal_pattern.signal_type.clone(),
-        plugin_id: trigger.signal_pattern.plugin_id.clone(),
-        conditions: trigger_condition_values(&trigger.conditions),
-        run_template_id: trigger.run_template_id.clone(),
-        max_per_minute: trigger.rate_limit.max_per_minute,
-        max_burst: trigger.rate_limit.max_burst,
-        max_chain_depth: trigger.max_chain_depth,
-        created_by: trigger.created_by.clone(),
-        created_at: trigger.created_at,
-    })
-}
+// RFC-025 Phase 1.5a: `runtime_trigger_suspension_reason` +
+// `runtime_event_for_run_template_created` + `runtime_event_for_trigger_created`
+// deleted — the projection-backed `TriggerService` constructs the full
+// `RuntimeEvent::Trigger*` inside each CRUD method and appends it inside
+// its own transaction, so cairn-app no longer needs to build these events.
 
 pub(crate) fn runtime_event_for_trigger_service_event(
     project: &ProjectKey,

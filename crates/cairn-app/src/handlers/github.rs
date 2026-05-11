@@ -14,13 +14,38 @@ use axum::{
 };
 
 use cairn_api::sse::SseFrame;
+use cairn_integrations::github::{
+    default_github_project_from_env, GitHubEventAction, GitHubPlugin, IssueQueueEntry,
+    IssueQueueStatus, WebhookAction,
+};
 use cairn_store::EventLog;
 
 use crate::errors::AppApiError;
-use crate::state::{
-    default_github_project_from_env, AppState, GitHubEventAction, GitHubIntegration,
-    IssueQueueEntry, IssueQueueStatus, WebhookAction,
-};
+use crate::state::AppState;
+
+/// Resolve the `GitHubPlugin` from the integration registry.
+///
+/// Returns `None` when the operator has not configured the GitHub
+/// integration (no `GITHUB_APP_ID`/key/webhook-secret at boot and no
+/// `POST /v1/integrations` with `"type": "github"`). Handlers surface
+/// this as `503 github_not_configured`, preserving the pre-migration
+/// contract.
+///
+/// # Cost model
+///
+/// One call is one `RwLock::read().await` + one `HashMap::get` +
+/// `Arc::clone` + `Arc::downcast`. Each handler in this file calls
+/// `github_plugin(&state).await` **exactly once** at entry and binds
+/// the returned `Arc<GitHubPlugin>` to a local (`let github = …`) for
+/// the rest of the request — so repeated registry lookups inside a
+/// single handler never happen. That per-request single-lookup
+/// pattern is deliberate and the reason this file doesn't need an
+/// axum extractor or an `AppState` cache field: the registry already
+/// *is* the cache (`GitHubPlugin` is registered once and the same
+/// `Arc` is handed out for every lookup).
+async fn github_plugin(state: &AppState) -> Option<Arc<GitHubPlugin>> {
+    state.integrations.get_typed::<GitHubPlugin>("github").await
+}
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
@@ -99,7 +124,7 @@ pub(crate) fn event_pattern_matches(pattern: &str, event_key: &str) -> bool {
 }
 
 pub(crate) async fn acknowledge_event(
-    github: &GitHubIntegration,
+    github: &GitHubPlugin,
     installation_id: u64,
     event: &cairn_github::WebhookEvent,
 ) -> Result<(), cairn_github::GitHubError> {
@@ -111,6 +136,14 @@ pub(crate) async fn acknowledge_event(
         cairn_github::WebhookEventPayload::Issues(e) => Some(e.issue.number),
         cairn_github::WebhookEventPayload::IssueComment(e) => Some(e.issue.number),
         cairn_github::WebhookEventPayload::PullRequest(e) => Some(e.pull_request.number),
+        // `pull_request_review_comment` carries the PR number on the
+        // event envelope; this is what lets an agent reviewer pick up
+        // human replies to its inline comments without a second
+        // REST lookup.
+        cairn_github::WebhookEventPayload::PullRequestReviewComment(e) => {
+            Some(e.pull_request.number)
+        }
+        cairn_github::WebhookEventPayload::PullRequestReview(e) => Some(e.pull_request.number),
         _ => None,
     };
 
@@ -126,19 +159,19 @@ pub(crate) async fn acknowledge_event(
     Ok(())
 }
 
-pub(crate) async fn process_webhook_orchestrate(
-    state: &AppState,
-    github: &GitHubIntegration,
+/// Derive the (goal, issue_or_pr_number) pair from a webhook event
+/// envelope. Pure — no AppState, no plugin, no IO — so it's unit-
+/// testable end-to-end.
+///
+/// The `goal` string is what gets fed into the downstream run as the
+/// initial prompt-surface text. For `pull_request_review_comment` it
+/// includes `in_reply_to_id` when present, so the downstream agent
+/// can correlate a human reply with its own prior inline comment.
+pub(crate) fn derive_webhook_goal(
     event: &cairn_github::WebhookEvent,
-) -> Result<(), String> {
-    use cairn_domain::{RunId, SessionId};
-    use cairn_store::projections::SessionReadModel;
-
-    let repo_full = event.repository().unwrap_or("unknown/unknown");
-    let (owner, repo_name) = repo_full.split_once('/').unwrap_or(("unknown", "unknown"));
-    let installation_id = event.installation_id().ok_or("no installation_id")?;
-
-    let (goal, issue_number) = match &event.payload {
+    repo_full: &str,
+) -> (String, Option<u64>) {
+    match &event.payload {
         cairn_github::WebhookEventPayload::Issues(e) => {
             let body = e.issue.body.as_deref().unwrap_or("");
             (
@@ -166,11 +199,170 @@ pub(crate) async fn process_webhook_orchestrate(
                 Some(e.pull_request.number),
             )
         }
+        // A human replied to (or edited/deleted) an inline comment.
+        // The goal carries the comment body, diff hunk, anchor, and
+        // — critically — `in_reply_to_id` so the downstream agent can
+        // correlate the reply with its own prior comment and treat it
+        // as a labeled training signal.
+        cairn_github::WebhookEventPayload::PullRequestReviewComment(e) => {
+            let parent = e
+                .comment
+                .in_reply_to_id
+                .map(|id| format!(" (in reply to #{id})"))
+                .unwrap_or_default();
+            let diff_hunk = e.comment.diff_hunk.as_deref().unwrap_or("");
+            let line = e
+                .comment
+                .line
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            (
+                format!(
+                    "GitHub PR #{pr_n} review-comment {action} by @{user}{parent} on \
+                     `{path}:{line}`:\n\n{body}\n\n--- diff hunk ---\n{diff_hunk}\n\n\
+                     Repository: {repo_full}",
+                    pr_n = e.pull_request.number,
+                    action = e.action,
+                    user = e.comment.user.login,
+                    path = e.comment.path,
+                    body = e.comment.body,
+                ),
+                Some(e.pull_request.number),
+            )
+        }
+        cairn_github::WebhookEventPayload::PullRequestReview(e) => {
+            let body = e.review.body.as_deref().unwrap_or("");
+            (
+                format!(
+                    "GitHub PR #{} review {} by @{}: state={}\n\n{}\n\nRepository: {}",
+                    e.pull_request.number,
+                    e.action,
+                    e.review.user.login,
+                    e.review.state,
+                    body,
+                    repo_full
+                ),
+                Some(e.pull_request.number),
+            )
+        }
         _ => (
             format!("GitHub event: {} on {}", event.event_key(), repo_full),
             None,
         ),
+    }
+}
+
+/// Webhook-path iteration floor — the pre-#848 in-binary value, kept
+/// so removing the previous commit's hardcoded bumps does not regress
+/// webhook runs to the cairn-wide 5-minute default. Operators raise
+/// via `CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS`.
+const WEBHOOK_DEFAULT_MAX_ITERATIONS: u32 = 50;
+/// Webhook-path wall-clock floor (30 minutes) — same rationale.
+const WEBHOOK_DEFAULT_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
+
+/// Envelope for webhook-triggered orchestrator runs. Starts from
+/// `LoopConfig::default()` and applies the webhook-path floors above
+/// (50 iter / 30 min, matching the pre-#848 hardcoded values on `main`)
+/// so no existing deployment regresses when this helper landed.
+/// Operators opt into a larger envelope per-deployment via env.
+///
+/// Env knobs (all optional, all read at call time — not cached):
+/// - `CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS` — u32, overrides `max_iterations`
+/// - `CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS` — u64, overrides `timeout_ms`
+/// - `CAIRN_GITHUB_WEBHOOK_TOKEN_CAP` — u64, overrides `breakers.token_cap`
+///
+/// Breaker caps (`round_cap`, `wall_clock_ms`, the others) are NOT
+/// exposed to env yet — if operators need to tighten or loosen them
+/// specifically, file a follow-up. The current helper auto-bumps
+/// `round_cap` / `wall_clock_ms` when they would otherwise sit
+/// at-or-below the loop limit so runs terminate cleanly via
+/// `LoopTermination::TimedOut` / `MaxIterations` rather than tripping
+/// the safety-net breaker first.
+///
+/// Extreme env values (e.g. `u32::MAX` / `u64::MAX`) are rejected by
+/// `parse_env_limit`: anything that leaves less than a sane headroom
+/// to the breaker is ignored and the floor default is used instead,
+/// with a warning log. That preserves the strictly-above invariant
+/// without silently clamping, which would be the worse failure mode.
+fn webhook_loop_config_from_env() -> cairn_orchestrator::LoopConfig {
+    let mut cfg = cairn_orchestrator::LoopConfig::default();
+    cfg.max_iterations = WEBHOOK_DEFAULT_MAX_ITERATIONS;
+    cfg.timeout_ms = WEBHOOK_DEFAULT_TIMEOUT_MS;
+
+    cfg.max_iterations = parse_env_limit::<u32>(
+        "CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS",
+        cfg.max_iterations,
+        u32::MAX - 50,
+    );
+    cfg.timeout_ms = parse_env_limit::<u64>(
+        "CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS",
+        cfg.timeout_ms,
+        u64::MAX - 10 * 60 * 1_000,
+    );
+    if let Some(v) = std::env::var("CAIRN_GITHUB_WEBHOOK_TOKEN_CAP")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        cfg.breakers.token_cap = v;
+    }
+
+    // Preserve the "breaker strictly above loop limit" invariant that
+    // the rest of cairn relies on (see `BreakerConfig` rustdoc). The
+    // `max_allowed` caller above already guarantees we can saturating-add
+    // the safety margin without wrapping.
+    if cfg.breakers.round_cap <= cfg.max_iterations {
+        cfg.breakers.round_cap = cfg.max_iterations.saturating_add(50);
+    }
+    if cfg.breakers.wall_clock_ms <= cfg.timeout_ms {
+        cfg.breakers.wall_clock_ms = cfg.timeout_ms.saturating_add(10 * 60 * 1_000);
+    }
+    cfg
+}
+
+/// Parse an env-var-backed loop limit, rejecting values > `max_allowed`
+/// (which would make it impossible to keep a strictly-greater breaker
+/// cap without wrapping). Invalid/out-of-range values log a WARN and
+/// fall back to `default`.
+fn parse_env_limit<T>(key: &str, default: T, max_allowed: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Copy + std::fmt::Display,
+{
+    let Ok(raw) = std::env::var(key) else {
+        return default;
     };
+    let Ok(parsed) = raw.parse::<T>() else {
+        tracing::warn!(
+            env_key = key,
+            raw = %raw,
+            "ignoring unparseable env value; falling back to default"
+        );
+        return default;
+    };
+    if parsed > max_allowed {
+        tracing::warn!(
+            env_key = key,
+            value = %parsed,
+            max_allowed = %max_allowed,
+            "env value exceeds max_allowed (would break breaker-above-limit invariant); falling back to default"
+        );
+        return default;
+    }
+    parsed
+}
+
+pub(crate) async fn process_webhook_orchestrate(
+    state: &AppState,
+    github: &GitHubPlugin,
+    event: &cairn_github::WebhookEvent,
+) -> Result<(), String> {
+    use cairn_domain::{RunId, SessionId};
+    use cairn_store::projections::SessionReadModel;
+
+    let repo_full = event.repository().unwrap_or("unknown/unknown");
+    let (owner, repo_name) = repo_full.split_once('/').unwrap_or(("unknown", "unknown"));
+    let installation_id = event.installation_id().ok_or("no installation_id")?;
+
+    let (goal, issue_number) = derive_webhook_goal(event, repo_full);
 
     // T6a-C5: derive the project from the GitHub installation_id. Fall
     // back to an operator-configured default (env) only when no explicit
@@ -223,10 +415,22 @@ pub(crate) async fn process_webhook_orchestrate(
 
     let run_id_str = format!("{}-run-{}", session_id_str, event.delivery_id);
     let run_id = RunId::new(&run_id_str);
+    // Bind the run to `github_agent` persistently so that after an
+    // approval-gate / watchdog / checkpoint resume, the orchestrator
+    // rebuilds its `OrchestrationContext.agent_type` from the run
+    // projection's `agent_role_id` instead of defaulting to the
+    // built-in `"orchestrator"` cascade. Without this, a custom
+    // webhook-bound role is only in effect for iteration 0.
     let run = state
         .runtime
         .runs
-        .start(&project, &session_id, run_id.clone(), None)
+        .start_with_role(
+            &project,
+            &session_id,
+            run_id,
+            None,
+            Some("github_agent".to_owned()),
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -237,6 +441,94 @@ pub(crate) async fn process_webhook_orchestrate(
         repo = repo_full,
         "Created session + run for GitHub webhook"
     );
+
+    // Persist per-run defaults that `handlers/runs/orchestrate.rs`
+    // consults so every F49 auto-resume POST (`/v1/runs/:id/orchestrate`
+    // with empty body) recovers the webhook-path envelope + goal
+    // instead of dropping back to `LoopConfig::default()` +
+    // "Execute the run objective." on every approval-cycle kick:
+    //
+    // - `goal`: the GitHub-PR-specific prompt (PR number, repo slug,
+    //   PR body). Without this, the agent loses all context after the
+    //   first approval, self-reports "goal string not in context", and
+    //   refuses to invoke `github_api.review_pr`.
+    // - `max_iterations` / `timeout_ms`: loop limits. Without these,
+    //   the resume kick drops back to the LoopConfig defaults (50 / 5m)
+    //   and the run exhausts its envelope mid-review.
+    //
+    // Breaker caps stay off the per-run defaults path: they're read
+    // from `runtime_config.orchestrator_*` (env +
+    // `CAIRN_ORCHESTRATOR_*`), so one operator-level setting applies
+    // to every run regardless of entry path.
+    if let Err(err) =
+        crate::persist_run_string_default(state, &project, &run.run_id, "goal", &goal).await
+    {
+        tracing::warn!(
+            run_id = %run_id_str,
+            error = %err,
+            "failed to persist run goal default; auto-resume will lose the PR-review objective"
+        );
+    }
+    // Persist the integration binding so `/orchestrate` can rebuild the
+    // integration tool registry (`prepare_tool_registry`) on F49 resume.
+    // Without this, every resume kick registers only the core builtins
+    // and strips `github_api.review_pr` + `GhApi*` tools — the agent
+    // can explore the diff on iteration 0 but can't post the review on
+    // iteration N>0. The four keys reconstruct the minimal `WorkItem`
+    // that the GitHub integration's `prepare_tool_registry` reads.
+    // `external_id` (issue/PR number) is persisted too so the reconstructed
+    // `WorkItem` carries the full read-persist-recover envelope.
+    for (suffix, value) in [
+        ("integration_id", "github".to_owned()),
+        ("integration_source_id", installation_id.to_string()),
+        ("integration_repo", repo_full.to_owned()),
+        (
+            "integration_external_id",
+            issue_number.map(|n| n.to_string()).unwrap_or_default(),
+        ),
+    ] {
+        if let Err(err) =
+            crate::persist_run_string_default(state, &project, &run.run_id, suffix, &value).await
+        {
+            tracing::warn!(
+                run_id = %run_id_str,
+                suffix,
+                error = %err,
+                "failed to persist integration binding default; auto-resume will lose the integration tool registry"
+            );
+        }
+    }
+    let webhook_cfg = webhook_loop_config_from_env();
+    if let Err(err) = crate::persist_run_u32_default(
+        state,
+        &project,
+        &run.run_id,
+        "max_iterations",
+        webhook_cfg.max_iterations,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id_str,
+            error = %err,
+            "failed to persist run max_iterations default; auto-resume may fall back to LoopConfig default"
+        );
+    }
+    if let Err(err) = crate::persist_run_u64_default(
+        state,
+        &project,
+        &run.run_id,
+        "timeout_ms",
+        webhook_cfg.timeout_ms,
+    )
+    .await
+    {
+        tracing::warn!(
+            run_id = %run_id_str,
+            error = %err,
+            "failed to persist run timeout_ms default; auto-resume may fall back to LoopConfig default"
+        );
+    }
 
     if let Some(number) = issue_number {
         let client = github.client_for_installation(installation_id).await;
@@ -249,7 +541,34 @@ pub(crate) async fn process_webhook_orchestrate(
         }
     }
 
-    webhook_trigger_orchestration(state, &run, &goal, None, None).await
+    // Synthesize a WorkItem so `webhook_trigger_orchestration` hands the
+    // GitHub plugin's `prepare_tool_registry` a real context. Without a
+    // WorkItem the orchestration path skips integration-specific tool
+    // registration entirely — the agent boots with only the Core builtins
+    // and loses `github_api.review_pr` + the `GhApi*` family, turning a
+    // PR reviewer into a read-only explorer that can't post. Every field
+    // is derived from data we already have; nothing is fabricated.
+    let title = goal.lines().next().unwrap_or("").to_owned();
+    let work_item = cairn_integrations::WorkItem {
+        integration_id: "github".to_owned(),
+        source_id: installation_id.to_string(),
+        external_id: issue_number.map(|n| n.to_string()).unwrap_or_default(),
+        repo: repo_full.to_owned(),
+        title,
+        body: goal,
+        run_id: run_id_str.clone(),
+        session_id: session_id_str.clone(),
+        status: cairn_integrations::WorkItemStatus::Processing,
+    };
+    webhook_trigger_orchestration(
+        state,
+        &run,
+        &work_item.body,
+        Some(installation_id),
+        Some(&work_item),
+        webhook_cfg,
+    )
+    .await
 }
 
 pub(crate) async fn webhook_trigger_orchestration(
@@ -258,9 +577,13 @@ pub(crate) async fn webhook_trigger_orchestration(
     goal: &str,
     _installation_id: Option<u64>,
     work_item: Option<&cairn_integrations::WorkItem>,
+    // Built once in `process_webhook_orchestrate` (along with the
+    // per-run `max_iterations` / `timeout_ms` persistence) so the env
+    // vars are read once per webhook delivery, not twice.
+    loop_config: cairn_orchestrator::LoopConfig,
 ) -> Result<(), String> {
     use cairn_orchestrator::{
-        LlmDecidePhase, LoopConfig, LoopTermination, OrchestrationContext, OrchestratorLoop,
+        LlmDecidePhase, LoopTermination, OrchestrationContext, OrchestratorLoop,
         RuntimeExecutePhase, StandardGatherPhase,
     };
     use cairn_runtime::services::{
@@ -309,10 +632,16 @@ pub(crate) async fn webhook_trigger_orchestration(
         agent_type: "github_agent".to_owned(),
         run_started_at_ms: now_ms,
         working_dir,
+        completion_contract: None,
         run_mode: cairn_domain::decisions::RunMode::default(),
         discovered_tool_names: vec![],
         step_history: vec![],
         is_recovery: false,
+        approval_timeout: None,
+        visibility: None,
+        parent_context: None,
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     };
 
     let model_id = {
@@ -371,14 +700,25 @@ pub(crate) async fn webhook_trigger_orchestration(
         Arc::new(full)
     };
 
-    let decide = LlmDecidePhase::new(brain, model_id).with_tools(registry.clone());
+    // RFC 031 PR-C: thread the agent-role resolver + event log so the
+    // GitHub webhook run DECIDE pipeline honors operator-defined roles
+    // and emits `ToolDeclaredButMissing` advisories. Mirrors the
+    // /v1/runs/:id/orchestrate handler's wiring via
+    // `AppState::agent_role_service`.
+    let decide = LlmDecidePhase::new(brain, model_id)
+        .with_tools(registry.clone())
+        .with_agent_roles(state.agent_role_service())
+        .with_event_log(state.runtime.store.clone());
 
     let store = state.runtime.store.clone();
-    let config = LoopConfig {
-        max_iterations: 50,
-        timeout_ms: 30 * 60 * 1_000,
-        ..LoopConfig::default()
-    };
+    // `loop_config` was built in `process_webhook_orchestrate` from
+    // `webhook_loop_config_from_env()` so env vars are read once per
+    // webhook delivery (not twice). The caller also persisted its
+    // `max_iterations` and `timeout_ms` to the per-run defaults
+    // projection so every subsequent F49 auto-resume kick through
+    // `POST /v1/runs/:id/orchestrate` (empty body) inherits the same
+    // envelope.
+    let config = loop_config;
 
     let execute = RuntimeExecutePhase::builder()
         .tool_registry(registry)
@@ -390,7 +730,11 @@ pub(crate) async fn webhook_trigger_orchestration(
         .tool_invocation_service(Arc::new(ToolInvocationServiceImpl::new(store)))
         .checkpoint_every_n_tool_calls(config.checkpoint_every_n_tool_calls)
         .tool_result_cache(state.tool_result_cache.clone())
-        .build();
+        .build()
+        // All six required services are supplied above — any missing
+        // setter here is a compile-time regression, not a runtime
+        // configuration gap, so `.expect` is the right shape.
+        .expect("RuntimeExecutePhase builder misconfigured");
 
     let emitter = build_orchestrator_emitter(state);
 
@@ -462,6 +806,7 @@ pub(crate) fn build_orchestrator_emitter(
         inner: std::sync::Arc<crate::sse_hooks::SseOrchestratorEmitter>,
         store: std::sync::Arc<cairn_store::InMemoryStore>,
         exporter: std::sync::Arc<cairn_runtime::telemetry::OtlpExporter>,
+        fatal_error: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -482,79 +827,14 @@ pub(crate) fn build_orchestrator_emitter(
             d: &cairn_orchestrator::DecideOutput,
         ) {
             self.inner.on_decide_completed(ctx, d).await;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let call_id = format!("orch_{}_{}", ctx.run_id.as_str(), now);
-            let event = cairn_domain::EventEnvelope::for_runtime_event(
-                cairn_domain::EventId::new(format!("evt_trace_{call_id}")),
-                cairn_domain::EventSource::Runtime,
-                cairn_domain::RuntimeEvent::ProviderCallCompleted(
-                    cairn_domain::events::ProviderCallCompleted {
-                        project: ctx.project.clone(),
-                        provider_call_id: cairn_domain::ProviderCallId::new(&call_id),
-                        route_decision_id: cairn_domain::RouteDecisionId::new(format!(
-                            "rd_{call_id}"
-                        )),
-                        route_attempt_id: cairn_domain::RouteAttemptId::new(format!(
-                            "ra_{call_id}"
-                        )),
-                        provider_binding_id: cairn_domain::ProviderBindingId::new("brain"),
-                        provider_connection_id: cairn_domain::ProviderConnectionId::new("brain"),
-                        provider_model_id: cairn_domain::ProviderModelId::new(&d.model_id),
-                        operation_kind: cairn_domain::providers::OperationKind::Generate,
-                        status: cairn_domain::providers::ProviderCallStatus::Succeeded,
-                        latency_ms: Some(d.latency_ms),
-                        input_tokens: d.input_tokens,
-                        output_tokens: d.output_tokens,
-                        cost_micros: Some(
-                            ((d.input_tokens.unwrap_or(0) as u64).saturating_mul(500)
-                                + (d.output_tokens.unwrap_or(0) as u64).saturating_mul(1500))
-                                / 1_000,
-                        ),
-                        completed_at: now,
-                        session_id: Some(ctx.session_id.clone()),
-                        run_id: Some(ctx.run_id.clone()),
-                        error_class: None,
-                        raw_error_message: None,
-                        retry_count: 0,
-                        task_id: ctx
-                            .task_id
-                            .as_ref()
-                            .map(|t| cairn_domain::TaskId::new(t.as_str())),
-                        prompt_release_id: None,
-                        fallback_position: 0,
-                        started_at: now.saturating_sub(d.latency_ms),
-                        finished_at: now,
-                    },
-                ),
-            );
-            let payload = event.payload.clone();
-            if let Err(e) = self.store.append(&[event]).await {
-                tracing::warn!("event store append failed (non-fatal): {e}");
-            }
-            let _ = self.exporter.export_event(&payload).await;
-
-            use cairn_store::projections::LlmCallTraceReadModel;
-            let input_tokens = d.input_tokens.unwrap_or(0);
-            let output_tokens = d.output_tokens.unwrap_or(0);
-            let cost_micros = ((input_tokens as u64).saturating_mul(500)
-                + (output_tokens as u64).saturating_mul(1500))
-                / 1_000;
-            let trace = cairn_domain::LlmCallTrace {
-                trace_id: call_id,
-                model_id: d.model_id.clone(),
-                prompt_tokens: input_tokens,
-                completion_tokens: output_tokens,
-                latency_ms: d.latency_ms,
-                cost_micros,
-                session_id: Some(ctx.session_id.clone()),
-                run_id: Some(ctx.run_id.clone()),
-                created_at_ms: now,
-                is_error: false,
-            };
-            let _ = self.store.insert_trace(trace).await;
+            crate::tracing_emitter::record_decide_trace(
+                ctx,
+                d,
+                &self.store,
+                &self.exporter,
+                &self.fatal_error,
+            )
+            .await;
         }
         async fn on_tool_called(
             &self,
@@ -611,12 +891,17 @@ pub(crate) fn build_orchestrator_emitter(
         ) {
             self.inner.on_finished(ctx, t).await;
         }
+        fn take_fatal_error(&self) -> Option<String> {
+            let mut slot = self.fatal_error.lock().unwrap_or_else(|p| p.into_inner());
+            slot.take()
+        }
     }
 
     std::sync::Arc::new(TracingEmitter {
         inner: sse_emitter,
         store: state.runtime.store.clone(),
         exporter: state.otlp_exporter.clone(),
+        fatal_error: std::sync::Mutex::new(None),
     })
 }
 
@@ -654,8 +939,8 @@ pub(crate) async fn github_webhook_handler(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let github = match &state.github {
-        Some(gh) => gh.clone(),
+    let github = match github_plugin(&state).await {
+        Some(gh) => gh,
         None => {
             return AppApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -794,7 +1079,7 @@ pub(crate) async fn github_webhook_handler(
 pub(crate) async fn list_webhook_actions_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return Json(serde_json::json!({"actions": [], "github_configured": false}))
@@ -809,7 +1094,7 @@ pub(crate) async fn set_webhook_actions_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SetWebhookActionsRequest>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return AppApiError::new(
@@ -831,8 +1116,8 @@ pub(crate) async fn github_scan_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ScanRequest>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
-        Some(gh) => gh.clone(),
+    let github = match github_plugin(&state).await {
+        Some(gh) => gh,
         None => {
             return AppApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1007,7 +1292,7 @@ pub(crate) async fn github_scan_handler(
     Json(serde_json::json!({"status": "queued", "repo": body.repo, "total_issues": issue_count, "queued": queued_count, "issues": queued})).into_response()
 }
 
-pub(crate) async fn process_issue_queue(state: Arc<AppState>, github: Arc<GitHubIntegration>) {
+pub(crate) async fn process_issue_queue(state: Arc<AppState>, github: Arc<GitHubPlugin>) {
     if github
         .queue_running
         .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -1096,7 +1381,7 @@ pub(crate) async fn process_issue_queue(state: Arc<AppState>, github: Arc<GitHub
 
 pub(crate) async fn orchestrate_single_issue(
     state: &AppState,
-    github: &GitHubIntegration,
+    github: &GitHubPlugin,
     entry: &IssueQueueEntry,
 ) -> Result<IssueQueueStatus, String> {
     let (owner, repo_name) = entry.repo.split_once('/').unwrap_or(("", &entry.repo));
@@ -1144,12 +1429,59 @@ pub(crate) async fn orchestrate_single_issue(
         )
         .await
         .map_err(|e| format!("repo allowlist failed: {}", e.client_message()))?;
+    // Mirror the webhook-path envelope + per-run defaults persistence
+    // so scan-queue dispatched runs honor the same budgets and their
+    // F49 auto-resume kicks inherit them. See the persistence block in
+    // `process_webhook_orchestrate` for the rationale.
+    if let Err(err) =
+        crate::persist_run_string_default(state, &run.project, &run.run_id, "goal", &goal).await
+    {
+        tracing::warn!(run_id = %run.run_id, error = %err, "failed to persist run goal default; auto-resume will lose the issue-resolution objective");
+    }
+    // Persist integration binding — see the webhook path for rationale.
+    for (suffix, value) in [
+        ("integration_id", "github".to_owned()),
+        ("integration_source_id", entry.installation_id.to_string()),
+        ("integration_repo", entry.repo.clone()),
+        ("integration_external_id", entry.issue_number.to_string()),
+    ] {
+        if let Err(err) =
+            crate::persist_run_string_default(state, &run.project, &run.run_id, suffix, &value)
+                .await
+        {
+            tracing::warn!(run_id = %run.run_id, suffix, error = %err, "failed to persist integration binding default");
+        }
+    }
+    let webhook_cfg = webhook_loop_config_from_env();
+    if let Err(err) = crate::persist_run_u32_default(
+        state,
+        &run.project,
+        &run.run_id,
+        "max_iterations",
+        webhook_cfg.max_iterations,
+    )
+    .await
+    {
+        tracing::warn!(run_id = %run.run_id, error = %err, "failed to persist run max_iterations default; auto-resume may fall back to LoopConfig default");
+    }
+    if let Err(err) = crate::persist_run_u64_default(
+        state,
+        &run.project,
+        &run.run_id,
+        "timeout_ms",
+        webhook_cfg.timeout_ms,
+    )
+    .await
+    {
+        tracing::warn!(run_id = %run.run_id, error = %err, "failed to persist run timeout_ms default; auto-resume may fall back to LoopConfig default");
+    }
     webhook_trigger_orchestration(
         state,
         &run,
         &goal,
         Some(entry.installation_id),
         Some(&work_item),
+        webhook_cfg,
     )
     .await?;
     let final_state =
@@ -1180,7 +1512,7 @@ pub(crate) async fn orchestrate_single_issue(
 }
 
 pub(crate) async fn update_queue_status(
-    github: &GitHubIntegration,
+    github: &GitHubPlugin,
     issue_number: u64,
     status: IssueQueueStatus,
 ) {
@@ -1193,7 +1525,7 @@ pub(crate) async fn update_queue_status(
 pub(crate) async fn github_queue_pause_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if let Some(ref gh) = state.github {
+    if let Some(gh) = github_plugin(&state).await {
         gh.queue_paused
             .store(true, std::sync::atomic::Ordering::SeqCst);
         emit_github_progress(&state, serde_json::json!({"action": "queue_paused"}));
@@ -1207,8 +1539,8 @@ pub(crate) async fn github_queue_pause_handler(
 pub(crate) async fn github_queue_resume_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
-        Some(gh) => gh.clone(),
+    let github = match github_plugin(&state).await {
+        Some(gh) => gh,
         None => {
             return AppApiError::new(StatusCode::SERVICE_UNAVAILABLE, "github_not_configured", "")
                 .into_response();
@@ -1252,7 +1584,7 @@ pub(crate) async fn github_queue_skip_handler(
     State(state): State<Arc<AppState>>,
     Path(issue_str): Path<String>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return AppApiError::new(StatusCode::SERVICE_UNAVAILABLE, "github_not_configured", "")
@@ -1283,8 +1615,8 @@ pub(crate) async fn github_queue_retry_handler(
     State(state): State<Arc<AppState>>,
     Path(issue_str): Path<String>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
-        Some(gh) => gh.clone(),
+    let github = match github_plugin(&state).await {
+        Some(gh) => gh,
         None => {
             return AppApiError::new(StatusCode::SERVICE_UNAVAILABLE, "github_not_configured", "")
                 .into_response();
@@ -1326,7 +1658,7 @@ pub(crate) async fn github_queue_retry_handler(
 pub(crate) async fn github_installations_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return Json(serde_json::json!({"installations": [], "configured": false}))
@@ -1351,7 +1683,7 @@ pub(crate) async fn set_queue_concurrency_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return AppApiError::new(StatusCode::SERVICE_UNAVAILABLE, "github_not_configured", "")
@@ -1371,7 +1703,7 @@ pub(crate) async fn set_queue_concurrency_handler(
 
 /// GET /v1/webhooks/github/queue
 pub(crate) async fn github_queue_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let github = match &state.github {
+    let github = match github_plugin(&state).await {
         Some(gh) => gh,
         None => {
             return Json(serde_json::json!({
@@ -1418,4 +1750,530 @@ pub(crate) async fn github_queue_handler(State(state): State<Arc<AppState>>) -> 
         "dispatcher_running": dispatcher_running,
     }))
     .into_response()
+}
+
+// ── POST /v1/integrations/github/verify-installation ───────────────────────
+//
+// Lets an operator prove a GitHub App installation works without mutating
+// server-side state: they paste `app_id`, PEM private key, and
+// `installation_id`, and cairn mints a JWT → exchanges it for an
+// installation access token → fetches the installation's repo count.
+// Success returns `{verified: true, owner, repo_count, expires_at}`.
+// Any GitHub-side failure surfaces as 502 `github_api_error` so the UI
+// can show the operator exactly why the paste didn't land.
+
+#[derive(serde::Deserialize)]
+pub(crate) struct VerifyInstallationRequest {
+    pub app_id: u64,
+    /// PEM-encoded RSA private key downloaded from the GitHub App page.
+    pub private_key: String,
+    pub installation_id: u64,
+}
+
+#[derive(serde::Serialize)]
+struct VerifyInstallationResponse {
+    verified: bool,
+    owner: String,
+    repo_count: u64,
+    expires_at: String,
+}
+
+#[derive(serde::Deserialize)]
+struct InstallationRepositoriesResponse {
+    total_count: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct InstallationLookupResponse {
+    #[serde(default)]
+    account: Option<InstallationLookupAccount>,
+}
+
+#[derive(serde::Deserialize)]
+struct InstallationLookupAccount {
+    login: String,
+}
+
+pub(crate) async fn verify_github_installation_handler(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<VerifyInstallationRequest>,
+) -> impl IntoResponse {
+    // Build a short-lived HTTP client per verify. The endpoint is
+    // operator-triggered (not hot-path) and the GitHub calls only take
+    // a few hundred ms, so a dedicated client keeps this path self-
+    // contained without depending on AppState plumbing. Bound the
+    // total time we'll wait on api.github.com so a stalled TLS/DNS
+    // handshake can't pin an axum worker indefinitely.
+    let http = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return AppApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "http_client_build_failed",
+                format!("could not build HTTP client: {e}"),
+            )
+            .into_response();
+        }
+    };
+    if body.private_key.trim().is_empty() {
+        return AppApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "private_key must not be empty",
+        )
+        .into_response();
+    }
+
+    // 1. Build credentials from the pasted PEM (validates RSA key shape).
+    let credentials =
+        match cairn_github::AppCredentials::new(body.app_id, body.private_key.as_bytes()) {
+            Ok(c) => c,
+            Err(e) => {
+                return AppApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_private_key",
+                    format!("could not parse RSA private key: {e}"),
+                )
+                .into_response();
+            }
+        };
+
+    // 2. Mint an installation access token.
+    let token_manager = cairn_github::InstallationToken::new(
+        credentials.clone(),
+        body.installation_id,
+        http.clone(),
+    );
+    let (access_token, expires_at) = match token_manager.refresh_with_metadata().await {
+        Ok(pair) => pair,
+        Err(e) => {
+            return AppApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "github_api_error",
+                format!("token exchange failed: {e}"),
+            )
+            .into_response();
+        }
+    };
+
+    // 3. Fetch installation metadata (owner login) with the App JWT.
+    let jwt = match credentials.generate_jwt() {
+        Ok(j) => j,
+        Err(e) => {
+            return AppApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "jwt_signing_failed",
+                format!("could not sign JWT: {e}"),
+            )
+            .into_response();
+        }
+    };
+    let installation_url = format!(
+        "https://api.github.com/app/installations/{}",
+        body.installation_id
+    );
+    let owner = match http
+        .get(&installation_url)
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "cairn-app/verify-installation")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<InstallationLookupResponse>().await {
+                Ok(parsed) => parsed
+                    .account
+                    .map(|a| a.login)
+                    .unwrap_or_else(|| "unknown".into()),
+                Err(e) => {
+                    return AppApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "github_api_error",
+                        format!("could not parse installation lookup: {e}"),
+                    )
+                    .into_response();
+                }
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return AppApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "github_api_error",
+                format!("installation lookup returned {status}: {body_text}"),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return AppApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "github_api_error",
+                format!("installation lookup request failed: {e}"),
+            )
+            .into_response();
+        }
+    };
+
+    // 4. Fetch accessible repository count using the installation token.
+    let repo_count = match http
+        .get("https://api.github.com/installation/repositories?per_page=1")
+        .header("Authorization", format!("token {access_token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "cairn-app/verify-installation")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<InstallationRepositoriesResponse>().await {
+                Ok(parsed) => parsed.total_count,
+                Err(e) => {
+                    return AppApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        "github_api_error",
+                        format!("could not parse repo list: {e}"),
+                    )
+                    .into_response();
+                }
+            }
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return AppApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "github_api_error",
+                format!("repositories lookup returned {status}: {body_text}"),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return AppApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "github_api_error",
+                format!("repositories lookup request failed: {e}"),
+            )
+            .into_response();
+        }
+    };
+
+    // `expires_at` came back alongside the access token from the first
+    // refresh — no need for a redundant second token mint.
+    Json(VerifyInstallationResponse {
+        verified: true,
+        owner,
+        repo_count,
+        expires_at,
+    })
+    .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_github::{WebhookEvent, WebhookEventPayload};
+
+    fn parse(event_type: &str, body: serde_json::Value) -> WebhookEvent {
+        WebhookEvent::parse(event_type, "dlv", &serde_json::to_vec(&body).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn derive_goal_pull_request_review_comment_with_reply() {
+        // A human reply to an agent's inline comment. The goal must
+        // carry the reply body, parent id, file anchor, and diff
+        // hunk so the downstream agent can correlate the reply with
+        // its prior finding.
+        let event = parse(
+            "pull_request_review_comment",
+            serde_json::json!({
+                "action": "created",
+                "comment": {
+                    "id": 777,
+                    "in_reply_to_id": 333,
+                    "user": {"login": "human-reviewer", "id": 1},
+                    "body": "good catch — I'll retry on EINTR",
+                    "path": "src/socket.c",
+                    "line": 382,
+                    "diff_hunk": "@@ -378,3 +378,7 @@ connSocketBlockingConnect",
+                    "html_url": "https://example.com"
+                },
+                "pull_request": {
+                    "number": 5, "title": "t", "state": "open",
+                    "user": {"login": "bot", "id": 2}, "html_url": "u"
+                },
+                "repository": {"full_name": "avifenesh/valkey"},
+                "sender": {"login": "human-reviewer", "id": 1},
+                "installation": {"id": 130_312_695}
+            }),
+        );
+
+        let (goal, pr) = derive_webhook_goal(&event, "avifenesh/valkey");
+        assert_eq!(pr, Some(5));
+        assert!(goal.contains("PR #5"), "goal names the PR: {goal}");
+        assert!(
+            goal.contains("review-comment created"),
+            "goal names the action: {goal}"
+        );
+        assert!(
+            goal.contains("@human-reviewer"),
+            "goal names the commenter: {goal}"
+        );
+        assert!(
+            goal.contains("in reply to #333"),
+            "goal preserves in_reply_to_id so the agent can correlate replies: {goal}",
+        );
+        assert!(
+            goal.contains("src/socket.c") && goal.contains(":382"),
+            "goal anchors to file:line: {goal}",
+        );
+        assert!(
+            goal.contains("connSocketBlockingConnect"),
+            "goal carries diff-hunk context: {goal}",
+        );
+        assert!(
+            goal.contains("good catch"),
+            "goal carries the reply body: {goal}",
+        );
+    }
+
+    #[test]
+    fn derive_goal_pull_request_review_comment_top_level() {
+        // Same event type, no in_reply_to_id — a top-level inline
+        // review comment. Agent logic distinguishes these by the
+        // absence of the "in reply to" phrase.
+        let event = parse(
+            "pull_request_review_comment",
+            serde_json::json!({
+                "action": "created",
+                "comment": {
+                    "id": 888,
+                    "user": {"login": "h", "id": 1},
+                    "body": "...",
+                    "path": "x.c",
+                    "html_url": "u"
+                },
+                "pull_request": {
+                    "number": 42, "title": "t", "state": "open",
+                    "user": {"login": "b", "id": 2}, "html_url": "u"
+                },
+                "repository": {"full_name": "o/r"},
+                "sender": {"login": "h", "id": 1}
+            }),
+        );
+
+        let (goal, pr) = derive_webhook_goal(&event, "o/r");
+        assert_eq!(pr, Some(42));
+        assert!(
+            !goal.contains("in reply to"),
+            "no reply tag on top-level: {goal}"
+        );
+        assert!(goal.contains(":?"), "missing line renders as ? : {goal}");
+    }
+
+    #[test]
+    fn derive_goal_pull_request_review_envelope() {
+        // Top-level review (state=APPROVED/CHANGES_REQUESTED/COMMENTED)
+        // envelope, distinct from an inline comment.
+        let event = parse(
+            "pull_request_review",
+            serde_json::json!({
+                "action": "submitted",
+                "review": {
+                    "id": 1,
+                    "state": "CHANGES_REQUESTED",
+                    "body": "breaking change needs docs update",
+                    "user": {"login": "maintainer", "id": 9},
+                    "html_url": "u"
+                },
+                "pull_request": {
+                    "number": 100, "title": "t", "state": "open",
+                    "user": {"login": "a", "id": 2}, "html_url": "u"
+                },
+                "repository": {"full_name": "o/r"},
+                "sender": {"login": "maintainer", "id": 9}
+            }),
+        );
+
+        let (goal, pr) = derive_webhook_goal(&event, "o/r");
+        assert_eq!(pr, Some(100));
+        assert!(goal.contains("state=CHANGES_REQUESTED"));
+        assert!(goal.contains("breaking change needs docs update"));
+    }
+
+    #[test]
+    fn derive_goal_falls_through_on_unknown_event_types() {
+        // Events other than the typed variants must not crash — the
+        // goal degrades gracefully to "event on repo" and pr_number
+        // is None.
+        let event = parse(
+            "check_run",
+            serde_json::json!({
+                "action": "completed",
+                "repository": {"full_name": "o/r"}
+            }),
+        );
+        let (goal, pr) = derive_webhook_goal(&event, "o/r");
+        assert_eq!(pr, None);
+        assert!(goal.contains("check_run.completed"));
+        assert!(matches!(event.payload, WebhookEventPayload::Other(_)));
+    }
+
+    // ── env-var test helpers ───────────────────────────────────────
+    //
+    // Tests that mutate `CAIRN_GITHUB_WEBHOOK_*` env vars must (a) hold
+    // the process-wide `ENV_MUTEX` so they don't race other tests in
+    // this binary, and (b) save + restore pre-existing values so a
+    // developer or CI host that already has these set is not clobbered.
+    // `EnvGuard` is an RAII wrapper that does both; its `Drop` runs
+    // even on panic, so the test's pre-existing env survives.
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_mutex() -> &'static Mutex<()> {
+        static M: OnceLock<Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard<'a> {
+        keys: Vec<(&'static str, Option<String>)>,
+        _lock: MutexGuard<'a, ()>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn new(sets: &[(&'static str, &str)]) -> Self {
+            // On poisoning, take the inner — a prior test may have
+            // panicked mid-mutation, but the env has already been
+            // restored by its own Drop, so the state is still usable.
+            let lock = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
+            let keys: Vec<(&'static str, Option<String>)> = sets
+                .iter()
+                .map(|(k, v)| {
+                    let prior = std::env::var(k).ok();
+                    // SAFETY: protected by `env_mutex()` — this thread
+                    // holds the only lock on all CAIRN_GITHUB_WEBHOOK_*
+                    // env mutation in this binary. FFI callers outside
+                    // the test harness are not in scope here.
+                    unsafe { std::env::set_var(k, v) };
+                    (*k, prior)
+                })
+                .collect();
+            EnvGuard { keys, _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            for (k, prior) in &self.keys {
+                // SAFETY: same as EnvGuard::new — mutex-protected,
+                // and this runs even on panic.
+                unsafe {
+                    match prior {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Guard against a config regression: when operators raise
+    /// `max_iterations` / `timeout_ms` via env, the paired breaker must
+    /// auto-bump to stay strictly above the loop limit so runs terminate
+    /// via `LoopTermination::{TimedOut, MaxIterations}` rather than
+    /// tripping the safety-net breaker first.
+    #[test]
+    fn webhook_loop_config_from_env_preserves_breaker_invariant() {
+        let _g = EnvGuard::new(&[
+            ("CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS", "300"),
+            ("CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS", "7200000"), // 120 min
+            ("CAIRN_GITHUB_WEBHOOK_TOKEN_CAP", "750000"),
+        ]);
+        let cfg = webhook_loop_config_from_env();
+        assert_eq!(cfg.max_iterations, 300);
+        assert_eq!(cfg.timeout_ms, 7_200_000);
+        assert_eq!(cfg.breakers.token_cap, 750_000);
+        assert!(
+            cfg.breakers.round_cap > cfg.max_iterations,
+            "round_cap {} must stay > max_iterations {}",
+            cfg.breakers.round_cap,
+            cfg.max_iterations
+        );
+        assert!(
+            cfg.breakers.wall_clock_ms > cfg.timeout_ms,
+            "wall_clock_ms {} must stay > timeout_ms {}",
+            cfg.breakers.wall_clock_ms,
+            cfg.timeout_ms
+        );
+    }
+
+    /// Extreme env values (or anything that leaves no headroom for the
+    /// paired breaker's `saturating_add` to stay strictly greater) must
+    /// be rejected and fall back to the webhook floor defaults — NOT
+    /// silently clamp, which would be the worse failure mode.
+    #[test]
+    fn webhook_loop_config_rejects_extreme_env_values() {
+        let _g = EnvGuard::new(&[
+            ("CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS", &u32::MAX.to_string()),
+            ("CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS", &u64::MAX.to_string()),
+        ]);
+        let cfg = webhook_loop_config_from_env();
+        assert_eq!(
+            cfg.max_iterations, WEBHOOK_DEFAULT_MAX_ITERATIONS,
+            "u32::MAX must be rejected; floor should win"
+        );
+        assert_eq!(
+            cfg.timeout_ms, WEBHOOK_DEFAULT_TIMEOUT_MS,
+            "u64::MAX must be rejected; floor should win"
+        );
+        assert!(cfg.breakers.round_cap > cfg.max_iterations);
+        assert!(cfg.breakers.wall_clock_ms > cfg.timeout_ms);
+    }
+
+    /// With no env overrides, the helper must return the webhook-path
+    /// floor defaults. This pins the no-regression promise from #848
+    /// and #850 — a deployment that doesn't set any of the env vars
+    /// must keep behaving exactly like it did before.
+    #[test]
+    fn webhook_loop_config_defaults_match_pre_rework_behavior() {
+        // Empty EnvGuard still serialises against the other tests.
+        let _g = EnvGuard::new(&[]);
+        // The EnvGuard itself doesn't clear — if a developer has these
+        // exported in their shell, the assertion would spuriously fail.
+        // Explicitly unset for this test.
+        let prior: Vec<(&str, Option<String>)> = [
+            "CAIRN_GITHUB_WEBHOOK_MAX_ITERATIONS",
+            "CAIRN_GITHUB_WEBHOOK_TIMEOUT_MS",
+            "CAIRN_GITHUB_WEBHOOK_TOKEN_CAP",
+        ]
+        .iter()
+        .map(|k| {
+            let p = std::env::var(k).ok();
+            // SAFETY: mutex-held via _g.
+            unsafe { std::env::remove_var(k) };
+            (*k, p)
+        })
+        .collect();
+
+        let cfg = webhook_loop_config_from_env();
+
+        // Restore.
+        for (k, p) in prior {
+            // SAFETY: mutex-held via _g.
+            unsafe {
+                match p {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+
+        assert_eq!(cfg.max_iterations, WEBHOOK_DEFAULT_MAX_ITERATIONS);
+        assert_eq!(cfg.timeout_ms, WEBHOOK_DEFAULT_TIMEOUT_MS);
+    }
 }

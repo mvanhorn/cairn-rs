@@ -11,6 +11,53 @@ use std::{
 pub(crate) const HTTP_DURATION_BUCKETS_MS: [u64; 10] =
     [5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000];
 
+/// Cardinality budget for tenant-labelled gauges (#502).
+///
+/// Prometheus starts choking (scrape latency, TSDB ingestion cost) in the
+/// 10k-100k series range per instance. Cairn at the commercial layer will
+/// run many small tenants (one per customer), so uncapped
+/// `cairn_active_{runs,tasks}_by_tenant{tenant=…}` can hit that ceiling.
+///
+/// Policy: emit at most `TENANT_METRIC_TOP_N` tenants (ranked by total
+/// activity, i.e. `active_runs + active_tasks + pending_approvals`);
+/// overflow aggregates into a single `tenant="__other__"` row whose value
+/// is the SUM across the evicted tenants. Operators get accurate top-N
+/// dashboards AND a visible signal that there's additional activity
+/// beyond the cap — "__other__" > 0 is the prompt to bump N or to
+/// redirect high-cardinality breakdowns to OpenTelemetry traces.
+///
+/// 100 is a deliberate compromise: the top decile of tenants dominate
+/// activity in every real cairn deployment we've seen, and 100 × 3
+/// gauges = 300 series — comfortably under the "several thousand"
+/// soft ceiling for a single Prometheus scrape.
+pub(crate) const TENANT_METRIC_TOP_N: usize = 100;
+
+/// Overflow-bucket label used when the tenant count exceeds
+/// `TENANT_METRIC_TOP_N` or the distinct `(provider_connection, model)`
+/// combination exceeds `PROVIDER_METRIC_TOP_N`. Pinned as a constant so
+/// alerting rules / dashboards can match on a stable string.
+pub(crate) const CARDINALITY_OVERFLOW_LABEL: &str = "__other__";
+
+/// Cardinality budget for provider-call series (#503).
+///
+/// `model` (and `provider_connection`) are operator-supplied — rotating
+/// model IDs (`gpt-4o-mini`, `gpt-4o-mini-2024-07-18`,
+/// `gpt-4o-mini-20241218`) accumulate one series each. `ProviderCallKey`
+/// crosses four labels, so the raw hashmap can reach
+/// `|connections| × |models| × |ops| × 3` — unbounded in practice.
+///
+/// Policy: at render time, keep the top-N `(provider_connection, model)`
+/// combinations ranked by total call count; overflow rows collapse into
+/// `{provider_connection="__other__", model="__other__"}`. `operation_kind`
+/// + `status` are bounded enums so they're never aggregated.
+///
+/// The counter map itself is still unbounded (record paths insert on
+/// every call) — an operator-visible overflow is better than a silent
+/// cap that drops updates. Render-time aggregation gives the backpressure
+/// where it matters: Prometheus scrapes.
+#[cfg(feature = "metrics-providers")]
+pub(crate) const PROVIDER_METRIC_TOP_N: usize = 100;
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RequestCountKey {
     pub(crate) method: String,
@@ -121,6 +168,139 @@ pub struct AppMetrics {
     provider_call_durations: Mutex<HashMap<ProviderCallDurationKey, HistogramSample>>,
     #[cfg(feature = "metrics-providers")]
     provider_tokens: Mutex<HashMap<ProviderTokenKey, u64>>,
+
+    // ── F65 PR-3 orchestrator breakers ──────────────────────────
+    /// Total trips per breaker kind (all four). Always-on: breakers
+    /// are core orchestrator policy, not an optional feature.
+    breaker_trips: Mutex<HashMap<String, u64>>,
+    /// Total warn-threshold crossings per breaker kind. Emitted for
+    /// Round / Tokens / WallClock only (NoToolUseConsecutive skips
+    /// the warning per arch §4.1 exception).
+    breaker_threshold_warns: Mutex<HashMap<String, u64>>,
+    /// Per-kind distribution of the measured value at trip time.
+    /// NoToolUseConsecutive is deliberately omitted (always trips at
+    /// exactly the cap — a single-bucket spike, not distribution-
+    /// worthy). Round / Tokens / WallClock each have their own
+    /// dedicated bucket array tuned to the quantity's natural range.
+    breaker_round_histogram: Mutex<BreakerHistogram<6>>,
+    breaker_tokens_histogram: Mutex<BreakerHistogram<6>>,
+    breaker_wall_clock_histogram: Mutex<BreakerHistogram<7>>,
+
+    // ── #661: subagent-spawn observability ──────────────────────
+    /// Total `spawn_subagent` decisions emitted by the orchestrator
+    /// since process start. Bumped once per `SubagentSpawned` domain
+    /// event observed by the metrics tap. Monotonic counter: if this
+    /// stays at 0 while orchestrator runs are firing, the LLM is not
+    /// delegating (the diagnostic question #661 was opened to answer).
+    subagent_spawn_total: AtomicU64,
+    /// Distribution of final-iteration counts observed on terminal
+    /// runs. Populated from `RunStateChanged` events landing on a
+    /// terminal state (`completed`, `failed`, `canceled`); the value
+    /// observed is the run's iteration high-water mark tracked by the
+    /// tap's in-flight table.
+    iterations_histogram: Mutex<BreakerHistogram<7>>,
+    /// Rolling window of the most recent terminal runs' subagent-spawn
+    /// outcomes. Each slot is `true` when the run reached terminal
+    /// state WITHOUT spawning any subagent; `false` when at least one
+    /// spawn fired. The reader takes `sum(window) / len(window)` to
+    /// produce `cairn_orchestrator_inline_run_ratio`. Fixed-capacity
+    /// so a noisy tenant can't unbounded-grow the gauge series.
+    inline_run_window: Mutex<InlineRunWindow>,
+
+    // ── Issue #689 R2-B: echo-via-bash prose-playing detector ─────
+    /// Total `on_prose_playing_detected` callbacks observed since
+    /// process start. Monotonic; each DECIDE turn classified as
+    /// consecutive echo-via-bash (past the threshold) increments
+    /// once. Useful for operators to track how often free-tier
+    /// models role-play actions instead of dispatching them.
+    prose_playing_detected_total: AtomicU64,
+}
+
+/// F65 PR-3: per-kind breaker-trip distribution sample. Distinct from
+/// `HistogramSample` because breakers use widely different natural
+/// ranges (iterations vs tokens vs ms) — reusing the 10-bucket
+/// `HistogramSample` would force all three to share one bucket layout,
+/// which operator decision 3 explicitly rejected.
+#[derive(Clone, Debug)]
+pub(crate) struct BreakerHistogram<const N: usize> {
+    pub(crate) bucket_counts: [u64; N],
+    pub(crate) sum: u64,
+    pub(crate) count: u64,
+}
+
+impl<const N: usize> Default for BreakerHistogram<N> {
+    fn default() -> Self {
+        Self {
+            bucket_counts: [0; N],
+            sum: 0,
+            count: 0,
+        }
+    }
+}
+
+/// F65 PR-3: bucket edges for the Round-breaker measured-at-trip
+/// histogram. Values past the last edge roll into the `+Inf` bucket.
+/// Tuned for the 1..=50 iteration range; round cap default is 30.
+pub(crate) const BREAKER_ROUND_BUCKETS: [u64; 6] = [1, 5, 10, 20, 30, 50];
+/// F65 PR-3: bucket edges for the Tokens-breaker measured-at-trip
+/// histogram. Tuned to the 10k..=500k range; token cap default 200k.
+pub(crate) const BREAKER_TOKENS_BUCKETS: [u64; 6] =
+    [10_000, 50_000, 100_000, 200_000, 300_000, 500_000];
+/// F65 PR-3: bucket edges for the WallClock-breaker measured-at-trip
+/// histogram (milliseconds). Tuned for 30s..=30min; wall-clock default
+/// 15 minutes.
+pub(crate) const BREAKER_WALL_CLOCK_BUCKETS: [u64; 7] = [
+    30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000,
+];
+
+/// #661: bucket edges for `cairn_orchestrator_iterations_per_run`.
+/// Covers the realistic range of iterations we see on cairn runs: a
+/// trivial one-shot completes in 1-2, a typical executor run lands
+/// around 5-15, and anything past 30 is almost always a run that
+/// would have benefited from subagent delegation (the signal #661
+/// is trying to surface). `+Inf` catches the breaker-tripped ceiling.
+pub(crate) const RUN_ITERATIONS_BUCKETS: [u64; 7] = [1, 3, 5, 10, 20, 30, 50];
+
+/// #661: rolling-window capacity for the inline-run-ratio gauge.
+/// 100 is the number called out in the issue brief; it gives the
+/// dashboard a quick-reacting signal without amplifying a single
+/// unusual run into a dramatic dip.
+pub(crate) const INLINE_RUN_WINDOW_CAPACITY: usize = 100;
+
+/// #661: fixed-capacity ring buffer of the most recent `bool`
+/// outcomes per terminal run (`true` = ran inline, no subagents;
+/// `false` = spawned at least one subagent). Implemented as a
+/// `VecDeque` because the reader side needs to scan all slots to
+/// sum, and a ring-buffer with explicit head/tail adds nothing
+/// given the tiny fixed size. Held behind a Mutex on `AppMetrics`.
+#[derive(Debug, Default)]
+pub(crate) struct InlineRunWindow {
+    outcomes: std::collections::VecDeque<bool>,
+}
+
+impl InlineRunWindow {
+    fn record(&mut self, inline: bool) {
+        if self.outcomes.len() == INLINE_RUN_WINDOW_CAPACITY {
+            self.outcomes.pop_front();
+        }
+        self.outcomes.push_back(inline);
+    }
+
+    /// Fraction of inline runs in the window. Returns `None` when the
+    /// window is empty so the renderer can omit the gauge — a 0.0
+    /// sample with no data would read as "full delegation" and mislead
+    /// operators.
+    fn ratio(&self) -> Option<f64> {
+        if self.outcomes.is_empty() {
+            return None;
+        }
+        let inline = self.outcomes.iter().filter(|&&v| v).count();
+        Some(inline as f64 / self.outcomes.len() as f64)
+    }
+
+    fn len(&self) -> usize {
+        self.outcomes.len()
+    }
 }
 
 /// Per-tenant gauge bundle. Held behind a single mutex so updates
@@ -185,6 +365,215 @@ pub(crate) struct ProviderTokenKey {
     pub(crate) kind: String,
 }
 
+/// F65 PR-3: map a `BreakerKind` to its snake_case label used both as
+/// the Prometheus `kind` label and the map-key. Stable across versions —
+/// dashboards pin on these strings.
+fn breaker_kind_label(which: cairn_domain::session_orchestration::BreakerKind) -> &'static str {
+    use cairn_domain::session_orchestration::BreakerKind;
+    match which {
+        BreakerKind::Round => "round",
+        BreakerKind::Tokens => "tokens",
+        BreakerKind::NoToolUseConsecutive => "no_tool_use_consecutive",
+        BreakerKind::WallClock => "wall_clock",
+    }
+}
+
+/// F65 PR-3: record a single circuit-breaker trip. Increments the
+/// per-kind counter and, for Round / Tokens / WallClock, adds a
+/// measured-at-trip histogram observation. NoToolUseConsecutive is
+/// excluded from the histogram (it always trips at exactly the cap).
+pub(crate) fn record_breaker_trip(
+    metrics: &AppMetrics,
+    which: cairn_domain::session_orchestration::BreakerKind,
+    measured: u64,
+) {
+    use cairn_domain::session_orchestration::BreakerKind;
+    let label = breaker_kind_label(which);
+    {
+        let mut m = metrics
+            .breaker_trips
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *m.entry(label.to_owned()).or_insert(0) += 1;
+    }
+    match which {
+        BreakerKind::Round => {
+            let mut h = metrics
+                .breaker_round_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            observe_histogram(&mut h, &BREAKER_ROUND_BUCKETS, measured);
+        }
+        BreakerKind::Tokens => {
+            let mut h = metrics
+                .breaker_tokens_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            observe_histogram(&mut h, &BREAKER_TOKENS_BUCKETS, measured);
+        }
+        BreakerKind::WallClock => {
+            let mut h = metrics
+                .breaker_wall_clock_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            observe_histogram(&mut h, &BREAKER_WALL_CLOCK_BUCKETS, measured);
+        }
+        BreakerKind::NoToolUseConsecutive => {
+            // Counter above already recorded; no histogram by design.
+        }
+    }
+}
+
+/// F65 PR-3: record a 80% warning threshold crossing.
+pub(crate) fn record_breaker_threshold_warn(
+    metrics: &AppMetrics,
+    which: cairn_domain::session_orchestration::BreakerKind,
+) {
+    let label = breaker_kind_label(which);
+    let mut m = metrics
+        .breaker_threshold_warns
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *m.entry(label.to_owned()).or_insert(0) += 1;
+}
+
+/// #661: bump the `cairn_orchestrator_subagent_spawn_total` counter.
+/// Called once per `SubagentSpawned` event observed by the metrics
+/// tap. The counter is process-lifetime — persistent state lives in
+/// the event log (`SubagentSpawned` + parent/child run lineage).
+pub(crate) fn record_subagent_spawn(metrics: &AppMetrics) {
+    metrics.subagent_spawn_total.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Issue #689 Finding R2-B: bump the
+/// `cairn_orchestrator_prose_playing_detected_total` counter. Called
+/// once per DECIDE turn classified as "echo-via-bash prose-playing"
+/// after the consecutive-turn threshold is reached. See
+/// `cairn_orchestrator::echo_detector` for the heuristic — this
+/// counter is the operator-facing observability signal; the loop
+/// itself does not auto-fail or cancel on detection.
+pub(crate) fn record_prose_playing_detected(metrics: &AppMetrics) {
+    metrics
+        .prose_playing_detected_total
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// #661: observe a terminal run's final iteration count. Populates
+/// the `cairn_orchestrator_iterations_per_run` histogram. Fired by
+/// the metrics tap when a `RunStateChanged` transitions to a
+/// terminal state — the `iteration` argument is the high-water mark
+/// tracked for that run in `iterations_inflight`. Runs with no
+/// recorded iterations (handler-initiated complete/cancel, no
+/// orchestrator loop ran) observe `0`.
+///
+/// Only called from the metrics tap (gated on
+/// `metrics-core`/`metrics-providers`); the no-feature build
+/// skips the tap so this function is unreferenced there. Kept
+/// unconditional on the type surface so no callers anywhere else
+/// need a cfg guard.
+#[cfg_attr(
+    not(any(feature = "metrics-core", feature = "metrics-providers")),
+    allow(dead_code)
+)]
+pub(crate) fn observe_run_iterations(metrics: &AppMetrics, iteration: u32) {
+    let mut h = metrics
+        .iterations_histogram
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    observe_histogram(&mut h, &RUN_ITERATIONS_BUCKETS, iteration as u64);
+}
+
+/// #661: record whether a just-terminated run delegated to a
+/// subagent. `true` = ran entirely inline (no `SubagentSpawned`
+/// event seen for this parent run); `false` = at least one child
+/// spawned. Reader side derives
+/// `cairn_orchestrator_inline_run_ratio`.
+///
+/// See the dead-code note on `observe_run_iterations` above.
+#[cfg_attr(
+    not(any(feature = "metrics-core", feature = "metrics-providers")),
+    allow(dead_code)
+)]
+pub(crate) fn record_inline_run_outcome(metrics: &AppMetrics, inline: bool) {
+    let mut w = metrics
+        .inline_run_window
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    w.record(inline);
+}
+
+/// Record one observation into a breaker histogram using **sparse
+/// storage**: only the first matching bucket gets incremented. The
+/// final Prometheus `le="x"` counts are then materialised
+/// cumulatively at render time by [`render_breaker_histogram`].
+///
+/// # Storage strategy (#517)
+///
+/// Cairn runs **two different histogram storage strategies** and a
+/// future refactor that "normalises" one to match the other would
+/// silently break the render path for that histogram. The two
+/// strategies — both produce identical Prometheus output — are:
+///
+/// | Histogram | Record-time | Render-time |
+/// |-----------|-------------|-------------|
+/// | HTTP request duration ([`AppMetrics::record_request`]) | **Cumulative** — increment every bucket where `value ≤ edge` (~N/2 writes) | Read `bucket_counts[idx]` directly |
+/// | Provider duration (`record_provider_call`) | **Cumulative** — same as HTTP | Read `bucket_counts[idx]` directly |
+/// | Breaker round / tokens / wall_clock ([`observe_histogram`] — this fn) | **Sparse** — increment only the first matching bucket (1 write) | [`render_breaker_histogram`] runs a prefix sum |
+///
+/// Why two strategies? Historical. The HTTP + provider paths were
+/// added first with cumulative storage (cheaper render, more
+/// obvious `bucket_counts[i] = count_of_le_edge_i`). The F65 PR-3
+/// breaker histograms picked sparse storage to make record-time
+/// O(1) instead of O(N). Both are correct; unifying them is a
+/// larger refactor than this audit finding warrants.
+///
+/// If you are reading this because a lint or a test flagged the
+/// inconsistency: **do not change either side without updating the
+/// matching render path.** Test coverage in this module
+/// (`breaker_histogram_renders_cumulatively_from_sparse_storage`
+/// and `http_request_duration_buckets_are_monotonic_per_request`)
+/// pins the contract on both strategies.
+fn observe_histogram<const N: usize>(
+    h: &mut BreakerHistogram<N>,
+    buckets: &[u64; N],
+    measured: u64,
+) {
+    h.count = h.count.saturating_add(1);
+    h.sum = h.sum.saturating_add(measured);
+    for (idx, edge) in buckets.iter().enumerate() {
+        if measured <= *edge {
+            h.bucket_counts[idx] = h.bucket_counts[idx].saturating_add(1);
+            return;
+        }
+    }
+    // `+Inf` bucket is implicit via `count - sum_of_buckets`; nothing
+    // to do here when the observation overflows the last edge.
+}
+
+/// F65 PR-3: render a per-kind breaker histogram in the Prometheus
+/// cumulative-bucket format (`le=` labels, monotonic counts, trailing
+/// `+Inf` / `_sum` / `_count`).
+fn render_breaker_histogram<const N: usize>(
+    lines: &mut Vec<String>,
+    metric_name: &str,
+    help: &str,
+    h: &BreakerHistogram<N>,
+    buckets: &[u64; N],
+) {
+    lines.push(format!("# HELP {metric_name} {help}"));
+    lines.push(format!("# TYPE {metric_name} histogram"));
+    let mut cumulative: u64 = 0;
+    for (idx, edge) in buckets.iter().enumerate() {
+        cumulative = cumulative.saturating_add(h.bucket_counts[idx]);
+        lines.push(format!(
+            "{metric_name}_bucket{{le=\"{edge}\"}} {cumulative}"
+        ));
+    }
+    lines.push(format!("{metric_name}_bucket{{le=\"+Inf\"}} {}", h.count));
+    lines.push(format!("{metric_name}_sum {}", h.sum));
+    lines.push(format!("{metric_name}_count {}", h.count));
+}
+
 impl AppMetrics {
     pub(crate) fn mark_started(&self) {
         self.startup_complete.store(true, Ordering::Relaxed);
@@ -220,6 +609,11 @@ impl AppMetrics {
             .or_default();
         sample.count += 1;
         sample.sum_ms = sample.sum_ms.saturating_add(latency_ms);
+        // Cumulative storage: increment every bucket whose edge covers
+        // this latency. At render time `bucket_counts[idx]` is read
+        // directly as the `le="edge_idx"` value. See the `observe_
+        // histogram` doc-comment (#517) for why the breaker path uses
+        // the sparse strategy instead, and why the two coexist.
         for (idx, bucket) in HTTP_DURATION_BUCKETS_MS.iter().enumerate() {
             if latency_ms <= *bucket {
                 sample.bucket_counts[idx] += 1;
@@ -421,6 +815,9 @@ impl AppMetrics {
             let sample = durations.entry(duration_key).or_default();
             sample.count += 1;
             sample.sum_ms = sample.sum_ms.saturating_add(latency_ms);
+            // Cumulative storage, same pattern as HTTP request
+            // duration — see `observe_histogram` (#517) for why this
+            // differs from the breaker sparse strategy.
             for (idx, bucket) in PROVIDER_DURATION_BUCKETS_MS.iter().enumerate() {
                 if latency_ms <= *bucket {
                     sample.bucket_counts[idx] += 1;
@@ -456,6 +853,75 @@ impl AppMetrics {
         if let (Some(key), Some(n)) = (output_key, output_tokens) {
             *tokens.entry(key).or_insert(0) += u64::from(n);
         }
+    }
+
+    /// Total number of HTTP requests observed (across all method/path/status
+    /// combinations). Exposed for binary-level Prometheus rendering.
+    pub fn http_total_requests(&self) -> u64 {
+        self.request_totals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .sum()
+    }
+
+    /// Errors-by-status map (status >= 400). Exposed for binary-level
+    /// Prometheus rendering.
+    pub fn http_errors_by_status(&self) -> HashMap<u16, u64> {
+        let mut out: HashMap<u16, u64> = HashMap::new();
+        for (key, count) in self
+            .request_totals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if key.status >= 400 {
+                *out.entry(key.status).or_insert(0) += *count;
+            }
+        }
+        out
+    }
+
+    /// Requests-by-path map (summed across methods and statuses). Exposed
+    /// for binary-level Prometheus rendering.
+    pub fn http_requests_by_path(&self) -> HashMap<String, u64> {
+        let mut out: HashMap<String, u64> = HashMap::new();
+        for (key, count) in self
+            .request_totals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            *out.entry(key.path.clone()).or_insert(0) += *count;
+        }
+        out
+    }
+
+    /// Average request latency in milliseconds, across all samples.
+    /// Returns 0 when no samples have been recorded.
+    pub fn http_avg_latency_ms(&self) -> u64 {
+        let durations = self
+            .request_durations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut total_sum, mut total_count) = (0u64, 0u64);
+        for sample in durations.values() {
+            total_sum = total_sum.saturating_add(sample.sum_ms);
+            total_count = total_count.saturating_add(sample.count);
+        }
+        total_sum.checked_div(total_count).unwrap_or(0)
+    }
+
+    /// Public wrapper around the histogram-bucket percentile. Returns 0
+    /// when no samples have been recorded (matches the Prometheus-friendly
+    /// semantic for empty histograms).
+    pub fn http_latency_percentile(&self, p: f64) -> u64 {
+        self.latency_percentile(p).unwrap_or(0)
+    }
+
+    /// Public wrapper around `error_rate` as an f64 in 0.0–1.0.
+    pub fn http_error_rate(&self) -> f64 {
+        f64::from(self.error_rate())
     }
 
     /// Approximate latency percentile (p50 or p95) from histogram buckets.
@@ -589,7 +1055,174 @@ impl AppMetrics {
         #[cfg(feature = "metrics-providers")]
         self.render_providers_into(&mut lines);
 
+        // F65 PR-3: orchestrator circuit-breaker metrics. Always-on —
+        // breakers are core orchestrator policy, not an optional
+        // feature.
+        self.render_breakers_into(&mut lines);
+
+        // #661: subagent-spawn observability. Always-on — the
+        // counter/histogram/ratio are the diagnostic loop for the
+        // orchestrator prompt rewrite in #662. A noisy 0 is a useful
+        // signal.
+        self.render_subagent_observability_into(&mut lines);
+
         lines.join("\n")
+    }
+
+    /// #661: render the subagent-spawn counter, iterations-per-run
+    /// histogram, and rolling inline-run ratio gauge. Rendered even
+    /// when the counter is zero (a visible `0` is the point — it's
+    /// the diagnostic signal that the orchestrator LLM isn't
+    /// delegating).
+    fn render_subagent_observability_into(&self, lines: &mut Vec<String>) {
+        // ── counter ──
+        lines.push(
+            "# HELP cairn_orchestrator_subagent_spawn_total Total spawn_subagent decisions emitted by the orchestrator since process start."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_subagent_spawn_total counter".to_owned());
+        lines.push(format!(
+            "cairn_orchestrator_subagent_spawn_total {}",
+            self.subagent_spawn_total.load(Ordering::Relaxed)
+        ));
+
+        // ── iterations histogram ──
+        render_breaker_histogram(
+            lines,
+            "cairn_orchestrator_iterations_per_run",
+            "Distribution of final-iteration counts observed when a run reaches a terminal state (completed/failed/canceled).",
+            &self
+                .iterations_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            &RUN_ITERATIONS_BUCKETS,
+        );
+
+        // ── inline-run ratio gauge ──
+        lines.push(
+            "# HELP cairn_orchestrator_inline_run_ratio Fraction of the last N terminal runs that finished without spawning any subagent. Emitted only when N > 0; the companion `_samples` gauge carries the current window size (ceiling: 100)."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_inline_run_ratio gauge".to_owned());
+        let window = self
+            .inline_run_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ratio) = window.ratio() {
+            // Six-decimal precision — plenty for a 100-sample window
+            // (finest granularity: 1/100 = 0.01) without flooding
+            // the scrape with phantom digits.
+            lines.push(format!("cairn_orchestrator_inline_run_ratio {ratio:.6}"));
+        }
+        lines.push(
+            "# HELP cairn_orchestrator_inline_run_ratio_samples Number of terminal-run outcomes currently held in the inline-run ratio window (0..=100)."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_inline_run_ratio_samples gauge".to_owned());
+        lines.push(format!(
+            "cairn_orchestrator_inline_run_ratio_samples {}",
+            window.len()
+        ));
+
+        // ── #689 R2-B: prose-playing detector counter ──
+        // Rendered alongside the subagent-spawn counter because both
+        // surface "is the LLM doing real work?" at a run-local scale.
+        // A visible `0` is the healthy signal; non-zero means at
+        // least one run reached >= 2 consecutive bash-echo turns.
+        lines.push(
+            "# HELP cairn_orchestrator_prose_playing_detected_total Total DECIDE turns classified as echo-via-bash prose-playing since process start. Fires on every consecutive turn past the detection threshold (see `cairn_orchestrator::echo_detector`). Non-terminal — runs continue after detection; the counter is observability only."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_prose_playing_detected_total counter".to_owned());
+        lines.push(format!(
+            "cairn_orchestrator_prose_playing_detected_total {}",
+            self.prose_playing_detected_total.load(Ordering::Relaxed)
+        ));
+    }
+
+    /// F65 PR-3: render the breaker counters + per-kind histograms.
+    fn render_breakers_into(&self, lines: &mut Vec<String>) {
+        // ── cairn_orchestrator_breaker_trips_total{kind}  (counter) ──
+        lines.push(
+            "# HELP cairn_orchestrator_breaker_trips_total Total circuit-breaker trips per kind."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_breaker_trips_total counter".to_owned());
+        {
+            let snapshot = self
+                .breaker_trips
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let mut rows: Vec<_> = snapshot.into_iter().collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            for (kind, count) in rows {
+                lines.push(format!(
+                    "cairn_orchestrator_breaker_trips_total{{kind=\"{kind}\"}} {count}"
+                ));
+            }
+        }
+
+        // ── cairn_orchestrator_breaker_threshold_warns_total{kind}  (counter) ──
+        lines.push(
+            "# HELP cairn_orchestrator_breaker_threshold_warns_total Total 80% breaker-threshold warnings per kind (Round/Tokens/WallClock only)."
+                .to_owned(),
+        );
+        lines.push("# TYPE cairn_orchestrator_breaker_threshold_warns_total counter".to_owned());
+        {
+            let snapshot = self
+                .breaker_threshold_warns
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let mut rows: Vec<_> = snapshot.into_iter().collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            for (kind, count) in rows {
+                lines.push(format!(
+                    "cairn_orchestrator_breaker_threshold_warns_total{{kind=\"{kind}\"}} {count}"
+                ));
+            }
+        }
+
+        // ── round histogram ──
+        render_breaker_histogram(
+            lines,
+            "cairn_orchestrator_breaker_round_measured_at_trip",
+            "Distribution of iterations observed at Round-breaker trip time.",
+            &self
+                .breaker_round_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            &BREAKER_ROUND_BUCKETS,
+        );
+
+        // ── tokens histogram ──
+        render_breaker_histogram(
+            lines,
+            "cairn_orchestrator_breaker_tokens_measured_at_trip",
+            "Distribution of cumulative tokens observed at Tokens-breaker trip time.",
+            &self
+                .breaker_tokens_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            &BREAKER_TOKENS_BUCKETS,
+        );
+
+        // ── wall-clock histogram ──
+        render_breaker_histogram(
+            lines,
+            "cairn_orchestrator_breaker_wall_clock_measured_at_trip_ms",
+            "Distribution of elapsed milliseconds observed at WallClock-breaker trip time.",
+            &self
+                .breaker_wall_clock_histogram
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            &BREAKER_WALL_CLOCK_BUCKETS,
+        );
     }
 
     #[cfg(feature = "metrics-core")]
@@ -749,12 +1382,13 @@ impl AppMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut tenant_entries: Vec<(String, TenantQueueDepth)> =
-            tenant_queue_depth.into_iter().collect();
-        tenant_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let tenant_entries = cap_tenant_entries(tenant_queue_depth.into_iter().collect());
 
         lines.push(
-            "# HELP cairn_active_runs_by_tenant Active non-terminal runs per tenant.".to_owned(),
+            "# HELP cairn_active_runs_by_tenant Active non-terminal runs per tenant. \
+             Capped at the top TENANT_METRIC_TOP_N tenants by activity; overflow \
+             aggregates into tenant=\"__other__\" (#502)."
+                .to_owned(),
         );
         lines.push("# TYPE cairn_active_runs_by_tenant gauge".to_owned());
         for (tenant, depth) in &tenant_entries {
@@ -766,7 +1400,10 @@ impl AppMetrics {
         }
 
         lines.push(
-            "# HELP cairn_active_tasks_by_tenant Active non-terminal tasks per tenant.".to_owned(),
+            "# HELP cairn_active_tasks_by_tenant Active non-terminal tasks per tenant. \
+             Capped at the top TENANT_METRIC_TOP_N tenants; overflow aggregates \
+             into tenant=\"__other__\"."
+                .to_owned(),
         );
         lines.push("# TYPE cairn_active_tasks_by_tenant gauge".to_owned());
         for (tenant, depth) in &tenant_entries {
@@ -778,7 +1415,9 @@ impl AppMetrics {
         }
 
         lines.push(
-            "# HELP cairn_pending_approvals_by_tenant Pending approvals awaiting decision per tenant."
+            "# HELP cairn_pending_approvals_by_tenant Pending approvals awaiting decision per \
+             tenant. Capped at the top TENANT_METRIC_TOP_N tenants; overflow aggregates into \
+             tenant=\"__other__\"."
                 .to_owned(),
         );
         lines.push("# TYPE cairn_pending_approvals_by_tenant gauge".to_owned());
@@ -793,15 +1432,31 @@ impl AppMetrics {
 
     #[cfg(feature = "metrics-providers")]
     fn render_providers_into(&self, lines: &mut Vec<String>) {
-        // Provider calls counter.
-        let calls = self
+        // ── #503 cardinality cap ─────────────────────────────────────
+        // `provider_connection` + `model` are operator-supplied and
+        // unbounded; rotating model IDs or frequent connection swaps
+        // accumulate one series each. Compute the top-N
+        // (connection, model) pairs by total call count; any row
+        // outside the top-N collapses into
+        // `{provider_connection="__other__", model="__other__"}` at
+        // render time. The in-memory counter maps stay unbounded so
+        // `record_provider_call` never has to decide what to drop —
+        // backpressure lives where it matters (Prometheus scrapes).
+        let calls_raw = self
             .provider_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let keep_pairs: std::collections::HashSet<(String, String)> =
+            provider_top_n_pairs(&calls_raw);
+
+        // Provider calls counter — aggregated with the cap applied.
+        let calls = capped_calls(&calls_raw, &keep_pairs);
         lines.push(
             "# HELP cairn_provider_calls_total \
-                LLM provider calls, labelled by provider family + model + operation + status."
+                LLM provider calls, labelled by provider family + model + operation + status. \
+                (provider_connection, model) capped at PROVIDER_METRIC_TOP_N; overflow \
+                aggregates into provider_connection=\"__other__\",model=\"__other__\" (#503)."
                 .to_owned(),
         );
         lines.push("# TYPE cairn_provider_calls_total counter".to_owned());
@@ -831,15 +1486,18 @@ impl AppMetrics {
             ));
         }
 
-        // Provider call duration histogram.
-        let durations = self
+        // Provider call duration histogram — same cap, but summing
+        // histogram samples rather than counts.
+        let durations_raw = self
             .provider_call_durations
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let durations = capped_durations(&durations_raw, &keep_pairs);
         lines.push(
             "# HELP cairn_provider_call_duration_ms \
-                LLM provider call wall-clock latency, labelled by provider family + model + operation."
+                LLM provider call wall-clock latency, labelled by provider family + model + operation. \
+                (provider_connection, model) capped at PROVIDER_METRIC_TOP_N."
                 .to_owned(),
         );
         lines.push("# TYPE cairn_provider_call_duration_ms histogram".to_owned());
@@ -878,15 +1536,17 @@ impl AppMetrics {
             ));
         }
 
-        // Token counters.
-        let tokens = self
+        // Token counters — same cap.
+        let tokens_raw = self
             .provider_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let tokens = capped_tokens(&tokens_raw, &keep_pairs);
         lines.push(
             "# HELP cairn_provider_tokens_total \
-                Tokens billed by LLM providers, by family + model + kind (input/output)."
+                Tokens billed by LLM providers, by family + model + kind (input/output). \
+                (provider_connection, model) capped at PROVIDER_METRIC_TOP_N."
                 .to_owned(),
         );
         lines.push("# TYPE cairn_provider_tokens_total counter".to_owned());
@@ -912,4 +1572,703 @@ impl AppMetrics {
 
 fn prometheus_label(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Cap the number of emitted tenants at `TENANT_METRIC_TOP_N` (#502).
+///
+/// Ranks the input entries by total activity (runs + tasks + approvals)
+/// descending, takes the top N, aggregates the remainder into a single
+/// `__other__` row whose value is the sum across the evicted tenants.
+/// The result is sorted by tenant name so the Prometheus exposition is
+/// stable between scrapes.
+///
+/// When the input is already within the cap, returns the input sorted
+/// by tenant (same shape as the old behaviour, no `__other__` row).
+///
+/// Declared outside `AppMetrics::render_*_into` so it's testable in
+/// isolation — the render functions are too large to unit-test cleanly.
+#[cfg(feature = "metrics-core")]
+fn cap_tenant_entries(input: Vec<(String, TenantQueueDepth)>) -> Vec<(String, TenantQueueDepth)> {
+    if input.len() <= TENANT_METRIC_TOP_N {
+        let mut sorted = input;
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        return sorted;
+    }
+
+    // Rank by total activity (descending). Ties broken by name ascending
+    // so the cap decision is deterministic across scrapes.
+    let mut ranked = input;
+    ranked.sort_by(|a, b| {
+        let a_total = a.1.active_runs + a.1.active_tasks + a.1.pending_approvals;
+        let b_total = b.1.active_runs + b.1.active_tasks + b.1.pending_approvals;
+        b_total.cmp(&a_total).then_with(|| a.0.cmp(&b.0))
+    });
+
+    let (top, overflow) = ranked.split_at(TENANT_METRIC_TOP_N);
+    let mut other = TenantQueueDepth::default();
+    for (_, depth) in overflow {
+        other.active_runs = other.active_runs.saturating_add(depth.active_runs);
+        other.active_tasks = other.active_tasks.saturating_add(depth.active_tasks);
+        other.pending_approvals = other
+            .pending_approvals
+            .saturating_add(depth.pending_approvals);
+    }
+
+    let mut out: Vec<(String, TenantQueueDepth)> = top.to_vec();
+    out.push((CARDINALITY_OVERFLOW_LABEL.to_owned(), other));
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Compute the set of `(provider_connection, model)` pairs to retain at
+/// render time for the provider metrics (#503).
+///
+/// Ranks by total call count across all `(operation_kind, status)`
+/// combinations for each pair; ties broken by lexicographic order so
+/// the cap decision is deterministic.
+///
+/// Returns the FULL set of distinct pairs when the input is already
+/// within `PROVIDER_METRIC_TOP_N` (the "everything is kept" semantic
+/// — callers treat membership in the returned set as "keep this pair
+/// as-is"). When the input exceeds the cap, only the top-N pairs
+/// appear in the set; everything outside folds into the `__other__`
+/// overflow bucket at render time.
+#[cfg(feature = "metrics-providers")]
+fn provider_top_n_pairs(
+    calls: &std::collections::HashMap<ProviderCallKey, u64>,
+) -> std::collections::HashSet<(String, String)> {
+    // Fold per-(connection, model) totals.
+    let mut totals: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::new();
+    for (key, count) in calls {
+        let pair = (key.provider_connection.clone(), key.model.clone());
+        *totals.entry(pair).or_insert(0) += *count;
+    }
+
+    if totals.len() <= PROVIDER_METRIC_TOP_N {
+        // No cap needed — return the full set.
+        return totals.into_keys().collect();
+    }
+
+    // Rank and keep top-N.
+    let mut ranked: Vec<((String, String), u64)> = totals.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(PROVIDER_METRIC_TOP_N)
+        .map(|(pair, _)| pair)
+        .collect()
+}
+
+/// Apply the top-N `(provider_connection, model)` cap to the provider-
+/// calls counter map. Rows whose `(provider_connection, model)` pair is
+/// in `keep_pairs` pass through unchanged; rows outside fold into an
+/// `__other__` overflow bucket (preserving `operation_kind` + `status`
+/// — those are bounded enums and stay as distinct rows under the fold).
+///
+/// Callers typically obtain `keep_pairs` from
+/// [`provider_top_n_pairs`], which returns the FULL set when below the
+/// cap — so "nothing to fold" is expressed by a keep-set that covers
+/// every pair, not by an empty keep-set. An empty `keep_pairs` is
+/// therefore an instruction to fold EVERYTHING into `__other__` (used
+/// only by tests that want to exercise the fold in isolation).
+#[cfg(feature = "metrics-providers")]
+fn capped_calls(
+    calls: &std::collections::HashMap<ProviderCallKey, u64>,
+    keep_pairs: &std::collections::HashSet<(String, String)>,
+) -> std::collections::HashMap<ProviderCallKey, u64> {
+    // Single linear pass: each input row is either kept as-is (its
+    // pair is in `keep_pairs`) or folded into the overflow bucket.
+    // When `keep_pairs` covers every pair (the below-cap case), all
+    // rows are kept as-is and the `HashMap` has the same shape as
+    // the input.
+    let mut out: std::collections::HashMap<ProviderCallKey, u64> =
+        std::collections::HashMap::with_capacity(calls.len());
+    for (key, count) in calls {
+        let pair = (key.provider_connection.clone(), key.model.clone());
+        if keep_pairs.contains(&pair) {
+            out.insert(key.clone(), *count);
+        } else {
+            let overflow_key = ProviderCallKey {
+                provider_connection: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                model: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                operation_kind: key.operation_kind.clone(),
+                status: key.status.clone(),
+            };
+            *out.entry(overflow_key).or_insert(0) += *count;
+        }
+    }
+    out
+}
+
+/// Apply the same cap to the duration-histogram map. Histogram samples
+/// fold by element-wise bucket addition; `sum_ms` and `count` sum
+/// normally.
+#[cfg(feature = "metrics-providers")]
+fn capped_durations(
+    durations: &std::collections::HashMap<ProviderCallDurationKey, HistogramSample>,
+    keep_pairs: &std::collections::HashSet<(String, String)>,
+) -> std::collections::HashMap<ProviderCallDurationKey, HistogramSample> {
+    let mut out: std::collections::HashMap<ProviderCallDurationKey, HistogramSample> =
+        std::collections::HashMap::with_capacity(durations.len());
+    for (key, sample) in durations {
+        let pair = (key.provider_connection.clone(), key.model.clone());
+        let target_key = if keep_pairs.contains(&pair) {
+            key.clone()
+        } else {
+            ProviderCallDurationKey {
+                provider_connection: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                model: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                operation_kind: key.operation_kind.clone(),
+            }
+        };
+        let agg = out.entry(target_key).or_default();
+        for (idx, b) in sample.bucket_counts.iter().enumerate() {
+            agg.bucket_counts[idx] = agg.bucket_counts[idx].saturating_add(*b);
+        }
+        agg.sum_ms = agg.sum_ms.saturating_add(sample.sum_ms);
+        agg.count = agg.count.saturating_add(sample.count);
+    }
+    out
+}
+
+/// Apply the cap to the token-counter map.
+#[cfg(feature = "metrics-providers")]
+fn capped_tokens(
+    tokens: &std::collections::HashMap<ProviderTokenKey, u64>,
+    keep_pairs: &std::collections::HashSet<(String, String)>,
+) -> std::collections::HashMap<ProviderTokenKey, u64> {
+    let mut out: std::collections::HashMap<ProviderTokenKey, u64> =
+        std::collections::HashMap::with_capacity(tokens.len());
+    for (key, value) in tokens {
+        let pair = (key.provider_connection.clone(), key.model.clone());
+        let target_key = if keep_pairs.contains(&pair) {
+            key.clone()
+        } else {
+            ProviderTokenKey {
+                provider_connection: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                model: CARDINALITY_OVERFLOW_LABEL.to_owned(),
+                kind: key.kind.clone(),
+            }
+        };
+        *out.entry(target_key).or_insert(0) += *value;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── #502 regression: tenant cardinality cap ───────────────────────
+
+    #[cfg(feature = "metrics-core")]
+    fn tenant_depth(runs: u64, tasks: u64, approvals: u64) -> TenantQueueDepth {
+        TenantQueueDepth {
+            active_runs: runs,
+            active_tasks: tasks,
+            pending_approvals: approvals,
+        }
+    }
+
+    #[cfg(feature = "metrics-core")]
+    #[test]
+    fn cap_tenant_entries_passthrough_below_cap() {
+        let input = vec![
+            ("alpha".to_owned(), tenant_depth(1, 2, 3)),
+            ("bravo".to_owned(), tenant_depth(4, 5, 6)),
+        ];
+        let out = cap_tenant_entries(input.clone());
+        assert_eq!(out.len(), input.len());
+        // Must be sorted by tenant name so Prometheus output is stable.
+        assert_eq!(out[0].0, "alpha");
+        assert_eq!(out[1].0, "bravo");
+        // No __other__ row when below the cap.
+        assert!(!out.iter().any(|(t, _)| t == CARDINALITY_OVERFLOW_LABEL));
+    }
+
+    #[cfg(feature = "metrics-core")]
+    #[test]
+    fn cap_tenant_entries_aggregates_overflow_into_other_bucket() {
+        // Build TOP_N + 3 tenants. Top TOP_N should survive; 3 fold.
+        let mut input: Vec<(String, TenantQueueDepth)> = Vec::new();
+        // High-activity top tenants (score: 1000 each).
+        for i in 0..TENANT_METRIC_TOP_N {
+            input.push((format!("hi_{i:04}"), tenant_depth(500, 400, 100)));
+        }
+        // Low-activity overflow tenants.
+        input.push(("lo_a".to_owned(), tenant_depth(1, 2, 3)));
+        input.push(("lo_b".to_owned(), tenant_depth(4, 5, 6)));
+        input.push(("lo_c".to_owned(), tenant_depth(7, 8, 9)));
+
+        let out = cap_tenant_entries(input);
+        // Top-N + one __other__ bucket.
+        assert_eq!(out.len(), TENANT_METRIC_TOP_N + 1);
+        let other = out
+            .iter()
+            .find(|(t, _)| t == CARDINALITY_OVERFLOW_LABEL)
+            .expect("__other__ bucket must exist when overflow occurs");
+        // __other__ = sum of lo_a/b/c.
+        assert_eq!(other.1.active_runs, 1 + 4 + 7);
+        assert_eq!(other.1.active_tasks, 2 + 5 + 8);
+        assert_eq!(other.1.pending_approvals, 3 + 6 + 9);
+
+        // Low-activity tenants must not appear (they were evicted into
+        // __other__).
+        assert!(!out.iter().any(|(t, _)| t.starts_with("lo_")));
+    }
+
+    #[cfg(feature = "metrics-core")]
+    #[test]
+    fn cap_tenant_entries_ranks_by_total_activity() {
+        // Build TOP_N-1 zero-activity tenants + 2 high-activity tenants
+        // + 2 medium-activity tenants. When we push past the cap, the
+        // low-activity ones should fold.
+        let mut input: Vec<(String, TenantQueueDepth)> = Vec::new();
+        for i in 0..TENANT_METRIC_TOP_N - 1 {
+            input.push((format!("zero_{i:04}"), tenant_depth(0, 0, 0)));
+        }
+        input.push(("alice".to_owned(), tenant_depth(1000, 0, 0)));
+        input.push(("bob".to_owned(), tenant_depth(500, 500, 0)));
+        input.push(("charlie".to_owned(), tenant_depth(10, 10, 10)));
+        input.push(("dave".to_owned(), tenant_depth(5, 5, 5)));
+        let out = cap_tenant_entries(input);
+        assert_eq!(out.len(), TENANT_METRIC_TOP_N + 1);
+        // Alice and Bob (high) must survive.
+        assert!(out.iter().any(|(t, _)| t == "alice"));
+        assert!(out.iter().any(|(t, _)| t == "bob"));
+        // At least one zero_ should have been evicted — there's
+        // TOP_N - 1 of them and only TOP_N survivor-slots after the
+        // 4 named ones, so some must fold.
+        let zero_survivors = out.iter().filter(|(t, _)| t.starts_with("zero_")).count();
+        assert!(zero_survivors < TENANT_METRIC_TOP_N - 1);
+    }
+
+    // ── #503 regression: provider cardinality cap ────────────────────
+
+    #[cfg(feature = "metrics-providers")]
+    fn pc_key(conn: &str, model: &str, op: &str, status: &str) -> ProviderCallKey {
+        ProviderCallKey {
+            provider_connection: conn.to_owned(),
+            model: model.to_owned(),
+            operation_kind: op.to_owned(),
+            status: status.to_owned(),
+        }
+    }
+
+    #[cfg(feature = "metrics-providers")]
+    #[test]
+    fn provider_top_n_passthrough_below_cap() {
+        let mut calls: std::collections::HashMap<ProviderCallKey, u64> =
+            std::collections::HashMap::new();
+        calls.insert(pc_key("openai", "gpt-4o", "chat", "succeeded"), 100);
+        calls.insert(pc_key("anthropic", "sonnet", "chat", "succeeded"), 50);
+        let keep = provider_top_n_pairs(&calls);
+        // Every pair in a below-cap set is kept.
+        assert_eq!(keep.len(), 2);
+        assert!(keep.contains(&("openai".to_owned(), "gpt-4o".to_owned())));
+        assert!(keep.contains(&("anthropic".to_owned(), "sonnet".to_owned())));
+    }
+
+    #[cfg(feature = "metrics-providers")]
+    #[test]
+    fn provider_top_n_ranks_and_caps_at_budget() {
+        let mut calls: std::collections::HashMap<ProviderCallKey, u64> =
+            std::collections::HashMap::new();
+        // TOP_N + 3 distinct (connection, model) pairs.
+        for i in 0..PROVIDER_METRIC_TOP_N {
+            calls.insert(
+                pc_key("openai", &format!("gpt-model-{i:04}"), "chat", "succeeded"),
+                1000,
+            );
+        }
+        // Low-activity overflow pairs (rotating model IDs exactly the
+        // case the audit flagged).
+        calls.insert(
+            pc_key("openai", "gpt-4o-mini-2024-07-18", "chat", "succeeded"),
+            1,
+        );
+        calls.insert(
+            pc_key("openai", "gpt-4o-mini-2024-11-20", "chat", "succeeded"),
+            2,
+        );
+        calls.insert(
+            pc_key("openai", "gpt-4o-mini-2024-12-18", "chat", "succeeded"),
+            3,
+        );
+
+        let keep = provider_top_n_pairs(&calls);
+        assert_eq!(keep.len(), PROVIDER_METRIC_TOP_N);
+        // Low-activity rotating-model-ID pairs must be evicted.
+        assert!(
+            !keep.contains(&("openai".to_owned(), "gpt-4o-mini-2024-07-18".to_owned())),
+            "low-activity rotating model ID must not be in the top-N"
+        );
+    }
+
+    #[cfg(feature = "metrics-providers")]
+    #[test]
+    fn capped_calls_folds_overflow_into_other_label_pair() {
+        let mut calls: std::collections::HashMap<ProviderCallKey, u64> =
+            std::collections::HashMap::new();
+        calls.insert(pc_key("openai", "gpt-4o", "chat", "succeeded"), 100);
+        calls.insert(pc_key("openai", "gpt-old-1", "chat", "succeeded"), 3);
+        calls.insert(pc_key("openai", "gpt-old-2", "chat", "succeeded"), 2);
+        calls.insert(pc_key("openai", "gpt-old-3", "chat", "succeeded"), 1);
+
+        // Keep only the top pair; force overflow.
+        let keep: std::collections::HashSet<(String, String)> =
+            std::iter::once(("openai".to_owned(), "gpt-4o".to_owned())).collect();
+        let out = capped_calls(&calls, &keep);
+
+        // gpt-4o kept as-is.
+        assert_eq!(
+            out.get(&pc_key("openai", "gpt-4o", "chat", "succeeded")),
+            Some(&100)
+        );
+        // Three gpt-old-* collapsed into __other__/__other__ with summed count.
+        let other_key = pc_key(
+            CARDINALITY_OVERFLOW_LABEL,
+            CARDINALITY_OVERFLOW_LABEL,
+            "chat",
+            "succeeded",
+        );
+        assert_eq!(out.get(&other_key), Some(&(3 + 2 + 1)));
+        // Exactly 2 distinct rows after folding.
+        assert_eq!(out.len(), 2);
+    }
+
+    #[cfg(feature = "metrics-providers")]
+    #[test]
+    fn capped_calls_preserves_status_dimension() {
+        // operation_kind + status are bounded enums — the cap must not
+        // collapse them. Distinct `status` values for the same evicted
+        // pair should remain distinct rows under __other__.
+        let mut calls: std::collections::HashMap<ProviderCallKey, u64> =
+            std::collections::HashMap::new();
+        calls.insert(pc_key("openai", "gpt-a", "chat", "succeeded"), 100);
+        calls.insert(pc_key("openai", "gpt-a", "chat", "failed"), 10);
+        let keep: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let out = capped_calls(&calls, &keep);
+        // Both collapsed rows should appear — same __other__/__other__
+        // on the (conn, model) axis but distinct on status.
+        let succeeded = pc_key(
+            CARDINALITY_OVERFLOW_LABEL,
+            CARDINALITY_OVERFLOW_LABEL,
+            "chat",
+            "succeeded",
+        );
+        let failed = pc_key(
+            CARDINALITY_OVERFLOW_LABEL,
+            CARDINALITY_OVERFLOW_LABEL,
+            "chat",
+            "failed",
+        );
+        assert_eq!(out.get(&succeeded), Some(&100));
+        assert_eq!(out.get(&failed), Some(&10));
+        assert_eq!(out.len(), 2);
+    }
+
+    // ── #517 regression: histogram storage strategies ──────────────────
+    //
+    // Two separate strategies coexist — HTTP + provider use cumulative
+    // storage, breaker uses sparse. Both paths MUST render identical
+    // Prometheus output shape: `le=edge` counts are monotonic
+    // non-decreasing. These tests pin each strategy's render contract
+    // so a maintainer can't silently collapse one into the other.
+
+    /// Breaker path: sparse-storage record, cumulative render.
+    ///
+    /// Round-breaker buckets are `[1, 5, 10, 20, 30, 50]`. Observe
+    /// {1, 10, 30}. Each observation hits exactly one slot — indices
+    /// 0, 2, 4. `render_breaker_histogram` must emit cumulative
+    /// counts: 1, 1, 2, 2, 3, 3, +Inf=3.
+    #[test]
+    fn breaker_histogram_renders_cumulatively_from_sparse_storage() {
+        let mut h: BreakerHistogram<{ BREAKER_ROUND_BUCKETS.len() }> = BreakerHistogram::default();
+        for v in [1u64, 10, 30] {
+            observe_histogram(&mut h, &BREAKER_ROUND_BUCKETS, v);
+        }
+
+        // Raw storage is sparse: each observation hit exactly one slot.
+        // Buckets: [1, 5, 10, 20, 30, 50]
+        //           idx 0    idx 2     idx 4
+        let nonzero_slots: Vec<usize> = h
+            .bucket_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| if v > 0 { Some(i) } else { None })
+            .collect();
+        assert_eq!(
+            nonzero_slots,
+            vec![0, 2, 4],
+            "sparse storage: observations land in exactly one slot each",
+        );
+
+        // Render and verify the Prometheus output is cumulative.
+        let mut lines = Vec::new();
+        render_breaker_histogram(
+            &mut lines,
+            "test_round",
+            "test round histogram",
+            &h,
+            &BREAKER_ROUND_BUCKETS,
+        );
+
+        let buckets: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| {
+                if l.starts_with("test_round_bucket{le=\"") && !l.contains("+Inf") {
+                    let v = l.rsplit(' ').next().unwrap();
+                    v.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Cumulative: 1, 1, 2, 2, 3, 3
+        assert_eq!(buckets, vec![1, 1, 2, 2, 3, 3]);
+
+        let inf_line = lines
+            .iter()
+            .find(|l| l.contains("le=\"+Inf\""))
+            .expect("+Inf line");
+        assert!(inf_line.ends_with(" 3"));
+        let sum_line = lines
+            .iter()
+            .find(|l| l.starts_with("test_round_sum"))
+            .unwrap();
+        assert!(sum_line.ends_with(&format!(" {}", 1 + 10 + 30)));
+        let count_line = lines
+            .iter()
+            .find(|l| l.starts_with("test_round_count"))
+            .unwrap();
+        assert!(count_line.ends_with(" 3"));
+    }
+
+    /// HTTP path: cumulative-storage record, direct render.
+    ///
+    /// Observe three requests with latencies {10, 500, 2500} ms. The
+    /// HTTP strategy writes to every bucket whose edge covers the
+    /// latency, so the raw `bucket_counts` already read as the
+    /// Prometheus `le="edge"` values. Bucket counts must be monotonic
+    /// non-decreasing — the contract every downstream dashboard
+    /// depends on.
+    #[test]
+    fn http_request_duration_buckets_are_monotonic_per_request() {
+        let metrics = AppMetrics::default();
+        metrics.record_request("GET", "/v1/runs", 200, 10);
+        metrics.record_request("GET", "/v1/runs", 200, 500);
+        metrics.record_request("GET", "/v1/runs", 200, 2500);
+
+        let durations = metrics
+            .request_durations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let key = RequestDurationKey {
+            method: "GET".to_owned(),
+            path: "/v1/runs".to_owned(),
+        };
+        let sample = durations.get(&key).expect("sample exists");
+
+        // Cumulative storage: each slot[i] must be >= slot[i-1].
+        for window in sample.bucket_counts.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "cumulative buckets must be monotonic: {:?}",
+                sample.bucket_counts,
+            );
+        }
+        // Final bucket covers all three observations.
+        assert_eq!(*sample.bucket_counts.last().unwrap(), 3);
+        assert_eq!(sample.count, 3);
+        assert_eq!(sample.sum_ms, 10 + 500 + 2500);
+    }
+
+    /// Parity: running the sparse-then-render pipeline (breaker) and
+    /// the cumulative-increment pipeline (HTTP) over the **same
+    /// observations against the same bucket edges** MUST yield
+    /// identical `le="edge"` counts. If they diverge, swapping one
+    /// strategy for the other would silently change dashboard values
+    /// — the whole point of keeping both is that they produce
+    /// identical Prometheus output.
+    #[test]
+    fn sparse_and_cumulative_strategies_produce_identical_output() {
+        let observations = [1u64, 10, 30, 30, 1, 50, 100];
+
+        // Sparse side (breaker pipeline):
+        // record into sparse storage, then cumulate at render.
+        let mut h: BreakerHistogram<{ BREAKER_ROUND_BUCKETS.len() }> = BreakerHistogram::default();
+        for v in observations {
+            observe_histogram(&mut h, &BREAKER_ROUND_BUCKETS, v);
+        }
+        let mut lines = Vec::new();
+        render_breaker_histogram(&mut lines, "parity", "parity", &h, &BREAKER_ROUND_BUCKETS);
+        let sparse_rendered: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| {
+                if l.starts_with("parity_bucket{le=\"") && !l.contains("+Inf") {
+                    l.rsplit(' ').next().unwrap().parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Cumulative side (HTTP pipeline, inlined with the same bucket
+        // edges so we can compare — AppMetrics::record_request uses
+        // HTTP_DURATION_BUCKETS_MS which are different widths).
+        let mut cumulative = [0u64; BREAKER_ROUND_BUCKETS.len()];
+        for v in observations {
+            for (idx, edge) in BREAKER_ROUND_BUCKETS.iter().enumerate() {
+                if v <= *edge {
+                    cumulative[idx] += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            sparse_rendered,
+            cumulative.to_vec(),
+            "sparse-then-render MUST equal cumulative-increment for the same input",
+        );
+    }
+
+    // ── #661: subagent-spawn observability ──────────────────────────
+
+    #[test]
+    fn subagent_spawn_counter_renders_zero_on_empty() {
+        let metrics = AppMetrics::default();
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_subagent_spawn_total 0"),
+            "counter must render as 0 when never incremented — \
+             that zero is the diagnostic signal #661 surfaces;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn subagent_spawn_counter_tracks_monotonic_increments() {
+        let metrics = AppMetrics::default();
+        record_subagent_spawn(&metrics);
+        record_subagent_spawn(&metrics);
+        record_subagent_spawn(&metrics);
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_subagent_spawn_total 3"),
+            "counter should read 3 after 3 increments;\n\ngot:\n{rendered}"
+        );
+    }
+
+    // ── #689 R2-B: prose-playing detector counter ───────────────────
+
+    #[test]
+    fn prose_playing_counter_renders_zero_on_empty() {
+        let metrics = AppMetrics::default();
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_prose_playing_detected_total 0"),
+            "counter must render as 0 when never incremented — a \
+             visible zero is the healthy signal;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn prose_playing_counter_tracks_monotonic_increments() {
+        let metrics = AppMetrics::default();
+        record_prose_playing_detected(&metrics);
+        record_prose_playing_detected(&metrics);
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_prose_playing_detected_total 2"),
+            "counter should read 2 after 2 increments;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn iterations_histogram_observes_on_both_completed_and_failed_terminals() {
+        // #661: the histogram observation fires on both completed AND
+        // failed (and canceled) terminals. A breaker-tripped run that
+        // completes at iteration 32 is as much a distribution sample as
+        // a clean-complete at iteration 4. Validating the histogram
+        // itself receives the samples independent of terminal kind.
+        let metrics = AppMetrics::default();
+        observe_run_iterations(&metrics, 3); // "completed"
+        observe_run_iterations(&metrics, 32); // "failed at breaker"
+        observe_run_iterations(&metrics, 8); // "canceled mid-run"
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_iterations_per_run_count 3"),
+            "histogram count must be 3 after 3 observations;\n\ngot:\n{rendered}"
+        );
+        // sum = 3 + 32 + 8 = 43
+        assert!(
+            rendered.contains("cairn_orchestrator_iterations_per_run_sum 43"),
+            "histogram sum must match the inputs;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn inline_run_ratio_omitted_until_first_sample() {
+        let metrics = AppMetrics::default();
+        let rendered = metrics.render_prometheus();
+        assert!(
+            !rendered.contains("\ncairn_orchestrator_inline_run_ratio "),
+            "ratio must be absent until the first terminal run — \
+             0.0 with no data would mislead operators;\n\ngot:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cairn_orchestrator_inline_run_ratio_samples 0"),
+            "samples gauge must render as 0 even when the ratio is absent;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn inline_run_ratio_averages_window_contents() {
+        let metrics = AppMetrics::default();
+        // 3 inline runs, 1 delegated run → ratio 0.75
+        record_inline_run_outcome(&metrics, true);
+        record_inline_run_outcome(&metrics, true);
+        record_inline_run_outcome(&metrics, false);
+        record_inline_run_outcome(&metrics, true);
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains("cairn_orchestrator_inline_run_ratio 0.750000"),
+            "3 inline / 1 delegated should give 0.75;\n\ngot:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cairn_orchestrator_inline_run_ratio_samples 4"),
+            "samples gauge must reflect window size;\n\ngot:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn inline_run_ratio_window_caps_at_capacity() {
+        let metrics = AppMetrics::default();
+        // Fill past capacity; the oldest samples should evict FIFO.
+        // After this sequence the window holds exactly
+        // INLINE_RUN_WINDOW_CAPACITY entries, all `false` because the
+        // terminal half was delegated.
+        for _ in 0..(INLINE_RUN_WINDOW_CAPACITY + 50) {
+            record_inline_run_outcome(&metrics, true); // these evict
+        }
+        for _ in 0..INLINE_RUN_WINDOW_CAPACITY {
+            record_inline_run_outcome(&metrics, false);
+        }
+        let rendered = metrics.render_prometheus();
+        assert!(
+            rendered.contains(&format!(
+                "cairn_orchestrator_inline_run_ratio_samples {}",
+                INLINE_RUN_WINDOW_CAPACITY
+            )),
+            "samples gauge must cap at INLINE_RUN_WINDOW_CAPACITY;\n\ngot:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("cairn_orchestrator_inline_run_ratio 0.000000"),
+            "all {INLINE_RUN_WINDOW_CAPACITY} most-recent samples are \
+             'delegated'; ratio must be 0 — the earlier 'inline' samples \
+             evicted past the capacity;\n\ngot:\n{rendered}",
+            INLINE_RUN_WINDOW_CAPACITY = INLINE_RUN_WINDOW_CAPACITY,
+        );
+    }
 }

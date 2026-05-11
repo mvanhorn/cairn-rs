@@ -19,9 +19,9 @@ use cairn_runtime::MailboxService;
 use cairn_store::EventLog;
 
 use crate::errors::{
-    bad_request_response, now_ms, runtime_error_response, store_error_response, AppApiError,
+    now_ms, runtime_error_response, store_error_response, validation_error_response, AppApiError,
 };
-use crate::extractors::OptionalProjectScopedQuery;
+use crate::extractors::{AdminRoleGuard, OptionalProjectScopedQuery};
 use crate::helpers::{event_message, event_type_name, mailbox_message_view, run_id_for_event};
 use crate::state::{AppMailboxMessage, AppState, MailboxMessageView};
 
@@ -133,8 +133,15 @@ pub(crate) async fn list_feed_handler(
 pub(crate) async fn mark_feed_item_read_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<OptionalProjectScopedQuery>,
 ) -> impl IntoResponse {
-    match state.feed.mark_read(&id).await {
+    // `FeedEndpoints::mark_read` gained a required `&ProjectKey` per
+    // Gemini review on #554 (tenant-isolation invariant locked by
+    // #438/#439 extended to the full FeedEndpoints surface). We pull
+    // the project from the same optional query-param extractor the
+    // sibling `mark_all_feed_items_read_handler` already uses — an
+    // explicit scope is required, not inferred.
+    match state.feed.mark_read(&query.project(), &id).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
         Err(err) => AppApiError::new(StatusCode::NOT_FOUND, "not_found", err).into_response(),
     }
@@ -166,61 +173,101 @@ pub(crate) async fn list_mailbox_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<MailboxListQuery>,
 ) -> impl IntoResponse {
-    let mut records = if let Some(run_id) = query.run_id.as_deref() {
+    // #422: honest pagination. Two query paths:
+    //   - by-run: push limit/offset into the service (`list_by_run`
+    //     accepts both). Fetch `limit + 1`, derive `has_more`, truncate.
+    //     Post-sort by `created_at` ASC: cursor-bugbot review flagged
+    //     that removing the original unconditional post-sort left the
+    //     by-run branch returning whatever order the store happened to
+    //     produce.
+    //   - by-session: naïvely merging every run's full mailbox across
+    //     an offset=K page is O(runs × (offset + limit)), a 2M-row hot
+    //     path at deep offsets (cursor+gemini+copilot flagged). Cap
+    //     each run's fetch at `MAX_PER_RUN` so callers that deep-page
+    //     into a multi-megabyte session still terminate. When a run
+    //     hits the cap — i.e. it has more mailbox messages than we
+    //     scanned — we conservatively flip `has_more=true` since we
+    //     can no longer compute the accurate total. Operators that
+    //     need deep paging through a single session's mailbox should
+    //     switch to the by-run endpoint where pagination is O(1).
+    let limit = query.limit();
+    let offset = query.offset();
+
+    let (raw_records, has_more) = if let Some(run_id) = query.run_id.as_deref() {
         match state
             .runtime
             .mailbox
-            .list_by_run(&RunId::new(run_id), query.limit(), query.offset())
+            .list_by_run(&RunId::new(run_id), limit + 1, offset)
             .await
         {
-            Ok(records) => records,
+            Ok(mut records) => {
+                let more = records.len() > limit;
+                records.truncate(limit);
+                // Preserve the historical created_at-ASC ordering the
+                // UI's feed view depends on (cursor bugbot review).
+                records.sort_by_key(|record| record.created_at);
+                (records, more)
+            }
             Err(err) => return runtime_error_response(err),
         }
     } else if let Some(session_id) = query.session_id.as_deref() {
+        // Bound the cross-run merge: this path is intentionally not
+        // optimized for deep paging (operators that need it should
+        // move to the by-run endpoint). We still emit a truthful
+        // `has_more` by flipping the flag defensively whenever any
+        // run's fetch hits the cap — the true per-session mailbox
+        // count is unknown without a k-way merge against every
+        // mailbox projection.
+        const MAX_RUNS_PER_SESSION_SCAN: usize = 500;
+        const MAX_MAILBOX_PER_RUN: usize = 1_000;
         let runs = match state
             .runtime
             .runs
-            .list_by_session(&SessionId::new(session_id), 500, 0)
+            .list_by_session(&SessionId::new(session_id), MAX_RUNS_PER_SESSION_SCAN, 0)
             .await
         {
             Ok(runs) => runs,
             Err(err) => return runtime_error_response(err),
         };
+        // If we had more runs than the scan cap, we cannot produce a
+        // truthful cross-run total — surface has_more=true so the UI
+        // shows a load-more / "deep-paging not supported here" hint.
+        let mut cap_exceeded = runs.len() >= MAX_RUNS_PER_SESSION_SCAN;
         let mut records = Vec::new();
         for run in runs {
+            // Fetch `MAX_MAILBOX_PER_RUN + 1` so we can tell when a
+            // single run's mailbox outgrew the cap (otherwise the
+            // cross-run sort silently drops rows).
             match state
                 .runtime
                 .mailbox
-                .list_by_run(&run.run_id, query.limit(), 0)
+                .list_by_run(&run.run_id, MAX_MAILBOX_PER_RUN + 1, 0)
                 .await
             {
-                Ok(mut run_records) => records.append(&mut run_records),
+                Ok(mut run_records) => {
+                    if run_records.len() > MAX_MAILBOX_PER_RUN {
+                        cap_exceeded = true;
+                        run_records.truncate(MAX_MAILBOX_PER_RUN);
+                    }
+                    records.append(&mut run_records);
+                }
                 Err(err) => return runtime_error_response(err),
             }
         }
         records.sort_by_key(|record| record.created_at);
-        records
-            .into_iter()
-            .skip(query.offset())
-            .take(query.limit())
-            .collect()
+        let total = records.len();
+        let slice: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
+        let more = cap_exceeded || offset.saturating_add(slice.len()) < total;
+        (slice, more)
     } else {
-        return bad_request_response("run_id or session_id is required");
+        return validation_error_response("run_id or session_id is required");
     };
 
-    records.sort_by_key(|record| record.created_at);
-    let items: Vec<MailboxMessageView> = records
+    let items: Vec<MailboxMessageView> = raw_records
         .into_iter()
         .filter_map(|record| mailbox_message_view(&state, record))
         .collect();
-    (
-        StatusCode::OK,
-        Json(ListResponse {
-            items,
-            has_more: false,
-        }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
 }
 
 pub(crate) async fn append_mailbox_handler(
@@ -258,8 +305,26 @@ pub(crate) async fn append_mailbox_handler(
                         delivered: false,
                     },
                 );
-            let item = mailbox_message_view(&state, record).expect("mailbox overlay inserted");
-            (StatusCode::CREATED, Json(item)).into_response()
+            // #456: `mailbox_message_view` looks up the overlay we just
+            // inserted above, so the `Some` arm is the happy path. If a
+            // tombstone interleaves (concurrent `mark_mailbox_delivered_handler`
+            // evicting the entry) the lookup returns `None` — refuse to
+            // panic the request path; log + 500 instead.
+            match mailbox_message_view(&state, record) {
+                Some(item) => (StatusCode::CREATED, Json(item)).into_response(),
+                None => {
+                    tracing::error!(
+                        message_id = %message_id,
+                        "mailbox overlay vanished between insert and view",
+                    );
+                    AppApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal_error",
+                        "mailbox message disappeared after insert",
+                    )
+                    .into_response()
+                }
+            }
         }
         Err(err) => runtime_error_response(err),
     }
@@ -291,8 +356,19 @@ pub(crate) async fn mark_mailbox_delivered_handler(
 ///
 /// No SSE connection needed — suitable for initial page load.
 /// Returns at most `limit` events (default 50, capped at 500).
+/// `GET /v1/events/recent` — cross-tenant event log peek.
+///
+/// **Admin-only (#428).** The handler reads `store.read_stream(None, ...)`
+/// without any tenant filter, so its output leaks event rows from every
+/// tenant on the deployment. The audit suggested either moving the path
+/// under `/v1/admin/` or gating it with `AdminRoleGuard`. Keeping the
+/// legacy path (pre-release; no users to break) and gating via guard
+/// is the least-invasive fix — callers that need per-tenant event
+/// streams should use `GET /v1/stream` (SSE, tenant-scoped) or
+/// `GET /v1/runs/:id/events` (run-scoped).
 pub(crate) async fn recent_events_handler(
     State(state): State<Arc<AppState>>,
+    _admin: AdminRoleGuard,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     let limit: usize = query.limit().min(500);
@@ -329,7 +405,15 @@ pub(crate) async fn recent_events_handler(
 }
 
 /// `GET /v1/stats` — lightweight aggregate counts for the deployment.
-pub(crate) async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+///
+/// **Admin-only (#428).** Same reasoning as `recent_events_handler`:
+/// event counts, active-run counts, and session counts are aggregated
+/// across every tenant and MUST NOT be visible to a per-tenant operator
+/// token (would leak sizing information about tenant B to tenant A).
+pub(crate) async fn stats_handler(
+    State(state): State<Arc<AppState>>,
+    _admin: AdminRoleGuard,
+) -> impl IntoResponse {
     let store = state.runtime.store.as_ref();
 
     let total_events: u64 = store

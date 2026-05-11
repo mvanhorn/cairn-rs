@@ -8,19 +8,22 @@ use crate::engine::{
     AddExecutionToFlowInput, ApplyDependencyToChildInput, CancelRunInput, CompleteRunInput,
     ControlPlaneBackend, EligibilityResult, Engine, ExecutionLeaseContext, ExecutionSnapshot,
     FailExecutionOutcome, FailRunInput, RenewLeaseInput, ResumeRunInput, StageDependencyEdgeInput,
-    StageDependencyOutcome, SubmitTaskInput, SuspendRunInput,
+    StageDependencyOutcome, SubmitTaskInput,
 };
 use crate::error::FabricError;
 use crate::event_bridge::{BridgeEvent, EventBridge};
 use crate::helpers::{parse_public_state, try_parse_project_key};
-use ff_core::types::{ExecutionId, LaneId};
+use flowfabric::core::types::{ExecutionId, LaneId};
 
-use crate::boot::FabricRuntime;
 use crate::id_map;
+use crate::runtime_handle::FabricRuntimeHandle;
 use crate::state_map;
 
 pub struct FabricTaskService {
-    runtime: Arc<FabricRuntime>,
+    // PR-C4c: backend-agnostic runtime handle. See
+    // `run_service.rs` for the audit of runtime-level accesses
+    // services actually perform.
+    runtime: Arc<dyn FabricRuntimeHandle>,
     bridge: Arc<EventBridge>,
     engine: Arc<dyn Engine>,
     control_plane: Arc<dyn ControlPlaneBackend>,
@@ -28,7 +31,7 @@ pub struct FabricTaskService {
 
 impl FabricTaskService {
     pub fn new(
-        runtime: Arc<FabricRuntime>,
+        runtime: Arc<dyn FabricRuntimeHandle>,
         bridge: Arc<EventBridge>,
         engine: Arc<dyn Engine>,
         control_plane: Arc<dyn ControlPlaneBackend>,
@@ -63,9 +66,9 @@ impl FabricTaskService {
                 project,
                 sid,
                 task_id,
-                &self.runtime.partition_config,
+                self.runtime.partition_config(),
             ),
-            None => id_map::task_to_execution_id(project, task_id, &self.runtime.partition_config),
+            None => id_map::task_to_execution_id(project, task_id, self.runtime.partition_config()),
         }
     }
 
@@ -87,10 +90,15 @@ impl FabricTaskService {
     }
 
     /// Build the lease context required by lifecycle FCALLs from a
-    /// pre-read snapshot. Fills `"cairn"` defaults for lane_id /
-    /// worker_instance_id and a nil `lease_id` when the execution
-    /// hasn't been claimed — required by the cancel-while-unclaimed
-    /// path.
+    /// pre-read snapshot.
+    ///
+    /// Enforces the same fence-triple invariant as
+    /// `FabricRunService::resolve_lease_context` (RFC #58.5): either all
+    /// three fence tokens are populated from a live lease + current
+    /// attempt, or all three are cleared and `source` is set to
+    /// `"operator_override"` (unfenced authoritative-writer mode, used
+    /// by the cancel-while-unclaimed path). A partial triple would
+    /// surface as FF's opaque `partial_fence_triple` rejection (F37).
     fn resolve_lease_context(&self, snapshot: &ExecutionSnapshot) -> ExecutionLeaseContext {
         let lane_id = if snapshot.lane_id.as_str().is_empty() {
             LaneId::new("cairn")
@@ -101,38 +109,22 @@ impl FabricTaskService {
             .current_attempt
             .as_ref()
             .map(|a| a.index)
-            .unwrap_or_else(|| ff_core::types::AttemptIndex::new(0));
-        let attempt_id = snapshot
-            .current_attempt
-            .as_ref()
-            .map(|a| a.id.to_string())
-            .unwrap_or_default();
-        let (lease_id, lease_epoch, worker_instance_id) = match &snapshot.current_lease {
-            Some(l) => (
-                l.lease_id.to_string(),
-                l.epoch.0.to_string(),
-                ff_core::types::WorkerInstanceId::new(l.owner.as_str()),
-            ),
-            None => (
-                String::new(),
-                snapshot
-                    .current_lease_epoch
-                    .map(|e| e.0.to_string())
-                    .unwrap_or_else(|| "1".to_owned()),
-                // Mirror FabricRunService::resolve_lease_context: no-lease
-                // placeholder is the literal "cairn" default, not the
-                // runtime's own instance id. Matches the documented
-                // "fills cairn defaults" contract on this method.
-                ff_core::types::WorkerInstanceId::new("cairn"),
-            ),
-        };
-        ExecutionLeaseContext {
-            lane_id,
-            attempt_index,
-            lease_id,
-            lease_epoch,
-            attempt_id,
-            worker_instance_id,
+            .unwrap_or_else(|| flowfabric::core::types::AttemptIndex::new(0));
+
+        match (&snapshot.current_lease, snapshot.current_attempt.as_ref()) {
+            (Some(l), Some(att)) => ExecutionLeaseContext {
+                lane_id,
+                attempt_index,
+                lease_id: l.lease_id.to_string(),
+                lease_epoch: l.lease_epoch.0.to_string(),
+                attempt_id: att.id.to_string(),
+                worker_instance_id: l.worker_instance_id.clone(),
+                source: String::new(),
+            },
+            // Any other shape (no lease, or lease without attempt) → use
+            // the unfenced path. FF still validates lifecycle phase via
+            // `validate_lease_and_mark_expired`.
+            _ => ExecutionLeaseContext::unfenced(lane_id, attempt_index),
         }
     }
 
@@ -190,7 +182,7 @@ impl FabricTaskService {
 
         let (lease_owner, lease_expires_at) = match snapshot.current_lease.as_ref() {
             Some(l) => (
-                Some(l.owner.clone()).filter(|s| !s.is_empty()),
+                Some(l.worker_instance_id.as_str().to_owned()).filter(|s| !s.is_empty()),
                 Some(l.expires_at.0 as u64).filter(|&v| v > 0),
             ),
             None => (None, None),
@@ -262,7 +254,7 @@ impl FabricTaskService {
         // invisible to its owner's subscriber after a lease expiry.
         tags.insert(
             "cairn.instance_id".to_owned(),
-            self.runtime.config.worker_instance_id.to_string(),
+            self.runtime.worker_instance_id().to_string(),
         );
         if let Some(sid) = session_id {
             tags.insert("cairn.session_id".to_owned(), sid.as_str().to_owned());
@@ -524,8 +516,8 @@ impl FabricTaskService {
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_existing_dependency_edge(
         &self,
-        flow_id: &ff_core::types::FlowId,
-        edge_id: &ff_core::types::EdgeId,
+        flow_id: &flowfabric::core::types::FlowId,
+        edge_id: &flowfabric::core::types::EdgeId,
         project: &ProjectKey,
         dependent_task_id: &TaskId,
         prerequisite_task_id: &TaskId,
@@ -686,7 +678,7 @@ impl FabricTaskService {
             .emit(BridgeEvent::TaskLeaseClaimed {
                 task_id: task_id.clone(),
                 project: record.project.clone(),
-                lease_owner: self.runtime.config.worker_instance_id.to_string(),
+                lease_owner: self.runtime.worker_instance_id().to_string(),
                 lease_epoch: record.version,
                 lease_expires_at_ms: record.lease_expires_at.unwrap_or(0),
             })
@@ -877,8 +869,8 @@ impl FabricTaskService {
         let lease = self.resolve_lease_context(&snapshot);
         let eid = snapshot.execution_id.clone();
 
-        let params = match reason.kind {
-            PauseReasonKind::OperatorPause => crate::suspension::for_operator_hold(),
+        let case = match reason.kind {
+            PauseReasonKind::OperatorPause => crate::suspension::SuspendCase::OperatorPause,
             PauseReasonKind::ToolRequestedSuspension => {
                 let invocation_id = reason
                     .detail
@@ -888,7 +880,10 @@ impl FabricTaskService {
                         reason: "ToolRequestedSuspension requires invocation_id in reason.detail"
                             .to_owned(),
                     })?;
-                crate::suspension::for_tool_result(invocation_id, reason.resume_after_ms)
+                crate::suspension::SuspendCase::ToolRequestedSuspension {
+                    invocation_id,
+                    resume_after_ms: reason.resume_after_ms,
+                }
             }
             PauseReasonKind::RuntimeSuspension => {
                 let signal_name = reason
@@ -899,41 +894,26 @@ impl FabricTaskService {
                         reason: "RuntimeSuspension requires signal_name in reason.detail"
                             .to_owned(),
                     })?;
-                crate::suspension::SuspensionParams {
-                    reason_code: "waiting_for_signal".into(),
-                    condition_matchers: vec![ff_sdk::task::ConditionMatcher {
-                        signal_name: signal_name.to_owned(),
-                    }],
-                    timeout_ms: reason.resume_after_ms,
-                    timeout_behavior: ff_sdk::task::TimeoutBehavior::Fail,
+                crate::suspension::SuspendCase::RuntimeSuspension {
+                    signal_name,
+                    resume_after_ms: reason.resume_after_ms,
                 }
             }
             PauseReasonKind::PolicyHold => {
                 let detail = reason.detail.as_deref().unwrap_or("policy");
-                crate::suspension::SuspensionParams {
-                    reason_code: "paused_by_policy".into(),
-                    condition_matchers: vec![ff_sdk::task::ConditionMatcher {
-                        signal_name: format!("policy_resolved:{detail}"),
-                    }],
-                    timeout_ms: reason.resume_after_ms,
-                    timeout_behavior: ff_sdk::task::TimeoutBehavior::Fail,
+                crate::suspension::SuspendCase::PolicyHold {
+                    detail,
+                    resume_after_ms: reason.resume_after_ms,
                 }
             }
         };
 
-        // Task pause: match-mode matches the pre-migration rule —
-        // single matcher resumes on ANY signal, multi-matcher
-        // requires ALL. Identical to FabricRunService::pause.
-        let match_mode = if params.condition_matchers.len() <= 1 {
-            "any"
-        } else {
-            "all"
-        };
-        let suspend_input = build_suspend_input(eid, lease, &params, match_mode);
-
-        self.control_plane
-            .suspend_run_execution(suspend_input)
-            .await?;
+        // FF 0.10 typed surface — identical treatment to
+        // `FabricRunService::pause`. `suspend_by_triple` fences against
+        // the lease triple; no Lua-ARGV translation.
+        let fence = crate::suspension::build_lease_fence(&lease)?;
+        let args = crate::suspension::build_suspend_args(case);
+        crate::suspension::suspend_by_triple(self.runtime.backend(), eid, fence, args).await?;
 
         // Emit TaskStateChanged so the cairn-store projection + SSE
         // subscribers observe the suspension. `record.state` carries FF's
@@ -1066,70 +1046,5 @@ impl FabricTaskService {
         // operators the current lease state so the surface stays
         // truthful.
         self.read_task_record(project, session_id, task_id).await
-    }
-}
-
-/// Build the typed `SuspendRunInput` from a suspension params bundle.
-///
-/// Mirror of `FabricRunService::build_suspend_input` — kept
-/// task-service-local (rather than hoisted to a shared module) so the
-/// match-mode policy (any vs all) can diverge later if tasks grow a
-/// different resume-condition model than runs. Today both services
-/// use identical logic; deduplication would hide the policy choice
-/// behind a function boundary that callers don't read.
-fn build_suspend_input(
-    eid: ExecutionId,
-    lease: ExecutionLeaseContext,
-    params: &crate::suspension::SuspensionParams,
-    match_mode: &'static str,
-) -> SuspendRunInput {
-    let timeout_behavior_str = match params.timeout_behavior {
-        ff_sdk::task::TimeoutBehavior::Fail => "fail",
-        ff_sdk::task::TimeoutBehavior::Cancel => "cancel",
-        ff_sdk::task::TimeoutBehavior::Expire => "expire",
-        ff_sdk::task::TimeoutBehavior::AutoResume => "auto_resume_with_timeout_signal",
-        ff_sdk::task::TimeoutBehavior::Escalate => "escalate",
-    };
-
-    let required_names: Vec<&str> = params
-        .condition_matchers
-        .iter()
-        .map(|m| m.signal_name.as_str())
-        .collect();
-
-    let resume_condition_json = serde_json::json!({
-        "condition_type": "signal_set",
-        "required_signal_names": required_names,
-        "signal_match_mode": match_mode,
-        "minimum_signal_count": 1,
-        "timeout_behavior": timeout_behavior_str,
-        "allow_operator_override": true,
-    })
-    .to_string();
-
-    let resume_policy_json = serde_json::json!({
-        "resume_target": "runnable",
-        "close_waitpoint_on_resume": true,
-        "consume_matched_signals": true,
-        "retain_signal_buffer_until_closed": true,
-    })
-    .to_string();
-
-    let timeout_at = params
-        .timeout_ms
-        .map(|ms| {
-            let now = ff_core::types::TimestampMs::now().0;
-            now.saturating_add(ms as i64).to_string()
-        })
-        .unwrap_or_default();
-
-    SuspendRunInput {
-        execution_id: eid,
-        lease,
-        reason_code: params.reason_code.clone(),
-        timeout_at,
-        resume_condition_json,
-        resume_policy_json,
-        timeout_behavior: timeout_behavior_str.to_owned(),
     }
 }

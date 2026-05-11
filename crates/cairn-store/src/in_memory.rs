@@ -56,6 +56,38 @@ pub fn arm_fail_next_append(skip: u32, fail: u32) {
     FAIL_APPEND_FAIL_REMAINING.store(fail, Ordering::Release);
 }
 
+/// Issue #668: cap on the number of resident `LlmCompletionBodyRecord`
+/// rows kept in the `InMemoryStore.llm_completion_bodies` projection.
+///
+/// Default 5000; override via `CAIRN_LLM_TRACE_IN_MEMORY_CAP=<n>`.
+/// Clamped to [100, 100_000] to stop typos (`=0`, `=99999999`) from
+/// either disabling the projection or letting it grow unboundedly.
+///
+/// The durable backends (pg + sqlite) keep the full history; the
+/// in-memory cap is a live-memory upper bound, not a retention
+/// policy. Operators querying pages deeper than the cap on an
+/// in-memory (`--db memory`) deployment will see gaps — acceptable
+/// because `--db memory` is dev-only and already announces
+/// "ALL DATA WILL BE LOST on restart".
+fn llm_completion_bodies_cap() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        const DEFAULT: usize = 5_000;
+        const MIN: usize = 100;
+        const MAX: usize = 100_000;
+        match std::env::var("CAIRN_LLM_TRACE_IN_MEMORY_CAP") {
+            Ok(v) => v
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .unwrap_or(DEFAULT)
+                .clamp(MIN, MAX),
+            Err(_) => DEFAULT,
+        }
+    })
+}
+
 fn now_millis() -> u64 {
     // Matches pg/sqlite backends' fallback on clock skew: a clock before
     // UNIX_EPOCH (container misconfiguration) MUST NOT panic the store.
@@ -77,6 +109,14 @@ struct State {
     runs: HashMap<String, RunRecord>,
     tasks: HashMap<String, TaskRecord>,
     approvals: HashMap<String, ApprovalRecord>,
+    /// RFC-025 Phase 2a.2 milestone 1: audit trail for `ApprovalDelegated`
+    /// events. One entry per delegation event, pushed on event apply.
+    /// Mirrors the `approval_delegations` projection on pg/sqlite so
+    /// `ApprovalDelegationReadModel::list_for_approval` returns byte-equal
+    /// results across backends.
+    approval_delegations: Vec<crate::projections::ApprovalDelegationRecord>,
+    /// PR BP-2: projection of `ToolCall*` approval events keyed by call_id.
+    tool_call_approvals: HashMap<String, ToolCallApprovalRecord>,
     checkpoints: HashMap<String, CheckpointRecord>,
     mailbox_messages: HashMap<String, MailboxRecord>,
     tool_invocations: HashMap<String, ToolInvocationRecord>,
@@ -106,10 +146,43 @@ struct State {
     session_costs: HashMap<String, cairn_domain::providers::SessionCostRecord>,
     /// Run-level accumulated costs keyed by run_id.
     run_costs: HashMap<String, cairn_domain::providers::RunCostRecord>,
+    /// F29 CD-2: lifetime project cost rollup, keyed by
+    /// `(tenant_id, workspace_id, project_id)`. Updated alongside
+    /// `session_costs` from the `SessionCostUpdated` handler so the
+    /// numbers are guaranteed consistent with the per-session totals.
+    project_costs: HashMap<(String, String, String), cairn_domain::providers::ProjectCostRecord>,
+    /// F29 CD-2: lifetime workspace cost rollup, keyed by
+    /// `(tenant_id, workspace_id)`. Same consistency invariant as
+    /// `project_costs`.
+    workspace_costs: HashMap<(String, String), cairn_domain::providers::WorkspaceCostRecord>,
     /// GAP-010: LLM call trace records derived from ProviderCallCompleted events.
     llm_traces: Vec<cairn_domain::LlmCallTrace>,
+    /// Issue #668: LLM chain-of-thought body records keyed by
+    /// `trace_id`. Written from `LlmCompletionRecorded` events
+    /// (emitted alongside `ProviderCallCompleted` from the orchestrator).
+    /// Separate from `llm_traces` so the big text fields don't bloat
+    /// the metadata projection.
+    llm_completion_bodies: HashMap<String, crate::projections::LlmCompletionBodyRecord>,
+    /// #789: per-iteration compacted reasoning records keyed by
+    /// `run_id`, ordered chronologically (oldest → newest).
+    /// Capped at `REASONING_STEP_CAP_PER_RUN` per run via FIFO
+    /// eviction. Written from `RunReasoningStepRecorded` events.
+    reasoning_steps:
+        HashMap<cairn_domain::RunId, Vec<crate::projections::reasoning_step::ReasoningStepRecord>>,
+    /// RFC 031 `project_agent_roles` projection. Keyed on
+    /// serialised `(tenant_id, workspace_id, project_id, role_id)`
+    /// so lookups are a single `HashMap::get`. Uniqueness on active
+    /// rows (§D6) is enforced at apply time: a retracted row stays
+    /// keyed the same; a subsequent `AgentRoleDefined` for the same
+    /// key upserts in place and clears `retracted_at`.
+    agent_roles: HashMap<(String, String, String, String), crate::projections::AgentRoleRecord>,
     operator_profiles: HashMap<String, crate::projections::OperatorProfileRecord>,
     full_operator_profiles: HashMap<String, cairn_domain::org::OperatorProfile>,
+    /// RFC 026 PR-A0: operator → tenant-role mapping keyed on
+    /// `(tenant_id, operator_id)`. Revoked rows are kept (the audit
+    /// trail survives); active-only queries filter on
+    /// `OperatorTenantRoleRecord::is_active`.
+    operator_tenant_roles: HashMap<(String, String), crate::projections::OperatorTenantRoleRecord>,
     workspace_members: Vec<crate::projections::WorkspaceMemberRecord>,
     signal_subscriptions: HashMap<String, crate::projections::SignalSubscriptionRecord>,
     provider_health_records: HashMap<String, cairn_domain::providers::ProviderHealthRecord>,
@@ -118,15 +191,52 @@ struct State {
     credentials: HashMap<String, cairn_domain::credentials::CredentialRecord>,
     channels: HashMap<String, cairn_domain::ChannelRecord>,
     channel_messages: HashMap<String, Vec<cairn_domain::ChannelMessage>>,
+    /// Sidecar dedupe index for `channel_messages` — keeps the
+    /// first-write-wins guard O(1) per event apply instead of a linear
+    /// scan of the message Vec. Mirrors the `guardrail_evaluation_keys`
+    /// pattern. Kept in lockstep with `channel_messages` by the applier
+    /// and the clear paths. Copilot PR #594 perf fix.
+    channel_message_keys: std::collections::HashSet<(String, String)>,
     credential_rotations: Vec<cairn_domain::credentials::CredentialRotationRecord>,
     licenses: HashMap<String, cairn_domain::LicenseRecord>,
     entitlement_overrides: HashMap<String, cairn_domain::EntitlementOverrideRecord>,
     notification_prefs: HashMap<String, cairn_domain::notification_prefs::NotificationPreference>,
     notification_records: Vec<cairn_domain::notification_prefs::NotificationRecord>,
+    /// Sidecar dedupe index for `notification_records` — first-write-wins
+    /// guard on `record_id` in O(1). Same reasoning as
+    /// `channel_message_keys` above. Copilot PR #594 perf fix.
+    notification_record_ids: std::collections::HashSet<String>,
     guardrail_policies: HashMap<String, cairn_domain::policy::GuardrailPolicy>,
+    /// RFC-025 Phase 2a.2 milestone 2: tenant association for guardrail
+    /// policies so `list_policies(tenant_id, ..)` scopes correctly. The
+    /// domain `GuardrailPolicy` struct omits tenant_id; pg/sqlite store
+    /// it on the projection row and filter in SQL. Mirror that here by
+    /// tracking it in a sibling map keyed on policy_id.
+    guardrail_policy_tenants: HashMap<String, cairn_domain::TenantId>,
+    /// RFC-025 Phase 2a.2 milestone 2: audit trail for
+    /// `GuardrailPolicyEvaluated` events. One row per evaluation; a
+    /// replayed event with the same composite key (tenant_id, policy_id,
+    /// subject_type, subject_id_or_empty, action, evaluated_at_ms) is a
+    /// no-op, mirroring the pg/sqlite `PRIMARY KEY` contract.
+    guardrail_evaluations: Vec<crate::projections::GuardrailEvaluationRecord>,
+    /// Sidecar dedupe set for `guardrail_evaluations` — keeps the idempotency
+    /// guard O(1) per event apply instead of the prior O(n) linear scan.
+    /// The Vec above stays as the authoritative store so tenant-scoped
+    /// reads can preserve insertion order and re-sort at read time
+    /// (matching pg/sqlite `ORDER BY evaluated_at_ms DESC`). The two
+    /// structures are kept in lockstep by the applier and the clear paths
+    /// (`clear_state` / `reset_state`). Copilot #571 round 3 perf fix.
+    guardrail_evaluation_keys:
+        std::collections::HashSet<(String, String, String, String, String, u64)>,
     provider_budgets: HashMap<String, cairn_domain::providers::ProviderBudget>,
     provider_connections: HashMap<String, cairn_domain::providers::ProviderConnectionRecord>,
     quotas: HashMap<String, cairn_domain::TenantQuota>,
+    /// RFC-025 Phase 2a.1 milestone 2: audit trail for
+    /// `TenantQuotaViolated` events. One entry per violation, pushed on
+    /// event apply. Matches the `tenant_quota_violations` projection on
+    /// pg/sqlite so `QuotaViolationReadModel::list_violations` returns
+    /// byte-equal results across backends.
+    quota_violations: Vec<crate::projections::QuotaViolationRecord>,
     provider_bindings: HashMap<String, cairn_domain::providers::ProviderBindingRecord>,
     provider_health_schedules: HashMap<String, cairn_domain::providers::ProviderHealthSchedule>,
     run_sla_configs: HashMap<String, cairn_domain::sla::SlaConfig>,
@@ -138,6 +248,95 @@ struct State {
     /// FF lease_history subscriber cursors, keyed by `(partition_id,
     /// execution_id)`.
     ff_lease_history_cursors: HashMap<(String, String), crate::projections::FfLeaseHistoryCursor>,
+    /// F52: projection of `ToolInvocationCacheHit` events keyed by
+    /// `invocation_id` so replay + second-boot reads converge to the same
+    /// set. Mirrors the pg/sqlite `tool_invocation_cache_hits` table.
+    tool_invocation_cache_hits: HashMap<String, crate::projections::ToolInvocationCacheHitRecord>,
+    /// #364: latest `ToolInvocationProgressUpdated` per invocation, keyed
+    /// by `invocation_id`. Carries the `ProjectKey` so
+    /// `GET /v1/tool-invocations/:id/progress` can enforce tenant scope
+    /// without a second lookup against `tool_invocations`. Replaces the
+    /// previous `read_stream(None, 10_000)` + filter scan — that scan
+    /// was both a DoS (bounded by a fixed 10k window that masked data
+    /// past it) and cross-tenant readable.
+    tool_invocation_progress: HashMap<String, crate::projections::ToolInvocationProgressRecord>,
+    /// F65 PR-2: orchestrator-session outcomes, keyed by `root_run_id`
+    /// (the primary key of the pg/sqlite `session_outcomes` table).
+    session_outcomes: HashMap<String, crate::projections::SessionOutcomeRecord>,
+    /// F65 PR-2: workspace snapshot rows, keyed by `snapshot_id`.
+    workspace_snapshots: HashMap<String, crate::projections::WorkspaceSnapshotRecord>,
+    /// F65 PR-2: workspace registry (live overlayfs mount tracking),
+    /// keyed by `workspace_id`.
+    workspace_registry: HashMap<String, crate::projections::WorkspaceRegistryRecord>,
+    /// F65 PR-2: orchestrator-resumable checkpoint bodies, keyed by
+    /// `checkpoint_id`. Distinct from `checkpoints` above — that map
+    /// holds the RFC 005 per-run checkpoint metadata; this one holds the
+    /// F65 body + schema version + session lineage.
+    f65_checkpoints: HashMap<String, crate::projections::F65CheckpointRecord>,
+    /// RFC-025 Phase 1.5a: trigger projection, keyed by `trigger_id`.
+    /// Owns the state-carrying lifecycle (created/enabled/disabled/
+    /// suspended/resumed/deleted). Mirror of the `triggers` pg/sqlite
+    /// table.
+    triggers: HashMap<String, crate::projections::TriggerRecord>,
+    /// RFC-025 Phase 1.5a: run template projection, keyed by
+    /// `template_id`. Mirror of `run_templates` pg/sqlite table.
+    run_templates: HashMap<String, crate::projections::RunTemplateRecord>,
+    /// RFC-025 Phase 1.5a: append-only audit of every trigger fire
+    /// attempt (fired / skipped / denied / rate_limited /
+    /// pending_approval). Mirror of `trigger_fires` pg/sqlite table.
+    /// Backs the duplicate-fire ledger + rate-limit + project-budget
+    /// windowed COUNT queries. Classified Ephemeral in the registry
+    /// because no runtime state is recovered from individual rows at
+    /// boot, but the rows persist here so the counters stay consistent
+    /// with pg/sqlite parity expectations.
+    trigger_fires: Vec<crate::projections::TriggerFireRecord>,
+    /// RFC-025 Phase 2b.1: audit log read-model keyed by `entry_id`.
+    /// Mirror of the `audit_log_entries` pg/sqlite table. Replaces an
+    /// earlier read-time scan over `state.events` that grew linearly
+    /// with total event count and silently violated the trait's
+    /// "newest-first" ordering contract. The event itself does not
+    /// carry the full `AuditLogEntry.metadata` — the projection persists
+    /// the empty-object default so list/get reconstruct a byte-equal
+    /// record across backends.
+    audit_log_entries: HashMap<String, crate::projections::AuditLogEntryRecord>,
+    /// RFC-025 Phase 2b.1 m4: plan-review read model (RFC 018).
+    /// Keyed by `plan_run_id`. Pre-Phase-2b.1 the four Plan-lifecycle
+    /// events (`PlanProposed`, `PlanApproved`, `PlanRejected`,
+    /// `PlanRevisionRequested`) were no-ops on every backend including
+    /// in-memory — `GET /v1/runs/:id/plan` had zero authoritative
+    /// state to read from.
+    plan_reviews: HashMap<String, crate::projections::PlanReviewRecord>,
+    /// RFC-025 Phase 2b.2b m3: subagent spawn audit (RFC 014).
+    /// Keyed by `child_task_id`. Mirror of the `subagent_spawns`
+    /// pg/sqlite table. Pre-Phase-2b.2b the in-memory applier updated
+    /// only the child's `tasks` row; this map captures the spawn
+    /// event itself so operator dashboards can enumerate a run's
+    /// subagent graph without walking the event log.
+    subagent_spawns: HashMap<String, crate::projections::SubagentSpawnRecord>,
+    /// RFC-025 Phase 2b.2b m4: user message projection.
+    /// Keyed by `(run_id, sequence)`. Mirror of the `user_messages`
+    /// pg/sqlite table. Pre-Phase-2b.2b `GET /v1/runs/:id/messages`
+    /// walked the event log on every call — this map turns the read
+    /// into O(messages-in-run) instead of O(events-total).
+    user_messages: HashMap<(String, u64), crate::projections::UserMessageRecord>,
+    /// RFC-025 Phase 2b.2b m5: soul patch lifecycle projection.
+    /// Keyed by `patch_id`. Mirror of the `soul_patches` pg/sqlite
+    /// table. Pre-Phase-2b.2b both `SoulPatchProposed` and
+    /// `SoulPatchApplied` were no-ops on every backend — no durable
+    /// state carried the proposal audit trail.
+    soul_patches: HashMap<String, crate::projections::SoulPatchRecord>,
+    /// RFC-025 Phase 2b.2b m6: tool-recovery pause audit (RFC 020
+    /// Track 3). Keyed by `tool_call_id`. Mirror of the
+    /// `tool_recovery_pauses` pg/sqlite table.
+    tool_recovery_pauses: HashMap<String, crate::projections::ToolRecoveryPauseRecord>,
+    /// Issue #592: evict-on-resume projection keyed by `run_id`.
+    /// Mirror of the `pause_schedules` pg/sqlite table (pg V062 +
+    /// sqlite `schema.rs`). `RunStateChanged(→Paused)` with a
+    /// non-None `resume_after_ms` inserts a row; any transition away
+    /// from Paused removes it. `PauseScheduleReadModel::list_due`
+    /// reads this map with an ordered range scan — no event-log
+    /// walker.
+    pause_schedules: HashMap<String, crate::projections::PauseScheduledRecord>,
 }
 
 pub struct InMemoryStore {
@@ -161,6 +360,26 @@ pub struct InMemoryStore {
     /// is best-effort: failures are logged but do NOT roll back the in-memory
     /// write, preserving the existing availability guarantee.
     secondary_log: std::sync::RwLock<Option<Arc<dyn EventLog + Send + Sync>>>,
+
+    /// #670 G4 PR-1b-4: optional durable secondary descendant counter
+    /// backend. `try_increment_descendants` / `decrement_descendants`
+    /// dual-write here AFTER the in-memory write completes — the
+    /// counter is a projection mutation, not an event, so it would
+    /// otherwise drift to 0 on restart (the event-log replay
+    /// rebuilds the in-memory projection but there are no events
+    /// to replay for the counter itself).
+    ///
+    /// When set, the in-memory arm remains authoritative for the
+    /// cap-check decision (the CAS loop runs in-memory first). The
+    /// durable secondary write follows the in-memory decision: if
+    /// the in-memory admit said "under cap, new_count=N", the
+    /// durable backend sees an UPDATE that sets its counter to
+    /// the SAME N via its own atomic primitive. Dual-write is
+    /// best-effort like the event log; failures log a WARN and the
+    /// durable value drifts by one until the next live write
+    /// reconciles.
+    secondary_counter:
+        std::sync::RwLock<Option<Arc<dyn crate::projections::RunDescendantsCounter + Send + Sync>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +403,8 @@ impl InMemoryStore {
                 runs: HashMap::new(),
                 tasks: HashMap::new(),
                 approvals: HashMap::new(),
+                approval_delegations: Vec::new(),
+                tool_call_approvals: HashMap::new(),
                 checkpoints: HashMap::new(),
                 mailbox_messages: HashMap::new(),
                 tool_invocations: HashMap::new(),
@@ -205,9 +426,15 @@ impl InMemoryStore {
                 external_workers: HashMap::new(),
                 session_costs: HashMap::new(),
                 run_costs: HashMap::new(),
+                project_costs: HashMap::new(),
+                workspace_costs: HashMap::new(),
                 llm_traces: Vec::new(),
+                llm_completion_bodies: HashMap::new(),
+                reasoning_steps: HashMap::new(),
+                agent_roles: HashMap::new(),
                 operator_profiles: HashMap::new(),
                 full_operator_profiles: HashMap::new(),
+                operator_tenant_roles: HashMap::new(),
                 workspace_members: Vec::new(),
                 signal_subscriptions: HashMap::new(),
                 provider_health_records: HashMap::new(),
@@ -216,15 +443,21 @@ impl InMemoryStore {
                 credentials: HashMap::new(),
                 channels: HashMap::new(),
                 channel_messages: HashMap::new(),
+                channel_message_keys: std::collections::HashSet::new(),
                 credential_rotations: Vec::new(),
                 licenses: HashMap::new(),
                 entitlement_overrides: HashMap::new(),
                 notification_prefs: HashMap::new(),
                 notification_records: Vec::new(),
+                notification_record_ids: std::collections::HashSet::new(),
                 guardrail_policies: HashMap::new(),
+                guardrail_policy_tenants: HashMap::new(),
+                guardrail_evaluations: Vec::new(),
+                guardrail_evaluation_keys: std::collections::HashSet::new(),
                 provider_budgets: HashMap::new(),
                 provider_connections: HashMap::new(),
                 quotas: HashMap::new(),
+                quota_violations: Vec::new(),
                 provider_bindings: HashMap::new(),
                 provider_health_schedules: HashMap::new(),
                 run_sla_configs: HashMap::new(),
@@ -234,15 +467,48 @@ impl InMemoryStore {
                 route_policies: HashMap::new(),
                 resource_shares: HashMap::new(),
                 ff_lease_history_cursors: HashMap::new(),
+                tool_invocation_cache_hits: HashMap::new(),
+                tool_invocation_progress: HashMap::new(),
+                session_outcomes: HashMap::new(),
+                workspace_snapshots: HashMap::new(),
+                workspace_registry: HashMap::new(),
+                f65_checkpoints: HashMap::new(),
                 tenants: HashMap::new(),
                 workspaces: HashMap::new(),
                 projects: HashMap::new(),
                 snapshots: Vec::new(),
+                triggers: HashMap::new(),
+                run_templates: HashMap::new(),
+                trigger_fires: Vec::new(),
+                audit_log_entries: HashMap::new(),
+                plan_reviews: HashMap::new(),
+                subagent_spawns: HashMap::new(),
+                user_messages: HashMap::new(),
+                soul_patches: HashMap::new(),
+                tool_recovery_pauses: HashMap::new(),
+                pause_schedules: HashMap::new(),
             }),
             usage_counters: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             secondary_log: std::sync::RwLock::new(None),
+            secondary_counter: std::sync::RwLock::new(None),
         }
+    }
+
+    /// #670 G4 PR-1b-4: install a durable secondary descendant
+    /// counter backend (e.g. pg or sqlite adapter). After this call,
+    /// every `try_increment_descendants` / `decrement_descendants`
+    /// that lands in the in-memory arm is followed by an equivalent
+    /// write against the durable backend. Without this, the counter
+    /// is not durable across restart.
+    pub fn set_secondary_descendants_counter(
+        &self,
+        backend: Arc<dyn crate::projections::RunDescendantsCounter + Send + Sync>,
+    ) {
+        *self
+            .secondary_counter
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(backend);
     }
 
     fn increment_usage_for_project(
@@ -287,6 +553,19 @@ impl InMemoryStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Test-only read of the `tool_invocation_cache_hits` projection,
+    /// mirroring the `arm_fail_next_append` gating pattern. Integration
+    /// tests assert the projection grew after a
+    /// `ToolInvocationCacheHit` append without committing to a stable
+    /// public API surface on the store.
+    #[cfg(debug_assertions)]
+    pub fn all_tool_invocation_cache_hits(
+        &self,
+    ) -> Vec<crate::projections::ToolInvocationCacheHitRecord> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.tool_invocation_cache_hits.values().cloned().collect()
     }
 
     /// Attach a durable secondary event log.
@@ -339,6 +618,13 @@ impl InMemoryStore {
                         version: 1,
                         created_at: now,
                         updated_at: now,
+                        // F65 PR-1: additive fields are populated by PR-2
+                        // projection writers. Initial in-memory rows get
+                        // the same defaults serde would apply on replay.
+                        goal_title: None,
+                        issue_budget: None,
+                        max_attempts: crate::projections::session::DEFAULT_MAX_ATTEMPTS,
+                        attempts_used: 0,
                     },
                 );
                 if is_fresh {
@@ -355,6 +641,24 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::RunCreated(e) => {
+                // #670 G4 / RFC 027: initialise `root_run_id`. Mirrors
+                // the pg/sqlite projection's sub-SELECT shape:
+                //   1. Root (no parent) → self-reference.
+                //   2. Child with parent row present → inherit the
+                //      parent's `root_run_id`. The whole chain shares
+                //      one absolute root; read-before-write of the
+                //      parent's value keeps this atomic with the
+                //      child's insertion.
+                //   3. Child with parent row missing → None. The
+                //      decrement path's no-op-on-None handles this
+                //      legacy case.
+                let root_run_id = match e.parent_run_id.as_ref() {
+                    None => Some(e.run_id.clone()),
+                    Some(parent_id) => state
+                        .runs
+                        .get(parent_id.as_str())
+                        .and_then(|parent| parent.root_run_id.clone()),
+                };
                 state.runs.insert(
                     e.run_id.as_str().to_owned(),
                     RunRecord {
@@ -371,6 +675,16 @@ impl InMemoryStore {
                         version: 1,
                         created_at: now,
                         updated_at: now,
+                        completion_summary: None,
+                        completion_verification: None,
+                        completion_annotated_at_ms: None,
+                        terminal_write_recovery: None,
+                        in_flight_descendants: 0,
+                        root_run_id,
+                        // #791: iteration starts at 0 — incremented on
+                        // each waiting_approval → running transition
+                        // in the RunStateChanged apply below.
+                        iteration: 0,
                     },
                 );
                 // Update run quota counter
@@ -379,13 +693,127 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::RunStateChanged(e) => {
-                if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
-                    rec.state = e.transition.to;
-                    rec.failure_class = e.failure_class;
-                    rec.pause_reason = e.pause_reason.clone();
-                    rec.resume_trigger = e.resume_trigger;
-                    rec.version += 1;
-                    rec.updated_at = now;
+                // Cross-tenant tampering guard (#732 expansion):
+                // mirror the `RunCompletionAnnotated` gate. A forged
+                // `RunStateChanged` with a victim tenant's `run_id`
+                // but the attacker's `project` could otherwise flip
+                // another tenant's run state (terminal/failed/
+                // paused) by appending a single event. NOTE: this
+                // event's payload does not carry `session_id`
+                // (unlike `RunCompletionAnnotated`), so the gate is
+                // `project`-only here — sufficient because the run
+                // row's project is fixed at `RunCreated` time and
+                // any legitimate emit must match it.
+                //
+                // The guard wraps the entire block — row update,
+                // descendant decrement, and pause_schedules write —
+                // because all three would otherwise leak across
+                // tenants. Missing-row → fall through (orphan
+                // replay is a legitimate path the existing
+                // `pause_schedule_list_due_filters_by_tenant_and_respects_limit`
+                // test exercises: state-change event arriving
+                // before the projection sees its `RunCreated`).
+                // Forged-event-against-existing-row → block.
+                let row_belongs_to_other_tenant = state
+                    .runs
+                    .get(e.run_id.as_str())
+                    .map(|rec| rec.project != e.project)
+                    .unwrap_or(false);
+                if !row_belongs_to_other_tenant {
+                    // #670 G4 / RFC 027 §97: on terminal transition of a
+                    // non-root descendant, decrement the root's
+                    // `in_flight_descendants` counter. The root id is
+                    // captured at spawn time into the terminating child's
+                    // `root_run_id` — no parent-chain traversal at
+                    // terminal time. `root_run_id = None` is a no-op
+                    // (pre-V069 / legacy-chain case).
+                    let terminal_decrement_target: Option<RunId> =
+                        if e.transition.to.is_terminal() {
+                            state
+                                .runs
+                                .get(e.run_id.as_str())
+                                .filter(|rec| rec.parent_run_id.is_some())
+                                .and_then(|rec| rec.root_run_id.clone())
+                        } else {
+                            None
+                        };
+                    if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
+                        // #791: increment iteration on every
+                        // approval-resume boundary (waiting_approval
+                        // → running). This is the projection-backed
+                        // counter that replaces PR #790's interim
+                        // event-log scan in
+                        // crates/cairn-app/src/handlers/runs/orchestrate.rs.
+                        //
+                        // #795: also increment on the parent-resume
+                        // boundary (waiting_dependency → running),
+                        // which fires when a sub-agent reports back
+                        // and G5 auto-resumes the parent. R21 dogfood
+                        // showed this transition was being missed —
+                        // the parent's iteration counter stayed at 0
+                        // across multiple delegation cycles, masking
+                        // re-spawn loops in the rendered trajectory.
+                        // And on `paused → running` for operator-paced
+                        // resume — same logical boundary, same fix.
+                        if e.transition.is_run_resume_boundary() {
+                            rec.iteration = rec.iteration.saturating_add(1);
+                        }
+                        rec.state = e.transition.to;
+                        rec.failure_class = e.failure_class;
+                        rec.pause_reason = e.pause_reason.clone();
+                        rec.resume_trigger = e.resume_trigger;
+                        rec.version += 1;
+                        rec.updated_at = now;
+                    }
+                    if let Some(root_id) = terminal_decrement_target {
+                        if let Some(root_rec) = state.runs.get_mut(root_id.as_str()) {
+                            // Unchecked subtract is deliberate — RFC 027
+                            // §93 specifies `i64` typing so underflow
+                            // surfaces as a negative value that the
+                            // adapter layer surfaces on its
+                            // `child_run_driver_descendant_underflow_total`
+                            // metric. Panicking (or clamping at 0) would
+                            // hide the auditable signal.
+                            root_rec.in_flight_descendants =
+                                root_rec.in_flight_descendants.wrapping_sub(1);
+                            root_rec.version = root_rec.version.saturating_add(1);
+                            root_rec.updated_at = now;
+                        }
+                    }
+
+                    // Issue #592: pause_schedules projection — evict-on-resume.
+                // Mirrors pg/sqlite: INSERT on Paused with
+                // `resume_after_ms=Some`, DELETE on any transition
+                // away from Paused. Parity harness asserts stable
+                // ordering + consistent membership/eviction across
+                // backends. Post Copilot #595 fix, all three backends
+                // compute `resume_at_ms` = event-time + resume_after_ms
+                // (in_memory reads `event.stored_at` via the enclosing
+                // `apply_projection`, pg/sqlite take `event_time_ms`
+                // through `apply_async`), so a rebuild replays
+                // scheduled resumes at their original wall-clock
+                // instead of shifting them to the rebuild wall-clock.
+                    match e.transition.to {
+                        cairn_domain::RunState::Paused => {
+                            if let Some(reason) = &e.pause_reason {
+                                if let Some(resume_after_ms) = reason.resume_after_ms {
+                                    let resume_at_ms = now.saturating_add(resume_after_ms);
+                                    state.pause_schedules.insert(
+                                        e.run_id.as_str().to_owned(),
+                                        crate::projections::PauseScheduledRecord {
+                                            run_id: e.run_id.clone(),
+                                            project: e.project.clone(),
+                                            resume_at_ms,
+                                            created_at_ms: now,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            state.pause_schedules.remove(e.run_id.as_str());
+                        }
+                    }
                 }
             }
             RuntimeEvent::TaskCreated(e) => {
@@ -528,6 +956,8 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::ToolInvocationStarted(e) => {
+                // F55: thread captured args into the in-memory projection
+                // so it returns the same shape as pg + sqlite.
                 let requested = ToolInvocationRecord::new_requested(
                     e.invocation_id.clone(),
                     e.project.clone(),
@@ -537,7 +967,8 @@ impl InMemoryStore {
                     e.target.clone(),
                     e.execution_class,
                     e.requested_at_ms,
-                );
+                )
+                .with_args(e.args_json.clone());
                 let started = requested
                     .mark_started(e.started_at_ms)
                     .expect("tool invocation started event should always be a valid requested->started transition");
@@ -547,17 +978,49 @@ impl InMemoryStore {
             }
             RuntimeEvent::ToolInvocationCompleted(e) => {
                 if let Some(rec) = state.tool_invocations.get_mut(e.invocation_id.as_str()) {
-                    *rec = rec.mark_finished(e.outcome, None, e.finished_at_ms).expect(
-                        "tool invocation completed event should preserve valid terminal transition",
-                    );
+                    // F55: persist the truncated output preview on the
+                    // projection when the event carries one.
+                    *rec = rec
+                        .mark_finished_with_output(
+                            e.outcome,
+                            None,
+                            e.finished_at_ms,
+                            e.output_preview.clone(),
+                        )
+                        .expect(
+                            "tool invocation completed event should preserve valid terminal transition",
+                        );
                 }
             }
             RuntimeEvent::ToolInvocationFailed(e) => {
                 if let Some(rec) = state.tool_invocations.get_mut(e.invocation_id.as_str()) {
                     *rec = rec
-                        .mark_finished(e.outcome, e.error_message.clone(), e.finished_at_ms)
+                        .mark_finished_with_output(
+                            e.outcome,
+                            e.error_message.clone(),
+                            e.finished_at_ms,
+                            e.output_preview.clone(),
+                        )
                         .expect("tool invocation failed event should preserve valid terminal transition");
                 }
+            }
+            // F52: project cache-hit events into the in-memory read model.
+            // Mirrors pg + sqlite; idempotent on re-apply (first event per
+            // invocation_id wins, later replays are silently absorbed).
+            RuntimeEvent::ToolInvocationCacheHit(e) => {
+                state
+                    .tool_invocation_cache_hits
+                    .entry(e.invocation_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::ToolInvocationCacheHitRecord {
+                        invocation_id: e.invocation_id.clone(),
+                        project: e.project.clone(),
+                        run_id: e.run_id.clone(),
+                        task_id: e.task_id.clone(),
+                        tool_name: e.tool_name.clone(),
+                        tool_call_id: e.tool_call_id.clone(),
+                        original_completed_at_ms: e.original_completed_at_ms,
+                        served_at_ms: e.served_at_ms,
+                    });
             }
             RuntimeEvent::SignalIngested(e) => {
                 state.signals.insert(
@@ -572,19 +1035,41 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::ExternalWorkerRegistered(e) => {
-                state.external_workers.insert(
-                    e.worker_id.as_str().to_owned(),
-                    cairn_domain::workers::ExternalWorkerRecord {
-                        worker_id: e.worker_id.clone(),
-                        tenant_id: e.tenant_id.clone(),
-                        display_name: e.display_name.clone(),
-                        status: "active".to_owned(),
-                        registered_at: e.registered_at,
-                        updated_at: now,
-                        health: cairn_domain::workers::WorkerHealth::default(),
-                        current_task_id: None,
-                    },
-                );
+                // PR #729 — cross-tenant takeover defence. Mirrors the
+                // pg/sqlite `ON CONFLICT (worker_id) DO UPDATE …
+                // WHERE external_workers.tenant_id = EXCLUDED.tenant_id`
+                // semantic: a colliding `worker_id` submitted from a
+                // *different* tenant is a no-op (NOT a tenant rewrite).
+                // A SAME-tenant re-register is treated as a fresh
+                // registration — full reset of status / health /
+                // current_task_id back to zero values, matching the
+                // pg/sqlite contract pinned by
+                // `external_worker_re_registration_resets_health_across_backends`
+                // in projection_parity.rs. Critical because RFC-025
+                // Phase 4 keeps InMemoryStore as the production read
+                // path — missing this gate here lets the takeover
+                // succeed even with the durable backends fixed.
+                let key = e.worker_id.as_str().to_owned();
+                let cross_tenant_collision = state
+                    .external_workers
+                    .get(&key)
+                    .map(|rec| rec.tenant_id != e.tenant_id)
+                    .unwrap_or(false);
+                if !cross_tenant_collision {
+                    state.external_workers.insert(
+                        key,
+                        cairn_domain::workers::ExternalWorkerRecord {
+                            worker_id: e.worker_id.clone(),
+                            tenant_id: e.tenant_id.clone(),
+                            display_name: e.display_name.clone(),
+                            status: "active".to_owned(),
+                            registered_at: e.registered_at,
+                            updated_at: now,
+                            health: cairn_domain::workers::WorkerHealth::default(),
+                            current_task_id: None,
+                        },
+                    );
+                }
             }
             RuntimeEvent::ExternalWorkerSuspended(e) => {
                 if let Some(rec) = state.external_workers.get_mut(e.worker_id.as_str()) {
@@ -611,7 +1096,44 @@ impl InMemoryStore {
                     rec.updated_at = now;
                 }
             }
-            RuntimeEvent::SoulPatchProposed(_) | RuntimeEvent::SoulPatchApplied(_) => {}
+            // RFC-025 Phase 2b.2b m5: soul_patches projection. Proposed
+            // inserts a proposed-state row (first-write-wins on replay);
+            // Applied upgrades the state + applied_at + new_version
+            // in-place. An out-of-order Applied-before-Proposed
+            // synthesises a minimal row in 'applied' state.
+            RuntimeEvent::SoulPatchProposed(e) => {
+                state
+                    .soul_patches
+                    .entry(e.patch_id.clone())
+                    .or_insert_with(|| crate::projections::SoulPatchRecord {
+                        patch_id: e.patch_id.clone(),
+                        project: e.project.clone(),
+                        state: crate::projections::SoulPatchState::Proposed,
+                        patch_content: e.patch_content.clone(),
+                        requires_approval: e.requires_approval,
+                        proposed_at_ms: e.proposed_at,
+                        applied_at_ms: None,
+                        new_version: None,
+                    });
+            }
+            RuntimeEvent::SoulPatchApplied(e) => {
+                let rec = state
+                    .soul_patches
+                    .entry(e.patch_id.clone())
+                    .or_insert_with(|| crate::projections::SoulPatchRecord {
+                        patch_id: e.patch_id.clone(),
+                        project: e.project.clone(),
+                        state: crate::projections::SoulPatchState::Applied,
+                        patch_content: String::new(),
+                        requires_approval: false,
+                        proposed_at_ms: 0,
+                        applied_at_ms: Some(e.applied_at),
+                        new_version: Some(e.new_version),
+                    });
+                rec.state = crate::projections::SoulPatchState::Applied;
+                rec.applied_at_ms = Some(e.applied_at);
+                rec.new_version = Some(e.new_version);
+            }
             RuntimeEvent::SpendAlertTriggered(_) => {}
             RuntimeEvent::RunCostUpdated(e) => {
                 // Accumulate run cost from directly appended RunCostUpdated events.
@@ -689,19 +1211,29 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::ChannelMessageSent(e) => {
-                state
-                    .channel_messages
-                    .entry(e.channel_id.as_str().to_owned())
-                    .or_default()
-                    .push(cairn_domain::ChannelMessage {
-                        channel_id: e.channel_id.clone(),
-                        message_id: e.message_id.clone(),
-                        sender_id: e.sender_id.clone(),
-                        body: e.body.clone(),
-                        sent_at_ms: e.sent_at_ms,
-                        consumed_by: None,
-                        consumed_at_ms: None,
-                    });
+                // RFC-025 Phase 2b.3 m3: first-write-wins on
+                // `(channel_id, message_id)` so replayed events are
+                // a no-op — matches the pg/sqlite ON CONFLICT DO NOTHING
+                // on the composite PK. Uses the `channel_message_keys`
+                // sidecar HashSet for O(1) dedupe (vs. O(n) Vec scan
+                // that would make ingesting N messages O(N^2) —
+                // Copilot PR #594 perf fix).
+                let key = (e.channel_id.as_str().to_owned(), e.message_id.clone());
+                if state.channel_message_keys.insert(key) {
+                    state
+                        .channel_messages
+                        .entry(e.channel_id.as_str().to_owned())
+                        .or_default()
+                        .push(cairn_domain::ChannelMessage {
+                            channel_id: e.channel_id.clone(),
+                            message_id: e.message_id.clone(),
+                            sender_id: e.sender_id.clone(),
+                            body: e.body.clone(),
+                            sent_at_ms: e.sent_at_ms,
+                            consumed_by: None,
+                            consumed_at_ms: None,
+                        });
+                }
             }
             RuntimeEvent::ChannelMessageConsumed(e) => {
                 if let Some(messages) = state.channel_messages.get_mut(e.channel_id.as_str()) {
@@ -712,7 +1244,17 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::DefaultSettingSet(e) => {
-                let composite_key = format!("{:?}:{}:{}", e.scope, e.scope_id, e.key);
+                // RFC-025 Phase 2b.3 m2: composite key uses the shared
+                // snake_case scope encoding (matches pg/sqlite
+                // `default_settings.scope` column) so doc-comment parity
+                // claims in `projections/defaults.rs` are literally
+                // true. Copilot PR #594 review.
+                let composite_key = format!(
+                    "{}:{}:{}",
+                    crate::projections::defaults_scope_str(e.scope),
+                    e.scope_id,
+                    e.key
+                );
                 state.default_settings.insert(
                     composite_key,
                     cairn_domain::DefaultSetting {
@@ -723,7 +1265,12 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::DefaultSettingCleared(e) => {
-                let composite_key = format!("{:?}:{}:{}", e.scope, e.scope_id, e.key);
+                let composite_key = format!(
+                    "{}:{}:{}",
+                    crate::projections::defaults_scope_str(e.scope),
+                    e.scope_id,
+                    e.key
+                );
                 state.default_settings.remove(&composite_key);
             }
             RuntimeEvent::LicenseActivated(e) => {
@@ -770,20 +1317,30 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::NotificationSent(e) => {
-                state.notification_records.push(
-                    cairn_domain::notification_prefs::NotificationRecord {
-                        record_id: e.record_id.clone(),
-                        tenant_id: e.tenant_id.clone(),
-                        operator_id: e.operator_id.clone(),
-                        event_type: e.event_type.clone(),
-                        channel_kind: e.channel_kind.clone(),
-                        channel_target: e.channel_target.clone(),
-                        payload: e.payload.clone(),
-                        sent_at_ms: e.sent_at_ms,
-                        delivered: e.delivered,
-                        delivery_error: e.delivery_error.clone(),
-                    },
-                );
+                // RFC-025 Phase 2b.3 m4: first-write-wins on `record_id`
+                // so replayed events are a no-op — matches pg/sqlite
+                // ON CONFLICT (record_id) DO NOTHING. Uses the
+                // `notification_record_ids` sidecar HashSet for O(1)
+                // dedupe (vs. O(n) Vec scan). Copilot PR #594 perf fix.
+                if state
+                    .notification_record_ids
+                    .insert(e.record_id.clone())
+                {
+                    state.notification_records.push(
+                        cairn_domain::notification_prefs::NotificationRecord {
+                            record_id: e.record_id.clone(),
+                            tenant_id: e.tenant_id.clone(),
+                            operator_id: e.operator_id.clone(),
+                            event_type: e.event_type.clone(),
+                            channel_kind: e.channel_kind.clone(),
+                            channel_target: e.channel_target.clone(),
+                            payload: e.payload.clone(),
+                            sent_at_ms: e.sent_at_ms,
+                            delivered: e.delivered,
+                            delivery_error: e.delivery_error.clone(),
+                        },
+                    );
+                }
             }
             RuntimeEvent::ProviderPoolCreated(e) => {
                 state.provider_pools.insert(
@@ -825,14 +1382,22 @@ impl InMemoryStore {
                 );
             }
             RuntimeEvent::ProviderBudgetSet(e) => {
-                let key = format!("{}:{:?}", e.tenant_id.as_str(), e.period);
+                // RFC-025 Phase 2a.1 milestone 3: key by `budget_id` so
+                // subsequent Alert/Exceeded events (which reference
+                // `budget_id`, not `tenant_id:period`) can update the
+                // matching row. Prior code keyed on `tenant_id:period`,
+                // silently orphaning Alert/Exceeded updates; the pg +
+                // sqlite projection tables own budget_id as primary key,
+                // so this brings the in-memory side into parity.
                 state.provider_budgets.insert(
-                    key,
+                    e.budget_id.clone(),
                     cairn_domain::providers::ProviderBudget {
                         tenant_id: e.tenant_id.clone(),
                         period: e.period,
                         limit_micros: e.limit_micros,
-                        alert_threshold_percent: e.alert_threshold_percent.unwrap_or(80),
+                        alert_threshold_percent: e
+                            .alert_threshold_percent
+                            .unwrap_or(cairn_domain::providers::DEFAULT_BUDGET_ALERT_THRESHOLD_PERCENT),
                         current_spend_micros: 0,
                         created_at: now,
                         updated_at: now,
@@ -853,24 +1418,64 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::CredentialStored(e) => {
-                state.credentials.insert(
-                    e.credential_id.as_str().to_owned(),
-                    cairn_domain::credentials::CredentialRecord {
-                        id: e.credential_id.clone(),
-                        tenant_id: e.tenant_id.clone(),
-                        name: e.provider_id.clone(),
-                        credential_type: "api_key".to_owned(),
-                        encrypted_value: e.encrypted_value.clone(),
-                        created_at: e.encrypted_at_ms,
-                        updated_at: e.encrypted_at_ms,
-                        active: true,
-                        provider_id: e.provider_id.clone(),
-                        encrypted_at_ms: Some(e.encrypted_at_ms),
-                        key_id: e.key_id.clone(),
-                        key_version: e.key_version.clone(),
-                        revoked_at_ms: None,
-                    },
-                );
+                // RFC-025 Phase 2a.1 milestone 1 (Copilot review PR #565):
+                // preserve `active` + `revoked_at_ms` + `created_at` on
+                // re-store so a `Stored → Revoked → Stored` sequence ends
+                // in the revoked state on all three backends. Previously
+                // the in-memory applier reset to `active: true,
+                // revoked_at_ms: None` on every re-store, diverging from
+                // pg/sqlite (which preserve the revoke via ON CONFLICT DO
+                // UPDATE that excludes active/revoked columns).
+                //
+                // Operators who want to un-revoke must issue the
+                // dedicated reactivation flow; a duplicate `Stored` event
+                // is a no-op on revocation state.
+                let key = e.credential_id.as_str().to_owned();
+                match state.credentials.get_mut(&key) {
+                    Some(existing) => {
+                        existing.name = e.provider_id.clone();
+                        existing.provider_id = e.provider_id.clone();
+                        // Wrap in `RedactedCiphertext` so the
+                        // projection heap copy is scrubbed on drop
+                        // (#579) and redacts in Debug output. The
+                        // previous value in `existing.encrypted_value`
+                        // is dropped by the assignment, which triggers
+                        // its own `ZeroizeOnDrop` and scrubs the
+                        // superseded ciphertext.
+                        existing.encrypted_value = cairn_domain::credentials::RedactedCiphertext::from(
+                            e.encrypted_value.clone(),
+                        );
+                        existing.encrypted_at_ms = Some(e.encrypted_at_ms);
+                        existing.key_id = e.key_id.clone();
+                        existing.key_version = e.key_version.clone();
+                        existing.updated_at = e.encrypted_at_ms;
+                        // `created_at`, `active`, `revoked_at_ms`
+                        // intentionally untouched — parity with pg/sqlite
+                        // ON CONFLICT DO UPDATE.
+                    }
+                    None => {
+                        state.credentials.insert(
+                            key,
+                            cairn_domain::credentials::CredentialRecord {
+                                id: e.credential_id.clone(),
+                                tenant_id: e.tenant_id.clone(),
+                                name: e.provider_id.clone(),
+                                credential_type: "api_key".to_owned(),
+                                encrypted_value: cairn_domain::credentials::RedactedCiphertext::from(
+                                    e.encrypted_value.clone(),
+                                ),
+                                created_at: e.encrypted_at_ms,
+                                updated_at: e.encrypted_at_ms,
+                                active: true,
+                                provider_id: e.provider_id.clone(),
+                                encrypted_at_ms: Some(e.encrypted_at_ms),
+                                key_id: e.key_id.clone(),
+                                key_version: e.key_version.clone(),
+                                revoked_at_ms: None,
+                            },
+                        );
+                    }
+                }
             }
             RuntimeEvent::CredentialRevoked(e) => {
                 if let Some(rec) = state.credentials.get_mut(e.credential_id.as_str()) {
@@ -905,6 +1510,12 @@ impl InMemoryStore {
                         enabled: true,
                     },
                 );
+                // RFC-025 Phase 2a.2 m2: mirror the tenant association
+                // the pg/sqlite row carries so `list_policies` scopes
+                // correctly across backends.
+                state
+                    .guardrail_policy_tenants
+                    .insert(e.policy_id.clone(), e.tenant_id.clone());
             }
             RuntimeEvent::OperatorProfileCreated(e) => {
                 state.operator_profiles.insert(
@@ -941,6 +1552,16 @@ impl InMemoryStore {
                     if let Some(email) = &e.email {
                         rec.email = Some(email.clone());
                     }
+                    // RFC 026 PR-A2: role edit. Same serialization as
+                    // `OperatorProfileCreated` — serde_json::to_string
+                    // yields a quoted variant name; strip the quotes so
+                    // the stored value matches `role TEXT NOT NULL`.
+                    if let Some(role) = &e.role {
+                        rec.role = serde_json::to_string(role)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                            .to_owned();
+                    }
                 }
                 if let Some(profile) = state.full_operator_profiles.get_mut(e.profile_id.as_str()) {
                     if let Some(dn) = &e.display_name {
@@ -949,6 +1570,45 @@ impl InMemoryStore {
                     if let Some(email) = &e.email {
                         profile.email = email.clone();
                     }
+                    if let Some(role) = &e.role {
+                        profile.role = *role;
+                    }
+                }
+            }
+            // RFC 026 PR-A0: operator_tenant_roles projection. Upsert on
+            // grant — a re-grant over a revoked row clears the revocation
+            // fields so the row reads as active again. The pg/sqlite
+            // appliers (V066) mirror this ON CONFLICT semantics.
+            RuntimeEvent::TenantRoleGranted(e) => {
+                let key = (
+                    e.tenant_id.as_str().to_owned(),
+                    e.operator_id.as_str().to_owned(),
+                );
+                state.operator_tenant_roles.insert(
+                    key,
+                    crate::projections::OperatorTenantRoleRecord {
+                        tenant_id: e.tenant_id.clone(),
+                        operator_id: e.operator_id.clone(),
+                        role: e.role,
+                        granted_at_ms: e.at_ms,
+                        granted_by: e.granted_by.clone(),
+                        revoked_at_ms: None,
+                        revoked_by: None,
+                    },
+                );
+            }
+            // RFC 026 PR-A0: soft-revoke. The row is NOT deleted — the
+            // audit trail survives, and a subsequent `TenantRoleGranted`
+            // upserts a fresh grant. Revoking a non-existent row is a
+            // no-op (replay-safe across reorders).
+            RuntimeEvent::TenantRoleRevoked(e) => {
+                let key = (
+                    e.tenant_id.as_str().to_owned(),
+                    e.operator_id.as_str().to_owned(),
+                );
+                if let Some(rec) = state.operator_tenant_roles.get_mut(&key) {
+                    rec.revoked_at_ms = Some(e.at_ms);
+                    rec.revoked_by = Some(e.revoked_by.clone());
                 }
             }
             RuntimeEvent::ProviderConnectionRegistered(e) => {
@@ -964,6 +1624,13 @@ impl InMemoryStore {
                         created_at: e.registered_at,
                     },
                 );
+            }
+            RuntimeEvent::ProviderConnectionDeleted(e) => {
+                // Hard-remove so the ID can be re-created. History stays in
+                // the event log for audit. F40.
+                state
+                    .provider_connections
+                    .remove(e.provider_connection_id.as_str());
             }
             RuntimeEvent::ProviderHealthChecked(e) => {
                 let healthy = matches!(
@@ -1170,16 +1837,146 @@ impl InMemoryStore {
                     },
                 );
             }
-            RuntimeEvent::TenantQuotaViolated(_)
-            | RuntimeEvent::ApprovalDelegated(_)
-            | RuntimeEvent::AuditLogEntryRecorded(_)
-            | RuntimeEvent::EventLogCompacted(_)
-            | RuntimeEvent::GuardrailPolicyEvaluated(_)
+            RuntimeEvent::TenantQuotaViolated(e) => {
+                // RFC-025 Phase 2a.1 milestone 2: projection parity with
+                // pg/sqlite `tenant_quota_violations` table.
+                //
+                // The pg + sqlite tables enforce uniqueness on
+                // (tenant_id, quota_type, occurred_at_ms) via a PRIMARY
+                // KEY + `ON CONFLICT DO NOTHING`. Mirror that here so a
+                // replayed or duplicated event does not accumulate
+                // phantom rows on the in-memory side — Copilot PR #565
+                // flagged this as a cross-backend drift risk.
+                let already_recorded = state.quota_violations.iter().any(|record| {
+                    record.tenant_id == e.tenant_id
+                        && record.quota_type == e.quota_type
+                        && record.occurred_at_ms == e.occurred_at_ms
+                });
+                if !already_recorded {
+                    state
+                        .quota_violations
+                        .push(crate::projections::QuotaViolationRecord {
+                            tenant_id: e.tenant_id.clone(),
+                            quota_type: e.quota_type.clone(),
+                            current: e.current,
+                            limit: e.limit,
+                            occurred_at_ms: e.occurred_at_ms,
+                        });
+                }
+            }
+            // RFC-025 Phase 2a.2 milestone 1: append the audit row for
+            // each delegation. Composite key `(approval_id, delegation_id)`
+            // mirrors the pg/sqlite PRIMARY KEY — a replayed event is a
+            // no-op here too. `delegation_id` is minted monotonically per
+            // emit by the runtime service so two rapid delegations of
+            // the same approval to the same operator in the same
+            // millisecond both persist as distinct rows (Copilot #571
+            // round 4).
+            //
+            // Copilot #571 round 3: the O(n) `.iter().any(...)` dedupe
+            // was O(n²) across a replay. The Vec is kept in read-order
+            // (approval_id ASC, delegated_at_ms ASC, delegation_id ASC)
+            // matching the pg/sqlite `ORDER BY` — a binary-search probe
+            // on the same tuple gives O(log n) membership. Dedupe is
+            // on the PK `(approval_id, delegation_id)`; the sort key
+            // adds `delegated_at_ms` as the secondary discriminator so
+            // reads walk the vec in time-order without a re-sort.
+            RuntimeEvent::ApprovalDelegated(e) => {
+                let sort_probe = |record: &crate::projections::ApprovalDelegationRecord| {
+                    record
+                        .approval_id
+                        .cmp(&e.approval_id)
+                        .then_with(|| record.delegated_at_ms.cmp(&e.delegated_at_ms))
+                        .then_with(|| record.delegation_id.cmp(&e.delegation_id))
+                };
+                if let Err(idx) = state.approval_delegations.binary_search_by(sort_probe) {
+                    state.approval_delegations.insert(
+                        idx,
+                        crate::projections::ApprovalDelegationRecord {
+                            approval_id: e.approval_id.clone(),
+                            delegated_to: e.delegated_to.clone(),
+                            delegated_at_ms: e.delegated_at_ms,
+                            delegation_id: e.delegation_id.clone(),
+                        },
+                    );
+                }
+            }
+            // RFC-025 Phase 2a.2 milestone 2: audit trail for guardrail
+            // evaluations. Composite-key check mirrors pg/sqlite
+            // `PRIMARY KEY (tenant_id, policy_id, subject_type,
+            // subject_id, action, evaluated_at_ms)` + `ON CONFLICT DO
+            // NOTHING`. `tenant_id` leads so shared runtime-emitted
+            // `policy_id`s (e.g. "implicit_allow") cannot silently
+            // collapse evaluations across tenants.
+            //
+            // Copilot #571 round 3: O(1) dedupe via a sidecar HashSet on
+            // the composite PK. The Vec stays authoritative so the
+            // read-model re-sorts at query time to match pg/sqlite
+            // `ORDER BY evaluated_at_ms DESC`. `subject_id` collapses
+            // Option<String> → String via unwrap_or_default so the key
+            // matches the pg empty-string sentinel on the PK.
+            RuntimeEvent::GuardrailPolicyEvaluated(e) => {
+                use cairn_domain::policy::GuardrailSubjectType as T;
+                let subject_type_str = match e.subject_type {
+                    T::Run => "run",
+                    T::Task => "task",
+                    T::Session => "session",
+                    T::Tool => "tool",
+                    T::Provider => "provider",
+                };
+                let key = (
+                    e.tenant_id.as_str().to_owned(),
+                    e.policy_id.clone(),
+                    subject_type_str.to_owned(),
+                    e.subject_id.clone().unwrap_or_default(),
+                    e.action.clone(),
+                    e.evaluated_at_ms,
+                );
+                if state.guardrail_evaluation_keys.insert(key) {
+                    state
+                        .guardrail_evaluations
+                        .push(crate::projections::GuardrailEvaluationRecord {
+                            policy_id: e.policy_id.clone(),
+                            tenant_id: e.tenant_id.clone(),
+                            subject_type: e.subject_type,
+                            subject_id: e.subject_id.clone(),
+                            action: e.action.clone(),
+                            decision: e.decision,
+                            reason: e.reason.clone(),
+                            evaluated_at_ms: e.evaluated_at_ms,
+                        });
+                }
+            }
+            RuntimeEvent::EventLogCompacted(_)
             | RuntimeEvent::OperatorIntervention(_)
             | RuntimeEvent::PauseScheduled(_)
             | RuntimeEvent::PermissionDecisionRecorded(_)
             | RuntimeEvent::ProviderModelRegistered(_)
             | RuntimeEvent::ProviderRetryPolicySet(_) => {}
+            // RFC-025 Phase 2b.1: audit projection. Idempotent on
+            // replay (entry_id is globally unique — a duplicate delivery
+            // keeps the first insert). Metadata defaults to `{}` because
+            // `AuditLogEntryRecorded` does not carry it on the wire (the
+            // event was kept Eq-able at RFC 002 time). The
+            // `or_insert_with_key` form re-uses the HashMap key as the
+            // record's `entry_id` field so we don't clone the string
+            // twice (Gemini PR #573 review).
+            RuntimeEvent::AuditLogEntryRecorded(e) => {
+                state
+                    .audit_log_entries
+                    .entry(e.entry_id.clone())
+                    .or_insert_with_key(|entry_id| crate::projections::AuditLogEntryRecord {
+                        entry_id: entry_id.clone(),
+                        tenant_id: e.tenant_id.clone(),
+                        actor_id: e.actor_id.clone(),
+                        action: e.action.clone(),
+                        resource_type: e.resource_type.clone(),
+                        resource_id: e.resource_id.clone(),
+                        outcome: e.outcome,
+                        metadata: serde_json::json!({}),
+                        occurred_at_ms: e.occurred_at_ms,
+                    });
+            }
             RuntimeEvent::ResourceShared(e) => {
                 state.resource_shares.insert(
                     e.share_id.clone(),
@@ -1235,15 +2032,64 @@ impl InMemoryStore {
             RuntimeEvent::TaskDependencyAdded(_)
             | RuntimeEvent::TaskDependencyResolved(_)
             | RuntimeEvent::TaskLeaseExpired(_)
-            | RuntimeEvent::TaskPriorityChanged(_)
-            | RuntimeEvent::ToolInvocationProgressUpdated(_) => {}
+            | RuntimeEvent::TaskPriorityChanged(_) => {}
+            // #364: project the LATEST progress update per invocation so
+            // the `get_tool_invocation_progress_handler` can answer
+            // tenant-scoped reads without walking the event log. We
+            // inherit the `ProjectKey` from the existing
+            // `tool_invocations` row rather than carrying it on the
+            // event, so the projection is only created when the
+            // invocation itself has been started. Progress events that
+            // arrive before the `ToolInvocationStarted` (should not
+            // happen in practice, but we refuse to silently fabricate a
+            // project) are a no-op.
+            //
+            // Out-of-order replay guard: an older event must not
+            // overwrite a newer one. Mirrors the
+            // `WHERE EXCLUDED.updated_at_ms >= …` clause on the pg/sqlite
+            // UPSERTs so every backend converges on the same row after
+            // replay. Flagged on PR #537 by Gemini / Copilot / Cursor.
+            RuntimeEvent::ToolInvocationProgressUpdated(e) => {
+                if let Some(inv) = state.tool_invocations.get(e.invocation_id.as_str()) {
+                    let should_write = state
+                        .tool_invocation_progress
+                        .get(e.invocation_id.as_str())
+                        .is_none_or(|existing| e.updated_at_ms >= existing.updated_at_ms);
+                    if should_write {
+                        state.tool_invocation_progress.insert(
+                            e.invocation_id.as_str().to_owned(),
+                            crate::projections::ToolInvocationProgressRecord {
+                                invocation_id: e.invocation_id.clone(),
+                                project: inv.project.clone(),
+                                progress_pct: e.progress_pct,
+                                message: e.message.clone(),
+                                updated_at_ms: e.updated_at_ms,
+                            },
+                        );
+                    }
+                }
+            }
             RuntimeEvent::SessionCostUpdated(e) => {
+                // The envelope carries a top-level `tenant_id` AND a
+                // `project.tenant_id` — two redundant fields that can
+                // drift. Some fixtures (see
+                // `crates/cairn-runtime/src/services/budget_impl.rs`'s
+                // budget-blocking test) intentionally leave `project`
+                // as a sentinel triple when only tenant-scoped effects
+                // matter. We bind one `tenant` local from the explicit
+                // field and use it for both the per-session record and
+                // the provider-budget loop so the redundant source
+                // divergence cannot make `session_costs` and
+                // `provider_budgets` disagree with each other. The
+                // project/workspace rollups still key off `e.project.*`
+                // for the workspace_id / project_id sub-keys.
+                let tenant = e.tenant_id.clone();
                 let rec = state
                     .session_costs
                     .entry(e.session_id.as_str().to_owned())
                     .or_insert_with(|| cairn_domain::providers::SessionCostRecord {
                         session_id: e.session_id.clone(),
-                        tenant_id: e.tenant_id.clone(),
+                        tenant_id: tenant.clone(),
                         total_cost_micros: 0,
                         total_tokens_in: 0,
                         total_tokens_out: 0,
@@ -1261,49 +2107,500 @@ impl InMemoryStore {
                 rec.updated_at_ms = now;
                 // Also accumulate into provider budget spend for the tenant.
                 for budget in state.provider_budgets.values_mut() {
-                    if budget.tenant_id == e.tenant_id {
+                    if budget.tenant_id == tenant {
                         budget.current_spend_micros = budget
                             .current_spend_micros
                             .saturating_add(e.delta_cost_micros);
                         budget.updated_at = now;
                     }
                 }
+                // F29 CD-2: fold the same delta into the project + workspace
+                // rollups so ProjectCostReadModel stays consistent with
+                // SessionCostReadModel without a separate aggregator.
+                let proj_key = (
+                    tenant.as_str().to_owned(),
+                    e.project.workspace_id.as_str().to_owned(),
+                    e.project.project_id.as_str().to_owned(),
+                );
+                let proj = state.project_costs.entry(proj_key).or_insert_with(|| {
+                    cairn_domain::providers::ProjectCostRecord {
+                        tenant_id: tenant.clone(),
+                        workspace_id: e.project.workspace_id.as_str().to_owned(),
+                        project_id: e.project.project_id.as_str().to_owned(),
+                        total_cost_micros: 0,
+                        total_tokens_in: 0,
+                        total_tokens_out: 0,
+                        provider_calls: 0,
+                        updated_at_ms: now,
+                    }
+                });
+                proj.total_cost_micros =
+                    proj.total_cost_micros.saturating_add(e.delta_cost_micros);
+                proj.total_tokens_in =
+                    proj.total_tokens_in.saturating_add(e.delta_tokens_in);
+                proj.total_tokens_out =
+                    proj.total_tokens_out.saturating_add(e.delta_tokens_out);
+                proj.provider_calls = proj.provider_calls.saturating_add(1);
+                proj.updated_at_ms = now;
+
+                let ws_key = (
+                    tenant.as_str().to_owned(),
+                    e.project.workspace_id.as_str().to_owned(),
+                );
+                let ws = state.workspace_costs.entry(ws_key).or_insert_with(|| {
+                    cairn_domain::providers::WorkspaceCostRecord {
+                        tenant_id: tenant.clone(),
+                        workspace_id: e.project.workspace_id.as_str().to_owned(),
+                        total_cost_micros: 0,
+                        total_tokens_in: 0,
+                        total_tokens_out: 0,
+                        provider_calls: 0,
+                        updated_at_ms: now,
+                    }
+                });
+                ws.total_cost_micros =
+                    ws.total_cost_micros.saturating_add(e.delta_cost_micros);
+                ws.total_tokens_in = ws.total_tokens_in.saturating_add(e.delta_tokens_in);
+                ws.total_tokens_out = ws.total_tokens_out.saturating_add(e.delta_tokens_out);
+                ws.provider_calls = ws.provider_calls.saturating_add(1);
+                ws.updated_at_ms = now;
             }
-            // RFC 005: link child task to parent run/task on subagent spawn.
+            // RFC 005 + RFC-025 Phase 2b.2b m3: link child task to
+            // parent run/task and record the spawn audit row.
             RuntimeEvent::SubagentSpawned(e) => {
                 if let Some(rec) = state.tasks.get_mut(e.child_task_id.as_str()) {
                     rec.parent_run_id = Some(e.parent_run_id.clone());
                     rec.parent_task_id = e.parent_task_id.clone();
                     rec.updated_at = now;
                 }
+                // Idempotent on replay via `or_insert_with` — the first
+                // delivery wins, a replayed event leaves the row
+                // untouched (mirrors ON CONFLICT DO NOTHING on pg/sqlite).
+                state
+                    .subagent_spawns
+                    .entry(e.child_task_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::SubagentSpawnRecord {
+                        child_task_id: e.child_task_id.clone(),
+                        project: e.project.clone(),
+                        parent_run_id: e.parent_run_id.clone(),
+                        parent_task_id: e.parent_task_id.clone(),
+                        child_session_id: e.child_session_id.clone(),
+                        child_run_id: e.child_run_id.clone(),
+                        spawned_at_ms: now,
+                        // #670 G2: carry the LLM delegation context
+                        // from the event verbatim. Pre-G2 events
+                        // deserialise with empty strings via
+                        // `#[serde(default)]`.
+                        goal: e.goal.clone(),
+                        role: e.role.clone(),
+                    });
             }
             // Audit/linkage events that don't update core projections.
             RuntimeEvent::CheckpointRestored(_)
             | RuntimeEvent::RecoveryAttempted(_)
             | RuntimeEvent::RecoveryCompleted(_)
-            | RuntimeEvent::UserMessageAppended(_)
-            | RuntimeEvent::TriggerCreated(_)
-            | RuntimeEvent::TriggerEnabled(_)
-            | RuntimeEvent::TriggerDisabled(_)
-            | RuntimeEvent::TriggerSuspended(_)
-            | RuntimeEvent::TriggerResumed(_)
-            | RuntimeEvent::TriggerDeleted(_)
-            | RuntimeEvent::TriggerFired(_)
-            | RuntimeEvent::TriggerSkipped(_)
-            | RuntimeEvent::TriggerDenied(_)
-            | RuntimeEvent::TriggerRateLimited(_)
-            | RuntimeEvent::TriggerPendingApproval(_)
-            | RuntimeEvent::RunTemplateCreated(_)
-            | RuntimeEvent::RunTemplateDeleted(_)
-            | RuntimeEvent::PlanProposed(_)
-            | RuntimeEvent::PlanApproved(_)
-            | RuntimeEvent::PlanRejected(_)
-            | RuntimeEvent::PlanRevisionRequested(_)
-            // RFC 020 Track 3: audit-only events; no in-memory projection update.
-            | RuntimeEvent::ToolInvocationCacheHit(_)
-            | RuntimeEvent::ToolRecoveryPaused(_)
             // RFC 020 Track 4: boot-level recovery audit event.
-            | RuntimeEvent::RecoverySummaryEmitted(_) => {}
+            | RuntimeEvent::RecoverySummaryEmitted(_)
+            => {}
+
+            // RFC-025 Phase 2b.2b m6: tool_recovery_pauses projection
+            // (RFC 020 Track 3). Keyed by tool_call_id; first-write
+            // wins on replay.
+            RuntimeEvent::ToolRecoveryPaused(e) => {
+                state
+                    .tool_recovery_pauses
+                    .entry(e.tool_call_id.clone())
+                    .or_insert_with(|| crate::projections::ToolRecoveryPauseRecord {
+                        tool_call_id: e.tool_call_id.clone(),
+                        project: e.project.clone(),
+                        run_id: e.run_id.clone(),
+                        task_id: e.task_id.clone(),
+                        tool_name: e.tool_name.clone(),
+                        reason: e.reason.clone(),
+                        paused_at_ms: e.paused_at_ms,
+                    });
+            }
+
+            // RFC-025 Phase 2b.2b m4: user_messages projection. Keyed
+            // by `(run_id, sequence)` so a replayed append is
+            // idempotent — mirrors ON CONFLICT DO NOTHING on pg/sqlite.
+            RuntimeEvent::UserMessageAppended(e) => {
+                state
+                    .user_messages
+                    .entry((e.run_id.as_str().to_owned(), e.sequence))
+                    .or_insert_with(|| crate::projections::UserMessageRecord {
+                        run_id: e.run_id.clone(),
+                        sequence: e.sequence,
+                        project: e.project.clone(),
+                        session_id: e.session_id.clone(),
+                        event_id: event.envelope.event_id.as_str().to_owned(),
+                        content: e.content.clone(),
+                        appended_at_ms: e.appended_at_ms,
+                    });
+            }
+
+            // ── RFC-025 Phase 2b.1 m4: plan_reviews projection (RFC 018) ──
+            // Parity with pg/sqlite arms. Creation inserts; resolution
+            // events mutate the state + resolver fields in-place, but
+            // only when the row is still in `Proposed` — mirrors the
+            // `WHERE state = 'proposed'` clause on pg/sqlite so a late
+            // duplicate resolution does not overwrite an earlier one.
+            RuntimeEvent::PlanProposed(e) => {
+                state
+                    .plan_reviews
+                    .entry(e.plan_run_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::PlanReviewRecord {
+                        plan_run_id: e.plan_run_id.clone(),
+                        project: e.project.clone(),
+                        session_id: e.session_id.clone(),
+                        plan_markdown: e.plan_markdown.clone(),
+                        state: crate::projections::PlanReviewState::Proposed,
+                        proposed_at: e.proposed_at,
+                        resolved_by: None,
+                        resolved_at: None,
+                        reviewer_comments: None,
+                        rejection_reason: None,
+                        revision_run_id: None,
+                    });
+            }
+            RuntimeEvent::PlanApproved(e) => {
+                if let Some(rec) = state.plan_reviews.get_mut(e.plan_run_id.as_str()) {
+                    if rec.state == crate::projections::PlanReviewState::Proposed {
+                        rec.state = crate::projections::PlanReviewState::Approved;
+                        rec.resolved_by = Some(e.approved_by.clone());
+                        rec.resolved_at = Some(e.approved_at);
+                        rec.reviewer_comments = e.reviewer_comments.clone();
+                    }
+                }
+            }
+            RuntimeEvent::PlanRejected(e) => {
+                if let Some(rec) = state.plan_reviews.get_mut(e.plan_run_id.as_str()) {
+                    if rec.state == crate::projections::PlanReviewState::Proposed {
+                        rec.state = crate::projections::PlanReviewState::Rejected;
+                        rec.resolved_by = Some(e.rejected_by.clone());
+                        rec.resolved_at = Some(e.rejected_at);
+                        rec.rejection_reason = Some(e.reason.clone());
+                    }
+                }
+            }
+            RuntimeEvent::PlanRevisionRequested(e) => {
+                if let Some(rec) = state
+                    .plan_reviews
+                    .get_mut(e.original_plan_run_id.as_str())
+                {
+                    if rec.state == crate::projections::PlanReviewState::Proposed {
+                        rec.state = crate::projections::PlanReviewState::RevisionRequested;
+                        rec.resolved_at = Some(e.requested_at);
+                        rec.reviewer_comments = Some(e.reviewer_comments.clone());
+                        rec.revision_run_id = Some(e.new_plan_run_id.clone());
+                    }
+                }
+            }
+
+            // ── RFC-025 Phase 1.5a: trigger + run_template + trigger_fires ─────
+            // Parity with pg/sqlite projection arms. Eight state-carrying
+            // lifecycle variants mutate `state.triggers` / `state.run_templates`;
+            // five audit variants append into `state.trigger_fires`.
+            RuntimeEvent::TriggerCreated(e) => {
+                // serde_json::to_string on a Vec<Value> cannot fail in practice;
+                // fall back to an empty JSON array so an impossible serde error
+                // doesn't leave the in-memory row half-written. pg/sqlite use `?`
+                // via their Result-returning applier, so those backends surface
+                // the error. In-memory stays infallible to match the signature
+                // that the rest of apply_projection already depends on.
+                let conditions_json =
+                    serde_json::to_string(&e.conditions).unwrap_or_else(|_| "[]".to_owned());
+                state
+                    .triggers
+                    .entry(e.trigger_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::TriggerRecord {
+                        trigger_id: e.trigger_id.clone(),
+                        project: e.project.clone(),
+                        name: e.name.clone(),
+                        description: e.description.clone(),
+                        signal_type: e.signal_type.clone(),
+                        plugin_id: e.plugin_id.clone(),
+                        conditions_json,
+                        run_template_id: e.run_template_id.clone(),
+                        state: crate::projections::TriggerStateKind::Enabled,
+                        state_reason: None,
+                        suspension_reason: None,
+                        state_since: None,
+                        max_per_minute: e.max_per_minute,
+                        max_burst: e.max_burst,
+                        max_chain_depth: e.max_chain_depth,
+                        created_by: e.created_by.clone(),
+                        created_at: e.created_at,
+                        updated_at: e.created_at,
+                    });
+            }
+            RuntimeEvent::TriggerEnabled(e) => {
+                if let Some(rec) = state.triggers.get_mut(e.trigger_id.as_str()) {
+                    rec.state = crate::projections::TriggerStateKind::Enabled;
+                    rec.state_reason = None;
+                    rec.suspension_reason = None;
+                    rec.state_since = None;
+                    rec.updated_at = e.at;
+                }
+            }
+            RuntimeEvent::TriggerDisabled(e) => {
+                if let Some(rec) = state.triggers.get_mut(e.trigger_id.as_str()) {
+                    rec.state = crate::projections::TriggerStateKind::Disabled;
+                    rec.state_reason = e.reason.clone();
+                    rec.suspension_reason = None;
+                    rec.state_since = Some(e.at);
+                    rec.updated_at = e.at;
+                }
+            }
+            RuntimeEvent::TriggerSuspended(e) => {
+                if let Some(rec) = state.triggers.get_mut(e.trigger_id.as_str()) {
+                    // Use the shared discriminant helper so pg + sqlite
+                    // + in-memory store the exact same short name. The
+                    // `failure_count` payload for RepeatedFailures lives
+                    // on the event log and is not rehydrated into the
+                    // projection; the trigger service's
+                    // rehydrate-from-record path reconstructs a
+                    // zero-count value because in practice the service
+                    // emits a fresh TriggerSuspended event whenever the
+                    // count matters.
+                    rec.state = crate::projections::TriggerStateKind::Suspended;
+                    rec.state_reason = None;
+                    rec.suspension_reason = Some(
+                        crate::projections::trigger::suspension_reason_discriminant(&e.reason)
+                            .to_owned(),
+                    );
+                    rec.state_since = Some(e.at);
+                    rec.updated_at = e.at;
+                }
+            }
+            RuntimeEvent::TriggerResumed(e) => {
+                if let Some(rec) = state.triggers.get_mut(e.trigger_id.as_str()) {
+                    rec.state = crate::projections::TriggerStateKind::Enabled;
+                    rec.state_reason = None;
+                    rec.suspension_reason = None;
+                    rec.state_since = None;
+                    rec.updated_at = e.at;
+                }
+            }
+            RuntimeEvent::TriggerDeleted(e) => {
+                state.triggers.remove(e.trigger_id.as_str());
+            }
+            RuntimeEvent::RunTemplateCreated(e) => {
+                // Same "serde cannot fail in practice" fallback as
+                // TriggerCreated above — infallible here to match the
+                // apply_projection signature.
+                let plugin_allowlist_json = e
+                    .plugin_allowlist
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok());
+                let tool_allowlist_json = e
+                    .tool_allowlist
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok());
+                let required_fields_json =
+                    serde_json::to_string(&e.required_fields).unwrap_or_else(|_| "[]".to_owned());
+                let default_mode_str = serde_json::to_value(&e.default_mode)
+                    .ok()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s,
+                        other => other.to_string().trim_matches('"').to_owned(),
+                    })
+                    .unwrap_or_else(|| "chat".to_owned());
+                state
+                    .run_templates
+                    .entry(e.template_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::RunTemplateRecord {
+                        template_id: e.template_id.clone(),
+                        project: e.project.clone(),
+                        name: e.name.clone(),
+                        description: e.description.clone(),
+                        default_mode: default_mode_str,
+                        system_prompt: e.system_prompt.clone(),
+                        initial_user_message: e.initial_user_message.clone(),
+                        plugin_allowlist_json,
+                        tool_allowlist_json,
+                        budget_max_tokens: e.budget_max_tokens,
+                        budget_max_wall_clock_ms: e.budget_max_wall_clock_ms,
+                        budget_max_iterations: e.budget_max_iterations,
+                        budget_exploration_budget_share: e.budget_exploration_budget_share,
+                        sandbox_hint: e.sandbox_hint.clone(),
+                        required_fields_json,
+                        created_by: e.created_by.clone(),
+                        created_at: e.created_at,
+                        updated_at: e.created_at,
+                    });
+            }
+            RuntimeEvent::RunTemplateDeleted(e) => {
+                state.run_templates.remove(e.template_id.as_str());
+            }
+            RuntimeEvent::TriggerFired(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "run_id": e.run_id.as_str(),
+                    "chain_depth": e.chain_depth,
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::Fired,
+                    signal_type: Some(e.signal_type.clone()),
+                    metadata_json: metadata,
+                    at_ms: e.fired_at,
+                });
+            }
+            RuntimeEvent::TriggerSkipped(e) => {
+                // Shared discriminant helper + optional field metadata
+                // so the in-memory row shape matches pg + sqlite
+                // byte-for-byte. Prior version collapsed the
+                // MissingRequiredField payload into the `reason` string
+                // (e.g. `missing_required_field:issue.number`) which
+                // diverged from the two persistent backends (Copilot
+                // review PR #569).
+                let reason_str =
+                    crate::projections::trigger::skip_reason_discriminant(&e.reason);
+                let field =
+                    if let cairn_domain::events::TriggerSkipReason::MissingRequiredField {
+                        field,
+                    } = &e.reason
+                    {
+                        Some(field.as_str())
+                    } else {
+                        None
+                    };
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "reason": reason_str,
+                    "field": field,
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::Skipped,
+                    signal_type: None,
+                    metadata_json: metadata,
+                    at_ms: e.skipped_at,
+                });
+            }
+            RuntimeEvent::TriggerDenied(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "decision_id": e.decision_id.as_str(),
+                    "reason": e.reason,
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::Denied,
+                    signal_type: None,
+                    metadata_json: metadata,
+                    at_ms: e.denied_at,
+                });
+            }
+            RuntimeEvent::TriggerRateLimited(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "bucket_remaining": e.bucket_remaining,
+                    "bucket_capacity": e.bucket_capacity,
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::RateLimited,
+                    signal_type: None,
+                    metadata_json: metadata,
+                    at_ms: e.rate_limited_at,
+                });
+            }
+            RuntimeEvent::TriggerPendingApproval(e) => {
+                let metadata = serde_json::to_string(&serde_json::json!({
+                    "approval_id": e.approval_id.as_str(),
+                }))
+                .ok();
+                state.trigger_fires.push(crate::projections::TriggerFireRecord {
+                    trigger_id: e.trigger_id.clone(),
+                    project: e.project.clone(),
+                    signal_id: e.signal_id.as_str().to_owned(),
+                    outcome: crate::projections::TriggerFireOutcome::PendingApproval,
+                    signal_type: None,
+                    metadata_json: metadata,
+                    at_ms: e.pending_at,
+                });
+            }
+            // PR BP-2: project tool-call approval events into the
+            // `tool_call_approvals` map.
+            RuntimeEvent::ToolCallProposed(e) => {
+                // Idempotent: mirror the SQL backends' `ON CONFLICT DO
+                // NOTHING` so a replayed ToolCallProposed does NOT reset
+                // an already-amended/approved/rejected record.
+                state
+                    .tool_call_approvals
+                    .entry(e.call_id.as_str().to_owned())
+                    .or_insert_with(|| ToolCallApprovalRecord {
+                        call_id: e.call_id.clone(),
+                        session_id: e.session_id.clone(),
+                        run_id: e.run_id.clone(),
+                        project: e.project.clone(),
+                        tool_name: e.tool_name.clone(),
+                        original_tool_args: e.tool_args.clone(),
+                        amended_tool_args: None,
+                        approved_tool_args: None,
+                        display_summary: if e.display_summary.is_empty() {
+                            None
+                        } else {
+                            Some(e.display_summary.clone())
+                        },
+                        match_policy: e.match_policy.clone(),
+                        state: ToolCallApprovalState::Pending,
+                        operator_id: None,
+                        scope: None,
+                        reason: None,
+                        proposed_at_ms: e.proposed_at_ms,
+                        approved_at_ms: None,
+                        rejected_at_ms: None,
+                        last_amended_at_ms: None,
+                        version: 1,
+                        created_at: now,
+                        updated_at: now,
+                    });
+            }
+            RuntimeEvent::ToolCallAmended(e) => {
+                if let Some(rec) = state.tool_call_approvals.get_mut(e.call_id.as_str()) {
+                    rec.amended_tool_args = Some(e.new_tool_args.clone());
+                    rec.last_amended_at_ms = Some(e.amended_at_ms);
+                    rec.version += 1;
+                    rec.updated_at = now;
+                }
+            }
+            RuntimeEvent::ToolCallApproved(e) => {
+                if let Some(rec) = state.tool_call_approvals.get_mut(e.call_id.as_str()) {
+                    rec.state = ToolCallApprovalState::Approved;
+                    rec.operator_id = Some(e.operator_id.clone());
+                    rec.scope = Some(e.scope.clone());
+                    // Mirror SQL behaviour (binding NULL clears the
+                    // override): assign unconditionally so a replayed
+                    // Approved-with-None cannot leave stale override
+                    // args. Preserves the "Approved-with-None must NOT
+                    // populate approved_tool_args" invariant.
+                    rec.approved_tool_args = e.approved_tool_args.clone();
+                    rec.approved_at_ms = Some(e.approved_at_ms);
+                    rec.version += 1;
+                    rec.updated_at = now;
+                }
+            }
+            RuntimeEvent::ToolCallRejected(e) => {
+                if let Some(rec) = state.tool_call_approvals.get_mut(e.call_id.as_str()) {
+                    rec.state = ToolCallApprovalState::Rejected;
+                    rec.operator_id = Some(e.operator_id.clone());
+                    rec.reason = e.reason.clone();
+                    rec.rejected_at_ms = Some(e.rejected_at_ms);
+                    rec.version += 1;
+                    rec.updated_at = now;
+                }
+            }
             RuntimeEvent::ScheduledTaskCreated(e) => {
                 state.scheduled_tasks.insert(
                     e.scheduled_task_id.as_str().to_owned(),
@@ -1367,6 +2664,9 @@ impl InMemoryStore {
                         cost_micros: e.cost_micros,
                         cost_type: cairn_domain::providers::ProviderCostType::default(),
                         error_class: e.error_class,
+                        started_at_ms: e.started_at,
+                        finished_at_ms: e.finished_at,
+                        raw_error_message: e.raw_error_message.clone(),
                     },
                 );
                 // GAP-010: derive LlmCallTrace from every ProviderCallCompleted.
@@ -1468,6 +2768,54 @@ impl InMemoryStore {
                     rec.token_in = rec.total_tokens_in;
                     rec.token_out = rec.total_tokens_out;
                     rec.updated_at_ms = event.stored_at;
+                    // F29 CD-2: project + workspace rollup. Kept in lock-step
+                    // with `session_costs` so `ProjectCostReadModel` matches
+                    // the sum of `SessionCostReadModel::list_by_tenant` over
+                    // the same (tenant, workspace, project).
+                    let proj_key = (
+                        e.project.tenant_id.as_str().to_owned(),
+                        e.project.workspace_id.as_str().to_owned(),
+                        e.project.project_id.as_str().to_owned(),
+                    );
+                    let proj = state.project_costs.entry(proj_key).or_insert_with(|| {
+                        cairn_domain::providers::ProjectCostRecord {
+                            tenant_id: cairn_domain::TenantId::new(e.project.tenant_id.as_str()),
+                            workspace_id: e.project.workspace_id.as_str().to_owned(),
+                            project_id: e.project.project_id.as_str().to_owned(),
+                            total_cost_micros: 0,
+                            total_tokens_in: 0,
+                            total_tokens_out: 0,
+                            provider_calls: 0,
+                            updated_at_ms: event.stored_at,
+                        }
+                    });
+                    proj.total_cost_micros =
+                        proj.total_cost_micros.saturating_add(delta_cost);
+                    proj.total_tokens_in = proj.total_tokens_in.saturating_add(delta_in);
+                    proj.total_tokens_out = proj.total_tokens_out.saturating_add(delta_out);
+                    proj.provider_calls = proj.provider_calls.saturating_add(1);
+                    proj.updated_at_ms = event.stored_at;
+
+                    let ws_key = (
+                        e.project.tenant_id.as_str().to_owned(),
+                        e.project.workspace_id.as_str().to_owned(),
+                    );
+                    let ws = state.workspace_costs.entry(ws_key).or_insert_with(|| {
+                        cairn_domain::providers::WorkspaceCostRecord {
+                            tenant_id: cairn_domain::TenantId::new(e.project.tenant_id.as_str()),
+                            workspace_id: e.project.workspace_id.as_str().to_owned(),
+                            total_cost_micros: 0,
+                            total_tokens_in: 0,
+                            total_tokens_out: 0,
+                            provider_calls: 0,
+                            updated_at_ms: event.stored_at,
+                        }
+                    });
+                    ws.total_cost_micros = ws.total_cost_micros.saturating_add(delta_cost);
+                    ws.total_tokens_in = ws.total_tokens_in.saturating_add(delta_in);
+                    ws.total_tokens_out = ws.total_tokens_out.saturating_add(delta_out);
+                    ws.provider_calls = ws.provider_calls.saturating_add(1);
+                    ws.updated_at_ms = event.stored_at;
                     // Emit SessionCostUpdated event into the log for traceability.
                     let sc_pos = EventPosition(state.next_position);
                     state.next_position += 1;
@@ -1500,6 +2848,111 @@ impl InMemoryStore {
                     state.events.push(sc_derived);
                 }
             }
+            RuntimeEvent::LlmCompletionRecorded(e) => {
+                // Issue #668: store the LLM round-trip body keyed by
+                // `trace_id`. Replay semantics: re-applying the event
+                // (restart, dual-write, etc.) overwrites the row with
+                // the latest payload — a re-emit carrying different
+                // text for the same trace_id would indicate an
+                // orchestrator bug, so last-write-wins keeps the
+                // projection convergent without silently hiding
+                // double-emit surprises.
+                //
+                // **Memory bound** (Copilot review on #672): bodies can
+                // be hundreds of KiB each; unbounded accumulation in
+                // this always-warm projection would OOM a busy
+                // deployment AND bloat the startup replay that warms
+                // this projection on restart. We cap the map at
+                // `llm_completion_bodies_cap()` entries (default 5000,
+                // env-overridable via `CAIRN_LLM_TRACE_IN_MEMORY_CAP`)
+                // with FIFO eviction of the oldest `recorded_at_ms`.
+                // Durable backends (pg + sqlite) keep the full history;
+                // operators querying pages deeper than the cap get
+                // served from those. In-memory deployments (`--db memory`)
+                // trade long-history body queries for bounded RAM —
+                // acceptable since `--db memory` already announces
+                // "ALL DATA WILL BE LOST on restart".
+                let record = crate::projections::LlmCompletionBodyRecord {
+                    trace_id: e.trace_id.clone(),
+                    project: e.project.clone(),
+                    session_id: e.session_id.clone(),
+                    run_id: e.run_id.clone(),
+                    model_id: e.model_id.clone(),
+                    system_prompt: e.system_prompt.clone(),
+                    messages_json: e.messages_json.clone(),
+                    response_text: e.response_text.clone(),
+                    tool_calls_json: e.tool_calls_json.clone(),
+                    tool_defs_json: e.tool_defs_json.clone(),
+                    recorded_at_ms: e.recorded_at_ms,
+                };
+                let is_replace = state
+                    .llm_completion_bodies
+                    .insert(e.trace_id.clone(), record)
+                    .is_some();
+                let cap = llm_completion_bodies_cap();
+                if !is_replace && state.llm_completion_bodies.len() > cap {
+                    // Find the oldest (smallest `recorded_at_ms`, break
+                    // ties on trace_id for determinism) and drop it.
+                    // O(N) per eviction — acceptable because evictions
+                    // are rare (only when over cap) and N is bounded
+                    // by the cap. A BTreeSet indexed on recorded_at_ms
+                    // would make this O(log N) but doubles the
+                    // per-insert cost on the hot path; not worth the
+                    // complexity until a profile shows it matters.
+                    if let Some(oldest_key) = state
+                        .llm_completion_bodies
+                        .iter()
+                        .min_by(|a, b| {
+                            a.1.recorded_at_ms
+                                .cmp(&b.1.recorded_at_ms)
+                                .then_with(|| a.0.cmp(b.0))
+                        })
+                        .map(|(k, _)| k.clone())
+                    {
+                        state.llm_completion_bodies.remove(&oldest_key);
+                    }
+                }
+            }
+            // #789: per-iteration compacted reasoning step. Pushed
+            // onto the per-run vec; capped at REASONING_STEP_CAP_PER_RUN
+            // via FIFO eviction of the oldest entry.
+            //
+            // #796: dedup on (run_id, iteration). The semantic invariant
+            // is "at most one reasoning step per iteration" — if a
+            // second emit lands for the same iteration (R21 dogfood
+            // surfaced the pattern), replace the existing entry with
+            // the newer payload rather than appending. Last-write-wins
+            // matches `LlmCompletionBodyReadModel`'s convention and
+            // keeps trajectory readers from seeing duplicate `iter=N`
+            // entries that confuse the post-mortem story.
+            RuntimeEvent::RunReasoningStepRecorded(e) => {
+                let record =
+                    crate::projections::reasoning_step::ReasoningStepRecord::from_event(e);
+                let entries = state
+                    .reasoning_steps
+                    .entry(e.run_id.clone())
+                    .or_default();
+                // Search from the tail: appends are chronological, so a
+                // double-emit for the current iteration is the most-recently-
+                // pushed entry. Linear from the front would scan the whole
+                // 200-entry vec on a hot path; rev().find hits in O(1) for
+                // the realistic case (Gemini PR #801).
+                if let Some(existing) =
+                    entries.iter_mut().rev().find(|r| r.iteration == e.iteration)
+                {
+                    *existing = record;
+                } else {
+                    entries.push(record);
+                }
+                if entries.len()
+                    > crate::projections::reasoning_step::REASONING_STEP_CAP_PER_RUN
+                {
+                    // FIFO: drop oldest. The vec is naturally
+                    // chronological (push appends), so remove the
+                    // front.
+                    entries.remove(0);
+                }
+            }
             RuntimeEvent::TenantCreated(e) => {
                 state.tenants.insert(
                     e.tenant_id.as_str().to_owned(),
@@ -1511,6 +2964,18 @@ impl InMemoryStore {
                     },
                 );
             }
+            // RFC 026 PR-A2: tenant PATCH edit. Leave fields untouched
+            // when the event carries `None` (matches pg/sqlite
+            // COALESCE). `updated_at` always advances to the event's
+            // `updated_at_ms` so admin-UI mtimes stay in sync.
+            RuntimeEvent::TenantUpdated(e) => {
+                if let Some(rec) = state.tenants.get_mut(e.tenant_id.as_str()) {
+                    if let Some(name) = &e.name {
+                        rec.name = name.clone();
+                    }
+                    rec.updated_at = e.updated_at_ms;
+                }
+            }
             RuntimeEvent::WorkspaceCreated(e) => {
                 state.workspaces.insert(
                     e.workspace_id.as_str().to_owned(),
@@ -1520,8 +2985,22 @@ impl InMemoryStore {
                         name: e.name.clone(),
                         created_at: e.created_at,
                         updated_at: e.created_at,
+                        archived_at: None,
                     },
                 );
+            }
+            RuntimeEvent::WorkspaceArchived(e) => {
+                // Defense-in-depth: only archive when the event's
+                // `tenant_id` matches the stored record. The service
+                // layer validates ownership before emitting, but a
+                // replay with a mismatched event must not touch
+                // another tenant's workspace.
+                if let Some(ws) = state.workspaces.get_mut(e.workspace_id.as_str()) {
+                    if ws.tenant_id == e.tenant_id {
+                        ws.archived_at = Some(e.archived_at);
+                        ws.updated_at = e.archived_at;
+                    }
+                }
             }
             RuntimeEvent::ProjectCreated(e) => {
                 state.projects.insert(
@@ -1650,9 +3129,19 @@ impl InMemoryStore {
                 }
             }
             RuntimeEvent::EvalRunStarted(e) => {
-                state.eval_runs.insert(
-                    e.eval_run_id.as_str().to_owned(),
-                    crate::projections::EvalRunRecord {
+                // Idempotency / lifecycle-edge pattern (RFC-025 Phase 1
+                // milestone 2): `EvalRunStarted` is emitted both by
+                // `create_eval_run_handler` (initial projection row) and
+                // by `start_eval_run_handler` (Pending → Running edge).
+                // The second emission MUST NOT clobber score/completion
+                // fields that were set between the two edges, so the
+                // projection upserts only fields that are unconditionally
+                // part of the "start" shape. Score / Completed / Archive
+                // events run their own arms.
+                state
+                    .eval_runs
+                    .entry(e.eval_run_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::EvalRunRecord {
                         eval_run_id: e.eval_run_id.clone(),
                         project: e.project.clone(),
                         subject_kind: e.subject_kind.clone(),
@@ -1661,14 +3150,61 @@ impl InMemoryStore {
                         error_message: None,
                         started_at: e.started_at,
                         completed_at: None,
-                    },
-                );
+                        archived_at: None,
+                        metrics: None,
+                        rubric_score: None,
+                        dataset_id: e.dataset_id.clone(),
+                        rubric_id: e.rubric_id.clone(),
+                        baseline_id: e.baseline_id.clone(),
+                        prompt_asset_id: e.prompt_asset_id.clone(),
+                        prompt_version_id: e.prompt_version_id.clone(),
+                        prompt_release_id: e.prompt_release_id.clone(),
+                        created_by: e.created_by.clone(),
+                    });
             }
             RuntimeEvent::EvalRunCompleted(e) => {
                 if let Some(rec) = state.eval_runs.get_mut(e.eval_run_id.as_str()) {
                     rec.success = Some(e.success);
                     rec.error_message = e.error_message.clone();
                     rec.completed_at = Some(e.completed_at);
+                }
+            }
+            // Issue #244: soft-delete. Preserve the record so audit/scorecard
+            // views keep their history; `list_by_project` on the eval service
+            // filters archived entries out by default. Earliest-wins: only
+            // set `archived_at` when it's currently None so a racing second
+            // `EvalRunArchived` event (two concurrent DELETEs) doesn't bump
+            // the timestamp to the later attempt. Matches
+            // `EvalRunService::archive`'s idempotency rule (Copilot review
+            // on PR #336).
+            RuntimeEvent::EvalRunArchived(e) => {
+                if let Some(rec) = state.eval_runs.get_mut(e.eval_run_id.as_str()) {
+                    if rec.archived_at.is_none() {
+                        rec.archived_at = Some(e.archived_at);
+                    }
+                }
+            }
+            // RFC-025 Phase 1 (milestone 5): project the most-recent
+            // metrics / rubric verdict onto the read model. Last-write
+            // wins — the full score history lives in the event log. If
+            // the run record doesn't exist yet (score landed before
+            // `EvalRunStarted` replayed) the score arm is a no-op rather
+            // than fabricating a ProjectKey / started_at; the sync
+            // projection runs inside the same `&mut tx` as the insert so
+            // this ordering only matters during replay.
+            RuntimeEvent::EvalRunScored(e) => {
+                if let Some(rec) = state.eval_runs.get_mut(e.eval_run_id.as_str()) {
+                    rec.metrics = Some(e.metrics.clone());
+                }
+            }
+            RuntimeEvent::EvalRubricScored(e) => {
+                if let Some(rec) = state.eval_runs.get_mut(e.eval_run_id.as_str()) {
+                    rec.rubric_score = Some(crate::projections::EvalRubricScoreSummary {
+                        rubric_id: e.rubric_id.clone(),
+                        dimension_scores: e.dimension_scores.clone(),
+                        overall: e.overall,
+                        recorded_at_ms: e.recorded_at_ms,
+                    });
                 }
             }
             RuntimeEvent::OutcomeRecorded(e) => {
@@ -1721,17 +3257,13 @@ impl InMemoryStore {
                         run_id.as_str().to_owned(),
                         cairn_domain::CheckpointStrategy {
                             strategy_id: e.strategy_id.clone(),
-                            project: cairn_domain::ProjectKey::new(
-                                "_strategy",
-                                "_strategy",
-                                "_strategy",
-                            ),
+                            project: crate::projections::checkpoint_strategy_sentinel_project(),
                             run_id: run_id.clone(),
                             interval_ms: e.interval_ms,
                             max_checkpoints: if e.max_checkpoints > 0 {
                                 e.max_checkpoints
                             } else {
-                                10
+                                crate::projections::CHECKPOINT_STRATEGY_DEFAULT_MAX_CHECKPOINTS
                             },
                             trigger_on_task_complete: e.trigger_on_task_complete,
                         },
@@ -1781,6 +3313,302 @@ impl InMemoryStore {
             // cairn-app rebuilds the in-memory decision cache from the
             // event log at startup.
             RuntimeEvent::DecisionRecorded(_) | RuntimeEvent::DecisionCacheWarmup(_) => {}
+            // F47 PR2: attach summary + verification to the existing
+            // RunRecord. The completion fields (`completion_summary`,
+            // `completion_verification`, `completion_annotated_at_ms`)
+            // are overwrite-stable: replaying the same event leaves
+            // those three fields at identical values. `version` and
+            // `updated_at` still bump on replay — matching the
+            // RunStateChanged handler and the projection-bookkeeping
+            // contract other projections use — but the operator-
+            // observable shape stays the same. Absent run row (orphan
+            // annotation) is silently ignored; annotation cannot
+            // create a run. Mirrors the `if let Some(rec) = get_mut`
+            // pattern used by RunStateChanged above.
+            RuntimeEvent::RunCompletionAnnotated(e) => {
+                if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
+                    if rec.project == e.project && rec.session_id == e.session_id {
+                        rec.completion_summary = Some(e.summary.clone());
+                        rec.completion_verification = Some(e.verification.clone());
+                        rec.completion_annotated_at_ms = Some(e.occurred_at_ms);
+                        rec.version += 1;
+                        rec.updated_at = now;
+                    }
+                }
+            }
+            // F64: record the terminal-write recovery attempt on the run
+            // row. Silent no-op on missing row mirrors the
+            // `RunCompletionAnnotated` handler above — an orphan
+            // TerminalRecoveryAttempted is a malformed log, not a
+            // projection error.
+            RuntimeEvent::TerminalRecoveryAttempted(e) => {
+                if let Some(rec) = state.runs.get_mut(e.run_id.as_str()) {
+                    // Cross-tenant tampering guard (#732 expansion):
+                    // gate on `project` match. A forged
+                    // `TerminalRecoveryAttempted` could otherwise
+                    // stamp false recovery metadata onto another
+                    // tenant's run row. NOTE: this event's payload
+                    // does not carry `session_id` (unlike
+                    // `RunCompletionAnnotated` /
+                    // `RunStateChanged`), so the gate is
+                    // `project`-only here. The `project` check is
+                    // sufficient: the run row's `project` is set at
+                    // `RunCreated` time and the event's `project`
+                    // must match for any legitimate emit.
+                    if rec.project == e.project {
+                        rec.terminal_write_recovery =
+                            Some(crate::projections::TerminalRecoveryRecord {
+                                fcall: e.fcall.clone(),
+                                attempts: e.attempts,
+                                wall_time_ms: e.wall_time_ms,
+                                outcome: e.outcome.clone(),
+                                occurred_at_ms: e.occurred_at_ms,
+                            });
+                        rec.version += 1;
+                        rec.updated_at = now;
+                    }
+                }
+            }
+            // ── F65 PR-2: orchestrator session redesign projections ────────
+            //
+            // Each event maps to a specific projection write. The pg/sqlite
+            // equivalents live in `pg/projections.rs` / `sqlite/projections.rs`
+            // and use the same idempotency contract: replaying the same
+            // event bumps `version` but leaves the operator-observable
+            // fields unchanged.
+            RuntimeEvent::SessionAttemptStarted(e) => {
+                // Bump attempts_used on the session row. Replay-safe: we
+                // only ever advance the counter to `attempt_number` rather
+                // than incrementing blindly — repeated delivery of the same
+                // event leaves the row idempotent.
+                if let Some(rec) = state.sessions.get_mut(e.session_id.as_str()) {
+                    if e.attempt_number > rec.attempts_used {
+                        rec.attempts_used = e.attempt_number;
+                    }
+                    // max_attempts carries the config captured at attempt
+                    // start. Keep the row in sync if the captured value is
+                    // higher (config bumped post-attempt) — but never lower,
+                    // since that would let a later event silently shrink
+                    // operator-visible capacity.
+                    if e.max_attempts > rec.max_attempts {
+                        rec.max_attempts = e.max_attempts;
+                    }
+                    rec.version += 1;
+                    rec.updated_at = now;
+                }
+            }
+            // Attempt-completed is observable via SessionOutcomeEmitted and
+            // the event log. No projection row to update beyond the event
+            // log itself; leaving the session row unchanged is intentional.
+            RuntimeEvent::SessionAttemptCompleted(_) => {}
+            // Breaker trips are forensic — recorded on the event log, and
+            // mirrored into the session outcome row when the trip
+            // terminates the attempt. No dedicated projection table.
+            RuntimeEvent::CircuitBreakerTripped(_) => {}
+            // Budget-threshold-crossed is purely observability (SSE) — no
+            // projection row.
+            RuntimeEvent::BudgetThresholdCrossed(_) => {}
+            // RFC 032 PR-2: completion-contract resolution event —
+            // SSE + trajectory only, no in-memory projection needed.
+            RuntimeEvent::CompletionContractResolved(_) => {}
+            RuntimeEvent::CheckpointPersisted(e) => {
+                // F65 projection row (orchestrator-resumable shape).
+                // Pg/sqlite use `ON CONFLICT DO UPDATE` that preserves the
+                // original `created_at` and only touches the F65-extended
+                // fields. In-memory matches: insert-once, overwrite only
+                // the session/schema/iteration fields on replay.
+                state
+                    .f65_checkpoints
+                    .entry(e.checkpoint_id.as_str().to_owned())
+                    .and_modify(|rec| {
+                        rec.session_id = e.session_id.clone();
+                        rec.schema_version = 1;
+                        rec.iteration = e.iteration;
+                    })
+                    .or_insert_with(|| crate::projections::F65CheckpointRecord {
+                        checkpoint_id: e.checkpoint_id.clone(),
+                        project: e.project.clone(),
+                        session_id: e.session_id.clone(),
+                        root_run_id: e.root_run_id.clone(),
+                        schema_version: 1,
+                        body: String::new(),
+                        body_size_bytes: 0,
+                        iteration: e.iteration,
+                        created_at: e.at_ms,
+                    });
+                // Shared RFC 005 checkpoint row. The pg/sqlite backends
+                // both write this row from the same event (see
+                // `pg/projections.rs` and `sqlite/projections.rs`) so the
+                // in-memory backend must match to keep
+                // `CheckpointReadModel::get` cross-backend consistent.
+                // `data = None` + `version = 1` mirrors the SQL path's
+                // INSERT with empty body + version 1. Disposition is
+                // Latest because F65 only persists the most-recent
+                // orchestrator-resumable state. Replay preserves the
+                // first-seen `created_at` — matching the pg path.
+                state
+                    .checkpoints
+                    .entry(e.checkpoint_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::CheckpointRecord {
+                        checkpoint_id: e.checkpoint_id.clone(),
+                        project: e.project.clone(),
+                        run_id: e.root_run_id.clone(),
+                        disposition: cairn_domain::CheckpointDisposition::Latest,
+                        data: None,
+                        version: 1,
+                        created_at: e.at_ms,
+                    });
+            }
+            RuntimeEvent::WorkspaceSnapshotCreated(e) => {
+                // SQL backends use `ON CONFLICT (snapshot_id) DO NOTHING`,
+                // so a replayed event must not overwrite the existing
+                // row (or its `created_at`). Use `entry().or_insert_with`
+                // for the same create-only semantics. #482: bytes /
+                // reflink_used / parent_snapshot_id land on the event so
+                // the in-memory projection rebuilds identically to
+                // pg/sqlite on replay.
+                state
+                    .workspace_snapshots
+                    .entry(e.snapshot_id.as_str().to_owned())
+                    .or_insert_with(|| crate::projections::WorkspaceSnapshotRecord {
+                        snapshot_id: e.snapshot_id.clone(),
+                        project: e.project.clone(),
+                        session_id: e.session_id.clone(),
+                        workspace_id: e.workspace_id.clone(),
+                        parent_snapshot_id: e.parent_snapshot_id.clone(),
+                        snapshot_path: String::new(),
+                        bytes: e.bytes,
+                        reflink_used: e.reflink_used,
+                        created_at: e.at_ms,
+                        reaped_at: None,
+                    });
+            }
+            RuntimeEvent::WorkspaceSnapshotReaped(e) => {
+                if let Some(rec) = state.workspace_snapshots.get_mut(e.snapshot_id.as_str()) {
+                    rec.reaped_at = Some(e.at_ms);
+                }
+            }
+            RuntimeEvent::SessionOutcomeEmitted(e) => {
+                let outcome = &e.outcome;
+                // Pg/sqlite upsert preserves the original `created_at` and
+                // updates only the mutable fields (workspace_snapshot_id,
+                // termination_reason, compacted_summary, next_step_hint,
+                // cost_micros). Mirror that: insert with the event's
+                // `emitted_at` on first delivery, and only touch the
+                // enrichable fields on replay.
+                state
+                    .session_outcomes
+                    .entry(outcome.root_run_id.as_str().to_owned())
+                    .and_modify(|rec| {
+                        rec.workspace_snapshot_id = outcome.workspace_snapshot_id.clone();
+                        rec.termination_reason = outcome.termination_reason.clone();
+                        rec.compacted_summary = outcome.compacted_summary.clone();
+                        rec.next_step_hint = outcome.next_step_hint.clone();
+                        rec.cost_micros = outcome.cost_micros;
+                    })
+                    .or_insert_with(|| crate::projections::SessionOutcomeRecord {
+                        root_run_id: outcome.root_run_id.clone(),
+                        project: outcome.project.clone(),
+                        session_id: outcome.session_id.clone(),
+                        checkpoint_id: outcome.checkpoint_id.clone(),
+                        workspace_snapshot_id: outcome.workspace_snapshot_id.clone(),
+                        termination_reason: outcome.termination_reason.clone(),
+                        compacted_summary: outcome.compacted_summary.clone(),
+                        next_step_hint: outcome.next_step_hint.clone(),
+                        cost_micros: outcome.cost_micros,
+                        created_at: outcome.emitted_at,
+                    });
+            }
+            // Orchestrator decisions are operator observability surfaces
+            // (SSE + audit); no projection table.
+            RuntimeEvent::OrchestratorDecisionMade(_) => {}
+            // Summarizer fallback is audit-only (provenance of
+            // compacted_summary). The fact is captured on the event log;
+            // no projection row is needed.
+            RuntimeEvent::SummarizerFallback(_) => {}
+            // Workspace-backend-degraded fires at sandbox init time. No
+            // projection row — operator alerts via SSE + metrics (PR-4).
+            RuntimeEvent::WorkspaceBackendDegraded(_) => {}
+            // F65 PR-5 (#359): crash-recovery umount sweep observability.
+            // No projection row — operator alerts via SSE + metrics; the
+            // event log itself is the audit trail.
+            RuntimeEvent::SandboxCrashRecovered(_) => {}
+            // ── RFC 029 pluggable knowledge providers ──
+            // The durable backends (pg/sqlite) own the read model for
+            // `project_knowledge_providers` / `knowledge_ingest_jobs`.
+            // InMemory does not carry dedicated projection state for
+            // these yet — MultiProviderRetrieval (cairn-memory) will add
+            // in-memory read-model rows if it queries them at runtime.
+            // For now the event log itself is the authoritative record.
+            RuntimeEvent::KnowledgeProviderConfigured(_)
+            | RuntimeEvent::KnowledgeProviderUnavailable(_)
+            | RuntimeEvent::KnowledgeProviderCapabilityChanged(_)
+            | RuntimeEvent::KnowledgeIngestSubmitted(_)
+            | RuntimeEvent::KnowledgeIngestRejected(_)
+            | RuntimeEvent::KnowledgeIngestStatusUpdated(_) => {}
+            // ── RFC 030 pluggable memory providers ──
+            // Same story as the knowledge family above: the durable backends
+            // (pg/sqlite) own the read model for `project_memory_providers`
+            // / `memory_ingest_jobs`; InMemory defers to the event log and
+            // to MultiProviderMemory's in-memory state (added in PR-C).
+            RuntimeEvent::MemoryProviderConfigured(_)
+            | RuntimeEvent::MemoryProviderUnavailable(_)
+            | RuntimeEvent::MemoryProviderCapabilityChanged(_)
+            | RuntimeEvent::MemoryIngestSubmitted(_)
+            | RuntimeEvent::MemoryIngestRejected(_)
+            | RuntimeEvent::MemoryIngestStatusUpdated(_) => {}
+            // RFC 030 finalize: family-mismatch audits are Ephemeral
+            // — no in-memory projection state to mutate. Operator
+            // visibility is via SSE + metrics.
+            RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
+            | RuntimeEvent::MemoryProviderFamilyMismatch(_) => {}
+            // RFC 031 PR-B: `project_agent_roles` projection.
+            RuntimeEvent::AgentRoleDefined(e) => {
+                let key = (
+                    e.project.tenant_id.as_str().to_owned(),
+                    e.project.workspace_id.as_str().to_owned(),
+                    e.project.project_id.as_str().to_owned(),
+                    e.role.role_id.clone(),
+                );
+                // §D6: re-POST after retract upserts the same key AND
+                // clears `retracted_at` atomically. Latest-wins on
+                // `(project, role_id)` regardless of prior retraction
+                // state — the event log retains full history.
+                let record = crate::projections::AgentRoleRecord {
+                    project: e.project.clone(),
+                    role_id: e.role.role_id.clone(),
+                    role: e.role.clone(),
+                    shadows_builtin: e.shadows_builtin.clone(),
+                    defined_by: e.defined_by.clone(),
+                    defined_at: e.at_ms,
+                    retracted_at: None,
+                    retracted_by: None,
+                };
+                state.agent_roles.insert(key, record);
+            }
+            RuntimeEvent::AgentRoleRetracted(e) => {
+                let key = (
+                    e.project.tenant_id.as_str().to_owned(),
+                    e.project.workspace_id.as_str().to_owned(),
+                    e.project.project_id.as_str().to_owned(),
+                    e.role_id.clone(),
+                );
+                // §D7: set `retracted_at` on the existing row. If the
+                // row doesn't exist (retracting a never-defined id),
+                // this is a no-op — the HTTP handler translates that
+                // to a 404 before emitting the event, so in practice
+                // the row is always present at apply time on
+                // operator-initiated retracts. Replay of an orphan
+                // Retract event from a corrupted log tolerates the
+                // miss.
+                if let Some(row) = state.agent_roles.get_mut(&key) {
+                    row.retracted_at = Some(e.at_ms);
+                    row.retracted_by = Some(e.retracted_by.clone());
+                }
+            }
+            // `ToolDeclaredButMissing` is Ephemeral — no projection
+            // state regardless of backend.
+            RuntimeEvent::ToolDeclaredButMissing(_) => {}
         }
     }
 }
@@ -2006,6 +3834,7 @@ fn event_matches_entity(event: &RuntimeEvent, entity: &EntityRef) -> bool {
         (RuntimeEvent::SessionStateChanged(e), EntityRef::Session(id)) => e.session_id == *id,
         (RuntimeEvent::RunCreated(e), EntityRef::Run(id)) => e.run_id == *id,
         (RuntimeEvent::RunStateChanged(e), EntityRef::Run(id)) => e.run_id == *id,
+        (RuntimeEvent::RunReasoningStepRecorded(e), EntityRef::Run(id)) => e.run_id == *id,
         (RuntimeEvent::TaskCreated(e), EntityRef::Task(id)) => e.task_id == *id,
         (RuntimeEvent::TaskLeaseClaimed(e), EntityRef::Task(id)) => e.task_id == *id,
         (RuntimeEvent::TaskLeaseHeartbeated(e), EntityRef::Task(id)) => e.task_id == *id,
@@ -2096,6 +3925,60 @@ impl SessionReadModel for InMemoryStore {
     }
 }
 
+// -- AgentRoleReadModel (RFC 031 PR-B) --
+
+#[async_trait]
+impl crate::projections::AgentRoleReadModel for InMemoryStore {
+    async fn get_active(
+        &self,
+        project: &ProjectKey,
+        role_id: &str,
+    ) -> Result<Option<crate::projections::AgentRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (
+            project.tenant_id.as_str().to_owned(),
+            project.workspace_id.as_str().to_owned(),
+            project.project_id.as_str().to_owned(),
+            role_id.to_owned(),
+        );
+        Ok(state
+            .agent_roles
+            .get(&key)
+            .filter(|r| r.is_active())
+            .cloned())
+    }
+
+    async fn get_any(
+        &self,
+        project: &ProjectKey,
+        role_id: &str,
+    ) -> Result<Option<crate::projections::AgentRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (
+            project.tenant_id.as_str().to_owned(),
+            project.workspace_id.as_str().to_owned(),
+            project.project_id.as_str().to_owned(),
+            role_id.to_owned(),
+        );
+        Ok(state.agent_roles.get(&key).cloned())
+    }
+
+    async fn list_active(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::AgentRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::AgentRoleRecord> = state
+            .agent_roles
+            .values()
+            .filter(|r| r.project == *project && r.is_active())
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.role_id.cmp(&b.role_id));
+        Ok(rows)
+    }
+}
+
 // -- SessionCostReadModel --
 
 #[async_trait]
@@ -2111,17 +3994,52 @@ impl crate::projections::SessionCostReadModel for InMemoryStore {
     async fn list_by_tenant(
         &self,
         tenant_id: &cairn_domain::TenantId,
-        _since_ms: u64,
+        since_ms: u64,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<cairn_domain::providers::SessionCostRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Issue #423: the in-memory impl now honours `since_ms`,
+        // `limit`, and `offset`. Filter → sort newest-first →
+        // skip → take so callers that pass `limit + 1` can still
+        // detect the overflow page.
         let mut results: Vec<_> = state
             .session_costs
             .values()
-            .filter(|r| &r.tenant_id == tenant_id)
+            .filter(|r| &r.tenant_id == tenant_id && r.updated_at_ms >= since_ms)
             .cloned()
             .collect();
-        results.sort_by_key(|r| r.updated_at_ms);
-        Ok(results)
+        results.sort_by_key(|r| std::cmp::Reverse(r.updated_at_ms));
+        let page: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
+        Ok(page)
+    }
+}
+
+// -- ProjectCostReadModel (F29 CD-2) --
+
+#[async_trait]
+impl crate::projections::ProjectCostReadModel for InMemoryStore {
+    async fn get_project_cost(
+        &self,
+        project: &cairn_domain::ProjectKey,
+    ) -> Result<Option<cairn_domain::providers::ProjectCostRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (
+            project.tenant_id.as_str().to_owned(),
+            project.workspace_id.as_str().to_owned(),
+            project.project_id.as_str().to_owned(),
+        );
+        Ok(state.project_costs.get(&key).cloned())
+    }
+
+    async fn get_workspace_cost(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        workspace_id: &str,
+    ) -> Result<Option<cairn_domain::providers::WorkspaceCostRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (tenant_id.as_str().to_owned(), workspace_id.to_owned());
+        Ok(state.workspace_costs.get(&key).cloned())
     }
 }
 
@@ -2190,6 +4108,36 @@ impl RunReadModel for InMemoryStore {
         Ok(results)
     }
 
+    /// #670 G4 / RFC 027 + PR-1b-4: pushed-down predicate for the
+    /// `ChildRunDriver` scan — child runs in `Pending` or `Running`
+    /// state. `Running` is included so the driver can re-claim
+    /// crashed children post-recovery; FF's atomic
+    /// `issue_grant_and_claim` rejects live-lease duplicates.
+    async fn list_driver_claimable_children(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunRecord>, StoreError> {
+        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<RunRecord> = store
+            .runs
+            .values()
+            .filter(|r| {
+                matches!(
+                    r.state,
+                    cairn_domain::RunState::Pending | cairn_domain::RunState::Running
+                ) && r.parent_run_id.is_some()
+            })
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
+
     async fn list_active_by_project(
         &self,
         project: &ProjectKey,
@@ -2227,6 +4175,170 @@ impl RunReadModel for InMemoryStore {
                 .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
         });
         Ok(refs.into_iter().take(limit).cloned().collect())
+    }
+
+    async fn list_stalled(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        now_ms: u64,
+        stale_after_ms: u64,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<RunRecord>, StoreError> {
+        // Issue #570: combines state + staleness + tenant at the
+        // projection surface so handlers no longer scan 20 000 rows
+        // (Running + Pending) in memory before filtering by tenant +
+        // staleness. `updated_at` is epoch-ms on `RunRecord` and
+        // `now_ms > updated_at + stale_after_ms` is the canonical
+        // stuck-run predicate used by the handler + the operator UI.
+        let store = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut refs: Vec<&RunRecord> = store
+            .runs
+            .values()
+            .filter(|r| {
+                r.project.tenant_id == *tenant_id
+                    && matches!(
+                        r.state,
+                        cairn_domain::RunState::Running | cairn_domain::RunState::Pending
+                    )
+                    && now_ms.saturating_sub(r.updated_at) > stale_after_ms
+            })
+            .collect();
+        // Most-stale first so page 1 surfaces the runs that have been
+        // silent longest — matches the operator dashboard's "worst
+        // offenders" expectation.
+        refs.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(refs.into_iter().skip(offset).take(limit).cloned().collect())
+    }
+}
+
+// -- RunDescendantsCounter (#670 G4 PR-1b-1) --
+
+#[async_trait]
+impl crate::projections::RunDescendantsCounter for InMemoryStore {
+    async fn try_increment_descendants(
+        &self,
+        root_run_id: &cairn_domain::RunId,
+        cap: i64,
+    ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
+        use crate::projections::DescendantsCapOutcome;
+        let outcome = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let row = match state.runs.get_mut(root_run_id.as_str()) {
+                Some(r) => r,
+                None => return Ok(DescendantsCapOutcome::RootNotFound),
+            };
+            // Atomic check-and-increment under the state lock. The durable
+            // backends (pg/sqlite) use `UPDATE ... WHERE counter < :cap
+            // RETURNING` for the same semantic; InMemory uses lock
+            // exclusion. Both reject above the cap deterministically.
+            if row.in_flight_descendants >= cap {
+                DescendantsCapOutcome::CapReached
+            } else {
+                row.in_flight_descendants += 1;
+                // Bump version + updated_at so stale-run detection and
+                // every other version-watching consumer see the change.
+                // (Copilot review on #676.)
+                row.version = row.version.saturating_add(1);
+                row.updated_at = now_millis();
+                DescendantsCapOutcome::Admitted {
+                    new_count: row.in_flight_descendants,
+                }
+            }
+        };
+        // #670 G4 PR-1b-4: dual-write to the durable secondary
+        // backend. Only mirror `Admitted` outcomes — `CapReached`
+        // and `RootNotFound` mean we didn't mutate the in-memory
+        // arm either. Best-effort per the `secondary_log` pattern;
+        // failures log a WARN so ops sees the drift.
+        if matches!(outcome, DescendantsCapOutcome::Admitted { .. }) {
+            let backend = self
+                .secondary_counter
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(backend) = backend {
+                if let Err(err) = backend.try_increment_descendants(root_run_id, cap).await {
+                    tracing::warn!(
+                        error = %err,
+                        root_run_id = %root_run_id,
+                        "secondary-counter increment failed; in-memory and durable \
+                         counters now drift by 1. Next live increment/decrement or \
+                         a restart-time reconciliation will resync.",
+                    );
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn decrement_descendants(
+        &self,
+        root_run_id: &cairn_domain::RunId,
+    ) -> Result<crate::projections::DescendantsCapOutcome, StoreError> {
+        use crate::projections::DescendantsCapOutcome;
+        let outcome = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let row = match state.runs.get_mut(root_run_id.as_str()) {
+                Some(r) => r,
+                None => return Ok(DescendantsCapOutcome::RootNotFound),
+            };
+            // Unconditional decrement. Post-decrement can go negative if
+            // a caller bug produces more decrements than increments;
+            // we return the negative count rather than panicking. The
+            // adapter layer surfaces negative values as a WARN metric per
+            // RFC 027 (see `child_run_driver_descendant_underflow_total`).
+            row.in_flight_descendants -= 1;
+            // Bump version + updated_at: see `try_increment_descendants`
+            // rationale above.
+            row.version = row.version.saturating_add(1);
+            row.updated_at = now_millis();
+            DescendantsCapOutcome::Admitted {
+                new_count: row.in_flight_descendants,
+            }
+        };
+        // Dual-write to the durable secondary. Best-effort.
+        let backend = self
+            .secondary_counter
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(backend) = backend {
+            if let Err(err) = backend.decrement_descendants(root_run_id).await {
+                tracing::warn!(
+                    error = %err,
+                    root_run_id = %root_run_id,
+                    "secondary-counter decrement failed; in-memory and durable \
+                     counters now drift by 1.",
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn list_nonzero_descendant_counters(
+        &self,
+    ) -> Result<Vec<(cairn_domain::RunId, i64)>, StoreError> {
+        // Cap at 10_000 rows to match pg + sqlite and bound memory
+        // (Gemini review on #680, MEDIUM). Sort before truncate so
+        // the cap is deterministic across a wider population —
+        // without the sort, the HashMap's iteration order would
+        // pick an arbitrary slice.
+        const RECONCILE_LIMIT: usize = 10_000;
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(cairn_domain::RunId, i64)> = state
+            .runs
+            .values()
+            .filter(|r| r.in_flight_descendants != 0)
+            .map(|r| (r.run_id.clone(), r.in_flight_descendants))
+            .collect();
+        out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        out.truncate(RECONCILE_LIMIT);
+        Ok(out)
     }
 }
 
@@ -2358,6 +4470,125 @@ impl ApprovalReadModel for InMemoryStore {
             .approvals
             .values()
             .any(|a| a.run_id.as_ref() == Some(run_id) && a.decision.is_none()))
+    }
+}
+
+// -- ApprovalDelegationReadModel --
+
+#[async_trait]
+impl crate::projections::ApprovalDelegationReadModel for InMemoryStore {
+    async fn list_for_approval(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<Vec<crate::projections::ApprovalDelegationRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<_> = state
+            .approval_delegations
+            .iter()
+            .filter(|r| r.approval_id == *approval_id)
+            .cloned()
+            .collect();
+        // Oldest first — matches pg/sqlite `ORDER BY delegated_at_ms ASC,
+        // delegation_id ASC`. `delegation_id` is a stable monotonic
+        // tiebreaker within the same ms.
+        rows.sort_by(|a, b| {
+            a.delegated_at_ms
+                .cmp(&b.delegated_at_ms)
+                .then_with(|| a.delegation_id.cmp(&b.delegation_id))
+        });
+        Ok(rows)
+    }
+}
+
+// -- ToolCallApprovalReadModel --
+
+#[async_trait]
+impl ToolCallApprovalReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        call_id: &ToolCallId,
+    ) -> Result<Option<ToolCallApprovalRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.tool_call_approvals.get(call_id.as_str()).cloned())
+    }
+
+    async fn list_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<ToolCallApprovalRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<ToolCallApprovalRecord> = state
+            .tool_call_approvals
+            .values()
+            .filter(|r| r.run_id == *run_id)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| {
+            a.proposed_at_ms
+                .cmp(&b.proposed_at_ms)
+                .then_with(|| a.call_id.as_str().cmp(b.call_id.as_str()))
+        });
+        Ok(results)
+    }
+
+    async fn list_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ToolCallApprovalRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<ToolCallApprovalRecord> = state
+            .tool_call_approvals
+            .values()
+            .filter(|r| r.session_id == *session_id)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| {
+            a.proposed_at_ms
+                .cmp(&b.proposed_at_ms)
+                .then_with(|| a.call_id.as_str().cmp(b.call_id.as_str()))
+        });
+        Ok(results)
+    }
+
+    async fn list_pending_for_project(
+        &self,
+        project: &ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ToolCallApprovalRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<ToolCallApprovalRecord> = state
+            .tool_call_approvals
+            .values()
+            .filter(|r| r.project == *project && r.state == ToolCallApprovalState::Pending)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| {
+            a.proposed_at_ms
+                .cmp(&b.proposed_at_ms)
+                .then_with(|| a.call_id.as_str().cmp(b.call_id.as_str()))
+        });
+        Ok(results.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn list_all_pending(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ToolCallApprovalRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<ToolCallApprovalRecord> = state
+            .tool_call_approvals
+            .values()
+            .filter(|r| r.state == ToolCallApprovalState::Pending)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| {
+            a.proposed_at_ms
+                .cmp(&b.proposed_at_ms)
+                .then_with(|| a.call_id.as_str().cmp(b.call_id.as_str()))
+        });
+        Ok(results.into_iter().skip(offset).take(limit).collect())
     }
 }
 
@@ -2496,6 +4727,22 @@ impl ToolInvocationReadModel for InMemoryStore {
     }
 }
 
+// -- ToolInvocationProgressReadModel --
+
+#[async_trait]
+impl crate::projections::ToolInvocationProgressReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        invocation_id: &ToolInvocationId,
+    ) -> Result<Option<crate::projections::ToolInvocationProgressRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .tool_invocation_progress
+            .get(invocation_id.as_str())
+            .cloned())
+    }
+}
+
 // -- SignalReadModel --
 
 #[async_trait]
@@ -2521,7 +4768,14 @@ impl SignalReadModel for InMemoryStore {
             .filter(|s| s.project == *project)
             .cloned()
             .collect();
-        results.sort_by_key(|s| s.timestamp_ms);
+        // RFC-025 Phase 2b.2b m2: sort by (timestamp_ms ASC, signal_id
+        // ASC) so same-ms ingests pick a stable order; pg/sqlite
+        // adapters ORDER BY the same composite key for parity.
+        results.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
         let results = results.into_iter().skip(offset).take(limit).collect();
         Ok(results)
     }
@@ -2552,7 +4806,16 @@ impl IngestJobReadModel for InMemoryStore {
             .filter(|j| j.project == *project)
             .cloned()
             .collect();
-        results.sort_by_key(|j| j.created_at);
+        // RFC-025 Phase 2b.3 m1: tiebreak on `id` so two jobs created in
+        // the same millisecond land in a deterministic order that pg/sqlite
+        // also produce (they `ORDER BY created_at_ms ASC, job_id ASC` on the
+        // composite project index). Without this, byte-equality parity with
+        // the SQL backends fails.
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
         let results = results.into_iter().skip(offset).take(limit).collect();
         Ok(results)
     }
@@ -2659,7 +4922,14 @@ impl OutcomeReadModel for InMemoryStore {
             .filter(|r| r.run_id == *run_id)
             .cloned()
             .collect();
-        results.sort_by_key(|r| r.recorded_at);
+        // Tiebreaker on outcome_id keeps cross-backend parity stable
+        // for events sharing a `recorded_at` timestamp (pg/sqlite
+        // ORDER BY uses the same compound key).
+        results.sort_by(|a, b| {
+            a.recorded_at
+                .cmp(&b.recorded_at)
+                .then_with(|| a.outcome_id.as_str().cmp(b.outcome_id.as_str()))
+        });
         results.truncate(limit);
         Ok(results)
     }
@@ -2677,7 +4947,11 @@ impl OutcomeReadModel for InMemoryStore {
             .filter(|r| r.project == *project)
             .cloned()
             .collect();
-        results.sort_by_key(|r| r.recorded_at);
+        results.sort_by(|a, b| {
+            a.recorded_at
+                .cmp(&b.recorded_at)
+                .then_with(|| a.outcome_id.as_str().cmp(b.outcome_id.as_str()))
+        });
         let results = results.into_iter().skip(offset).take(limit).collect();
         Ok(results)
     }
@@ -2708,7 +4982,14 @@ impl crate::projections::EvalDatasetReadModel for InMemoryStore {
             .filter(|d| d.tenant_id == *tenant_id || tenant_id.as_str().is_empty())
             .cloned()
             .collect();
-        results.sort_by_key(|d| d.created_at_ms);
+        // RFC-025 Phase 2b.4 m2: dataset_id tiebreaker so cross-backend
+        // parity holds when two datasets share a `created_at_ms` (matches
+        // the pg/sqlite `ORDER BY created_at_ms ASC, dataset_id ASC` query).
+        results.sort_by(|a, b| {
+            a.created_at_ms
+                .cmp(&b.created_at_ms)
+                .then_with(|| a.dataset_id.cmp(&b.dataset_id))
+        });
         Ok(results.into_iter().skip(offset).take(limit).collect())
     }
 }
@@ -3104,6 +5385,28 @@ impl ProviderCallReadModel for InMemoryStore {
             .collect();
         Ok(results)
     }
+
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+        limit: usize,
+    ) -> Result<Vec<cairn_domain::providers::ProviderCallRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<_> = state
+            .provider_calls
+            .values()
+            .filter(|c| c.run_id.as_ref() == Some(run_id))
+            .cloned()
+            .collect();
+        // Stable order: by started_at_ms ascending, then by provider_call_id.
+        results.sort_by(|a, b| {
+            a.started_at_ms
+                .cmp(&b.started_at_ms)
+                .then_with(|| a.provider_call_id.as_str().cmp(b.provider_call_id.as_str()))
+        });
+        results.truncate(limit);
+        Ok(results)
+    }
 }
 
 // -- Lease helpers (not trait-based, used by runtime directly) --
@@ -3191,7 +5494,16 @@ impl ExternalWorkerReadModel for InMemoryStore {
             .filter(|w| w.tenant_id == *tenant_id)
             .cloned()
             .collect();
-        results.sort_by_key(|r| r.registered_at);
+        // Deterministic tiebreak on worker_id — matches the pg + sqlite
+        // `ORDER BY registered_at ASC, worker_id ASC` clause. Without
+        // the tiebreak, HashMap iteration order leaks into the result
+        // under same-ms registration bursts (projection_parity test
+        // caught this).
+        results.sort_by(|a, b| {
+            a.registered_at
+                .cmp(&b.registered_at)
+                .then_with(|| a.worker_id.as_str().cmp(b.worker_id.as_str()))
+        });
         Ok(results.into_iter().skip(offset).take(limit).collect())
     }
 }
@@ -3244,6 +5556,80 @@ impl crate::projections::LlmCallTraceReadModel for InMemoryStore {
     }
 }
 
+// -- LlmCompletionBodyReadModel (issue #668) --
+
+#[async_trait]
+impl crate::projections::LlmCompletionBodyReadModel for InMemoryStore {
+    async fn get_by_trace_id(
+        &self,
+        trace_id: &str,
+    ) -> Result<Option<crate::projections::LlmCompletionBodyRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.llm_completion_bodies.get(trace_id).cloned())
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+    ) -> Result<Vec<crate::projections::LlmCompletionBodyRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::LlmCompletionBodyRecord> = state
+            .llm_completion_bodies
+            .values()
+            .filter(|r| r.session_id == *session_id)
+            .cloned()
+            .collect();
+        // Ascending by recorded_at_ms so the UI can render turns
+        // chronologically. `recorded_at_ms` may tie across iterations
+        // that completed in the same millisecond; break with
+        // `trace_id` so the order is stable across queries.
+        rows.sort_by(|a, b| {
+            a.recorded_at_ms
+                .cmp(&b.recorded_at_ms)
+                .then_with(|| a.trace_id.cmp(&b.trace_id))
+        });
+        Ok(rows)
+    }
+}
+
+#[async_trait]
+impl crate::projections::reasoning_step::ReasoningStepReadModel for InMemoryStore {
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::reasoning_step::ReasoningStepRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entries) = state.reasoning_steps.get(run_id) else {
+            return Ok(vec![]);
+        };
+        // The vec is maintained in append order (oldest first), which
+        // is chronological. Slice [offset..offset+limit].
+        Ok(entries.iter().skip(offset).take(limit).cloned().collect())
+    }
+
+    async fn latest_for_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+    ) -> Result<Option<crate::projections::reasoning_step::ReasoningStepRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .reasoning_steps
+            .get(run_id)
+            .and_then(|v| v.last().cloned()))
+    }
+
+    async fn count_for_run(&self, run_id: &cairn_domain::RunId) -> Result<usize, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .reasoning_steps
+            .get(run_id)
+            .map(|v| v.len())
+            .unwrap_or(0))
+    }
+}
+
 #[async_trait]
 impl crate::projections::RunCostReadModel for InMemoryStore {
     async fn get_run_cost(
@@ -3256,11 +5642,52 @@ impl crate::projections::RunCostReadModel for InMemoryStore {
 
     async fn list_by_session(
         &self,
-        _session_id: &cairn_domain::SessionId,
+        session_id: &cairn_domain::SessionId,
     ) -> Result<Vec<cairn_domain::providers::RunCostRecord>, StoreError> {
-        // In-memory store does not index run_costs by session; return all for now.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state.run_costs.values().cloned().collect())
+
+        // Per Gemini PR #727 review: pre-build a `run_id -> session_id`
+        // map from the event log in one pass so the per-cost-row check
+        // is O(1) instead of O(events). The lookup is two-tier:
+        //
+        //   1. Authoritative path — if `state.runs` knows the run, use
+        //      its `session_id` directly. This is the fast happy path
+        //      when `RunCreated` has been projected.
+        //   2. Event-log fallback — for runs whose `RunCreated`
+        //      projection has not landed yet (e.g. orphan replay,
+        //      cross-projection ordering races), scan the
+        //      `RunCostUpdated` events for the run_id and use the
+        //      event's `session_id` if present. We build this index
+        //      ONCE per call rather than per-cost-row, dropping the
+        //      original O(N*M) shape to O(N+M).
+        let cost_run_to_event_session: std::collections::HashMap<String, cairn_domain::SessionId> =
+            state
+                .events
+                .iter()
+                .rev()
+                .filter_map(|evt| match &evt.envelope.payload {
+                    cairn_domain::RuntimeEvent::RunCostUpdated(e) => e
+                        .session_id
+                        .clone()
+                        .map(|sid| (e.run_id.as_str().to_owned(), sid)),
+                    _ => None,
+                })
+                .collect();
+
+        let mut out = Vec::new();
+        for cost in state.run_costs.values() {
+            let run_matches = state
+                .runs
+                .get(cost.run_id.as_str())
+                .map(|run| run.session_id == *session_id)
+                .unwrap_or(false);
+            let event_matches = !run_matches
+                && cost_run_to_event_session.get(cost.run_id.as_str()) == Some(session_id);
+            if run_matches || event_matches {
+                out.push(cost.clone());
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -3295,6 +5722,57 @@ impl crate::projections::OperatorProfileReadModel for InMemoryStore {
             .cloned()
             .collect();
         results.sort_by_key(|p| p.operator_id.to_string());
+        Ok(results.into_iter().skip(offset).take(limit).collect())
+    }
+}
+
+// -- OperatorTenantRoleReadModel (RFC 026 PR-A0) --
+
+#[async_trait]
+impl crate::projections::OperatorTenantRoleReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        tenant_id: &cairn_domain::ids::TenantId,
+        operator_id: &cairn_domain::ids::OperatorId,
+    ) -> Result<Option<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (
+            tenant_id.as_str().to_owned(),
+            operator_id.as_str().to_owned(),
+        );
+        Ok(state.operator_tenant_roles.get(&key).cloned())
+    }
+
+    async fn list_by_operator(
+        &self,
+        operator_id: &cairn_domain::ids::OperatorId,
+    ) -> Result<Vec<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::OperatorTenantRoleRecord> = state
+            .operator_tenant_roles
+            .values()
+            .filter(|r| &r.operator_id == operator_id)
+            .cloned()
+            .collect();
+        // Deterministic ordering across backends: tenant_id ASC.
+        results.sort_by(|a, b| a.tenant_id.as_str().cmp(b.tenant_id.as_str()));
+        Ok(results)
+    }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: &cairn_domain::ids::TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::OperatorTenantRoleRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::OperatorTenantRoleRecord> = state
+            .operator_tenant_roles
+            .values()
+            .filter(|r| &r.tenant_id == tenant_id)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| a.operator_id.as_str().cmp(b.operator_id.as_str()));
         Ok(results.into_iter().skip(offset).take(limit).collect())
     }
 }
@@ -3405,21 +5883,29 @@ impl crate::projections::SignalSubscriptionReadModel for InMemoryStore {
     async fn list_by_project(
         &self,
         project: &cairn_domain::tenancy::ProjectKey,
-        _limit: usize,
-        _offset: usize,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<crate::projections::SignalSubscriptionRecord>, StoreError> {
+        // #422: the previous impl ignored both `limit` and `offset`,
+        // returning every subscription for the project. That broke the
+        // pagination contract the handler now enforces (fetch
+        // `limit + 1`, check overflow, truncate). Sort by
+        // subscription_id for stable ordering across pages, then
+        // skip/take.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let tid = project.tenant_id.as_str();
         let wid = project.workspace_id.as_str();
         let pid = project.project_id.as_str();
-        Ok(state
+        let mut all: Vec<_> = state
             .signal_subscriptions
             .values()
             .filter(|s| {
                 s.project_tenant == tid && s.project_workspace == wid && s.project_id == pid
             })
             .cloned()
-            .collect())
+            .collect();
+        all.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        Ok(all.into_iter().skip(offset).take(limit).collect())
     }
 
     async fn upsert_subscription(
@@ -3622,14 +6108,21 @@ impl crate::projections::ChannelReadModel for InMemoryStore {
         offset: usize,
     ) -> Result<Vec<cairn_domain::ChannelRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m3: sort by (created_at ASC, channel_id ASC)
+        // to match pg/sqlite ORDER BY. HashMap::values is otherwise
+        // unordered and breaks byte-equal parity.
+        let mut rows: Vec<cairn_domain::ChannelRecord> = state
             .channels
             .values()
             .filter(|c| &c.project == project)
-            .skip(offset)
-            .take(limit)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.channel_id.as_str().cmp(b.channel_id.as_str()))
+        });
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
     }
     async fn list_messages(
         &self,
@@ -3637,14 +6130,22 @@ impl crate::projections::ChannelReadModel for InMemoryStore {
         limit: usize,
     ) -> Result<Vec<cairn_domain::ChannelMessage>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m3: sort by (sent_at_ms ASC, message_id ASC)
+        // — the in-memory store appends to a Vec in arrival order which
+        // happens to match sent_at_ms ordering when events are appended
+        // in chronological order, but an out-of-order replay would drift
+        // from the SQL `ORDER BY` otherwise.
+        let mut msgs = state
             .channel_messages
             .get(channel_id.as_str())
             .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .take(limit)
-            .collect())
+            .unwrap_or_default();
+        msgs.sort_by(|a, b| {
+            a.sent_at_ms
+                .cmp(&b.sent_at_ms)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        Ok(msgs.into_iter().take(limit).collect())
     }
 }
 
@@ -3668,12 +6169,53 @@ impl crate::projections::GuardrailReadModel for InMemoryStore {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<cairn_domain::policy::GuardrailPolicy>, StoreError> {
-        let _ = tenant_id;
+        // RFC-025 Phase 2a.2 milestone 2: tenant-scoped read. pg/sqlite
+        // now filter `guardrail_policies.tenant_id = $1` in SQL; the
+        // in-memory side mirrors that via the sibling
+        // `guardrail_policy_tenants` map. Pre-fix the in-memory impl
+        // silently leaked policies across tenants.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut policies: Vec<_> = state.guardrail_policies.values().cloned().collect();
+        let mut policies: Vec<_> = state
+            .guardrail_policies
+            .values()
+            .filter(|p| {
+                state
+                    .guardrail_policy_tenants
+                    .get(&p.policy_id)
+                    .is_some_and(|t| t == tenant_id)
+            })
+            .cloned()
+            .collect();
         // Sort by policy_id (timestamp-based) for deterministic creation-order iteration.
         policies.sort_by_key(|r| r.policy_id.clone());
         Ok(policies.into_iter().skip(offset).take(limit).collect())
+    }
+}
+
+// -- GuardrailEvaluationReadModel --
+
+#[async_trait]
+impl crate::projections::GuardrailEvaluationReadModel for InMemoryStore {
+    async fn list_evaluations(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::GuardrailEvaluationRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<_> = state
+            .guardrail_evaluations
+            .iter()
+            .filter(|r| r.tenant_id == *tenant_id)
+            .cloned()
+            .collect();
+        // Most-recent first: mirrors pg/sqlite
+        // `ORDER BY evaluated_at_ms DESC, policy_id ASC`.
+        rows.sort_by(|a, b| {
+            b.evaluated_at_ms
+                .cmp(&a.evaluated_at_ms)
+                .then_with(|| a.policy_id.cmp(&b.policy_id))
+        });
+        Ok(rows.into_iter().take(limit).collect())
     }
 }
 
@@ -3696,12 +6238,18 @@ impl crate::projections::LicenseReadModel for InMemoryStore {
         tenant_id: &cairn_domain::TenantId,
     ) -> Result<Vec<cairn_domain::EntitlementOverrideRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2a.2 milestone 4: sort by `feature` ASC to match
+        // the pg/sqlite `ORDER BY feature ASC` contract. HashMap::values
+        // yields unordered output otherwise, which breaks byte-equal
+        // parity with the projection backends.
+        let mut rows: Vec<cairn_domain::EntitlementOverrideRecord> = state
             .entitlement_overrides
             .values()
             .filter(|r| &r.tenant_id == tenant_id)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| a.feature.cmp(&b.feature));
+        Ok(rows)
     }
 }
 
@@ -3713,7 +6261,12 @@ impl crate::projections::DefaultsReadModel for InMemoryStore {
         scope_id: &str,
         key: &str,
     ) -> Result<Option<cairn_domain::DefaultSetting>, StoreError> {
-        let k = format!("{scope:?}:{scope_id}:{key}");
+        let k = format!(
+            "{}:{}:{}",
+            crate::projections::defaults_scope_str(scope),
+            scope_id,
+            key
+        );
         Ok(self
             .state
             .lock()
@@ -3727,14 +6280,23 @@ impl crate::projections::DefaultsReadModel for InMemoryStore {
         scope: cairn_domain::Scope,
         scope_id: &str,
     ) -> Result<Vec<cairn_domain::DefaultSetting>, StoreError> {
-        let prefix = format!("{scope:?}:{scope_id}:");
+        let prefix = format!(
+            "{}:{}:",
+            crate::projections::defaults_scope_str(scope),
+            scope_id
+        );
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m2: sort by `key` to match pg/sqlite
+        // `ORDER BY key ASC`. HashMap iteration is otherwise unordered
+        // and breaks byte-equal parity with the SQL backends.
+        let mut rows: Vec<cairn_domain::DefaultSetting> = state
             .default_settings
             .iter()
             .filter(|(k, _)| k.starts_with(&prefix))
             .map(|(_, v)| v.clone())
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(rows)
     }
 }
 
@@ -3847,14 +6409,25 @@ impl crate::projections::RunSlaReadModel for InMemoryStore {
     async fn list_breached_by_tenant(
         &self,
         tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<cairn_domain::sla::SlaBreach>, StoreError> {
+        // Issue #570: pagination moved into the projection — handlers no
+        // longer fetch every row then slice in memory.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        let mut filtered: Vec<cairn_domain::sla::SlaBreach> = state
             .run_sla_breaches
             .values()
             .filter(|b| &b.tenant_id == tenant_id)
             .cloned()
-            .collect())
+            .collect();
+        // Newest-first order so page 1 is the most-recent breaches.
+        filtered.sort_by(|a, b| {
+            b.breached_at_ms
+                .cmp(&a.breached_at_ms)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(filtered.into_iter().skip(offset).take(limit).collect())
     }
 }
 
@@ -3879,12 +6452,16 @@ impl crate::projections::NotificationReadModel for InMemoryStore {
         tenant_id: &cairn_domain::TenantId,
     ) -> Result<Vec<cairn_domain::notification_prefs::NotificationPreference>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m4: sort by `operator_id ASC` to match
+        // pg/sqlite `ORDER BY operator_id ASC`.
+        let mut rows: Vec<cairn_domain::notification_prefs::NotificationPreference> = state
             .notification_prefs
             .values()
             .filter(|p| &p.tenant_id == tenant_id)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| a.operator_id.cmp(&b.operator_id));
+        Ok(rows)
     }
     async fn list_sent_notifications(
         &self,
@@ -3892,24 +6469,38 @@ impl crate::projections::NotificationReadModel for InMemoryStore {
         since_ms: u64,
     ) -> Result<Vec<cairn_domain::notification_prefs::NotificationRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.3 m4: sort (sent_at_ms ASC, record_id ASC) to
+        // match pg/sqlite ORDER BY.
+        let mut rows: Vec<cairn_domain::notification_prefs::NotificationRecord> = state
             .notification_records
             .iter()
             .filter(|r| &r.tenant_id == tenant_id && r.sent_at_ms >= since_ms)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| {
+            a.sent_at_ms
+                .cmp(&b.sent_at_ms)
+                .then_with(|| a.record_id.cmp(&b.record_id))
+        });
+        Ok(rows)
     }
     async fn list_failed_notifications(
         &self,
         tenant_id: &cairn_domain::TenantId,
     ) -> Result<Vec<cairn_domain::notification_prefs::NotificationRecord>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        let mut rows: Vec<cairn_domain::notification_prefs::NotificationRecord> = state
             .notification_records
             .iter()
             .filter(|r| &r.tenant_id == tenant_id && !r.delivered)
             .cloned()
-            .collect())
+            .collect();
+        rows.sort_by(|a, b| {
+            a.sent_at_ms
+                .cmp(&b.sent_at_ms)
+                .then_with(|| a.record_id.cmp(&b.record_id))
+        });
+        Ok(rows)
     }
 }
 
@@ -4003,6 +6594,33 @@ impl crate::projections::CredentialReadModel for InMemoryStore {
             .cloned()
             .collect())
     }
+
+    /// Single-pass scan across all tenants. Used by
+    /// `cairn_runtime::services::scan_legacy_ciphertexts` at boot. The
+    /// InMemoryStore projection is the authoritative read model for
+    /// every backend (pg and sqlite dual-write through service events),
+    /// so one pass over `state.credentials` covers the whole deployment
+    /// without the per-tenant N+1 that the default impl falls back to.
+    ///
+    /// Returns `Some(rows)` — including `Some(Vec::new())` on a deployment
+    /// with zero credentials — so the caller can unambiguously skip the
+    /// per-tenant fallback. The default `Ok(None)` is reserved for
+    /// backends that have not wired a single-pass path.
+    async fn list_all_active(
+        &self,
+        limit: usize,
+    ) -> Result<Option<Vec<cairn_domain::credentials::CredentialRecord>>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Some(
+            state
+                .credentials
+                .values()
+                .filter(|r| r.active)
+                .take(limit)
+                .cloned()
+                .collect(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -4022,14 +6640,25 @@ impl crate::projections::RunCostAlertReadModel for InMemoryStore {
     async fn list_triggered_by_tenant(
         &self,
         tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<cairn_domain::providers::RunCostAlert>, StoreError> {
+        // Issue #570: pagination at the projection — callers pass
+        // `limit + 1` to detect `has_more` without re-scanning.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        let mut filtered: Vec<cairn_domain::providers::RunCostAlert> = state
             .run_cost_alerts
             .values()
             .filter(|a| &a.tenant_id == tenant_id && a.triggered_at_ms > 0)
             .cloned()
-            .collect())
+            .collect();
+        // Newest-first so page 1 is the most-recent triggers.
+        filtered.sort_by(|a, b| {
+            b.triggered_at_ms
+                .cmp(&a.triggered_at_ms)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(filtered.into_iter().skip(offset).take(limit).collect())
     }
 }
 
@@ -4039,40 +6668,30 @@ impl crate::projections::AuditLogReadModel for InMemoryStore {
         &self,
         tenant_id: &cairn_domain::TenantId,
         since_ms: Option<u64>,
+        before_ms: Option<u64>,
         limit: usize,
     ) -> Result<Vec<cairn_domain::AuditLogEntry>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let entries: Vec<_> = state
-            .events
-            .iter()
-            .filter_map(|e| {
-                if let RuntimeEvent::AuditLogEntryRecorded(a) = &e.envelope.payload {
-                    if &a.tenant_id == tenant_id {
-                        if let Some(since) = since_ms {
-                            if a.occurred_at_ms < since {
-                                return None;
-                            }
-                        }
-                        return Some(cairn_domain::AuditLogEntry {
-                            entry_id: a.entry_id.clone(),
-                            tenant_id: a.tenant_id.clone(),
-                            actor_id: a.actor_id.clone(),
-                            action: a.action.clone(),
-                            resource_type: a.resource_type.clone(),
-                            resource_id: a.resource_id.clone(),
-                            outcome: a.outcome,
-                            request_id: None,
-                            ip_address: None,
-                            occurred_at_ms: a.occurred_at_ms,
-                            metadata: serde_json::json!({}),
-                        });
-                    }
-                }
-                None
-            })
-            .take(limit)
+        let mut rows: Vec<&crate::projections::AuditLogEntryRecord> = state
+            .audit_log_entries
+            .values()
+            .filter(|rec| &rec.tenant_id == tenant_id)
+            .filter(|rec| since_ms.is_none_or(|since| rec.occurred_at_ms >= since))
+            .filter(|rec| before_ms.is_none_or(|before| rec.occurred_at_ms < before))
             .collect();
-        Ok(entries)
+        // Newest-first per trait doc. Tiebreak on entry_id so cross-backend
+        // parity does not flap on identical timestamps.
+        rows.sort_by(|a, b| {
+            b.occurred_at_ms
+                .cmp(&a.occurred_at_ms)
+                .then_with(|| b.entry_id.cmp(&a.entry_id))
+        });
+        Ok(rows
+            .into_iter()
+            .take(limit)
+            .cloned()
+            .map(crate::projections::AuditLogEntryRecord::into_entry)
+            .collect())
     }
 
     async fn list_by_resource(
@@ -4081,31 +6700,26 @@ impl crate::projections::AuditLogReadModel for InMemoryStore {
         resource_id: &str,
     ) -> Result<Vec<cairn_domain::AuditLogEntry>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let entries: Vec<_> = state
-            .events
-            .iter()
-            .filter_map(|e| {
-                if let RuntimeEvent::AuditLogEntryRecorded(a) = &e.envelope.payload {
-                    if a.resource_type == resource_type && a.resource_id == resource_id {
-                        return Some(cairn_domain::AuditLogEntry {
-                            entry_id: a.entry_id.clone(),
-                            tenant_id: a.tenant_id.clone(),
-                            actor_id: a.actor_id.clone(),
-                            action: a.action.clone(),
-                            resource_type: a.resource_type.clone(),
-                            resource_id: a.resource_id.clone(),
-                            outcome: a.outcome,
-                            request_id: None,
-                            ip_address: None,
-                            occurred_at_ms: a.occurred_at_ms,
-                            metadata: serde_json::json!({}),
-                        });
-                    }
-                }
-                None
-            })
+        let mut rows: Vec<&crate::projections::AuditLogEntryRecord> = state
+            .audit_log_entries
+            .values()
+            .filter(|rec| rec.resource_type == resource_type && rec.resource_id == resource_id)
             .collect();
-        Ok(entries)
+        rows.sort_by(|a, b| {
+            b.occurred_at_ms
+                .cmp(&a.occurred_at_ms)
+                .then_with(|| b.entry_id.cmp(&a.entry_id))
+        });
+        // Shared cap with pg + sqlite — see `LIST_BY_RESOURCE_MAX_ROWS`
+        // docs. Copilot PR #573 review flagged this as a cross-backend
+        // divergence + DoS vector on a pathological per-resource audit
+        // trail.
+        Ok(rows
+            .into_iter()
+            .take(crate::projections::LIST_BY_RESOURCE_MAX_ROWS)
+            .cloned()
+            .map(crate::projections::AuditLogEntryRecord::into_entry)
+            .collect())
     }
 }
 
@@ -4141,20 +6755,56 @@ impl crate::projections::QuotaReadModel for InMemoryStore {
 }
 
 #[async_trait]
+impl crate::projections::QuotaViolationReadModel for InMemoryStore {
+    async fn list_violations(
+        &self,
+        tenant_id: &cairn_domain::TenantId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::QuotaViolationRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Most-recent-first ordering matches the pg/sqlite
+        // `ORDER BY occurred_at_ms DESC, quota_type ASC` contract —
+        // Copilot PR #565 flagged the missing quota_type tiebreaker as
+        // a determinism/parity gap.
+        let mut rows: Vec<_> = state
+            .quota_violations
+            .iter()
+            .filter(|v| &v.tenant_id == tenant_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.occurred_at_ms
+                .cmp(&a.occurred_at_ms)
+                .then_with(|| a.quota_type.cmp(&b.quota_type))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+}
+
+#[async_trait]
 impl crate::projections::ProviderBudgetReadModel for InMemoryStore {
     async fn get_by_tenant_period(
         &self,
         tenant_id: &cairn_domain::TenantId,
         period: cairn_domain::providers::ProviderBudgetPeriod,
     ) -> Result<Option<cairn_domain::providers::ProviderBudget>, StoreError> {
-        let key = format!("{}:{period:?}", tenant_id.as_str());
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
+        // RFC-025 Phase 2a.1 milestone 3: provider_budgets are now keyed
+        // by `budget_id` (parity with pg/sqlite), so the tenant/period
+        // lookup scans the values map. Historical behaviour returned
+        // the single `tenant_id:period` row; to preserve deterministic
+        // selection when multiple budgets share (tenant, period), return
+        // the one with the earliest `created_at` so repeat calls always
+        // pick the same row.
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut candidates: Vec<_> = state
             .provider_budgets
-            .get(&key)
-            .cloned())
+            .values()
+            .filter(|b| &b.tenant_id == tenant_id && b.period == period)
+            .cloned()
+            .collect();
+        candidates.sort_by_key(|b| (b.created_at, b.limit_micros));
+        Ok(candidates.into_iter().next())
     }
     async fn list_by_tenant(
         &self,
@@ -4247,48 +6897,36 @@ impl crate::projections::OperatorInterventionReadModel for InMemoryStore {
 impl crate::projections::PauseScheduleReadModel for InMemoryStore {
     async fn list_due(
         &self,
+        tenant_id: &cairn_domain::TenantId,
         before_ms: u64,
+        limit: usize,
     ) -> Result<Vec<crate::projections::PauseScheduledRecord>, StoreError> {
+        // Issue #592: evict-on-resume projection — read from
+        // `state.pause_schedules` (populated by the RunStateChanged
+        // projection arm) instead of walking the full event log.
+        //
+        // Contract parity with pg/sqlite/sqlite adapter's `list_due`:
+        //   - tenant gate (`tenant_id == caller`).
+        //   - `resume_at_ms <= before_ms` filter.
+        //   - ORDER BY `resume_at_ms ASC, run_id ASC` — stable
+        //     ordering so backends agree on membership/eviction
+        //     semantics even when `resume_at_ms` is compared with
+        //     sub-second tolerance.
+        //   - LIMIT applied AFTER the ordering, not via a random
+        //     partial iterator.
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        // Find all RunStateChanged(to=Paused) events with resume_after_ms set.
-        // Use a map to keep only the latest pause event per run.
-        let mut paused: std::collections::HashMap<
-            String,
-            crate::projections::PauseScheduledRecord,
-        > = std::collections::HashMap::new();
-        for stored in &state.events {
-            if let RuntimeEvent::RunStateChanged(e) = &stored.envelope.payload {
-                if e.transition.to == cairn_domain::RunState::Paused {
-                    if let Some(reason) = &e.pause_reason {
-                        if let Some(resume_after_ms) = reason.resume_after_ms {
-                            let resume_at_ms = stored.stored_at + resume_after_ms;
-                            paused.insert(
-                                e.run_id.as_str().to_owned(),
-                                crate::projections::PauseScheduledRecord {
-                                    run_id: e.run_id.clone(),
-                                    project: e.project.clone(),
-                                    resume_at_ms,
-                                    created_at_ms: stored.stored_at,
-                                },
-                            );
-                        }
-                    }
-                } else if matches!(
-                    e.transition.to,
-                    cairn_domain::RunState::Running
-                        | cairn_domain::RunState::Completed
-                        | cairn_domain::RunState::Failed
-                ) {
-                    // Run resumed/completed — remove from paused map.
-                    paused.remove(e.run_id.as_str());
-                }
-            }
-        }
-        let due: Vec<_> = paused
-            .into_values()
-            .filter(|r| r.resume_at_ms <= before_ms)
+        let mut due: Vec<_> = state
+            .pause_schedules
+            .values()
+            .filter(|r| r.project.tenant_id == *tenant_id && r.resume_at_ms <= before_ms)
+            .cloned()
             .collect();
-        Ok(due)
+        due.sort_by(|a, b| {
+            a.resume_at_ms
+                .cmp(&b.resume_at_ms)
+                .then_with(|| a.run_id.as_str().cmp(b.run_id.as_str()))
+        });
+        Ok(due.into_iter().take(limit).collect())
     }
 }
 
@@ -4305,7 +6943,13 @@ impl crate::projections::RecoveryEscalationReadModel for InMemoryStore {
     async fn list_by_tenant(
         &self,
         _tenant_id: &cairn_domain::TenantId,
+        _limit: usize,
+        _offset: usize,
     ) -> Result<Vec<cairn_domain::RecoveryEscalation>, StoreError> {
+        // Issue #570: trait shape updated to carry storage-layer
+        // pagination. The InMemoryStore impl is a no-op stub —
+        // recovery escalations are not projected here today. Callers
+        // always see an empty list regardless of page params.
         Ok(vec![])
     }
 }
@@ -4452,12 +7096,22 @@ impl crate::projections::ResourceSharingReadModel for InMemoryStore {
         target_workspace_id: &cairn_domain::WorkspaceId,
     ) -> Result<Vec<cairn_domain::resource_sharing::SharedResource>, StoreError> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(state
+        // RFC-025 Phase 2b.2b m1: sort by (shared_at_ms ASC, share_id ASC)
+        // to match pg/sqlite `ORDER BY shared_at_ms, share_id` so parity
+        // tests and operator dashboards see stable ordering under
+        // same-ms share bursts.
+        let mut out: Vec<_> = state
             .resource_shares
             .values()
             .filter(|s| &s.tenant_id == tenant_id && &s.target_workspace_id == target_workspace_id)
             .cloned()
-            .collect())
+            .collect();
+        out.sort_by(|a, b| {
+            a.shared_at_ms
+                .cmp(&b.shared_at_ms)
+                .then_with(|| a.share_id.cmp(&b.share_id))
+        });
+        Ok(out)
     }
     async fn get_share_for_resource(
         &self,
@@ -4477,6 +7131,152 @@ impl crate::projections::ResourceSharingReadModel for InMemoryStore {
                     && s.resource_id == resource_id
             })
             .cloned())
+    }
+}
+
+// -- RFC-025 Phase 2b.2b m3: SubagentSpawnReadModel --
+
+#[async_trait]
+impl crate::projections::SubagentSpawnReadModel for InMemoryStore {
+    async fn get_by_child_task(
+        &self,
+        child_task_id: &cairn_domain::TaskId,
+    ) -> Result<Option<crate::projections::SubagentSpawnRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.subagent_spawns.get(child_task_id.as_str()).cloned())
+    }
+
+    async fn get_by_child_run_id(
+        &self,
+        child_run_id: &cairn_domain::RunId,
+    ) -> Result<Option<crate::projections::SubagentSpawnRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .subagent_spawns
+            .values()
+            .find(|r| r.child_run_id.as_ref() == Some(child_run_id))
+            .cloned())
+    }
+
+    async fn list_by_parent_run(
+        &self,
+        parent_run_id: &cairn_domain::RunId,
+    ) -> Result<Vec<crate::projections::SubagentSpawnRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = state
+            .subagent_spawns
+            .values()
+            .filter(|r| r.parent_run_id == *parent_run_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.spawned_at_ms
+                .cmp(&b.spawned_at_ms)
+                .then_with(|| a.child_task_id.as_str().cmp(b.child_task_id.as_str()))
+        });
+        Ok(out)
+    }
+}
+
+// -- RFC-025 Phase 2b.2b m4: UserMessageReadModel --
+
+#[async_trait]
+impl crate::projections::UserMessageReadModel for InMemoryStore {
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::UserMessageRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = state
+            .user_messages
+            .values()
+            .filter(|m| m.run_id == *run_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.sequence
+                .cmp(&b.sequence)
+                .then_with(|| a.appended_at_ms.cmp(&b.appended_at_ms))
+        });
+        Ok(out.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn count_by_run(&self, run_id: &cairn_domain::RunId) -> Result<u64, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .user_messages
+            .values()
+            .filter(|m| m.run_id == *run_id)
+            .count() as u64)
+    }
+}
+
+// -- RFC-025 Phase 2b.2b m6: ToolRecoveryPauseReadModel --
+
+#[async_trait]
+impl crate::projections::ToolRecoveryPauseReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        tool_call_id: &str,
+    ) -> Result<Option<crate::projections::ToolRecoveryPauseRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.tool_recovery_pauses.get(tool_call_id).cloned())
+    }
+
+    async fn list_by_run(
+        &self,
+        run_id: &cairn_domain::RunId,
+    ) -> Result<Vec<crate::projections::ToolRecoveryPauseRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = state
+            .tool_recovery_pauses
+            .values()
+            .filter(|p| p.run_id == *run_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.paused_at_ms
+                .cmp(&b.paused_at_ms)
+                .then_with(|| a.tool_call_id.cmp(&b.tool_call_id))
+        });
+        Ok(out)
+    }
+}
+
+// -- RFC-025 Phase 2b.2b m5: SoulPatchReadModel --
+
+#[async_trait]
+impl crate::projections::SoulPatchReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        patch_id: &str,
+    ) -> Result<Option<crate::projections::SoulPatchRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.soul_patches.get(patch_id).cloned())
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::tenancy::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::SoulPatchRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = state
+            .soul_patches
+            .values()
+            .filter(|p| p.project == *project)
+            .cloned()
+            .collect();
+        // Newest-first by proposed_at_ms, tiebreak on patch_id DESC.
+        out.sort_by(|a, b| {
+            b.proposed_at_ms
+                .cmp(&a.proposed_at_ms)
+                .then_with(|| b.patch_id.cmp(&a.patch_id))
+        });
+        Ok(out.into_iter().skip(offset).take(limit).collect())
     }
 }
 
@@ -4528,9 +7328,278 @@ impl crate::projections::FfLeaseHistoryCursorStore for InMemoryStore {
     }
 }
 
+// ── F65 PR-2: orchestrator-session read models ────────────────────────────
+
+#[async_trait]
+impl crate::projections::SessionOutcomeReadModel for InMemoryStore {
+    async fn get_by_root_run(
+        &self,
+        project: &ProjectKey,
+        root_run_id: &RunId,
+    ) -> Result<Option<crate::projections::SessionOutcomeRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Defence-in-depth per issue #438: filter on the project tuple
+        // even though the row also has a unique id, so a caller that
+        // forgets to pre-check the tenant cannot return a foreign
+        // outcome. Returning None (not NotFound) is intentional: it
+        // mirrors the pg/sqlite `AND tenant_id/workspace_scope/project_id`
+        // WHERE clause which also yields an empty row-set.
+        Ok(state
+            .session_outcomes
+            .get(root_run_id.as_str())
+            .filter(|o| o.project == *project)
+            .cloned())
+    }
+
+    async fn list_by_session(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::SessionOutcomeRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::SessionOutcomeRecord> = state
+            .session_outcomes
+            .values()
+            .filter(|o| o.project == *project && o.session_id == *session_id)
+            .cloned()
+            .collect();
+        // sort_by with a two-key comparator avoids the per-comparison
+        // String allocation that `sort_by_key` would require for
+        // tuples containing `String`.
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.root_run_id.as_str().cmp(b.root_run_id.as_str()))
+        });
+        Ok(results)
+    }
+}
+
+impl InMemoryStore {
+    /// F65 PR-5: enumerate every `workspace_snapshots` row that is
+    /// past-TTL AND belongs to a session in a terminal state.
+    ///
+    /// Lives directly on `InMemoryStore` (not a trait) because it
+    /// iterates two read models at once and the trait-based approach
+    /// requires an "enumerate all" method on `SessionReadModel` /
+    /// `WorkspaceSnapshotReadModel` that is not portable to pg/sqlite
+    /// without introducing a dialect-specific OFFSET/LIMIT pagination
+    /// plus a session-status join. The single-node in-memory store
+    /// has full visibility into both tables; the GC sweeper uses that.
+    pub fn list_snapshots_for_gc(
+        &self,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Vec<crate::projections::WorkspaceSnapshotRecord> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .workspace_snapshots
+            .values()
+            .filter(|s| s.reaped_at.is_none())
+            .filter(|s| now_ms.saturating_sub(s.created_at) >= ttl_ms)
+            .filter(|s| {
+                state
+                    .sessions
+                    .get(s.session_id.as_str())
+                    .map(|r| !matches!(r.state, cairn_domain::SessionState::Open))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait]
+impl crate::projections::WorkspaceSnapshotWriter for InMemoryStore {
+    async fn stamp_metadata(
+        &self,
+        snapshot_id: &WorkspaceSnapshotId,
+        snapshot_path: &str,
+        bytes: u64,
+        reflink_used: bool,
+        parent_snapshot_id: Option<&WorkspaceSnapshotId>,
+    ) -> Result<(), StoreError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rec) = state.workspace_snapshots.get_mut(snapshot_id.as_str()) {
+            rec.snapshot_path = snapshot_path.to_owned();
+            rec.bytes = bytes;
+            rec.reflink_used = reflink_used;
+            rec.parent_snapshot_id = parent_snapshot_id.cloned();
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::projections::WorkspaceSnapshotReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        project: &ProjectKey,
+        snapshot_id: &WorkspaceSnapshotId,
+    ) -> Result<Option<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .workspace_snapshots
+            .get(snapshot_id.as_str())
+            .filter(|s| s.project == *project)
+            .cloned())
+    }
+
+    async fn list_by_session(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::WorkspaceSnapshotRecord> = state
+            .workspace_snapshots
+            .values()
+            .filter(|s| s.project == *project && s.session_id == *session_id)
+            .cloned()
+            .collect();
+        // sort_by avoids the per-comparison String allocation that
+        // sort_by_key would need here. See the matching rationale on
+        // `SessionOutcomeReadModel::list_by_session` above.
+        results.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.snapshot_id.as_str().cmp(b.snapshot_id.as_str()))
+        });
+        Ok(results)
+    }
+
+    async fn lineage(
+        &self,
+        project: &ProjectKey,
+        start: &WorkspaceSnapshotId,
+    ) -> Result<Vec<crate::projections::WorkspaceSnapshotRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut chain: Vec<crate::projections::WorkspaceSnapshotRecord> = Vec::new();
+        let mut cursor = Some(start.as_str().to_owned());
+        // Bound the walk to table size so a cycle in the lineage chain
+        // cannot spin forever. The pg FK on `parent_snapshot_id` makes
+        // cycles unreachable in practice, but the in-memory store has no
+        // such guardrail — be defensive.
+        let cap = state.workspace_snapshots.len() + 1;
+        for _ in 0..cap {
+            let Some(id) = cursor.take() else {
+                break;
+            };
+            let Some(rec) = state.workspace_snapshots.get(&id) else {
+                break;
+            };
+            // Issue #438: a lineage chain is always within one project
+            // by construction (parent/child rows share the same scope at
+            // insert time). A boundary crossing therefore means writer
+            // corruption — stop walking rather than leak a foreign row.
+            if rec.project != *project {
+                break;
+            }
+            cursor = rec
+                .parent_snapshot_id
+                .as_ref()
+                .map(|p| p.as_str().to_owned());
+            chain.push(rec.clone());
+        }
+        Ok(chain)
+    }
+}
+
+#[async_trait]
+impl crate::projections::WorkspaceRegistryReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        project: &ProjectKey,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .workspace_registry
+            .get(workspace_id.as_str())
+            .filter(|w| w.project == *project)
+            .cloned())
+    }
+
+    async fn get_by_root_run(
+        &self,
+        project: &ProjectKey,
+        root_run_id: &RunId,
+    ) -> Result<Option<crate::projections::WorkspaceRegistryRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .workspace_registry
+            .values()
+            .find(|w| w.project == *project && w.root_run_id == *root_run_id)
+            .cloned())
+    }
+}
+
+#[async_trait]
+impl crate::projections::F65CheckpointReadModel for InMemoryStore {
+    async fn get_f65(
+        &self,
+        project: &ProjectKey,
+        checkpoint_id: &CheckpointId,
+    ) -> Result<Option<crate::projections::F65CheckpointRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .f65_checkpoints
+            .get(checkpoint_id.as_str())
+            .filter(|c| c.project == *project)
+            .cloned())
+    }
+
+    async fn list_by_session(
+        &self,
+        project: &ProjectKey,
+        session_id: &SessionId,
+    ) -> Result<Vec<crate::projections::F65CheckpointRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<crate::projections::F65CheckpointRecord> = state
+            .f65_checkpoints
+            .values()
+            .filter(|c| c.project == *project && c.session_id == *session_id)
+            .cloned()
+            .collect();
+        // sort_by avoids allocating a String per comparison (same
+        // rationale as the matching SessionOutcomeReadModel /
+        // WorkspaceSnapshotReadModel impls above).
+        results.sort_by(|a, b| {
+            a.iteration
+                .cmp(&b.iteration)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a.checkpoint_id.as_str().cmp(b.checkpoint_id.as_str()))
+        });
+        Ok(results)
+    }
+}
+
 // ── Convenience query methods for cairn-app ───────────────────────────────
 
 impl InMemoryStore {
+    /// #670 G4 PR-1b-4: restore a root run's `in_flight_descendants`
+    /// counter to a specific value. Used by cairn-app's boot
+    /// reconciliation pass after the event-log replay re-initialises
+    /// the in-memory projection: the descendant counter is mutated
+    /// via direct SQL UPDATE (not event-sourced), so replay rebuilds
+    /// the projection with counter=0. cairn-app reads the authoritative
+    /// values from the durable backend via
+    /// `RunDescendantsCounter::list_nonzero_descendant_counters` and
+    /// writes them back here.
+    ///
+    /// No-op if `root_run_id` is missing from the projection
+    /// (shouldn't happen for a row that came from the durable
+    /// backend, but safely tolerated). Unlike `try_increment_*` and
+    /// `decrement_descendants`, this does NOT bump `version` or
+    /// `updated_at` — the reconciliation pass is a projection repair,
+    /// not a logical state change.
+    pub async fn restore_descendants_counter(&self, root_run_id: &cairn_domain::RunId, value: i64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(row) = state.runs.get_mut(root_run_id.as_str()) {
+            row.in_flight_descendants = value;
+        }
+    }
+
     /// Count runs currently in active states (Running or Leased).
     pub async fn count_active_runs(&self) -> u64 {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -4715,6 +7784,7 @@ impl InMemoryStore {
         state.runs.clear();
         state.tasks.clear();
         state.approvals.clear();
+        state.approval_delegations.clear();
         state.checkpoints.clear();
         state.mailbox_messages.clear();
         state.tool_invocations.clear();
@@ -4740,6 +7810,7 @@ impl InMemoryStore {
         state.llm_traces.clear();
         state.operator_profiles.clear();
         state.full_operator_profiles.clear();
+        state.operator_tenant_roles.clear();
         state.workspace_members.clear();
         state.signal_subscriptions.clear();
         state.provider_health_records.clear();
@@ -4748,12 +7819,17 @@ impl InMemoryStore {
         state.credentials.clear();
         state.channels.clear();
         state.channel_messages.clear();
+        state.channel_message_keys.clear();
         state.credential_rotations.clear();
         state.licenses.clear();
         state.entitlement_overrides.clear();
         state.notification_prefs.clear();
         state.notification_records.clear();
+        state.notification_record_ids.clear();
         state.guardrail_policies.clear();
+        state.guardrail_policy_tenants.clear();
+        state.guardrail_evaluations.clear();
+        state.guardrail_evaluation_keys.clear();
         state.provider_budgets.clear();
         state.provider_connections.clear();
         state.quotas.clear();
@@ -4765,8 +7841,22 @@ impl InMemoryStore {
         state.retention_policies.clear();
         state.route_policies.clear();
         state.resource_shares.clear();
+        // Issue #592: pause_schedules is an evict-on-resume projection
+        // that must be part of compaction's clear-then-rebuild pass.
+        // Otherwise a compact-while-paused run's schedule row would
+        // duplicate into the rebuilt map or, worse, survive a
+        // retention-window prune of its originating RunStateChanged
+        // event and leak a stale resume entry into `list_due`.
+        state.pause_schedules.clear();
         state.snapshots.clear();
         state.command_id_index.clear();
+        // RFC-025 Phase 1.5a: trigger / run_template / trigger_fires
+        // projections need to be part of compaction's clear-then-rebuild
+        // pass, otherwise a compact-while-running would leave stale rows
+        // for deleted triggers in place after the event log is pruned.
+        state.triggers.clear();
+        state.run_templates.clear();
+        state.trigger_fires.clear();
 
         // Rebuild projections from retained events.
         for event in state.events.clone() {
@@ -4869,6 +7959,7 @@ impl InMemoryStore {
             state.runs.clear();
             state.tasks.clear();
             state.approvals.clear();
+            state.approval_delegations.clear();
             state.checkpoints.clear();
             state.mailbox_messages.clear();
             state.tool_invocations.clear();
@@ -4894,6 +7985,7 @@ impl InMemoryStore {
             state.llm_traces.clear();
             state.operator_profiles.clear();
             state.full_operator_profiles.clear();
+            state.operator_tenant_roles.clear();
             state.workspace_members.clear();
             state.signal_subscriptions.clear();
             state.provider_health_records.clear();
@@ -4902,12 +7994,17 @@ impl InMemoryStore {
             state.credentials.clear();
             state.channels.clear();
             state.channel_messages.clear();
+            state.channel_message_keys.clear();
             state.credential_rotations.clear();
             state.licenses.clear();
             state.entitlement_overrides.clear();
             state.notification_prefs.clear();
             state.notification_records.clear();
+            state.notification_record_ids.clear();
             state.guardrail_policies.clear();
+            state.guardrail_policy_tenants.clear();
+            state.guardrail_evaluations.clear();
+            state.guardrail_evaluation_keys.clear();
             state.provider_budgets.clear();
             state.provider_connections.clear();
             state.quotas.clear();
@@ -4921,6 +8018,11 @@ impl InMemoryStore {
             state.resource_shares.clear();
             state.snapshots.clear();
             state.command_id_index.clear();
+            // RFC-025 Phase 1.5a: rehydrate trigger / run_template /
+            // trigger_fires projections from the retained event log.
+            state.triggers.clear();
+            state.run_templates.clear();
+            state.trigger_fires.clear();
 
             for event in state.events.clone() {
                 Self::apply_projection(&mut state, &event);
@@ -4949,11 +8051,18 @@ impl InMemoryStore {
     }
 
     /// List runs with optional filters.
+    ///
+    /// `agent_role_id` filters by the run's `agent_role_id` field; it
+    /// matches `Some(id)` (exact equality) — rows with `None` never
+    /// match when the filter is present. Used by the RFC 031
+    /// retract-confirmation modal to surface the N-runs-currently-
+    /// using-this-role count before the operator commits.
     pub async fn list_runs_filtered(
         &self,
         query: &cairn_domain::tenancy::ProjectKey,
         session_id: Option<&cairn_domain::SessionId>,
         status: Option<cairn_domain::RunState>,
+        agent_role_id: Option<&str>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::projections::RunRecord>, crate::StoreError> {
@@ -4964,6 +8073,13 @@ impl InMemoryStore {
             .filter(|r| r.project == *query)
             .filter(|r| session_id.is_none_or(|s| r.session_id == *s))
             .filter(|r| status.is_none_or(|st| r.state == st))
+            .filter(|r| {
+                agent_role_id.is_none_or(|role| {
+                    r.agent_role_id
+                        .as_deref()
+                        .is_some_and(|existing| existing == role)
+                })
+            })
             .skip(offset)
             .take(limit)
             .cloned()
@@ -4971,11 +8087,17 @@ impl InMemoryStore {
     }
 
     /// List tasks with optional filters.
+    ///
+    /// The `query` project key is always applied so the list cannot leak
+    /// tasks across tenants. Issue #234: previously the filter args were
+    /// silently ignored and every task in the store was returned
+    /// regardless of scope. `run_id` and `state_filter` narrow the
+    /// result further when present.
     pub async fn list_tasks_filtered(
         &self,
-        _query: &cairn_domain::tenancy::ProjectKey,
-        _run_id: Option<&cairn_domain::RunId>,
-        _state_filter: Option<cairn_domain::TaskState>,
+        query: &cairn_domain::tenancy::ProjectKey,
+        run_id: Option<&cairn_domain::RunId>,
+        state_filter: Option<cairn_domain::TaskState>,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::projections::TaskRecord>, crate::StoreError> {
@@ -4983,6 +8105,9 @@ impl InMemoryStore {
         Ok(state
             .tasks
             .values()
+            .filter(|t| t.project == *query)
+            .filter(|t| run_id.is_none_or(|r| t.parent_run_id.as_ref() == Some(r)))
+            .filter(|t| state_filter.is_none_or(|st| t.state == st))
             .skip(offset)
             .take(limit)
             .cloned()
@@ -5178,6 +8303,7 @@ impl InMemoryStore {
         state.runs.clear();
         state.tasks.clear();
         state.approvals.clear();
+        state.approval_delegations.clear();
         state.checkpoints.clear();
         state.mailbox_messages.clear();
         state.tool_invocations.clear();
@@ -5200,6 +8326,7 @@ impl InMemoryStore {
         state.llm_traces.clear();
         state.operator_profiles.clear();
         state.full_operator_profiles.clear();
+        state.operator_tenant_roles.clear();
         state.workspace_members.clear();
         state.signal_subscriptions.clear();
         state.provider_health_records.clear();
@@ -5208,12 +8335,17 @@ impl InMemoryStore {
         state.credentials.clear();
         state.channels.clear();
         state.channel_messages.clear();
+        state.channel_message_keys.clear();
         state.credential_rotations.clear();
         state.licenses.clear();
         state.entitlement_overrides.clear();
         state.notification_prefs.clear();
         state.notification_records.clear();
+        state.notification_record_ids.clear();
         state.guardrail_policies.clear();
+        state.guardrail_policy_tenants.clear();
+        state.guardrail_evaluations.clear();
+        state.guardrail_evaluation_keys.clear();
         state.provider_budgets.clear();
         state.provider_connections.clear();
         state.quotas.clear();
@@ -5229,6 +8361,11 @@ impl InMemoryStore {
         state.workspaces.clear();
         state.projects.clear();
         state.snapshots.clear();
+        // RFC-025 Phase 1.5a: drop trigger/run_template/trigger_fires rows
+        // so the snapshot replay below rebuilds a fresh copy.
+        state.triggers.clear();
+        state.run_templates.clear();
+        state.trigger_fires.clear();
 
         // Replay events in order.
         let count = snap.events.len() as u64;
@@ -5242,6 +8379,248 @@ impl InMemoryStore {
         count
     }
 }
+
+// ── RFC-025 Phase 1.5a: TriggerReadModel / RunTemplateReadModel /
+// TriggerFireReadModel on InMemoryStore ────────────────────────────────
+//
+// Backs the same projection-first query path that pg/sqlite implement.
+// The HashMaps + Vec are written inside `apply_projection` above from
+// the 13 trigger / run_template / audit RuntimeEvent variants; read
+// paths below are simple HashMap lookups + linear Vec scans. The linear
+// scans are fine at this scale — the three bounded windows (duplicate
+// ledger by (trigger_id, signal_id), per-trigger 1-min rate-limit, and
+// per-project 1-hour budget) are microsecond-cheap even on tens of
+// thousands of rows.
+
+#[async_trait]
+impl crate::projections::TriggerReadModel for InMemoryStore {
+    async fn get_trigger(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+    ) -> Result<Option<crate::projections::TriggerRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.triggers.get(trigger_id.as_str()).cloned())
+    }
+
+    async fn list_triggers_by_project(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::TriggerRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<_> = state
+            .triggers
+            .values()
+            .filter(|r| r.project == *project)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| a.trigger_id.as_str().cmp(b.trigger_id.as_str()));
+        Ok(results)
+    }
+
+    async fn list_matching_enabled(
+        &self,
+        project: &ProjectKey,
+        signal_type: &str,
+        plugin_id: &str,
+    ) -> Result<Vec<crate::projections::TriggerRecord>, StoreError> {
+        // Linear scan over all triggers in the store. pg/sqlite use the
+        // `idx_triggers_signal_match` composite index on `(tenant_id,
+        // workspace_id, project_id, signal_type)` for a cheap lookup;
+        // the in-memory store scales with total trigger count across
+        // the process, which is fine at the `--db memory` scale (hundreds
+        // of triggers per dev box) but would be a hot spot if `--db memory`
+        // ever held tens-of-thousands of triggers. If that ever happens,
+        // swap in a `HashMap<(ProjectKey, String), Vec<TriggerId>>`
+        // index populated in the `TriggerCreated`/`Deleted` arms.
+        // (PR #569 review: noted explicitly so future readers don't
+        // need to rediscover the tradeoff.)
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<_> = state
+            .triggers
+            .values()
+            .filter(|r| {
+                r.project == *project
+                    && matches!(r.state, crate::projections::TriggerStateKind::Enabled)
+                    && r.signal_type == signal_type
+                    && r.plugin_id.as_ref().is_none_or(|pid| pid == plugin_id)
+            })
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| a.trigger_id.as_str().cmp(b.trigger_id.as_str()));
+        Ok(results)
+    }
+}
+
+#[async_trait]
+impl crate::projections::RunTemplateReadModel for InMemoryStore {
+    async fn get_template(
+        &self,
+        template_id: &cairn_domain::ids::RunTemplateId,
+    ) -> Result<Option<crate::projections::RunTemplateRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.run_templates.get(template_id.as_str()).cloned())
+    }
+
+    async fn list_templates_by_project(
+        &self,
+        project: &ProjectKey,
+    ) -> Result<Vec<crate::projections::RunTemplateRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut results: Vec<_> = state
+            .run_templates
+            .values()
+            .filter(|r| r.project == *project)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| a.template_id.as_str().cmp(b.template_id.as_str()));
+        Ok(results)
+    }
+
+    async fn triggers_referencing_template(
+        &self,
+        template_id: &cairn_domain::ids::RunTemplateId,
+    ) -> Result<Vec<cairn_domain::ids::TriggerId>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .triggers
+            .values()
+            .filter(|t| &t.run_template_id == template_id)
+            .map(|t| t.trigger_id.clone())
+            .collect())
+    }
+}
+
+#[async_trait]
+impl crate::projections::TriggerFireReadModel for InMemoryStore {
+    async fn has_fired(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+        signal_id: &str,
+    ) -> Result<bool, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.trigger_fires.iter().any(|f| {
+            &f.trigger_id == trigger_id
+                && f.signal_id == signal_id
+                && matches!(f.outcome, crate::projections::TriggerFireOutcome::Fired)
+        }))
+    }
+
+    async fn count_fires_since(
+        &self,
+        trigger_id: &cairn_domain::ids::TriggerId,
+        since_ms: u64,
+    ) -> Result<u32, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .trigger_fires
+            .iter()
+            .filter(|f| {
+                &f.trigger_id == trigger_id
+                    && matches!(f.outcome, crate::projections::TriggerFireOutcome::Fired)
+                    && f.at_ms > since_ms
+            })
+            .count() as u32)
+    }
+
+    async fn count_project_fires_since(
+        &self,
+        project: &ProjectKey,
+        since_ms: u64,
+    ) -> Result<u32, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .trigger_fires
+            .iter()
+            .filter(|f| {
+                f.project == *project
+                    && matches!(f.outcome, crate::projections::TriggerFireOutcome::Fired)
+                    && f.at_ms > since_ms
+            })
+            .count() as u32)
+    }
+}
+
+// ── RFC-025 Phase 2b.1 m4: plan_reviews read model (RFC 018) ────────
+
+#[async_trait]
+impl crate::projections::PlanReviewReadModel for InMemoryStore {
+    async fn get(
+        &self,
+        plan_run_id: &cairn_domain::RunId,
+    ) -> Result<Option<crate::projections::PlanReviewRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.plan_reviews.get(plan_run_id.as_str()).cloned())
+    }
+
+    async fn list_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::PlanReviewRecord> = state
+            .plan_reviews
+            .values()
+            .filter(|r| r.project == *project)
+            .cloned()
+            .collect();
+        // Newest-first on proposed_at, id DESC tiebreak so parity
+        // harness stays stable on identical timestamps (pg/sqlite
+        // ORDER BY uses the same compound key).
+        rows.sort_by(|a, b| {
+            b.proposed_at
+                .cmp(&a.proposed_at)
+                .then_with(|| b.plan_run_id.as_str().cmp(a.plan_run_id.as_str()))
+        });
+        Ok(rows.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn list_pending_by_project(
+        &self,
+        project: &cairn_domain::ProjectKey,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::PlanReviewRecord> = state
+            .plan_reviews
+            .values()
+            .filter(|r| {
+                r.project == *project && r.state == crate::projections::PlanReviewState::Proposed
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.proposed_at
+                .cmp(&a.proposed_at)
+                .then_with(|| b.plan_run_id.as_str().cmp(a.plan_run_id.as_str()))
+        });
+        Ok(rows.into_iter().take(limit).collect())
+    }
+
+    async fn list_by_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+        limit: usize,
+    ) -> Result<Vec<crate::projections::PlanReviewRecord>, StoreError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::projections::PlanReviewRecord> = state
+            .plan_reviews
+            .values()
+            .filter(|r| r.session_id == *session_id)
+            .cloned()
+            .collect();
+        // Oldest-proposed-first on session lineage — callers walk the
+        // plan → revision chain in creation order.
+        rows.sort_by(|a, b| {
+            a.proposed_at
+                .cmp(&b.proposed_at)
+                .then_with(|| a.plan_run_id.as_str().cmp(b.plan_run_id.as_str()))
+        });
+        Ok(rows.into_iter().take(limit).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5557,6 +8936,7 @@ mod tests {
                     prompt_release_id: None,
                     requested_at_ms: 100,
                     started_at_ms: 101,
+                    args_json: None,
                 })),
                 make_envelope(RuntimeEvent::ToolInvocationCompleted(
                     ToolInvocationCompleted {
@@ -5568,6 +8948,7 @@ mod tests {
                         outcome: ToolInvocationOutcomeKind::Success,
                         tool_call_id: None,
                         result_json: None,
+                        output_preview: None,
                     },
                 )),
             ])
@@ -5587,6 +8968,140 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].invocation_id, invocation_id);
+    }
+
+    /// #364: the in-memory `tool_invocation_progress` projection
+    /// records the LATEST progress event per invocation, inherits the
+    /// `ProjectKey` from the existing `tool_invocations` row, and
+    /// refuses to overwrite with an older event (out-of-order replay
+    /// guard). Mirrors the pg/sqlite `WHERE excluded.updated_at_ms
+    /// >= …` UPSERT.
+    #[tokio::test]
+    async fn tool_invocation_progress_projection_idempotent_against_out_of_order_replay() {
+        use crate::projections::ToolInvocationProgressReadModel;
+
+        let store = InMemoryStore::new();
+        let project = test_project();
+        let invocation_id = ToolInvocationId::new("tool_progress_1");
+
+        // Seed the invocation so the progress projection has a
+        // project scope to inherit.
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationStarted(
+                ToolInvocationStarted {
+                    project: project.clone(),
+                    invocation_id: invocation_id.clone(),
+                    session_id: None,
+                    run_id: None,
+                    task_id: None,
+                    target: ToolInvocationTarget::Builtin {
+                        tool_name: "fs.read".to_owned(),
+                    },
+                    execution_class: ExecutionClass::SupervisedProcess,
+                    prompt_release_id: None,
+                    requested_at_ms: 100,
+                    started_at_ms: 101,
+                    args_json: None,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        // First progress event → stored.
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationProgressUpdated(
+                cairn_domain::ToolInvocationProgressUpdated {
+                    invocation_id: invocation_id.clone(),
+                    progress_pct: 20,
+                    message: Some("phase 1".to_owned()),
+                    updated_at_ms: 200,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        let rec = ToolInvocationProgressReadModel::get(&store, &invocation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.project, project);
+        assert_eq!(rec.progress_pct, 20);
+        assert_eq!(rec.updated_at_ms, 200);
+
+        // Newer progress event → replaces.
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationProgressUpdated(
+                cairn_domain::ToolInvocationProgressUpdated {
+                    invocation_id: invocation_id.clone(),
+                    progress_pct: 60,
+                    message: Some("phase 2".to_owned()),
+                    updated_at_ms: 300,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        let rec = ToolInvocationProgressReadModel::get(&store, &invocation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.progress_pct, 60, "newer event must overwrite");
+        assert_eq!(rec.updated_at_ms, 300);
+
+        // Older replay → must NOT regress.
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationProgressUpdated(
+                cairn_domain::ToolInvocationProgressUpdated {
+                    invocation_id: invocation_id.clone(),
+                    progress_pct: 10,
+                    message: Some("stale phase 0".to_owned()),
+                    updated_at_ms: 50,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        let rec = ToolInvocationProgressReadModel::get(&store, &invocation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.progress_pct, 60,
+            "older replay must NOT overwrite newer progress — would regress the operator UI",
+        );
+        assert_eq!(rec.updated_at_ms, 300);
+    }
+
+    /// #364: a progress event for an invocation that has not yet been
+    /// started is a no-op (we refuse to fabricate a project scope).
+    /// This is the edge case documented in the apply handler — in
+    /// practice `ToolInvocationStarted` always precedes progress.
+    #[tokio::test]
+    async fn tool_invocation_progress_projection_noop_without_invocation_row() {
+        use crate::projections::ToolInvocationProgressReadModel;
+
+        let store = InMemoryStore::new();
+        let invocation_id = ToolInvocationId::new("tool_progress_orphan");
+
+        store
+            .append(&[make_envelope(RuntimeEvent::ToolInvocationProgressUpdated(
+                cairn_domain::ToolInvocationProgressUpdated {
+                    invocation_id: invocation_id.clone(),
+                    progress_pct: 5,
+                    message: None,
+                    updated_at_ms: 10,
+                },
+            ))])
+            .await
+            .unwrap();
+
+        assert!(
+            ToolInvocationProgressReadModel::get(&store, &invocation_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "progress without a prior Started event must NOT create a projection row",
+        );
     }
 
     #[tokio::test]
@@ -5612,6 +9127,7 @@ mod tests {
                     prompt_release_id: None,
                     requested_at_ms: 200,
                     started_at_ms: 201,
+                    args_json: None,
                 })),
                 make_envelope(RuntimeEvent::ToolInvocationFailed(ToolInvocationFailed {
                     project: project.clone(),
@@ -5621,6 +9137,7 @@ mod tests {
                     finished_at_ms: 205,
                     outcome: ToolInvocationOutcomeKind::Canceled,
                     error_message: Some("canceled".to_owned()),
+                    output_preview: None,
                 })),
                 make_envelope(RuntimeEvent::ToolInvocationStarted(ToolInvocationStarted {
                     project,
@@ -5635,6 +9152,7 @@ mod tests {
                     prompt_release_id: None,
                     requested_at_ms: 100,
                     started_at_ms: 101,
+                    args_json: None,
                 })),
             ])
             .await
@@ -6339,5 +9857,315 @@ mod tests {
             1,
             "primary projection must still reflect the in-memory write so diagnosis + retry see consistent state"
         );
+    }
+
+    // Issue #570: PauseScheduleReadModel::list_due must filter by
+    // tenant and apply the `limit` at the trait layer.
+    //
+    // The cairn-app integration test for the resume-due endpoint is
+    // stuck behind a separate latent bug: the bridge converter
+    // `bridge_event_to_runtime_event` drops `pause_reason` when
+    // emitting `ExecutionSuspended → RunStateChanged`, so the
+    // service-layer path never lands a pause_reason on the cairn-store
+    // event log. This test bypasses the bridge by appending raw
+    // RunStateChanged envelopes directly — same shape `list_due`
+    // walks — so the pagination contract is still exercised.
+    #[tokio::test]
+    async fn pause_schedule_list_due_filters_by_tenant_and_respects_limit() {
+        use crate::projections::PauseScheduleReadModel;
+        use cairn_domain::lifecycle::{PauseReason, PauseReasonKind};
+
+        let store = InMemoryStore::new();
+        let tenant_a = cairn_domain::TenantId::new("tenant_a");
+        let tenant_b = cairn_domain::TenantId::new("tenant_b");
+
+        // Helper: append a RunStateChanged(Running→Paused) with a
+        // scheduled resume under the given project.
+        let append_paused = |project: ProjectKey, run_id: &str, resume_after_ms: u64| {
+            let envelope = make_envelope(RuntimeEvent::RunStateChanged(RunStateChanged {
+                project,
+                run_id: RunId::new(run_id),
+                transition: StateTransition {
+                    from: Some(RunState::Running),
+                    to: RunState::Paused,
+                },
+                failure_class: None,
+                pause_reason: Some(PauseReason {
+                    kind: PauseReasonKind::OperatorPause,
+                    detail: None,
+                    resume_after_ms: Some(resume_after_ms),
+                    actor: None,
+                }),
+                resume_trigger: None,
+            }));
+            let store = &store;
+            async move { store.append(&[envelope]).await.unwrap() }
+        };
+
+        // Seed 4 paused runs under tenant_a and 2 under tenant_b.
+        let project_a = ProjectKey::new(tenant_a.as_str(), "w", "p");
+        let project_b = ProjectKey::new(tenant_b.as_str(), "w", "p");
+        for i in 0..4u32 {
+            append_paused(project_a.clone(), &format!("run_a_{i}"), 0).await;
+        }
+        for i in 0..2u32 {
+            append_paused(project_b.clone(), &format!("run_b_{i}"), 0).await;
+        }
+
+        // now_ms is 1 s after the append — `resume_at_ms = stored_at +
+        // resume_after_ms(0) = stored_at`, which is before `now_ms`,
+        // so every paused row is due.
+        let now_ms = u64::MAX / 2; // well past any wall-clock append time
+
+        let a_page = PauseScheduleReadModel::list_due(&store, &tenant_a, now_ms, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            a_page.len(),
+            4,
+            "tenant_a sees all 4 of its own paused runs, never tenant_b's"
+        );
+        assert!(
+            a_page.iter().all(|r| r.project.tenant_id == tenant_a),
+            "cross-tenant leak: {a_page:?}"
+        );
+
+        let b_page = PauseScheduleReadModel::list_due(&store, &tenant_b, now_ms, 100)
+            .await
+            .unwrap();
+        assert_eq!(b_page.len(), 2, "tenant_b sees its 2 runs");
+
+        // Limit enforcement: 4 rows under tenant_a, limit=2 → 2 rows.
+        let a_limited = PauseScheduleReadModel::list_due(&store, &tenant_a, now_ms, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            a_limited.len(),
+            2,
+            "limit bound at projection, not handler: {a_limited:?}"
+        );
+    }
+
+    // Issue #570: RecoveryEscalationReadModel's trait now takes
+    // `limit` + `offset`. The InMemoryStore impl is a stub that
+    // always returns empty — assert that still holds post-#570 so a
+    // future projection-backed impl doesn't change the no-escalations
+    // wire contract without conscious migration.
+    #[tokio::test]
+    async fn recovery_escalation_list_by_tenant_paginated_stub_is_empty() {
+        use crate::projections::RecoveryEscalationReadModel;
+        let store = InMemoryStore::new();
+        let tenant = cairn_domain::TenantId::new("tenant_stub");
+        let page = RecoveryEscalationReadModel::list_by_tenant(&store, &tenant, 10, 0)
+            .await
+            .unwrap();
+        assert!(page.is_empty(), "InMemoryStore stub must stay empty");
+    }
+
+    // Issue #570: RunSlaReadModel::list_breached_by_tenant orders
+    // newest-first and respects limit + offset.
+    #[tokio::test]
+    async fn run_sla_list_breached_newest_first_with_pagination() {
+        use crate::projections::RunSlaReadModel;
+        let store = InMemoryStore::new();
+        let tenant = cairn_domain::TenantId::new("tenant_sla");
+
+        // Seed 5 breaches with strictly increasing breached_at_ms so
+        // newest-first ordering is unambiguous.
+        for i in 0..5u32 {
+            let envelope = make_envelope(RuntimeEvent::RunSlaBreached(
+                cairn_domain::events::RunSlaBreached {
+                    run_id: RunId::new(format!("run_sla_{i}")),
+                    tenant_id: tenant.clone(),
+                    elapsed_ms: 60_000 + i as u64,
+                    target_ms: 30_000,
+                    breached_at_ms: 1_700_000_000_000 + (i as u64) * 1_000,
+                },
+            ));
+            store.append(&[envelope]).await.unwrap();
+        }
+
+        // Page 1 of 2 — newest-first: run_sla_4, run_sla_3.
+        let page1 = RunSlaReadModel::list_breached_by_tenant(&store, &tenant, 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].run_id.as_str(), "run_sla_4");
+        assert_eq!(page1[1].run_id.as_str(), "run_sla_3");
+
+        // Offset 2 → page 2: run_sla_2, run_sla_1.
+        let page2 = RunSlaReadModel::list_breached_by_tenant(&store, &tenant, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2[0].run_id.as_str(), "run_sla_2");
+        assert_eq!(page2[1].run_id.as_str(), "run_sla_1");
+
+        // Offset 4 → tail: single row (run_sla_0).
+        let tail = RunSlaReadModel::list_breached_by_tenant(&store, &tenant, 2, 4)
+            .await
+            .unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].run_id.as_str(), "run_sla_0");
+    }
+
+    // Issue #570: RunReadModel::list_stalled composes state +
+    // staleness + tenant at the projection surface with pagination.
+    #[tokio::test]
+    async fn run_list_stalled_combines_state_staleness_tenant_with_pagination() {
+        let store = InMemoryStore::new();
+        let tenant = cairn_domain::TenantId::new("tenant_stall");
+        let project = ProjectKey::new(tenant.as_str(), "w", "p");
+        let session_id = SessionId::new("sess_stall");
+
+        // Seed 5 runs: 3 Running, 1 Pending, 1 Completed (not stalled).
+        for (i, state) in [
+            RunState::Running,
+            RunState::Running,
+            RunState::Running,
+            RunState::Pending,
+            RunState::Completed, // terminal — must be excluded
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let run_id = RunId::new(format!("run_stall_{i}"));
+            store
+                .append(&[make_envelope(RuntimeEvent::RunCreated(RunCreated {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    parent_run_id: None,
+                    agent_role_id: None,
+                    prompt_release_id: None,
+                }))])
+                .await
+                .unwrap();
+            if state != RunState::Pending {
+                // RunCreated starts the run in Pending; transition to
+                // the target state for the non-Pending cases.
+                store
+                    .append(&[make_envelope(RuntimeEvent::RunStateChanged(
+                        RunStateChanged {
+                            project: project.clone(),
+                            run_id,
+                            transition: StateTransition {
+                                from: Some(RunState::Pending),
+                                to: state,
+                            },
+                            failure_class: None,
+                            pause_reason: None,
+                            resume_trigger: None,
+                        },
+                    ))])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // now_ms far into the future so every non-terminal run is
+        // considered stale against a 0ms staleness window.
+        let now_ms = u64::MAX / 2;
+
+        // Tenant filter: wrong tenant sees 0 runs.
+        let other_tenant = cairn_domain::TenantId::new("tenant_other");
+        let other = RunReadModel::list_stalled(&store, &other_tenant, now_ms, 0, 100, 0)
+            .await
+            .unwrap();
+        assert!(other.is_empty(), "cross-tenant leak: {other:?}");
+
+        // Correct tenant sees 3 Running + 1 Pending = 4 non-terminal
+        // stalled runs. Completed is excluded by the SQL-equivalent
+        // predicate.
+        let all_stalled = RunReadModel::list_stalled(&store, &tenant, now_ms, 0, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(all_stalled.len(), 4, "{all_stalled:?}");
+        assert!(
+            all_stalled
+                .iter()
+                .all(|r| matches!(r.state, RunState::Running | RunState::Pending)),
+            "terminal runs leaked: {all_stalled:?}"
+        );
+
+        // Pagination: limit=2 → 2 rows, offset=2 → next 2 rows.
+        let page1 = RunReadModel::list_stalled(&store, &tenant, now_ms, 0, 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        let page2 = RunReadModel::list_stalled(&store, &tenant, now_ms, 0, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        let union: std::collections::HashSet<_> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|r| r.run_id.as_str().to_owned())
+            .collect();
+        assert_eq!(union.len(), 4, "pages must be disjoint");
+    }
+
+    // RFC 031 PR-D3 — `list_runs_filtered` honours `agent_role_id`.
+    // Powers the retract-modal in-flight-runs probe.
+    #[tokio::test]
+    async fn list_runs_filtered_honours_agent_role_id() {
+        let store = InMemoryStore::new();
+        let project = ProjectKey::new("t_r", "w_r", "p_r");
+        let session_id = SessionId::new("sess_r");
+
+        // Seed: r0 (role=alpha), r1 (role=alpha), r2 (role=beta),
+        // r3 (role=None). RunCreated carries agent_role_id directly.
+        let seed = [
+            ("r0", Some("alpha")),
+            ("r1", Some("alpha")),
+            ("r2", Some("beta")),
+            ("r3", None),
+        ];
+        for (run_id, role) in &seed {
+            store
+                .append(&[make_envelope(RuntimeEvent::RunCreated(RunCreated {
+                    project: project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: RunId::new(*run_id),
+                    parent_run_id: None,
+                    agent_role_id: role.map(str::to_owned),
+                    prompt_release_id: None,
+                }))])
+                .await
+                .unwrap();
+        }
+
+        // No filter → all 4.
+        let all = store
+            .list_runs_filtered(&project, None, None, None, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 4);
+
+        // Filter by role=alpha → 2.
+        let alpha = store
+            .list_runs_filtered(&project, None, None, Some("alpha"), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(alpha.len(), 2);
+        assert!(alpha
+            .iter()
+            .all(|r| r.agent_role_id.as_deref() == Some("alpha")));
+
+        // Filter by role=beta → 1.
+        let beta = store
+            .list_runs_filtered(&project, None, None, Some("beta"), 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].run_id.as_str(), "r2");
+
+        // Filter by a role no run carries → 0 (the None-role rows
+        // don't match by the exact-equality predicate).
+        let ghost = store
+            .list_runs_filtered(&project, None, None, Some("ghost"), 100, 0)
+            .await
+            .unwrap();
+        assert!(ghost.is_empty());
     }
 }

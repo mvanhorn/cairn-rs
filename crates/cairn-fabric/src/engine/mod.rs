@@ -53,13 +53,26 @@
 pub mod control_plane;
 pub mod control_plane_types;
 pub mod snapshots;
+// Valkey-specific implementations of `Engine` + `ControlPlaneBackend`.
+// Gated behind `fabric-valkey` so the traits remain compilable under
+// `--no-default-features` without dragging in `ferriskey` or
+// `ff_backend_valkey`. PR-C will add a sibling `postgres_impl`
+// gated behind `fabric-postgres`.
+#[cfg(feature = "fabric-valkey")]
 pub mod valkey_control_plane_impl;
+#[cfg(feature = "fabric-valkey")]
 pub mod valkey_impl;
 
-use std::collections::BTreeMap;
+// PR-C3: compile-only PostgreSQL stub. Gated on `fabric-postgres` so the
+// default Valkey build neither compiles nor links it. PR-C4 replaces
+// every `unimplemented!("PR-C4: …")` body with real delegations / PG
+// bodies and adds a live-Postgres integration test suite.
+#[cfg(feature = "fabric-postgres")]
+pub mod postgres_control_plane_impl;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
-use ff_core::types::{EdgeId, ExecutionId, FlowId, WorkerId, WorkerInstanceId};
 
 use crate::error::FabricError;
 
@@ -69,13 +82,31 @@ pub use control_plane_types::{
     CancelFlowInput, CancelRunInput, ClaimGrantOutcome, CompleteRunInput, CreateFlowInput,
     CreateRunExecutionInput, DeliverApprovalSignalInput, EligibilityResult, ExecutionCreated,
     ExecutionLeaseContext, ExpiredLease, FailExecutionOutcome, FailRunInput, FlowCancelOutcome,
-    IssueGrantAndClaimInput, QuotaAdmission, RenewLeaseInput, ResumeRunInput, RotationFailure,
-    RotationOutcome, StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
-    SuspendRunInput, WorkerRegistration,
+    IssueGrantAndClaimInput, IssueReclaimGrantInput, IssueReclaimGrantOutcome, QuotaAdmission,
+    ReclaimExecutionInput, ReclaimExecutionOutcome, ReclaimGrantHandle, ReclaimedHandle,
+    RenewLeaseInput, ResumeRunInput, RotationFailure, RotationOutcome, StageDependencyEdgeInput,
+    StageDependencyOutcome, SubmitTaskInput, WorkerRegistration, WorkerSummary,
 };
+// Re-export the FF contracts + state-vector types the `Engine` trait's
+// `read_execution_info` surface depends on, plus the typed id surface
+// the trait methods take by reference. Keeps downstream callers (e.g.
+// `cairn_app::lease_keeper`) off a direct `flowfabric` dep while still
+// letting them pattern-match the full state vector (#666) and
+// instantiate `Engine` mocks in tests.
+pub use flowfabric::core::contracts::ExecutionInfo;
+pub use flowfabric::core::state::{
+    AttemptState, BlockingReason, EligibilityState, LifecyclePhase, OwnershipState, PublicState,
+    StateVector, TerminalOutcome,
+};
+pub use flowfabric::core::types::{
+    EdgeId, ExecutionId, FlowId, LaneId, Namespace, WorkerId, WorkerInstanceId,
+};
+#[cfg(feature = "fabric-postgres")]
+pub use postgres_control_plane_impl::PostgresControlPlane;
 pub use snapshots::{
     AttemptSummary, EdgeSnapshot, EdgeState, ExecutionSnapshot, FlowSnapshot, LeaseSummary,
 };
+#[cfg(feature = "fabric-valkey")]
 pub use valkey_impl::ValkeyEngine;
 
 /// Cairn-side read abstraction over FF state.
@@ -147,6 +178,26 @@ pub trait Engine: Send + Sync {
         key: &str,
     ) -> Result<Option<String>, FabricError>;
 
+    /// Fetch the `lane_id` stamped on an execution's core hash.
+    ///
+    /// Targeted read — cheaper than
+    /// [`Self::describe_execution`](Engine::describe_execution) when
+    /// the caller only needs the lane (e.g. `SignalBridge` assembling
+    /// an FCALL that routes through a lane-scoped index). Avoids the
+    /// full `HGETALL exec_core` + `HGETALL exec_tags` amplification
+    /// paid on every signal delivery on the hot path.
+    ///
+    /// FF stamps `lane_id` on the core hash at
+    /// `ff_create_flow` / `ff_create_execution` time and never
+    /// rewrites it — callers can cache the result per-execution for
+    /// the lifetime of the process without worrying about staleness.
+    ///
+    /// Returns `Ok(None)` if the execution's core hash doesn't exist
+    /// or the field is absent. Empty-string values are normalised to
+    /// `None` so callers can fall back to a default lane (cairn uses
+    /// `"cairn"`) via `.unwrap_or_else(|| LaneId::new("cairn"))`.
+    async fn get_execution_lane_id(&self, id: &ExecutionId) -> Result<Option<LaneId>, FabricError>;
+
     /// Set a single tag on an execution's tag hash.
     ///
     /// Namespace-guarded: `key` must match `^[a-z][a-z0-9_]*\.` —
@@ -190,34 +241,72 @@ pub trait Engine: Send + Sync {
         tags: &BTreeMap<String, String>,
     ) -> Result<(), FabricError>;
 
-    // ── Worker registry (Phase D PR 1) ──────────────────────────────────
+    // ── Worker registry (RFC-025 — FF 0.14 trait-routed) ────────────────
+    //
+    // FF 0.14 shipped 5 new `EngineBackend` trait methods covering the
+    // worker-pool lifecycle + live-worker readback + expired-lease
+    // enumeration (RFC-025 Phase 1-6). Cairn's cairn-side `Engine`
+    // trait mirrors them so services stay backend-agnostic. Both
+    // in-tree impls — [`valkey_impl::ValkeyEngine`] and
+    // [`postgres_control_plane_impl::PostgresControlPlane`] — route
+    // directly to the FF trait method; no bespoke per-backend commands.
 
-    /// Register a worker instance. Writes the worker hash, stamps the
-    /// initial heartbeat timestamp, adds the instance to the global
-    /// workers index, and registers each `key=value` capability on
-    /// the capability index. TTL = `3 × lease_ttl_ms` — dead workers
-    /// auto-expire if heartbeats stop.
+    /// Register (or idempotently refresh) a worker instance.
+    ///
+    /// Re-registering the same `instance_id` overwrites caps + lanes +
+    /// TTL (RFC-025 §9.3). FF 0.14 rejects re-registering with a
+    /// different `worker_id` under the same `instance_id` with
+    /// `Validation(InvalidInput, "instance_id reassigned")`.
+    ///
+    /// `liveness_ttl_ms` is stored alongside the registration so
+    /// `heartbeat_worker` refreshes to the same value without the
+    /// caller re-supplying it.
     async fn register_worker(
         &self,
         worker_id: &WorkerId,
         instance_id: &WorkerInstanceId,
-        capabilities: &[String],
+        namespace: &Namespace,
+        lanes: &BTreeSet<LaneId>,
+        capabilities: &BTreeSet<String>,
+        liveness_ttl_ms: u64,
     ) -> Result<WorkerRegistration, FabricError>;
 
-    /// Update the worker's `last_heartbeat_ms` field and extend its
-    /// TTL. Called on every worker tick.
-    async fn heartbeat_worker(&self, instance_id: &WorkerInstanceId) -> Result<(), FabricError>;
+    /// Refresh the worker-instance liveness TTL. Returns
+    /// `HeartbeatWorkerOutcome::NotRegistered` transparently via
+    /// [`FabricError`] on the TTL-expired-between-heartbeats race.
+    async fn heartbeat_worker(
+        &self,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+    ) -> Result<(), FabricError>;
 
-    /// Explicitly mark a worker dead (`is_alive = false`). The TTL
-    /// path covers the implicit case; this is the opt-out for graceful
-    /// shutdown.
-    async fn mark_worker_dead(&self, instance_id: &WorkerInstanceId) -> Result<(), FabricError>;
+    /// Operator-driven worker death (distinct from passive TTL expiry).
+    /// `reason` is capped at 256 bytes and must not contain control
+    /// characters; oversize / invalid reject with
+    /// `EngineError::Validation`. Idempotent: marking an already-absent
+    /// instance is a no-op success.
+    async fn mark_worker_dead(
+        &self,
+        instance_id: &WorkerInstanceId,
+        namespace: &Namespace,
+        reason: &str,
+    ) -> Result<(), FabricError>;
 
-    // ── Task lifecycle reads (Phase D PR 2b) ────────────────────────────
+    /// Enumerate live workers (RFC-025 Phase 6, §9.4) in the given
+    /// namespace. Pass `namespace = None` for a cross-namespace sweep
+    /// (auth enforced at the cairn-app admin route, NOT the trait
+    /// boundary).
+    async fn list_workers(
+        &self,
+        namespace: Option<&Namespace>,
+    ) -> Result<Vec<control_plane_types::WorkerSummary>, FabricError>;
+
+    // ── Task lifecycle reads ────────────────────────────────────────────
 
     /// Enumerate executions whose active lease has expired as of
-    /// `now_ms`, capped at `limit`. Read-only ZRANGEBYSCORE over FF's
-    /// `lease_expiry` zset across every execution partition.
+    /// `now_ms`, capped at `limit`. FF 0.14 routes this through
+    /// `EngineBackend::list_expired_leases`; every in-tree backend
+    /// ships a body (Valkey, Postgres, SQLite).
     ///
     /// FF's server-side lease_expiry scanner handles reclaim — this
     /// primitive exists so cairn can surface a projection of
@@ -231,4 +320,27 @@ pub trait Engine: Send + Sync {
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<control_plane_types::ExpiredLease>, FabricError>;
+
+    /// Read FF's full execution state vector for `id`.
+    ///
+    /// `Ok(None)` ⇒ no such execution in FF (id minted but never
+    /// submitted, or purged). `Ok(Some(_))` returns the 7-dimension
+    /// [`StateVector`](flowfabric::core::state::StateVector) that
+    /// drives FF's FCALL gating rules.
+    ///
+    /// The cairn-side lease keeper (issue #666) uses this probe to
+    /// classify the execution's `lifecycle_phase` / `attempt_state` /
+    /// `ownership_state` before issuing `ff_renew_lease`. FF rejects
+    /// renews on any `lifecycle_phase != "active"` or
+    /// `attempt_state == "attempt_interrupted"`; without this probe
+    /// cairn had to infer the phase from its own projection, which
+    /// lags FF on rapid suspend/resume cycles (dogfood R5, 2026-05-03).
+    ///
+    /// FF 0.15 ships this on `EngineBackend` — both `valkey_impl` and
+    /// `postgres_control_plane_impl` forward directly to
+    /// `EngineBackend::read_execution_info`.
+    async fn read_execution_info(
+        &self,
+        id: &ExecutionId,
+    ) -> Result<Option<ExecutionInfo>, FabricError>;
 }

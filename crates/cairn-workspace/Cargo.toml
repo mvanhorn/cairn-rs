@@ -9,16 +9,89 @@ rust-version.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "f65_kernel_probe"
+path = "src/bin/f65_kernel_probe.rs"
+required-features = ["kernel-probe"]
+
+# Test-only helper: the `test_sandbox_env_isolation` integration test spawns
+# this binary via `spawn_sandboxed_agent` and asserts the child's observed
+# environment matches the allowlist — i.e. no parent secrets leak across the
+# sandbox boundary. Cargo always compiles `[[bin]]` entries regardless of
+# profile, but the binary is tiny (dumps /proc/self/environ to fd 3) and
+# contributes < 1 KiB to the debug build. Exposing it as a real bin also
+# lets us resolve its path via `env!("CARGO_BIN_EXE_...")` from the test.
+[[bin]]
+name = "sandbox_env_dumper"
+path = "src/bin/sandbox_env_dumper.rs"
+
+# Test-only helper for the F65 PR-4 sandbox integration suite. Always
+# built so integration tests get `CARGO_BIN_EXE_sandbox_primitive_harness`
+# without needing a feature flag. Small and dep-free by design — see the
+# module comment at `src/bin/sandbox_primitive_harness.rs`.
+[[bin]]
+name = "sandbox_primitive_harness"
+path = "src/bin/sandbox_primitive_harness.rs"
+
 [dependencies]
 cairn-domain = { path = "../cairn-domain" }
 async-trait = "0.1"
 reflink-copy = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["time"] }
+tempfile = "3"
+tokio = { version = "1", features = ["time", "net", "io-util", "sync", "macros", "rt"] }
+# Closes #466: SystemClock's clock-before-epoch fallback emits a WARN
+# rather than panicking. Matches the `tracing = "0.1"` pin used in
+# cairn-runtime / cairn-app.
+tracing = "0.1"
+
+# F65 PR-4 sandbox runtime: the three-layer kernel fence + overlay driver +
+# reflink fallback all require these Linux-only crates. They compile on every
+# Linux host (aarch64 + x86_64); non-Linux falls through to stubs.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["mount", "sched", "process", "fs", "user", "socket", "signal", "ptrace", "dir"] }
+landlock = "0.4"
+seccompiler = "0.5"
+libc = "0.2"
+command-fds = "0.3"
+# Cache the compiled seccomp BPF program across `apply()` calls — see
+# seccomp::SECCOMP_FILTER (#504). `once_cell::sync::Lazy` rather than
+# `std::sync::LazyLock` because the workspace MSRV is 1.78 and
+# `LazyLock` stabilised in 1.80.
+once_cell = "1"
+
+# Optional dependencies gated behind the `kernel-probe` feature so the
+# spike binary pulls its chrono/anyhow deps only when the probe feature is
+# on. The runtime crates above (nix/landlock/seccompiler) are shared — the
+# probe binary uses the main crate's versions.
+[dependencies.anyhow]
+version = "1"
+optional = true
+
+[dependencies.chrono]
+version = "0.4"
+default-features = false
+features = ["clock"]
+optional = true
+
+[features]
+default = []
+# Compiles the `f65_kernel_probe` binary. Gated so the probe-specific deps
+# stay out of the default cargo build + lib consumers. The main runtime
+# deps (nix/landlock/seccompiler) are shared with PR-4's confinement module
+# and already live in the target-cfg block above; the feature just pulls in
+# the probe's stdout-formatting crates.
+kernel-probe = ["dep:anyhow", "dep:chrono"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+tempfile = "3"
+# Note: integration tests use `command-fds` to dup2 pre-opened fds into the
+# child of `sandbox_primitive_harness`. That crate is already declared
+# above under `[target.'cfg(target_os = "linux")'.dependencies]` (used by
+# the production spawn path in `src/sandbox/spawn.rs`); tests inherit that
+# dependency automatically, so we do NOT redeclare it here.
 
 [lints]
 workspace = true

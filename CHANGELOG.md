@@ -11,6 +11,1077 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **#799 — `GET /v1/projects/:project/tools` per-project tool inventory.**
+  Returns every built-in tool (Core / Registered / Deferred with the
+  registry's `tier`) plus every plugin-advertised tool from plugins
+  currently enabled for this project (RFC 015), honouring each
+  enablement's `tool_allowlist`. Response: `{items, total, has_more}`
+  sorted alphabetically by `id`; each item carries `{id, source, tier,
+  description, parameters_schema}` with `source = "builtin"` or
+  `"plugin:<plugin_id>"`.
+
+  Powers the RFC 031 role-editor tool-allowlist autocomplete
+  (`AgentRoleToolPicker`) — the operator sees grouped, tier-badged
+  tool cards with search, click-to-toggle selection, and a
+  "declared but not in registry" bucket for stale allowlist entries.
+  The picker falls back to the legacy freehand textarea when the
+  endpoint is empty (fresh project, no plugins) or errors. No admin
+  guard — read-only endpoint, any authenticated operator in the
+  tenant scope can call it.
+
+  4 new integration tests in `crates/cairn-app/tests/project_tools_http.rs`
+  cover 401 (missing bearer), 403 (cross-tenant), 200 shape on both
+  admin + plain-operator tokens, 400 (bad project path). OpenAPI
+  spec + compat TSV + `docs/api/projects.md` updated; UI build
+  passes; lint matches main baseline; `cargo clippy` clean.
+
+  Closes [#799](https://github.com/avifenesh/cairn-rs/issues/799).
+
+- **RFC 031 PR-A: operator-defined agent roles — shape skeleton.**
+  Lands the domain and service skeleton for operator-defined per-project
+  agent roles (RFC 031 §Implementation Plan PR-A). Zero observable
+  behaviour change — resolve / list fall through to `default_roles()`
+  exactly as before; the HTTP handlers and projection readers that wire
+  custom roles into runtime decisions ship in PR-B/C.
+
+  Key changes:
+
+  - Three new `RuntimeEvent` variants: `AgentRoleDefined`,
+    `AgentRoleRetracted`, `ToolDeclaredButMissing` (Ephemeral, RFC 031
+    §D3). Projection registry updated: +2 Projected + 1 Ephemeral →
+    counters 143 / 37 / 0 / 180. Exhaustive-match arms added in all
+    four projectors as no-ops pending PR-B.
+
+  - `AgentRole.allowed_tools` → `tools` field rename with `#[serde(alias
+    = "allowed_tools")]` for event-log replay compatibility. New
+    `forbid_all_tools: bool` flag (§D3). LLM-visible JSON key in
+    `agent_description` / `list_agents` renames in lockstep.
+
+  - `AgentRoleService` trait + `AgentRoleServiceImpl` + `ResolvedRole` /
+    `RoleSource` / `SourceFilter` types. Wired into `RuntimeServices`
+    aggregate.
+
+  - `OrchestrationContext` gains `declared_but_missing: Arc<Mutex<HashSet<...>>>`
+    (per-run dedup for `ToolDeclaredButMissing` advisory) and
+    `agent_role_list_cache: Arc<OnceCell<Vec<ResolvedRole>>>` (§D14
+    layer-2 per-run snapshot). Both `Arc`-wrapped so `Clone` gives
+    iterations shared state.
+
+  16 new tests across three layers: 3 domain unit, 6 event log
+  round-trip (serde shape pins + append-without-error), 7 service
+  (define / retract / resolve / list + source-tagging).
+
+
+- **RFC 031 PR-B: operator-defined agent roles — HTTP surface + projection + validator.**
+  Wires the five agent-role endpoints, the event-log projection reader/writer, and the
+  structural prompt validator (RFC 031 §Implementation Plan PR-B). With
+  `CAIRN_OPERATOR_DEFINED_ROLES=1` set, operators can create, read, update, and retract
+  custom agent roles per project via the HTTP surface; without the flag the projection
+  read-path is a no-op and behaviour is identical to pre-RFC.
+
+  Key changes:
+
+  - Five new routes under `/v1/projects/:project/agent-roles`: `GET` (list), `GET /:id`
+    (get one), `POST` (define/re-define), `PATCH /:id` (partial update with If-Match ETag
+    concurrency guard), `DELETE /:id` (retract). All project-scoped; writes require
+    `AdminRoleGuard`. Idempotent ETag-based PATCH; retract is idempotent (200 on
+    already-retracted ids).
+
+  - `AgentRoleProjection` + `AgentRoleWriter` in `cairn-store::projections::agent_role`.
+    Reads `AgentRoleDefined` / `AgentRoleRetracted` events into the in-memory projection
+    and dual-writes to the durable backend table. Projection-registry counters updated to
+    reflect the two Projected variants now fully wired (previously no-op arms).
+
+  - `agent_roles_validation::validate_prompt_structure` in `cairn-domain` — structural
+    validator that runs on every POST / PATCH body before the event is emitted. Checks:
+    required H2 section presence (`## Identity`, `## Capabilities`, `## Constraints`),
+    prohibited patterns (early-completion phrasing, ALL-CAPS stage markers,
+    subagent-identity shadowing), role-id namespace (`[a-z0-9][a-z0-9_-]*`, max 64 chars),
+    tier immutability on PATCH, reserved-tier guard, `response_shape` closed enum,
+    `max_context_tokens` bounds, prompt-size limit (128 KiB). Returns structured
+    `ValidationFailure` list; 413 for size, 422 for all other structural errors.
+
+  - Prompt normalisation applied exactly once in the handler before validation: BOM strip,
+    CRLF → LF, trailing whitespace per line. Event payload carries normalised bytes;
+    replay is pure passthrough.
+
+  - ETag / `If-Match` concurrency guard on PATCH: 412 on stale, 428 on missing header.
+    Shadowing a built-in emits a `warnings[]` advisory in the response body without
+    blocking the write.
+
+  - OpenAPI spec delta in `cairn-app::openapi_spec`: all five verbs, request/response
+    schemas, error bodies (400/401/403/404/409/412/413/422/428).
+
+  54 new tests: 20 HTTP integration (all status-code paths across all five verbs, ETag
+  concurrency, shadowing warning, re-POST-after-retract), 21 domain validation unit
+  (each validator rule has at least one pass + one fail case), 13 service unit (tests
+  already landed in PR-A; no net-new service tests in PR-B).
+
+- **RFC 031 PR-B2: operator-defined agent roles — Postgres + SQLite durable projection parity.**
+  Closes the durable-backend gap left open by PR-B: pg and sqlite operators no longer need
+  the boot-time replay into `InMemoryStore` to power the agent-roles HTTP surface.
+
+  Key changes:
+
+  - `V074__create_project_agent_roles.sql` migration (pg). `project_agent_roles` table with
+    composite PK on `(tenant_id, workspace_id, project_id, role_id)`. BIGINT ms-since-epoch
+    timestamps — no JSONB, no partial indexes per portability guidelines. Mirrored verbatim
+    in `sqlite/schema.rs`.
+
+  - `PgSyncProjection` and `SqliteSyncProjection` `apply` arms for `AgentRoleDefined`
+    (upsert + clear `retracted_at`/`retracted_by` to NULL per §D6) and `AgentRoleRetracted`
+    (UPDATE those two columns). Replaces the PR-A explicit no-op arms.
+
+  - `AgentRoleReadModel` impls for `PgAdapter` and `SqliteAdapter` (`get_active`, `get_any`,
+    `list_active`). Both adapters use a shared column-list constant to keep SELECT column
+    order in sync across query sites.
+
+  - 3 new `projection_parity.rs` fixtures: define (active row parity), retract (`get_active`
+    returns None / `get_any` returns tombstone), re-POST after retract (`retracted_at` clears
+    atomically). All three assert byte-equality between in-memory and sqlite; schema shape is
+    enforced against pg via `pg_migration_contract` + `schema_parity`.
+
+- **RFC 031 PR-C: operator-defined agent roles — orchestrator call-site pivot.**
+  Wires the six DECIDE-phase call sites in `crates/cairn-orchestrator/src/decide_impl.rs`
+  to the operator-defined agent-role service (RFC 031 §Orchestrator call-site pivot).
+  With this PR, every orchestrator DECIDE turn honours project-scoped operator roles for
+  tool allowlist, system prompt, memory hint, footer response shape, and the
+  `spawn_subagent` role enum — with zero behaviour change when no custom role is defined.
+
+  Key changes:
+
+  - `LlmDecidePhase::with_agent_roles(svc)` and `with_event_log(log)` builder methods.
+    App-side wiring added in both `handlers/runs/orchestrate.rs` (HTTP-triggered runs) and
+    `handlers/github.rs` (webhook-triggered runs) — mirrors the same builder chain in each.
+
+  - Site 1 (tool-allowlist filter): `default_roles().iter().find(...)` replaced by
+    `resolve_role_or_fallback(ctx).await` + `apply_role_tool_allowlist`. Handles
+    `forbid_all_tools=true` (empty surface), non-empty `tools[]` (filtered surface), and
+    empty `tools[]` (unrestricted). Unknown role id returns an empty-allowlist fallback
+    record byte-identical to pre-RFC-031 DECIDE behaviour.
+
+  - `ToolDeclaredButMissing` emission at site 1: for each tool id a role declared but that
+    is not in the current tool registry, emits a `ToolDeclaredButMissing` advisory via the
+    attached event log. Per-run dedup on `ctx.declared_but_missing` (sync Mutex released
+    before the async `log.append` call per the lock convention on that field).
+
+  - Sites 2–4 (system prompt, memory hint, footer): `assembled_prompt_for(agent_type)` and
+    `response_shape_for(agent_type)` replaced by calls that read directly from the
+    `resolved_role` already held from site 1 — at most one `resolve` call per DECIDE turn.
+
+  - Site 5 (`spawn_subagent` role enum): `spawn_subagent_tool_def_for(ctx)` sources the
+    spawnable-role enum from the project's projection-backed list
+    (`AgentRoleService::list(project, SourceFilter::All)`) via a per-run
+    `Arc<OnceCell<Vec<ResolvedRole>>>` cache on `OrchestrationContext` (§D14 layer 2).
+    First DECIDE of the run pays one `list` call; subsequent turns reuse the snapshot.
+    Fallback path calls the existing process-lifetime `OnceLock`-backed
+    `spawn_subagent_tool_def()` when no service is wired.
+
+  - 4 new `rfc_031_prc` unit tests: `custom_role_with_tools_filters_to_declared_subset`,
+    `missing_tool_emits_tool_declared_but_missing_event`, `forbid_all_tools_clears_surface`,
+    `spawn_subagent_tool_def_uses_run_scoped_cache`. All 200 cairn-orchestrator unit tests
+    pass; 311 cairn-app unit tests pass; `agent_roles_http` 20/20; `bootstrap_server` 34/34.
+
+- **RFC 031 PR-D3: operator-defined agent roles — history panel, retract modal, copy-to-project.**
+  Third and final RFC 031 UI slice. Lands the per-role event timeline,
+  a §D7-aware retract-confirmation modal, and the copy-to-project flow
+  (RFC 031 §History panel, §Retract, §Copy to project).
+
+  Key changes:
+
+  - `GET /v1/projects/:project/agent-roles/:id/history` — new handler
+    in `crates/cairn-app/src/handlers/agent_roles.rs`. Walks the global
+    event log in 10 000-event chunks, filters `AgentRoleDefined` and
+    `AgentRoleRetracted` events matching `(project, role_id)`, returns
+    oldest-first. Routed, OpenAPI-documented, compat TSV regenerated,
+    `docs/api/projects.md` updated. 3 new integration tests
+    (`history_returns_defined_then_retracted_in_order`,
+    `history_is_empty_for_unknown_role`,
+    `history_cross_tenant_is_refused`).
+
+  - `ui/src/components/AgentRoleHistoryPanel.tsx` — timeline UI.
+    Consecutive `defined` entries show a change summary (name / tier /
+    response_shape / tools / forbid flag / prompt-length delta). First
+    definition emits a "First definition" label; retract entries quote
+    the §D7 guarantee verbatim.
+
+  - `ui/src/components/AgentRoleRetractModal.tsx` — replaces the PR-D1
+    `window.confirm`. Two-button dialog (Keep / Retract) with an amber
+    §D7 banner: running orchestrations never interrupted; new runs fall
+    back. The RFC-prescribed runs-count probe
+    (`?agent_role_id=X&state=active`) is deferred — §D7 holds
+    regardless, the count is a v1.1 enhancement.
+
+  - `ui/src/components/AgentRoleCopyToProjectModal.tsx` — POST against
+    the target project scope. 201 → toast + close. 409 → conflict step
+    with [Overwrite] (PATCH with fetched ETag) / [Rename & retry]
+    (appends `-copy` to the id, returns to form step). 412 on the PATCH
+    re-fetches the latest ETag and surfaces a stale-tab warning.
+
+  - `ui/src/pages/AgentRoleDetailPage.tsx` updated to mount all three
+    components. Copy-to-project button appears on every role (built-in
+    or custom). Retract / Edit buttons remain gated on `isEditable`.
+
+  Scope trim (known): `/v1/projects/:project/runs?agent_role_id=X&state=active`
+  not added — larger than PR-D3 scope, deferred to a follow-on.
+
+  Verification: `npx tsc --noEmit` clean; 230/230 UI unit tests pass.
+  Lint baseline unchanged (109 existing errors, no new debt). `npm run
+  build` clean; `cargo build -p cairn-app` clean; `cargo clippy -p
+  cairn-app --lib --tests` clean; `cargo fmt --all` clean.
+  `agent_roles_http` 23/23 (+3 history fixtures); `compat_catalog_sync`
+  16/16; `api_docs_coverage` 1/1.
+
+- **RFC 031 PR-D2: operator-defined agent roles — editor polish.**
+  Lands draft persistence, the section-indicator rail, and the shared
+  source badge for the agent-role editor (RFC 031 §Draft persistence,
+  §Editor form layout).
+
+  Key changes:
+
+  - `ui/src/lib/agentRolePromptCheck.ts` — 227-LOC client-side preview
+    of the server's `validate_prompt_structure`. Same ATX-H2 regex +
+    counters (≥ 2 `### Phase` headings, ≥ 3 column-0 bullets) +
+    orchestrator-shadow exemption. Exposes `analysePrompt(prompt, roleId,
+    tier) → PromptStructureReport` with `SectionStatus[]` (id, label,
+    present, detail, offset) and `AntiPatternHit[]` (early_completion,
+    caps_adversarial, identity_shadow).
+
+  - `ui/src/hooks/useAgentRoleDraft.ts` — 250 ms debounced localStorage
+    draft hook. Key shape per RFC §Draft persistence:
+    `cairn:agent_role_draft:{tenant}:{workspace}:{project}:edit:{role_id}`
+    (edit) / `…:new:{tab_uuid}` (new, tab-isolated via sessionStorage).
+    Exposes `write`, `loadExisting`, `clear`.
+
+  - `ui/src/components/AgentRoleBadge.tsx` — extracted shared source
+    badge (`builtin` / `custom` / `custom_shadow`). Removes the inline
+    `sourceBadge` helpers PR-D1 duplicated in `AgentRolesPage` and
+    `AgentRoleDetailPage`.
+
+  - `ui/src/components/AgentRoleSectionRail.tsx` — present/missing/
+    insufficient badges with jump-to-section click handler (scrolls
+    the system-prompt textarea to the section header offset).
+
+  - `ui/src/pages/AgentRoleEditorPage.tsx` — wires draft persistence
+    (restore-draft banner on mount, debounced writes on every edit,
+    clear on save success) and the section-indicator rail below the
+    system-prompt textarea.
+
+  - `ui/src/lib/__tests__/agentRolePromptCheck.test.ts` — 11 unit
+    fixtures covering: all-present specialty prompt, section synonyms,
+    insufficient-phases, insufficient-bullets, missing sections,
+    orchestrator-shadow 2-section layout, orchestrator non-id tier
+    fallthrough, and all three anti-pattern regex shapes.
+
+  Verification: `npx tsc --noEmit` clean; 230/230 UI unit tests pass
+  (was 219; +11 `analysePrompt` fixtures). Lint baseline unchanged (109
+  existing errors, no new debt). `npm run build` clean; `cargo build -p
+  cairn-app` clean. Deferred to PR-D3: retract-during-active-run
+  confirmation modal, copy-to-project flow, history panel with prompt
+  diff, Playwright e2e smoke.
+
+
+- **RFC 031 PR-D1: operator-defined agent roles — UI first slice.**
+  Lands the load-bearing operator journeys for RFC 031 in the cairn-app
+  dashboard: list, detail, create, and edit agent roles end-to-end.
+
+  Key changes:
+
+  - `ui/src/pages/AgentRolesPage.tsx` — merged list of built-in +
+    operator-defined roles for the active project scope. Source badges
+    distinguish `builtin` / `custom` / `custom_shadow`; click a row to
+    view / edit. "New role" button routes to the editor.
+
+  - `ui/src/pages/AgentRoleDetailPage.tsx` — role detail with metadata,
+    tool allowlist, assembled system prompt, and Edit / Retract (or
+    "Restore built-in" on a shadow) actions. Built-in rows render
+    read-only. Placeholder section reserved for the PR-D2 history panel.
+
+  - `ui/src/pages/AgentRoleEditorPage.tsx` — unified create + edit form.
+    Immutable `id` / `tier` on edit (§D6); `If-Match` ETag threaded from
+    the initial GET into PATCH for lost-update protection (§PATCH); §D4
+    size counters; §D3 `forbid_all_tools` + `tools[]` wiring; 422
+    `details.failures[]` surfaced as field-level errors + form-level
+    banner; POST / PATCH `warnings[]` rendered as a blue advisory panel.
+
+  - Three new `Route` variants in `components/Layout.tsx`
+    (`agent-role-detail`, `agent-role-editor`, plus the `agents` page).
+    Breadcrumbs wired. Sidebar gains an "Agent Roles" entry under
+    Operations (next to Agent Templates).
+
+  - API client: `listAgentRoles`, `getAgentRole`, `createAgentRole`,
+    `patchAgentRole`, `retractAgentRole` added to `defaultApi`. New
+    `apiFetchWithResponse` helper returns both body and `Response` so
+    the editor can round-trip the `ETag` header into `If-Match` on PATCH.
+
+  - `lib/types.ts`: `AgentRole`, `AgentRoleListItem`,
+    `AgentRoleListResponse`, `CreateAgentRoleRequest`,
+    `PatchAgentRoleRequest`, `AgentRoleAdvisory`, `DefineAgentRoleResponse`,
+    `RetractAgentRoleResponse`.
+
+  Verification: `npx tsc --noEmit` clean; `npm run build` clean;
+  `cargo build -p cairn-app` clean (rust-embed picks up the new bundle);
+  219 UI unit tests pass. Lint baseline unchanged (109 existing errors, no
+  new debt). Deferred to PR-D2+: draft persistence, section-indicator
+  rail, history panel with prompt diff, retract-during-active-run modal,
+  copy-to-project, Playwright e2e.
+
+
+- **`cairn-providers` native Bedrock Converse tool calls.** The native
+  `Bedrock` backend now translates cairn's `Tool` / `ToolCall` / `ChatMessage`
+  types into the Converse `toolConfig` + content-block shape and parses
+  `toolUse` response blocks back into `ChatResponse::tool_calls()`.
+  Removes the legacy `Unsupported("Bedrock chat_with_tools does not
+  support tools")` guard. Structured-output enforcement (JSON schema)
+  remains unsupported — that path requires `additionalModelRequestFields`
+  mapping and will land separately. Covers all four shape transitions
+  the orchestrator needs: user → assistant toolUse → user toolResult →
+  assistant text. Invalid JSON tool arguments are tolerated via a `_raw`
+  wrapper key rather than failing the turn. Stop reason now surfaces as
+  `finish_reason()` and `cacheReadInputTokens` flows into `Usage`.
+  17 unit tests covering `build_tool_config` (all four `ToolChoice`
+  arms + empty-name rejection + empty-description elision) and
+  `chat_message_to_converse` / `parse_converse_response` (tool-use,
+  tool-result, mixed blocks, missing toolUseId), plus 6 httpmock
+  integration tests covering the full wire-level request body, multi-turn
+  toolResult serialization, system-message routing, and 429/500 error
+  paths. Verified live against `us.anthropic.claude-opus-4-7` on EC2
+  via SigV4/IMDS — single-turn tool call returned a real `toolUse`
+  block; multi-turn `user → assistant(toolUse) → user(toolResult)`
+  produced `"3 + 4 = 7"` with `finish_reason = end_turn`.
+
+- **Per-iteration reasoning step observability (#789, PR-A backend).**
+  Operators get two new endpoints to investigate stuck agents and
+  tail what's running in real time:
+
+  - `GET /v1/runs/:id/trajectory` — returns the run's compacted
+    per-iteration reasoning steps in chronological order. Each
+    step carries the model's chain-of-thought (truncated to
+    ~1 KiB), the top-1 proposed action (tool call /
+    complete_run / spawn_subagent / escalate), the user-message
+    delta vs the prior iteration, and the calibrated confidence.
+    Read it like a story: prompt delta → reasoning → action.
+  - `GET /v1/admin/agents/live` — fleet-view snapshot of every
+    non-terminal run for the caller's tenant, joined with the
+    most-recent reasoning step. Each entry shows the run's
+    current iteration, current action, current reasoning preview,
+    and confidence. Answers "what's in the box right now, and
+    what is each agent thinking?"
+
+  New domain event `RunReasoningStepRecorded` (run-keyed) emitted
+  on every DECIDE phase by `record_reasoning_step` in
+  `tracing_emitter.rs`. Materialized on the `InMemoryStore`
+  per-run vec capped at 200 entries (FIFO eviction); pg/sqlite
+  parity is a follow-up. Compaction is pure string ops — no
+  extra LLM calls per iteration.
+
+  R20 dogfood (2026-05-09) symptom this addresses: an executor
+  subagent ran 36 LLM calls / 62 bash invocations on issue #8
+  (wire CI) without ever calling write/edit, and operators had
+  no live view to diagnose why. With this PR an operator hitting
+  `/v1/admin/agents/live` sees every active agent's chain-of-
+  thought + current action + confidence — they can read the
+  pathology forming in real time and either intervene or capture
+  enough state for a post-mortem before killing the run. The
+  fix for the bash-loop pathology itself is a separate design
+  conversation; this PR ships the observability substrate so
+  that conversation has data to work from.
+
+  Regression test `test_789_reasoning_step_observability` (LiveHarness)
+  drives one DECIDE iteration through a mock LLM, asserts
+  `/v1/runs/:id/trajectory` returns one step with the model's
+  reasoning + bash tool-call summary, and asserts
+  `/v1/admin/agents/live` lists the active run with its
+  current_action populated. Pre-fix simulation (disabled
+  `record_reasoning_step` call site) makes the test fail.
+
+- **`cairn-providers` SigV4 signer for the Bedrock backends.** New
+  `signer` module exposing `RequestSigner` (trait), `BearerAuth`
+  (back-compat default), and `SigV4Signer` (AWS SigV4 via the default
+  credential chain: env → shared config → IMDS → container role → SSO).
+  The native `Bedrock` backend gains `with_bearer`, `with_sigv4`, and
+  `with_signer` constructors plus a `from_env_async` entry that prefers
+  a Bearer key when set and falls back to SigV4 otherwise. The
+  OpenAI-compat provider gains a `with_signer(...)` builder so the
+  `BedrockCompat` preset can plug in the same signer without duplicating
+  wire code. `cairn-app` boot now uses `from_env_async` so Bedrock works
+  on EC2/ECS/EKS via IMDS with no API key, and reports the negotiated
+  auth scheme (`bearer` / `sigv4`) at startup. 6 new signer unit tests
+  (canonical SigV4 vectors, static-creds path, STS session-token
+  handling) + 3 integration tests (openai-compat SigV4 header shape,
+  Bearer regression guard, empty-key-without-signer rejection).
+  Verified live against `us.anthropic.claude-opus-4-7` in `us-west-2`
+  from EC2 with instance-profile IMDS credentials.
+
+- **`cairn-github` PR-review surface.** `GitHubClient` gains 7 new methods
+  covering the full code-review lifecycle: `get_pull_request`,
+  `list_pull_request_files`, `list_pull_request_review_comments`,
+  `list_pull_request_reviews`, `list_pull_request_issue_comments`,
+  `create_pull_request_review`, and `create_pull_request_review_comment`.
+  Eight new wire types (`PullRequestDetail`, `PullRequestRef`,
+  `PullRequestRepoRef`, `PullRequestFile`, `PullRequestReviewComment`,
+  `PullRequestReview`, `CreatePullRequestReviewRequest`,
+  `ReviewCommentInput`) are added and re-exported from the crate root.
+  All types use `#[serde(default)]` on optional fields so partial GitHub
+  API responses (plan-gated fields, null repos) deserialize cleanly.
+  Integration tests use `httpmock` to verify HTTP verb, path, auth header,
+  and wire-type deserialization for all 7 methods; unit tests cover
+  serde round-trips for all 8 wire types.
+
+- **`list_agents` and `agent_description` orchestrator-only tools
+  (#776).** The orchestrator can now enumerate registered sub-agent
+  roles before delegating, instead of relying on hardcoded role
+  names baked into `spawn_subagent`'s schema description. R19
+  dogfood symptom this prevents: the orchestrator picked
+  `executor` for goals that should have gone to `researcher`
+  because the role names looked similar enough at the prompt
+  layer; with a real description-introspection path the wrong
+  choice becomes visible. `list_agents` returns
+  `[{role_id, display_name, description, tier, response_shape}, ...]`
+  for every role except the orchestrator (which doesn't delegate
+  to itself); `agent_description(role_id)` returns the same plus
+  the role's allowed-tools list, max-context-tokens cap, and
+  specialty-overlay prompt. Both read-only, both registered as
+  `Registered` tier so they appear in the orchestrator's prompt
+  by default. Sub-agents do not get these tools — they already
+  know their role.
+
+- **`spawn_subagent.role` schema is now a runtime-derived JSON
+  enum (#776).** Pre-#776 the field was a free-form string; the
+  LLM could pass any value, and unknown roles silently fell
+  through to the generic prompt at the sub-agent side. The
+  `role` parameter now declares an `enum` derived from
+  `default_roles()` minus orchestrator. Schema-validation
+  rejects unknown roles up front, and adding a new role to
+  `default_roles()` automatically extends the schema.
+
+### Security
+
+- **Boot-time scrub of operator-environment credential variables
+  (#773).** `cairn-app` now removes well-known credential env vars
+  (`GH_TOKEN`, `GITHUB_TOKEN`, `AWS_*`, `AZURE_*`, `GCP_*`,
+  `OPENAI_API_KEY`, `ZAI_API_KEY`, `ANTHROPIC_API_KEY`, plus generic
+  `*_API_KEY` / `*_SECRET` / `*_ACCESS_TOKEN` suffix patterns) from
+  `std::env` at startup, before any subprocess spawn. Without the
+  scrub, an operator's stale `GH_TOKEN` propagates into every
+  bash subprocess the harness-tools layer spawns for sub-agents and
+  shadows the host's valid hosts.yml credentials — observed wedge
+  in R19 dogfood (executor sub-agent looped 71 iterations on
+  `gh auth status` with `unset GH_TOKEN` between calls because each
+  new bash subprocess re-inherited the bad token from cairn-app's
+  env). Sub-agents that need a credential get it via the cairn
+  credential service (POST `/v1/admin/tenants/.../credentials`),
+  not via inherited operator env. Operator override:
+  `CAIRN_INHERIT_OPERATOR_ENV=1` keeps the legacy behaviour for
+  trusted local-dev environments. `CAIRN_ADMIN_TOKEN`,
+  `CAIRN_CREDENTIAL_KEY`, `CAIRN_FABRIC_WAITPOINT_HMAC_SECRET` are
+  on a never-scrub allowlist (cairn-app reads them legitimately).
+
+### Fixed
+
+- **`RunRecord.iteration` advances on every resume boundary, not
+  just `WaitingApproval → Running` (#795).** PR #792 (#791)
+  materialized the iteration counter and incremented on
+  `WaitingApproval → Running` transitions, but R21 dogfood
+  (2026-05-09) revealed two missed transitions: `WaitingDependency
+  → Running` (parent-resume-after-subagent-completion via G5
+  auto-resume) and `Paused → Running` (operator-paced resume).
+  Both are logically the same boundary — the loop is re-entering
+  Running from a suspension — and both must advance the counter so
+  the trajectory rendered to operators reflects how many times the
+  run has actually resumed. Fix extends the projection apply
+  match in all three backends (in-memory, pg, sqlite) to cover the
+  three resume sources. Test
+  `iteration_increments_on_resume_transition` extended to exercise
+  the full `pending → running → waiting_approval → running →
+  waiting_dependency → running → paused → running` sequence and
+  asserts `iteration == 3` at the end.
+
+- **Reasoning step projection apply dedups on `(run_id, iteration)`
+  (#796).** R21 dogfood saw double-emits of
+  `RunReasoningStepRecorded` for the same iteration value
+  (timestamps ~0.8-5s apart, audit trail showed two consecutive
+  `WaitingApproval` non-transitions). The naïve append-only apply
+  left operators staring at duplicate `iter=N` rows in
+  `/v1/runs/:id/trajectory`. The semantic invariant is "at most
+  one reasoning step per iteration" — fix makes the apply
+  last-write-wins on `(run_id, iteration)`. New unit test
+  `reasoning_step_apply_dedups_on_iteration_value` directly
+  asserts: two emits at iter=2 collapse to one entry with the
+  later payload. Doesn't address the upstream double-emit (still
+  worth investigating; the duplicate `WaitingApproval` transitions
+  in the audit trail are a separate signal), but the user-visible
+  trajectory shape is now clean regardless.
+
+- **Sub-agents stop self-bailing at low iteration counts (#797).**
+  R21 dogfood (2026-05-09) surfaced the next layer of the
+  iteration-counter pathology: even though `DEFAULT_MAX_ITERATIONS`
+  was 20, sub-agents were calling `complete_run` with "partial
+  completion" reports at `iter=3`, never delivering multi-step
+  procedural goals (clone → branch → write file → cargo check →
+  commit → push → `gh pr create`). 13 of 20 sub-agents in R21
+  hit `iter=3` and bailed; zero PRs were delivered across 8
+  dogfood-m1 issues despite the orchestrator correctly delegating
+  to executors and re-spawning on partial completions.
+
+  Root cause: the user message rendered `iteration: 3` in the
+  `## Run state` block and `[3]` prefixes on each step-history
+  line, with no indication of the cap. The model read those numbers
+  and self-paced — concluding it was near a limit and producing a
+  graceful "partial" report instead of continuing.
+
+  Fix: stop rendering `iteration` to the model. The user message's
+  `## Run state` now carries only `run_id` + `agent_type`, and
+  step-history lines drop the `[N]` prefix. The iteration counter
+  remains internal orchestrator bookkeeping — operators still get
+  it via `RunRecord.iteration` (HTTP API) and the
+  `/v1/runs/:id/trajectory` endpoint, but the model never sees a
+  number it can pattern-match against. Also bumped
+  `DEFAULT_MAX_ITERATIONS` from 20 → 50: a typical procedural
+  goal needs 9-12 distinct DECIDE turns and each approval-gated
+  tool call is a separate iteration, so 20 was sized for a
+  Q&A-shaped run and not the procedural goals dogfood actually
+  exercises.
+
+  Regression test:
+  `decide_impl::tests::build_user_message_does_not_render_iteration_to_model`
+  asserts no `iteration: N` line in `## Run state` and no `[N]`
+  prefix on step-history lines. Pre-fix simulation (revert the
+  format string) makes the test fail.
+
+- **Replace event-log iteration scan with projection-backed
+  `RunRecord.iteration` field (#791).** PR #790's #788 fix derived
+  prior-iteration count from a forward scan of
+  `RunStateChanged { from: WaitingApproval, to: Running }` events
+  on the hot path of every `/orchestrate` POST. Gemini correctly
+  flagged this as O(N) replay of the event log on a hot path, so
+  this PR materializes the counter as `iteration: u32` on
+  `RunRecord`, incremented in the projection apply on every
+  approval-resume transition, and reads it directly. Schema:
+  V073 PG migration adds `iteration INTEGER NOT NULL DEFAULT 0`;
+  SQLite schema gets the same column inline. All three backends
+  (in-memory, pg, sqlite) increment in their `RunStateChanged`
+  apply via a folded UPDATE that commits atomically with the
+  state change. `orchestrate.rs` re-reads the run record after
+  the entry-time `WaitingApproval → Running` transition (lines
+  ~550-572 of `drive_run_iteration`) so the counter reflects the
+  just-committed increment. PR #790's regression test
+  (`test_788_iteration_counter_persists_across_resumes`) now
+  exercises the new code path; a new `cairn-store` integration
+  test (`test_iteration_projection`) directly asserts the
+  projection apply increments correctly across all three
+  state-transition combinations. Pre/post test verified by
+  simulating regression with `let prior_iteration_count: u32 = 0`.
+
+- **`OrchestrationContext.iteration` now persists across
+  `/orchestrate`-resume boundaries (#788).** Pre-fix,
+  `crates/cairn-app/src/handlers/runs/orchestrate.rs:975` hardcoded
+  `iteration: 0` on every POST to `/v1/runs/:id/orchestrate` —
+  including F49 auto-resume kicks after tool-call approval. Result:
+  every resumed loop ran with `ctx.iteration == 0`, so every step
+  pushed by F25 drain or by the loop's own `step_history` rendered
+  as `[0]` in the next DECIDE prompt's `## Step history` section,
+  and `should_inject_stuck_nudge` (which gates on iteration count)
+  never fired across resumes. R20 dogfood (2026-05-09) saw an
+  executor subagent run 36 LLM calls / 62 approved bash invocations
+  on issue #8 with every step rendered `[0]`, and the model
+  responded "Looking at the step history, it seems there have been
+  many attempts with various issues" before issuing yet another
+  bash discovery call. Post-fix, prior-iteration count is derived
+  from the run's event log by counting
+  `RunStateChanged { from: WaitingApproval, to: Running }`
+  transitions — the only run-indexed event that fires
+  deterministically once per resumed iteration. Read by
+  `EntityRef::Run`, no schema change. Doesn't fix the bash-loop
+  pathology directly (#789 tracks the design conversation), but
+  removes a confounder that masked the loop pattern from the
+  model and from the iteration-threshold nudge. Regression test:
+  `crates/cairn-app/tests/test_788_iteration_counter_persists_across_resumes.rs`
+  drives a tool-call → approve → resume cycle and asserts the
+  rendered step-history contains a `[N]` entry with `N >= 1`;
+  the test fails on pre-fix code.
+
+- **Per-iteration footer no longer biases procedural sub-agents toward
+  early `complete_run` (#774).** Pre-fix, every DECIDE iteration appended
+  a `## Next step` footer that read "If you already have the answer,
+  call the `complete_run` tool NOW" — correct for orchestrator and
+  Q&A roles, wrong for executor / researcher / reviewer / generic
+  whose specialty prompts explicitly walk through Phase 1–5 with
+  `complete_run` reserved for Phase 5 (Report). R19 dogfood evidence:
+  the executor subagent did 71 iterations of bash discovery and 0
+  write/edit calls — the model split the difference between "complete
+  NOW" and "make it through Phase 5", defaulting to a defensive bash
+  every turn. Now the footer branches on `AgentRole.response_shape`:
+  DirectAnswer roles keep the answer-NOW nudge; ProceduralArtifact
+  roles get a continuation footer that explicitly forbids
+  `complete_run` until the goal's success criteria are demonstrably
+  met. Memory-hint sentence likewise branches — procedural roles no
+  longer see "answer directly" when memory retrieval returns empty.
+  Unknown role ids fall back to the generic role's shape
+  (ProceduralArtifact), matching the assembled-prompt fallback wired
+  in #775.
+### Changed
+
+- **AgentRole architecture refactor (#775).** The four built-in role
+  prompts no longer duplicate scaffolding inline; sub-agent identity,
+  autonomous-completion mandate, and meta-rules now live in a shared
+  `BASE_SUBAGENT_PROMPT` constant pre-pended to each role's specialty
+  overlay (executor / researcher / reviewer / generic). The
+  orchestrator's prompt remains standalone — it is the parent, not a
+  sub-agent. New `AgentRole.description` field carries a short
+  orchestrator-facing summary for future `list_agents` /
+  `agent_description` tools (#776). New `AgentRole.response_shape`
+  enum (DirectAnswer | ProceduralArtifact) lets future per-iteration
+  footer logic (#774) pick the right nudge per role. New `Generic`
+  tier + `generic` role for goals that do not fit a registered
+  specialty cleanly — content-neutral prompt skeleton, parent owns
+  the workflow design entirely via the goal text. Use
+  `assembled_prompt_for(role_id)` to render any role's full prompt;
+  reading `AgentRole.system_prompt` directly returns only the
+  specialty overlay (or full text for the orchestrator).
+
+- **Optional `parent_context` field on spawn_subagent (#775).** The
+  parent orchestrator can now thread a freeform context string into a
+  sub-agent's first DECIDE prompt — typically a previous-attempt
+  mistake to avoid, or workspace context the child should know up
+  front. Schema: `spawn_subagent(role, goal, parent_context?)`.
+  Threaded through `BridgeEvent::SubagentSpawned`,
+  `RuntimeEvent::SubagentSpawned`, persisted on the child run's
+  defaults at `run:<child_run_id>:parent_context` (same pattern as
+  `goal`), resolved into `OrchestrationContext.parent_context` on
+  the child's first orchestrate iteration, and rendered in the
+  user message as `## Parent context` between `## Goal` and
+  `## Run state`. `SubagentSpawned.parent_context` is
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` so
+  pre-#775 events replay cleanly as `None`.
+
+- **Unknown `agent_type` falls back to `generic` (#775).** Pre-#775
+  an unknown role id resolved to a 3-line generic system prompt
+  that did not satisfy any of the role-prompt structural anchors
+  (Phase 1, Phase 5, completion gate, …). Now it falls back to the
+  generic role's full assembled prompt — structurally complete,
+  contract-satisfying, parent owns the workflow.
+
+### Security (breaking pre-release)
+
+- **Credential encryption cluster (META #461; closes #447, #448, #449, #450,
+  #492). Breaking ciphertext format — operators must rotate existing
+  credentials.** Five regressions shipped together:
+  - **Fixed master key eradicated (#448).** The credential store previously
+    encrypted every secret with a key derived from the string
+    `"cairn-local-test-key"` committed in the source tree. Operators now
+    supply a 32-byte master key via `CAIRN_CREDENTIAL_KEY` (hex or base64)
+    or `CAIRN_CREDENTIAL_KEY_FILE` (Docker secrets / K8s). In
+    `--mode team`, the binary refuses to start if neither is set. In local
+    mode, a loud warning names the env var and boot falls back to a
+    dev-only deterministic key — local dev keeps working but the literal
+    repo string is gone.
+  - **Random AES-GCM nonces (#449).** Every encrypt now draws a fresh
+    12-byte nonce from `OsRng`. The on-disk ciphertext layout is
+    `nonce(12) || ct_with_tag`, and post-fix rows carry
+    `key_version = Some("v2")`. The previous deterministic nonce
+    (`SHA-256(tenant:provider:timestamp_ms)`) collapsed to a static value
+    on same-millisecond writes and is a keystream-recovery primitive on
+    any collision. This is a **hard wire-format break**: rows written by
+    the pre-fix code cannot be decrypted by the new code. On every boot,
+    `AppState::new` invokes `scan_legacy_ciphertexts`, which flags every
+    active credential whose `key_version` is not `Some("v2")` (the
+    pre-fix code either omitted the tag or wrote `"v1"`) and logs up to
+    twenty rows by `(tenant_id, credential_id, provider_id, key_version)`
+    plus a `...and N more` line when the list is longer. Length-based
+    detection was dropped because realistic API keys (50-char `sk-...`
+    tokens) produce 66-byte pre-fix blobs that easily pass any sane
+    nonce+tag length threshold.
+  - **`list_credentials_handler` now enforces tenant scope (#447).** Added
+    `TenantScope` extractor; non-admin cross-tenant lists return 404.
+  - **`rotate_key` scrubs plaintext via `Zeroizing<String>` (#450).** The
+    re-encrypt loop previously held decrypted secrets in a plain
+    `Vec<String>` across await points.
+  - **`StoreCredentialRequest` redacts plaintext in `Debug` (#492).** Belt-
+    and-braces against a future `tracing::debug!("{body:?}")` leaking the
+    API key into the request-log ring buffer.
+
+  **Operator action required:** before upgrading, export every stored
+  credential via the pre-fix binary, then revoke-and-re-create them
+  under the new binary with `CAIRN_CREDENTIAL_KEY` set. The new binary
+  CANNOT decrypt pre-fix ciphertexts — it reads the first 12 bytes as
+  a random nonce — so `POST .../credentials/rotate-key` is NOT a valid
+  remediation; its decrypt side errors on every pre-fix row. The boot
+  scan (`scan_legacy_ciphertexts`) labels every legacy row so the
+  revoke+recreate queue is visible, with up to 20 rows printed and a
+  count-of-remaining line when the list exceeds that.
+
+### Changed
+
+- **F63: default `CAIRN_FABRIC_LEASE_TTL_MS` raised `30_000` → `180_000`
+  (30 s → 3 min).** The previous 30 s default routinely expired between
+  `POST /v1/runs/:id/orchestrate` calls on pull-mode, operator-paced
+  workflows (typical iteration: LLM tail ~30 s + human approval
+  ~60 s + tool exec ~30 s). Every expiry tripped F62's
+  `TerminalWriteDeadlock` path and lost the LLM's productive work.
+  180 s covers the typical iteration with headroom while keeping
+  stuck-run recovery latency bounded (vs the previously-tried 600 s
+  workaround, reverted in F43 triage for 20× zombie-recovery delay
+  + `worker_leases` bloat). The underlying FF dual-door-deadlock root
+  cause is tracked upstream at
+  <https://github.com/avifenesh/FlowFabric/issues/371>; once FF ships
+  the fix this default can be revisited.
+- **Upgraded FlowFabric 0.10.0 -> 0.11.0 (Wave 9 Postgres parity; no
+  cairn consumer-facing changes).** FF 0.11 flips 12 Postgres
+  `Unavailable` trait methods to concrete impls (cancel/revoke/replay
+  execution, change_priority, read_execution_info/state,
+  get_execution_result, budget_admin, quota_admin,
+  list_pending_waitpoints, cancel_flow_header, ack_cancel_member) plus
+  ships five additive pg migrations (0010-0014) and a new
+  `ff_operator_event` LISTEN/NOTIFY channel. Per upstream's
+  `docs/CONSUMER_MIGRATION_0.11.md`, there are zero Rust API changes,
+  zero wire-format changes, and zero Valkey-backend behaviour changes.
+  cairn runs on the Valkey backend today, so the bump is purely a
+  lockfile + `Cargo.toml` pin move (`flowfabric`, `ff-observability`,
+  `ff-core` test-fixtures, `ferriskey` from `"0.10"` to `"0.11"`).
+  Workspace `cargo check`, `cargo clippy -D warnings`, `cairn-fabric`
+  lib tests (292/0), and `cairn-app` lib tests (149/0) are all green
+  on the bump; UI `npm run build` also clean.
+
+### Added
+
+- **RFC 029 PR A: KnowledgeProvider capability family + wire types**
+  (`cairn-plugin-proto`, `cairn-tools`). First implementation PR from
+  [RFC 029](./docs/design/rfcs/029-pluggable-knowledge-providers.md).
+  Adds `CapabilityFamily::KnowledgeProvider`, the full
+  `knowledge.{query,ingest,ingest_status,list_sources}` wire-type
+  surface in the new `cairn-plugin-proto::knowledge` module, and the
+  `KnowledgeProviderCapability` handshake snapshot type used at
+  `initialize` (Layer 2 of RFC 007's three-layer declaration model)
+  because knowledge providers' effective capability detail depends on
+  runtime state (credentials, backend reachability) unavailable at
+  manifest-parse time. Adds `PluginCapability::KnowledgeProvider`
+  (empty variant; detail is at handshake) plus `PluginManifest::validate()`
+  enforcing the RFC 029 co-occurrence rule: manifests declaring both
+  `knowledge_provider` and `signal_source` are rejected with
+  `CapabilityConflict` (preserves RFC 015's lazy-spawn invariant for
+  tool-only plugins, which knowledge providers rely on). `cairn-plugin-proto`
+  gains a `cairn-domain` dep for shared ID types per RFC 029's locked
+  decision. Scope deferred to PR B1: `From`/`TryFrom` bridges between
+  wire types and in-process `cairn-memory::{retrieval, ingest}` types
+  + in-process `ScoringBreakdown.freshness → freshness_decay` rename
+  (both require touching `cairn-memory` which is B1's home crate).
+  Tests: 10 new in `cairn-plugin-proto::knowledge`, 5 new in
+  `cairn-tools::plugins`; round-trip + tri-state scoring-dimension
+  rejection + capability-conflict rejection all covered.
+
+- **`DELETE /v1/admin/tenants/:t/sessions/:s` admin soft-delete (closes
+  #229).** Previously there was no way to remove a session short of
+  wiping the event log — stray / mistyped session ids accumulated in
+  the projection forever. The new route mirrors PR BB's workspace
+  pattern exactly: it verifies the session belongs to the supplied
+  tenant, calls `SessionService::archive` (which issues the
+  fabric-side cancel + `cairn.archived` tag write and emits a
+  `SessionArchived` bridge event), and returns 204. Cross-tenant
+  DELETE by id is refused with 404 so a mistyped `:tenant_id` cannot
+  silently archive another tenant's session.
+
+- **Traces page detail drawer + cross-entity links + scope-aware query
+  (closes #241).** `TracesPage` now opens a right-side `Drawer` when an
+  operator clicks (or keyboards onto) any row, surfacing the full
+  metadata cairn persists for each provider call — trace id, model,
+  provider, latency, cost, prompt/completion tokens, status, timestamp
+  — plus deep links out to the owning session and run. The drawer is
+  explicit about *not* rendering prompt or completion bodies, because
+  cairn deliberately keeps that content off the trace read model, and
+  points operators at the session/run pages for transcripts instead.
+- **`session_id` and `run_id` as navigable links in the traces table.**
+  Both ids were previously rendered as opaque `shortId` text; they are
+  now `#session/:id` / `#run/:id` anchors so hopping from a slow
+  provider call to its originating run or session no longer requires a
+  manual URL edit. A new `Run` column also appears on md-and-wider
+  viewports.
+- **`defaultApi.getTraces` is now scope-aware.** The helper used to
+  take a bare `limit: number`; it now accepts `{ limit?, tenant_id?,
+  workspace_id?, project_id? }`, folds the current `useScope()` values
+  in via `withScope()`, and `TracesPage`'s React-Query `queryKey`
+  includes the scope tuple so switching tenants/workspaces/projects
+  invalidates the cache instead of flashing stale rows from another
+  project. Existing call sites in `DashboardPage`, `CostsPage`, and
+  `GlobalSearch` were migrated to the new object form.
+
+- **Workspace soft-delete via `DELETE /v1/admin/tenants/:t/workspaces/:w`
+  (closes #218).** Before this there was no way to remove a workspace
+  short of wiping the event log — every typo or stale dev workspace
+  piled up on the operator's sidebar forever. The backend now accepts
+  a `DELETE` on the workspace resource, emits a new
+  `WorkspaceArchived` event, and stamps `archived_at` on the
+  projection row. The list endpoint filters archived workspaces by
+  default; passing `?include_archived=true` surfaces them again for
+  audit. The in-memory, SQLite, and Postgres projections all track
+  the new column (SQLite adds it via best-effort `ALTER TABLE` for
+  existing dev databases; Postgres via a new `V020` migration).
+  `WorkspacesPage` gains a per-card **Delete** action (protected by a
+  confirm dialog, hidden on the currently-active workspace) wired to
+  a new `defaultApi.deleteWorkspace` helper; `WorkspaceRecord` picks
+  up an optional `archived_at` field on the UI side.
+
+### Fixed
+
+- **`POST /v1/runs/:id/orchestrate` now survives HTTP client disconnect**
+  **(closes #765).** Axum cancels the request task when a client disconnects
+  mid-request (e.g., a `curl -m 5` timeout, a gateway 504, a load-balancer
+  teardown). Before this fix, the orchestrator loop future was owned by the
+  request task, so cancellation dropped every in-flight `tokio::time::timeout`
+  and `provider.generate(...)` before they could return; `finalize_run_failure`
+  never fired; affected runs were permanently stuck at `state=running` with no
+  resume path (R17c dogfood: 8 orphaned runs). Fix: the loop is now launched
+  via `tokio::spawn`, which detaches it from the request task's scope. Client
+  disconnect only severs response delivery — the loop runs to terminal state
+  regardless. The synchronous response shape for connected callers is
+  unchanged (the handler awaits the JoinHandle). Regression test
+  (`test_765_orchestrate_survives_client_disconnect`) uses a 4s mock LLM
+  and 300ms client timeout to deterministically reproduce and prove the fix.
+- **`cairn_http_*` Prometheus counters now advance with live traffic
+  (closes #243).** The binary-side `metrics_prometheus_handler` was
+  reading from a binary-local `AppMetrics` struct that no middleware
+  ever wrote to — so `cairn_http_requests_total`,
+  `cairn_http_latency_ms`, and `cairn_http_error_rate` all stayed at 0
+  despite sustained traffic. The handler now reads from the lib-side
+  `AppMetrics` that the `observability_middleware` populates on every
+  request. The orphaned binary struct was removed and new public
+  accessors (`http_total_requests`, `http_errors_by_status`,
+  `http_requests_by_path`, `http_avg_latency_ms`,
+  `http_latency_percentile`, `http_error_rate`) expose the existing
+  histograms without duplicating the recording path. A new integration
+  test (`test_http_metrics_middleware`) drives mixed 2xx/4xx traffic
+  through the router and asserts the counters advance.
+- **`GET /v1/admin/logs` returns a clean `{entries, limit, total}`
+  response, and the LogsPage "Showing N of M buffered" footer now
+  renders (closes #237).** The handler previously emitted five fields
+  (`entries`, `limit`, `total`, `buffered`, `has_more`) while the UI
+  typed only `buffered?`/`has_more?` as optional — the derived counts
+  drifted. The handler is now trimmed to the three canonical fields
+  (`total` is the ring buffer depth; clients derive "there is more"
+  from `entries.length >= limit && total > entries.length`), and
+  `LogsPage` + `RequestLogsResponse` were aligned so the footer
+  surfaces real counts instead of the static ring-buffer fallback.
+- **`GET /v1/skills/:id` returns 404 JSON for unknown ids even behind
+  the binary's SPA catch-all (closes #236).** The route is registered
+  in `build_catalog_routes` and the existing lib-level test covered
+  it, but nothing asserted the bin-level composition
+  (`catalog.merge(binary).fallback(serve_frontend)`) didn't accidentally
+  drop the match. A new regression test in `test_http_skills` stands up
+  the full bin-router shape in-process — catalog routes + empty binary
+  merge + 200-text/html SPA fallback — and pins both the JSON 200 for a
+  known id and the `application/json` 404 with the canonical
+  `skill_not_found` envelope for an unknown one.
+- **`PUT /v1/settings/defaults/:scope/:scope_id/:key` now validates the
+  value server-side (closes #228).** Before this the endpoint accepted
+  anything — empty string, 10k-character garbage, `nonsense-model-id`
+  — and returned 200, leaving the typo to surface later as an opaque
+  provider-layer failure. Validation is per-key: model-id keys
+  (`brain_model`, `generate_model`, `stream_model`, `embed_model`) must
+  resolve in the static provider registry AND be listed as supported
+  by at least one active provider connection (mirrors PR #185's
+  UI-side filter, now enforced server-side); numeric keys (`max_tokens`,
+  `timeout_ms`, `temperature`) are parsed and range-checked; string
+  values are capped at 256 chars for model ids and 4096 chars for
+  prompt-like keys. All failures surface as 422 with a specific error
+  message.
+
+- **`POST /v1/sessions` now rejects duplicate / empty / oversized
+  `session_id` (closes #229).** Previously a dup silently returned 201
+  (UI couldn't distinguish a new session from a collision), and empty
+  or 10k-character session ids also succeeded. The handler now
+  pre-checks for an existing session via `SessionService::get` and
+  returns 409 on collision (mirrors PR BA/#217's
+  `CredentialServiceImpl::store` pattern), rejects empty `session_id`
+  with 422, and caps length at 256 characters.
+
+- **`POST /v1/memory/ingest` now validates `source_id` and structured
+  JSON payloads (closes #238).** An empty `source_id` used to silently
+  mint a blank-id source; `source_type: "structured_json"` accepted
+  arbitrary non-JSON content and only failed later at retrieval time.
+  Both now 422 at ingest, with the JSON parse error surfaced in the
+  response body. The accompanying UI fix changes
+  `MemoryPage`'s search-result React key from the bare `chunk_id` to
+  `${chunk_id}-${rank}` so duplicate chunks across pages no longer
+  trigger React's duplicate-key warning.
+- **ApprovalsPage rows now navigate to the linked run on click
+  (closes #231).** Clicking (or pressing Enter/Space on) an approval
+  row whose `run_id` is populated now routes to `#run/:id`; rows
+  without a run id remain non-interactive, and the Approve/Reject and
+  copy-id buttons keep stopping propagation so they don't trigger
+  navigation.
+
+- **`GET /v1/tasks` + `GET /v1/runs` now honor the
+  `tenant_id`/`workspace_id`/`project_id` query filters (closes
+  #234).** `list_tasks_filtered` in the in-memory store was declared
+  with underscore-prefixed scope arguments and returned every task in
+  the store regardless of the caller's requested scope, so an admin
+  querying `/v1/tasks?tenant_id=A&workspace_id=B&project_id=C` got
+  tasks from other tenants mixed into the response — a cross-tenant
+  leak on the operator list surfaces. The project key is now applied
+  alongside the existing `run_id` and `state` narrowing predicates
+  (mirroring the run-list contract from #184), with a new integration
+  test seeding entities in two tenants and asserting neither leaks
+  into the other's list. The run-list path was already wired
+  correctly; the new test locks in that behavior too so a future
+  refactor can't silently regress it the way #234 did.
+
+- **DecisionsPage Cache tab crashed with "Objects are not valid as a
+  React child" (closes #240).** The UI `CacheEntry.outcome` type
+  declared `string`, but `GET /v1/decisions/cache` emits the same
+  nested `{outcome, deny_reason?}` struct as `Decision.outcome`, so
+  `OutcomePill` received an object and React bailed. `scope` was
+  similarly a `ProjectScope` object being rendered directly. The
+  `CacheEntry` type now mirrors the wire shape, the outcome column
+  reads `r.outcome.outcome`, and `scope` is folded to a
+  `tenant/workspace/project` label via `scopeLabel`. Row keys moved
+  from the non-existent `key` field to `decision_id`.
+
+- **AuditLog "Older" pagination permanently disabled (closes #239).**
+  The backend returns `cairn_api::ListResponse<T>` which serializes
+  via `#[serde(rename_all = "camelCase")]`, so the wire envelope is
+  `{items, hasMore}`, but `AuditLogResponse` in `ui/src/lib/types.ts`
+  and the reader in `AuditLogPage.tsx` both read `has_more`. The
+  boolean was always `undefined`, so `Older` was always disabled.
+  Types and the reader now use `hasMore` to match the wire
+  contract.
+
+- **Eval `dataset_id` lost on restart (closes #220).** `POST
+  /v1/evals/runs` persisted an `EvalRunStarted` event so runs would
+  survive a reboot, but the event only carried prompt-asset /
+  version / release / created_by fields — not the dataset binding
+  submitted alongside them. `replay_evals()` rebuilt each run from
+  the event and silently dropped the dataset linkage, so after a
+  reboot `GET /v1/evals/runs/:id` came back with `dataset_id: null`
+  even though the operator had picked one in the form.
+  `EvalRunStarted` now carries an optional `dataset_id` (defaulted
+  via `#[serde(default)]` for backward-compatibility with pre-#220
+  event log entries). The handler populates it from the request
+  body and `replay_evals()` calls `set_dataset_id` on the
+  in-memory eval service when the event carries one, so the
+  binding round-trips through a full sigkill + replay cycle.
+
+- **GraphPage — full node-kind coverage + 5 provenance query tabs
+  (closes #151).** The simulation view previously collapsed all 22
+  backend `NodeKind` variants down to `session` / `run` / `task` via a
+  `toSimKind` filter, silently hiding approvals, checkpoints, triggers,
+  mailbox messages, tool invocations, route decisions, provider calls,
+  memories, documents, chunks, sources, ingest jobs, signals, prompt
+  assets/versions/releases, eval runs, skills, and channel targets.
+  The filter is gone; every emitted kind now renders with its own
+  radius / fill / stroke, the legend rebuilds from live counts, and the
+  simulation cap was raised from 100 to 150 nodes. A new **Queries**
+  tab exposes thin wrappers around the five previously unused graph
+  endpoints — `GET /v1/graph/execution-trace/:run_id`,
+  `/v1/graph/dependency-path/:node_id`,
+  `/v1/graph/retrieval-provenance/:run_id`,
+  `/v1/graph/prompt-provenance/:release_id`, and
+  `/v1/graph/multi-hop/:node_id` — each with a small form for its
+  params (ID, max-depth/hops, and for multi-hop `min_confidence` +
+  `direction`) and a render pane reusing the existing force-graph
+  primitive. `GraphNodeKind` picked up the missing `trigger` variant
+  and `GraphEdgeKind` picked up `matched_by` and `fired` so the
+  TypeScript types match the Rust enum 1:1.
+
+- **EvalsPage — real eval-run contract with dataset / rubric / baseline /
+  prompt-release pickers (closes #138).** The "New Eval Run" popover used
+  to collect only `evaluator_type` and `subject_kind`; the backend accepted
+  the submission and returned a 201 with a run id, but the run was a
+  no-op stub — no dataset, no rubric, no scorecard. `POST /v1/evals/runs`
+  now additionally accepts (and validates against tenant state) optional
+  `dataset_id`, `rubric_id`, and `baseline_id`. Dangling ids return 404
+  instead of being silently ignored. New list endpoints
+  `GET /v1/evals/rubrics` and `GET /v1/evals/baselines` (wrapping the
+  existing `EvalRubricService::list` / `EvalBaselineService::list` — both
+  tenant-scoped via `?tenant_id=`) back the pickers. The form now fetches
+  datasets, rubrics, baselines, and — when `subject_kind=prompt_release`
+  — prompt releases, letting the operator wire a real subject to a real
+  eval configuration. A "Results" link on every row navigates to
+  `#eval-results/:run_id`, which reuses `EvalComparisonPage` in
+  single-run mode and hydrates metrics from `/v1/evals/compare`. Locked
+  by integration test
+  `cairn-app/tests/test_http_evals_full.rs::eval_run_full_contract_roundtrip`.
+
+- **ChannelsPage — real `/v1/channels` CRUD UI (closes #139).** The
+  `/v1/channels` runtime-channel API (create/list/send/consume/messages
+  on `cairn-runtime::ChannelService`) had no operator UI. A new
+  `ChannelsPage` now wires it up: project-scoped list with name /
+  channel_id / capacity / created columns, a "New Channel" modal
+  (name + capacity), a per-row "Send" modal (sender_id + body), and a
+  per-row "Messages" drawer that polls `/v1/channels/:id/messages`.
+  `api.ts` gains `listChannels`, `createChannel`, `sendToChannel`,
+  `getChannelMessages`, `consumeChannelMessage`; `types.ts` gains
+  `Channel`, `ChannelMessage`, `CreateChannelRequest`,
+  `SendChannelMessageRequest`, `SendChannelMessageResponse` mirroring
+  the `cairn_domain::{ChannelRecord, ChannelMessage}` Rust types. New
+  integration test
+  `crates/cairn-app/tests/test_http_channels.rs::channel_create_send_list_roundtrip`
+  pins the create → send → list contract end-to-end against a live
+  `cairn-app` subprocess.
+
+- **LogsPage + AuditLogPage — time-range filter, page-size control, and
+  cursor pagination (closes #163).** Both pages previously hardcoded a
+  single fetch (500 / 200 entries) with no way to scroll into older
+  history. The admin request-log handler now accepts `since_ms`; the
+  audit-log handler now accepts `before_ms` (exclusive upper bound) in
+  addition to the existing `since_ms`/`limit`, with the limit clamped to
+  `[1, 1000]`. The UI gains last-15m / 1h / 24h / 7d / all time-range
+  dropdowns, a 50/100/250/500 page-size picker, and — for the audit log
+  — prev / next / jump-to-newest pagination driven by a `before_ms`
+  cursor stack. The request-log response now also returns `buffered` +
+  `has_more` so the footer can show "showing N of M" and surface a
+  hint when the page was truncated.
+
+- **`GET /v1/skills` + `GET /v1/skills/:id` — real skills catalog wiring.**
+  Replaces the hard-coded empty stub
+  (`list_skills_preserved_handler` in `handlers/memory.rs`) with a
+  handler that reads a live `cairn_domain::skills::SkillCatalog` held
+  on `AppState`. List returns the UI-expected
+  `{items, summary, currently_active}` shape derived from the real
+  `SkillSummary` records (`skill_id`, `name`, `description`,
+  `version`, `tags`, `enabled`); `?tag=<tag>` filters by tag; detail
+  endpoint returns the full `Skill` struct (with `entry_point`,
+  `required_permissions`, `status`). `SkillsPage` now renders real
+  skill metadata (skill id, version badge, tag pills) instead of
+  dumping opaque `Record<string, unknown>` entries. The catalog
+  starts empty; workers register skills via the domain API. The
+  response body stays shape-compatible with the previous stub:
+  `items`, `summary`, and both `currentlyActive` (camelCase, first)
+  and `currently_active` (snake_case) keys are still emitted from a
+  single shared list, so UI clients keyed on either name continue to
+  work. `currently_active` includes a skill only when it is BOTH
+  lifecycle-`Active` and `enabled` — the domain `disable()` only
+  clears `enabled`, so gating on both avoids listing disabled skills
+  under "Currently active".
+  Integration tests at `crates/cairn-app/tests/test_http_skills.rs`
+  cover list, tag-filter, detail, 404, disabled-skill handling, and
+  empty-state paths. Closes #147.
+- **`RunDetailPage` + `OrchestrationPage` — operator run-mutation actions.**
+  Wires the 10 mutation endpoints under `/v1/runs/:id/*` that had no UI
+  consumer: **pause**, **resume**, **recover**, **replay**, **claim**,
+  **spawn subagent**, **children list**, **orchestrate**, **diagnose**,
+  and **intervene** (plus `GET /v1/runs/:id/interventions` history).
+  `RunDetailPage` gains an Operator Actions toolbar (pause/resume
+  state-aware, orchestrate/diagnose drawer, intervene & spawn modals,
+  recover/claim gated behind `window.confirm`), a Children Runs
+  subtable that navigates to each child on click, and an Interventions
+  history drawer. `OrchestrationPage` gains per-row quick-action icons
+  (pause/resume/orchestrate/diagnose/intervene) that disable themselves
+  based on run state and invalidate the live orchestration tree on
+  success. Closes #166 and #173.
+- **`defaultApi` — new run-scoped methods**: `recoverRun`, `replayRun`,
+  `claimRun`, `spawnSubagentRun`, `listChildRuns`, `orchestrateRun`,
+  `diagnoseRun`, `interveneRun`, `listRunInterventions`, plus widened
+  `pauseRun` / `resumeRun` signatures that accept the full
+  `PauseRunRequest` / `ResumeRunRequest` bodies (reason kind, actor,
+  trigger, target). Matching TypeScript types in `lib/types.ts`
+  (`PauseReasonKind`, `ResumeTrigger`, `RunResumeTarget`,
+  `SpawnSubagentRequest`, `InterventionAction`, `InterveneRequest`,
+  `InterventionRecord`, …) mirror the Rust DTOs in
+  `crates/cairn-app/src/handlers/runs.rs`.
+- **`test_http_run_operator_actions.rs`** integration test covering
+  pause/resume endpoint wiring, `spawn → list_children` roundtrip, and
+  `intervene → list_interventions` against the live HTTP server via
+  `LiveHarness`.
 - **`WorkersPage` now reads the real worker registry.** The page used to
   synthesise "workers" by grouping `GET /v1/tasks` rows by `lease_owner`,
   which reported zero workers whenever no task was currently leased —
@@ -47,8 +1118,343 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (attach → list → get → detach → list-empty roundtrip + malformed-id
   400 contract).
 
+### Changed
+
+- **ChannelsPage → NotificationsPage rename (closes #139).** The
+  legacy `ChannelsPage.tsx` was misnamed — it managed per-operator
+  notification preferences at `/v1/admin/operators/:id/notifications`,
+  not the `/v1/channels` CRUD surface. The file is renamed to
+  `NotificationsPage.tsx`, the nav item splits into two entries under
+  Infrastructure ("Channels" for runtime channels, "Notifications" for
+  notification preferences), and the `NavPage` union in `Sidebar.tsx`
+  / `Layout.tsx` gains a `notifications` key. Existing
+  `/v1/admin/operators/:id/notifications` behaviour is unchanged.
+
+### Removed
+
+- **`list_skills_preserved_handler` stub (part of #147).** The
+  hard-coded empty stub at
+  `crates/cairn-app/src/handlers/memory.rs:1588-1603` that returned
+  `{items: [], summary: {total: 0, enabled: 0, disabled: 0}}` for
+  every `GET /v1/skills` request is deleted; the route is now served
+  by the real handler in `handlers/skills.rs` backed by the domain
+  `SkillCatalog`.
+
 ### Fixed
 
+- **Backend: `EvalRunStarted` persists `dataset_id` / `rubric_id` /
+  `baseline_id` (closes #223, supersedes #220).** `POST /v1/evals/runs`
+  accepted the three linkage fields in the request body but dropped
+  them before emitting the `EvalRunStarted` event, so the binding was
+  invisible on `GET /v1/evals/runs/:id` and vanished entirely on
+  event-log replay. The event now carries the three ids (all
+  `Option<String>` with `#[serde(default)]` for backward-compat),
+  `create_eval_run_handler` threads them from the request into the
+  event and the in-memory `EvalRun` record via
+  `set_dataset_id` / `set_rubric_id` / `set_baseline_id`, and
+  `AppState::replay_evals` re-binds them on boot. Covered by
+  `tests/test_http_evals_full.rs::eval_run_full_contract_roundtrip`
+  and a new replay-survives-restart assertion.
+
+- **Backend: `GET /v1/evals/rubrics` + `/v1/evals/baselines` return
+  200 with the list shape the UI consumes (closes #223).** The routes
+  are registered in the preserved catalog and the axum fold; this PR
+  locks the contract with an integration test so they cannot regress
+  to 405 again.
+
+- **Backend: `POST /v1/prompts/releases/:id/request-approval` routed to
+  the wrong handler (closes #222).** QA2 Slice 9 surfaced a 422 on every
+  "Request Approval" click (`missing field approval_id`). Two routes
+  registered the path — the later (and winning) one dispatched to the
+  generic `request_approval_handler`, which deserializes the body into
+  `RequestApprovalRequest { tenant_id, workspace_id, project_id, approval_id, … }`
+  and 422'd on the empty body the UI posts. Fixed the duplicate route
+  to use `request_prompt_release_approval_handler`, which takes only
+  the path id and looks up the release's project server-side. The UI
+  `requestPromptReleaseApproval` call now also wraps its body via
+  `withScope(…)` for consistency with `createPromptVersion`,
+  `createPromptRelease`, and `getPromptReleases`. `test_http_prompts.rs`
+  now covers the full asset → version → release → request-approval
+  roundtrip as a regression guard.
+
+- **UI: `MemoryPage` — ingest `source_type` is now a dropdown of valid
+  enum values (closes #219).** The ingest form shipped a free-text input
+  with a placeholder suggesting `web, file, api, …` — none of which are
+  valid; the backend rejected every submission with 422. Replaced with
+  a `<select>` populated from the real `SourceType` enum (`plain_text`,
+  `markdown`, `html`, `structured_json`, `json_structured`,
+  `knowledge_pack`), defaulting to `plain_text`. The request field name
+  is unchanged so the API contract is untouched.
+
+- **Backend: `POST /v1/runs/:id/pause` returns 409 on invalid state
+  (closes #216).** Pausing a run that was not yet claimable (pending
+  state, no lease) previously crashed into a 500: FF's
+  `ff_suspend_execution` rejects with `fence_required` /
+  `execution_not_active`, which rolled up as `FabricError::Internal`
+  and then `RuntimeError::Internal`. The fabric adapter now classifies
+  the documented suspend-state rejection codes (`fence_required`,
+  `partial_fence_triple`, `execution_not_active`, `lease_revoked`,
+  `stale_lease`, `invalid_lease_for_suspend`, `already_suspended`,
+  `waitpoint_not_token_bound`) as `RuntimeError::InvalidTransition`,
+  and the HTTP error mapper returns 409 Conflict with code
+  `invalid_state_transition` for every `InvalidTransition` variant
+  (was 422). Regression covered end-to-end by
+  `test_http_run_operator_actions::pause_on_pending_run_returns_409_not_500`.
+- **Backend: duplicate credential for the same `(tenant, provider_id)`
+  returns 409 (closes #217).** `POST /v1/admin/tenants/:t/credentials`
+  silently accepted repeated posts with the same `provider_id`, both
+  returning 201 and accumulating two active records in the read model.
+  `CredentialServiceImpl::store` now rejects when an active credential
+  already exists for the pair, surfacing `RuntimeError::Conflict`; the
+  admin handler re-shapes this into a 409 with code
+  `credential_exists` and a message naming the tenant and provider.
+  Revoke-then-create still succeeds, preserving the rotation workflow.
+  Regression covered by `test_http_credentials`.
+- **UI: `PromptsPage` — create initial version alongside asset (#150).**
+  `NewPromptForm` previously only posted to `/v1/prompts/assets`, leaving
+  authors with an asset they could not release without a curl step. The
+  form now accepts an optional "Initial version" textarea; on submit, the
+  UI sequentially creates the asset and, when the body is non-empty,
+  posts the first `PromptVersion` with a SHA-256 `content_hash` computed
+  in the browser. Backend `POST /v1/prompts/assets/:id/versions` and
+  `POST /v1/prompts/releases` now accept the request with
+  `prompt_version_id`/`prompt_release_id` omitted and mint `pv_<uuid>`
+  and `rel_<uuid>` respectively, so the UI no longer fabricates IDs
+  client-side. `createPromptVersion` + `createPromptRelease` now route
+  through `withScope(body)` (matching `createPromptAsset`) so the
+  sequential flow inherits the active tenant/workspace/project scope.
+  Asset-only creation (blank textarea) still works. Closes #150.
+- **Backend: admin bypass on `POST /v1/runs/:id/spawn` and
+  `POST /v1/runs/:id/intervene`.** Both handlers compared the run's
+  `project.tenant_id` to the principal's tenant without an admin
+  short-circuit, so the `admin` service account (hard-bound to
+  `TenantId("default")`) returned a `404` with error code `"not_found"`
+  and message `"run not found"` for any run in another tenant —
+  inconsistent with `replay_to_checkpoint` and other
+  sibling handlers that already honor `tenant_scope.is_admin`. Surfaced
+  while wiring the run-detail operator pages (PR P / PR O'). Both
+  handlers now read `tenant_scope.is_admin || run.project.tenant_id ==
+  *tenant_scope.tenant_id()`, matching the existing pattern at
+  `runs.rs:775`. Spawn keeps the strict parent-child project match on
+  the child session lookup — admin does not enable cross-tenant child
+  spawning. Downstream event-stamping and notification sites inside
+  `intervene_run_handler` (5 sites: `append_run_intervention_event`,
+  `OperatorIntervention.tenant_id` for `force_fail` / `force_restart`,
+  and `notify_if_applicable`) now read the run's actual tenant from
+  `run.project.tenant_id` instead of `tenant_scope.tenant_id()`, so
+  an admin crossing tenants does not mislabel intervention events
+  or misroute SSE notifications (fixed pre-merge after Cursor Bugbot
+  flagged the regression on the first admin-bypass pass).
+- **Backend: `event_message()` no longer renders Plan* events as
+  `"unknown"`.** `PlanProposed`, `PlanApproved`, `PlanRejected`, and
+  `PlanRevisionRequested` had entries in `event_type()` but fell into
+  the catch-all fallthrough arm in `event_message()`, so every plan
+  lifecycle event showed up in SSE frames and audit payloads with a
+  message of `"unknown"`. Added dedicated arms that include the plan
+  run id plus the relevant actor / reason / revision id so operators
+  can read the message without decoding the event payload.
+
+- **UI: `DashboardPage` — real widgets, no placeholders (#179).** Three
+  bugs fixed in one pass: (A) the Runs / Tasks tabs rendered empty or
+  dummy content — now render compact, live tables driven by
+  `defaultApi.getRuns({ limit: 50 })` / `defaultApi.getAllTasks({
+  limit: 50 })` filtered to active states, sorted newest-first, capped
+  at 8 rows, auto-refreshing every 5 s, mirroring the row pattern from
+  the existing `ActiveRunsWidget`. (B) `ProviderStatusWidget` hardcoded
+  three rows (`Store / Events / Memory`) against `/v1/health/detailed`;
+  it now iterates the real `components` array from `/v1/status`,
+  normalizes status tokens (`ok`/`healthy`/`degraded`/`unhealthy`/
+  `unconfigured`) and pretty-prints snake_case names. New components
+  added server-side appear automatically with no UI change. (C) the
+  `CostWidget` trend was dead code — the previous-snapshot query was
+  `enabled: false` so the arrow never rendered. Replaced with a
+  `useRef`-tracked prior total updated after each successful fetch;
+  widget now shows an up / down / flat arrow plus a signed percent
+  delta (`+12.3%` / `-4.1%` / `0.0%`) vs. the previous 30 s snapshot.
+  The `displayedPrev` baseline only advances when `dataUpdatedAt`
+  changes, so ordinary re-renders don't collapse the delta to flat.
+  Also fixed the event-sparkline bucketing bug: `useHourlyEventCounts`
+  now prefers numeric `stored_at` (backend truth) and falls back to
+  ISO `timestamp` — previously it only read `timestamp`, dropping
+  every `RecentEvent` that arrived with only the numeric field.
+  Hash navigation from the Run / Task rows is now URL-encoded, to
+  match the rest of the UI's routing pattern.
+- **UI: `TestHarnessPage` "Run All Scenarios" no-op'd scenario cards (#143).**
+  The page-level Run All handler ran its own private copy of each
+  scenario's steps against the server and then bumped a `runAllKey`
+  to remount cards. Cards themselves never executed — step rows
+  stayed idle ("0/N steps") while the summary banner reported
+  green. Rewired Run All so each `ScenarioCard` accepts a per-card
+  `runNonce` prop; the parent increments nonces sequentially and
+  awaits an `onComplete` callback from the card's real
+  `runScenario` before moving to the next. Step rows now reflect
+  live per-step progress during Run All, and the summary reflects
+  what the cards actually saw. Closes #143.
+- **UI: `TestHarnessPage` "Event log" step was a sham (#143).**
+  The `event_log` step called `getRunEvents("__nonexistent__")`
+  with a blanket `.catch(() => [])` and reported pass regardless
+  of server state — it asserted nothing. Replaced with a real
+  `GET /v1/events/recent?limit=5` probe via `getRecentEvents` that
+  asserts the response is an array and each returned record has a
+  non-empty `event_type`. Description updated to match.
+- **UI: `AgentTemplatesPage` navigated after a 500 ms `setTimeout` (#161).**
+  After `instantiateAgentTemplate` succeeded the page slept 500 ms before
+  routing to the new run, hoping the backend had finished creating it —
+  a pure race. The endpoint returns the `run_id` synchronously in its
+  201 response, so the page now navigates immediately on success. No
+  more stale-detail flash, no more missed-run when the handler is slow.
+- **UI: `ProjectDashboardPage` rendered tenant-wide cost widgets as if
+  they were project-scoped (#144).** `/v1/costs` is tenant-scoped on the
+  backend (`SessionCostRecord` has `tenant_id` only; no workspace/project
+  fields on the event or projection), so the "Total Spend" and "Provider
+  Calls" cards aggregated across every workspace and project in the
+  tenant while the labels suggested a single project. The cards are now
+  labeled "Tenant Spend" / "Tenant Provider Calls" with a description
+  that says "authenticated tenant — not project-scoped"; the Resources
+  summary sub-label reads "tenant-wide". The copy avoids interpolating
+  the UI's `tenantId` state because the backend derives the tenant from
+  the bearer token (`TenantScope`) and ignores any UI-side tenant
+  filter, so hardcoding a tenant id in copy would mis-attribute spend
+  whenever the scope selector and the bearer token disagree. Proper
+  project-scoped cost filtering needs a backend change (event shape
+  extension + projection); tracked separately.
+- **UI: `OrchestrationPage` re-processed the oldest buffered SSE event
+  on each SSE update and leaked `setTimeout` callbacks on unmount
+  (#177).** The stream effect depended on the whole `streamEvents`
+  array and read `streamEvents[length - 1]`, but `useEventStream`
+  prepends frames (newest-first), so each new stream frame re-handled
+  the OLDEST buffered event — spurious refetches + fresh highlights
+  per unrelated state change — and the 3 s fresh-clear `setTimeout`
+  it scheduled had no cleanup (timeouts accumulated for the life of
+  the tab). Fixed by iterating `streamEvents` in reverse so events
+  are processed exactly once in causal order (dedupe via a
+  `useRef<Set>` of server-assigned event ids, capped at
+  `STREAM_BUFFER_MAX * 5` (currently 250) with
+  oldest-insertion-order eviction), tracking pending highlight
+  timeouts in a `useRef<Map>` that clears them on supersede +
+  unmount, and coalescing refetches so an event burst triggers at
+  most one `rSessions`/`rRuns`/`rTasks`. Payload ids read both
+  snake_case and camelCase to match the pattern in `RunDetailPage`.
+  Operator actions wired in PR P are untouched.
+- **UI: `PlaygroundPage` model picker excluded Anthropic-native providers (#160).** The registry-derived model list filtered out providers whose `api_format` was `anthropic`, silently hiding every Anthropic-native connection even though the backend `chat/stream` handler routes through the native adapter. Removed the adapter-kind filter so all available registered providers contribute their models to the picker. Closes #160.
+- **UI: `DecisionsPage` row-level Invalidate button was invisible (#153).**
+  The per-row "Invalidate" button in the cache tab used Tailwind's
+  `opacity-0 group-hover:opacity-100` reveal pattern, but the shared
+  `DataTable` `<tr>` did not declare the `group` class, so the
+  `group-hover:` variant never activated and the button stayed
+  permanently hidden. Added an opt-in `rowClassName` prop to
+  `DataTable` (keeps the shared component free of implicit Tailwind
+  scopes) and pass `rowClassName="group"` from `DecisionsPage` for
+  the cache tab so hover-revealed row actions become visible on
+  hover. Closes #153.
+- **UI: `CredentialsPage` Add-Credential modal missing toast on store error + stale `default` placeholder (#162).**
+  The `storeCredential` mutation only declared `onSuccess`, so any
+  failure (invalid provider, encryption key lookup miss, transport
+  error) was only shown via the modal's inline `mutErr` text and did
+  not surface through the shared toast — inconsistent with the rest
+  of the app (ApprovalsPage, DecisionsPage) where operator-initiated
+  mutations always raise a toast on failure. Added an `onError`
+  handler that surfaces the error message via `useToast()`, matching
+  the `ApprovalsPage` pattern. Also replaced a stale
+  `placeholder="default"` string literal on the Tenant input with
+  `DEFAULT_SCOPE.tenant_id` from `ui/src/lib/scope.ts` so the
+  placeholder stays in sync with the canonical default tenant id
+  (`default_tenant`) — the PR #132 cleanup missed this one field.
+  Closes #162.
+- **UI: `RunDetailPage` plan-mode detection used a loose substring match (#178).**
+  The `isPlanMode` check in `ui/src/pages/RunDetailPage.tsx` used a loose
+  substring match (`runModeType.includes("plan")`), so runs with names or
+  mode strings that merely contained the substring `plan` (e.g.
+  `"deploy-plan"`, `"reviewplan"`) triggered the Plan Mode review panel
+  spuriously. Replaced with an exact match on the typed
+  `cairn_domain::RunMode` discriminator (`runModeType === "plan"`), with
+  the existing `hasPlan` fallback retained for legacy plan-artifact rows.
+- **UI: `RunDetailPage` terminal-state set missed `dead_lettered` (#178).**
+  The page-local `TERMINAL_STATES` set used for disabling operator
+  actions, stamping the run-end on the Gantt chart, and choosing the
+  "running"/"total" task stat label only listed `completed | failed |
+  canceled`. Aligned with `cairn_domain::RunState::is_terminal()` and
+  defensively added `dead_lettered` (bubbled up from
+  `TaskState::DeadLettered` if a DLQ'd row is ever surfaced as a
+  run-level state); `retryable_failed` is intentionally excluded
+  because it is pending-retry, not terminal. The two inline duplicate
+  literals lower in the file now reuse the named set so the three sites
+  can't drift apart.
+- **UI: `TriggersPage` swallowed backend failures on raw `fetch` calls (#154).**
+  Replaced the 5 raw `fetch` calls (list triggers, list run-templates,
+  enable/disable/delete trigger) with new `defaultApi.listTriggers` /
+  `listRunTemplates` / `enableTrigger` / `disableTrigger` /
+  `deleteTrigger` methods that route through `apiFetch` and throw on
+  non-2xx. Added `onError` toasts to all three mutations so operators
+  see the real backend reason instead of a lying "Trigger enabled."
+  toast after a 4xx/5xx. DecisionsPage was already fixed in PR #131;
+  this closes the TriggersPage half.
+
+- **UI: `SessionsPage` per-row run count was O(N*M) per render (#180).**
+  Replaced the per-row `allRuns.filter(...)` scan with a memoized
+  `Map<session_id, count>` computed once from `allRuns`, collapsing
+  per-render work from O(sessions * runs) to O(runs) build + O(1)
+  lookup.
+- **UI: `ApprovalsPage` 24h stats double-counted pending requests (#176).**
+  The "Approved (24h)" and "Rejected (24h)" stat cards filtered resolved
+  approvals by `created_at`, so approvals requested within the last 24h
+  were counted regardless of when (or whether) they were decided, and
+  approvals resolved recently but requested earlier were missed. Switched
+  both filters to `updated_at`, which the backend `ApprovalRecord`
+  projection stamps on every decision write — effectively the resolution
+  timestamp for resolved records. `updated_at` was already serialized by
+  the handler but was missing from the UI `ApprovalRecord` type and the
+  OpenAPI schema; both are now aligned with the wire shape.
+- **UI: `TasksPage` table rows were not clickable (#181).** Added
+  `onRowClick` to the DataTable so clicking a task row navigates to the
+  parent run detail page (`#run/:id`), mirroring the behaviour of the
+  kanban task cards. Rows without a `parent_run_id` remain non-clickable.
+- **UI: `TasksPage` kanban board omitted DLQ columns (#175).** Added
+  `retryable_failed` ("Retryable Failed") and `dead_lettered`
+  ("Dead Lettered") kanban columns so tasks that drop into the
+  retry/dead-letter queues are visible alongside the other states. The
+  Rust `TaskState` enum in `crates/cairn-domain/src/lifecycle.rs` already
+  supports both variants; the UI now renders them.
+- **UI: `ApiDocsPage` endpoint catalog had drifted (#148).** Audited
+  every documented entry against `router.rs` + `bin_router.rs` and added
+  17 missing real routes: run operator mutations
+  (`orchestrate`/`diagnose`/`intervene`/`spawn`/`children`),
+  `GET /v1/runs/:id/replay`, `POST /v1/runs/:id/replay-to-checkpoint`,
+  `GET /v1/sessions/:id/runs`, workers/fleet
+  (`/v1/workers`, `/v1/workers/:id`, `/v1/fleet`), project repo
+  allowlist (`/v1/projects/:project/repos` GET/POST +
+  `/v1/projects/:project/repos/:owner/:repo` GET/DELETE), the skills
+  catalog (`/v1/skills`), and `/v1/metrics/prometheus`. No existing
+  entries were fakes once cross-checked — the `/v1/events/stream` case
+  flagged in the QA slice was already fixed in an earlier PR.
+
+- **UI: `MetricsPage` percentiles were always zero (#159).** The API
+  client's `getMetrics` fetched `/v1/metrics` (JSON counters-only,
+  no histogram buckets), so `p50_latency_ms` / `p95_latency_ms` /
+  `p99_latency_ms` were never populated. It now fetches
+  `/v1/metrics/prometheus`, and `parsePrometheusMetrics` was extended
+  (not rewritten) with branches for the four metric names the Rust
+  handler actually emits — `cairn_http_latency_ms{quantile="0.50|0.95|0.99|avg"}`
+  direct gauges, `cairn_http_requests_by_path_total`,
+  `cairn_http_error_rate`, and `cairn_http_errors_by_status` — with the
+  existing histogram-bucket path kept as a defensive fallback for
+  non-cairn Prometheus feeds. Follow-up to #131's dual-name parser fix.
+- **UI: `RunsPage` detail side-panel was dead code (#169).** A
+  `DetailPanel` component was rendered against a `selected`/`setSelected`
+  state pair that nothing ever set — clicking a row already navigates to
+  `#run/<id>`, so the panel was guaranteed never to appear. The unused
+  component, state, and all orphaned imports (`X`, `ChevronRight`,
+  `FieldRow`, `SectionLabel`, `sectionLabel`, `card` preset) have been
+  removed (~60 LOC).
+- **UI: `RunsPage` batch create now issues one HTTP call (#174).** The
+  `BatchCreateModal` fan-out of N sequential `POST /v1/runs` requests
+  has been replaced by a single `POST /v1/runs/batch` round-trip via
+  `defaultApi.batchCreateRuns`. On partial failure the toast now
+  surfaces the first per-item error message from the backend's
+  `{results: [{ok, error}…]}` body instead of a generic "failed" line.
+  Plan-mode parity is preserved by extending the backend
+  `CreateRunBody` with an optional `mode` field so batch callers can
+  opt into `RunMode::plan` the same way single-run create already does.
 - **UI: `RunDetailPage` rendered `$0.000000` for every run with no
   provider calls (#168).** `GET /v1/runs/:id/cost` returns `200` with a
   zero-valued `RunCostRecord` when no cost data has been recorded, so
@@ -65,6 +1471,16 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for up to 10 seconds after the cancel succeeded. The mutation now
   also invalidates `["run-detail", runId]`, matching the pattern
   established in #131 for plan approve / reject / revise.
+- **UI: `PromptsPage` enum values now match the Rust domain (#150).** The
+  kind dropdown and release-state badges used values (`user`, `assistant`,
+  `pending_approval`, `released`, `rolling_out`, `rolled_back`) that the
+  backend's `PromptKind` / `PromptReleaseState` enums do not recognize, so
+  action buttons fired transition requests the server rejected. Kinds are
+  now `system`, `user_template`, `tool_prompt`, `critic`, `router` and
+  release states are `draft`, `proposed`, `approved`, `active`, `rejected`,
+  `archived`, all exported as typed literal unions in `ui/src/lib/types.ts`
+  and mirrored by state-driven buttons that only fire transitions allowed
+  by `PromptReleaseState::can_transition_to` in `cairn-evals`.
 - **UI: `SessionDetailPage` silently dropped runs past the first 500 (#170).**
   The page fetched `GET /v1/runs?limit=500` and filtered by
   `session_id` client-side, so on projects with more than 500 total

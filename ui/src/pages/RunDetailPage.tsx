@@ -4,17 +4,34 @@ import {
   ArrowLeft, Loader2, Clock, Hash, Cpu, Download,
   Brain, Search, Zap, CheckCircle2, Wrench, ChevronDown, ChevronRight,
   Play, AlertTriangle, FileText, ThumbsUp, ThumbsDown, RotateCcw,
-  Bolt, Box,
+  Bolt, Box, Pause, Stethoscope, LifeBuoy, Lock, GitBranch,
+  MessageSquare, Sparkles, Info, AlertCircle, Terminal,
 } from "lucide-react";
 import { clsx } from "clsx";
 import { StatCard } from "../components/StatCard";
 import { StateBadge } from "../components/StateBadge";
 import { GanttView } from "../components/TimelineView";
+import { RunTelemetryPanel } from "../components/RunTelemetryPanel";
 import { CopyButton } from "../components/CopyButton";
+import { Drawer } from "../components/Drawer";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { useToast } from "../components/Toast";
 import { defaultApi } from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import {
+  mapRunActionError,
+  stateGateTooltip,
+  PAUSABLE_RUN_STATES,
+  TERMINAL_RUN_STATES,
+} from "../lib/runStateErrors";
 import { useEventStream } from "../hooks/useEventStream";
 import { table as tablePreset } from "../lib/design-system";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
+import type {
+  RunRecord, InterveneRequest, InterventionAction,
+  RunCompletion, CompletionVerification,
+} from "../lib/types";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -116,7 +133,12 @@ function orchSummary(type: string, p: Record<string, unknown>): string {
     }
     case "orchestrate_finished": {
       const term = typeof p.termination === "string" ? p.termination : "unknown";
-      const summary = typeof p.summary === "string" ? ` — ${p.summary.slice(0, 60)}` : "";
+      // Wire field is `detail` (see OrchestratorEvent::Finished); the older
+      // `summary` key is kept as a fallback for any replayed legacy payloads.
+      const raw = typeof p.detail === "string"
+        ? p.detail
+        : typeof p.summary === "string" ? p.summary : "";
+      const summary = raw ? ` — ${raw.slice(0, 60)}` : "";
       return `${term}${summary}`;
     }
     case "operator_notification": {
@@ -282,12 +304,22 @@ function OrchestrationTimeline({ runId }: { runId: string }) {
 
 function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib/types").RunRecord }) {
   const queryClient = useQueryClient();
+  const toast = useToast();
   const [rejectReason, setRejectReason] = useState("");
   const [reviseComments, setReviseComments] = useState("");
   const [showReject, setShowReject] = useState(false);
   const [showRevise, setShowRevise] = useState(false);
 
   // Check if this run has a plan artifact via events
+  //
+  // Issue #391: RunDetail mounts many queries per run — the default
+  // TanStack retry of 3× with exponential backoff multiplies load under an
+  // outage. The plan-events query commonly returns an empty array for
+  // non-plan runs (not 404, so no signal there), so the lack of retries is
+  // safe: on a transient failure the next render/focus will refetch. A 404
+  // specifically means "no plan artifact here" and must never retry; for
+  // other statuses we allow a single retry to absorb one blip without
+  // cascading.
   const { data: planEvents } = useQuery({
     queryKey: ["run-plan", runId],
     queryFn: async () => {
@@ -299,6 +331,11 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
       );
     },
     staleTime: 10_000,
+    retry: (failureCount, err) => {
+      const status = (err as { status?: number })?.status;
+      if (status === 404) return false;
+      return failureCount < 1;
+    },
   });
 
   const hasPlan = planEvents && planEvents.length > 0;
@@ -311,10 +348,16 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
     typeof run.mode.type === "string" ? run.mode.type :
     "";
 
-  // Check if mode is plan by looking at run metadata
+  // Check if mode is plan by looking at run metadata.
+  // Use an exact match on the RunMode discriminator — never a substring check
+  // ("deploy-plan", "reviewplan" would match spuriously). Rust's
+  // cairn_domain::RunMode is a tagged enum that serializes as `{"type":"plan"}`;
+  // the API layer may also surface a bare `"plan"` string for legacy/compat
+  // rows. `runModeType` (extracted above) normalizes both into a single string
+  // so `runModeType === "plan"` covers both shapes. `hasPlan` keeps
+  // plan-artifact-only legacy rows rendering correctly.
   const isPlanMode = run && (
     runModeType === "plan" ||
-    runModeType.includes("plan") ||
     hasPlan
   );
 
@@ -322,36 +365,61 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
   // rerenders with the plan-state event) and `approvals` (so any pending
   // approval row on the Approvals tab disappears immediately instead of
   // waiting for the next poll).
+  //
+  // RFC 018 plan-gate safety (issue #373): these three mutations must NEVER
+  // fail silently. A 403 (missing reviewer role), 409 (plan already decided,
+  // or wrong plan-mode state), or 500 (engine error) must surface a toast
+  // so the operator does NOT assume the plan was approved. On error we keep
+  // the reject/revise form OPEN so the operator can read their comment and
+  // retry without retyping — same shape as the #253 orchestrate fix.
+  //
+  // Invalidations live in `onSettled` (runs on both success AND failure) to
+  // close the partial-success-with-network-error window: the backend may
+  // have applied the plan decision before the client lost the connection,
+  // so we must always refetch to reconcile. Mirrors the WorkspacesPage
+  // `deleteWorkspace` pattern.
+  const invalidatePlanQueries = () => {
+    queryClient.invalidateQueries({ queryKey: ["run-plan", runId] });
+    queryClient.invalidateQueries({ queryKey: ["runs"] });
+    queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
+    queryClient.invalidateQueries({ queryKey: ["approvals"] });
+  };
+
   const approveMut = useMutation({
-    mutationFn: () => defaultApi.approvePlan(runId, { approved_by: "operator" }),
+    // #427 / PR #555 review: drop the `approved_by` field — backend
+    // attributes the approval from the auth principal. No comments
+    // from the operator UI today; omit the body entirely.
+    mutationFn: () => defaultApi.approvePlan(runId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["run-plan", runId] });
-      queryClient.invalidateQueries({ queryKey: ["runs"] });
-      queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
-      queryClient.invalidateQueries({ queryKey: ["approvals"] });
+      toast.success("Plan approved.");
     },
+    onError: (err: unknown) =>
+      toast.error(`Failed to approve plan — ${err instanceof Error ? err.message : "try again."}`),
+    onSettled: invalidatePlanQueries,
   });
 
   const rejectMut = useMutation({
-    mutationFn: () => defaultApi.rejectPlan(runId, { rejected_by: "operator", reason: rejectReason }),
+    // #427 / PR #555 review: drop the `rejected_by` field — backend
+    // attributes the rejection from the auth principal.
+    mutationFn: () => defaultApi.rejectPlan(runId, { reason: rejectReason }),
     onSuccess: () => {
+      toast.success("Plan rejected.");
       setShowReject(false);
-      queryClient.invalidateQueries({ queryKey: ["run-plan", runId] });
-      queryClient.invalidateQueries({ queryKey: ["runs"] });
-      queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
-      queryClient.invalidateQueries({ queryKey: ["approvals"] });
     },
+    onError: (err: unknown) =>
+      toast.error(`Failed to reject plan — ${err instanceof Error ? err.message : "try again."}`),
+    onSettled: invalidatePlanQueries,
   });
 
   const reviseMut = useMutation({
     mutationFn: () => defaultApi.revisePlan(runId, { reviewer_comments: reviseComments }),
     onSuccess: () => {
+      toast.success("Revision requested.");
       setShowRevise(false);
-      queryClient.invalidateQueries({ queryKey: ["run-plan", runId] });
-      queryClient.invalidateQueries({ queryKey: ["runs"] });
-      queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
-      queryClient.invalidateQueries({ queryKey: ["approvals"] });
     },
+    onError: (err: unknown) =>
+      toast.error(`Failed to request revision — ${err instanceof Error ? err.message : "try again."}`),
+    onSettled: invalidatePlanQueries,
   });
 
   if (!isPlanMode) return null;
@@ -407,6 +475,8 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
           {!showReject && !showRevise && (
             <div className="flex items-center gap-2">
               <button
+                data-testid="plan-approve-btn"
+                data-pending={approveMut.isPending ? "true" : "false"}
                 onClick={() => approveMut.mutate()}
                 disabled={approveMut.isPending}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-emerald-600 text-white text-[12px] font-medium hover:bg-emerald-500 disabled:opacity-50 transition-colors"
@@ -415,12 +485,14 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
                 Approve
               </button>
               <button
+                data-testid="plan-reject-open-btn"
                 onClick={() => setShowReject(true)}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-red-600/80 text-white text-[12px] font-medium hover:bg-red-500 transition-colors"
               >
                 <ThumbsDown size={11} /> Reject
               </button>
               <button
+                data-testid="plan-revise-open-btn"
                 onClick={() => setShowRevise(true)}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-gray-200 dark:bg-zinc-700 text-gray-700 dark:text-zinc-200 text-[12px] font-medium hover:bg-zinc-600 transition-colors"
               >
@@ -431,8 +503,9 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
 
           {/* Reject form */}
           {showReject && (
-            <div className="space-y-2">
+            <div data-testid="plan-reject-form" className="space-y-2">
               <textarea
+                data-testid="plan-reject-reason"
                 value={rejectReason}
                 onChange={e => setRejectReason(e.target.value)}
                 placeholder="Reason for rejection…"
@@ -440,6 +513,8 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
               />
               <div className="flex items-center gap-2">
                 <button
+                  data-testid="plan-reject-confirm-btn"
+                  data-pending={rejectMut.isPending ? "true" : "false"}
                   onClick={() => rejectMut.mutate()}
                   disabled={rejectMut.isPending || !rejectReason.trim()}
                   className="px-3 py-1.5 rounded bg-red-600 text-white text-[12px] hover:bg-red-500 disabled:opacity-50 transition-colors"
@@ -458,8 +533,9 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
 
           {/* Revise form */}
           {showRevise && (
-            <div className="space-y-2">
+            <div data-testid="plan-revise-form" className="space-y-2">
               <textarea
+                data-testid="plan-revise-comments"
                 value={reviseComments}
                 onChange={e => setReviseComments(e.target.value)}
                 placeholder="What should be changed in the plan?"
@@ -467,6 +543,8 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
               />
               <div className="flex items-center gap-2">
                 <button
+                  data-testid="plan-revise-confirm-btn"
+                  data-pending={reviseMut.isPending ? "true" : "false"}
                   onClick={() => reviseMut.mutate()}
                   disabled={reviseMut.isPending || !reviseComments.trim()}
                   className="px-3 py-1.5 rounded bg-indigo-600 text-white text-[12px] hover:bg-indigo-500 disabled:opacity-50 transition-colors"
@@ -488,7 +566,837 @@ function PlanArtifactPanel({ runId, run }: { runId: string; run?: import("../lib
   );
 }
 
+// ── Operator actions (issues #166/#173) ──────────────────────────────────────
+
+// Canonical pause / terminal sets live in `lib/runStateErrors.ts` so all
+// pages agree on what's pausable and what's terminal. We re-alias here to
+// keep existing call-site names (`RUNNING_STATES`, `TERMINAL_STATES`).
+const RUNNING_STATES = PAUSABLE_RUN_STATES;
+const TERMINAL_STATES = TERMINAL_RUN_STATES;
+
+// Issue #393: destructive actions (Cancel Run / Recover / Claim) now route
+// through the ConfirmDialog component, matching the Drawer-based Intervene
+// and Spawn-subagent flows on this same page. The previous `window.confirm`
+// blocked the main thread, ignored the dark theme, and was inconsistent
+// with the rest of the design system. State for each prompt lives in
+// OperatorActions / RunDetailPage so the parent can pass `isPending` from
+// the underlying mutation and keep the dialog open until the mutation
+// settles.
+
+interface ActionBtnProps {
+  onClick: () => void;
+  disabled?: boolean;
+  pending?: boolean;
+  icon: React.ReactNode;
+  label: string;
+  variant?: "default" | "danger" | "primary";
+  title?: string;
+  testId?: string;
+}
+
+function ActionBtn({ onClick, disabled, pending, icon, label, variant = "default", title, testId }: ActionBtnProps) {
+  const base = "flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed";
+  const variants = {
+    default: "border border-gray-200 dark:border-zinc-700 text-gray-600 dark:text-zinc-300 hover:text-gray-900 dark:hover:text-zinc-100 hover:border-zinc-500 bg-gray-50 dark:bg-zinc-900",
+    primary: "border border-indigo-300 dark:border-indigo-700 text-indigo-700 dark:text-indigo-300 hover:text-indigo-900 dark:hover:text-indigo-100 bg-indigo-50 dark:bg-indigo-950/30",
+    danger:  "border border-red-200 dark:border-red-800/60 text-red-600 dark:text-red-300 hover:text-red-700 dark:hover:text-red-200 bg-red-50 dark:bg-red-950/30",
+  };
+  // Issue #385: while these buttons render icon+text, the extended `title`
+  // often contains state-gate context (e.g. "Cannot pause: run is terminal")
+  // that screen readers should announce verbatim. Set `aria-label` from the
+  // same string the sighted user sees via `title` so keyboard/AT users
+  // get the same hover-tooltip information without relying on `title` alone.
+  const accessibleName = title ?? label;
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled || pending}
+      title={accessibleName}
+      aria-label={accessibleName}
+      className={clsx(base, variants[variant])}
+      data-testid={testId}
+      data-pending={pending ? "true" : undefined}
+    >
+      {pending ? <Loader2 size={12} className="animate-spin" /> : icon}
+      {label}
+    </button>
+  );
+}
+
+function JsonDrawer({
+  open, onClose, title, data,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  data: unknown;
+}) {
+  return (
+    <Drawer open={open} onClose={onClose} title={title} width="w-[28rem]">
+      <pre className="text-[11px] font-mono text-gray-700 dark:text-zinc-300 bg-gray-50 dark:bg-zinc-950/50 rounded-md p-3 overflow-auto whitespace-pre-wrap break-all">
+        {data === undefined ? "—" : JSON.stringify(data, null, 2)}
+      </pre>
+    </Drawer>
+  );
+}
+
+interface SpawnFormState {
+  session_id: string;
+  child_run_id: string;
+  parent_task_id: string;
+}
+
+function SpawnSubagentModal({
+  runId, defaultSessionId, open, onClose, onSuccess,
+}: {
+  runId: string;
+  defaultSessionId: string;
+  open: boolean;
+  onClose: () => void;
+  onSuccess: (childRunId: string) => void;
+}) {
+  const [form, setForm] = useState<SpawnFormState>({
+    session_id: defaultSessionId,
+    child_run_id: "",
+    parent_task_id: "",
+  });
+  const toast = useToast();
+  useEffect(() => {
+    if (open) setForm({ session_id: defaultSessionId, child_run_id: "", parent_task_id: "" });
+  }, [open, defaultSessionId]);
+
+  const mut = useMutation({
+    mutationFn: () => defaultApi.spawnSubagentRun(runId, {
+      session_id: form.session_id,
+      child_run_id: form.child_run_id || undefined,
+      parent_task_id: form.parent_task_id || undefined,
+    }),
+    onSuccess: (r) => {
+      toast.success(`Subagent run ${r.child_run_id} spawned.`);
+      onSuccess(r.child_run_id);
+      onClose();
+    },
+    onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Spawn failed."),
+  });
+
+  return (
+    <Drawer open={open} onClose={onClose} title="Spawn subagent" width="w-[28rem]">
+      <div className="space-y-3">
+        <label className="block">
+          <span className="text-[11px] text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Session ID (required)</span>
+          <input
+            value={form.session_id}
+            onChange={e => setForm({ ...form, session_id: e.target.value })}
+            placeholder="sess_..."
+            className="mt-1 w-full bg-gray-50 dark:bg-zinc-950 border border-gray-300 dark:border-zinc-700 rounded-md px-3 py-1.5 text-[12px] font-mono text-gray-800 dark:text-zinc-200 focus:outline-none focus:border-indigo-500"
+          />
+        </label>
+        <label className="block">
+          <span className="text-[11px] text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Parent task ID (optional)</span>
+          <input
+            value={form.parent_task_id}
+            onChange={e => setForm({ ...form, parent_task_id: e.target.value })}
+            placeholder="task_..."
+            className="mt-1 w-full bg-gray-50 dark:bg-zinc-950 border border-gray-300 dark:border-zinc-700 rounded-md px-3 py-1.5 text-[12px] font-mono text-gray-800 dark:text-zinc-200 focus:outline-none focus:border-indigo-500"
+          />
+        </label>
+        <label className="block">
+          <span className="text-[11px] text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Child run ID (optional)</span>
+          <input
+            value={form.child_run_id}
+            onChange={e => setForm({ ...form, child_run_id: e.target.value })}
+            placeholder="run_subagent_... (auto)"
+            className="mt-1 w-full bg-gray-50 dark:bg-zinc-950 border border-gray-300 dark:border-zinc-700 rounded-md px-3 py-1.5 text-[12px] font-mono text-gray-800 dark:text-zinc-200 focus:outline-none focus:border-indigo-500"
+          />
+        </label>
+        <div className="flex items-center gap-2 pt-2">
+          <button
+            onClick={() => mut.mutate()}
+            disabled={mut.isPending || !form.session_id.trim()}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-indigo-600 text-white text-[12px] font-medium hover:bg-indigo-500 disabled:opacity-50"
+          >
+            {mut.isPending ? <Loader2 size={11} className="animate-spin" /> : <GitBranch size={11} />}
+            Spawn
+          </button>
+          <button onClick={onClose} className="px-3 py-1.5 rounded bg-gray-100 dark:bg-zinc-800 text-gray-500 dark:text-zinc-400 text-[12px] hover:bg-gray-200 dark:hover:bg-zinc-700">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </Drawer>
+  );
+}
+
+function InterveneModal({
+  runId, open, onClose, onSuccess,
+}: {
+  runId: string;
+  open: boolean;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const [action, setAction] = useState<InterventionAction>("force_restart");
+  const [reason, setReason] = useState("");
+  const [messageBody, setMessageBody] = useState("");
+  const toast = useToast();
+
+  useEffect(() => { if (open) { setReason(""); setMessageBody(""); setAction("force_restart"); } }, [open]);
+
+  const mut = useMutation({
+    mutationFn: () => {
+      const body: InterveneRequest = { action, reason };
+      if (action === "inject_message") body.message_body = messageBody;
+      return defaultApi.interveneRun(runId, body);
+    },
+    onSuccess: () => {
+      toast.success(`Intervention "${action}" recorded.`);
+      onSuccess();
+      onClose();
+    },
+    onError: (e: unknown) => toast.error(mapRunActionError(e, "Intervene failed.", "intervene")),
+  });
+
+  const ACTIONS: { id: InterventionAction; label: string; hint: string }[] = [
+    { id: "force_complete", label: "Force complete",  hint: "Mark the run completed regardless of state." },
+    { id: "force_fail",     label: "Force fail",      hint: "Mark the run failed with the given reason." },
+    { id: "force_restart",  label: "Force restart",   hint: "Cancel + restart the run." },
+    { id: "inject_message", label: "Inject message",  hint: "Deliver an operator message to the run." },
+  ];
+
+  return (
+    <Drawer open={open} onClose={onClose} title="Intervene" width="w-[28rem]">
+      <div className="space-y-3">
+        <div className="space-y-1">
+          <span className="text-[11px] text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Action</span>
+          <div className="grid grid-cols-2 gap-1">
+            {ACTIONS.map(a => (
+              <button
+                key={a.id}
+                onClick={() => setAction(a.id)}
+                title={a.hint}
+                className={clsx(
+                  "rounded border px-2 py-1.5 text-[11px] text-left",
+                  action === a.id
+                    ? "border-indigo-500 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-800 dark:text-indigo-200"
+                    : "border-gray-200 dark:border-zinc-700 text-gray-500 dark:text-zinc-400 hover:border-zinc-500",
+                )}
+              >
+                {a.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <label className="block">
+          <span className="text-[11px] text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Reason</span>
+          <textarea
+            value={reason}
+            onChange={e => setReason(e.target.value)}
+            placeholder="Why is this intervention needed?"
+            className="mt-1 w-full h-20 bg-gray-50 dark:bg-zinc-950 border border-gray-300 dark:border-zinc-700 rounded-md px-3 py-2 text-[12px] text-gray-700 dark:text-zinc-300 resize-none focus:outline-none focus:border-indigo-500"
+          />
+        </label>
+        {action === "inject_message" && (
+          <label className="block">
+            <span className="text-[11px] text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Message body</span>
+            <textarea
+              value={messageBody}
+              onChange={e => setMessageBody(e.target.value)}
+              placeholder="Operator message to inject…"
+              className="mt-1 w-full h-20 bg-gray-50 dark:bg-zinc-950 border border-gray-300 dark:border-zinc-700 rounded-md px-3 py-2 text-[12px] text-gray-700 dark:text-zinc-300 resize-none focus:outline-none focus:border-indigo-500"
+            />
+          </label>
+        )}
+        <div className="flex items-center gap-2 pt-2">
+          <button
+            onClick={() => mut.mutate()}
+            disabled={mut.isPending || !reason.trim() || (action === "inject_message" && !messageBody.trim())}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-indigo-600 text-white text-[12px] font-medium hover:bg-indigo-500 disabled:opacity-50"
+          >
+            {mut.isPending ? <Loader2 size={11} className="animate-spin" /> : <MessageSquare size={11} />}
+            Submit intervention
+          </button>
+          <button onClick={onClose} className="px-3 py-1.5 rounded bg-gray-100 dark:bg-zinc-800 text-gray-500 dark:text-zinc-400 text-[12px] hover:bg-gray-200 dark:hover:bg-zinc-700">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </Drawer>
+  );
+}
+
+function OperatorActions({ runId, run }: { runId: string; run?: RunRecord }) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const [spawnOpen, setSpawnOpen] = useState(false);
+  const [interveneOpen, setInterveneOpen] = useState(false);
+  const [diagnoseDrawer, setDiagnoseDrawer] = useState<{ open: boolean; data?: unknown }>({ open: false });
+  const [interventionsOpen, setInterventionsOpen] = useState(false);
+  // Issue #393: single discriminator drives both Recover and Claim confirm
+  // dialogs — they are mutually exclusive (the operator can only be
+  // confirming one at a time). `null` = no dialog open.
+  const [destructiveConfirm, setDestructiveConfirm] = useState<"recover" | "claim" | null>(null);
+
+  const invalidateRun = () => {
+    void queryClient.invalidateQueries({ queryKey: ["run-detail", runId] });
+    void queryClient.invalidateQueries({ queryKey: ["run-events", runId] });
+    void queryClient.invalidateQueries({ queryKey: ["runs"] });
+  };
+
+  const pauseMut = useMutation({
+    mutationFn: () => defaultApi.pauseRun(runId, { reason_kind: "operator_pause", actor: "operator" }),
+    onSuccess: () => { toast.success("Run paused."); invalidateRun(); },
+    onError: (e: unknown) => toast.error(mapRunActionError(e, "Pause failed.", "pause")),
+  });
+  const resumeMut = useMutation({
+    mutationFn: () => defaultApi.resumeRun(runId, { trigger: "operator_resume", target: "running" }),
+    onSuccess: () => { toast.success("Run resumed."); invalidateRun(); },
+    onError: (e: unknown) => toast.error(mapRunActionError(e, "Resume failed.", "resume")),
+  });
+  const recoverMut = useMutation({
+    mutationFn: () => defaultApi.recoverRun(runId),
+    onSuccess: (r) => {
+      toast.success(r.deprecated ? "Recover acknowledged (handled by background scanners)." : "Recovery requested.");
+      invalidateRun();
+    },
+    onError: (e: unknown) => toast.error(mapRunActionError(e, "Recover failed.", "recover")),
+  });
+  const claimMut = useMutation({
+    mutationFn: () => defaultApi.claimRun(runId),
+    onSuccess: () => { toast.success("Run claimed for inspection."); invalidateRun(); },
+    onError: (e: unknown) => toast.error(mapRunActionError(e, "Claim failed.", "claim")),
+  });
+  const orchestrateMut = useMutation({
+    mutationFn: () => defaultApi.orchestrateRun(runId, {}),
+    onSuccess: () => { toast.success("Orchestration step triggered."); invalidateRun(); },
+    onError: (e: unknown) => toast.error(mapRunActionError(e, "Orchestrate failed.", "orchestrate")),
+  });
+  const diagnoseMut = useMutation({
+    mutationFn: () => defaultApi.diagnoseRun(runId),
+    onSuccess: (data) => { setDiagnoseDrawer({ open: true, data }); },
+    onError: (e: unknown) => toast.error(mapRunActionError(e, "Diagnose failed.", "diagnose")),
+  });
+
+  const { data: interventions } = useQuery({
+    queryKey: ["run-interventions", runId],
+    queryFn: () => defaultApi.listRunInterventions(runId),
+    enabled: interventionsOpen,
+    staleTime: 5_000,
+  });
+
+  const state = run?.state;
+  const canPause  = state !== undefined && RUNNING_STATES.has(state) && state !== "paused";
+  const canResume = state === "paused";
+  const isTerminal = state !== undefined && TERMINAL_STATES.has(state);
+
+  return (
+    <div className="rounded-lg border border-gray-200 dark:border-zinc-800 bg-gray-50/60 dark:bg-zinc-900/60 px-4 py-3">
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-[11px] font-semibold text-gray-400 dark:text-zinc-500 uppercase tracking-wider">
+          Operator Actions
+        </p>
+        <button
+          onClick={() => setInterventionsOpen(true)}
+          className="text-[11px] text-gray-400 dark:text-zinc-500 hover:text-gray-700 dark:hover:text-zinc-300 underline-offset-2 hover:underline"
+        >
+          History
+        </button>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <ActionBtn
+          icon={<Pause size={12} />}
+          label="Pause"
+          onClick={() => pauseMut.mutate()}
+          disabled={!canPause}
+          pending={pauseMut.isPending}
+          title={canPause ? "Pause this run" : stateGateTooltip("pause", state)}
+        />
+        <ActionBtn
+          icon={<Play size={12} />}
+          label="Resume"
+          variant="primary"
+          onClick={() => resumeMut.mutate()}
+          disabled={!canResume}
+          pending={resumeMut.isPending}
+          title={canResume ? "Resume paused run" : stateGateTooltip("resume", state)}
+        />
+        <ActionBtn
+          icon={<Sparkles size={12} />}
+          label="Orchestrate"
+          onClick={() => orchestrateMut.mutate()}
+          disabled={isTerminal}
+          pending={orchestrateMut.isPending}
+          title={isTerminal ? stateGateTooltip("orchestrate", state) : "Drive the orchestration loop one step"}
+          testId="run-orchestrate-btn"
+        />
+        <ActionBtn
+          icon={<Stethoscope size={12} />}
+          label="Diagnose"
+          onClick={() => diagnoseMut.mutate()}
+          pending={diagnoseMut.isPending}
+          title="Run the diagnosis report"
+        />
+        <ActionBtn
+          icon={<MessageSquare size={12} />}
+          label="Intervene"
+          variant="primary"
+          onClick={() => setInterveneOpen(true)}
+          disabled={isTerminal}
+          title={isTerminal ? stateGateTooltip("intervene", state) : "Operator intervention (force complete/fail/restart or inject message)"}
+        />
+        <ActionBtn
+          icon={<GitBranch size={12} />}
+          label="Spawn subagent"
+          onClick={() => setSpawnOpen(true)}
+          disabled={!run}
+          title="Spawn a child run"
+        />
+        <ActionBtn
+          icon={<LifeBuoy size={12} />}
+          label="Recover"
+          variant="danger"
+          onClick={() => setDestructiveConfirm("recover")}
+          pending={recoverMut.isPending}
+          title="Re-trigger the recovery scanners (legacy no-op in v1)"
+          testId="run-recover-btn"
+        />
+        <ActionBtn
+          icon={<Lock size={12} />}
+          label="Claim"
+          variant="danger"
+          onClick={() => setDestructiveConfirm("claim")}
+          pending={claimMut.isPending}
+          title="Take an admin claim on this run for inspection"
+          testId="run-claim-btn"
+        />
+      </div>
+
+      {/* Issue #393: styled confirm dialogs for destructive actions — replaces
+          the previous window.confirm. Kept mounted (via `open`) so focus-trap
+          mounts/unmounts cleanly. */}
+      <ConfirmDialog
+        open={destructiveConfirm === "recover"}
+        title="Re-run recovery scanners?"
+        message={
+          <>
+            This will re-trigger the recovery scanners on run{" "}
+            <span className="font-mono text-gray-700 dark:text-zinc-300">{runId}</span>.
+            It is safe but may be a no-op in v1 (handled by background scanners).
+          </>
+        }
+        confirmLabel="Recover"
+        variant="danger"
+        isPending={recoverMut.isPending}
+        onConfirm={() => {
+          setDestructiveConfirm(null);
+          recoverMut.mutate();
+        }}
+        onCancel={() => setDestructiveConfirm(null)}
+        testId="run-recover-confirm"
+      />
+      <ConfirmDialog
+        open={destructiveConfirm === "claim"}
+        title="Take operator claim?"
+        message={
+          <>
+            This takes an admin claim on run{" "}
+            <span className="font-mono text-gray-700 dark:text-zinc-300">{runId}</span>{" "}
+            so you can inspect it. The run will not progress further until released.
+          </>
+        }
+        confirmLabel="Take claim"
+        variant="danger"
+        isPending={claimMut.isPending}
+        onConfirm={() => {
+          setDestructiveConfirm(null);
+          claimMut.mutate();
+        }}
+        onCancel={() => setDestructiveConfirm(null)}
+        testId="run-claim-confirm"
+      />
+
+      {run && (
+        <SpawnSubagentModal
+          runId={runId}
+          defaultSessionId={run.session_id}
+          open={spawnOpen}
+          onClose={() => setSpawnOpen(false)}
+          onSuccess={() => {
+            invalidateRun();
+            void queryClient.invalidateQueries({ queryKey: ["run-children", runId] });
+          }}
+        />
+      )}
+      <InterveneModal
+        runId={runId}
+        open={interveneOpen}
+        onClose={() => setInterveneOpen(false)}
+        onSuccess={() => {
+          invalidateRun();
+          void queryClient.invalidateQueries({ queryKey: ["run-interventions", runId] });
+        }}
+      />
+      <JsonDrawer
+        open={diagnoseDrawer.open}
+        onClose={() => setDiagnoseDrawer({ open: false })}
+        title="Diagnosis report"
+        data={diagnoseDrawer.data}
+      />
+      <Drawer
+        open={interventionsOpen}
+        onClose={() => setInterventionsOpen(false)}
+        title={`Interventions${interventions ? ` (${interventions.length})` : ""}`}
+        width="w-[28rem]"
+      >
+        {!interventions ? (
+          <p className="text-[12px] text-gray-400 dark:text-zinc-500">Loading…</p>
+        ) : interventions.length === 0 ? (
+          <p className="text-[12px] text-gray-400 dark:text-zinc-500">No interventions recorded.</p>
+        ) : (
+          <ul className="space-y-2">
+            {interventions.map((iv, i) => (
+              <li key={`${iv.intervened_at_ms}-${i}`} className="rounded border border-gray-200 dark:border-zinc-800 p-2">
+                <div className="flex items-center gap-2 text-[11px]">
+                  <span className="font-mono font-medium text-indigo-700 dark:text-indigo-300">{iv.action}</span>
+                  <span className="text-gray-400 dark:text-zinc-600 tabular-nums">
+                    {new Date(iv.intervened_at_ms).toLocaleString()}
+                  </span>
+                </div>
+                <p className="mt-1 text-[12px] text-gray-700 dark:text-zinc-300 whitespace-pre-wrap">{iv.reason}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Drawer>
+    </div>
+  );
+}
+
+function ChildRunsSection({ runId }: { runId: string }) {
+  // Issue #389 polling hygiene:
+  //   * `refetchInterval` stops firing once the query is in an error state —
+  //     a transient 5xx used to keep hammering the server every 15s under an
+  //     outage. TanStack Query calls `refetchInterval` with the `Query`
+  //     object, so we can switch it to `false` on the first error.
+  //   * `refetchIntervalInBackground: false` pauses polling while the tab is
+  //     hidden, avoiding multiplied load from operators who leave RunDetail
+  //     open across multiple tabs.
+  //   * `retry: (_, err) => err.status < 500` retries client-classified
+  //     4xx once (in case of stale scope) but never retries 5xx — retry is
+  //     the interval's job, and only after the next focus event.
+  const { data: children, isLoading } = useQuery({
+    queryKey: ["run-children", runId],
+    queryFn: () => defaultApi.listChildRuns(runId),
+    refetchInterval: (query) => (query.state.error ? false : 15_000),
+    refetchIntervalInBackground: false,
+    retry: (failureCount, err) => {
+      // `ApiError` carries `status`; anything else (network failure,
+      // runtime bug) is treated as 5xx-equivalent — don't retry.
+      const status = (err as { status?: number })?.status;
+      if (typeof status !== "number") return false;
+      return status < 500 && failureCount < 1;
+    },
+  });
+
+  if (isLoading) {
+    return (
+      <Section title="Children runs">
+        <div className="flex items-center gap-2 text-gray-400 dark:text-zinc-600 text-[13px] py-4">
+          <Loader2 size={14} className="animate-spin" /> Loading children…
+        </div>
+      </Section>
+    );
+  }
+  if (!children || children.length === 0) return null;
+
+  return (
+    <Section title={`Children runs (${children.length})`}>
+      <div className="rounded-lg border border-gray-200 dark:border-zinc-800 overflow-x-auto">
+        <table className="min-w-full text-[13px]">
+          <thead className="bg-gray-50 dark:bg-zinc-900">
+            <tr>
+              <TH ch="Run ID" />
+              <TH ch="State" />
+              <TH ch="Created" />
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200 dark:divide-zinc-800/50">
+            {children.map((c, i) => (
+              <tr
+                key={c.run_id}
+                className={clsx(
+                  "transition-colors cursor-pointer",
+                  i % 2 === 0 ? tablePreset.rowEven : tablePreset.rowOdd,
+                  "hover:bg-gray-100/60 dark:hover:bg-zinc-800/60",
+                )}
+                onClick={() => { window.location.hash = `run/${c.run_id}`; }}
+              >
+                <td className="px-3 py-1.5 font-mono text-gray-700 dark:text-zinc-300 whitespace-nowrap" title={c.run_id}>
+                  {shortId(c.run_id)}
+                </td>
+                <td className="px-3 py-1.5 whitespace-nowrap">
+                  <StateBadge state={c.state} compact />
+                </td>
+                <td className="px-3 py-1.5 text-gray-400 dark:text-zinc-500 whitespace-nowrap tabular-nums">
+                  {fmtTime(c.created_at)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Section>
+  );
+}
+
 // ── Section wrapper ────────────────────────────────────────────────────────────
+
+// ── F47 PR3: "What actually happened" block ──────────────────────────────────
+//
+// Renders the CompletionVerification sidecar below the orchestrator's free-text
+// summary so operators can cross-check the LLM's claims against extractor-
+// produced evidence (warning/error lines + command outcomes from tool_results).
+//
+// Hidden entirely when `completion` is null — we do not show empty scaffolding
+// for still-running runs, failed/canceled runs, or pre-F47 runs that never had
+// a `RunCompletionAnnotated` event appended. See RunCompletion in types.ts.
+
+const COMPLETION_BLOCK_TOOLTIP =
+  "Cairn extracts warnings, errors, and command outcomes from the run's " +
+  "tool outputs independently of the LLM's summary above. Use this to " +
+  "verify the summary's claims.";
+
+/** Small ellipsis-on-overflow string cell with a `title` for full text on hover. */
+function TruncLine({ text, maxChars }: { text: string; maxChars: number }) {
+  const truncated = text.length > maxChars ? `${text.slice(0, maxChars)}…` : text;
+  return (
+    <span title={text.length > maxChars ? text : undefined} className="break-all">
+      {truncated}
+    </span>
+  );
+}
+
+function CompletionBlock({ completion }: { completion: RunCompletion }) {
+  // Defensive: while current persisted payloads always carry a fully-populated
+  // `verification`, guarding against missing/partial shapes keeps the block
+  // from crashing on older runs or unexpected backends replaying pre-F47
+  // envelopes.
+  const summary = completion.summary ?? "";
+  const verification = completion.verification ?? ({} as Partial<CompletionVerification>);
+  const warnings = Array.isArray(verification.warnings) ? verification.warnings : [];
+  const errors = Array.isArray(verification.errors) ? verification.errors : [];
+  const commands = Array.isArray(verification.commands) ? verification.commands : [];
+  const tool_results_scanned =
+    typeof verification.tool_results_scanned === "number" ? verification.tool_results_scanned : 0;
+  const extractor_version =
+    typeof verification.extractor_version === "number" ? verification.extractor_version : 0;
+
+  const scanned = tool_results_scanned;
+  const nothingScanned = scanned === 0;
+  const allEmpty = warnings.length === 0 && errors.length === 0 && commands.length === 0;
+  const cleanRun = !nothingScanned && allEmpty;
+
+  return (
+    <Section title="What actually happened">
+      {/* LLM summary (context above the evidence block) */}
+      <p className="text-[12px] text-gray-400 dark:text-zinc-500 mb-2 flex items-start gap-2">
+        {/* F32 tooltip on the header */}
+        <button
+          type="button"
+          aria-label="About this block"
+          title={COMPLETION_BLOCK_TOOLTIP}
+          className="shrink-0 mt-[2px] text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 cursor-help"
+        >
+          <Info size={12} />
+        </button>
+        <span>
+          <span className="text-gray-500 dark:text-zinc-400 font-medium">LLM says:</span>{" "}
+          {summary.trim().length > 0
+            ? <span className="italic">{summary}</span>
+            : <span className="italic text-gray-300 dark:text-zinc-600">(no summary)</span>}
+        </span>
+      </p>
+
+      {nothingScanned ? (
+        <div className="rounded-lg border border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-900 px-4 py-3">
+          <p className="text-[12px] text-gray-500 dark:text-zinc-400">No tool results scanned.</p>
+          <p className="text-[11px] text-gray-400 dark:text-zinc-500 mt-1">
+            The run completed without invoking any tools, so there is no tool output
+            to cross-check the summary against.
+          </p>
+        </div>
+      ) : cleanRun ? (
+        <div className="rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-4 py-3">
+          <p className="text-[12px] text-emerald-300">
+            No warnings or errors captured from {scanned} tool result{scanned === 1 ? "" : "s"}.
+          </p>
+          <p className="text-[11px] text-emerald-400/70 mt-1">
+            The summary has nothing to contradict in this run's tool outputs.
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <CompletionSubsection
+            title="Warnings"
+            oneLiner='Lines matching "warning:" in tool outputs.'
+            count={warnings.length}
+            accent="warning"
+            icon={<AlertTriangle size={12} className="text-amber-400" />}
+            emptyLabel="No warnings"
+          >
+            {warnings.length > 0 && (
+              <ul className="divide-y divide-amber-900/30">
+                {warnings.map((w, i) => (
+                  <li
+                    key={i}
+                    className="px-3 py-1.5 font-mono text-[11px] text-amber-200 hover:bg-amber-950/30 transition-colors"
+                  >
+                    <TruncLine text={w} maxChars={500} />
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CompletionSubsection>
+
+          <CompletionSubsection
+            title="Errors"
+            oneLiner='Lines matching "error:" or "error[...]" in tool outputs.'
+            count={errors.length}
+            accent={errors.length > 0 ? "error" : "warning"}
+            icon={<AlertCircle size={12} className={errors.length > 0 ? "text-red-400" : "text-gray-400 dark:text-zinc-500"} />}
+            emptyLabel="No errors"
+          >
+            {errors.length > 0 && (
+              <ul className="divide-y divide-red-900/30">
+                {errors.map((e, i) => (
+                  <li
+                    key={i}
+                    className="px-3 py-1.5 font-mono text-[11px] text-red-200 hover:bg-red-950/30 transition-colors"
+                  >
+                    <TruncLine text={e} maxChars={500} />
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CompletionSubsection>
+
+          <CompletionSubsection
+            title="Commands"
+            oneLiner="Tool invocations and their exit codes."
+            count={commands.length}
+            accent="neutral"
+            icon={<Terminal size={12} className="text-gray-500 dark:text-zinc-400" />}
+            emptyLabel="No commands"
+          >
+            {commands.length > 0 && (
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-[11px]">
+                  <thead className="bg-gray-100 dark:bg-zinc-900/60">
+                    <tr>
+                      <TH ch="tool" />
+                      <TH ch="cmd" />
+                      <TH ch="exit" right />
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200 dark:divide-zinc-800/50">
+                    {commands.map((c, i) => {
+                      const isBashLike = c.tool_name === "bash" || c.tool_name === "shell_exec";
+                      const cmdDisplay = isBashLike && c.cmd.length > 120
+                        ? `${c.cmd.slice(0, 120)}…`
+                        : c.cmd;
+                      return (
+                        <tr key={i} className="hover:bg-gray-100/60 dark:hover:bg-zinc-800/40">
+                          <td className="px-3 py-1 font-mono text-gray-700 dark:text-zinc-300 whitespace-nowrap">
+                            {c.tool_name}
+                          </td>
+                          <td
+                            className="px-3 py-1 font-mono text-gray-600 dark:text-zinc-400"
+                            title={isBashLike && c.cmd.length > 120 ? c.cmd : undefined}
+                          >
+                            {cmdDisplay}
+                          </td>
+                          <td className="px-3 py-1 font-mono text-right tabular-nums">
+                            {c.exit_code === null ? (
+                              <span className="text-gray-300 dark:text-zinc-600">—</span>
+                            ) : c.exit_code === 0 ? (
+                              <span className="text-emerald-400">{c.exit_code}</span>
+                            ) : (
+                              <span className="text-red-400">{c.exit_code}</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </CompletionSubsection>
+        </div>
+      )}
+
+      <p className="text-[10px] text-gray-400 dark:text-zinc-600 mt-2">
+        Scanned {scanned} tool result{scanned === 1 ? "" : "s"} · extractor v{extractor_version}
+      </p>
+    </Section>
+  );
+}
+
+function CompletionSubsection({
+  title,
+  oneLiner,
+  count,
+  accent,
+  icon,
+  emptyLabel,
+  children,
+}: {
+  title: string;
+  oneLiner: string;
+  count: number;
+  accent: "warning" | "error" | "neutral";
+  icon: React.ReactNode;
+  emptyLabel: string;
+  children: React.ReactNode;
+}) {
+  const borderCls =
+    accent === "error" && count > 0
+      ? "border-red-900/50"
+      : accent === "warning" && count > 0
+      ? "border-amber-900/50"
+      : "border-gray-200 dark:border-zinc-800";
+  const badgeCls =
+    accent === "error" && count > 0
+      ? "bg-red-950/40 text-red-300 ring-red-900/60"
+      : accent === "warning" && count > 0
+      ? "bg-amber-950/40 text-amber-300 ring-amber-900/60"
+      : "bg-gray-100 dark:bg-zinc-800 text-gray-500 dark:text-zinc-400 ring-gray-300 dark:ring-zinc-700";
+
+  return (
+    <details
+      open={count > 0}
+      className={clsx(
+        "rounded-lg border bg-gray-50 dark:bg-zinc-900 overflow-hidden",
+        borderCls,
+      )}
+    >
+      <summary className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none hover:bg-gray-100/60 dark:hover:bg-zinc-800/40">
+        {icon}
+        <span className="text-[12px] font-medium text-gray-700 dark:text-zinc-300">{title}</span>
+        <span className={clsx("rounded px-1.5 py-0.5 text-[10px] font-mono ring-1 tabular-nums", badgeCls)}>
+          {count}
+        </span>
+        <span className="text-[10px] text-gray-400 dark:text-zinc-500 ml-1">{oneLiner}</span>
+      </summary>
+      {count === 0 ? (
+        <p className="px-3 py-2 text-[11px] text-gray-400 dark:text-zinc-500 italic border-t border-gray-200 dark:border-zinc-800">
+          {emptyLabel}
+        </p>
+      ) : (
+        <div className="border-t border-gray-200 dark:border-zinc-800">{children}</div>
+      )}
+    </details>
+  );
+}
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -530,12 +1438,46 @@ interface RunDetailPageProps {
 export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
   const queryClient = useQueryClient();
   const toast = useToast();
+  // Issue #393: Drawer-style confirm for Cancel Run — replaces the former
+  // window.confirm. Kept in RunDetailPage state because the button lives in
+  // the header, not inside OperatorActions.
+  const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
 
-  const { data: run } = useQuery({
+  const { data: runDetail } = useQuery({
     queryKey: ["run-detail", runId],
-    queryFn: () => defaultApi.getRun(runId),
+    queryFn: () => defaultApi.getRunDetail(runId),
     staleTime: 10_000,
   });
+  const run = runDetail?.run;
+
+  // F47 PR3: completion block is driven by the persisted envelope but can be
+  // live-updated from the `orchestrate_finished` SSE frame so the block
+  // appears the moment the run terminates, without requiring a refetch.
+  const { events: streamEvents } = useEventStream();
+  const [liveCompletion, setLiveCompletion] = useState<RunCompletion | null>(null);
+  // Reset the live-SSE fallback whenever the user navigates to a different
+  // run; otherwise the previous run's completion would leak into the new
+  // detail page until its own orchestrate_finished frame arrived.
+  useEffect(() => {
+    setLiveCompletion(null);
+  }, [runId]);
+  useEffect(() => {
+    for (const ev of streamEvents) {
+      if (ev.type !== "orchestrate_finished") continue;
+      const p = (ev.payload ?? {}) as Record<string, unknown>;
+      if (p.run_id !== runId && p.runId !== runId) continue;
+      if (p.termination !== "completed") continue;
+      const verification = p.completion_verification as CompletionVerification | undefined;
+      if (!verification) continue;
+      const summary = typeof p.detail === "string" ? p.detail : "";
+      setLiveCompletion({
+        summary,
+        verification,
+        completed_at: ev.receivedAt,
+      });
+    }
+  }, [streamEvents, runId]);
+  const completion: RunCompletion | null = runDetail?.completion ?? liveCompletion;
 
   const { data: tasks, isLoading: tasksLoading } = useQuery({
     queryKey: ["run-tasks", runId],
@@ -570,11 +1512,31 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
       toast.success(`Run ${runId} canceled.`);
     },
     onError: (error: unknown) => {
-      toast.error(error instanceof Error ? error.message : "Failed to cancel run.");
+      toast.error(errorMessage(error, "Failed to cancel run."));
     },
   });
 
-  const isTerminal = run && ["completed", "failed", "canceled"].includes(run.state);
+  // #380: Export run as JSON. Previously a bare `defaultApi.exportRun(...)`
+  // promise with no loading state — the operator could double-click and
+  // fire parallel downloads while a run with many events serialised. Now
+  // `useMutation.isPending` disables the button and swaps the icon for a
+  // spinner. `onSuccess` runs the blob download; `onError` surfaces the
+  // backend message via the shared `errorMessage` helper.
+  const exportRunMut = useMutation({
+    mutationFn: () => defaultApi.exportRun(runId),
+    onSuccess: (data) => {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `run-${runId}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    onError: (e) => toast.error(errorMessage(e, "Export failed.")),
+  });
+
+  const isTerminal = run && TERMINAL_STATES.has(run.state);
   const duration = run ? fmtDuration(run.created_at, isTerminal ? run.updated_at : undefined) : "—";
 
   // The backend returns a zero-valued RunCostRecord (HTTP 200) for runs with no cost
@@ -606,6 +1568,7 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
                 {runId}
                 <CopyButton text={runId} label="Copy run ID" size={12} />
               </p>
+              <EntityExplainer className="mt-1">{ENTITY_EXPLAINERS.run}</EntityExplainer>
               {run && (
                 <p className="text-[12px] text-gray-400 dark:text-zinc-500 mt-1 font-mono">
                   {run.project.project_id} · {fmtTime(run.created_at)}
@@ -616,11 +1579,14 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
               {run && <StateBadge state={run.state} />}
               {run && !isTerminal && (
                 <button
-                  onClick={() => {
-                    if (!window.confirm(`Cancel run ${runId}?`)) return;
-                    cancelRunMut.mutate();
-                  }}
+                  data-testid="run-cancel-btn"
+                  onClick={() => setCancelConfirmOpen(true)}
                   disabled={cancelRunMut.isPending}
+                  // Issue #385: screen readers inconsistently read `title`.
+                  // Keep `title` for the sighted hover tooltip, add
+                  // `aria-label` so assistive tech always announces the
+                  // action even on icon-only rendering.
+                  aria-label="Cancel run"
                   title="Cancel this run"
                   className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
                              border border-red-200 dark:border-red-800/60 text-red-600 dark:text-red-300 hover:text-red-700 dark:hover:text-red-200
@@ -631,25 +1597,21 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
                 </button>
               )}
               <button
-                onClick={() => {
-                  void defaultApi.exportRun(runId)
-                    .then(data => {
-                      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-                      const url  = URL.createObjectURL(blob);
-                      const a    = document.createElement('a');
-                      a.href     = url;
-                      a.download = `run-${runId}.json`;
-                      a.click();
-                      URL.revokeObjectURL(url);
-                    })
-                    .catch(e => toast.error(`Export failed: ${e instanceof Error ? e.message : String(e)}`));
-                }}
+                data-testid="run-export-btn"
+                data-pending={exportRunMut.isPending ? "true" : "false"}
+                onClick={() => exportRunMut.mutate()}
+                disabled={exportRunMut.isPending}
+                // Issue #385: explicit aria-label for AT users.
+                aria-label="Export run as JSON"
                 title="Export run as JSON"
                 className="flex items-center gap-1.5 rounded px-2.5 py-1.5 text-[12px] font-medium
                            border border-gray-200 dark:border-zinc-700 text-gray-500 dark:text-zinc-400 hover:text-gray-800 dark:hover:text-zinc-200 hover:border-zinc-600
-                           bg-gray-50 dark:bg-zinc-900 transition-colors"
+                           bg-gray-50 dark:bg-zinc-900 transition-colors disabled:opacity-50"
               >
-                <Download size={12} /> Export
+                {exportRunMut.isPending
+                  ? <Loader2 size={12} className="animate-spin" />
+                  : <Download size={12} />}
+                Export
               </button>
             </div>
           </div>
@@ -678,6 +1640,34 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
           />
         </div>
 
+        {/* F62: terminal-write deadlock banner. The fabric rejected both
+            the terminal FCALL and the lease re-claim; artifacts produced
+            by earlier tool calls may still be on disk, but the run can
+            only be closed once the upstream fabric fix lands. */}
+        {run?.failure_class === "terminal_write_deadlock" && (
+          <div className="flex items-start gap-2 px-4 py-3 rounded-lg border border-red-300 dark:border-red-800/60 bg-red-50 dark:bg-red-950/30">
+            <AlertTriangle size={14} className="text-red-500 dark:text-red-400 shrink-0 mt-0.5" />
+            <div className="text-[12px] text-red-700 dark:text-red-300 space-y-1">
+              <div className="font-medium">Terminal-write deadlock</div>
+              <div>
+                The orchestrator produced artifacts successfully but the fabric refuses both the
+                terminal write and the lease re-claim. Files written by earlier tool calls may still
+                be visible on the operator's filesystem, but the run cannot be closed without an
+                upstream fabric fix. Tracked at{" "}
+                <a
+                  href="https://github.com/avifenesh/FlowFabric/issues/371"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:no-underline"
+                >
+                  FlowFabric#371
+                </a>
+                .
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Trigger origin badge */}
         {run?.created_by_trigger_id && (
           <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg border border-amber-800/40 bg-amber-950/20">
@@ -701,18 +1691,27 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
           </div>
         )}
 
+        {/* Operator actions (issues #166/#173) */}
+        <OperatorActions runId={runId} run={run} />
+
         {/* Plan artifact (RFC 018 — Plan mode) */}
         <PlanArtifactPanel runId={runId} run={run} />
 
         {/* Orchestration live timeline — visible when SSE events arrive */}
         <OrchestrationTimeline runId={runId} />
 
+        {/* F47 PR3: "What actually happened" — LLM summary + extractor evidence */}
+        {completion && <CompletionBlock completion={completion} />}
+
+        {/* F29 CE — Telemetry panel (provider calls, tool invocations, totals) */}
+        <RunTelemetryPanel runId={runId} />
+
         {/* Task Gantt chart */}
         {safeTasks && safeTasks.length > 0 && run && (
           <Section title="Task Execution Timeline">
             <GanttView
               runStart={run.created_at}
-              runEnd={run && ["completed","failed","canceled"].includes(run.state) ? run.updated_at : undefined}
+              runEnd={run && TERMINAL_STATES.has(run.state) ? run.updated_at : undefined}
               tasks={safeTasks}
             />
           </Section>
@@ -767,6 +1766,9 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
             </div>
           )}
         </Section>
+
+        {/* Children subagent runs (issues #166/#173) */}
+        <ChildRunsSection runId={runId} />
 
         {/* Cost breakdown */}
         {cost && (
@@ -844,6 +1846,32 @@ export function RunDetailPage({ runId, onBack }: RunDetailPageProps) {
         </Section>
 
       </div>
+
+      {/* Issue #393: Drawer-style confirm for Cancel Run — replaces
+          window.confirm. `isPending` flips the primary button into a
+          spinner so double-click cannot fire the mutation twice while
+          the request is in flight. */}
+      <ConfirmDialog
+        open={cancelConfirmOpen}
+        title="Cancel run?"
+        message={
+          <>
+            This immediately terminates run{" "}
+            <span className="font-mono text-gray-700 dark:text-zinc-300">{runId}</span>.
+            Any in-flight tool calls will be aborted. This cannot be undone.
+          </>
+        }
+        confirmLabel="Cancel run"
+        cancelLabel="Keep running"
+        variant="danger"
+        isPending={cancelRunMut.isPending}
+        onConfirm={() => {
+          setCancelConfirmOpen(false);
+          cancelRunMut.mutate();
+        }}
+        onCancel={() => setCancelConfirmOpen(false)}
+        testId="run-cancel-confirm"
+      />
     </div>
   );
 }

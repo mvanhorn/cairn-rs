@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use cairn_domain::lifecycle::SessionState;
 use cairn_domain::SessionId;
-use ff_core::keys::FlowKeyContext;
-use ff_core::partition::flow_partition;
+use flowfabric::core::keys::FlowKeyContext;
+use flowfabric::core::partition::flow_partition;
 
 use crate::TestHarness;
 
@@ -29,11 +29,10 @@ use crate::TestHarness;
 ///     `cancelled_at`, `cancel_reason`, `last_mutation_at`
 async fn read_flow_core(h: &TestHarness, session_id: &SessionId) -> HashMap<String, String> {
     let fid = cairn_fabric::id_map::session_to_flow_id(&h.project, session_id);
-    let partition = flow_partition(&fid, &h.fabric.runtime.partition_config);
+    let partition = flow_partition(&fid, h.partition_config());
     let ctx = FlowKeyContext::new(&partition, &fid);
     let fields: HashMap<String, String> = h
-        .fabric
-        .runtime
+        .valkey_runtime()
         .client
         .hgetall(&ctx.core())
         .await

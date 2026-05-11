@@ -12,11 +12,13 @@
 
 use cairn_fabric::id_map;
 use cairn_fabric::stream::{restore_frames, FRAME_CHECKPOINT, FRAME_TOOL_CALL, FRAME_TOOL_RESULT};
-use ff_core::contracts::{AppendFrameArgs, AppendFrameResult, STREAM_READ_HARD_CAP};
-use ff_core::keys::ExecKeyContext;
-use ff_core::partition::execution_partition;
-use ff_core::types::{AttemptId, AttemptIndex, ExecutionId, LeaseEpoch, LeaseId, TimestampMs};
-use ff_script::functions::stream::{ff_append_frame, StreamOpKeys};
+use flowfabric::core::contracts::{AppendFrameArgs, AppendFrameResult, STREAM_READ_HARD_CAP};
+use flowfabric::core::keys::ExecKeyContext;
+use flowfabric::core::partition::execution_partition;
+use flowfabric::core::types::{
+    AttemptId, AttemptIndex, ExecutionId, LeaseEpoch, LeaseId, TimestampMs,
+};
+use flowfabric::script::functions::stream::{ff_append_frame, StreamOpKeys};
 
 use crate::TestHarness;
 
@@ -107,7 +109,7 @@ async fn test_checkpoint_restore_reads_frames() {
     let partition = execution_partition(&eid, h.partition_config());
     let ctx = ExecKeyContext::new(&partition, &eid);
     let (lease_id, lease_epoch, attempt_id, attempt_index) =
-        lease_context(&h.fabric.runtime.client, &ctx).await;
+        lease_context(&h.valkey_runtime().client, &ctx).await;
     let keys = StreamOpKeys { ctx: &ctx };
 
     // Append 3 frames in known order. Stream is created lazily on first
@@ -132,7 +134,7 @@ async fn test_checkpoint_restore_reads_frames() {
             retention_maxlen: None,
             max_payload_bytes: None,
         };
-        let result = ff_append_frame(&h.fabric.runtime.client, &keys, &args)
+        let result = ff_append_frame(&h.valkey_runtime().client, &keys, &args)
             .await
             .unwrap_or_else(|e| panic!("append frame {idx} failed: {e}"));
         assert!(
@@ -141,10 +143,11 @@ async fn test_checkpoint_restore_reads_frames() {
         );
     }
 
-    // Restore — this is the API under test.
+    // Restore — this is the API under test. FF 0.9 (FF#281 + trait-
+    // stream surface) consolidated the (client, partition_config) pair
+    // into a single `&dyn EngineBackend` — the backend holds both.
     let frames = restore_frames(
-        &h.fabric.runtime.client,
-        &h.fabric.runtime.partition_config,
+        h.valkey_runtime().backend.as_ref(),
         &eid,
         attempt_index,
         STREAM_READ_HARD_CAP,

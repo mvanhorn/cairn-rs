@@ -372,10 +372,14 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::PromptReleaseTransitioned(_)
             | RuntimeEvent::PromptRolloutStarted(_)
             | RuntimeEvent::TenantCreated(_)
+            | RuntimeEvent::TenantUpdated(_)
             | RuntimeEvent::WorkspaceCreated(_)
+            | RuntimeEvent::WorkspaceArchived(_)
+            | RuntimeEvent::EvalRunArchived(_)
             | RuntimeEvent::ProjectCreated(_)
             | RuntimeEvent::RouteDecisionMade(_)
             | RuntimeEvent::ProviderCallCompleted(_)
+            | RuntimeEvent::LlmCompletionRecorded(_)
             | RuntimeEvent::OutcomeRecorded(_)
             | RuntimeEvent::ScheduledTaskCreated(_)
             | RuntimeEvent::PlanProposed(_)
@@ -430,6 +434,10 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::OperatorIntervention(_)
             | RuntimeEvent::OperatorProfileCreated(_)
             | RuntimeEvent::OperatorProfileUpdated(_)
+            // RFC 026 PR-A0: tenant-admin role events — projected into
+            // `operator_tenant_roles`, not into the graph.
+            | RuntimeEvent::TenantRoleGranted(_)
+            | RuntimeEvent::TenantRoleRevoked(_)
             | RuntimeEvent::PauseScheduled(_)
             | RuntimeEvent::PermissionDecisionRecorded(_)
             | RuntimeEvent::ProviderBindingCreated(_)
@@ -437,6 +445,7 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::ProviderBudgetAlertTriggered(_)
             | RuntimeEvent::ProviderBudgetExceeded(_)
             | RuntimeEvent::ProviderConnectionRegistered(_)
+            | RuntimeEvent::ProviderConnectionDeleted(_)
             | RuntimeEvent::ProviderHealthChecked(_)
             | RuntimeEvent::ProviderHealthScheduleSet(_)
             | RuntimeEvent::ProviderHealthScheduleTriggered(_)
@@ -467,7 +476,93 @@ impl<P: GraphProjection> EventProjector<P> {
             | RuntimeEvent::DecisionRecorded(_)
             | RuntimeEvent::DecisionCacheWarmup(_)
             // RFC 020 Track 4: boot-level recovery audit event.
-            | RuntimeEvent::RecoverySummaryEmitted(_) => {}
+            | RuntimeEvent::RecoverySummaryEmitted(_)
+            // PR BP-1: tool-call approval foundation events — not yet
+            // projected into the graph; a later PR in the wave wires in
+            // the projection state.
+            | RuntimeEvent::ToolCallProposed(_)
+            | RuntimeEvent::ToolCallApproved(_)
+            | RuntimeEvent::ToolCallRejected(_)
+            | RuntimeEvent::ToolCallAmended(_)
+            // F47 PR2: run completion annotation carries summary +
+            // verification sidecar. The runs node already exists from
+            // RunCreated; annotation is stored on the cairn-store
+            // projection, not the graph. No edges to add here.
+            | RuntimeEvent::RunCompletionAnnotated(_)
+            // F64: terminal-write recovery annotation is stored on the
+            // cairn-store projection, not the graph. No edges to add.
+            | RuntimeEvent::TerminalRecoveryAttempted(_)
+            // F65 PR-2: orchestrator session redesign events are persisted
+            // through the store projection layer (`cairn_store::session_outcome`,
+            // `workspace_snapshots`, `workspace_registry`, F65 checkpoint cols).
+            // They do not seed graph nodes or edges — the provenance graph
+            // models code/document lineage, not orchestration-state lifecycle.
+            // Later PRs (PR-6 summarizer → memory ingest) may surface outcome
+            // content as nodes; that wiring lives in cairn-memory, not here.
+            | RuntimeEvent::SessionAttemptStarted(_)
+            | RuntimeEvent::SessionAttemptCompleted(_)
+            | RuntimeEvent::CircuitBreakerTripped(_)
+            | RuntimeEvent::BudgetThresholdCrossed(_)
+            // RFC 032 PR-2: completion-contract resolution is a
+            // run-level observability event with no graph shape.
+            | RuntimeEvent::CompletionContractResolved(_)
+            | RuntimeEvent::CheckpointPersisted(_)
+            | RuntimeEvent::WorkspaceSnapshotCreated(_)
+            | RuntimeEvent::WorkspaceSnapshotReaped(_)
+            | RuntimeEvent::SessionOutcomeEmitted(_)
+            | RuntimeEvent::OrchestratorDecisionMade(_)
+            | RuntimeEvent::SummarizerFallback(_)
+            | RuntimeEvent::WorkspaceBackendDegraded(_)
+            | RuntimeEvent::SandboxCrashRecovered(_)
+            // RFC 029: knowledge-provider lifecycle and ingest-job events
+            // land in their own projection tables
+            // (`project_knowledge_providers` / `knowledge_ingest_jobs`).
+            // The provenance graph does not model provider configuration
+            // as nodes or edges — document-level provenance for ingested
+            // content is added by cairn-memory when chunks land, not here.
+            | RuntimeEvent::KnowledgeProviderConfigured(_)
+            | RuntimeEvent::KnowledgeProviderUnavailable(_)
+            | RuntimeEvent::KnowledgeProviderCapabilityChanged(_)
+            | RuntimeEvent::KnowledgeIngestSubmitted(_)
+            | RuntimeEvent::KnowledgeIngestRejected(_)
+            | RuntimeEvent::KnowledgeIngestStatusUpdated(_)
+            // RFC 030: memory-provider lifecycle events share the same
+            // "not modelled in the provenance graph" treatment as the
+            // knowledge-family events above.
+            | RuntimeEvent::MemoryProviderConfigured(_)
+            | RuntimeEvent::MemoryProviderUnavailable(_)
+            | RuntimeEvent::MemoryProviderCapabilityChanged(_)
+            | RuntimeEvent::MemoryIngestSubmitted(_)
+            | RuntimeEvent::MemoryIngestRejected(_)
+            | RuntimeEvent::MemoryIngestStatusUpdated(_)
+            // RFC 030 finalize: family-mismatch audits are not
+            // modelled in the provenance graph — operator-visibility
+            // only.
+            | RuntimeEvent::KnowledgeProviderFamilyMismatch(_)
+            | RuntimeEvent::MemoryProviderFamilyMismatch(_)
+            // RFC-025 Phase 1: eval scoring events are projection-only
+            // (they update the `eval_runs` read-model metrics columns in
+            // milestones 3/4/5). The graph projector does not need to
+            // create nodes or edges for score updates — the
+            // `EvalRunStarted` arm below already places the eval run
+            // node in the graph; score events are metric updates on that
+            // existing node, observable via the `eval_runs` table, not
+            // via new graph edges.
+            | RuntimeEvent::EvalRunScored(_)
+            | RuntimeEvent::EvalRubricScored(_)
+            // #789: per-iteration reasoning records are operator
+            // observability — not provenance. The decision artefact
+            // (run, tool invocation, etc.) is already in the graph;
+            // reasoning steps describe the model's internal thinking,
+            // which doesn't add provenance edges.
+            | RuntimeEvent::RunReasoningStepRecorded(_)
+            // RFC 031 PR-A: operator-defined agent roles. The
+            // provenance graph doesn't model role lifecycle or
+            // tool-availability advisories — both surface via their
+            // own projection table / event log.
+            | RuntimeEvent::AgentRoleDefined(_)
+            | RuntimeEvent::AgentRoleRetracted(_)
+            | RuntimeEvent::ToolDeclaredButMissing(_) => {}
 
             RuntimeEvent::EvalRunStarted(e) => {
                 self.add_node(
@@ -551,7 +646,7 @@ mod tests {
     use async_trait::async_trait;
     use cairn_domain::*;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
     struct MemGraph {
         nodes: Mutex<HashMap<String, GraphNode>>,
@@ -565,25 +660,38 @@ mod tests {
                 edges: Mutex::new(Vec::new()),
             }
         }
+
+        // #484: poison-tolerant accessors. A panic in any test that holds one
+        // of these locks will mark the Mutex poisoned; without this,
+        // subsequent tests that share the `Arc<MemGraph>` would cascade-panic
+        // on `.lock().unwrap()` and mask the real failure with a useless
+        // "second panic" message. This mirrors the pattern established in
+        // PR #544 (`BufferedF65EventSink::lock_or_recover`) and used across
+        // cairn-runtime (see `model_registry.rs`, `bandit.rs`, `worktree.rs`,
+        // `config_store.rs`).
+        fn nodes_lock(&self) -> MutexGuard<'_, HashMap<String, GraphNode>> {
+            self.nodes.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        fn edges_lock(&self) -> MutexGuard<'_, Vec<GraphEdge>> {
+            self.edges.lock().unwrap_or_else(PoisonError::into_inner)
+        }
     }
 
     #[async_trait]
     impl GraphProjection for Arc<MemGraph> {
         async fn add_node(&self, node: GraphNode) -> Result<(), GraphProjectionError> {
-            self.nodes
-                .lock()
-                .unwrap()
-                .insert(node.node_id.clone(), node);
+            self.nodes_lock().insert(node.node_id.clone(), node);
             Ok(())
         }
 
         async fn add_edge(&self, edge: GraphEdge) -> Result<(), GraphProjectionError> {
-            self.edges.lock().unwrap().push(edge);
+            self.edges_lock().push(edge);
             Ok(())
         }
 
         async fn node_exists(&self, node_id: &str) -> Result<bool, GraphProjectionError> {
-            Ok(self.nodes.lock().unwrap().contains_key(node_id))
+            Ok(self.nodes_lock().contains_key(node_id))
         }
     }
 
@@ -623,11 +731,11 @@ mod tests {
         assert_eq!(result.nodes_created, 2); // session + run
         assert_eq!(result.edges_created, 1); // run -> session
 
-        let nodes = graph.nodes.lock().unwrap();
+        let nodes = graph.nodes_lock();
         assert!(nodes.contains_key("sess_1"));
         assert!(nodes.contains_key("run_1"));
 
-        let edges = graph.edges.lock().unwrap();
+        let edges = graph.edges_lock();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].source_node_id, "run_1");
         assert_eq!(edges[0].target_node_id, "sess_1");
@@ -646,6 +754,9 @@ mod tests {
                 child_task_id: TaskId::new("child_task"),
                 child_session_id: SessionId::new("child_sess"),
                 child_run_id: Some(RunId::new("child_run")),
+                goal: String::new(),
+                role: String::new(),
+                parent_context: None,
             },
         ))];
 
@@ -694,6 +805,9 @@ mod tests {
                 prompt_version_id: None,
                 prompt_release_id: None,
                 created_by: None,
+                dataset_id: None,
+                rubric_id: None,
+                baseline_id: None,
             })),
             make_stored(RuntimeEvent::EvalRunCompleted(EvalRunCompleted {
                 project: ProjectKey::new("t", "w", "p"),
@@ -709,11 +823,11 @@ mod tests {
         assert_eq!(result.nodes_created, 1); // EvalRun node
         assert_eq!(result.edges_created, 1); // EvaluatedBy edge
 
-        let nodes = graph.nodes.lock().unwrap();
+        let nodes = graph.nodes_lock();
         assert!(nodes.contains_key("eval_1"));
         assert_eq!(nodes["eval_1"].kind, NodeKind::EvalRun);
 
-        let edges = graph.edges.lock().unwrap();
+        let edges = graph.edges_lock();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].source_node_id, "eval_1");
         assert_eq!(edges[0].target_node_id, "release_1");
@@ -736,6 +850,9 @@ mod tests {
                 prompt_version_id: None,
                 prompt_release_id: None,
                 created_by: None,
+                dataset_id: None,
+                rubric_id: None,
+                baseline_id: None,
             })),
             make_stored(RuntimeEvent::EvalRunCompleted(EvalRunCompleted {
                 project: ProjectKey::new("t", "w", "p"),
@@ -803,13 +920,13 @@ mod tests {
         assert_eq!(result.nodes_created, 3);
         assert_eq!(result.edges_created, 3);
 
-        let nodes = graph.nodes.lock().unwrap();
+        let nodes = graph.nodes_lock();
         assert!(nodes.contains_key("sig_1"));
         assert!(nodes.contains_key("run_1"));
         assert!(nodes.contains_key("trigger:trigger_1"));
         assert_eq!(nodes["trigger:trigger_1"].kind, NodeKind::Trigger);
 
-        let edges = graph.edges.lock().unwrap();
+        let edges = graph.edges_lock();
         assert!(edges.iter().any(|edge| {
             edge.source_node_id == "sig_1"
                 && edge.target_node_id == "trigger:trigger_1"
@@ -820,5 +937,62 @@ mod tests {
                 && edge.target_node_id == "run_1"
                 && edge.kind == EdgeKind::Fired
         }));
+    }
+
+    // ── #484: poison-tolerance regression ─────────────────────────────────
+    //
+    // Verify that a panic inside a thread holding `nodes` / `edges` does
+    // not cascade into subsequent readers. If we regress back to
+    // `.lock().unwrap()`, this test prints `thread ... panicked at ...
+    // PoisonError { .. }` instead of passing.
+    #[tokio::test]
+    async fn mem_graph_survives_writer_panic() {
+        let graph = Arc::new(MemGraph::new());
+
+        // Poison the `edges` mutex by panicking while holding it. Spawn on
+        // a blocking worker so the panic is confined to that thread
+        // (`#[should_panic]` on the outer test would catch the whole
+        // runtime; the intent here is to poison the lock, not fail the
+        // test).
+        let poisoner_graph = graph.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner_graph.edges.lock().expect("first lock succeeds");
+            panic!("intentional panic to poison the edges mutex");
+        })
+        .join();
+
+        // Poison the `nodes` mutex the same way.
+        let poisoner_graph = graph.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner_graph.nodes.lock().expect("first lock succeeds");
+            panic!("intentional panic to poison the nodes mutex");
+        })
+        .join();
+
+        // Both mutexes are now poisoned — confirm that assumption so the
+        // test remains meaningful if `Mutex` semantics ever change.
+        assert!(graph.edges.is_poisoned(), "edges must be poisoned");
+        assert!(graph.nodes.is_poisoned(), "nodes must be poisoned");
+
+        // Reader path: must not panic. The projector writes via the
+        // trait, the asserts read via the helper — both flow through
+        // `unwrap_or_else(PoisonError::into_inner)` and succeed.
+        let projector = EventProjector::new(graph.clone());
+        let events = vec![make_stored(RuntimeEvent::SessionCreated(SessionCreated {
+            project: ProjectKey::new("t", "w", "p"),
+            session_id: SessionId::new("sess_after_poison"),
+        }))];
+
+        let result = projector
+            .project_events(&events)
+            .await
+            .expect("projection must succeed through a poisoned lock");
+        assert_eq!(result.nodes_created, 1);
+
+        // Readers must also succeed. A regression to `.lock().unwrap()`
+        // would panic here with a PoisonError.
+        let nodes = graph.nodes_lock();
+        assert!(nodes.contains_key("sess_after_poison"));
+        let _edges = graph.edges_lock();
     }
 }

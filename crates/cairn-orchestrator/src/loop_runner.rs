@@ -28,13 +28,13 @@
 use std::sync::Arc;
 
 use crate::context::{
-    ActionStatus, DecideOutput, ExecuteOutcome, GatherOutput, LoopConfig, LoopSignal,
+    ActionResult, ActionStatus, DecideOutput, ExecuteOutcome, GatherOutput, LoopConfig, LoopSignal,
     LoopTermination, OrchestrationContext, StepSummary,
 };
 use crate::decide::DecidePhase;
 use crate::emitter::{NoOpEmitter, OrchestratorEventEmitter};
 use crate::error::OrchestratorError;
-use crate::execute::ExecutePhase;
+use crate::execute::{ApprovedDispatch, ExecutePhase};
 use crate::gather::GatherPhase;
 use crate::task_sink::{NoOpTaskSink, TaskFrameSink};
 
@@ -292,7 +292,35 @@ impl CheckpointHook for NoOpCheckpointHook {
 /// on this exact string — use the const to avoid typo-driven breakage.
 pub const LEASE_UNHEALTHY_REASON: &str = "lease unhealthy";
 
+/// Minimum wall-clock budget remaining (ms) required to start a DECIDE.
+///
+/// When less than this is left on the run deadline we terminate cleanly as
+/// `LoopTermination::TimedOut` instead of firing an LLM call that is
+/// guaranteed to miss the deadline mid-flight. 5s is a conservative heuristic:
+/// smaller than any provider's default timeout so it only fires near the
+/// actual deadline, but large enough that a successful DECIDE could realistically
+/// finish in the remaining window on fast paths. Chosen over the per-provider
+/// timeout because different bindings in a routing chain have different
+/// defaults — 5s is the largest common lower bound that doesn't leak those
+/// internals up to the loop.
+pub const MIN_DECIDE_BUDGET_MS: u64 = 5_000;
+
 // ── OrchestratorLoop ──────────────────────────────────────────────────────────
+
+/// One operator-rejected tool call surfaced by the F46 rejection
+/// drain.
+///
+/// Thin wrapper around the `StepSummary` that the next DECIDE sees;
+/// earlier drafts also carried `tool_name` + `preview` for prospective
+/// SSE/metrics plumbing, but those fields were never read and
+/// "reserved for later" accumulated churn on every refactor. When an
+/// SSE or metrics consumer materialises we will reinstate the fields
+/// alongside the emission site in the same PR — audit #474.
+struct DrainedRejection {
+    /// Step summary that will be pushed into `step_history` so the
+    /// next DECIDE's user message sees the rejection verbatim.
+    summary: StepSummary,
+}
 
 /// Drives the GATHER → DECIDE → EXECUTE loop for a single run.
 ///
@@ -319,6 +347,53 @@ pub struct OrchestratorLoop<G, D, E> {
     /// sink once the handler has claimed a task. Non-consuming
     /// (frames only); terminal + suspension ops stay at the caller.
     task_sink: Arc<dyn TaskFrameSink>,
+    /// F25 drain: optional read of the tool-call approval projection.
+    /// When wired, the loop drains any operator-approved-but-not-executed
+    /// proposals for the run at the top of each `run_inner` invocation
+    /// BEFORE calling DECIDE. Without this, a re-orchestrate after
+    /// approval never reaches the approved tool — the LLM just sees the
+    /// un-changed context and emits the same proposal again (which the
+    /// approval service then treats as a duplicate and auto-approves
+    /// without re-dispatch, looping forever).
+    approval_reader: Option<Arc<dyn cairn_runtime::tool_call_approvals::ToolCallApprovalReader>>,
+    /// RFC 032 PR-4: optional verifier for
+    /// [`cairn_domain::completion_contracts::CompletionContract`].
+    ///
+    /// Wired by PR-5's handler with a real implementation that
+    /// bridges to `cairn_orchestrator::contract_verifier::verify_contract`
+    /// using the run's project repo access + (optional) cairn-github
+    /// client. When `None`, the gate's contract-check branch is a
+    /// no-op and the pre-RFC-032 behaviour is preserved.
+    ///
+    /// The indirection keeps cairn-orchestrator free of
+    /// cairn-app-level concerns (AppState, GitHubClient construction):
+    /// the crate declares the shape of what it needs, the caller
+    /// provides it.
+    contract_verifier: Option<Arc<dyn ContractVerifier>>,
+}
+
+/// RFC 032 PR-4: gate-side callback for contract verification.
+/// The orchestrator loop calls this once per `complete_run`
+/// proposal, BEFORE the existing gate branches' pass decision but
+/// AFTER the error-bucket / sentinel / FailRun checks — per the
+/// RFC §3 ordering. Implementations route to
+/// [`crate::contract_verifier::verify_contract`] with the right
+/// tenant-scoping + GitHub client wired from AppState.
+///
+/// Separated from the underlying `verify_contract` function so the
+/// orchestrator crate stays decoupled from AppState wiring concerns;
+/// PR-5 ships the concrete impl.
+#[async_trait::async_trait]
+pub trait ContractVerifier: Send + Sync {
+    async fn verify(
+        &self,
+        contract: &cairn_domain::completion_contracts::CompletionContract,
+        ctx: &crate::context::OrchestrationContext,
+        final_answer: &str,
+    ) -> Result<
+        cairn_domain::completion_contracts::ContractVerifiedOutput,
+        crate::contract_verifier::VerifierRejection,
+    >;
 }
 
 impl<G, D, E> OrchestratorLoop<G, D, E>
@@ -339,7 +414,33 @@ where
             checkpoint_hook: Arc::new(NoOpCheckpointHook),
             emitter: Arc::new(NoOpEmitter),
             task_sink: Arc::new(NoOpTaskSink),
+            approval_reader: None,
+            contract_verifier: None,
         }
+    }
+
+    /// RFC 032 PR-4: install the completion-contract verifier.
+    /// PR-5's orchestrate handler constructs the concrete impl
+    /// (see cairn-app/src/contract_verifier_adapter.rs in PR-5) and
+    /// calls this once at loop construction. Without it, contract
+    /// verification is a no-op — the gate runs its pre-RFC-032
+    /// checks only.
+    pub fn with_contract_verifier(mut self, verifier: Arc<dyn ContractVerifier>) -> Self {
+        self.contract_verifier = Some(verifier);
+        self
+    }
+
+    /// F25 drain: install the tool-call approval reader so the loop
+    /// drains operator-approved proposals for the run before the next
+    /// DECIDE iteration. Without this, re-orchestrate after an approval
+    /// round-trip silently drops the approved tool call (the dogfood
+    /// blocker).
+    pub fn with_approval_reader(
+        mut self,
+        reader: Arc<dyn cairn_runtime::tool_call_approvals::ToolCallApprovalReader>,
+    ) -> Self {
+        self.approval_reader = Some(reader);
+        self
     }
 
     /// Replace the checkpoint hook (e.g., a durable Postgres checkpoint writer).
@@ -383,22 +484,262 @@ where
         &self,
         mut ctx: OrchestrationContext,
     ) -> Result<LoopTermination, OrchestratorError> {
+        let started_iteration = ctx.iteration;
         self.emitter.on_started(&ctx).await;
         let result = self.run_inner(&mut ctx).await;
+        // #744 instrumentation: record exactly which `LoopTermination`
+        // variant the loop returned (or which `OrchestratorError` it
+        // propagated), with the start + end iteration counter. Without
+        // this, R13 dogfood evidence on #744 (parent stuck in
+        // state=running after G5 auto-resume) can't distinguish
+        // \"loop returned Continue indefinitely\" from \"loop returned
+        // a terminal that didn't drive the run to terminal\". Logged at
+        // INFO so it shows up on the standard production log level.
+        let kind: &'static str = match &result {
+            Ok(LoopTermination::Completed { .. }) => "completed",
+            Ok(LoopTermination::Failed { .. }) => "failed",
+            Ok(LoopTermination::MaxIterationsReached) => "max_iterations_reached",
+            Ok(LoopTermination::TimedOut) => "timed_out",
+            Ok(LoopTermination::WaitingApproval { .. }) => "waiting_approval",
+            Ok(LoopTermination::WaitingSubagent { .. }) => "waiting_subagent",
+            Ok(LoopTermination::PlanProposed { .. }) => "plan_proposed",
+            Ok(LoopTermination::BreakerTripped { .. }) => "breaker_tripped",
+            Err(_) => "error",
+        };
+        // Log start + end iteration without a derived `iterations_run`.
+        // `ctx.iteration` is only bumped on `Continue`; on terminating
+        // signals (`Completed`, `WaitingSubagent`, etc.) the counter
+        // is the index of the iteration that produced the terminating
+        // action. On `MaxIterationsReached` it's already past the cap.
+        // The two indices are unambiguous in isolation; a synthesised
+        // \"iterations_run\" derived from them would be off-by-one
+        // depending on which terminator fired (Gemini review).
+        tracing::info!(
+            run_id = %ctx.run_id,
+            session_id = %ctx.session_id,
+            kind,
+            started_iteration,
+            ended_iteration = ctx.iteration,
+            "OrchestratorLoop::run returned"
+        );
         // Emit on_finished for every terminal outcome. For the Err branch
         // propagate the underlying OrchestratorError's Display string so
         // dashboards see the real cause (e.g. "decide: model 404",
         // "memory: kb unavailable") rather than "infrastructure error".
-        match &result {
-            Ok(t) => self.emitter.on_finished(&ctx, t).await,
+        let run_terminal = match &result {
+            Ok(t) => {
+                self.emitter.on_finished(&ctx, t).await;
+                t.drives_run_to_terminal()
+            }
             Err(e) => {
                 let term = LoopTermination::Failed {
                     reason: e.to_string(),
                 };
                 self.emitter.on_finished(&ctx, &term).await;
+                // Infrastructure errors still end the run for good —
+                // there is no resume path for an Err branch.
+                true
             }
+        };
+        if run_terminal {
+            // #606: evict harness-tools caches (write ledger + LSP
+            // clients) so rust-analyzer child processes terminate
+            // and the maps stay bounded to live runs.
+            cairn_harness_tools::evict_run(&ctx.tool_context(), &ctx.project);
         }
         result
+    }
+
+    /// F25 drain: execute any operator-approved tool calls for this run
+    /// whose `ToolCallId` the caller has not already drained this
+    /// `run_inner` invocation. Returns one `ActionResult` per drained
+    /// proposal in oldest-first order.
+    ///
+    /// `already_drained` is a per-invocation ledger of `ToolCallId`
+    /// strings the loop has already processed. Without it, every
+    /// iteration would re-fetch the same Approved rows and re-emit
+    /// tool_called / tool_result / StepSummary for each one — even if
+    /// `dispatch_approved` silently served a cache hit, the bloat in
+    /// `step_history` would poison the next DECIDE's context. This
+    /// caller-owned set caps the work at once per call_id per invocation.
+    ///
+    /// `dispatch_approved` still performs its own
+    /// `ToolCallResultCache`-presence check as a second line of defence:
+    /// a long-running loop that outlives a restart (theoretical; current
+    /// runner does not) would hit the cache on the post-restart rebuild.
+    ///
+    /// When no approval reader is wired (default), the drain is a no-op.
+    async fn drain_approved_pending(
+        &self,
+        ctx: &OrchestrationContext,
+        already_drained: &mut std::collections::HashSet<String>,
+    ) -> Result<Vec<ActionResult>, OrchestratorError> {
+        let Some(reader) = &self.approval_reader else {
+            return Ok(Vec::new());
+        };
+
+        let approved = reader
+            .list_approved_for_run(&ctx.run_id)
+            .await
+            .map_err(OrchestratorError::Runtime)?;
+        if approved.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        for ap in approved {
+            let call_id_str = ap.call_id.as_str().to_owned();
+            if !already_drained.insert(call_id_str.clone()) {
+                // Already handled this call_id earlier in the same
+                // `run_inner` invocation — skip to avoid duplicate
+                // emissions and step_history entries.
+                continue;
+            }
+
+            let started_at = std::time::Instant::now();
+            let dispatch = ApprovedDispatch {
+                call_id: ap.call_id,
+                tool_name: ap.tool_name,
+                tool_args: ap.tool_args,
+            };
+            let mut result = self.execute.dispatch_approved(ctx, &dispatch).await?;
+            result.duration_ms = started_at.elapsed().as_millis() as u64;
+            tracing::info!(
+                run_id = %ctx.run_id,
+                tool = ?dispatch.tool_name,
+                succeeded = matches!(result.status, ActionStatus::Succeeded),
+                "F25 drain: dispatched approved tool call"
+            );
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// F46 rejection drain: surface every operator-rejected tool call
+    /// for this run that the caller has not already processed. Returns
+    /// one `StepSummary` per rejection so the next DECIDE's user
+    /// message carries the rejection reason verbatim. Without this, a
+    /// rejected proposal leaves no trace in step history and the LLM
+    /// re-proposes the same call — the F46 dogfood repro.
+    ///
+    /// Dedup shares the `already_drained` ledger with the approved
+    /// drain: a call_id can be in at most one terminal state
+    /// (approved-then-executed OR rejected), so one ledger covers both.
+    async fn drain_rejected_pending(
+        &self,
+        ctx: &OrchestrationContext,
+        already_drained: &mut std::collections::HashSet<String>,
+    ) -> Result<Vec<DrainedRejection>, OrchestratorError> {
+        let Some(reader) = &self.approval_reader else {
+            return Ok(Vec::new());
+        };
+
+        let rejected = reader
+            .list_rejected_for_run(&ctx.run_id)
+            .await
+            .map_err(OrchestratorError::Runtime)?;
+        if rejected.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for rj in rejected {
+            let call_id_str = rj.call_id.as_str().to_owned();
+            if !already_drained.insert(call_id_str.clone()) {
+                continue;
+            }
+            let reason_text = rj
+                .reason
+                .as_deref()
+                .unwrap_or("operator rejected tool call (no reason provided)");
+            let preview = truncate_for_summary(reason_text, 400);
+            let tool_name = rj.tool_name;
+            tracing::info!(
+                run_id = %ctx.run_id,
+                tool = %tool_name,
+                call_id = %call_id_str,
+                "F46 drain: surfacing rejected tool call to next DECIDE"
+            );
+            let summary = StepSummary {
+                iteration: ctx.iteration,
+                action_kind: "invoke_tool".to_owned(),
+                // Format mirrors `build_step_summary` so all three
+                // outcomes (ok / ERROR / REJECTED) render through the
+                // same "tool_result[<name>] ..." grammar downstream.
+                // Header uses "drained rejected" — avoids the
+                // contradictory "rejected approved proposal" wording
+                // while staying parallel to the approved drain's
+                // "drained approved: <tool>" header.
+                summary: format!(
+                    "drained rejected: {tool_name}\n  tool_result[{tool_name}] REJECTED: {preview}"
+                ),
+                // Rejection is a terminal *non-failure* from the loop's
+                // perspective — the run continues, just without the
+                // tool call. Mark succeeded=true so the DECIDE prompt
+                // doesn't render `ok=false` (which would signal a hard
+                // failure). The summary text itself carries the
+                // rejection semantics.
+                succeeded: true,
+                verified_output: None,
+            };
+            out.push(DrainedRejection { summary });
+        }
+        Ok(out)
+    }
+
+    /// F65 PR-3 helper: dispatch a `BreakerCheck` result. `Continue`
+    /// is a no-op; `Warning` logs + invokes `on_budget_threshold_crossed`
+    /// and returns `None` so the caller keeps running; `Tripped` logs +
+    /// invokes `on_breaker_tripped` and returns
+    /// `Some(LoopTermination::BreakerTripped)` which the caller
+    /// propagates as the final termination.
+    ///
+    /// Extracted to close the pre-gather / post-decide duplication
+    /// Gemini flagged on PR #348 review.
+    async fn handle_breaker_check(
+        &self,
+        ctx: &OrchestrationContext,
+        check: crate::breakers::BreakerCheck,
+        where_label: &'static str,
+    ) -> Option<LoopTermination> {
+        use crate::breakers::BreakerCheck;
+        match check {
+            BreakerCheck::Continue => None,
+            BreakerCheck::Warning {
+                which,
+                measured,
+                limit,
+                ratio_bps,
+            } => {
+                tracing::warn!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    which     = ?which,
+                    measured,
+                    limit,
+                    ratio_bps,
+                    where_label,
+                    "orchestrator budget threshold crossed"
+                );
+                self.emitter
+                    .on_budget_threshold_crossed(ctx, which, measured, limit, ratio_bps)
+                    .await;
+                None
+            }
+            BreakerCheck::Tripped(trip) => {
+                tracing::warn!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    which     = ?trip.which,
+                    measured  = trip.measured,
+                    limit     = trip.limit,
+                    where_label,
+                    "orchestrator circuit breaker tripped"
+                );
+                self.emitter.on_breaker_tripped(ctx, &trip).await;
+                Some(LoopTermination::BreakerTripped { trip })
+            }
+        }
     }
 
     async fn run_inner(
@@ -410,8 +751,81 @@ where
         // Local step history — carried across iterations within this invocation.
         // On resume from a checkpoint the gather phase rebuilds history from the
         // store; this vec accumulates steps taken during the *current* invocation.
-        let mut step_history: Vec<StepSummary> = Vec::new();
+        //
+        // #670 G7: seed from `ctx.step_history` so callers (e.g. cairn-app's
+        // `drive_run_iteration`) can prepend cross-run context before the
+        // loop starts. Without this seed the loop overwrites `ctx.step_history`
+        // with its own empty vec at the top of the first gather, dropping
+        // the subagent-completion entries that G7 injects. `std::mem::take`
+        // avoids a clone: the caller's `ctx.step_history` is consumed into
+        // the local vec, then re-synced on the next `ctx.step_history =
+        // step_history.clone()` below.
+        let mut step_history: Vec<StepSummary> = std::mem::take(&mut ctx.step_history);
         let mut last_compaction_iteration: Option<u32> = None;
+        // F25 drain dedup ledger: every approved `ToolCallId` the drain
+        // has processed in THIS `run_inner` invocation. Prevents
+        // duplicate tool_called/tool_result/StepSummary emissions when
+        // subsequent iterations re-list the same projection row.
+        let mut drained_call_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // F47 PR1 incremental verification accumulator. Each
+        // `ActionResult` produced by execute (main path, approval-gate
+        // inline path, AND the F25 drain path) is fed to
+        // `verification_acc.observe(...)` which scans the tool_output in
+        // place and retains only the bounded bucket output (50 entries *
+        // 500 chars per bucket). Keeps per-run memory flat even when a
+        // run issues a `read` on a large file — we never retain the full
+        // `tool_output` past the scan. At Done `verification_acc.finish()`
+        // produces the `CompletionVerification` sidecar attached to
+        // `LoopTermination::Completed`. Copilot review on #312 flagged
+        // the original `Vec<ActionResult>` form as a memory risk; this
+        // scan-and-discard design closes that. Cursor Bugbot on #312
+        // flagged the drain path as uncovered; every observe-site below
+        // is audited against the three dispatch paths.
+        let mut verification_acc = crate::completion_verification::VerificationAccumulator::new();
+
+        // F65 PR-3: circuit-breaker state, anchored to Instant::now() for
+        // monotonic wall-clock measurement independent of system-clock jumps.
+        // `check_pre_gather` fires at the top of each iteration (Round +
+        // WallClock); `after_decide` fires after DECIDE (Tokens +
+        // NoToolUseConsecutive). The config's caps are resolved by the
+        // HTTP handler via the 3-layer RuntimeConfig fallback plus per-run
+        // overrides.
+        let mut breaker_state = crate::breakers::BreakerState::new(self.config.breakers.clone());
+        // Issue #689 Finding R2-B: per-run state tracking consecutive
+        // `bash` + bare-`echo` prose-playing turns. Observational only —
+        // the loop continues even when the detector fires; the
+        // emitter-side metric + WARN log surfaces the signal to
+        // operators without auto-failing the run. See
+        // `crate::echo_detector` rustdoc for the heuristic + scope
+        // guardrails.
+        let mut echo_detector_state = crate::echo_detector::EchoDetectorState::new();
+        // Warn-once latch: fired when a DECIDE response lacks both input
+        // and output token counts so token-cap accounting silently
+        // under-counts. Set on first occurrence and never cleared; rare
+        // in practice (providers routinely report usage) but we refuse
+        // to silently accept a stuck under-count.
+        let mut decide_usage_absent_warned = false;
+        // Issue #660: strict completion-gate rejection counter. Increments
+        // every time the LLM proposes `complete_run` while the F47
+        // verification accumulator still has non-empty errors. Three
+        // consecutive rejections end the run in `Failed
+        // (VerificationRejected)` so a non-converging model can't ping-
+        // pong against the gate until `max_iterations` exhausts the
+        // budget. Gated by `config.orchestrator_strict_completion_gate`.
+        let mut completion_gate_rejections: u32 = 0;
+
+        // Issue #689 R2-A: consecutive malformed `spawn_subagent`
+        // proposals. A single malformed proposal no longer fails the
+        // run (see `MALFORMED_SPAWN_PROPOSAL_PREFIX` in `execute_impl`);
+        // instead the LLM sees the rejection in `step_history` and can
+        // re-emit. The counter increments on every iteration whose
+        // execute outcome contains a malformed-spawn rejection and
+        // resets on any iteration that completes without one. Reaching
+        // `MAX_CONSECUTIVE_MALFORMED_SPAWNS` terminates the run so a
+        // permanently-broken model can't ping-pong against the gate
+        // until `max_iterations` exhausts the budget.
+        let mut consecutive_malformed_spawns: u32 = 0;
 
         tracing::info!(
             run_id    = %ctx.run_id,
@@ -419,9 +833,166 @@ where
             agent     = %ctx.agent_type,
             max_iter  = self.config.max_iterations,
             timeout_s = self.config.timeout_ms / 1_000,
+            round_cap = self.config.breakers.round_cap,
+            token_cap = self.config.breakers.token_cap,
+            no_tool_use_streak = self.config.breakers.no_tool_use_streak,
+            wall_clock_ms = self.config.breakers.wall_clock_ms,
             "orchestrator loop starting"
         );
         for _iter in 0..self.config.max_iterations {
+            // ── (0) F25 drain: flush operator-approved tool calls ────────────
+            //
+            // Before GATHER reads the event log, replay any
+            // `ToolCallApproved`-state proposals for this run that don't
+            // yet have a matching `ToolInvocationCompleted`. Without this
+            // step, a re-orchestrate after approval never invokes the
+            // approved tool: the LLM sees the same context as last turn,
+            // emits the same proposal, the approval service (correctly)
+            // returns AutoApproved from its cache, but nothing actually
+            // *runs* the tool — the dogfood F25 blocker. See
+            // `CLAUDE.md` + `project_session_2026_04_22_part4.md`.
+            //
+            // Failures inside the drain surface as synthesized
+            // StepSummary entries + tool_result events so the next
+            // DECIDE sees what went wrong and the LLM can self-correct.
+            let drained = self
+                .drain_approved_pending(ctx, &mut drained_call_ids)
+                .await?;
+            if !drained.is_empty() {
+                for result in &drained {
+                    // F47 PR1 (Cursor Bugbot #312 fix): the drain path
+                    // dispatches approved tool calls, and its outputs MUST
+                    // flow into the verification sidecar — otherwise an
+                    // operator-approved bash command that emits warnings
+                    // would be invisible to the SSE evidence consumer,
+                    // defeating the F47 contract for approval-gated runs.
+                    verification_acc.observe(result);
+
+                    let Some(tool_name) = result.proposal.tool_name.as_deref() else {
+                        continue;
+                    };
+                    let args = result
+                        .proposal
+                        .tool_args
+                        .clone()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    // SSE: tool_called + tool_result (mirrors main path).
+                    self.emitter
+                        .on_tool_called(ctx, tool_name, Some(&args))
+                        .await;
+                    let (succeeded, error) = match &result.status {
+                        ActionStatus::Succeeded => (true, None),
+                        ActionStatus::Failed { reason } => (false, Some(reason.as_str())),
+                        _ => (false, None),
+                    };
+                    self.emitter
+                        .on_tool_result(
+                            ctx,
+                            tool_name,
+                            succeeded,
+                            result.tool_output.as_ref(),
+                            error,
+                            result.duration_ms,
+                        )
+                        .await;
+
+                    // FF attempt-stream: tool_call + tool_result frames.
+                    // `restore_frames()` on resume expects these pair
+                    // with every tool dispatch, including drain. Best-
+                    // effort (warn+continue) per the sink contract.
+                    if let Err(e) = self.task_sink.log_tool_call(tool_name, &args).await {
+                        tracing::warn!(
+                            run_id = %ctx.run_id,
+                            tool = %tool_name,
+                            error = %e,
+                            "drain: task_sink.log_tool_call failed — frame lost"
+                        );
+                    }
+                    let output = match &result.tool_output {
+                        Some(v) => v.clone(),
+                        None => match error {
+                            Some(reason) => serde_json::json!({"error": reason}),
+                            None => serde_json::Value::Null,
+                        },
+                    };
+                    if let Err(e) = self
+                        .task_sink
+                        .log_tool_result(tool_name, &output, succeeded, result.duration_ms)
+                        .await
+                    {
+                        tracing::warn!(
+                            run_id = %ctx.run_id,
+                            tool = %tool_name,
+                            error = %e,
+                            "drain: task_sink.log_tool_result failed — frame lost"
+                        );
+                    }
+
+                    // Append StepSummary so DECIDE's next gather sees
+                    // the drained action as part of the run's history.
+                    //
+                    // F46: mirror `build_step_summary`'s tool_result line
+                    // format so the LLM sees stdout/stderr (bash) or file
+                    // content (read) or error text on the NEXT DECIDE
+                    // turn. Pre-F46 this just wrote "drained approved:
+                    // {tool_name}" with no payload — the LLM saw an
+                    // opaque success marker and re-proposed the same
+                    // call (dogfood M1 repro).
+                    let action_kind = "invoke_tool".to_owned();
+                    let header = format!("drained approved: {tool_name}");
+                    let summary = match &result.status {
+                        ActionStatus::Succeeded => match result.tool_output.as_ref() {
+                            Some(output) => {
+                                // F54: tool-aware preview so bash output
+                                // keeps its tail + exit_code line.
+                                let preview = render_tool_output_preview(tool_name, output);
+                                format!("{header}\n  tool_result[{tool_name}] ok: {preview}")
+                            }
+                            None => header,
+                        },
+                        ActionStatus::Failed { reason } => {
+                            let preview = truncate_for_summary(reason, 400);
+                            format!("{header}\n  tool_result[{tool_name}] ERROR: {preview}")
+                        }
+                        _ => header,
+                    };
+                    step_history.push(StepSummary {
+                        iteration: ctx.iteration,
+                        action_kind,
+                        summary,
+                        succeeded,
+                        verified_output: None,
+                    });
+                }
+            }
+
+            // ── (0b) F46 rejection drain: surface rejected proposals ─────────
+            //
+            // Operator rejections leave no trace in the in-memory
+            // step_history across suspend/resume boundaries — the
+            // projection row moves to `Rejected` but no drain-side
+            // dispatch emits a StepSummary. Without this pass the next
+            // DECIDE can't see the rejection reason and re-proposes the
+            // same call (F46 dogfood M1 repro). Runs every iteration
+            // because a second approval may be rejected while a first
+            // is executing.
+            let rejections = self
+                .drain_rejected_pending(ctx, &mut drained_call_ids)
+                .await?;
+            for DrainedRejection { summary } in rejections {
+                // Rejections are NOT tool executions — the tool was
+                // never invoked. Emitting a `tool_result` SSE frame
+                // (succeeded=false) would mislead UI consumers and skew
+                // tool-failure metrics. The rejection is already
+                // surfaced to operators via the ToolCallApproval
+                // projection + its dedicated `/reject` endpoint — the
+                // UI consumes that stream directly. Here we only need
+                // to thread the rejection into the next DECIDE's user
+                // message, which happens via `step_history` below.
+                step_history.push(summary);
+            }
+
             // ── (1) Timeout check ─────────────────────────────────────────────
             let now_ms = now_millis();
             if now_ms >= deadline_ms {
@@ -431,6 +1002,24 @@ where
                     "orchestrator loop timed out"
                 );
                 return Ok(LoopTermination::TimedOut);
+            }
+
+            // ── (1a) F65 PR-3: pre-GATHER breaker check ─────────────────────
+            // Round + WallClock caps are consulted here so a trip fires
+            // BEFORE we commit irreversible side effects (LLM call, tool
+            // dispatch, checkpoint write) for this iteration. The
+            // emitter hook appends `RuntimeEvent::CircuitBreakerTripped`
+            // via the cairn-app `TracingEmitter`; a `Warning` variant
+            // records `BudgetThresholdCrossed` without terminating.
+            if let Some(term) = self
+                .handle_breaker_check(
+                    ctx,
+                    breaker_state.check_pre_gather(ctx.iteration),
+                    "pre_gather",
+                )
+                .await
+            {
+                return Ok(term);
             }
 
             // ── (1b) Lease health gate ───────────────────────────────────────
@@ -511,8 +1100,36 @@ where
                     .await;
             }
 
+            // ── (2c) Pre-DECIDE budget check ─────────────────────────────────
+            // GATHER just finished; if the remaining budget is too small
+            // to reasonably complete a DECIDE round-trip, bail now rather
+            // than firing the LLM call only to have the wall-clock
+            // deadline trip in the middle and leave a stranded provider
+            // request. The threshold is heuristic: smaller than the
+            // smallest per-provider default would guarantee a provider
+            // timeout fires before the loop deadline — wasteful. Larger
+            // than DECIDE's typical latency avoids false positives.
+            //
+            // Uses `now_millis()` fresh: GATHER may itself have taken
+            // meaningful time (retrieval + chunk scoring), so the
+            // `remaining_ms` computed at iteration start is stale.
+            let pre_decide_now_ms = now_millis();
+            let remaining_before_decide_ms = deadline_ms.saturating_sub(pre_decide_now_ms);
+            if remaining_before_decide_ms < MIN_DECIDE_BUDGET_MS {
+                tracing::warn!(
+                    run_id        = %ctx.run_id,
+                    iteration     = ctx.iteration,
+                    remaining_ms  = remaining_before_decide_ms,
+                    min_budget_ms = MIN_DECIDE_BUDGET_MS,
+                    "orchestrator loop budget too low to start DECIDE — timing out cleanly"
+                );
+                return Ok(LoopTermination::TimedOut);
+            }
+
             // ── (3) DECIDE ────────────────────────────────────────────────────
-            let decide_output = self.decide.decide(ctx, &gather_output).await.map_err(|e| {
+            // `mut` so the #660 strict completion gate can strip a refused
+            // `complete_run` proposal in place before execute dispatches it.
+            let mut decide_output = self.decide.decide(ctx, &gather_output).await.map_err(|e| {
                 tracing::error!(run_id = %ctx.run_id, iteration = ctx.iteration, error = %e, "decide failed");
                 e
             })?;
@@ -532,6 +1149,108 @@ where
                 "decide complete"
             );
             self.emitter.on_decide_completed(ctx, &decide_output).await;
+
+            // ── (3a) F65 PR-3: post-DECIDE breaker check ────────────────────
+            // DecideOutput carries provider-reported token counts; we
+            // build a "tool or terminal" proposal count (see below) for
+            // the NoToolUseConsecutive streak. If both input AND output
+            // are None for a given DECIDE round, the provider did not
+            // report usage — we warn once per run and treat this round as
+            // zero tokens. Providers that PERMANENTLY omit usage will
+            // cause the token-cap breaker to under-count for the whole
+            // run; operators should confirm their provider reports usage
+            // before relying on the token-cap breaker. This is the
+            // intentional trade-off — we prefer under-counting to
+            // refusing to run entirely.
+            if decide_output.input_tokens.is_none()
+                && decide_output.output_tokens.is_none()
+                && !decide_usage_absent_warned
+            {
+                decide_usage_absent_warned = true;
+                tracing::warn!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    model     = %decide_output.model_id,
+                    "DECIDE response carried no token usage — token-cap breaker may \
+                     under-count for this run (warn-once)"
+                );
+            }
+            // NoToolUseConsecutive streak counts as "non-zero" for any
+            // proposal that either carries a concrete tool_name OR is
+            // a terminal / operator-gated action type (complete_run /
+            // escalate_to_operator / spawn_subagent). Without this
+            // carve-out, a legitimate `complete_run` after two prior
+            // narration rounds would trip the streak breaker BEFORE
+            // execute dispatches the terminal action — converting the
+            // user's intentional completion into a BreakerTripped
+            // failure. Cursor Bugbot flagged this HIGH-severity on
+            // PR #348.
+            //
+            // Classification logic lives on `DecideOutput` so future
+            // DECIDE refactors (batched tool bursts, provider-side
+            // segmented counts, `.terminal_action_count()` etc.) can
+            // memoise it without touching this call site — see #510.
+            let tool_or_terminal_count = decide_output.tool_or_terminal_count();
+            let post_decide_check = breaker_state.after_decide(
+                ctx.iteration,
+                decide_output.input_tokens.unwrap_or(0),
+                decide_output.output_tokens.unwrap_or(0),
+                tool_or_terminal_count,
+            );
+            if let Some(term) = self
+                .handle_breaker_check(ctx, post_decide_check, "post_decide")
+                .await
+            {
+                return Ok(term);
+            }
+
+            // ── (3a'') Issue #689 R2-B: echo-via-bash prose-playing ──────────
+            // Non-terminal detector. When the LLM emits consecutive
+            // `bash` + bare-`echo` proposals (no redirects / pipes /
+            // operators), it's narrating its intentions instead of
+            // dispatching the action. WARN-log + emitter hook, then
+            // continue — the operator decides what to do. No run
+            // modification, no breaker trip, no cancel.
+            use crate::echo_detector::EchoDetectorCheck;
+            match echo_detector_state.on_decide(&decide_output) {
+                EchoDetectorCheck::Detected { consecutive_count } => {
+                    tracing::warn!(
+                        run_id             = %ctx.run_id,
+                        iteration          = ctx.iteration,
+                        model              = %decide_output.model_id,
+                        consecutive_count  = consecutive_count,
+                        pattern            = "echo_via_bash",
+                        "issue #689 R2-B: LLM appears to be prose-playing — emitting \
+                         consecutive `bash` + bare-`echo` proposals instead of the \
+                         correct ActionType. Operator visibility only; the run \
+                         continues."
+                    );
+                    self.emitter
+                        .on_prose_playing_detected(ctx, consecutive_count)
+                        .await;
+                }
+                EchoDetectorCheck::Continue => {}
+            }
+
+            // ── (3a') Emitter fatal-error check ──────────────────────────────
+            // `on_decide_completed` is the only callback that dual-writes
+            // provider-call telemetry into the durable secondary (see the
+            // `TracingEmitter` implementation in `cairn-app`). When its
+            // append fails, the in-memory and durable logs have diverged
+            // — the next iteration would read stale state from the
+            // primary, so the loop must abort with a store error rather
+            // than silently continue toward the iteration cap.
+            if let Some(msg) = self.emitter.take_fatal_error() {
+                tracing::error!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    error     = %msg,
+                    "orchestrator emitter reported fatal error — aborting loop"
+                );
+                return Err(OrchestratorError::Store(cairn_store::StoreError::Internal(
+                    msg,
+                )));
+            }
 
             // ── (3b') FF stream: llm_response frame ──────────────────────────
             // DecideOutput already carries model_id, token counts, and
@@ -615,6 +1334,13 @@ where
                     e
                 })?;
 
+                // F47 PR1: scan this iteration's results incrementally so
+                // tool_output payloads aren't retained across the whole run.
+                // Approval-gate inline dispatch path.
+                for r in &execute_outcome.results {
+                    verification_acc.observe(r);
+                }
+
                 // T5-M8: mirror the main-path post-execute bookkeeping so
                 // resuming from a checkpointed approval-suspended run sees a
                 // step_summary, a persisted checkpoint, and a step_completed
@@ -654,11 +1380,123 @@ where
                     }
                 }
 
-                // Execute returned without setting AwaitingApproval — unexpected.
-                return Err(OrchestratorError::Execute(
-                    "requires_approval=true but execute returned no AwaitingApproval status"
-                        .to_owned(),
-                ));
+                // No AwaitingApproval result — the BP-v2 ToolCallApproval
+                // path ran the whole propose-then-await flow inline: the
+                // proposal was submitted, the operator resolved it (or
+                // it timed out), and the tool already dispatched +
+                // recorded its result in this very execute_outcome.
+                //
+                // Treat the terminal loop_signal from the outcome as
+                // authoritative: Continue (if the tool succeeded and
+                // there's more work) flows back into the main loop via
+                // the logic below; Done/Failed/etc. terminate via the
+                // same match arms the non-approval path uses.
+                //
+                // Emit per-result tool_called/tool_result AND FF
+                // tool_result frames so SSE + FF attempt-stream
+                // telemetry stay consistent with the non-approval
+                // path. The approval-gate pre-execute log_tool_call
+                // already fired above; we emit on_tool_called here
+                // too so SSE timelines render a matching begin/end
+                // pair (the dashboard treats on_tool_called as the
+                // "started" event — without it the dispatch would
+                // show only a "result" with no corresponding call).
+                for result in &execute_outcome.results {
+                    let Some(tool_name) = result.proposal.tool_name.as_deref() else {
+                        continue;
+                    };
+                    let args = result
+                        .proposal
+                        .tool_args
+                        .clone()
+                        .unwrap_or(serde_json::Value::Null);
+                    self.emitter
+                        .on_tool_called(ctx, tool_name, Some(&args))
+                        .await;
+                    let (succeeded, error) = match &result.status {
+                        ActionStatus::Succeeded => (true, None),
+                        ActionStatus::Failed { reason } => (false, Some(reason.as_str())),
+                        _ => (false, None),
+                    };
+                    self.emitter
+                        .on_tool_result(
+                            ctx,
+                            tool_name,
+                            succeeded,
+                            result.tool_output.as_ref(),
+                            error,
+                            result.duration_ms,
+                        )
+                        .await;
+                    // FF attempt-stream: tool_result frame mirrors
+                    // the main-path log_tool_result at loop-runner
+                    // line ~820. `restore_frames()` expects this on
+                    // every dispatched call.
+                    let output = match &result.tool_output {
+                        Some(v) => v.clone(),
+                        None => match error {
+                            Some(reason) => serde_json::json!({"error": reason}),
+                            None => serde_json::Value::Null,
+                        },
+                    };
+                    if let Err(e) = self
+                        .task_sink
+                        .log_tool_result(tool_name, &output, succeeded, result.duration_ms)
+                        .await
+                    {
+                        tracing::warn!(
+                            run_id = %ctx.run_id,
+                            tool = %tool_name,
+                            error = %e,
+                            "BP-v2 inline: task_sink.log_tool_result failed — frame lost"
+                        );
+                    }
+                }
+
+                match execute_outcome.loop_signal.clone() {
+                    LoopSignal::Done => {
+                        let summary = decide_output
+                            .proposals
+                            .iter()
+                            .find(|p| p.action_type == cairn_domain::ActionType::CompleteRun)
+                            .map(|p| p.description.clone())
+                            .unwrap_or_else(|| "run completed".to_owned());
+                        // F47 PR1: finalise the incremental verification
+                        // sidecar. The extractor is pure; no IO happens
+                        // on this path. `.clone().finish()` because the
+                        // second Done branch (legacy fall-through) owns
+                        // the binding and only one branch executes per
+                        // run; clippy's dead-code analysis would
+                        // otherwise flag the unreachable arm.
+                        let verification = verification_acc.clone().finish();
+                        return Ok(LoopTermination::Completed {
+                            summary,
+                            verification,
+                        });
+                    }
+                    LoopSignal::Failed { reason } => {
+                        return Ok(LoopTermination::Failed { reason });
+                    }
+                    LoopSignal::WaitSubagent { child_task_id } => {
+                        return Ok(LoopTermination::WaitingSubagent { child_task_id });
+                    }
+                    LoopSignal::WaitApproval { approval_id } => {
+                        // Redundant with the `AwaitingApproval` scan
+                        // above, but covers derive_signal paths that
+                        // set WaitApproval without the per-result
+                        // status (legacy Escalate path).
+                        return Ok(LoopTermination::WaitingApproval { approval_id });
+                    }
+                    LoopSignal::PlanProposed { plan_markdown } => {
+                        return Ok(LoopTermination::PlanProposed { plan_markdown });
+                    }
+                    LoopSignal::Continue => {
+                        // BP-v2 dispatched successfully; bump iteration
+                        // and fall through to the next loop turn.
+                        ctx.iteration = ctx.iteration.saturating_add(1);
+                        continue;
+                    }
+                }
             }
 
             // ── (4b) RFC 020 Track 4: INTENT CHECKPOINT ───────────────────────
@@ -683,6 +1521,364 @@ where
                     error     = %e,
                     "intent checkpoint save failed — continuing without intent checkpoint"
                 );
+            }
+
+            // ── (4c) #660 strict completion gate ─────────────────────────────
+            //
+            // Belt-and-suspenders for the role-prompt completion gate
+            // shipped in #662. The role prompt tells the LLM "don't emit
+            // `complete_run` with a failing `completion_verification`";
+            // this gate enforces it in case the LLM lies. When the
+            // accumulator has at least one error line AND DECIDE emitted
+            // a `CompleteRun` proposal:
+            //
+            //   * Strip the `CompleteRun` from `decide_output.proposals`
+            //     so execute never dispatches `RunService::complete`
+            //     (which would flip the run to `state=completed`).
+            //   * Push a synthesised `StepSummary` into `step_history`
+            //     carrying a short excerpt of the first errors so the
+            //     next DECIDE turn sees the rejection + the concrete
+            //     diagnostics in its user-message context.
+            //   * On the third consecutive rejection, terminate with
+            //     `LoopTermination::Failed { reason = "verification_rejected: …" }`
+            //     so `finalize_run_failure` can map the reason to
+            //     `FailureClass::VerificationRejected` (issue #660). Three
+            //     rejections is enough for a genuinely self-correcting
+            //     model to recover; any more would just burn budget
+            //     against a stuck loop.
+            //
+            // Soft-fail posture: if anything in the gate's inspection goes
+            // sideways (unlikely — it's a pure read of `verification_acc`),
+            // log WARN + fall through to the pre-fix behaviour. A platform
+            // gate that blocks the happy path when its own check breaks
+            // is worse than the non-authoritative baseline.
+            if self.config.orchestrator_strict_completion_gate {
+                // #821: scope the gate's check to errors NEW since the
+                // last rejection (or run start). Pre-#821 the gate
+                // rejected on the run-wide error count, which meant a
+                // single transient `error:` line from any earlier
+                // iteration's tool output would permanently block
+                // complete_run — even after the model fixed every
+                // actual problem and produced the deliverable. R25
+                // dogfood saw this end-to-end: the executor wrote
+                // .github/workflows/ci.yml, committed, pushed, and
+                // opened a PR; then every complete_run attempt was
+                // rejected because earlier `git status` runs had
+                // emitted `error: src refspec ...` style lines that
+                // were no longer relevant.
+                // Three conditions reject a CompleteRun proposal:
+                //   (a) #823 review (Gemini) — errors_since_baseline
+                //       > 0: the model introduced fresh errors since
+                //       the last attempt (or this is the first
+                //       attempt with any errors at all).
+                //   (b) #823 review (Gemini) — baseline is active AND
+                //       the model made no tool-call progress between
+                //       rejections. Without this the model can bypass
+                //       the gate by retrying complete_run with zero
+                //       work done; #660's #821-aware fixture proves
+                //       this was a real hole.
+                //   (c) #830 — the proposal's `final_answer` opens
+                //       with a failure-admission sentinel (R27 saw
+                //       glm-4.7 call complete_run with `"Task
+                //       incomplete. The following was NOT performed:
+                //       ..."` even though ActionType::FailRun was in
+                //       the published tool_defs). Server-side backstop
+                //       for model non-compliance with the prompt-level
+                //       "use fail_run when blocked" directive.
+                // Single pass over proposals: the CompleteRun
+                // lookup for `proposes_complete_run` and `#830`'s
+                // sentinel scan both need the same proposal, so find
+                // it once (Gemini review, medium).
+                let complete_run_proposal = decide_output
+                    .proposals
+                    .iter()
+                    .find(|p| p.action_type == cairn_domain::ActionType::CompleteRun);
+                let proposes_complete_run = complete_run_proposal.is_some();
+                let has_new_errors = verification_acc.errors_since_baseline() > 0;
+                let stalled_since_rejection = !verification_acc.made_progress_since_baseline();
+
+                // #830: scan the CompleteRun proposal's final_answer
+                // (stored in `description` per decide_impl's
+                // translation) for admission sentinels. `None` when
+                // no CompleteRun is in proposals or description is
+                // empty — either way the gate has nothing to
+                // inspect on this condition, preserving the pre-#830
+                // branch behaviour.
+                let self_reported_failure: Option<&'static str> =
+                    complete_run_proposal.and_then(|p| {
+                        crate::completion_verification::detect_self_reported_failure(&p.description)
+                    });
+
+                // RFC 032 PR-4: completion-contract verification.
+                // Fires on every `CompleteRun` proposal when both
+                // (a) the handler populated `ctx.completion_contract`
+                // with a resolved contract, AND (b) a
+                // `contract_verifier` is wired on this loop
+                // (PR-5 ships the concrete impl; PR-4 ships the
+                // plumbing). Skipped when the pre-existing gate
+                // would ALREADY reject on errors / sentinel — those
+                // checks are cheaper and more actionable (RFC §3
+                // ordering), so we don't burn a verifier call
+                // re-confirming what a $0 check just caught. But
+                // `stalled_since_rejection` does NOT skip the
+                // verifier: the stalled signal fires on the 2nd/3rd
+                // retry after the model failed to produce work
+                // between attempts, and the verifier must still run
+                // so the terminal reason keeps the `contract_not_met:`
+                // prefix through the rejection loop (the model may
+                // still be attempting to satisfy a contract it
+                // cannot, and the operator dashboard needs to see
+                // that diagnosis).
+                let contract_rejection: Option<
+                    cairn_domain::completion_contracts::ContractRejectionCode,
+                > = if proposes_complete_run && !has_new_errors && self_reported_failure.is_none() {
+                    if let (Some(verifier), Some(contract), Some(proposal)) = (
+                        self.contract_verifier.as_ref(),
+                        ctx.completion_contract.as_ref(),
+                        complete_run_proposal,
+                    ) {
+                        match verifier.verify(contract, ctx, &proposal.description).await {
+                            Ok(_verified_output) => {
+                                // PR-5 will thread the extracted
+                                // `ContractVerifiedOutput` into the
+                                // child's `StepSummary.verified_output`
+                                // so a parent aggregate contract can
+                                // inspect it. PR-4 just confirms the
+                                // accept path runs to completion.
+                                None
+                            }
+                            Err(rejection) => {
+                                tracing::warn!(
+                                    run_id         = %ctx.run_id,
+                                    iteration      = ctx.iteration,
+                                    contract_kind  = %contract.kind(),
+                                    rejection_code = ?rejection.code,
+                                    operator_trace = %rejection.operator_trace,
+                                    "RFC 032: completion-contract verifier rejecting complete_run"
+                                );
+                                Some(rejection.code)
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let gate_would_reject = proposes_complete_run
+                    && (has_new_errors
+                        || stalled_since_rejection
+                        || self_reported_failure.is_some()
+                        || contract_rejection.is_some());
+
+                if gate_would_reject {
+                    let error_count = verification_acc.errors_since_baseline();
+                    let preview: Vec<String> = verification_acc
+                        .errors_since_baseline_slice()
+                        .iter()
+                        .take(crate::context::COMPLETION_GATE_ERROR_PREVIEW)
+                        .cloned()
+                        .collect();
+
+                    completion_gate_rejections = completion_gate_rejections.saturating_add(1);
+
+                    tracing::warn!(
+                        run_id        = %ctx.run_id,
+                        iteration     = ctx.iteration,
+                        rejection_num = completion_gate_rejections,
+                        error_count,
+                        stalled_since_rejection,
+                        self_reported_failure_sentinel = self_reported_failure.unwrap_or(""),
+                        "#660 strict completion gate rejecting complete_run"
+                    );
+
+                    if completion_gate_rejections >= crate::context::MAX_COMPLETION_GATE_REJECTIONS
+                    {
+                        // Budget cap hit. Terminate the run so it can't
+                        // ping-pong against the gate until `max_iterations`.
+                        // Reason string is matched by the handler's
+                        // `classify_failed_reason` to set the run's
+                        // `FailureClass::VerificationRejected` terminal
+                        // state. Keep the literal prefix stable — it's a
+                        // contract with `crates/cairn-app/src/handlers/runs/helpers.rs`.
+                        let reason = if let Some(code) = contract_rejection {
+                            // RFC 032 PR-4: completion-contract
+                            // verifier rejected the claimed deliverable
+                            // `MAX_COMPLETION_GATE_REJECTIONS` times.
+                            // `contract_not_met:` prefix is a wire
+                            // contract with cairn-app's
+                            // `classify_failed_reason` → maps to
+                            // `FailureClass::ContractNotMet`. The
+                            // snake_case `code` (via Display) surfaces
+                            // the specific rejection (pr_not_found,
+                            // file_missing, prose_insufficient_citations,
+                            // etc) so operator dashboards show why.
+                            // `{code}` uses the Display impl which
+                            // returns the stable snake_case wire
+                            // form — never `{:?}` / Debug (drifts on
+                            // rename; Copilot review #860).
+                            format!(
+                                "contract_not_met: {completion_gate_rejections} \
+                                 complete_run attempts rejected by completion-contract \
+                                 verifier (code: {code}). See operator logs for details."
+                            )
+                        } else if let Some(sentinel) = self_reported_failure {
+                            // #830: the model kept calling complete_run
+                            // with a failure-admission summary even
+                            // after 3 rejections telling it to use
+                            // fail_run. Terminal reason names the
+                            // sentinel so operators see WHY in the
+                            // run record.
+                            format!(
+                                "verification_rejected: {completion_gate_rejections} \
+                                 complete_run attempts with a summary self-reporting \
+                                 failure (sentinel: {sentinel:?}). The agent should \
+                                 have called fail_run instead."
+                            )
+                        } else if stalled_since_rejection && error_count == 0 {
+                            format!(
+                                "verification_rejected: {completion_gate_rejections} \
+                                 complete_run attempts with no intervening tool call \
+                                 to address prior rejection feedback."
+                            )
+                        } else {
+                            format!(
+                                "verification_rejected: {error_count} error(s) after \
+                                 {completion_gate_rejections} complete_run attempts. \
+                                 First errors: {}",
+                                preview.join(" | "),
+                            )
+                        };
+                        tracing::warn!(
+                            run_id    = %ctx.run_id,
+                            iteration = ctx.iteration,
+                            %reason,
+                            "#660 completion gate hit rejection cap — failing run"
+                        );
+                        return Ok(LoopTermination::Failed { reason });
+                    }
+
+                    // Strip the CompleteRun proposal(s) from this turn's
+                    // decide output so execute dispatches only the
+                    // non-terminal remainder (most turns have nothing
+                    // else, in which case execute is a no-op).
+                    decide_output
+                        .proposals
+                        .retain(|p| p.action_type != cairn_domain::ActionType::CompleteRun);
+
+                    // Synthesised rejection step so the next DECIDE turn
+                    // sees the concrete error excerpts in its user
+                    // message via the `## Step history` section (see
+                    // `decide_impl::build_user_message`). Marked
+                    // `succeeded=false` so the model reads it as a
+                    // failure signal, not a completed action.
+                    let rejection_summary = if let Some(code) = contract_rejection {
+                        // RFC 032 PR-4 §3.1: structured, code-based
+                        // LLM-visible diagnostic. Operator-only
+                        // context (paths, PR URLs, HTTP status) is
+                        // logged at `tracing::warn!` with
+                        // `operator_trace` as the payload; the LLM
+                        // sees only the stable snake_case code. The
+                        // model learns the codes over time the same
+                        // way it learned the FailRun verb.
+                        // `{code}` → Display → snake_case wire form
+                        // (not `{:?}` / Debug per Copilot #860).
+                        format!(
+                            "complete_run refused by completion-contract verifier: \
+                             code={code}. Your claimed deliverable does not exist \
+                             or does not match the declared contract. Produce the \
+                             deliverable and retry complete_run, OR call `fail_run` \
+                             if you cannot (attempt {completion_gate_rejections} of {}).",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                        )
+                    } else if let Some(sentinel) = self_reported_failure {
+                        // #830: the model's final_answer opens with a
+                        // failure-admission phrase — it knows the run
+                        // isn't done but called complete_run anyway.
+                        // Tell it explicitly: use fail_run, or keep
+                        // working. The quoted sentinel shows the
+                        // model exactly which phrase was matched so
+                        // it doesn't have to guess what tripped the
+                        // gate.
+                        format!(
+                            "complete_run refused by strict completion gate: \
+                             your final_answer opens with {sentinel:?}, which \
+                             is a failure-admission phrase. Call `fail_run` \
+                             with that reason to terminate truthfully, OR do \
+                             the work that's still outstanding and retry \
+                             complete_run once the deliverable actually exists \
+                             (attempt {completion_gate_rejections} of {}).",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                        )
+                    } else if stalled_since_rejection && error_count == 0 {
+                        // #823 review (Gemini): tell the model
+                        // explicitly that retrying complete_run with
+                        // no work in between is the bypass we're
+                        // refusing. Otherwise the only signal it has
+                        // is "you got rejected again" without a
+                        // pointer at WHY.
+                        format!(
+                            "complete_run refused by strict completion gate: \
+                             you have not run any tool calls since the prior \
+                             rejection. Issue at least one tool call to \
+                             investigate or address the verification feedback \
+                             before retrying complete_run \
+                             (attempt {completion_gate_rejections} of {}).",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                        )
+                    } else if preview.is_empty() {
+                        format!(
+                            "complete_run refused by strict completion gate: \
+                             verification accumulator has {error_count} error(s). \
+                             Fix them before calling complete_run again \
+                             (attempt {completion_gate_rejections} of {}).",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                        )
+                    } else {
+                        format!(
+                            "complete_run refused by strict completion gate: \
+                             verification reports {error_count} error(s). \
+                             Fix them before calling complete_run again \
+                             (attempt {completion_gate_rejections} of {}). \
+                             First errors: {}",
+                            crate::context::MAX_COMPLETION_GATE_REJECTIONS,
+                            preview.join(" | "),
+                        )
+                    };
+                    let rejection_step = StepSummary {
+                        iteration: ctx.iteration,
+                        action_kind: "complete_run_rejected".to_owned(),
+                        summary: rejection_summary,
+                        succeeded: false,
+                        verified_output: None,
+                    };
+                    step_history.push(rejection_step);
+                    ctx.step_history = step_history.clone();
+
+                    // #821: advance the verification baseline so the
+                    // NEXT complete_run attempt is judged only on
+                    // errors observed AFTER this rejection. Errors
+                    // we just told the model about ("Fix these")
+                    // shouldn't re-block the next attempt — only NEW
+                    // errors emitted by the model's recovery work
+                    // should. Without this, the model is stuck: the
+                    // gate rejects on the same set of errors forever
+                    // because the accumulator only grows. The
+                    // sidecar at Done still reports the full run-wide
+                    // error history via `verification_acc.finish()`.
+                    verification_acc.mark_baseline();
+
+                    // If nothing non-terminal is left to dispatch this
+                    // turn, skip execute entirely and let the next
+                    // iteration re-run DECIDE with the rejection
+                    // summary in view. Otherwise fall through to the
+                    // normal execute path for the remaining proposals.
+                    if decide_output.proposals.is_empty() {
+                        ctx.iteration = ctx.iteration.saturating_add(1);
+                        continue;
+                    }
+                }
             }
 
             // ── (5a) FF stream: tool_call frames (intent) ────────────────────
@@ -714,6 +1910,113 @@ where
                 tracing::error!(run_id = %ctx.run_id, iteration = ctx.iteration, error = %e, "execute failed");
                 e
             })?;
+
+            // F47 PR1: scan this iteration's results incrementally
+            // (main execute path). See `verification_acc` rustdoc for why
+            // scan-and-discard is preferred over retaining `ActionResult`.
+            for r in &execute_outcome.results {
+                verification_acc.observe(r);
+            }
+
+            // Issue #689 R2-A: bounded retry for malformed spawn_subagent
+            // proposals. The execute phase demotes malformed spawns from
+            // terminal failure to `LoopSignal::Continue` (see
+            // `MALFORMED_SPAWN_PROPOSAL_PREFIX` in `execute_impl`) so the
+            // LLM gets a retry via `step_history`. This cap prevents a
+            // permanently-broken model from ping-ponging the rejection
+            // until `max_iterations`.
+            //
+            // Reset-on-any-non-malformed-result so transient flakes don't
+            // accumulate across an otherwise-healthy run: if the LLM
+            // emits one bad spawn, then a valid tool call, then another
+            // bad spawn, the counter resets on the tool call.
+            //
+            // Single-pass scan over `execute_outcome.results` captures all
+            // three signals (malformed-spawn flag, non-malformed-result
+            // flag, and first malformed reason for the cap-hit diagnostic)
+            // so we walk the vec once instead of three times.
+            //
+            // A "non-malformed result" is any result that is NOT a
+            // malformed-spawn rejection. Successes count (they move the
+            // run forward); non-spawn failures count (InvokeTool errors
+            // are LLM feedback but still prove the LLM emitted a
+            // well-formed proposal). Only the malformed-spawn flag itself
+            // is suppressed here.
+            let mut iteration_had_malformed_spawn = false;
+            let mut iteration_had_non_malformed_result = false;
+            let mut first_malformed_reason: Option<String> = None;
+            for r in &execute_outcome.results {
+                let is_malformed_spawn = r.proposal.action_type
+                    == cairn_domain::ActionType::SpawnSubagent
+                    && matches!(
+                        &r.status,
+                        ActionStatus::Failed { reason }
+                            if reason.starts_with(
+                                crate::execute_impl::MALFORMED_SPAWN_PROPOSAL_PREFIX,
+                            )
+                    );
+                if is_malformed_spawn {
+                    iteration_had_malformed_spawn = true;
+                    if first_malformed_reason.is_none() {
+                        if let ActionStatus::Failed { reason } = &r.status {
+                            first_malformed_reason = Some(reason.clone());
+                        }
+                    }
+                } else {
+                    iteration_had_non_malformed_result = true;
+                }
+            }
+            if iteration_had_malformed_spawn {
+                consecutive_malformed_spawns = consecutive_malformed_spawns.saturating_add(1);
+                tracing::warn!(
+                    run_id    = %ctx.run_id,
+                    iteration = ctx.iteration,
+                    rejection_num = consecutive_malformed_spawns,
+                    "#689 R2-A malformed spawn_subagent rejected — \
+                     LLM may retry on next DECIDE turn"
+                );
+                if consecutive_malformed_spawns >= crate::context::MAX_CONSECUTIVE_MALFORMED_SPAWNS
+                {
+                    // Cap hit. Use the first malformed-spawn reason
+                    // captured during the single-pass scan above so the
+                    // operator-facing termination carries concrete
+                    // diagnostics rather than just the cap count. The
+                    // `malformed_spawn_proposal:` prefix is the wire
+                    // contract with `classify_failed_reason` in the HTTP
+                    // handler — keep it literal.
+                    let first_reason = first_malformed_reason.unwrap_or_else(|| {
+                        format!(
+                            "{}malformed spawn_subagent proposal",
+                            crate::execute_impl::MALFORMED_SPAWN_PROPOSAL_PREFIX,
+                        )
+                    });
+                    let reason = format!(
+                        "{first_reason} — cap of {} consecutive malformed \
+                         spawn_subagent proposals hit; the LLM did not \
+                         correct the proposal after repeated rejections",
+                        crate::context::MAX_CONSECUTIVE_MALFORMED_SPAWNS,
+                    );
+                    tracing::warn!(
+                        run_id    = %ctx.run_id,
+                        iteration = ctx.iteration,
+                        %reason,
+                        "#689 R2-A malformed-spawn cap hit — failing run"
+                    );
+                    return Ok(LoopTermination::Failed { reason });
+                }
+            } else if iteration_had_non_malformed_result {
+                // Reset on any non-malformed result so we only count
+                // *consecutive* malformed spawns.
+                if consecutive_malformed_spawns > 0 {
+                    tracing::debug!(
+                        run_id    = %ctx.run_id,
+                        iteration = ctx.iteration,
+                        "#689 R2-A malformed-spawn counter reset — \
+                         non-malformed action observed"
+                    );
+                }
+                consecutive_malformed_spawns = 0;
+            }
 
             let succeeded_count = execute_outcome
                 .results
@@ -908,14 +2211,23 @@ where
                         .find(|p| p.action_type == cairn_domain::ActionType::CompleteRun)
                         .map(|p| p.description.clone())
                         .unwrap_or_else(|| "run completed".to_owned());
+                    // F47 PR1: verification sidecar from the incremental
+                    // accumulator. See extractor rustdoc for semantics.
+                    let verification = verification_acc.clone().finish();
 
                     tracing::info!(
-                        run_id    = %ctx.run_id,
-                        iteration = ctx.iteration,
-                        summary   = %summary,
+                        run_id        = %ctx.run_id,
+                        iteration     = ctx.iteration,
+                        summary       = %summary,
+                        warnings      = verification.warnings.len(),
+                        errors        = verification.errors.len(),
+                        scanned       = verification.tool_results_scanned,
                         "orchestrator loop completed"
                     );
-                    return Ok(LoopTermination::Completed { summary });
+                    return Ok(LoopTermination::Completed {
+                        summary,
+                        verification,
+                    });
                 }
 
                 LoopSignal::Failed { reason } => {
@@ -1045,11 +2357,18 @@ fn maybe_compact_history(
 
     let before_steps = step_history.len();
 
+    // #797: do NOT include `iter {}: ` prefix in the compacted
+    // summary. Compacted summaries flow back into step_history
+    // (under action_kind="compacted_summary") and get rendered to
+    // the LLM in the next DECIDE's user message — so any iteration
+    // numbers leak right back into model context. Render only the
+    // ordered action kinds + status; positional ordering in the
+    // compacted_text already preserves chronology.
     let compacted_text: String = step_history[..to_compact]
         .iter()
         .map(|s| {
             let status = if s.succeeded { "ok" } else { "fail" };
-            format!("  iter {}: {} [{}]", s.iteration, s.action_kind, status)
+            format!("  - {} [{}]", s.action_kind, status)
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1059,6 +2378,7 @@ fn maybe_compact_history(
         action_kind: "compacted_summary".to_owned(),
         summary: format!("Compacted {} prior steps:\n{}", to_compact, compacted_text),
         succeeded: true,
+        verified_output: None,
     };
 
     let recent: Vec<StepSummary> = step_history[to_compact..].to_vec();
@@ -1145,12 +2465,98 @@ fn build_step_summary(
         })
         .unwrap_or_else(|| "no_op".to_owned());
 
-    let summary = decide
+    let description = decide
         .proposals
         .first()
         .map(|p| p.description.clone())
         .unwrap_or_else(|| format!("iteration {} complete", ctx.iteration));
 
+    // F35: threading tool errors back into the next DECIDE turn.
+    //
+    // The orchestrator does not maintain a multi-turn assistant/tool
+    // message history (each DECIDE is a fresh `system`+`user` call with
+    // the step history embedded). So the only channel that carries a
+    // failed tool result's error text into the next LLM turn is the
+    // per-step `summary` string. Pre-F35 this only carried the proposal
+    // `description` ("read the design document"), so even once we stop
+    // terminating on tool errors the LLM would still be blind to *what*
+    // failed — it would just see `ok=false` with no explanation and
+    // repeat the same broken call.
+    //
+    // Fix: for InvokeTool proposals whose status is `Failed`, append the
+    // concrete error text. For successful tool calls, append a short
+    // output preview so the LLM doesn't have to guess what came back.
+    // Both are truncated so a massive payload doesn't dominate the step
+    // history budget on later iterations.
+    // Cursor Bugbot + Copilot review feedback on PR #295: iterate
+    // `execute.results` directly rather than zipping against
+    // `decide.proposals`. `ExecuteOutcome::results` is flattened in
+    // `execute_impl.rs` (`results.into_iter().flatten().collect()`) to
+    // drop None slots for proposals that a terminal short-circuit
+    // prevented from running — for example when Phase 1 sets
+    // `WaitApproval` on an InvokeTool at index N, any non-InvokeTool
+    // proposal at indices < N that had not yet been dispatched by Phase
+    // 2 will be `None` and removed by `flatten()`. Zipping against
+    // `decide.proposals` after that would shift results left and pair
+    // each result with the wrong proposal, silently misattributing tool
+    // error / success text.
+    //
+    // Each `ActionResult` already carries its own `proposal`, so the
+    // correct iteration is over `execute.results` using
+    // `result.proposal` as the source of truth.
+    let mut summary = description;
+    for result in execute.results.iter() {
+        match result.proposal.action_type {
+            cairn_domain::ActionType::InvokeTool => {
+                let tool_name = result.proposal.tool_name.as_deref().unwrap_or("<unknown>");
+                match &result.status {
+                    ActionStatus::Failed { reason } => {
+                        let preview = truncate_for_summary(reason, 400);
+                        summary.push_str(&format!("\n  tool_result[{tool_name}] ERROR: {preview}"));
+                    }
+                    ActionStatus::Succeeded => {
+                        if let Some(output) = result.tool_output.as_ref() {
+                            // F54: tool-aware preview. For bash tools this
+                            // prepends `exit_code:` and keeps the tail of
+                            // stdout/stderr so the LLM can see the trailing
+                            // `warning:` / `error:` / success banner that
+                            // previously was clipped by the head+tail 400-char
+                            // cap on the serialized JSON blob.
+                            let preview = render_tool_output_preview(tool_name, output);
+                            summary
+                                .push_str(&format!("\n  tool_result[{tool_name}] ok: {preview}"));
+                        }
+                    }
+                    // AwaitingApproval / SubagentSpawned have their own dedicated
+                    // step-kinds — no inline note needed.
+                    _ => {}
+                }
+            }
+            // #689 R2-A: surface a malformed-spawn rejection so the
+            // next DECIDE turn sees the validation error in
+            // `step_history` and can re-emit a valid proposal. Without
+            // this line the LLM would read a bare "spawn_subagent:
+            // delegate research" description and re-emit the same
+            // malformed shape. The summary line mirrors the InvokeTool
+            // error grammar so `decide_impl::build_user_message` renders
+            // it consistently with recoverable tool failures.
+            cairn_domain::ActionType::SpawnSubagent => {
+                if let ActionStatus::Failed { reason } = &result.status {
+                    if reason.starts_with(crate::execute_impl::MALFORMED_SPAWN_PROPOSAL_PREFIX) {
+                        let preview = truncate_for_summary(reason, 400);
+                        summary.push_str(&format!("\n  spawn_rejected: {preview}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A step counts as failed only when the loop itself failed — i.e. a
+    // non-InvokeTool terminal error. InvokeTool failures are recoverable
+    // feedback (F35) and must not mark the step as failed, otherwise the
+    // LLM sees `ok=false` and a terminal "run failed" signal in the
+    // prompt even though execution is continuing.
     let succeeded = !matches!(execute.loop_signal, LoopSignal::Failed { .. });
 
     StepSummary {
@@ -1158,7 +2564,187 @@ fn build_step_summary(
         action_kind,
         summary,
         succeeded,
+        verified_output: None,
     }
+}
+
+/// F54: tool-aware preview rendering for the `tool_result[<name>] ok:`
+/// line in a [`StepSummary`].
+///
+/// For `bash` / `shell_exec` / `run_bash`, we do not fall through to
+/// the generic JSON serialisation + head-and-tail truncation. Instead
+/// we:
+///
+///   1. Surface `exit_code` on its own line so the LLM can pattern-match
+///      "did the previous invocation succeed?" without having to parse
+///      a truncated JSON object. Accepts every exit-code key spelling
+///      that [`completion_verification::extract_exit_code`] already
+///      recognises (`exit_code`, `exitCode`, `returncode`,
+///      `return_code`, `status`) so adapter drift does not silently
+///      degrade the preview to `exit_code: ?`.
+///   2. Preserve the **tail** of stdout/stderr (last ~2 KB) because
+///      build tools stream "Compiling X" headers and put the decisive
+///      signal — `warning:`, `error:`, or a success banner — at the
+///      very end.
+///
+/// For non-bash tools we keep the existing head+tail 400-char cap: read
+/// tools dump a file body whose head is usually the most informative
+/// section, and the LLM has already seen the surrounding action
+/// description.
+///
+/// The bash-name matching and exit-code extraction are shared with
+/// `completion_verification` via the `is_bash_tool` and
+/// `extract_exit_code` helpers so the two subsystems cannot drift
+/// (e.g. adding a new bash-class adapter name elsewhere).
+fn render_tool_output_preview(tool_name: &str, output: &serde_json::Value) -> String {
+    if crate::completion_verification::is_bash_tool(tool_name) {
+        if let serde_json::Value::Object(map) = output {
+            return render_bash_preview(output, map);
+        }
+    }
+
+    truncate_for_summary(&output.to_string(), 400)
+}
+
+/// Tail-biased bash preview: prepend `exit_code`, then render the tail
+/// of `stdout`, then the tail of `stderr`. Total cap stays under ~2.2
+/// KB so a busy run with many iterations does not balloon the
+/// DECIDE-phase prompt.
+///
+/// Why stderr last: `cargo`, `rustc`, and most build tools emit
+/// diagnostics on stderr while using stdout for informational banners
+/// ("Compiling X v0.1.0"). Putting stderr at the end means the
+/// compiler diagnostic — the signal the LLM actually needs to decide
+/// "did the gate pass?" — survives any downstream truncation done by
+/// the decide-phase prompt builder.
+fn render_bash_preview(
+    output: &serde_json::Value,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let mut out = String::with_capacity(2048);
+
+    // Use the shared extract_exit_code so alternate key spellings
+    // (`exitCode`, `returncode`, …) surface the code correctly instead
+    // of degrading to `exit_code: ?`.
+    let exit_code = crate::completion_verification::extract_exit_code(output)
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    out.push_str(&format!("exit_code: {exit_code}"));
+
+    // Split the 2 KB budget 3:1 between stdout and stderr. Build-time
+    // diagnostics usually land on stderr but are small; stdout can
+    // carry multi-megabyte "Compiling X" streams.
+    let stdout = map.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = map.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+
+    if !stdout.is_empty() {
+        out.push_str("\nstdout(tail):\n");
+        out.push_str(&tail_of(stdout, 1536));
+    }
+    if !stderr.is_empty() {
+        out.push_str("\nstderr(tail):\n");
+        out.push_str(&tail_of(stderr, 512));
+    }
+
+    out
+}
+
+/// Return the trailing `max_chars` of `text`, prepended with a
+/// `[truncated …]` marker when material was dropped.
+///
+/// Review feedback (Gemini on PR #315): the previous implementation
+/// was an O(N) forward scan over every char. For multi-megabyte tool
+/// outputs that scan is a real cost on the orchestrator's hot path.
+/// We now scan backwards via `char_indices().rev()` to locate the
+/// tail's starting byte offset in O(max_chars) work, then slice the
+/// original `&str` verbatim — no intermediate buffer, no per-char
+/// copy. Memory stays O(max_chars) regardless of input size.
+///
+/// Edge case (Gemini): `max_chars == 0` returns an empty string when
+/// the input is non-empty (with a truncation marker indicating the
+/// whole input was dropped), rather than the degenerate
+/// "full-string-plus-marker" the deque-based approach produced.
+fn tail_of(text: &str, max_chars: usize) -> String {
+    // Byte-length pre-check is a safe "definitely fits" fast path:
+    // bytes ≥ chars for any valid UTF-8.
+    if text.len() <= max_chars {
+        return text.to_owned();
+    }
+
+    // Walk back through char boundaries; stop once we've counted
+    // `max_chars` chars or exhausted the input. `char_indices().rev()`
+    // is O(max_chars) in this use because we break early.
+    let mut start = text.len();
+    for (counted, (idx, _)) in text.char_indices().rev().enumerate() {
+        if counted == max_chars {
+            break;
+        }
+        start = idx;
+    }
+
+    // If the input turned out to have ≤ max_chars chars despite
+    // `text.len() > max_chars` (possible with multi-byte UTF-8), return
+    // verbatim with no marker.
+    if start == 0 {
+        return text.to_owned();
+    }
+
+    format!("[truncated …] …{}", &text[start..])
+}
+
+/// Truncate a string for inclusion in a step history `summary`. Keeps
+/// head + tail so both the error kind prefix (e.g. `Error [NOT_FOUND]:`)
+/// and the tail (usually the path or detail) survive even when the
+/// middle of a multi-line payload is clipped. 1 char ≈ 0.25 tokens in
+/// the decide-phase estimator.
+fn truncate_for_summary(text: &str, max_chars: usize) -> String {
+    // Review feedback on PR #295 (Gemini + Copilot):
+    //   * Short-circuit path: fast byte-length pre-check so ASCII-only
+    //     strings never touch the char iterator — `text.len()` is bytes
+    //     but `bytes >= chars` for any valid UTF-8, so a `len <= max`
+    //     byte test is a safe "definitely fits" fast path.
+    //   * Truncation path: stream the prefix directly off
+    //     `text.chars()` (bounded-size Vec) instead of collecting the
+    //     whole input, so a 10 MB tool output doesn't materialise a
+    //     10 MB `Vec<char>` just to keep 400 chars. The tail uses a
+    //     bounded ring-buffer (`VecDeque` capacity `tail`) so the
+    //     allocation stays O(max_chars) regardless of input size.
+    if text.len() <= max_chars {
+        return text.to_owned();
+    }
+
+    let head_cap = max_chars / 2;
+    let tail_cap = max_chars.saturating_sub(head_cap);
+
+    let mut prefix = String::with_capacity(head_cap * 4);
+    let mut tail_buf: std::collections::VecDeque<char> =
+        std::collections::VecDeque::with_capacity(tail_cap);
+    let mut total = 0usize;
+
+    for (i, c) in text.chars().enumerate() {
+        total = i + 1;
+        if i < head_cap {
+            prefix.push(c);
+        } else if tail_cap > 0 {
+            if tail_buf.len() == tail_cap {
+                tail_buf.pop_front();
+            }
+            tail_buf.push_back(c);
+        }
+    }
+
+    // Final char-count check: if the input turned out to be short (bytes
+    // > max_chars but chars ≤ max_chars — possible with multi-byte
+    // characters), don't synthesise the truncation marker. Rebuild
+    // verbatim from the streamed buffers.
+    if total <= max_chars {
+        prefix.extend(tail_buf);
+        return prefix;
+    }
+
+    let omitted = total.saturating_sub(head_cap + tail_cap);
+    let suffix: String = tail_buf.into_iter().collect();
+    format!("{prefix}… [{omitted} chars omitted] …{suffix}")
 }
 
 fn now_millis() -> u64 {
@@ -1171,942 +2757,5 @@ fn now_millis() -> u64 {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::context::{
-        ActionResult, ActionStatus, CompactionConfig, DecideOutput, ExecuteOutcome, GatherOutput,
-        LoopConfig, LoopSignal, OrchestrationContext,
-    };
-    use crate::error::OrchestratorError;
-    use async_trait::async_trait;
-    use cairn_domain::{
-        ActionProposal, ActionType, ApprovalId, ProjectKey, RunId, SessionId, TaskId,
-    };
-    use std::path::PathBuf;
-
-    // ── Minimal stubs ─────────────────────────────────────────────────────────
-
-    struct FixedGather;
-    #[async_trait]
-    impl GatherPhase for FixedGather {
-        async fn gather(
-            &self,
-            _ctx: &OrchestrationContext,
-        ) -> Result<GatherOutput, OrchestratorError> {
-            Ok(GatherOutput::default())
-        }
-    }
-
-    /// A DecidePhase stub whose behaviour is configured at construction time.
-    struct ScriptedDecide {
-        /// Sequence of outputs to return, one per call.
-        /// Cycles back to the last entry if calls exceed the vec length.
-        outputs: Vec<DecideOutput>,
-        call_count: std::sync::Mutex<usize>,
-    }
-
-    impl ScriptedDecide {
-        fn always(output: DecideOutput) -> Self {
-            Self {
-                outputs: vec![output],
-                call_count: std::sync::Mutex::new(0),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl DecidePhase for ScriptedDecide {
-        async fn decide(
-            &self,
-            _ctx: &OrchestrationContext,
-            _: &GatherOutput,
-        ) -> Result<DecideOutput, OrchestratorError> {
-            let mut n = self.call_count.lock().unwrap();
-            let idx = (*n).min(self.outputs.len() - 1);
-            *n += 1;
-            Ok(self.outputs[idx].clone())
-        }
-    }
-
-    struct ScriptedExecute {
-        signal: LoopSignal,
-    }
-
-    #[async_trait]
-    impl ExecutePhase for ScriptedExecute {
-        async fn execute(
-            &self,
-            _ctx: &OrchestrationContext,
-            decide: &DecideOutput,
-        ) -> Result<ExecuteOutcome, OrchestratorError> {
-            let results = decide
-                .proposals
-                .iter()
-                .map(|p| ActionResult {
-                    proposal: p.clone(),
-                    status: ActionStatus::Succeeded,
-                    tool_output: None,
-                    invocation_id: None,
-                    duration_ms: 0,
-                })
-                .collect();
-            Ok(ExecuteOutcome {
-                results,
-                loop_signal: self.signal.clone(),
-            })
-        }
-    }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    fn ctx() -> OrchestrationContext {
-        OrchestrationContext {
-            project: ProjectKey::new("t", "w", "p"),
-            session_id: SessionId::new("sess"),
-            run_id: RunId::new("run"),
-            task_id: None,
-            iteration: 0,
-            goal: "test goal".to_owned(),
-            agent_type: "test_agent".to_owned(),
-            run_started_at_ms: now_millis(),
-            working_dir: PathBuf::from("."),
-            run_mode: cairn_domain::decisions::RunMode::Direct,
-            discovered_tool_names: vec![],
-            step_history: vec![],
-            is_recovery: false,
-        }
-    }
-
-    fn complete_run_proposal() -> ActionProposal {
-        ActionProposal {
-            action_type: ActionType::CompleteRun,
-            description: "all done".to_owned(),
-            confidence: 0.95,
-            tool_name: None,
-            tool_args: None,
-            requires_approval: false,
-        }
-    }
-
-    fn decide_done() -> DecideOutput {
-        DecideOutput {
-            raw_response: r#"[{"action_type":"complete_run"}]"#.to_owned(),
-            proposals: vec![complete_run_proposal()],
-            calibrated_confidence: 0.95,
-            requires_approval: false,
-            model_id: "test-model".to_owned(),
-            latency_ms: 10,
-            input_tokens: None,
-            output_tokens: None,
-        }
-    }
-
-    fn decide_tool(tool: &str) -> DecideOutput {
-        DecideOutput {
-            raw_response: format!(r#"[{{"action_type":"invoke_tool","tool_name":"{tool}"}}]"#),
-            proposals: vec![ActionProposal {
-                action_type: ActionType::InvokeTool,
-                description: format!("call {tool}"),
-                confidence: 0.8,
-                tool_name: Some(tool.to_owned()),
-                tool_args: Some(serde_json::json!({})),
-                requires_approval: false,
-            }],
-            calibrated_confidence: 0.8,
-            requires_approval: false,
-            model_id: "test-model".to_owned(),
-            latency_ms: 20,
-            input_tokens: None,
-            output_tokens: None,
-        }
-    }
-
-    // ── (1) Timeout ───────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn timeout_returns_timed_out() {
-        let mut past_ctx = ctx();
-        past_ctx.run_started_at_ms = 0; // started at epoch = already timed out
-
-        let config = LoopConfig {
-            timeout_ms: 1,
-            ..Default::default()
-        };
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            ScriptedDecide::always(decide_done()),
-            ScriptedExecute {
-                signal: LoopSignal::Done,
-            },
-            config,
-        );
-
-        let result = lp.run(past_ctx).await.unwrap();
-        assert!(matches!(result, LoopTermination::TimedOut));
-    }
-
-    // ── (1b) Lease health gate ────────────────────────────────────────────────
-    //
-    // The §1b gate in `run_inner` polls `task_sink.is_lease_healthy()` at
-    // each iteration start and short-circuits to
-    // `LoopTermination::Failed { reason: "lease unhealthy" }` when the
-    // sink reports false. This is the safety gate for the whole feature —
-    // a degraded lease means every downstream FCALL (LLM call, tool
-    // dispatch, checkpoint) will be rejected by FF anyway, so bailing
-    // early avoids committing irreversible work.
-
-    struct UnhealthySink;
-    #[async_trait]
-    impl crate::task_sink::TaskFrameSink for UnhealthySink {
-        async fn log_tool_call(
-            &self,
-            _name: &str,
-            _args: &serde_json::Value,
-        ) -> Result<(), OrchestratorError> {
-            panic!("log_tool_call must not be reached when lease is unhealthy")
-        }
-        async fn log_tool_result(
-            &self,
-            _name: &str,
-            _output: &serde_json::Value,
-            _success: bool,
-            _duration_ms: u64,
-        ) -> Result<(), OrchestratorError> {
-            panic!("log_tool_result must not be reached when lease is unhealthy")
-        }
-        async fn log_llm_response(
-            &self,
-            _model: &str,
-            _tokens_in: u64,
-            _tokens_out: u64,
-            _latency_ms: u64,
-        ) -> Result<(), OrchestratorError> {
-            panic!("log_llm_response must not be reached when lease is unhealthy")
-        }
-        async fn save_checkpoint(&self, _bytes: &[u8]) -> Result<(), OrchestratorError> {
-            panic!("save_checkpoint must not be reached when lease is unhealthy")
-        }
-        fn is_lease_healthy(&self) -> bool {
-            false
-        }
-    }
-
-    #[tokio::test]
-    async fn unhealthy_lease_aborts_before_gather() {
-        // Install a sink that reports unhealthy AND panics on any frame
-        // write — if the loop reached gather/decide/execute and tried to
-        // emit a frame, the test would fail with the panic message.
-        // Termination must arrive from the §1b gate alone.
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            ScriptedDecide::always(decide_done()),
-            ScriptedExecute {
-                signal: LoopSignal::Done,
-            },
-            LoopConfig::default(),
-        )
-        .with_task_sink(std::sync::Arc::new(UnhealthySink));
-
-        let result = lp.run(ctx()).await.unwrap();
-        match result {
-            LoopTermination::Failed { reason } => {
-                assert_eq!(
-                    reason, "lease unhealthy",
-                    "lease-health gate must surface the exact reason — callers downstream \
-                     (CairnTask::fail_with_retry, handler error mapping) may match on it",
-                );
-            }
-            other => panic!("expected Failed {{ reason: 'lease unhealthy' }}, got {other:?}"),
-        }
-    }
-
-    // ── (2–5) Happy path: Continue × N then Done ──────────────────────────────
-
-    #[tokio::test]
-    async fn two_iterations_then_done() {
-        // First two calls return Continue; third returns Done.
-        let config = LoopConfig {
-            max_iterations: 10,
-            ..Default::default()
-        };
-
-        struct CountingExecute {
-            calls: std::sync::Mutex<u32>,
-        }
-        #[async_trait]
-        impl ExecutePhase for CountingExecute {
-            async fn execute(
-                &self,
-                _ctx: &OrchestrationContext,
-                decide: &DecideOutput,
-            ) -> Result<ExecuteOutcome, OrchestratorError> {
-                let mut n = self.calls.lock().unwrap();
-                *n += 1;
-                let signal = if *n < 3 {
-                    LoopSignal::Continue
-                } else {
-                    LoopSignal::Done
-                };
-                let results = decide
-                    .proposals
-                    .iter()
-                    .map(|p| ActionResult {
-                        proposal: p.clone(),
-                        status: ActionStatus::Succeeded,
-                        tool_output: None,
-                        invocation_id: None,
-                        duration_ms: 0,
-                    })
-                    .collect();
-                Ok(ExecuteOutcome {
-                    results,
-                    loop_signal: signal,
-                })
-            }
-        }
-
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            ScriptedDecide::always(decide_done()),
-            CountingExecute {
-                calls: std::sync::Mutex::new(0),
-            },
-            config,
-        );
-        let result = lp.run(ctx()).await.unwrap();
-        assert!(
-            matches!(result, LoopTermination::Completed { .. }),
-            "expected Completed, got {result:?}"
-        );
-    }
-
-    // ── Max iterations ────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn max_iterations_returns_max_iterations_reached() {
-        let config = LoopConfig {
-            max_iterations: 3,
-            ..Default::default()
-        };
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            ScriptedDecide::always(decide_tool("web_search")),
-            ScriptedExecute {
-                signal: LoopSignal::Continue,
-            },
-            config,
-        );
-        let result = lp.run(ctx()).await.unwrap();
-        assert!(matches!(result, LoopTermination::MaxIterationsReached));
-    }
-
-    // ── Execute failure ───────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn failed_signal_returns_failed() {
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            ScriptedDecide::always(decide_tool("broken_tool")),
-            ScriptedExecute {
-                signal: LoopSignal::Failed {
-                    reason: "tool error".to_owned(),
-                },
-            },
-            LoopConfig::default(),
-        );
-        let result = lp.run(ctx()).await.unwrap();
-        assert!(matches!(result, LoopTermination::Failed { reason } if reason == "tool error"));
-    }
-
-    // ── Approval gate ─────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn requires_approval_suspends_immediately() {
-        let appr_id = ApprovalId::new("appr_1");
-        let appr_id_clone = appr_id.clone();
-
-        struct ApprovalExecute(ApprovalId);
-        #[async_trait]
-        impl ExecutePhase for ApprovalExecute {
-            async fn execute(
-                &self,
-                _ctx: &OrchestrationContext,
-                decide: &DecideOutput,
-            ) -> Result<ExecuteOutcome, OrchestratorError> {
-                let results = decide
-                    .proposals
-                    .iter()
-                    .map(|p| ActionResult {
-                        proposal: p.clone(),
-                        status: ActionStatus::AwaitingApproval {
-                            approval_id: self.0.clone(),
-                        },
-                        tool_output: None,
-                        invocation_id: None,
-                        duration_ms: 0,
-                    })
-                    .collect();
-                Ok(ExecuteOutcome {
-                    results,
-                    loop_signal: LoopSignal::WaitApproval {
-                        approval_id: self.0.clone(),
-                    },
-                })
-            }
-        }
-
-        let needs_approval_decide = DecideOutput {
-            requires_approval: true,
-            proposals: vec![ActionProposal {
-                action_type: ActionType::EscalateToOperator,
-                description: "need approval".to_owned(),
-                confidence: 0.5,
-                tool_name: None,
-                tool_args: None,
-                requires_approval: true,
-            }],
-            raw_response: String::new(),
-            calibrated_confidence: 0.5,
-            model_id: "m".to_owned(),
-            latency_ms: 0,
-            input_tokens: None,
-            output_tokens: None,
-        };
-
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            ScriptedDecide::always(needs_approval_decide),
-            ApprovalExecute(appr_id_clone),
-            LoopConfig::default(),
-        );
-        let result = lp.run(ctx()).await.unwrap();
-        assert!(
-            matches!(&result, LoopTermination::WaitingApproval { approval_id } if *approval_id == appr_id),
-            "expected WaitingApproval, got {result:?}"
-        );
-    }
-
-    // ── WaitSubagent ──────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn wait_subagent_signal_suspends() {
-        let child_id = TaskId::new("task_child_1");
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            ScriptedDecide::always(decide_tool("spawn")),
-            ScriptedExecute {
-                signal: LoopSignal::WaitSubagent {
-                    child_task_id: child_id.clone(),
-                },
-            },
-            LoopConfig::default(),
-        );
-        let result = lp.run(ctx()).await.unwrap();
-        assert!(
-            matches!(&result, LoopTermination::WaitingSubagent { child_task_id } if *child_task_id == child_id)
-        );
-    }
-
-    // ── Checkpoint hook ───────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn checkpoint_hook_called_after_each_iteration() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        struct CountingHook(Arc<AtomicU32>);
-        #[async_trait::async_trait]
-        impl CheckpointHook for CountingHook {
-            async fn save(
-                &self,
-                _: &OrchestrationContext,
-                _: &GatherOutput,
-                _: &DecideOutput,
-                _: &ExecuteOutcome,
-            ) -> Result<(), OrchestratorError> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        }
-
-        let call_count = Arc::new(AtomicU32::new(0));
-        let hook = Arc::new(CountingHook(call_count.clone()));
-
-        struct TwoThenDone(std::sync::Mutex<u32>);
-        #[async_trait]
-        impl ExecutePhase for TwoThenDone {
-            async fn execute(
-                &self,
-                _: &OrchestrationContext,
-                decide: &DecideOutput,
-            ) -> Result<ExecuteOutcome, OrchestratorError> {
-                let mut n = self.0.lock().unwrap();
-                *n += 1;
-                let signal = if *n < 3 {
-                    LoopSignal::Continue
-                } else {
-                    LoopSignal::Done
-                };
-                let results = decide
-                    .proposals
-                    .iter()
-                    .map(|p| ActionResult {
-                        proposal: p.clone(),
-                        status: ActionStatus::Succeeded,
-                        tool_output: None,
-                        invocation_id: None,
-                        duration_ms: 0,
-                    })
-                    .collect();
-                Ok(ExecuteOutcome {
-                    results,
-                    loop_signal: signal,
-                })
-            }
-        }
-
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            ScriptedDecide::always(decide_done()),
-            TwoThenDone(std::sync::Mutex::new(0)),
-            LoopConfig::default(),
-        )
-        .with_checkpoint_hook(hook);
-
-        let result = lp.run(ctx()).await.unwrap();
-        assert!(matches!(result, LoopTermination::Completed { .. }));
-        // Checkpoint hook must be called once per completed iteration (3 total).
-        assert_eq!(
-            call_count.load(Ordering::SeqCst),
-            3,
-            "checkpoint hook must be called after each of the 3 iterations"
-        );
-    }
-
-    // ── Step summary accumulation ─────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn build_step_summary_captures_action_kind_and_success() {
-        let context = ctx();
-        let decide = decide_tool("search");
-        let exec = ExecuteOutcome {
-            results: vec![ActionResult {
-                proposal: decide.proposals[0].clone(),
-                status: ActionStatus::Succeeded,
-                tool_output: Some(serde_json::json!({"result": "ok"})),
-                invocation_id: None,
-                duration_ms: 0,
-            }],
-            loop_signal: LoopSignal::Continue,
-        };
-
-        let summary = build_step_summary(&context, &decide, &exec);
-        assert_eq!(summary.iteration, 0);
-        assert_eq!(summary.action_kind, "invoke_tool");
-        assert!(summary.succeeded);
-        assert!(summary.summary.contains("search"));
-    }
-
-    // ── tool_search discovery injection ──────────────────────────────────────
-
-    /// Verify that tool_search results in `tool_output` are extracted and
-    /// carried into `ctx.discovered_tool_names` for the next iteration.
-    #[test]
-    fn extract_tool_search_discoveries_finds_matches() {
-        let outcome = ExecuteOutcome {
-            results: vec![ActionResult {
-                proposal: ActionProposal {
-                    action_type: ActionType::InvokeTool,
-                    description: "search for tools".to_owned(),
-                    confidence: 0.8,
-                    tool_name: Some("tool_search".to_owned()),
-                    tool_args: None,
-                    requires_approval: false,
-                },
-                status: ActionStatus::Succeeded,
-                tool_output: Some(serde_json::json!({
-                    "matches": [
-                        { "name": "bash",   "description": "run shell commands" },
-                        { "name": "graph_query",  "description": "query the graph" },
-                    ],
-                    "total": 2,
-                })),
-                invocation_id: None,
-                duration_ms: 0,
-            }],
-            loop_signal: LoopSignal::Continue,
-        };
-
-        let discovered = extract_tool_search_discoveries(&outcome);
-        assert_eq!(discovered.len(), 2);
-        assert!(discovered.contains(&"bash".to_owned()));
-        assert!(discovered.contains(&"graph_query".to_owned()));
-    }
-
-    #[test]
-    fn extract_tool_search_discoveries_ignores_non_tool_search() {
-        let outcome = ExecuteOutcome {
-            results: vec![ActionResult {
-                proposal: ActionProposal {
-                    action_type: ActionType::InvokeTool,
-                    description: "call something else".to_owned(),
-                    confidence: 0.9,
-                    tool_name: Some("memory_search".to_owned()),
-                    tool_args: None,
-                    requires_approval: false,
-                },
-                status: ActionStatus::Succeeded,
-                tool_output: Some(serde_json::json!({
-                    "matches": [{ "name": "should_not_appear" }]
-                })),
-                invocation_id: None,
-                duration_ms: 0,
-            }],
-            loop_signal: LoopSignal::Continue,
-        };
-
-        let discovered = extract_tool_search_discoveries(&outcome);
-        assert!(
-            discovered.is_empty(),
-            "non-tool_search results must not produce discoveries"
-        );
-    }
-
-    #[test]
-    fn extract_tool_search_discoveries_empty_matches() {
-        let outcome = ExecuteOutcome {
-            results: vec![ActionResult {
-                proposal: ActionProposal {
-                    action_type: ActionType::InvokeTool,
-                    description: "search".to_owned(),
-                    confidence: 0.5,
-                    tool_name: Some("tool_search".to_owned()),
-                    tool_args: None,
-                    requires_approval: false,
-                },
-                status: ActionStatus::Succeeded,
-                tool_output: Some(serde_json::json!({ "matches": [], "total": 0 })),
-                invocation_id: None,
-                duration_ms: 0,
-            }],
-            loop_signal: LoopSignal::Continue,
-        };
-
-        let discovered = extract_tool_search_discoveries(&outcome);
-        assert!(discovered.is_empty());
-    }
-
-    /// Integration test: after a tool_search invocation, the loop carries the
-    /// discovered names into ctx.discovered_tool_names for the next iteration.
-    #[tokio::test]
-    async fn loop_runner_carries_discovered_tools_to_next_iteration() {
-        use std::sync::Mutex;
-
-        // Capture the ctx seen at each decide() call
-        struct CapturingDecide {
-            captured: std::sync::Arc<Mutex<Vec<Vec<String>>>>,
-            call_n: Mutex<u32>,
-        }
-        #[async_trait]
-        impl DecidePhase for CapturingDecide {
-            async fn decide(
-                &self,
-                ctx: &OrchestrationContext,
-                _: &GatherOutput,
-            ) -> Result<DecideOutput, OrchestratorError> {
-                self.captured
-                    .lock()
-                    .unwrap()
-                    .push(ctx.discovered_tool_names.clone());
-                let n = {
-                    let mut g = self.call_n.lock().unwrap();
-                    *g += 1;
-                    *g
-                };
-                // First call: invoke tool_search; second call: done
-                let (action, tool_name, tool_args) = if n == 1 {
-                    (
-                        ActionType::InvokeTool,
-                        Some("tool_search".to_owned()),
-                        Some(serde_json::json!({"query":"shell"})),
-                    )
-                } else {
-                    (ActionType::CompleteRun, None, None)
-                };
-                Ok(DecideOutput {
-                    raw_response: String::new(),
-                    proposals: vec![ActionProposal {
-                        action_type: action,
-                        description: "step".to_owned(),
-                        confidence: 0.9,
-                        tool_name,
-                        tool_args,
-                        requires_approval: false,
-                    }],
-                    calibrated_confidence: 0.9,
-                    requires_approval: false,
-                    model_id: "test".to_owned(),
-                    latency_ms: 0,
-                    input_tokens: None,
-                    output_tokens: None,
-                })
-            }
-        }
-
-        // Execute returns tool_search results on first call, Done on second
-        struct DiscoveryExecute {
-            calls: Mutex<u32>,
-        }
-        #[async_trait]
-        impl ExecutePhase for DiscoveryExecute {
-            async fn execute(
-                &self,
-                _: &OrchestrationContext,
-                decide: &DecideOutput,
-            ) -> Result<ExecuteOutcome, OrchestratorError> {
-                let n = {
-                    let mut g = self.calls.lock().unwrap();
-                    *g += 1;
-                    *g
-                };
-                let (signal, tool_output) = if n == 1 {
-                    (
-                        LoopSignal::Continue,
-                        Some(serde_json::json!({
-                            "matches": [{"name":"bash","description":"run shell"}],
-                            "total": 1,
-                        })),
-                    )
-                } else {
-                    (LoopSignal::Done, None)
-                };
-                let results = decide
-                    .proposals
-                    .iter()
-                    .map(|p| ActionResult {
-                        proposal: p.clone(),
-                        status: ActionStatus::Succeeded,
-                        tool_output: tool_output.clone(),
-                        invocation_id: None,
-                        duration_ms: 0,
-                    })
-                    .collect();
-                Ok(ExecuteOutcome {
-                    results,
-                    loop_signal: signal,
-                })
-            }
-        }
-
-        let shared_captured: std::sync::Arc<Mutex<Vec<Vec<String>>>> =
-            std::sync::Arc::new(Mutex::new(vec![]));
-        let capturing = CapturingDecide {
-            captured: shared_captured.clone(),
-            call_n: Mutex::new(0),
-        };
-
-        let lp = OrchestratorLoop::new(
-            FixedGather,
-            capturing,
-            DiscoveryExecute {
-                calls: Mutex::new(0),
-            },
-            LoopConfig {
-                max_iterations: 5,
-                ..Default::default()
-            },
-        );
-
-        let result = lp.run(ctx()).await.unwrap();
-        assert!(matches!(result, LoopTermination::Completed { .. }));
-
-        let snapshots = shared_captured.lock().unwrap();
-        // First decide: no discovered tools yet
-        assert!(
-            snapshots[0].is_empty(),
-            "iteration 0 must have no discovered tools yet"
-        );
-        // Second decide: bash must be in discovered_tool_names
-        assert!(
-            snapshots[1].contains(&"bash".to_owned()),
-            "iteration 1 must see bash from prior tool_search result"
-        );
-    }
-
-    // ── Plan extraction tests (RFC 018) ─────────────────────────────────
-
-    #[test]
-    fn extract_proposed_plan_parses_block() {
-        let response = "Here's my analysis.\n\n<proposed_plan>\n# Plan: Fix the bug\n\n## What I found\nThe bug is in foo.rs line 42.\n\n## What I propose\n1. Fix foo.rs\n</proposed_plan>\n\nDone.";
-        let plan = extract_proposed_plan(response);
-        assert!(plan.is_some());
-        let md = plan.unwrap();
-        assert!(md.contains("# Plan: Fix the bug"));
-        assert!(md.contains("Fix foo.rs"));
-    }
-
-    #[test]
-    fn extract_proposed_plan_returns_none_when_absent() {
-        let response = "I need more information before I can propose a plan.";
-        assert!(extract_proposed_plan(response).is_none());
-    }
-
-    #[test]
-    fn extract_proposed_plan_returns_none_for_empty_block() {
-        let response = "<proposed_plan>\n\n</proposed_plan>";
-        assert!(extract_proposed_plan(response).is_none());
-    }
-
-    #[test]
-    fn extract_proposed_plan_handles_unclosed_tag() {
-        let response = "<proposed_plan>\nPartial plan without closing tag";
-        assert!(extract_proposed_plan(response).is_none());
-    }
-
-    // ── Compaction tests (RFC 018) ──────────────────────────────────────
-
-    #[test]
-    fn compaction_config_defaults() {
-        let cfg = crate::CompactionConfig::default();
-        assert!(cfg.enabled);
-        assert_eq!(cfg.threshold_pct, 70);
-        assert_eq!(cfg.min_steps, 10);
-        assert_eq!(cfg.keep_last, 4);
-        assert_eq!(cfg.summary_token_budget, 2000);
-        assert_eq!(cfg.cooldown_iterations, 5);
-    }
-
-    #[tokio::test]
-    async fn compaction_triggers_when_history_exceeds_threshold() {
-        // Build a loop with compaction enabled and low thresholds for testing.
-        let config = LoopConfig {
-            max_iterations: 1,
-            compaction: CompactionConfig {
-                enabled: true,
-                min_steps: 3,
-                keep_last: 2,
-                threshold_pct: 1, // very low so it always triggers
-                ..CompactionConfig::default()
-            },
-            ..LoopConfig::default()
-        };
-
-        // Pre-populate step_history with enough steps.
-        // We can't directly set step_history in the loop, so instead we test
-        // the compaction logic directly here.
-        let mut step_history: Vec<StepSummary> = (0..10)
-            .map(|i| StepSummary {
-                iteration: i,
-                action_kind: "tool_call".to_owned(),
-                summary: format!("Called tool_{i} with result: some long output text repeated many times to ensure token threshold is met. Extra padding to make the history large."),
-                succeeded: true,
-            })
-            .collect();
-
-        let before_count = step_history.len();
-        let keep = config.compaction.keep_last;
-        let to_compact = step_history.len() - keep;
-
-        // Simulate the compaction logic from the loop runner.
-        let compacted_text: String = step_history[..to_compact]
-            .iter()
-            .map(|s| format!("  iter {}: {} [ok]", s.iteration, s.action_kind))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let summary = StepSummary {
-            iteration: step_history[to_compact - 1].iteration,
-            action_kind: "compacted_summary".to_owned(),
-            summary: format!("Compacted {} prior steps:\n{}", to_compact, compacted_text),
-            succeeded: true,
-        };
-
-        let recent: Vec<StepSummary> = step_history[to_compact..].to_vec();
-        step_history.clear();
-        step_history.push(summary);
-        step_history.extend(recent);
-
-        // After compaction: 1 summary + keep_last recent = 3 total
-        assert_eq!(step_history.len(), 1 + keep);
-        assert_eq!(step_history[0].action_kind, "compacted_summary");
-        assert!(step_history[0].summary.contains("Compacted 8 prior steps"));
-        // Most recent steps preserved verbatim.
-        assert_eq!(step_history[1].iteration, 8);
-        assert_eq!(step_history[2].iteration, 9);
-        assert!(before_count > step_history.len());
-    }
-
-    #[test]
-    fn compaction_skips_when_below_min_steps() {
-        let cfg = crate::CompactionConfig {
-            enabled: true,
-            min_steps: 10,
-            keep_last: 4,
-            threshold_pct: 70,
-            summary_token_budget: 2000,
-            cooldown_iterations: 5,
-        };
-
-        let history_len = 5; // below min_steps
-        assert!(history_len < cfg.min_steps);
-        // Compaction would not trigger — this is a logic assertion, not a runtime test.
-    }
-
-    #[test]
-    fn compaction_disabled_skips() {
-        let cfg = crate::CompactionConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        assert!(!cfg.enabled);
-    }
-
-    #[test]
-    fn compaction_is_throttled_within_cooldown_window() {
-        let config = crate::CompactionConfig {
-            enabled: true,
-            threshold_pct: 1,
-            min_steps: 3,
-            keep_last: 2,
-            summary_token_budget: 2000,
-            cooldown_iterations: 5,
-        };
-        let mut history: Vec<StepSummary> = (0..8)
-            .map(|i| StepSummary {
-                iteration: i,
-                action_kind: "tool_call".to_owned(),
-                summary: format!(
-                    "Iteration {i} returned a very large diagnostic payload that should trigger compaction."
-                ),
-                succeeded: true,
-            })
-            .collect();
-        let mut last_compaction_iteration = None;
-
-        let first = maybe_compact_history(&mut history, 0, &config, &mut last_compaction_iteration);
-        assert!(
-            first.is_some(),
-            "first over-threshold compaction should run"
-        );
-
-        history.extend((8..11).map(|i| StepSummary {
-            iteration: i,
-            action_kind: "tool_call".to_owned(),
-            summary: format!(
-                "Iteration {i} also returned a large payload but falls inside cooldown."
-            ),
-            succeeded: true,
-        }));
-
-        let second =
-            maybe_compact_history(&mut history, 1, &config, &mut last_compaction_iteration);
-        assert!(
-            second.is_none(),
-            "second compaction attempt inside cooldown must be throttled"
-        );
-        assert_eq!(
-            last_compaction_iteration,
-            Some(0),
-            "cooldown should preserve the original compaction iteration"
-        );
-    }
-}
+#[path = "loop_runner_tests.rs"]
+mod tests;

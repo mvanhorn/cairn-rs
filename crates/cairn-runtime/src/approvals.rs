@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use cairn_domain::{ApprovalDecision, ApprovalId, ApprovalRequirement, ProjectKey, RunId, TaskId};
-use cairn_store::projections::ApprovalRecord;
+use cairn_store::projections::{ApprovalDelegationRecord, ApprovalRecord};
 
 use crate::error::RuntimeError;
 
@@ -63,6 +63,28 @@ pub trait ApprovalService: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ApprovalRecord>, RuntimeError>;
+
+    /// Delegate an unresolved approval to a named operator.
+    ///
+    /// Emits `ApprovalDelegated` which the projection stores as an
+    /// audit-trail row keyed by `(approval_id, delegation_id)`.
+    /// `delegation_id` is monotonic per emit so every delegation
+    /// action — re-delegation over time, to distinct operators, or
+    /// even two rapid delegations to the *same* operator in the same
+    /// millisecond — produces a distinct row. Fails with
+    /// `InvalidTransition` if the approval is already resolved.
+    async fn delegate(
+        &self,
+        approval_id: &ApprovalId,
+        delegated_to: String,
+    ) -> Result<ApprovalDelegationRecord, RuntimeError>;
+
+    /// Return the full delegation history for an approval, oldest
+    /// delegation first.
+    async fn list_delegations(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<Vec<ApprovalDelegationRecord>, RuntimeError>;
 }
 
 #[cfg(test)]

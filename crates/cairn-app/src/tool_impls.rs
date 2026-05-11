@@ -6,10 +6,23 @@
 //!
 //! # Provided implementations
 //!
-//! | Type                    | Backed by                                         |
-//! |-------------------------|---------------------------------------------------|
-//! | `ConcreteMemorySearchTool` | `Arc<dyn RetrievalService>` from cairn-memory  |
-//! | `ConcreteMemoryStoreTool`  | `Arc<dyn IngestService>` from cairn-memory     |
+//! | Type                          | Backed by                                                 |
+//! |-------------------------------|-----------------------------------------------------------|
+//! | `ConcreteMemorySearchTool`    | `Arc<dyn RetrievalService>` — expects `MultiProviderMemory` (RFC 030) |
+//! | `ConcreteMemoryStoreTool`     | `Arc<dyn IngestService>` — expects `MultiProviderMemoryIngest` (RFC 030) + `MemoryAutoExtractResolver` for agent-visible suppression |
+//! | `ConcreteKnowledgeSearchTool` | `Arc<dyn RetrievalService>` — expects `MultiProviderRetrieval` (RFC 029 knowledge family) |
+//!
+//! # RFC 030 tool-surface split
+//!
+//! Memory (`memory_search`, `memory_store`) and knowledge (`knowledge_search`)
+//! route through distinct dispatchers per PR-C. At invocation time
+//! `memory_store` also consults [`MemoryAutoExtractResolver`] — a belt-and-
+//! suspenders check matching PR-C's tool-visibility gate. When the agent
+//! somehow dispatches `memory_store` despite the prompt-level suppression
+//! (race between run-start and a config change, or a misconfigured
+//! visibility context), the invocation-time check returns
+//! [`ToolError::Permanent`] rather than silently double-writing into a
+//! backend that auto-extracts from the conversation turn.
 //!
 //! # Wiring
 //!
@@ -24,8 +37,11 @@ use cairn_domain::{
     RepoAccessContext, SourceId,
 };
 use cairn_memory::{
+    in_memory::MISSING_EMBEDDER_ERROR_MESSAGE,
     ingest::{IngestRequest, IngestService, SourceType},
-    retrieval::{RerankerStrategy, RetrievalMode, RetrievalQuery, RetrievalService},
+    retrieval::{
+        RerankerStrategy, RetrievalError, RetrievalMode, RetrievalQuery, RetrievalService,
+    },
 };
 use cairn_tools::builtins::{
     BuiltinToolRegistry, PermissionLevel, RetrySafety, ToolCategory, ToolEffect, ToolError,
@@ -33,6 +49,34 @@ use cairn_tools::builtins::{
 };
 use cairn_workspace::{ProjectRepoAccessService, RepoCloneCache, RepoId};
 use serde_json::Value;
+
+/// Detects the specific `RetrievalError` produced by `InMemoryRetrieval` when
+/// `VectorOnly` is requested but no embedding provider is configured.
+///
+/// This is a placeholder-retrieval guard: the built-in in-memory backend has
+/// no embedder in the default wiring (the real embedding stack ships with the
+/// external memory crate). We compare against the exact sentinel string
+/// exported from `cairn-memory` ([`MISSING_EMBEDDER_ERROR_MESSAGE`]), so both
+/// sides share a single source of truth. The coupling surface this creates:
+///
+/// - Reword the error text without renaming the constant → still works
+///   (both sides dereference the same `pub const`).
+/// - Rename or remove the constant → compile error here, which is the
+///   intended break-glass.
+/// - Stop using the constant inside `InMemoryRetrieval` (emit a different
+///   error there) → this check silently returns `false` and the crash
+///   would reappear. The hybrid/backward-compat integration test guards
+///   against that regression.
+///
+/// A dedicated `RetrievalError::MissingEmbedder` variant would be cleaner
+/// still, but the retrieval stack is being replaced by the external memory
+/// crate; a shared constant is the minimum-surface fix.
+fn is_missing_embedder_error(err: &RetrievalError) -> bool {
+    matches!(
+        err,
+        RetrievalError::Internal(msg) if msg == MISSING_EMBEDDER_ERROR_MESSAGE
+    )
+}
 
 // ── ConcreteMemorySearchTool ──────────────────────────────────────────────────
 
@@ -66,7 +110,11 @@ impl ToolHandler for ConcreteMemorySearchTool {
     fn description(&self) -> &str {
         "Search the agent's memory for relevant information. \
          Returns the most relevant text chunks from previously stored knowledge. \
-         Use this before answering questions that may require prior context."
+         Use this before answering questions that may require prior context. \
+         NOTE: Only `mode=lexical` is currently guaranteed. `vector` and `hybrid` \
+         are accepted but fall back to lexical when no embedding provider is \
+         configured (the common case today). Prefer `lexical` unless you know \
+         an embedder is wired."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -87,7 +135,13 @@ impl ToolHandler for ConcreteMemorySearchTool {
                 },
                 "mode": {
                     "type": "string",
-                    "description": "Retrieval mode: lexical (keyword match), vector (semantic), or hybrid",
+                    "description": "Retrieval mode. `lexical` (keyword match) is always \
+                                    supported. `vector` (semantic) requires an embedding \
+                                    provider; when none is configured the tool clamps to \
+                                    `lexical` and attaches a `mode_clamped` diagnostic to \
+                                    the result. `hybrid` currently falls back to lexical \
+                                    silently inside the backend when no embedder is wired, \
+                                    without a diagnostic — prefer `lexical` explicitly.",
                     "enum": ["lexical", "vector", "hybrid"],
                     "default": "lexical"
                 }
@@ -96,84 +150,276 @@ impl ToolHandler for ConcreteMemorySearchTool {
     }
 
     async fn execute(&self, project: &ProjectKey, args: Value) -> Result<ToolResult, ToolError> {
-        let query_text = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs {
-                field: "query".into(),
-                message: "required string".into(),
-            })?
-            .to_owned();
+        search_via_retrieval_service(&*self.retrieval, project, args).await
+    }
+}
 
-        if query_text.trim().is_empty() {
-            return Err(ToolError::InvalidArgs {
-                field: "query".into(),
-                message: "must not be empty".into(),
-            });
-        }
+/// Shared search path for [`ConcreteMemorySearchTool`] and
+/// [`ConcreteKnowledgeSearchTool`]. Both tools project a query against a
+/// `RetrievalService` and format the response identically; the difference
+/// is which `RetrievalService` gets injected (memory family vs knowledge
+/// family). Factored out so neither tool drifts from the other's handling
+/// of the missing-embedder clamp, empty-query validation, or
+/// `mode_clamped` diagnostic.
+async fn search_via_retrieval_service(
+    retrieval: &dyn RetrievalService,
+    project: &ProjectKey,
+    args: Value,
+) -> Result<ToolResult, ToolError> {
+    let query_text = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArgs {
+            field: "query".into(),
+            message: "required string".into(),
+        })?
+        .to_owned();
 
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|n| (n as usize).min(20))
-            .unwrap_or(5);
+    if query_text.trim().is_empty() {
+        return Err(ToolError::InvalidArgs {
+            field: "query".into(),
+            message: "must not be empty".into(),
+        });
+    }
 
-        let mode = match args
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("lexical")
-        {
-            "vector" => RetrievalMode::VectorOnly,
-            "hybrid" => RetrievalMode::Hybrid,
-            _ => RetrievalMode::LexicalOnly,
-        };
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).min(20))
+        .unwrap_or(5);
 
-        let query = RetrievalQuery {
-            project: project.clone(),
-            query_text,
-            mode,
-            reranker: RerankerStrategy::None,
-            limit,
-            metadata_filters: vec![],
-            scoring_policy: None,
-        };
+    let requested_mode_str = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("lexical");
+    let requested_mode = match requested_mode_str {
+        "vector" => RetrievalMode::VectorOnly,
+        "hybrid" => RetrievalMode::Hybrid,
+        _ => RetrievalMode::LexicalOnly,
+    };
 
-        match self.retrieval.query(query).await {
-            Ok(resp) => {
-                let results: Vec<Value> = resp
-                    .results
-                    .into_iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "chunk_id":    r.chunk.chunk_id.as_str(),
-                            "text":        r.chunk.text,
-                            "score":       r.score,
-                            "source_id":   r.chunk.source_id.as_str(),
-                            "document_id": r.chunk.document_id.as_str(),
-                        })
-                    })
-                    .collect();
-                let total = results.len();
-                Ok(ToolResult::ok(serde_json::json!({
-                    "results": results,
-                    "total":   total,
-                })))
+    let build_query = |mode: RetrievalMode| RetrievalQuery {
+        project: project.clone(),
+        query_text: query_text.clone(),
+        mode,
+        reranker: RerankerStrategy::None,
+        limit,
+        metadata_filters: vec![],
+        scoring_policy: None,
+    };
+
+    // Retrieval attempt with a guarded clamp: if the backend rejects
+    // `VectorOnly` because no embedder is configured (the default today —
+    // real vector retrieval ships with the external memory crate), fall
+    // back to lexical so the orchestrator run survives. We surface the
+    // clamp via a `mode_clamped` diagnostic so the LLM can adapt.
+    //
+    // `Hybrid` without an embedder already degrades to lexical inside
+    // `InMemoryRetrieval`, so only `VectorOnly` needs handling here.
+    let (resp, clamped_from) = match retrieval.query(build_query(requested_mode)).await {
+        Ok(resp) => (resp, None),
+        Err(e) if is_missing_embedder_error(&e) && requested_mode != RetrievalMode::LexicalOnly => {
+            let original = requested_mode_str.to_owned();
+            match retrieval
+                .query(build_query(RetrievalMode::LexicalOnly))
+                .await
+            {
+                Ok(resp) => (resp, Some(original)),
+                Err(e2) => {
+                    return Err(ToolError::Transient(format!("retrieval failed: {e2}")));
+                }
             }
-            Err(e) => Err(ToolError::Transient(format!("retrieval failed: {e}"))),
         }
+        Err(e) => return Err(ToolError::Transient(format!("retrieval failed: {e}"))),
+    };
+
+    let results: Vec<Value> = resp
+        .results
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "chunk_id":    r.chunk.chunk_id.as_str(),
+                "text":        r.chunk.text,
+                "score":       r.score,
+                "source_id":   r.chunk.source_id.as_str(),
+                "document_id": r.chunk.document_id.as_str(),
+            })
+        })
+        .collect();
+    let total = results.len();
+    let mut payload = serde_json::json!({
+        "results": results,
+        "total":   total,
+    });
+    if let Some(from) = clamped_from {
+        payload["mode_clamped"] = serde_json::json!({
+            "from": from,
+            "to": "lexical",
+            "reason": "no embedding provider configured",
+        });
+    }
+    Ok(ToolResult::ok(payload))
+}
+
+// ── MemoryAutoExtractResolver ─────────────────────────────────────────────────
+
+/// RFC 030: resolves whether the project's configured memory backend
+/// auto-extracts memories from conversation turns (mem0-style
+/// `auto_extract = true` capability). Used by
+/// [`ConcreteMemoryStoreTool`] to reject explicit `memory_store` calls
+/// at invocation time for projects on an auto-extract backend — a
+/// belt-and-suspenders check against PR-C's tool-visibility gate.
+///
+/// Implementations project from the `project_memory_providers` read
+/// model. The stub/default implementation ([`NeverAutoExtract`]) returns
+/// `false` for every project, matching the rollout-window story where
+/// the memory-family resolver doesn't exist yet — cairn-default served
+/// through the `ProjectCreated` bootstrap path is explicit-ingest.
+///
+/// `Send + Sync` required because the tool registry is shared across
+/// run-execution tasks.
+#[async_trait]
+pub trait MemoryAutoExtractResolver: Send + Sync {
+    async fn is_auto_extract(&self, project: &ProjectKey) -> bool;
+}
+
+#[async_trait]
+impl<T: MemoryAutoExtractResolver + ?Sized> MemoryAutoExtractResolver for Arc<T> {
+    async fn is_auto_extract(&self, project: &ProjectKey) -> bool {
+        (**self).is_auto_extract(project).await
+    }
+}
+
+/// Default resolver that reports every project as explicit-ingest. Used
+/// during the RFC 030 rollout (PR-D ships the tool-layer split; PR-G
+/// introduces the real `ProjectCreated`-driven memory-family resolver).
+pub struct NeverAutoExtract;
+
+#[async_trait]
+impl MemoryAutoExtractResolver for NeverAutoExtract {
+    async fn is_auto_extract(&self, _project: &ProjectKey) -> bool {
+        false
+    }
+}
+
+// ── ConcreteKnowledgeSearchTool ──────────────────────────────────────────────
+
+/// Real `knowledge_search` — calls [`RetrievalService::query`] with the
+/// LLM's args against the project's configured **knowledge** provider
+/// (curated, operator-ingested corpora — RFC 029 / Bedrock KB-style
+/// backends). Mirror of [`ConcreteMemorySearchTool`] differing only in
+/// name, description, and the `RetrievalService` instance it's wired to:
+/// this one expects `MultiProviderRetrieval` (knowledge family), the
+/// memory variant expects `MultiProviderMemory`.
+pub struct ConcreteKnowledgeSearchTool {
+    retrieval: Arc<dyn RetrievalService>,
+}
+
+impl ConcreteKnowledgeSearchTool {
+    pub fn new(retrieval: Arc<dyn RetrievalService>) -> Self {
+        Self { retrieval }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ConcreteKnowledgeSearchTool {
+    fn name(&self) -> &str {
+        "knowledge_search"
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Core
+    }
+    fn tool_effect(&self) -> ToolEffect {
+        ToolEffect::Observational
+    }
+    fn retry_safety(&self) -> RetrySafety {
+        RetrySafety::IdempotentSafe
+    }
+
+    fn description(&self) -> &str {
+        "Search the project's curated knowledge corpus for relevant information. \
+         Returns the most relevant text chunks from documents the operator has \
+         ingested (design docs, runbooks, corpus imports, Bedrock KB, etc.). \
+         Use this for questions that need ground-truth reference material — \
+         distinct from `memory_search`, which retrieves episodic memories the \
+         agent wrote during prior turns. `mode` honours the same lexical / \
+         vector / hybrid semantics as `memory_search`."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural language search query"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return (default 5, max 20)",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Retrieval mode. `lexical` (keyword match) is always \
+                                    supported. `vector` (semantic) requires an embedding \
+                                    provider; when none is configured the tool clamps to \
+                                    `lexical` and attaches a `mode_clamped` diagnostic to \
+                                    the result. `hybrid` currently falls back to lexical \
+                                    silently inside the backend when no embedder is wired, \
+                                    without a diagnostic — prefer `lexical` explicitly.",
+                    "enum": ["lexical", "vector", "hybrid"],
+                    "default": "lexical"
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, project: &ProjectKey, args: Value) -> Result<ToolResult, ToolError> {
+        // Shared pipeline with `ConcreteMemorySearchTool` — see
+        // `search_via_retrieval_service` for the retrieval → format →
+        // clamp-to-lexical logic.
+        search_via_retrieval_service(&*self.retrieval, project, args).await
     }
 }
 
 // ── ConcreteMemoryStoreTool ───────────────────────────────────────────────────
 
-/// Real `memory_store` — calls [`IngestService::submit`] to ingest new content.
+/// Real `memory_store` — calls [`IngestService::submit`] to ingest new
+/// content. Under RFC 030 the ingest service is expected to be
+/// `MultiProviderMemoryIngest`; the tool also consults a
+/// [`MemoryAutoExtractResolver`] before dispatching so projects on an
+/// auto-extract backend don't silently double-write (invocation-time
+/// mirror of PR-C's tool-visibility gate).
 pub struct ConcreteMemoryStoreTool {
     ingest: Arc<dyn IngestService>,
+    auto_extract_resolver: Arc<dyn MemoryAutoExtractResolver>,
 }
 
 impl ConcreteMemoryStoreTool {
+    /// Convenience constructor for call sites that have not yet adopted
+    /// the resolver. Mirrors the RFC 030 rollout rule: no resolver →
+    /// never auto-extract. Explicit [`Self::with_auto_extract_resolver`]
+    /// should replace this once PR-G's memory-family resolver lands.
     pub fn new(ingest: Arc<dyn IngestService>) -> Self {
-        Self { ingest }
+        Self {
+            ingest,
+            auto_extract_resolver: Arc::new(NeverAutoExtract),
+        }
+    }
+
+    pub fn with_auto_extract_resolver(
+        ingest: Arc<dyn IngestService>,
+        resolver: Arc<dyn MemoryAutoExtractResolver>,
+    ) -> Self {
+        Self {
+            ingest,
+            auto_extract_resolver: resolver,
+        }
     }
 }
 
@@ -223,6 +469,22 @@ impl ToolHandler for ConcreteMemoryStoreTool {
     }
 
     async fn execute(&self, project: &ProjectKey, args: Value) -> Result<ToolResult, ToolError> {
+        // RFC 030 belt-and-suspenders: if the project's memory provider
+        // auto-extracts from conversation turns, reject the explicit
+        // store. PR-C's visibility gate already hides the tool from the
+        // prompt; this check catches the race where the tool is
+        // dispatched despite the prompt-level suppression (config
+        // changed mid-run, stale visibility context, etc.). Permanent
+        // rather than transient — no retry will help.
+        if self.auto_extract_resolver.is_auto_extract(project).await {
+            return Err(ToolError::Permanent(
+                "memory_store is not available on this project: the configured memory \
+                 provider auto-extracts memories from conversation turns. Rely on the \
+                 provider's post-turn extraction instead of explicit stores."
+                    .to_owned(),
+            ));
+        }
+
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
@@ -426,18 +688,36 @@ impl ToolHandler for ConcreteRegisterRepoTool {
 ///
 /// Call this at startup and attach the result to `RuntimeExecutePhase::builder()
 /// .tool_registry(Arc::new(registry))`.
+///
+/// RFC 030: `memory_retrieval` and `knowledge_retrieval` are separate
+/// handles — the memory family uses `MultiProviderMemory`, the knowledge
+/// family uses `MultiProviderRetrieval`. Pre-RFC-030 callers that only
+/// have one handle should pass the same `Arc` for both; during the
+/// rollout window both tools dispatch through the knowledge-family
+/// provider, matching the single-provider behaviour PR-B/PR-C
+/// deliberately preserved.
 pub fn build_tool_registry(
-    retrieval: Arc<dyn RetrievalService>,
-    ingest: Arc<dyn IngestService>,
+    memory_retrieval: Arc<dyn RetrievalService>,
+    memory_ingest: Arc<dyn IngestService>,
+    knowledge_retrieval: Arc<dyn RetrievalService>,
+    auto_extract_resolver: Arc<dyn MemoryAutoExtractResolver>,
     project_repo_access: Arc<ProjectRepoAccessService>,
     repo_clone_cache: Arc<RepoCloneCache>,
 ) -> BuiltinToolRegistry {
-    // Base registry with memory tools only — used at startup before
-    // working_dir is known. The full tool set with file/shell/git is
-    // built per-run by `build_full_tool_registry`.
+    // Base registry with memory + knowledge tools — used at startup
+    // before working_dir is known. The full tool set with file/shell/git
+    // is built per-run by `build_full_tool_registry`.
     BuiltinToolRegistry::new()
-        .register(Arc::new(ConcreteMemorySearchTool::new(retrieval)))
-        .register(Arc::new(ConcreteMemoryStoreTool::new(ingest)))
+        .register(Arc::new(ConcreteMemorySearchTool::new(memory_retrieval)))
+        .register(Arc::new(
+            ConcreteMemoryStoreTool::with_auto_extract_resolver(
+                memory_ingest,
+                auto_extract_resolver,
+            ),
+        ))
+        .register(Arc::new(ConcreteKnowledgeSearchTool::new(
+            knowledge_retrieval,
+        )))
         .register(Arc::new(ConcreteRegisterRepoTool::new(
             project_repo_access,
             repo_clone_cache,
@@ -457,8 +737,9 @@ pub fn build_full_tool_registry(
 ) -> BuiltinToolRegistry {
     use cairn_harness_tools::{
         HarnessBash, HarnessBashKill, HarnessBashOutput, HarnessBuiltin, HarnessEdit, HarnessGlob,
-        HarnessGrep, HarnessMultiEdit, HarnessRead, HarnessWebFetch, HarnessWrite,
+        HarnessGrep, HarnessLsp, HarnessMultiEdit, HarnessRead, HarnessWebFetch, HarnessWrite,
     };
+    use cairn_skills::HarnessSkill;
     use cairn_tools::builtins::{ScratchPadTool, ToolSearchTool};
     let _ = working_dir; // harness tools use ToolContext.working_dir at exec time.
 
@@ -472,12 +753,16 @@ pub fn build_full_tool_registry(
             .register(Arc::new(HarnessBuiltin::<HarnessMultiEdit>::new()))
             .register(Arc::new(HarnessBuiltin::<HarnessGlob>::new()))
             .register(Arc::new(HarnessBuiltin::<HarnessGrep>::new()))
+            // LSP — precise code navigation (hover, definition, references, symbols).
+            .register(Arc::new(HarnessBuiltin::<HarnessLsp>::new()))
             // Shell — agents invoke git/gh CLI through bash.
             .register(Arc::new(HarnessBuiltin::<HarnessBash>::new()))
             .register(Arc::new(HarnessBuiltin::<HarnessBashOutput>::new()))
             .register(Arc::new(HarnessBuiltin::<HarnessBashKill>::new()))
             // Utilities.
             .register(Arc::new(HarnessBuiltin::<HarnessWebFetch>::new()))
+            // Skills — agentskills.io activation via published harness-skill.
+            .register(Arc::new(HarnessBuiltin::<HarnessSkill>::new()))
             .register(Arc::new(ScratchPadTool::new())),
     );
 
@@ -722,8 +1007,10 @@ mod tests {
         let retrieval = Arc::new(InMemoryRetrieval::new(store)) as Arc<dyn RetrievalService>;
         let ingest = pipeline as Arc<dyn IngestService>;
         let registry = build_tool_registry(
-            retrieval,
+            retrieval.clone(),
             ingest,
+            retrieval,
+            Arc::new(NeverAutoExtract),
             Arc::new(ProjectRepoAccessService::new()),
             Arc::new(RepoCloneCache::default()),
         );
@@ -747,8 +1034,10 @@ mod tests {
         ))) as Arc<dyn RetrievalService>;
         let ingest = pipeline as Arc<dyn IngestService>;
         let registry = build_tool_registry(
-            retrieval,
+            retrieval.clone(),
             ingest,
+            retrieval,
+            Arc::new(NeverAutoExtract),
             Arc::new(ProjectRepoAccessService::new()),
             Arc::new(RepoCloneCache::default()),
         );
@@ -765,14 +1054,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_dispatches_knowledge_search() {
+        // RFC 030: `knowledge_search` is a separate tool from
+        // `memory_search` — this test pins the registration + dispatch.
+        let (store, pipeline) = make_ingest();
+        pipeline
+            .submit(IngestRequest {
+                document_id: cairn_domain::KnowledgeDocumentId::new("doc_k"),
+                source_id: cairn_domain::SourceId::new("test"),
+                source_type: SourceType::PlainText,
+                project: project(),
+                content: "design decision: cairn uses two-phase event sourcing".to_owned(),
+                tags: vec![],
+                corpus_id: None,
+                import_id: None,
+                bundle_source_id: None,
+            })
+            .await
+            .unwrap();
+        let retrieval = Arc::new(InMemoryRetrieval::new(store)) as Arc<dyn RetrievalService>;
+        let ingest = pipeline as Arc<dyn IngestService>;
+        let registry = build_tool_registry(
+            retrieval.clone(),
+            ingest,
+            retrieval,
+            Arc::new(NeverAutoExtract),
+            Arc::new(ProjectRepoAccessService::new()),
+            Arc::new(RepoCloneCache::default()),
+        );
+
+        let result = registry
+            .execute(
+                "knowledge_search",
+                &project(),
+                serde_json::json!({ "query": "event sourcing" }),
+            )
+            .await
+            .unwrap();
+        assert!(result.output["total"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn memory_store_rejected_under_auto_extract_resolver() {
+        // RFC 030 belt-and-suspenders: even if visibility didn't suppress
+        // the tool, an auto-extract memory backend must reject the
+        // explicit store at invocation time.
+        struct AlwaysAutoExtract;
+        #[async_trait]
+        impl MemoryAutoExtractResolver for AlwaysAutoExtract {
+            async fn is_auto_extract(&self, _p: &ProjectKey) -> bool {
+                true
+            }
+        }
+        let (_, pipeline) = make_ingest();
+        let tool = ConcreteMemoryStoreTool::with_auto_extract_resolver(
+            pipeline as Arc<dyn IngestService>,
+            Arc::new(AlwaysAutoExtract),
+        );
+        let err = tool
+            .execute(
+                &project(),
+                serde_json::json!({ "content": "should be suppressed" }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Permanent(msg) => {
+                assert!(
+                    msg.contains("auto-extract"),
+                    "error should cite auto-extract suppression: {msg}"
+                );
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn registry_returns_error_for_unknown_tool() {
         let (_, pipeline) = make_ingest();
         let retrieval = Arc::new(InMemoryRetrieval::new(Arc::new(
             InMemoryDocumentStore::new(),
         ))) as Arc<dyn RetrievalService>;
         let registry = build_tool_registry(
-            retrieval,
+            retrieval.clone(),
             pipeline as Arc<dyn IngestService>,
+            retrieval,
+            Arc::new(NeverAutoExtract),
             Arc::new(ProjectRepoAccessService::new()),
             Arc::new(RepoCloneCache::default()),
         );

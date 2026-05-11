@@ -3,6 +3,15 @@
 //! All routes are project-scoped:
 //!   /v1/projects/:project/triggers/*
 //!   /v1/projects/:project/run-templates/*
+//!
+//! RFC-025 Phase 1.5a migration notes: the handlers below previously
+//! took a `Mutex<TriggerService>` lock, mutated in-memory HashMaps, then
+//! separately appended a `RuntimeEvent` through the event log. Post-
+//! refactor the `TriggerService` is projection-backed and each async
+//! method already appends the durable event inside the same call, so the
+//! handlers are thinner — no lock, no second append, one `.await` per
+//! CRUD call. The cross-tenant guard + request validation + response
+//! shape are unchanged so the HTTP contract is preserved.
 
 use std::sync::Arc;
 
@@ -13,14 +22,12 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use cairn_domain::decisions::RunMode;
-use cairn_domain::ids::{EventId, OperatorId, RunTemplateId, TriggerId};
+use cairn_domain::ids::{OperatorId, RunTemplateId, TriggerId};
 use cairn_domain::tenancy::ProjectKey;
-use cairn_domain::{EventEnvelope, EventSource, RuntimeEvent};
 use cairn_runtime::{
     RateLimitConfig, RunTemplate, SignalPattern, TemplateBudget, Trigger, TriggerCondition,
     TriggerError, TriggerEvent, TriggerState,
 };
-use cairn_store::EventLog;
 
 use crate::AppState;
 
@@ -175,23 +182,45 @@ fn not_found_response(entity: &str, id: &str) -> axum::response::Response {
         .into_response()
 }
 
-async fn append_operator_runtime_event(
-    state: &AppState,
-    operator_id: OperatorId,
-    event: RuntimeEvent,
-) -> Result<(), String> {
-    let envelope = EventEnvelope::for_runtime_event(
-        EventId::new(format!("evt_trigger_{}", uuid::Uuid::new_v4())),
-        EventSource::Operator { operator_id },
-        event,
-    );
-    state
-        .runtime
-        .store
-        .append(&[envelope])
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+/// RFC-025 Phase 1.5a: surface a `TriggerError` from the projection-backed
+/// service as the right HTTP status. Keeps the response body shape
+/// identical to the pre-refactor handler so clients don't see a behaviour
+/// change.
+///
+/// `treat_template_not_found_as_bad_request` = true lets create handlers
+/// preserve the pre-refactor 400 response when a caller posts a trigger
+/// referencing a missing template (vs. 404 used by GET/DELETE endpoints
+/// where the entity itself is what's missing). See PR #569 Copilot
+/// review for the compatibility rationale.
+fn trigger_error_response_with(
+    err: TriggerError,
+    treat_template_not_found_as_bad_request: bool,
+) -> axum::response::Response {
+    let status = match &err {
+        TriggerError::TemplateNotFound(_) if treat_template_not_found_as_bad_request => {
+            StatusCode::BAD_REQUEST
+        }
+        TriggerError::TriggerNotFound(_) | TriggerError::TemplateNotFound(_) => {
+            StatusCode::NOT_FOUND
+        }
+        TriggerError::TemplateInUse { .. } => StatusCode::CONFLICT,
+        TriggerError::NotSuspended(_) => StatusCode::BAD_REQUEST,
+        TriggerError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: err.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Thin wrapper for endpoints where a missing template/trigger should
+/// be 404 (reads + deletes). See `trigger_error_response_with` for
+/// endpoints that need the 400-for-missing-template legacy semantics.
+fn trigger_error_response(err: TriggerError) -> axum::response::Response {
+    trigger_error_response_with(err, false)
 }
 
 // ── Trigger Handlers ────────────────────────────────────────────────────────
@@ -211,10 +240,12 @@ pub async fn list_triggers_handler(
     if let Some(resp) = check_tenant(&principal, &project) {
         return resp;
     }
-    let triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-    let mut list: Vec<&Trigger> = triggers.list_triggers_for_project(&project);
+    let mut list = match state.triggers.list_triggers_for_project(&project).await {
+        Ok(list) => list,
+        Err(err) => return trigger_error_response(err),
+    };
     list.sort_by_key(|r| r.id.clone());
-    let list: Vec<&Trigger> = list
+    let list: Vec<Trigger> = list
         .into_iter()
         .skip(query.offset())
         .take(query.limit())
@@ -229,82 +260,52 @@ pub async fn create_trigger_handler(
     Path(project_id): Path<String>,
     Json(body): Json<CreateTriggerRequest>,
 ) -> impl IntoResponse {
-    let (event, persisted) = {
-        let project = match project_key(&project_id) {
-            Ok(project) => project,
-            Err(message) => return bad_request_response(message),
-        };
-        // T6c-C3: refuse cross-tenant trigger creation.
-        if let Some(resp) = check_tenant(&principal, &project) {
-            return resp;
-        }
+    let project = match project_key(&project_id) {
+        Ok(project) => project,
+        Err(message) => return bad_request_response(message),
+    };
+    if let Some(resp) = check_tenant(&principal, &project) {
+        return resp;
+    }
 
-        let mut triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-        let now = now_ms();
-
-        let trigger = Trigger {
-            id: TriggerId::new(format!("trigger_{now}")),
-            project,
-            name: body.name,
-            description: body.description,
-            signal_pattern: SignalPattern {
-                signal_type: body.signal_type,
-                plugin_id: body.plugin_id,
-            },
-            conditions: body.conditions,
-            run_template_id: RunTemplateId::new(body.run_template_id),
-            state: TriggerState::Enabled,
-            rate_limit: body.rate_limit.unwrap_or_default(),
-            max_chain_depth: body.max_chain_depth,
-            // T6c-C3: audit the real principal, not a hardcoded literal.
-            created_by: operator_id_from_principal(&principal),
-            created_at: now,
-            updated_at: now,
-        };
-
-        match triggers.create_trigger(trigger) {
-            Ok(event) => {
-                let persisted = crate::runtime_event_for_trigger_created(
-                    triggers
-                        .get_trigger(match &event {
-                            TriggerEvent::TriggerCreated { trigger_id, .. } => trigger_id,
-                            _ => unreachable!("create_trigger must emit TriggerCreated"),
-                        })
-                        .expect("created trigger must remain available"),
-                );
-                (event, persisted)
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
+    let now = now_ms();
+    // RFC-025 Phase 1.5a review: UUID-based id rather than
+    // millisecond-timestamp so concurrent trigger creations in the same
+    // ms can't collide with the projection's PRIMARY KEY on
+    // `trigger_id` + `ON CONFLICT DO NOTHING` (which would silently
+    // drop the second row).
+    let trigger = Trigger {
+        id: TriggerId::new(format!("trigger_{}", uuid::Uuid::new_v4())),
+        project,
+        name: body.name,
+        description: body.description,
+        signal_pattern: SignalPattern {
+            signal_type: body.signal_type,
+            plugin_id: body.plugin_id,
+        },
+        conditions: body.conditions,
+        run_template_id: RunTemplateId::new(body.run_template_id),
+        state: TriggerState::Enabled,
+        rate_limit: body.rate_limit.unwrap_or_default(),
+        max_chain_depth: body.max_chain_depth,
+        created_by: operator_id_from_principal(&principal),
+        created_at: now,
+        updated_at: now,
     };
 
-    match append_operator_runtime_event(
-        state.as_ref(),
-        operator_id_from_principal(&principal),
-        persisted,
-    )
-    .await
-    {
-        Ok(()) => (
+    match state.triggers.create_trigger(trigger).await {
+        Ok(event) => (
             StatusCode::CREATED,
             Json(TriggerEventResponse {
                 events: vec![event],
             }),
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error }),
-        )
-            .into_response(),
+        // Pre-refactor: create-trigger returned 400 when the referenced
+        // template was missing. Preserve that (PR #569 review) rather
+        // than switching to 404 — the caller's referenced entity is not
+        // missing from the URL; the body payload is invalid.
+        Err(err) => trigger_error_response_with(err, true),
     }
 }
 
@@ -318,16 +319,19 @@ pub async fn get_trigger_handler(
         Ok(project) => project,
         Err(message) => return bad_request_response(message),
     };
-    // T6c-C3: refuse cross-tenant reads.
     if let Some(resp) = check_tenant(&principal, &project) {
         return resp;
     }
-    let triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-    match triggers.get_trigger(&TriggerId::new(&trigger_id)) {
-        Some(trigger) if trigger.project == project => {
-            Json(serde_json::to_value(trigger).expect("trigger serialization")).into_response()
+    match state
+        .triggers
+        .get_trigger(&TriggerId::new(&trigger_id))
+        .await
+    {
+        Ok(Some(trigger)) if trigger.project == project => {
+            Json(serde_json::to_value(&trigger).expect("trigger serialization")).into_response()
         }
-        _ => not_found_response("trigger", &trigger_id),
+        Ok(_) => not_found_response("trigger", &trigger_id),
+        Err(err) => trigger_error_response(err),
     }
 }
 
@@ -337,61 +341,36 @@ pub async fn delete_trigger_handler(
     axum::extract::Extension(principal): axum::extract::Extension<cairn_api::auth::AuthPrincipal>,
     Path((project_id, trigger_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let (event, persisted) = {
-        let project = match project_key(&project_id) {
-            Ok(project) => project,
-            Err(message) => return bad_request_response(message),
-        };
-        // T6c-C3: refuse cross-tenant mutation.
-        if let Some(resp) = check_tenant(&principal, &project) {
-            return resp;
-        }
-        let mut triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-        match triggers.get_trigger(&TriggerId::new(&trigger_id)) {
-            Some(trigger) if trigger.project == project => {}
-            _ => return not_found_response("trigger", &trigger_id),
-        }
-
-        match triggers.delete_trigger(
-            &TriggerId::new(&trigger_id),
-            operator_id_from_principal(&principal),
-        ) {
-            Ok(event) => {
-                let persisted = crate::runtime_event_for_trigger_service_event(&project, &event)
-                    .expect("delete trigger should persist");
-                (event, persisted)
-            }
-            Err(e) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
+    let project = match project_key(&project_id) {
+        Ok(project) => project,
+        Err(message) => return bad_request_response(message),
     };
-
-    match append_operator_runtime_event(
-        state.as_ref(),
-        operator_id_from_principal(&principal),
-        persisted,
-    )
-    .await
+    if let Some(resp) = check_tenant(&principal, &project) {
+        return resp;
+    }
+    let trigger_id = TriggerId::new(&trigger_id);
+    // Cross-project guard: reject if the trigger exists but in a
+    // different project than the URL-scoped one. Matches the
+    // pre-refactor behaviour (404 rather than 403 so we don't leak
+    // cross-tenant existence).
+    match state.triggers.get_trigger(&trigger_id).await {
+        Ok(Some(trigger)) if trigger.project == project => {}
+        Ok(_) => return not_found_response("trigger", trigger_id.as_str()),
+        Err(err) => return trigger_error_response(err),
+    }
+    match state
+        .triggers
+        .delete_trigger(&trigger_id, operator_id_from_principal(&principal))
+        .await
     {
-        Ok(()) => (
+        Ok(event) => (
             StatusCode::OK,
             Json(TriggerEventResponse {
                 events: vec![event],
             }),
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error }),
-        )
-            .into_response(),
+        Err(err) => trigger_error_response(err),
     }
 }
 
@@ -401,61 +380,32 @@ pub async fn enable_trigger_handler(
     axum::extract::Extension(principal): axum::extract::Extension<cairn_api::auth::AuthPrincipal>,
     Path((project_id, trigger_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let (event, persisted) = {
-        let project = match project_key(&project_id) {
-            Ok(project) => project,
-            Err(message) => return bad_request_response(message),
-        };
-        // T6c-C3: refuse cross-tenant mutation.
-        if let Some(resp) = check_tenant(&principal, &project) {
-            return resp;
-        }
-        let mut triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-        match triggers.get_trigger(&TriggerId::new(&trigger_id)) {
-            Some(trigger) if trigger.project == project => {}
-            _ => return not_found_response("trigger", &trigger_id),
-        }
-
-        match triggers.enable_trigger(
-            &TriggerId::new(&trigger_id),
-            operator_id_from_principal(&principal),
-        ) {
-            Ok(event) => {
-                let persisted = crate::runtime_event_for_trigger_service_event(&project, &event)
-                    .expect("enable trigger should persist");
-                (event, persisted)
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
+    let project = match project_key(&project_id) {
+        Ok(project) => project,
+        Err(message) => return bad_request_response(message),
     };
-
-    match append_operator_runtime_event(
-        state.as_ref(),
-        operator_id_from_principal(&principal),
-        persisted,
-    )
-    .await
+    if let Some(resp) = check_tenant(&principal, &project) {
+        return resp;
+    }
+    let trigger_id = TriggerId::new(&trigger_id);
+    match state.triggers.get_trigger(&trigger_id).await {
+        Ok(Some(trigger)) if trigger.project == project => {}
+        Ok(_) => return not_found_response("trigger", trigger_id.as_str()),
+        Err(err) => return trigger_error_response(err),
+    }
+    match state
+        .triggers
+        .enable_trigger(&trigger_id, operator_id_from_principal(&principal))
+        .await
     {
-        Ok(()) => (
+        Ok(event) => (
             StatusCode::OK,
             Json(TriggerEventResponse {
                 events: vec![event],
             }),
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error }),
-        )
-            .into_response(),
+        Err(err) => trigger_error_response(err),
     }
 }
 
@@ -467,62 +417,32 @@ pub async fn disable_trigger_handler(
     body: Option<Json<DisableRequest>>,
 ) -> impl IntoResponse {
     let reason = body.and_then(|Json(b)| b.reason);
-    let (event, persisted) = {
-        let project = match project_key(&project_id) {
-            Ok(project) => project,
-            Err(message) => return bad_request_response(message),
-        };
-        // T6c-C3: refuse cross-tenant mutation.
-        if let Some(resp) = check_tenant(&principal, &project) {
-            return resp;
-        }
-        let mut triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-        match triggers.get_trigger(&TriggerId::new(&trigger_id)) {
-            Some(trigger) if trigger.project == project => {}
-            _ => return not_found_response("trigger", &trigger_id),
-        }
-
-        match triggers.disable_trigger(
-            &TriggerId::new(&trigger_id),
-            operator_id_from_principal(&principal),
-            reason,
-        ) {
-            Ok(event) => {
-                let persisted = crate::runtime_event_for_trigger_service_event(&project, &event)
-                    .expect("disable trigger should persist");
-                (event, persisted)
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
+    let project = match project_key(&project_id) {
+        Ok(project) => project,
+        Err(message) => return bad_request_response(message),
     };
-
-    match append_operator_runtime_event(
-        state.as_ref(),
-        operator_id_from_principal(&principal),
-        persisted,
-    )
-    .await
+    if let Some(resp) = check_tenant(&principal, &project) {
+        return resp;
+    }
+    let trigger_id = TriggerId::new(&trigger_id);
+    match state.triggers.get_trigger(&trigger_id).await {
+        Ok(Some(trigger)) if trigger.project == project => {}
+        Ok(_) => return not_found_response("trigger", trigger_id.as_str()),
+        Err(err) => return trigger_error_response(err),
+    }
+    match state
+        .triggers
+        .disable_trigger(&trigger_id, operator_id_from_principal(&principal), reason)
+        .await
     {
-        Ok(()) => (
+        Ok(event) => (
             StatusCode::OK,
             Json(TriggerEventResponse {
                 events: vec![event],
             }),
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error }),
-        )
-            .into_response(),
+        Err(err) => trigger_error_response(err),
     }
 }
 
@@ -532,58 +452,32 @@ pub async fn resume_trigger_handler(
     axum::extract::Extension(principal): axum::extract::Extension<cairn_api::auth::AuthPrincipal>,
     Path((project_id, trigger_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let (event, persisted) = {
-        let project = match project_key(&project_id) {
-            Ok(project) => project,
-            Err(message) => return bad_request_response(message),
-        };
-        // T6c-C3: refuse cross-tenant mutation.
-        if let Some(resp) = check_tenant(&principal, &project) {
-            return resp;
-        }
-        let mut triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-        match triggers.get_trigger(&TriggerId::new(&trigger_id)) {
-            Some(trigger) if trigger.project == project => {}
-            _ => return not_found_response("trigger", &trigger_id),
-        }
-
-        match triggers.resume_trigger(&TriggerId::new(&trigger_id)) {
-            Ok(event) => {
-                let persisted = crate::runtime_event_for_trigger_service_event(&project, &event)
-                    .expect("resume trigger should persist");
-                (event, persisted)
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
+    let project = match project_key(&project_id) {
+        Ok(project) => project,
+        Err(message) => return bad_request_response(message),
     };
-
-    match append_operator_runtime_event(
-        state.as_ref(),
-        operator_id_from_principal(&principal),
-        persisted,
-    )
-    .await
+    if let Some(resp) = check_tenant(&principal, &project) {
+        return resp;
+    }
+    let trigger_id = TriggerId::new(&trigger_id);
+    match state.triggers.get_trigger(&trigger_id).await {
+        Ok(Some(trigger)) if trigger.project == project => {}
+        Ok(_) => return not_found_response("trigger", trigger_id.as_str()),
+        Err(err) => return trigger_error_response(err),
+    }
+    match state
+        .triggers
+        .resume_trigger(&trigger_id, operator_id_from_principal(&principal))
+        .await
     {
-        Ok(()) => (
+        Ok(event) => (
             StatusCode::OK,
             Json(TriggerEventResponse {
                 events: vec![event],
             }),
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error }),
-        )
-            .into_response(),
+        Err(err) => trigger_error_response(err),
     }
 }
 
@@ -600,14 +494,15 @@ pub async fn list_run_templates_handler(
         Ok(project) => project,
         Err(message) => return bad_request_response(message),
     };
-    // T6c-C3: refuse cross-tenant reads.
     if let Some(resp) = check_tenant(&principal, &project) {
         return resp;
     }
-    let triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-    let mut list: Vec<&RunTemplate> = triggers.list_templates_for_project(&project);
+    let mut list = match state.triggers.list_templates_for_project(&project).await {
+        Ok(list) => list,
+        Err(err) => return trigger_error_response(err),
+    };
     list.sort_by_key(|r| r.id.clone());
-    let list: Vec<&RunTemplate> = list
+    let list: Vec<RunTemplate> = list
         .into_iter()
         .skip(query.offset())
         .take(query.limit())
@@ -622,68 +517,42 @@ pub async fn create_run_template_handler(
     Path(project_id): Path<String>,
     Json(body): Json<CreateRunTemplateRequest>,
 ) -> impl IntoResponse {
-    let (event, persisted) = {
-        let project = match project_key(&project_id) {
-            Ok(project) => project,
-            Err(message) => return bad_request_response(message),
-        };
-        // T6c-C3: refuse cross-tenant mutation.
-        if let Some(resp) = check_tenant(&principal, &project) {
-            return resp;
-        }
-        let mut triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-        let now = now_ms();
-
-        let template = RunTemplate {
-            id: RunTemplateId::new(format!("tmpl_{now}")),
-            project,
-            name: body.name,
-            description: body.description,
-            default_mode: body.default_mode,
-            system_prompt: body.system_prompt,
-            initial_user_message: body.initial_user_message,
-            plugin_allowlist: body.plugin_allowlist,
-            tool_allowlist: body.tool_allowlist,
-            budget: body.budget,
-            sandbox_hint: body.sandbox_hint,
-            required_fields: body.required_fields,
-            // T6c-C3: audit the real principal.
-            created_by: operator_id_from_principal(&principal),
-            created_at: now,
-            updated_at: now,
-        };
-
-        let event = triggers.create_template(template);
-        let persisted = crate::runtime_event_for_run_template_created(
-            triggers
-                .get_template(match &event {
-                    TriggerEvent::RunTemplateCreated { template_id, .. } => template_id,
-                    _ => unreachable!("create_template must emit RunTemplateCreated"),
-                })
-                .expect("created template must remain available"),
-        );
-        (event, persisted)
+    let project = match project_key(&project_id) {
+        Ok(project) => project,
+        Err(message) => return bad_request_response(message),
     };
-
-    match append_operator_runtime_event(
-        state.as_ref(),
-        operator_id_from_principal(&principal),
-        persisted,
-    )
-    .await
-    {
-        Ok(()) => (
+    if let Some(resp) = check_tenant(&principal, &project) {
+        return resp;
+    }
+    let now = now_ms();
+    // RFC-025 Phase 1.5a review: same UUID-based-id rationale as
+    // `create_trigger_handler` above.
+    let template = RunTemplate {
+        id: RunTemplateId::new(format!("tmpl_{}", uuid::Uuid::new_v4())),
+        project,
+        name: body.name,
+        description: body.description,
+        default_mode: body.default_mode,
+        system_prompt: body.system_prompt,
+        initial_user_message: body.initial_user_message,
+        plugin_allowlist: body.plugin_allowlist,
+        tool_allowlist: body.tool_allowlist,
+        budget: body.budget,
+        sandbox_hint: body.sandbox_hint,
+        required_fields: body.required_fields,
+        created_by: operator_id_from_principal(&principal),
+        created_at: now,
+        updated_at: now,
+    };
+    match state.triggers.create_template(template).await {
+        Ok(event) => (
             StatusCode::CREATED,
             Json(TriggerEventResponse {
                 events: vec![event],
             }),
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error }),
-        )
-            .into_response(),
+        Err(err) => trigger_error_response(err),
     }
 }
 
@@ -697,16 +566,19 @@ pub async fn get_run_template_handler(
         Ok(project) => project,
         Err(message) => return bad_request_response(message),
     };
-    // T6c-C3: refuse cross-tenant reads.
     if let Some(resp) = check_tenant(&principal, &project) {
         return resp;
     }
-    let triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-    match triggers.get_template(&RunTemplateId::new(&template_id)) {
-        Some(template) if template.project == project => {
-            Json(serde_json::to_value(template).expect("template serialization")).into_response()
+    match state
+        .triggers
+        .get_template(&RunTemplateId::new(&template_id))
+        .await
+    {
+        Ok(Some(template)) if template.project == project => {
+            Json(serde_json::to_value(&template).expect("template serialization")).into_response()
         }
-        _ => not_found_response("run template", &template_id),
+        Ok(_) => not_found_response("run template", &template_id),
+        Err(err) => trigger_error_response(err),
     }
 }
 
@@ -717,69 +589,31 @@ pub async fn delete_run_template_handler(
     axum::extract::Extension(principal): axum::extract::Extension<cairn_api::auth::AuthPrincipal>,
     Path((project_id, template_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let (event, persisted) = {
-        let project = match project_key(&project_id) {
-            Ok(project) => project,
-            Err(message) => return bad_request_response(message),
-        };
-        // T6c-C3: refuse cross-tenant mutation.
-        if let Some(resp) = check_tenant(&principal, &project) {
-            return resp;
-        }
-        let mut triggers = state.triggers.lock().unwrap_or_else(|e| e.into_inner());
-        match triggers.get_template(&RunTemplateId::new(&template_id)) {
-            Some(template) if template.project == project => {}
-            _ => return not_found_response("run template", &template_id),
-        }
-
-        match triggers.delete_template(
-            &RunTemplateId::new(&template_id),
-            operator_id_from_principal(&principal),
-        ) {
-            Ok(event) => {
-                let persisted = crate::runtime_event_for_trigger_service_event(&project, &event)
-                    .expect("delete template should persist");
-                (event, persisted)
-            }
-            Err(TriggerError::TemplateInUse { .. }) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: "template is referenced by one or more triggers".to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse {
-                        error: e.to_string(),
-                    }),
-                )
-                    .into_response();
-            }
-        }
+    let project = match project_key(&project_id) {
+        Ok(project) => project,
+        Err(message) => return bad_request_response(message),
     };
-
-    match append_operator_runtime_event(
-        state.as_ref(),
-        operator_id_from_principal(&principal),
-        persisted,
-    )
-    .await
+    if let Some(resp) = check_tenant(&principal, &project) {
+        return resp;
+    }
+    let template_id = RunTemplateId::new(&template_id);
+    match state.triggers.get_template(&template_id).await {
+        Ok(Some(template)) if template.project == project => {}
+        Ok(_) => return not_found_response("run template", template_id.as_str()),
+        Err(err) => return trigger_error_response(err),
+    }
+    match state
+        .triggers
+        .delete_template(&template_id, operator_id_from_principal(&principal))
+        .await
     {
-        Ok(()) => (
+        Ok(event) => (
             StatusCode::OK,
             Json(TriggerEventResponse {
                 events: vec![event],
             }),
         )
             .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error }),
-        )
-            .into_response(),
+        Err(err) => trigger_error_response(err),
     }
 }

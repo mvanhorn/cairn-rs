@@ -20,11 +20,14 @@ const TOKEN: &str = "tenant-overview-token";
 async fn tenant_overview_returns_workspace_and_member_counts() {
     let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
     let runtime = state.runtime.clone();
+    // PR-A7b: the overview handler now rejects foreign-tenant
+    // operators with 404. Register the operator inside `acme` so the
+    // test exercises the same-tenant happy path.
     state.service_tokens.register(
         TOKEN.to_string(),
         AuthPrincipal::Operator {
             operator_id: OperatorId::new("test_op"),
-            tenant: TenantKey::new("default_tenant"),
+            tenant: TenantKey::new("acme"),
         },
     );
 

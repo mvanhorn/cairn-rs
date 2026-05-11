@@ -17,6 +17,7 @@ pub mod migration_check;
 pub mod migrations;
 #[cfg(feature = "postgres")]
 pub mod pg;
+pub mod projection_registry;
 pub mod projections;
 pub mod snapshot;
 #[cfg(feature = "sqlite")]
@@ -32,6 +33,10 @@ pub use event_log::{DurabilityClass, EntityRef, EventLog, EventPosition, StoredE
 pub use in_memory::arm_fail_next_append;
 pub use in_memory::{InMemoryStore, UsageCounters};
 pub use migrations::{AppliedMigration, Migration, MigrationRunner};
+pub use projection_registry::{
+    assert_no_stubs_for_in_memory, assert_no_stubs_for_persistent_backend,
+    lookup as registry_lookup, ProjectionEntry, ProjectionStatus, RegistryError, REGISTRY,
+};
 pub use projections::SyncProjection;
 
 #[cfg(test)]

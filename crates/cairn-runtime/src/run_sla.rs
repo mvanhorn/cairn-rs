@@ -28,9 +28,13 @@ pub trait RunSlaService: Send + Sync {
     /// Get the raw SLA config for a run.
     async fn get_sla(&self, run_id: &RunId) -> Result<Option<SlaConfig>, RuntimeError>;
 
-    /// List all SLA-breached runs for a tenant.
+    /// List SLA-breached runs for a tenant with storage-layer
+    /// pagination (issue #570). Callers pass `limit + 1` to detect
+    /// `has_more`; results are ordered newest-first.
     async fn list_breached_by_tenant(
         &self,
         tenant_id: &TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<SlaBreach>, RuntimeError>;
 }

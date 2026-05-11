@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+// Shared DTOs moved to cairn-api-contracts in #440 so downstream
+// implementor crates (cairn-memory, etc.) can consume them without
+// depending on cairn-api. Re-exported here at the historical module
+// path so existing callers continue to resolve `cairn_api::http::…`
+// unchanged.
+pub use cairn_api_contracts::http::{ApiError, HealthResponse, ListResponse, OkResponse};
+
 /// Preserved HTTP route classification per compatibility catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,65 +32,6 @@ pub enum HttpMethod {
     Put,
     Delete,
     Patch,
-}
-
-/// Standard paginated list response used by preserved endpoints.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListResponse<T> {
-    pub items: Vec<T>,
-    pub has_more: bool,
-}
-
-/// Standard success acknowledgement for mutation endpoints.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OkResponse {
-    pub ok: bool,
-}
-
-/// Health check response for `GET /health`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HealthResponse {
-    pub ok: bool,
-}
-
-/// Structured API error returned by HTTP handlers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct ApiError {
-    pub status_code: u16,
-    pub code: String,
-    pub message: String,
-    #[serde(default)]
-    pub request_id: Option<String>,
-}
-
-impl ApiError {
-    pub fn new(status_code: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            status_code,
-            code: code.into(),
-            message: message.into(),
-            request_id: None,
-        }
-    }
-
-    pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new(404, "not_found", message)
-    }
-
-    pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self::new(401, "unauthorized", message)
-    }
-
-    pub fn bad_request(message: impl Into<String>) -> Self {
-        Self::new(400, "bad_request", message)
-    }
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {}: {}", self.status_code, self.code, self.message)
-    }
 }
 
 /// Seam for HTTP route registration. Implementors wire routes to handlers.
@@ -298,6 +246,11 @@ pub fn preserved_route_catalog() -> Vec<RouteEntry> {
         },
         RouteEntry {
             method: Get,
+            path: "/v1/skills/:id".into(),
+            classification: Preserve,
+        },
+        RouteEntry {
+            method: Get,
             path: "/v1/soul".into(),
             classification: Transitional,
         },
@@ -381,6 +334,18 @@ pub fn preserved_route_catalog() -> Vec<RouteEntry> {
         RouteEntry {
             method: Get,
             path: "/v1/evals/datasets".into(),
+            classification: Preserve,
+        },
+        // Issue #138 — eval artifacts list surfaces used by the EvalsPage
+        // New Eval Run form.
+        RouteEntry {
+            method: Get,
+            path: "/v1/evals/rubrics".into(),
+            classification: Preserve,
+        },
+        RouteEntry {
+            method: Get,
+            path: "/v1/evals/baselines".into(),
             classification: Preserve,
         },
         // RFC 010: sources and channels surface.

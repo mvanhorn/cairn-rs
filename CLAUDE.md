@@ -23,7 +23,6 @@ When there is ambiguity, resolve in this order:
 1. The relevant RFCs under `docs/design/rfcs/`
 2. Compatibility docs under `docs/design/`
 3. This file (CLAUDE.md)
-4. The current Go implementation in `../cairn-sdk` only where preserved behavior or fixtures need to be checked
 
 If the docs disagree, fix the docs before inventing local behavior.
 
@@ -122,6 +121,14 @@ domain → store → runtime → {memory, graph, evals, tools, agent, signal, ch
 
 All state derives from an immutable event log. Flow: `RuntimeCommand` → handler → `RuntimeEvent` → `EventLog::append()` → `SyncProjection` updates read models. SSE at `GET /v1/stream` with Last-Event-ID replay.
 
+Every `RuntimeEvent` variant is declared in `crates/cairn-store/src/projection_registry.rs` as `Projected { table }`, `Ephemeral { reason }`, or `Stubbed { tracking }`. The registry is exhaustive-checked at build time (`crates/cairn-store/build.rs`) and at boot (`assert_no_stubs_for_persistent_backend` logs the Stubbed list at WARN on pg/sqlite). A pre-commit hook + CI `projection-stub-guard` job reject new `log_stub(` sites. See RFC-025 for the full contract.
+
+### Runtime aggregate
+
+`cairn_runtime::RuntimeServices` (at `crates/cairn-runtime/src/aggregate.rs`) bundles the ~30 non-execution services (approvals, evals, credentials, quotas, provider bindings, etc.) that `AppState` exposes to handlers. Named `InMemoryServices` historically; renamed under RFC-025 Phase 4 because the aggregate's future is backend-generic even though today its fields are still concretely typed `*ServiceImpl<InMemoryStore>`. Core execution services (runs, tasks, sessions) are `Arc<dyn Trait>` fields with the `FabricService*Adapter` installed at boot.
+
+**Storage + boot (honest accounting after RFC-025 Phase 4).** Writes route through `InMemoryStore` first — `main.rs` calls `InMemoryStore::set_secondary_log(pg_or_sqlite_event_log)` so every service-layer append lands in the InMemory projection and then dual-writes to the durable backend in the same call. On pg/sqlite boots `main.rs` runs a `Startup replay from durable event log` block that streams the full event log into `InMemoryStore::append` (10 k-event batches) so handler reads see a warm in-memory projection on restart — boot is therefore still O(N) in event-log size today. What RFC-025 shipped is the substrate for the follow-up cutover: every `Projected` event variant now writes to a named pg/sqlite read-model table inside the same transaction as the event append (125 Projected / 32 Ephemeral / 1 Stubbed tracked in `crates/cairn-store/src/projection_registry.rs`; parity harness asserts byte-equality between in-memory and sqlite). The three ad-hoc hand-rolled walkers that motivated the RFC (`replay_evals`, `replay_graph`, `replay_triggers`) are deleted. Recovery of execution-layer state is owned by FlowFabric's scanners (RFC 020).
+
 ### Multi-Tenancy
 
 Every entity scoped by `ProjectKey { tenant_id, workspace_id, project_id }`. All queries filter by scope. UI stores active scope in localStorage and injects via `withScope()` in the API client.
@@ -143,6 +150,7 @@ React 19 + TypeScript + Tailwind v4 + TanStack Query. 30 operator pages. Embedde
 - **List responses** are inconsistent: some endpoints return `T[]`, others `{items: T[], hasMore}`. The UI `getList()` helper in `api.ts` normalizes both. Always use `getList()` for list endpoints.
 - **Health endpoints**: `/health` returns `{status: "healthy", store_ok, ...}`. `/v1/status` returns `{status: "ok", components: [...]}`. Use `isRuntimeHealthy()` / `isStoreHealthy()` from `ui/src/lib/types.ts` — never access `runtime_ok` or `store_ok` directly.
 - **Store backends**: Feature-gated via Cargo features (`postgres`, `sqlite`). Default is Postgres when `DATABASE_URL` is set. Use `--db memory` for explicit in-memory (ephemeral, with startup warning).
+- **Fabric backends**: FlowFabric control-plane runs on Valkey (default, complete) or Postgres (`fabric-postgres` feature). PR-C4c (cairn-rs #602) landed full service-aggregate boot on both backends; run / task / session / quota surfaces route through the same trait objects. Worker-claim and signal-delivery paths are still Valkey-only at the service layer until FF surfaces the equivalents on `EngineBackend`. See [`docs/design/postgres-parity-gaps.md`](docs/design/postgres-parity-gaps.md) for the per-method parity table + operator guide.
 - **`unsafe_code = "forbid"`** at workspace level. No exceptions.
 - **RFCs**: Behavior is specified by RFCs in `docs/design/rfcs/`. Each RFC has integration tests as compliance proof.
 

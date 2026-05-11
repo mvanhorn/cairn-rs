@@ -21,7 +21,10 @@
 //! ```
 
 use async_trait::async_trait;
-use cairn_domain::RunId;
+use cairn_domain::{
+    session_orchestration::{BreakerKind, CircuitBreakerTrip},
+    CompletionVerification, RunId,
+};
 
 use crate::context::{
     DecideOutput, ExecuteOutcome, GatherOutput, LoopTermination, OrchestrationContext,
@@ -108,12 +111,45 @@ pub enum OrchestratorEvent {
         /// The extracted plan markdown.
         plan_markdown: String,
     },
+    /// F65 PR-3: a circuit breaker tripped — the loop is about to
+    /// return `LoopTermination::BreakerTripped`.
+    BreakerTripped {
+        run_id: RunId,
+        iteration: u32,
+        which: BreakerKind,
+        measured: u64,
+        limit: u64,
+    },
+    /// F65 PR-3: a budget threshold (80% of a breaker cap) was crossed —
+    /// non-terminal, the loop continues.
+    BudgetThresholdCrossed {
+        run_id: RunId,
+        iteration: u32,
+        which: BreakerKind,
+        measured: u64,
+        limit: u64,
+        /// Measured-to-limit ratio in basis points (0-10_000).
+        ratio_bps: u32,
+    },
     /// The loop has finished (terminal or suspended).
     Finished {
         run_id: RunId,
         termination: String,
         /// Human-readable summary (from `LoopTermination::Completed` or error reason).
         detail: Option<String>,
+        /// F47 PR1: extractor-produced sidecar of warning/error lines and
+        /// per-command exit codes distilled from tool_results observed
+        /// during the run. Present only when the run reached
+        /// `LoopTermination::Completed`; `None` for failed / timed-out /
+        /// suspended terminations. Serialised as `completion_verification`
+        /// so the JSON wire key cannot be confused with the unrelated
+        /// `termination` field.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "completion_verification"
+        )]
+        completion_verification: Option<CompletionVerification>,
     },
 }
 
@@ -186,8 +222,92 @@ pub trait OrchestratorEventEmitter: Send + Sync {
     /// Called when a Plan-mode run detects a `<proposed_plan>` block (RFC 018).
     async fn on_plan_proposed(&self, _ctx: &OrchestrationContext, _plan_markdown: &str) {}
 
+    /// F65 PR-3: called once when a circuit breaker reaches its cap and
+    /// the loop is about to return `LoopTermination::BreakerTripped`.
+    ///
+    /// The production emitter in `cairn-app` appends
+    /// `RuntimeEvent::CircuitBreakerTripped` to the durable event log so
+    /// the projections + operator UI can surface the trip. SSE-only
+    /// emitters render a dashboard frame. The default no-op impl keeps
+    /// tests and local mode decoupled from the event log.
+    async fn on_breaker_tripped(&self, _ctx: &OrchestrationContext, _trip: &CircuitBreakerTrip) {}
+
+    /// F65 PR-3: called once per breaker per run when the measured value
+    /// first crosses the 80 % warning threshold. Non-terminal; the loop
+    /// continues. `ratio_bps` is the measured-to-limit ratio in basis
+    /// points (integer, 0-10_000) — matches the wire format of
+    /// `RuntimeEvent::BudgetThresholdCrossed`.
+    ///
+    /// `NoToolUseConsecutive` deliberately never triggers this hook —
+    /// see `BreakerConfig` rustdoc for the rationale.
+    async fn on_budget_threshold_crossed(
+        &self,
+        _ctx: &OrchestrationContext,
+        _which: BreakerKind,
+        _measured: u64,
+        _limit: u64,
+        _ratio_bps: u32,
+    ) {
+    }
+
+    /// Issue #689 Finding R2-B: called once per DECIDE turn once the
+    /// "echo-via-bash prose-playing" detector reaches its
+    /// consecutive-turn threshold. Fires on every turn from the
+    /// threshold onwards while the model keeps prose-playing —
+    /// dashboards count each fire, but the loop's WARN log is
+    /// rate-limited by the monotonic counter (same count never
+    /// re-observed).
+    ///
+    /// **Non-terminal**: the loop keeps running. The detector is
+    /// an operator-visible signal, not an enforcer. See the task
+    /// brief on `issue #689` for the scope rationale.
+    ///
+    /// `consecutive_count` is the total consecutive echo-bash turns
+    /// observed (>= `ECHO_BASH_DETECTION_THRESHOLD`); operators can
+    /// plot it to see how long the run has been stuck.
+    async fn on_prose_playing_detected(
+        &self,
+        _ctx: &OrchestrationContext,
+        _consecutive_count: u32,
+    ) {
+    }
+
     /// Called once after the loop terminates (terminal or suspended).
     async fn on_finished(&self, _ctx: &OrchestrationContext, _termination: &LoopTermination) {}
+
+    /// Drain a pending fatal error stashed by the emitter since the last
+    /// call. The loop runner currently consults this after the DECIDE
+    /// phase callback (the only phase boundary where the production
+    /// emitter commits telemetry events to the durable secondary) and
+    /// — if `Some` — aborts the loop with a `Store` error carrying the
+    /// message.
+    ///
+    /// Additional consult sites may be added as other callbacks gain
+    /// side-effectful durable writes; each addition should keep the
+    /// "take once" semantics consistent with the existing DECIDE-phase
+    /// check.
+    ///
+    /// The contract is "take": the emitter MUST return the error exactly
+    /// once. Subsequent calls return `None` until another fatal error is
+    /// recorded. This lets the emitter surface side-effect failures
+    /// (e.g. dual-write divergence against the durable secondary) that
+    /// the trait methods can't express through their `()` return type,
+    /// without silently continuing the loop on top of a diverged store.
+    ///
+    /// **Security (SEC-007): error strings returned here are surfaced
+    /// via `OrchestratorError::Store` and may reach public-facing API
+    /// responses.** Implementors MUST NOT include raw driver messages,
+    /// connection strings, schema fragments, or other internals. Keep
+    /// the message to a short operator-facing class label (e.g.
+    /// `"dual-write divergence"`) plus an identifier the operator
+    /// already owns (e.g. the run_id), and log the detailed cause
+    /// separately via `tracing::error!`.
+    ///
+    /// Default is `None` — emitters that never record fatal errors
+    /// don't need to override this.
+    fn take_fatal_error(&self) -> Option<String> {
+        None
+    }
 }
 
 // ── NoOpEmitter ───────────────────────────────────────────────────────────────
@@ -358,9 +478,45 @@ impl OrchestratorEventEmitter for ChannelEmitter {
         });
     }
 
+    async fn on_breaker_tripped(&self, ctx: &OrchestrationContext, trip: &CircuitBreakerTrip) {
+        self.send(OrchestratorEvent::BreakerTripped {
+            run_id: ctx.run_id.clone(),
+            iteration: trip.at_iteration,
+            which: trip.which,
+            measured: trip.measured,
+            limit: trip.limit,
+        });
+    }
+
+    async fn on_budget_threshold_crossed(
+        &self,
+        ctx: &OrchestrationContext,
+        which: BreakerKind,
+        measured: u64,
+        limit: u64,
+        ratio_bps: u32,
+    ) {
+        self.send(OrchestratorEvent::BudgetThresholdCrossed {
+            run_id: ctx.run_id.clone(),
+            iteration: ctx.iteration,
+            which,
+            measured,
+            limit,
+            ratio_bps,
+        });
+    }
+
     async fn on_finished(&self, ctx: &OrchestrationContext, termination: &LoopTermination) {
+        // F47 PR1: carry the verification sidecar only on the Completed
+        // branch. Other terminations (failed / timed_out / suspended)
+        // have no meaningful "what did the tools say" signal to report.
+        let mut verification: Option<CompletionVerification> = None;
         let (term_str, detail) = match termination {
-            LoopTermination::Completed { summary } => {
+            LoopTermination::Completed {
+                summary,
+                verification: v,
+            } => {
+                verification = Some(v.clone());
                 ("completed".to_owned(), Some(summary.clone()))
             }
             LoopTermination::Failed { reason } => ("failed".to_owned(), Some(reason.clone())),
@@ -377,11 +533,26 @@ impl OrchestratorEventEmitter for ChannelEmitter {
                 "plan_proposed".to_owned(),
                 Some(format!("plan ({} chars)", plan_markdown.len())),
             ),
+            // F65 PR-3: surface breaker-trip terminations on the SSE
+            // `finished` frame so operator dashboards can render a
+            // distinct badge. The detail string carries the kind +
+            // measured/limit so the UI can format it inline without
+            // parsing the full `CircuitBreakerTrip` — the event-log side
+            // still carries the structured payload via
+            // `RuntimeEvent::CircuitBreakerTripped`.
+            LoopTermination::BreakerTripped { trip } => (
+                "breaker_tripped".to_owned(),
+                Some(format!(
+                    "{:?} breaker tripped at iteration {}: measured={} limit={}",
+                    trip.which, trip.at_iteration, trip.measured, trip.limit
+                )),
+            ),
         };
         self.send(OrchestratorEvent::Finished {
             run_id: ctx.run_id.clone(),
             termination: term_str,
             detail,
+            completion_verification: verification,
         });
     }
 }
@@ -428,10 +599,16 @@ mod tests {
             agent_type: "test_agent".to_owned(),
             run_started_at_ms: 0,
             working_dir: PathBuf::from("."),
+            completion_contract: None,
             run_mode: cairn_domain::decisions::RunMode::Direct,
             discovered_tool_names: vec![],
             step_history: vec![],
             is_recovery: false,
+            approval_timeout: None,
+            visibility: None,
+            parent_context: None,
+            declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+            agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
         }
     }
 
@@ -445,6 +622,10 @@ mod tests {
             latency_ms: 0,
             input_tokens: None,
             output_tokens: None,
+            system_prompt: String::new(),
+            messages_json: "[]".to_owned(),
+            tool_calls_json: "[]".to_owned(),
+            tool_defs_json: "[]".to_owned(),
         }
     }
 
@@ -474,6 +655,7 @@ mod tests {
         e.on_finished(
             &ctx,
             &LoopTermination::Completed {
+                verification: Default::default(),
                 summary: "done".into(),
             },
         )
@@ -518,6 +700,7 @@ mod tests {
             .on_finished(
                 &ctx(),
                 &LoopTermination::Completed {
+                    verification: Default::default(),
                     summary: "all done".into(),
                 },
             )
@@ -599,6 +782,7 @@ mod tests {
             .on_finished(
                 &ctx,
                 &LoopTermination::Completed {
+                    verification: Default::default(),
                     summary: "done".into(),
                 },
             )

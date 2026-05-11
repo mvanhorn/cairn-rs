@@ -19,8 +19,12 @@ import { StatCard } from "../components/StatCard";
 import { useToast } from "../components/Toast";
 import { MiniChart } from "../components/MiniChart";
 import { BarChart } from "../components/BarChart";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
+import { errorMessage } from "../lib/errors";
+import { useScope } from "../hooks/useScope";
 import type { EvalRunRecord, EvalRunStatus } from "../lib/types";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -301,7 +305,9 @@ function CompareBanner({
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 const EVALUATOR_TYPES = ["accuracy", "relevance", "coherence", "safety", "custom"] as const;
-const SUBJECT_KINDS   = ["prompt_release", "agent_template", "run_output", "custom"] as const;
+// NOTE: these must match `cairn_domain::EvalSubjectKind` (snake_case).
+// Adding a value here without a corresponding domain variant will 400.
+const SUBJECT_KINDS   = ["prompt_release", "provider_route", "retrieval_policy", "skill", "guardrail_policy"] as const;
 
 export function EvalsPage() {
   const [statusFilter, setStatusFilter] = useState<EvalRunStatus | "all">("all");
@@ -309,33 +315,102 @@ export function EvalsPage() {
   const [showNewForm, setShowNewForm]   = useState(false);
   const [newEvalType, setNewEvalType]   = useState<string>(EVALUATOR_TYPES[0]);
   const [newSubject, setNewSubject]     = useState<string>(SUBJECT_KINDS[0]);
+  const [newDatasetId, setNewDatasetId]     = useState<string>("");
+  const [newRubricId, setNewRubricId]       = useState<string>("");
+  const [newBaselineId, setNewBaselineId]   = useState<string>("");
+  const [newReleaseId, setNewReleaseId]     = useState<string>("");
+  // Issue #244: scorecard picker — lets operators target an existing
+  // scorecard (i.e. a prompt_asset_id that already has completed runs)
+  // instead of typing the asset id by hand. Selecting a scorecard
+  // pre-fills `prompt_asset_id` on the submitted run so the new run lands
+  // on the same scorecard track.
+  const [selectedPromptAssetId, setSelectedPromptAssetId] = useState<string>("");
   const qc = useQueryClient();
   const toast = useToast();
+  // Scope goes into every cache key so that switching tenant/workspace/project
+  // does not serve the previous scope's data from cache.
+  const [scope] = useScope();
+  const scopeKey = [scope.tenant_id, scope.workspace_id, scope.project_id];
 
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
-    queryKey: ["evals"],
+    queryKey: ["evals", "runs", ...scopeKey],
     queryFn:  () => defaultApi.getEvalRuns(200),
     refetchInterval: 20_000,
+  });
+
+  // Artifact pickers — fetched lazily when the form is opened.
+  // tenant_id is the server-side scope for these list endpoints, so only that
+  // piece of the scope needs to be in the cache key; include it all for safety.
+  const datasetsQ  = useQuery({
+    queryKey: ["evals", "datasets", ...scopeKey],
+    queryFn:  () => defaultApi.listEvalDatasets(),
+    enabled:  showNewForm,
+    staleTime: 60_000,
+  });
+  const rubricsQ   = useQuery({
+    queryKey: ["evals", "rubrics", ...scopeKey],
+    queryFn:  () => defaultApi.listEvalRubrics(),
+    enabled:  showNewForm,
+    staleTime: 60_000,
+  });
+  const baselinesQ = useQuery({
+    queryKey: ["evals", "baselines", ...scopeKey],
+    queryFn:  () => defaultApi.listEvalBaselines(),
+    enabled:  showNewForm,
+    staleTime: 60_000,
+  });
+  const releasesQ  = useQuery({
+    queryKey: ["evals", "prompt-releases", ...scopeKey],
+    queryFn:  () => defaultApi.getPromptReleases({ limit: 200 }),
+    enabled:  showNewForm && newSubject === "prompt_release",
+    staleTime: 60_000,
+  });
+  // Issue #244: scorecards are derived per-(project, prompt_asset_id), so
+  // the picker is scoped by the active project (not tenant) and stale-cached
+  // while the form is open.
+  const scorecardsQ = useQuery({
+    queryKey: ["evals", "scorecards", ...scopeKey],
+    queryFn:  () => defaultApi.listEvalScorecards(),
+    enabled:  showNewForm,
+    staleTime: 60_000,
   });
 
   const createEval = useMutation({
     mutationFn: () => {
       const id = `eval_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      // Issue #244: selected scorecard maps to `prompt_asset_id` on the new
+      // run so it aggregates into the chosen scorecard. The picker stores
+      // the `prompt_asset_id` (not an opaque scorecard id) because
+      // scorecards are derived from `(project, prompt_asset_id)`.
       return defaultApi.createEvalRun({
-        eval_run_id: id,
-        subject_kind: newSubject,
-        evaluator_type: newEvalType,
+        eval_run_id:       id,
+        subject_kind:      newSubject,
+        evaluator_type:    newEvalType,
+        dataset_id:        newDatasetId  || undefined,
+        rubric_id:         newRubricId   || undefined,
+        baseline_id:       newBaselineId || undefined,
+        prompt_release_id: newSubject === "prompt_release" && newReleaseId ? newReleaseId : undefined,
+        prompt_asset_id:   selectedPromptAssetId || undefined,
       });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["evals"] });
       setShowNewForm(false);
+      setNewDatasetId("");
+      setNewRubricId("");
+      setNewBaselineId("");
+      setNewReleaseId("");
+      setSelectedPromptAssetId("");
+      toast.success("Eval run created");
     },
-    onError: (e: unknown) =>
-      toast.error(`Failed to create eval run: ${e instanceof Error ? e.message : String(e)}`),
+    // #382: the prior form used `String(e)` as fallback which produces
+    // "[object Object]" on non-Error throws. The shared `errorMessage`
+    // helper degrades to the fallback string instead.
+    onError: (e) => toast.error(errorMessage(e, "Failed to create eval run.")),
   });
 
-  const runs = data?.items ?? [];
+  // #425: shared normalizer.
+  const runs = unwrapList<EvalRunRecord>(data);
   const annotated = useMemo(
     () => runs.map((r) => ({ ...r, _status: deriveStatus(r) })),
     [runs],
@@ -407,6 +482,7 @@ export function EvalsPage() {
 
         <div className="ml-auto relative">
           <button
+            data-testid="eval-new-open-btn"
             onClick={() => setShowNewForm(v => !v)}
             className="flex items-center gap-1.5 rounded bg-indigo-600 hover:bg-indigo-500
                        text-white text-[12px] font-medium px-3 py-1.5 transition-colors"
@@ -419,7 +495,13 @@ export function EvalsPage() {
           {showNewForm && (
             <>
               <div className="fixed inset-0 z-30" onClick={() => setShowNewForm(false)} />
-              <div className="absolute right-0 top-full mt-1 z-40 w-64 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg shadow-xl p-3 space-y-3">
+              <div className="absolute right-0 top-full mt-1 z-40 w-80 bg-white dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg shadow-xl p-3 space-y-3 max-h-[80vh] overflow-y-auto">
+                <p className="text-[11px] text-gray-500 dark:text-zinc-400 leading-snug">
+                  Linked artifacts (dataset, rubric, baseline) are all optional,
+                  but when supplied they are validated to exist at create time —
+                  dangling references are rejected.
+                </p>
+
                 <label className="block">
                   <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">Evaluator Type</span>
                   <select
@@ -430,6 +512,7 @@ export function EvalsPage() {
                     {EVALUATOR_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
                   </select>
                 </label>
+
                 <label className="block">
                   <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">Subject Kind</span>
                   <select
@@ -440,7 +523,122 @@ export function EvalsPage() {
                     {SUBJECT_KINDS.map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </label>
+
+                {/* Subject-specific pickers ─ only for prompt_release today */}
+                {newSubject === "prompt_release" && (
+                  <label className="block">
+                    <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">
+                      Prompt Release
+                      {releasesQ.isLoading && <span className="ml-1 normal-case text-gray-400">loading…</span>}
+                    </span>
+                    <select
+                      value={newReleaseId}
+                      onChange={e => setNewReleaseId(e.target.value)}
+                      className="mt-1 w-full rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-950 text-gray-700 dark:text-zinc-300 text-[12px] px-2 py-1.5 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="">— none —</option>
+                      {unwrapList<import("../lib/types").PromptReleaseRecord>(releasesQ.data).map(r => (
+                        <option key={r.prompt_release_id} value={r.prompt_release_id}>
+                          {r.prompt_release_id}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+
+                <label className="block" data-testid="scorecard-picker-label">
+                  <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">
+                    Scorecard (optional)
+                    {scorecardsQ.isLoading && <span className="ml-1 normal-case text-gray-400">loading…</span>}
+                  </span>
+                  <select
+                    data-testid="scorecard-select"
+                    value={selectedPromptAssetId}
+                    onChange={e => setSelectedPromptAssetId(e.target.value)}
+                    className="mt-1 w-full rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-950 text-gray-700 dark:text-zinc-300 text-[12px] px-2 py-1.5 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="">— none —</option>
+                    {(scorecardsQ.data ?? []).map(sc => {
+                      const best = sc.best_task_success_rate;
+                      const label = `${sc.prompt_asset_id.slice(0, 18)}${sc.prompt_asset_id.length > 18 ? "…" : ""}`
+                        + ` (${sc.entry_count} runs`
+                        + (best !== null && best !== undefined
+                            ? `, best ${(best * 100).toFixed(1)}%`
+                            : "")
+                        + ")";
+                      return (
+                        <option key={sc.prompt_asset_id} value={sc.prompt_asset_id}>
+                          {label}
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {(scorecardsQ.data ?? []).length === 0 && !scorecardsQ.isLoading && (
+                    <span className="mt-1 block text-[10px] text-gray-400 dark:text-zinc-600">
+                      No scorecards yet. One appears per prompt asset once a run completes with prompt release + version set.
+                    </span>
+                  )}
+                </label>
+
+                <label className="block">
+                  <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">
+                    Dataset
+                    {datasetsQ.isLoading && <span className="ml-1 normal-case text-gray-400">loading…</span>}
+                  </span>
+                  <select
+                    value={newDatasetId}
+                    onChange={e => setNewDatasetId(e.target.value)}
+                    className="mt-1 w-full rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-950 text-gray-700 dark:text-zinc-300 text-[12px] px-2 py-1.5 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="">— none —</option>
+                    {(datasetsQ.data ?? []).map(d => (
+                      <option key={d.dataset_id} value={d.dataset_id}>{d.name} ({d.dataset_id.slice(0, 8)}…)</option>
+                    ))}
+                  </select>
+                  {(datasetsQ.data ?? []).length === 0 && !datasetsQ.isLoading && (
+                    <span className="mt-1 block text-[10px] text-gray-400 dark:text-zinc-600">
+                      No datasets for this tenant. Create one via POST /v1/evals/datasets.
+                    </span>
+                  )}
+                </label>
+
+                <label className="block">
+                  <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">
+                    Rubric (optional)
+                    {rubricsQ.isLoading && <span className="ml-1 normal-case text-gray-400">loading…</span>}
+                  </span>
+                  <select
+                    value={newRubricId}
+                    onChange={e => setNewRubricId(e.target.value)}
+                    className="mt-1 w-full rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-950 text-gray-700 dark:text-zinc-300 text-[12px] px-2 py-1.5 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="">— none —</option>
+                    {(rubricsQ.data ?? []).map(r => (
+                      <option key={r.rubric_id} value={r.rubric_id}>{r.name} ({r.rubric_id.slice(0, 8)}…)</option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="block">
+                  <span className="text-[10px] text-gray-400 dark:text-zinc-500 uppercase tracking-wide">
+                    Baseline (optional)
+                    {baselinesQ.isLoading && <span className="ml-1 normal-case text-gray-400">loading…</span>}
+                  </span>
+                  <select
+                    value={newBaselineId}
+                    onChange={e => setNewBaselineId(e.target.value)}
+                    className="mt-1 w-full rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-950 text-gray-700 dark:text-zinc-300 text-[12px] px-2 py-1.5 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="">— none —</option>
+                    {(baselinesQ.data ?? []).map(b => (
+                      <option key={b.baseline_id} value={b.baseline_id}>{b.name} ({b.baseline_id.slice(0, 8)}…)</option>
+                    ))}
+                  </select>
+                </label>
+
                 <button
+                  data-testid="eval-create-submit-btn"
+                  data-pending={createEval.isPending ? "true" : "false"}
                   onClick={() => createEval.mutate()}
                   disabled={createEval.isPending}
                   className="w-full flex items-center justify-center gap-1.5 rounded bg-indigo-600 hover:bg-indigo-500
@@ -458,12 +656,16 @@ export function EvalsPage() {
           onClick={() => void refetch()}
           disabled={isFetching}
           className="flex items-center gap-1.5 rounded border border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-900
-                     text-gray-400 dark:text-zinc-500 text-[12px] px-2.5 py-1 hover:text-gray-800 dark:hover:text-zinc-200 hover:bg-gray-100 dark:hover:bg-gray-100 dark:bg-zinc-800
+                     text-gray-500 dark:text-zinc-400 text-[12px] px-2.5 py-1 hover:text-gray-900 dark:hover:text-zinc-100 hover:bg-gray-100 dark:hover:bg-zinc-800
                      disabled:opacity-40 transition-colors"
         >
           <RefreshCw size={11} className={clsx(isFetching && "animate-spin")} />
           Refresh
         </button>
+      </div>
+      {/* F32 — inline entity explainer. */}
+      <div className="px-4 py-1.5 border-b border-gray-200 dark:border-zinc-800 shrink-0 bg-white dark:bg-zinc-950">
+        <EntityExplainer>{ENTITY_EXPLAINERS.eval}</EntityExplainer>
       </div>
 
       {/* Compare selection banner */}
@@ -524,6 +726,7 @@ export function EvalsPage() {
                   { label: "Status",     cls: "text-left"  },
                   { label: "Duration",   cls: "text-right" },
                   { label: "Created",    cls: "text-right" },
+                  { label: "",           cls: "text-right" },
                 ].map(({ label, cls }) => (
                   <th key={label} className={clsx(
                     "px-4 py-2 text-[11px] font-medium text-gray-400 dark:text-zinc-500 uppercase tracking-wider whitespace-nowrap",
@@ -544,10 +747,10 @@ export function EvalsPage() {
                     className={clsx(
                       "border-b border-gray-200/40 dark:border-zinc-800/40 h-9 transition-colors",
                       isSelected
-                        ? "bg-indigo-950/30"
+                        ? "bg-indigo-600/15 dark:bg-indigo-500/20 hover:bg-indigo-600/20 dark:hover:bg-indigo-500/25 text-gray-900 dark:text-zinc-100"
                         : idx % 2 !== 0
-                        ? "bg-gray-50/20 dark:bg-zinc-900/20 hover:bg-gray-50/50 dark:bg-zinc-900/50"
-                        : "hover:bg-gray-50/50 dark:bg-zinc-900/50",
+                        ? "bg-gray-50/20 dark:bg-zinc-900/20 hover:bg-gray-100 dark:hover:bg-zinc-800/70 text-gray-700 dark:text-zinc-300 hover:text-gray-900 dark:hover:text-zinc-100"
+                        : "hover:bg-gray-100 dark:hover:bg-zinc-800/70 text-gray-700 dark:text-zinc-300 hover:text-gray-900 dark:hover:text-zinc-100",
                     )}
                   >
                     {/* Checkbox */}
@@ -592,6 +795,15 @@ export function EvalsPage() {
                     </td>
                     <td className="px-4 py-0 text-[11px] text-gray-400 dark:text-zinc-600 whitespace-nowrap text-right font-mono">
                       {fmtTime(run.started_at)}
+                    </td>
+                    <td className="px-4 py-0 text-right whitespace-nowrap">
+                      <a
+                        href={`#eval-results/${encodeURIComponent(run.eval_run_id)}`}
+                        className="text-[11px] text-indigo-400 hover:text-indigo-300 transition-colors"
+                        title="View results for this eval run"
+                      >
+                        Results
+                      </a>
                     </td>
                   </tr>
                 );

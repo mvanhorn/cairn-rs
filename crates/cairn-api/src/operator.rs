@@ -190,6 +190,13 @@ mod tests {
                 version: 1,
                 created_at: 1000,
                 updated_at: 1001,
+                completion_summary: None,
+                completion_verification: None,
+                completion_annotated_at_ms: None,
+                terminal_write_recovery: None,
+                in_flight_descendants: 0,
+                root_run_id: None,
+                iteration: 0,
             },
             tasks: vec![],
         };

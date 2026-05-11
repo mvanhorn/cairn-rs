@@ -84,7 +84,21 @@ async fn sigstop_sigcont_resumes_cleanly() {
     //    bytes, depending on timing. What we assert is that the
     //    subprocess does NOT wake on its own: we'll verify that
     //    below by measuring readiness BEFORE SIGCONT.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    //
+    //    Pre-probe sleep budget: SIGSTOP delivery on Linux is
+    //    synchronous once `libc::kill` returns zero — the kernel
+    //    flips the process into TASK_STOPPED before any further
+    //    user-space runs in this test. 100ms is a generous margin
+    //    against any residual in-flight tokio work on the
+    //    subprocess side completing a response that was already
+    //    mid-flight when the signal arrived. There is no OS-level
+    //    phenomenon that needs seconds to stabilise here; the old
+    //    3s value (#413) was arbitrary and served only to keep the
+    //    test wall-clock inflated. The probe's own 500ms request
+    //    timeout below is what establishes "subprocess can't
+    //    respond 200"; the sleep just steps past the stop-signal
+    //    handoff.
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let probe = h
         .client()
@@ -142,10 +156,13 @@ async fn sigstop_sigcont_resumes_cleanly() {
         res.text().await.unwrap_or_default(),
     );
 
-    // 5. Hard elapsed-budget cap. SIGSTOP held 3s + ≤10s readiness
+    // 5. Hard elapsed-budget cap. SIGSTOP held 100ms + ≤10s readiness
     //    recovery + one HTTP round-trip — any more than 30s total
     //    means something is hung and we want the test to fail loudly
-    //    rather than masquerade as a flaky slow test.
+    //    rather than masquerade as a flaky slow test. The 30s budget
+    //    stays conservative despite the shortened SIGSTOP window so
+    //    CI runners with cold-boot overhead in `LiveHarness::setup`
+    //    still finish under the cap.
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(30),
@@ -176,6 +193,41 @@ async fn fail_next_append_surfaces_cleanly() {
     assert!(
         h.poll_readiness_until_ready(Duration::from_secs(10)).await,
         "subprocess not ready pre-arming",
+    );
+
+    // Seed the provider connection BEFORE arming the failure hook.
+    // PR #717's tenant-ownership sweep made every retry-policy PUT
+    // pre-load the connection record (404 if missing), so a PUT
+    // against a non-existent id no longer reaches the append path
+    // — it short-circuits to 404 and the failure hook never fires.
+    // We need a real connection in place so the PUT actually
+    // attempts to write the `ProviderRetryPolicySet` event, which
+    // is the append path the chaos hook is meant to intercept.
+    //
+    // Use `default_tenant` (seeded by the harness boot) rather than
+    // `h.tenant` (per-uuid scope only used for sessions/runs/tasks);
+    // tenants must exist before connections can register against them
+    // and we don't want to add a tenant-create+ append before SIGUSR1
+    // (it would consume the failure budget).
+    let create_resp = h
+        .client()
+        .post(format!("{}/v1/providers/connections", h.base_url))
+        .bearer_auth(&h.admin_token)
+        .json(&json!({
+            "tenant_id": "default_tenant",
+            "provider_connection_id": "conn_chaos_b",
+            "provider_family": "openai_compat",
+            "adapter_type": "ollama",
+            "supported_models": ["llama3"],
+        }))
+        .send()
+        .await
+        .expect("seed connection request");
+    assert_eq!(
+        create_resp.status().as_u16(),
+        201,
+        "seed connection: {}",
+        create_resp.text().await.unwrap_or_default(),
     );
 
     // Arm one injected failure on the next append. The signal handler

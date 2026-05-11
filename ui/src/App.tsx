@@ -3,6 +3,8 @@ import { Loader2 } from 'lucide-react';
 import { Layout } from './components/Layout';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { RequestLogProvider } from './components/RequestLogContext';
+import { StarterSetup } from './components/StarterSetup';
+import { useBootstrapScope, SCOPE_NEEDS_PICK_EVENT } from './hooks/useScope';
 import { LoginPage } from './pages/LoginPage';
 // ── Eagerly-loaded pages (always needed on first paint) ───────────────────────
 import { DashboardPage } from './pages/DashboardPage';
@@ -18,6 +20,10 @@ const EvalComparisonPage    = lazy(() => import('./pages/EvalComparisonPage').th
 const ProjectDashboardPage  = lazy(() => import('./pages/ProjectDashboardPage').then(m => ({ default: m.ProjectDashboardPage })));
 const PlaygroundPage     = lazy(() => import('./pages/PlaygroundPage').then(m => ({ default: m.PlaygroundPage })));
 const WorkspacesPage = lazy(() => import('./pages/WorkspacesPage').then(m => ({ default: m.WorkspacesPage })));
+const TenantsPage        = lazy(() => import('./pages/TenantsPage').then(m => ({ default: m.TenantsPage })));
+const OperatorsPage      = lazy(() => import('./pages/OperatorsPage').then(m => ({ default: m.OperatorsPage })));
+const QuotasPage         = lazy(() => import('./pages/QuotasPage').then(m => ({ default: m.QuotasPage })));
+const RetentionPage      = lazy(() => import('./pages/RetentionPage').then(m => ({ default: m.RetentionPage })));
 const WorkersPage        = lazy(() => import('./pages/WorkersPage').then(m => ({ default: m.WorkersPage })));
 const TestHarnessPage    = lazy(() => import('./pages/TestHarnessPage').then(m => ({ default: m.TestHarnessPage })));
 const MetricsPage        = lazy(() => import('./pages/MetricsPage').then(m => ({ default: m.MetricsPage })));
@@ -38,6 +44,7 @@ const DecisionsPage      = lazy(() => import('./pages/DecisionsPage').then(m => 
 const SourcesPage        = lazy(() => import('./pages/SourcesPage').then(m => ({ default: m.SourcesPage })));
 const CredentialsPage    = lazy(() => import('./pages/CredentialsPage').then(m => ({ default: m.CredentialsPage })));
 const ChannelsPage       = lazy(() => import('./pages/ChannelsPage').then(m => ({ default: m.ChannelsPage })));
+const NotificationsPage  = lazy(() => import('./pages/NotificationsPage').then(m => ({ default: m.NotificationsPage })));
 const IntegrationsPage   = lazy(() => import('./pages/IntegrationsPage').then(m => ({ default: m.IntegrationsPage })));
 const ProjectReposPage   = lazy(() => import('./pages/ProjectReposPage').then(m => ({ default: m.ProjectReposPage })));
 const LogsPage           = lazy(() => import('./pages/LogsPage').then(m => ({ default: m.LogsPage })));
@@ -45,7 +52,11 @@ const AuditLogPage       = lazy(() => import('./pages/AuditLogPage').then(m => (
 const SettingsPage         = lazy(() => import('./pages/SettingsPage').then(m => ({ default: m.SettingsPage })));
 const ProfilePage          = lazy(() => import('./pages/ProfilePage').then(m => ({ default: m.ProfilePage })));
 const AgentTemplatesPage   = lazy(() => import('./pages/AgentTemplatesPage').then(m => ({ default: m.AgentTemplatesPage })));
+const AgentRolesPage       = lazy(() => import('./pages/AgentRolesPage').then(m => ({ default: m.AgentRolesPage })));
+const AgentRoleDetailPage  = lazy(() => import('./pages/AgentRoleDetailPage').then(m => ({ default: m.AgentRoleDetailPage })));
+const AgentRoleEditorPage  = lazy(() => import('./pages/AgentRoleEditorPage').then(m => ({ default: m.AgentRoleEditorPage })));
 import { NotFoundPage } from './pages/NotFoundPage';
+import { AdminGate } from './components/AdminGate';
 
 import { defaultApi, getStoredToken, clearStoredToken, ApiError, AUTH_EXPIRED_EVENT } from './lib/api';
 import type { NavPage } from './components/Sidebar';
@@ -103,11 +114,41 @@ function renderRoute(route: Route): React.ReactNode {
       </Guarded>
     );
   }
+  if (route.kind === 'eval-results') {
+    // Single-run view — reuse the comparison page in single-run mode by
+    // passing the same id for both sides; the page detects this and
+    // renders a results view instead of a diff.
+    return (
+      <Guarded name="Eval Results">
+        <Suspense fallback={<PageLoader />}>
+          <EvalComparisonPage leftId={route.runId} rightId={route.runId} />
+        </Suspense>
+      </Guarded>
+    );
+  }
   if (route.kind === 'project-dashboard') {
     return (
       <Guarded name="Project Dashboard">
         <Suspense fallback={<PageLoader />}>
           <ProjectDashboardPage projectId={route.projectId} />
+        </Suspense>
+      </Guarded>
+    );
+  }
+  if (route.kind === 'agent-role-detail') {
+    return (
+      <Guarded name="Agent Role">
+        <Suspense fallback={<PageLoader />}>
+          <AgentRoleDetailPage roleId={route.roleId} />
+        </Suspense>
+      </Guarded>
+    );
+  }
+  if (route.kind === 'agent-role-editor') {
+    return (
+      <Guarded name="Agent Role Editor">
+        <Suspense fallback={<PageLoader />}>
+          <AgentRoleEditorPage mode={route.mode} roleId={route.roleId} />
         </Suspense>
       </Guarded>
     );
@@ -130,6 +171,10 @@ function renderRoute(route: Route): React.ReactNode {
   // Lazy pages — wrapped in Suspense.
   const lazy_page = (() => {
     switch (page) {
+      case 'tenants':         return <AdminGate><TenantsPage /></AdminGate>;
+      case 'operators':       return <AdminGate><OperatorsPage /></AdminGate>;
+      case 'quotas':          return <AdminGate><QuotasPage /></AdminGate>;
+      case 'retention':       return <AdminGate><RetentionPage /></AdminGate>;
       case 'workers':         return <WorkersPage />;
       case 'orchestration': return <OrchestrationPage />;
       case 'deployment':  return <DeploymentPage />;
@@ -146,6 +191,7 @@ function renderRoute(route: Route): React.ReactNode {
       case 'sources':     return <SourcesPage />;
       case 'credentials': return <CredentialsPage />;
       case 'channels':      return <ChannelsPage />;
+      case 'notifications': return <NotificationsPage />;
       case 'integrations': return <IntegrationsPage />;
       case 'project-repos': return <ProjectReposPage />;
       case 'logs':        return <LogsPage />;
@@ -158,6 +204,7 @@ function renderRoute(route: Route): React.ReactNode {
       case 'profile':          return <ProfilePage />;
       case 'playground':       return <PlaygroundPage />;
       case 'agent-templates':  return <AgentTemplatesPage />;
+      case 'agents':           return <AgentRolesPage />;
       default:            return <NotFoundPage />;
     }
   })();
@@ -247,7 +294,51 @@ export default function App() {
 
   return (
     <RequestLogProvider>
-      <Layout routeRenderer={renderRoute} onLogout={handleLogout} />
+      <ScopeBootstrapGate>
+        <Layout routeRenderer={renderRoute} onLogout={handleLogout} />
+      </ScopeBootstrapGate>
     </RequestLogProvider>
   );
 }
+
+// ── Scope bootstrap gate ──────────────────────────────────────────────────────
+//
+// Before the operator sees the dashboard, resolve initial scope:
+//   - zero tenants     → <StarterSetup/>
+//   - one tenant/ws/p  → auto-select silently, render the app
+//   - multi-tenant     → render the app with the scope-picker forced open
+//   - cached scope     → validate still exists, else re-resolve
+//
+// Fixes the "empty pages everywhere on first login" UX bug (PR: scope
+// discovery dropdowns).
+
+function ScopeBootstrapGate({ children }: { children: React.ReactNode }) {
+  const bootstrap = useBootstrapScope();
+  const [forceSetup, setForceSetup] = useState(false);
+
+  // Prompt setup if backend is empty and user didn't just finish it.
+  const showSetup = bootstrap.status === 'empty' || forceSetup;
+
+  // When multiple tenants exist but nothing is cached, fire an event so the
+  // TenantSelector in the TopBar opens itself on first paint.
+  useEffect(() => {
+    if (bootstrap.status === 'needs-pick') {
+      // Defer one tick so the TopBar has mounted its listener.
+      const t = setTimeout(() => {
+        window.dispatchEvent(new CustomEvent(SCOPE_NEEDS_PICK_EVENT));
+      }, 0);
+      return () => clearTimeout(t);
+    }
+  }, [bootstrap.status]);
+
+  if (bootstrap.status === 'loading') {
+    return <ValidatingScreen />;
+  }
+
+  if (showSetup) {
+    return <StarterSetup onComplete={() => setForceSetup(false)} />;
+  }
+
+  return <>{children}</>;
+}
+

@@ -144,6 +144,16 @@ async fn provider_builder_uses_backend_defaults_for_openai_style_backends() {
             path: "/chat/completions",
             model: "default",
         },
+        BackendCase {
+            backend: Backend::Zai,
+            path: "/chat/completions",
+            model: "glm-4.7",
+        },
+        BackendCase {
+            backend: Backend::ZaiCoding,
+            path: "/chat/completions",
+            model: "glm-4.7",
+        },
     ];
 
     for case in cases {
@@ -210,7 +220,14 @@ fn provider_builder_requires_endpoint_for_generic_backend() {
 }
 
 #[tokio::test]
-async fn bedrock_rejects_tools_and_structured_output_until_supported() {
+async fn bedrock_rejects_structured_output_until_supported() {
+    // Tools are now supported on the Converse path (see
+    // `tests/bedrock_converse_tools.rs` and the module-level
+    // `build_tool_config` / `chat_message_to_converse` unit tests).
+    // Structured output is still unsupported — we don't map JSON schema
+    // into Converse's `additionalModelRequestFields` shim yet. This test
+    // guards the remaining `Unsupported` surface so the error stays
+    // consistent until the schema path lands.
     let provider = ProviderBuilder::new(Backend::Bedrock)
         .api_key("bedrock-key")
         .model("anthropic.claude-3-7-sonnet")
@@ -218,19 +235,6 @@ async fn bedrock_rejects_tools_and_structured_output_until_supported() {
         .build_chat()
         .expect("bedrock builder should succeed");
 
-    let tool = Tool {
-        tool_type: "function".to_owned(),
-        function: cairn_providers::chat::FunctionDef {
-            name: "search".to_owned(),
-            description: "search docs".to_owned(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "q": { "type": "string" }
-                }
-            }),
-        },
-    };
     let schema = StructuredOutput {
         name: "result".to_owned(),
         description: None,
@@ -244,12 +248,22 @@ async fn bedrock_rejects_tools_and_structured_output_until_supported() {
     };
 
     let error = provider
-        .chat_with_tools(&[ChatMessage::user("hello")], Some(&[tool]), Some(schema))
+        .chat_with_tools(&[ChatMessage::user("hello")], None, Some(schema))
         .await
-        .expect_err("bedrock should reject tools/schema until implemented");
+        .expect_err("bedrock should reject structured output until implemented");
 
     assert!(
-        matches!(error, ProviderError::Unsupported(message) if message.contains("does not support tools or structured output"))
+        matches!(error, ProviderError::Unsupported(message) if message.contains("structured output"))
     );
+    // Still round-trip the imports so an accidental unused-import
+    // regression catches drift here.
+    let _ = Tool {
+        tool_type: "function".to_owned(),
+        function: cairn_providers::chat::FunctionDef {
+            name: "noop".to_owned(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+        },
+    };
     let _ = ToolChoice::Auto;
 }

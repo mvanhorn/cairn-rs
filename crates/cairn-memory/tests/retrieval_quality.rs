@@ -573,10 +573,10 @@ async fn stale_chunks_score_lower_on_freshness() {
 
     // Fresh chunk must score significantly higher.
     assert!(
-        fresh_result.breakdown.freshness > stale_result.breakdown.freshness,
-        "fresh chunk freshness ({:.4}) must exceed stale chunk freshness ({:.4})",
-        fresh_result.breakdown.freshness,
-        stale_result.breakdown.freshness
+        fresh_result.breakdown.freshness_decay > stale_result.breakdown.freshness_decay,
+        "fresh chunk freshness_decay ({:.4}) must exceed stale chunk freshness_decay ({:.4})",
+        fresh_result.breakdown.freshness_decay,
+        stale_result.breakdown.freshness_decay
     );
     assert!(
         fresh_result.score > stale_result.score,

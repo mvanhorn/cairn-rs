@@ -182,6 +182,33 @@ impl Client {
             }
         }
     }
+
+    /// Poll `GET /v1/tasks/:id` until it returns 200 or the deadline
+    /// fires. The bridge populates the task projection on a separate
+    /// task from FF's `submit_task_execution`, so the claim-then-
+    /// operate sequence must wait for eventual consistency before
+    /// invoking `claim_task_handler` (which reads the projection
+    /// via `load_task_visible_to_tenant` first).
+    async fn wait_for_task_visible(&mut self, task_id: &str) -> bool {
+        let url = format!("{}/v1/tasks/{}", self.base, task_id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(resp) = self.inner.get(&url).bearer_auth(&self.token).send().await {
+                if resp.status().as_u16() == 200 {
+                    println!("  ✓ task visible before claim");
+                    self.passes += 1;
+                    return true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                self.failures
+                    .push(format!("task {task_id} not visible within 5s"));
+                println!("  ✗ task {task_id} not visible within 5s");
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 }
 
 #[tokio::main]
@@ -192,12 +219,6 @@ async fn main() -> ExitCode {
         opts.base, opts.run_id, opts.task_id, opts.session_id
     );
     let mut c = Client::new(&opts);
-
-    let project = json!({
-        "tenant_id": opts.tenant,
-        "workspace_id": opts.workspace,
-        "project_id": opts.project,
-    });
 
     // ── Create session + run ───────────────────────────────────────────────
     c.post(
@@ -227,38 +248,36 @@ async fn main() -> ExitCode {
     )
     .await;
 
-    // ── Submit task + claim it (required before any lease-scoped op) ──────
-    let ownership = json!({
-        "scope": "project",
-        "tenant_id": opts.tenant,
-        "workspace_id": opts.workspace,
-        "project_id": opts.project,
-    });
-    let source = json!({ "source_type": "runtime" });
-    let envelope = json!([{
-        "event_id": format!("evt_t_{}", opts.task_id),
-        "source": source,
-        "ownership": ownership,
-        "causation_id": null,
-        "correlation_id": null,
-        "payload": {
-            "event": "task_created",
-            "project": project,
+    // ── Submit task via the operator path + claim it ──────────────────────
+    // `POST /v1/tasks` is the operator-contract submit path
+    // (`create_task_handler` → `TaskService::submit`): it mints the FF
+    // execution, registers it with the control-plane, and emits
+    // `TaskCreated` via the bridge, so projections + FF state stay
+    // in lockstep and the subsequent claim is guaranteed to find the
+    // execution FF has on record.
+    c.post(
+        "POST /v1/tasks (operator submit path)",
+        "/v1/tasks",
+        json!({
+            "tenant_id": opts.tenant,
+            "workspace_id": opts.workspace,
+            "project_id": opts.project,
             "task_id": opts.task_id,
             "parent_run_id": opts.run_id,
             "parent_task_id": null,
-            "prompt_release_id": null,
-        }
-    }]);
-    c.post(
-        "POST /v1/events/append (TaskCreated)",
-        "/v1/events/append",
-        envelope,
+            "priority": 0,
+        }),
         201,
     )
     .await;
 
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    // Wait for the projection to catch up. `POST /v1/tasks` returns as
+    // soon as FF confirms submit, but the bridge-driven projection
+    // upsert runs on a separate task and `claim_task_handler` reads the
+    // projection first (via `load_task_visible_to_tenant`). Without the
+    // poll a fast CI could race and see a 404 on a freshly-submitted
+    // task.
+    c.wait_for_task_visible(&opts.task_id).await;
 
     let claimed = c
         .post(
@@ -273,12 +292,27 @@ async fn main() -> ExitCode {
         .await;
     if let Some(body) = &claimed {
         let got = body.get("state").and_then(|s| s.as_str()).unwrap_or("");
-        if got == "leased" {
-            println!("  ✓ task state=leased after claim");
+        // Under the operator-path (`POST /v1/tasks` → service submit),
+        // FF auto-advances the execution through `leased` to `running`
+        // as part of the grant+claim sequence. Either state is a
+        // successful claim for this fixture — both carry a populated
+        // lease_owner + lease_expires_at, which is what the
+        // claim-then-operate sequence below actually needs.
+        if matches!(got, "leased" | "running") {
+            println!("  ✓ task state={got} after claim");
+            c.passes += 1;
+        } else {
+            c.failures.push(format!(
+                "task state after claim = {got:?}, want leased or running",
+            ));
+        }
+        let has_lease = body.get("lease_owner").and_then(|v| v.as_str()).is_some();
+        if has_lease {
+            println!("  ✓ lease_owner populated after claim");
             c.passes += 1;
         } else {
             c.failures
-                .push(format!("task state after claim = {got:?}, want leased"));
+                .push("lease_owner missing after claim".to_owned());
         }
     }
 

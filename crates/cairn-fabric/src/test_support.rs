@@ -7,9 +7,25 @@
 //! typically one that accepts `&TestHarness` so it threads the
 //! cluster-wide `partition_config()` through.
 
-use ff_core::partition::PartitionConfig;
-use ff_core::types::{ExecutionId, LaneId};
+use flowfabric::core::backend::BackendConfig;
+use flowfabric::core::partition::PartitionConfig;
+use flowfabric::core::types::{ExecutionId, LaneId};
 use uuid::Uuid;
+
+/// Default `BackendConfig` for unit tests that only need *some* backend
+/// value populated (e.g. capability-threading tests that never hit the
+/// backend at all).
+///
+/// Picks whichever backend is available under the current feature set.
+/// Today that's always Valkey (cairn-fabric is still Valkey-only). When
+/// PR-B lands the `valkey`/`postgres` cargo feature gate, this helper
+/// is the single place to switch — unit tests that call it will Just
+/// Work under `--no-default-features` or `--features postgres-only`
+/// instead of breaking on a hard-coded `BackendConfig::valkey(..)`
+/// literal in the test body (see issue #508).
+pub(crate) fn default_test_backend() -> BackendConfig {
+    BackendConfig::valkey("localhost", 6379)
+}
 
 /// Mint a deterministic-but-distinct `ExecutionId` for tests.
 ///

@@ -1,14 +1,18 @@
-import { useRef } from 'react';
+import { useMemo, useRef } from 'react';
 import { useQuery, useQueryClient, useMutation } from '@tanstack/react-query';
 import { ChevronRight, RefreshCw, Plus, Upload } from 'lucide-react';
 import { DataTable } from '../components/DataTable';
 import { StatCard } from '../components/StatCard';
 import { ErrorFallback } from '../components/ErrorFallback';
+import { EmptyScopeHint } from '../components/EmptyScopeHint';
 import { useToast } from '../components/Toast';
 import { clsx } from 'clsx';
 import { defaultApi } from '../lib/api';
+import { errorMessage } from '../lib/errors';
 import { sectionLabel } from '../lib/design-system';
 import type { SessionRecord, SessionState } from '../lib/types';
+import { EntityExplainer } from '../components/EntityExplainer';
+import { ENTITY_EXPLAINERS } from '../lib/entityExplainers';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -88,11 +92,21 @@ export function SessionsPage() {
       toast.success(`Session ${s.session_id} created`);
       qc.invalidateQueries({ queryKey: ['sessions'] });
     },
-    onError: () => toast.error('Failed to create session'),
+    // #378: surface backend message — scope, tenant-auth, or uniqueness
+    // reasons all have distinct operator-actionable text that was being
+    // discarded by the previous zero-arg handler.
+    onError: (e) => toast.error(errorMessage(e, 'Failed to create session.')),
   });
 
   const list = sessions ?? [];
-  const runCountFor = (id: string) => (allRuns ?? []).filter(r => r.session_id === id).length;
+  const runsBySession = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of allRuns ?? []) {
+      m.set(r.session_id, (m.get(r.session_id) ?? 0) + 1);
+    }
+    return m;
+  }, [allRuns]);
+  const runCountFor = (id: string) => runsBySession.get(id) ?? 0;
   const activeNow   = list.filter(s => s.state === 'open').length;
 
   /** Parse a JSON file chosen by the user and POST it to /v1/sessions/import. */
@@ -107,7 +121,7 @@ export function SessionsPage() {
         toast.success('Session imported successfully.');
         void qc.invalidateQueries({ queryKey: ['sessions'] });
       } catch (err) {
-        toast.error(err instanceof Error ? err.message : 'Import failed — invalid JSON or incompatible format.');
+        toast.error(errorMessage(err, 'Import failed — invalid JSON or incompatible format.'));
       }
       // Reset input so the same file can be re-imported if needed.
       if (importRef.current) importRef.current.value = '';
@@ -119,7 +133,10 @@ export function SessionsPage() {
     <div className="p-6 space-y-5">
       {/* Toolbar */}
       <div className="flex items-center justify-between">
-        <p className={`${sectionLabel} mb-0`}>Sessions</p>
+        <div className="min-w-0">
+          <p className={`${sectionLabel} mb-0`}>Sessions</p>
+          <EntityExplainer className="mt-1">{ENTITY_EXPLAINERS.sessionsList}</EntityExplainer>
+        </div>
         <div className="flex items-center gap-2">
           <button onClick={() => refetch()} className="flex items-center gap-1.5 rounded-md bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 px-2.5 py-1.5 text-[11px] text-gray-400 dark:text-zinc-500 hover:bg-white/5 transition-colors">
             <RefreshCw size={11} className={clsx(isFetching && 'animate-spin')} /> Refresh
@@ -181,6 +198,8 @@ export function SessionsPage() {
           emptyText="No sessions yet — click New Session above to create one."
         />
       )}
+
+      <EmptyScopeHint empty={list.length === 0} />
     </div>
   );
 }

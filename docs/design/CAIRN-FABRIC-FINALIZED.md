@@ -58,8 +58,8 @@ unsupported (FF is the only correctness-guaranteed path).
 | `CAIRN_FABRIC_WAITPOINT_HMAC_SECRET` | unset (boot fails) | env var | 64-char hex (32-byte) HMAC secret. **Required** — boot aborts with `FabricError::Config` if unset (no silent degrade). |
 | `CAIRN_FABRIC_WAITPOINT_HMAC_KID` | `k1` when secret set | env var | Kid for the HMAC secret. Must be non-empty and free of `:` (FF field-name delimiter). |
 | `CAIRN_FABRIC_WORKER_CAPABILITIES` | empty set | env var | Comma-separated capability tokens. Passed to `ff_scheduler::Scheduler::claim_for_worker`. Empty = matches only executions with no capability requirements. |
-| `CAIRN_FABRIC_HOST` / `_PORT` / `_TLS` / `_CLUSTER` | `localhost` / `6379` / off / off | env var | Valkey connection. `_CLUSTER=1` uses cluster mode; all FCALL KEYS on a single `{p:N}` hash tag so this is cluster-safe without extra wiring. |
-| `CAIRN_FABRIC_LEASE_TTL_MS` / `_GRANT_TTL_MS` | `30_000` / `5_000` | env var | Timing knobs. |
+| `CAIRN_FABRIC_URL` | `valkey://localhost:6379` | env var | Backend connection URL. Schemes: `valkey://` (plain) and `rediss://` (TLS). Query params `?tls=1&cluster=1` toggle Valkey flags (`cluster=1` uses cluster mode; all FCALL KEYS on a single `{p:N}` hash tag so this is cluster-safe without extra wiring). |
+| `CAIRN_FABRIC_LEASE_TTL_MS` / `_GRANT_TTL_MS` | `180_000` / `5_000` | env var | Timing knobs. Lease default bumped 30s → 180s in F63 to match pull-mode orchestrate cadence (operator approvals + LLM tail + tool exec routinely exceed 30s); see [FF#371](https://github.com/avifenesh/FlowFabric/issues/371) for the upstream dual-door-deadlock root cause this default mitigates. |
 
 ---
 
@@ -75,8 +75,7 @@ that requires Valkey at boot. To get a Fabric-backed deployment up:
 3. Generate a 32-byte HMAC secret: `openssl rand -hex 32`.
 4. Set env vars before boot. The HMAC secret is **required** — boot fails loud if it's missing:
    ```bash
-   export CAIRN_FABRIC_HOST=valkey.internal
-   export CAIRN_FABRIC_PORT=6379
+   export CAIRN_FABRIC_URL=valkey://valkey.internal:6379
    export CAIRN_FABRIC_WAITPOINT_HMAC_SECRET=<64-hex>
    export CAIRN_FABRIC_WAITPOINT_HMAC_KID=prod-2026-04
    ```
@@ -111,7 +110,7 @@ cairn-app integration tests under `crates/cairn-app/tests/` boot
 read method (`get` / `list_by_session` / …) to the projection store and
 returns `RuntimeError::Internal` on every mutation. The fixture wires
 into `AppBootstrap::router_with_injected_runtime`, which accepts a
-caller-provided `InMemoryServices`.
+caller-provided `RuntimeServices` (renamed from `InMemoryServices` under RFC-025 Phase 4 — see `docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md`).
 
 Running the production binary (`cargo run -p cairn-app`) without a
 reachable Valkey will fail at boot with `FabricError::Config` — this is
@@ -122,12 +121,12 @@ intentional (no silent degrade).
 Post kill-in-memory-runtime, there is exactly one backing for
 Run/Task/Session services: `Fabric{Run,Task,Session}ServiceAdapter`
 against Valkey + FF. `AppState::new` wires it unconditionally;
-`InMemoryServices::with_store_and_core(store, runs, tasks, sessions)` is
-the only factory.
+`RuntimeServices::with_store_and_core(store, runs, tasks, sessions)` is
+the only factory (was `InMemoryServices` pre-RFC-025-Phase-4).
 
 The courtesy in-memory `RunServiceImpl` / `TaskServiceImpl` /
 `SessionServiceImpl` backings, together with their
-`InMemoryServices::{new, with_store, with_fabric}` constructors, existed
+historical `InMemoryServices::{new, with_store, with_fabric}` constructors (the struct is now `RuntimeServices` after RFC-025 Phase 4) existed
 during the Fabric migration as a compile-time escape hatch. Post
 migration they carried no correctness guarantees (state transitions
 drifted from Fabric's, no scanner lifecycle participation) and were

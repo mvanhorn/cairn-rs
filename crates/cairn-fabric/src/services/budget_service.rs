@@ -21,7 +21,7 @@
 //! §2.6 for the full rationale.
 use std::sync::Arc;
 
-use ff_core::types::{BudgetId, ExecutionId};
+use flowfabric::core::types::{BudgetId, ExecutionId};
 use uuid::Uuid;
 
 use crate::engine::control_plane::ControlPlaneBackend;
@@ -187,8 +187,18 @@ impl FabricBudgetService {
         .await
     }
 
-    pub async fn release_budget(&self, budget_id: &BudgetId) -> Result<(), FabricError> {
-        self.backend.release_budget(budget_id).await
+    /// Release this execution's attribution against a budget.
+    ///
+    /// Per-execution (not whole-budget flush): reverses the execution's
+    /// contribution to the aggregate counter. The budget persists
+    /// across executions. Routes through FF 0.13's typed
+    /// `EngineBackend::release_budget`.
+    pub async fn release_budget(
+        &self,
+        budget_id: &BudgetId,
+        execution_id: &ExecutionId,
+    ) -> Result<(), FabricError> {
+        self.backend.release_budget(budget_id, execution_id).await
     }
 
     /// Record spend against a budget. Returns the cairn-native

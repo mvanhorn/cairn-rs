@@ -33,11 +33,15 @@ pub const OPENAPI_JSON: &str = r##"{
     "schemas": {
       "Error": {
         "type": "object",
+        "description": "Canonical error envelope. Every HTTP error response uses this shape: `status_code` mirrors the HTTP status, `code` is a stable machine-readable sentinel, `message` is a human-readable operator message, and `request_id` is the correlation id (also echoed in the `x-request-id` response header). Some errors carry additional structured context under `details` — this field is optional and its schema is endpoint-specific (e.g. rotate-waitpoint-hmac returns partition breakdown; all_providers_exhausted returns per-attempt diagnostics).",
         "properties": {
-          "code":    { "type": "string" },
-          "message": { "type": "string" }
+          "status_code": { "type": "integer", "format": "int32", "description": "HTTP status code echoed in the body for parsers that inspect JSON only." },
+          "code":        { "type": "string", "description": "Stable machine-readable error sentinel (e.g. `not_found`, `invalid_state_transition`, `lease_expired`, `all_providers_exhausted`)." },
+          "message":     { "type": "string", "description": "Human-readable operator message. Must not carry internal details such as SQL fragments, driver error text, or credential-adjacent fragments (SEC-007)." },
+          "request_id":  { "type": "string", "nullable": true, "description": "Per-request correlation id; also emitted as the `x-request-id` response header. The key is always present; the value is `null` when the handler has not been instrumented to thread the id into the body (the header still carries it)." },
+          "details":     { "type": "object", "nullable": true, "description": "Optional endpoint-specific structured context. Schema varies by endpoint. Absent for most errors; some endpoints emit `null` explicitly.", "additionalProperties": true }
         },
-        "required": ["code", "message"]
+        "required": ["status_code", "code", "message", "request_id"]
       },
       "ProjectKey": {
         "type": "object",
@@ -49,14 +53,280 @@ pub const OPENAPI_JSON: &str = r##"{
       },
       "SessionRecord": {
         "type": "object",
+        "description": "Current-state projection of a session. F65 PR-1 adds `goal_title`, `issue_budget`, `max_attempts`, and `attempts_used`; all are additive and carry serde defaults so legacy event logs deserialize cleanly.",
         "properties": {
           "session_id":  { "type": "string" },
           "project":     { "$ref": "#/components/schemas/ProjectKey" },
           "state":       { "type": "string", "enum": ["open","completed","failed","archived"] },
           "version":     { "type": "integer" },
           "created_at":  { "type": "integer", "description": "Unix ms" },
-          "updated_at":  { "type": "integer" }
+          "updated_at":  { "type": "integer" },
+          "goal_title":     { "type": "string", "nullable": true, "description": "F65: operator-visible short title describing the session's goal. Empty on legacy-shape replay." },
+          "issue_budget":   { "$ref": "#/components/schemas/IssueBudget", "nullable": true, "description": "F65: per-session budget envelope. Null means no session-level override." },
+          "max_attempts":   { "type": "integer", "description": "F65: maximum session attempts. Defaults to 5 when absent on replay." },
+          "attempts_used":  { "type": "integer", "description": "F65: count of attempts used so far within the session." }
         }
+      },
+      "IssueBudget": {
+        "type": "object",
+        "description": "F65: per-session budget envelope. Every field is optional — `null` at any field means 'unlimited at this layer'; circuit-breaker enforcement (PR-3) falls back to per-run defaults when a field is absent.",
+        "properties": {
+          "max_tokens":       { "type": "integer", "nullable": true, "description": "Cap on total LLM tokens (input + output) spent across the session." },
+          "max_cost_micros":  { "type": "integer", "nullable": true, "description": "Cap on total provider cost, in USD micros (1 USD = 1_000_000). Integer-valued to match the codebase-wide cost convention." },
+          "max_wall_seconds": { "type": "integer", "nullable": true, "description": "Cap on wall-clock seconds elapsed from first attempt start to terminal outcome." }
+        }
+      },
+      "BreakerKind": {
+        "type": "string",
+        "description": "F65: kinds of circuit breakers enforced by the orchestrator in PR-3.",
+        "enum": ["round", "tokens", "no_tool_use_consecutive", "wall_clock"]
+      },
+      "BreakerOverrides": {
+        "type": "object",
+        "description": "F65 PR-3: per-run overrides for any subset of the four circuit-breaker caps. Tighten-only — each override must be less than or equal to the corresponding operator-configured default resolved via the RuntimeConfig 3-layer fallback (store → env → default). Loosening requests return HTTP 400 `invalid_breaker_override`.",
+        "properties": {
+          "round_cap":          { "type": "integer", "nullable": true, "description": "Cap on orchestrator iterations (tighter than default only)." },
+          "token_cap":          { "type": "integer", "nullable": true, "description": "Cap on cumulative LLM tokens (input + output). Tighter than default only." },
+          "no_tool_use_streak": { "type": "integer", "nullable": true, "description": "Cap on consecutive DECIDE rounds with zero tool-use proposals. Tighter than default only." },
+          "wall_clock_ms":      { "type": "integer", "nullable": true, "description": "Cap on wall-clock milliseconds from orchestrator loop start. Tighter than default only." }
+        }
+      },
+      "OrchestrateRequest": {
+        "type": "object",
+        "description": "F65 PR-3: request body for POST /v1/runs/{id}/orchestrate. All fields optional. `breaker_overrides` tightens the operator-configured defaults on a per-run basis.",
+        "properties": {
+          "goal":                { "type": "string", "nullable": true },
+          "max_iterations":      { "type": "integer", "nullable": true, "description": "Legacy iteration cap. Still enforced independently of `breaker_overrides.round_cap` — whichever cap is tighter wins. If both are provided the run terminates under `MaxIterationsReached` or `BreakerTripped(Round)` respectively depending on which one fires first." },
+          "timeout_ms":          { "type": "integer", "nullable": true, "description": "Legacy wall-clock timeout. Still enforced independently of `breaker_overrides.wall_clock_ms` — whichever cap is tighter wins. If both are provided the run terminates under `TimedOut` or `BreakerTripped(WallClock)` respectively depending on which one fires first." },
+          "mode":                { "type": "string", "enum": ["direct", "plan", "execute"], "nullable": true },
+          "approval_timeout_ms": { "type": "integer", "nullable": true },
+          "breaker_overrides":   { "$ref": "#/components/schemas/BreakerOverrides", "nullable": true }
+        }
+      },
+      "ApprovePlanRequest": {
+        "type": "object",
+        "description": "Request body for POST /v1/runs/{id}/approve (RFC 018 plan review). Typed + `deny_unknown_fields` per #427 — unknown keys (e.g. `reviewerComments` camelCase) return 422.",
+        "additionalProperties": false,
+        "properties": {
+          "reviewer_comments": { "type": "string", "nullable": true, "description": "Optional operator note attached to the approval audit event." }
+        }
+      },
+      "RejectPlanRequest": {
+        "type": "object",
+        "description": "Request body for POST /v1/runs/{id}/reject (RFC 018 plan review). Typed + `deny_unknown_fields` per #427.",
+        "additionalProperties": false,
+        "properties": {
+          "reason": { "type": "string", "nullable": true, "description": "Optional operator-provided reason. Defaults to \"rejected by operator\" when omitted or empty." }
+        }
+      },
+      "RevisePlanRequest": {
+        "type": "object",
+        "description": "Request body for POST /v1/runs/{id}/revise (RFC 018 plan review). Typed + `deny_unknown_fields` per #427.",
+        "additionalProperties": false,
+        "properties": {
+          "reviewer_comments": { "type": "string", "description": "Required. An empty string returns 400." }
+        },
+        "required": ["reviewer_comments"]
+      },
+      "RunCostAlertResponse": {
+        "type": "object",
+        "description": "Response body for POST /v1/runs/{id}/cost-alert — #431. Returns the created alert so the UI does not need a follow-up GET to learn the value it just set.",
+        "properties": {
+          "run_id":           { "type": "string" },
+          "tenant_id":        { "type": "string" },
+          "threshold_micros": { "type": "integer", "format": "int64", "minimum": 0 }
+        },
+        "required": ["run_id", "tenant_id", "threshold_micros"]
+      },
+      "PatchSourceRequest": {
+        "type": "object",
+        "description": "Partial-update request body for PATCH /v1/sources/{id} (#426). `name` and `description` are optional; absent fields preserve the current value. `deny_unknown_fields` — any unknown key returns 422. PR #555 review (Copilot): explicit `null` is NOT a way to clear a field — omit the key instead. The handler collapses `null` to the same as missing via `#[serde(default)] Option<String>`.",
+        "additionalProperties": false,
+        "properties": {
+          "tenant_id":    { "type": "string" },
+          "workspace_id": { "type": "string" },
+          "project_id":   { "type": "string" },
+          "name":         { "type": "string" },
+          "description":  { "type": "string" }
+        },
+        "required": ["tenant_id", "workspace_id", "project_id"]
+      },
+      "OrchestrateTerminationBreakerTripped": {
+        "type": "object",
+        "description": "F65 PR-3: response body shape for `termination = \"breaker_tripped\"`. HTTP 200 — the run was cleanly terminated by a circuit-breaker trip; the run's `state` is flipped to the terminal `Failed` state with `FailureClass::ExecutionError` before the response returns.",
+        "properties": {
+          "termination":  { "type": "string", "enum": ["breaker_tripped"] },
+          "which":        { "$ref": "#/components/schemas/BreakerKind" },
+          "measured":     { "type": "integer" },
+          "limit":        { "type": "integer" },
+          "at_iteration": { "type": "integer" }
+        },
+        "required": ["termination", "which", "measured", "limit", "at_iteration"]
+      },
+      "CircuitBreakerTrip": {
+        "type": "object",
+        "description": "F65: one circuit-breaker trip event.",
+        "properties": {
+          "which":        { "$ref": "#/components/schemas/BreakerKind" },
+          "measured":     { "type": "integer", "description": "Measured value that crossed the limit." },
+          "limit":        { "type": "integer", "description": "Configured limit that was exceeded." },
+          "at_iteration": { "type": "integer", "description": "0-based iteration number at which the trip was observed." }
+        },
+        "required": ["which", "measured", "limit", "at_iteration"]
+      },
+      "TerminationReason": {
+        "type": "object",
+        "description": "F65: exhaustive classification of why a session attempt ended. `kind` is the discriminator; the payload fields depend on the kind.",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "complete_run",
+              "circuit_breaker_tripped",
+              "lease_lost",
+              "provider_error",
+              "operator_cancel",
+              "crashed"
+            ]
+          },
+          "which":        { "$ref": "#/components/schemas/BreakerKind", "description": "Present only when `kind == circuit_breaker_tripped`." },
+          "measured":     { "type": "integer", "description": "Present only when `kind == circuit_breaker_tripped`." },
+          "limit":        { "type": "integer", "description": "Present only when `kind == circuit_breaker_tripped`." },
+          "at_iteration": { "type": "integer", "description": "Present only when `kind == circuit_breaker_tripped`." },
+          "message":      { "type": "string", "description": "Present when `kind` is `provider_error` or `crashed`." }
+        },
+        "required": ["kind"]
+      },
+      "SessionOutcome": {
+        "type": "object",
+        "description": "F65: rich terminal envelope emitted once per session when it closes. PR-1 defines the shape; PR-6 wires the summarizer that populates `compacted_summary` and `next_step_hint`.",
+        "properties": {
+          "session_id":            { "type": "string" },
+          "root_run_id":           { "type": "string" },
+          "project":               { "$ref": "#/components/schemas/ProjectKey" },
+          "checkpoint_id":         { "type": "string" },
+          "workspace_snapshot_id": { "type": "string", "nullable": true, "description": "Workspace snapshot captured for this outcome. Null on ephemeral backends." },
+          "termination_reason":    { "$ref": "#/components/schemas/TerminationReason" },
+          "compacted_summary":     { "type": "string", "description": "JSON-encoded summary produced by the LLM summarizer in PR-6. Empty-string placeholder on pre-PR-6 outcomes." },
+          "next_step_hint":        { "type": "string", "nullable": true },
+          "cost_micros":           { "type": "integer", "description": "Total provider cost in USD micros (1 USD = 1_000_000)." },
+          "emitted_at":            { "type": "integer", "description": "Unix-epoch ms." }
+        },
+        "required": ["session_id", "root_run_id", "project", "checkpoint_id", "termination_reason", "compacted_summary", "cost_micros", "emitted_at"]
+      },
+      "CreateRunRequest": {
+        "type": "object",
+        "description": "Body for POST /v1/runs. RFC 032 PR-5 adds the optional `completion_contract` field — the operator-declared definition-of-done for the run. When present the handler validates the contract, rejects File-variant contracts on runs with no persistent workspace (allowlisted repo OR registered local_fs path), and persists the contract under the run's per-run defaults so the first orchestrate boot grades `complete_run` against it. Omitted → cairn infers a contract from the goal text on the first orchestrate boot.",
+        "properties": {
+          "tenant_id":      { "type": "string" },
+          "workspace_id":   { "type": "string" },
+          "project_id":     { "type": "string" },
+          "session_id":     { "type": "string" },
+          "run_id":         { "type": "string" },
+          "parent_run_id":  { "type": "string", "nullable": true },
+          "mode":           { "type": "string", "nullable": true, "description": "RFC 018 execution mode: `direct` | `plan` | `execute`." },
+          "prompt":         { "type": "string", "nullable": true, "description": "F42: operator-supplied natural-language objective for this run. Persisted as the run's `goal` default." },
+          "completion_contract": {
+            "$ref": "#/components/schemas/CompletionContract",
+            "nullable": true,
+            "description": "RFC 032: optional operator-declared contract. When omitted, the gate infers from `prompt` at the first orchestrate boot."
+          }
+        },
+        "required": ["tenant_id", "workspace_id", "project_id", "session_id", "run_id"]
+      },
+      "CompletionContract": {
+        "type": "object",
+        "description": "RFC 032: operator-declared definition-of-done for a run's `complete_run` action. Uses the `tag = kind` discriminator convention. Six variants ship in Phase 1 (`prose_non_empty`, `prose`, `file`, `pull_request`, plus Phase-2 `structured` and Phase-3 `external_state` variants whose verifiers currently return `not_implemented`). See RFC 032 §1 for full shape.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": { "kind": { "const": "prose_non_empty" } },
+            "required": ["kind"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "prose" },
+              "min_chars": { "type": "integer" },
+              "min_citations": { "type": "integer" }
+            },
+            "required": ["kind", "min_chars", "min_citations"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "file" },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "path": { "type": "string", "description": "Relative path under working_dir. Absolute paths, `.`, and `..` components reject at deserialize time." },
+                    "contains_regex": { "type": "string", "nullable": true, "description": "Optional contains-regex applied to file contents via BoundedRegex (64 KiB / 256 KiB compile-memory caps)." },
+                    "max_bytes": { "type": "integer", "nullable": true, "description": "Optional size cap. Absent = no size check. Ceiling 1 GiB." }
+                  },
+                  "required": ["path"]
+                }
+              }
+            },
+            "required": ["kind", "paths"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "pull_request" },
+              "expected_repo": { "type": "string", "nullable": true, "description": "owner/repo. When set, MUST be on the run's project allowlist — cairn rejects cross-tenant reads." },
+              "expected_head_branch": { "type": "string", "nullable": true, "description": "BoundedRegex matched against the PR's head branch." },
+              "must_be_open": { "type": "boolean", "description": "Default true. Set false to accept merged PRs." }
+            },
+            "required": ["kind", "must_be_open"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "structured" },
+              "schema": {
+                "anyOf": [
+                  { "type": "object" },
+                  { "type": "boolean" }
+                ],
+                "description": "Operator-supplied JSON Schema (cap 32 KiB). Per JSON Schema Draft-7 root-type rules the document must be an object OR a boolean; both shapes deserialize. Verifier is Phase 2; Phase 1 returns `not_implemented`."
+              }
+            },
+            "required": ["kind", "schema"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "external_state" },
+              "check": { "$ref": "#/components/schemas/ExternalStateCheck" }
+            },
+            "required": ["kind", "check"]
+          }
+        ]
+      },
+      "ExternalStateCheck": {
+        "description": "RFC 032 Phase 3: external-system check the `external_state` verifier grades against. Tagged union on `kind`. Phase 1 returns `not_implemented` for all variants; the wire shape is defined so operator/LLM declarations validate up front.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "github_issue_closed" },
+              "repo": { "type": "string", "description": "owner/repo" },
+              "number": { "type": "integer", "description": "Issue number (>= 1)." }
+            },
+            "required": ["kind", "repo", "number"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "github_pr_merged" },
+              "repo": { "type": "string" },
+              "number": { "type": "integer" }
+            },
+            "required": ["kind", "repo", "number"]
+          }
+        ]
       },
       "RunRecord": {
         "type": "object",
@@ -72,8 +342,114 @@ pub const OPENAPI_JSON: &str = r##"{
           "failure_class": { "type": "string", "nullable": true },
           "version":       { "type": "integer" },
           "created_at":    { "type": "integer" },
-          "updated_at":    { "type": "integer" }
+          "updated_at":    { "type": "integer" },
+          "root_run_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "#670 G4 / RFC 027: the root run of this run's subagent tree. Populated on root runs at `RunCreated` time (equal to `run_id`). Left NULL on non-root runs until the embedded Child Run Driver spawn path (PR-1b-3) sets it atomically alongside the root's `in_flight_descendants` increment. Operator dashboards use this to group a root with every descendant it spawned."
+          },
+          "in_flight_descendants": {
+            "type": "integer",
+            "nullable": true,
+            "description": "#670 G4 / RFC 027: count of live (non-terminal) descendant subagent runs rooted at this run. Only meaningful on roots; always 0 on non-roots. Mutated atomically by the Child Run Driver: incremented on spawn (gated by the per-root descendant cap), decremented when a descendant reaches a terminal state. Negative values are an auditable signal of underflow, not a panic — monitored via `child_run_driver_descendant_underflow_total`."
+          },
+          "terminal_write_recovery": {
+            "$ref": "#/components/schemas/TerminalRecoveryRecord",
+            "nullable": true,
+            "description": "F64: present only when the cairn-side terminal-write recovery loop fired for this run (the bridge workaround for FF#371). Omitted on the hot path."
+          },
+          "subagents_spawned": {
+            "type": "integer",
+            "nullable": true,
+            "description": "#661: count of child runs (`spawn_subagent` delegations) observed for this run. Populated by `GET /v1/runs/:id` (detail) — omitted from list responses to keep the batch shape flat. Counted from `RunReadModel::list_by_parent_run`; includes non-terminal children."
+          },
+          "subagents_completed": {
+            "type": "integer",
+            "nullable": true,
+            "description": "#661: child runs that reached `completed` terminal state. Populated alongside `subagents_spawned` by the detail endpoint."
+          },
+          "subagents_failed": {
+            "type": "integer",
+            "nullable": true,
+            "description": "#661: child runs that reached `failed` or `canceled` terminal state. `canceled` is aggregated here because an operator cancelling a delegated child saw the delegation as unsuccessful."
+          }
         }
+      },
+      "TerminalRecoveryRecord": {
+        "type": "object",
+        "description": "F64: summary of the most recent terminal-write recovery loop, if one fired for this run. Bridge workaround for the FF#371 dual-door deadlock. Retained for historical audit even after the upstream fix lands — only the active retry-loop code retires at that point; the schema + OpenAPI field stay so existing annotations remain inspectable.",
+        "properties": {
+          "fcall":         { "type": "string", "description": "Which terminal FCALL the loop wrapped: `complete`, `fail`, or `cancel`." },
+          "attempts":      { "type": "integer", "description": "Number of re-claim + retry attempts (>= 1)." },
+          "wall_time_ms":  { "type": "integer", "description": "Milliseconds spent in the recovery loop (sum of backoff sleeps + FCALL round-trips)." },
+          "outcome":       {
+            "type": "string",
+            "description": "Machine-readable recovery result. `recovered` = retry succeeded. `deadlocked` = schedule exhausted, F62 TerminalWriteDeadlock fallback fired. `non_transient_retry_error` / `non_transient_reclaim_error` = audit-only diagnostic strings for non-transient errors inside the loop. Dashboards should surface `recovered` + `deadlocked` prominently.",
+            "enum": ["recovered", "deadlocked", "non_transient_retry_error", "non_transient_reclaim_error"]
+          },
+          "occurred_at_ms":{ "type": "integer", "description": "Wall-clock ms when the loop finished." }
+        },
+        "required": ["fcall", "attempts", "wall_time_ms", "outcome", "occurred_at_ms"]
+      },
+      "CommandOutcome": {
+        "type": "object",
+        "description": "F47: one bash-class tool invocation distilled from a tool_result frame. `exit_code` is always emitted; the value is `null` when the tool_result did not structurally expose one. The extractor never fabricates exit codes — do not infer success from a missing code.",
+        "properties": {
+          "tool_name": { "type": "string", "description": "Tool name from the proposal (e.g. `bash`, `shell_exec`)." },
+          "cmd":       { "type": "string", "description": "For bash-class tools, the `command` argument. Truncated to 500 chars." },
+          "exit_code": { "type": "integer", "nullable": true, "description": "Exit code surfaced by the tool_result, or `null` when not structurally exposed." }
+        },
+        "required": ["tool_name", "cmd", "exit_code"]
+      },
+      "RunCompletion": {
+        "type": "object",
+        "description": "F47 PR2: operator-visible shape of a run's completion annotation on GET /v1/runs/:id. Populated after `LoopTermination::Completed` is persisted via the `RunCompletionAnnotated` event. Omitted for runs that are still running, failed, canceled, or completed before F47 PR2 shipped (no annotation ever landed on the event log).",
+        "properties": {
+          "summary": { "type": "string", "description": "LLM free-text summary from the CompleteRun action proposal." },
+          "verification": { "$ref": "#/components/schemas/CompletionVerification" },
+          "completed_at": { "type": "integer", "description": "Wall-clock ms at which the orchestrator emitted the annotation." }
+        },
+        "required": ["summary", "verification", "completed_at"]
+      },
+      "RunDetailResponse": {
+        "type": "object",
+        "description": "Response body for GET /v1/runs/:id. Wraps the RunRecord alongside child tasks and the F47 PR2 completion annotation.",
+        "properties": {
+          "run":        { "$ref": "#/components/schemas/RunRecord" },
+          "tasks":      { "type": "array", "items": { "$ref": "#/components/schemas/TaskRecord" } },
+          "completion": { "$ref": "#/components/schemas/RunCompletion", "nullable": true, "description": "F47 PR2 annotation. Omitted from the response body when absent (`skip_serializing_if = Option::is_none`)." }
+        },
+        "required": ["run", "tasks"]
+      },
+      "CompletionVerification": {
+        "type": "object",
+        "description": "F47 PR1 sidecar attached to the `orchestrate_finished` SSE event on `termination=completed` runs. Warning / error lines extracted from tool_result text give operators an independent signal alongside the LLM's free-text `summary`. Non-authoritative: the extractor reports what tool outputs say, not whether the run succeeded.",
+        "properties": {
+          "warnings": {
+            "type": "array",
+            "description": "Tool-output lines matched by the warning signal (e.g. `warning: unused import`). Full matched line, truncated to 500 chars. Capped at 50 entries.",
+            "items": { "type": "string" }
+          },
+          "errors": {
+            "type": "array",
+            "description": "Tool-output lines matched by the error signal (e.g. `error[E0308]:`, `error:`). Same truncation / cap rules as warnings.",
+            "items": { "type": "string" }
+          },
+          "commands": {
+            "type": "array",
+            "description": "Per-bash-class-tool invocations: command text and (optional) exit code.",
+            "items": { "$ref": "#/components/schemas/CommandOutcome" }
+          },
+          "tool_results_scanned": {
+            "type": "integer",
+            "description": "How many InvokeTool results were scanned to produce this summary. `0` means Done reached with no recorded tool calls."
+          },
+          "extractor_version": {
+            "type": "integer",
+            "description": "Version of the extractor logic (1 = F47 PR1). Bumped when the matching or truncation policy changes."
+          }
+        },
+        "required": ["warnings", "errors", "commands", "tool_results_scanned", "extractor_version"]
       },
       "TaskRecord": {
         "type": "object",
@@ -126,7 +502,8 @@ pub const OPENAPI_JSON: &str = r##"{
           "task_id":      { "type": "string", "nullable": true },
           "requirement":  { "type": "string", "enum": ["required","advisory"] },
           "decision":     { "type": "string", "enum": ["approved","rejected"], "nullable": true },
-          "created_at":   { "type": "integer" }
+          "created_at":   { "type": "integer" },
+          "updated_at":   { "type": "integer" }
         }
       },
       "ListResponse": {
@@ -397,6 +774,30 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "200": { "description": "Run list" } }
       }
     },
+    "/v1/sessions/{id}/snapshots": {
+      "delete": {
+        "tags": ["Sessions"],
+        "summary": "F65 PR-5: admin-only immediate reap of all workspace snapshots belonging to a session",
+        "description": "Walks workspace_snapshots for the session and reaps each live row (on-disk directory removal + WorkspaceSnapshotReaped event emission). Admin-only per locked Q4. Returns {reaped: u32, at_ms: u64}.",
+        "operationId": "deleteSessionSnapshots",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": {
+            "description": "Reap result",
+            "content": { "application/json": { "schema": {
+              "type": "object",
+              "properties": {
+                "reaped": { "type": "integer", "description": "Count of snapshots reaped in this call" },
+                "at_ms":  { "type": "integer", "description": "Unix-ms timestamp of the reap" }
+              },
+              "required": ["reaped", "at_ms"]
+            }}}
+          },
+          "401": { "description": "Unauthorized (admin token required)" },
+          "403": { "description": "Forbidden (non-admin token)" }
+        }
+      }
+    },
     "/v1/sessions/{id}/events": {
       "get": {
         "tags": ["Sessions"],
@@ -419,14 +820,36 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "200": { "description": "Trace list" } }
       }
     },
+    "/v1/sessions/{session_id}/llm-traces/{trace_id}/body": {
+      "get": {
+        "tags": ["Sessions"],
+        "summary": "LLM chain-of-thought body for a single trace (#668, admin-only)",
+        "description": "Admin-only audit endpoint. Returns the post-redaction system prompt, messages, response text, and proposed tool calls for one LLM round-trip. Sibling to `GET /v1/sessions/{id}/llm-traces` which returns metadata only. Gated behind the System / admin-ServiceAccount principal check — regular operator tokens receive 404 (not 403) so the endpoint cannot be used to enumerate sessions or traces. Secrets (API keys, bearer tokens, provider-key literals) are stripped via `cairn_providers::redact::redact_secrets` before persistence. Individual fields are capped at `CAIRN_LLM_TRACE_MAX_FIELD_BYTES` (default 256 KiB) with a `[TRUNCATED]` suffix on overflow. Tenants that have set `CAIRN_LLM_TRACE_BODIES_ENABLED=false` get 404 because no row was ever written.",
+        "operationId": "getSessionLlmTraceBody",
+        "parameters": [
+          { "name": "session_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trace_id",   "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "LLM round-trip body (system prompt, messages, response, tool calls)" },
+          "404": { "description": "Non-admin caller, session not found, trace id unknown, cross-session id, or tenant opted out" }
+        }
+      }
+    },
     "/v1/runs": {
       "get": {
         "tags": ["Runs"],
         "summary": "List runs",
         "operationId": "listRuns",
         "parameters": [
-          { "name": "limit",  "in": "query", "schema": { "type": "integer" } },
-          { "name": "offset", "in": "query", "schema": { "type": "integer" } }
+          { "name": "tenant_id",     "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id",  "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "session_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "status",        "in": "query", "description": "Run-state wire name (`pending`, `running`, `waiting_approval`, `completed`, `failed`, `canceled`). Unknown values return 422.", "schema": { "type": "string" } },
+          { "name": "agent_role_id", "in": "query", "description": "RFC 031 PR-D3 — filter runs by their `agent_role_id`. Exact-match equality; runs without a role never match. Powers the retract-confirmation modal's in-flight-runs probe.", "schema": { "type": "string" } },
+          { "name": "limit",         "in": "query", "schema": { "type": "integer" } },
+          { "name": "offset",        "in": "query", "schema": { "type": "integer" } }
         ],
         "responses": { "200": { "description": "Run list" } }
       },
@@ -434,9 +857,10 @@ pub const OPENAPI_JSON: &str = r##"{
         "tags": ["Runs"],
         "summary": "Start a new run",
         "operationId": "createRun",
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateRunRequest" } } } },
         "responses": {
-          "201": { "description": "Created run", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunRecord" } } } }
+          "201": { "description": "Created run", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunRecord" } } } },
+          "422": { "description": "Invalid request — e.g. `contract_invalid: file_contract_requires_persistent_workspace` (RFC 032 §2.4) or `contract_invalid: <structural validation error>`. Cairn-rs uses 422 (`validation_error`) for body-level validation rejections; generated clients should key on the `contract_invalid:` message prefix, not the HTTP code alone.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },
@@ -446,7 +870,17 @@ pub const OPENAPI_JSON: &str = r##"{
         "summary": "Get run by ID",
         "operationId": "getRun",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Run record" }, "404": { "description": "Not found" } }
+        "responses": {
+          "200": {
+            "description": "Run detail. Includes a `completion` object once the run has been annotated via `RunCompletionAnnotated` (F47 PR2) — absent for running / failed / canceled / force-completed runs.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RunDetailResponse" }
+              }
+            }
+          },
+          "404": { "description": "Not found" }
+        }
       }
     },
     "/v1/runs/{id}/claim": {
@@ -513,13 +947,67 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Runs", "Events"],
         "summary": "Event stream for a run",
+        "description": "Returns an `EventsPage { events, next_cursor, has_more }` wrapper ALWAYS — #429 removed the dual-shape behaviour where passing `from=N` returned a bare array. `from` is still accepted as a legacy alias for `cursor`, but the response wrapper is unconditional now.",
         "operationId": "listRunEvents",
         "parameters": [
           { "name": "id",     "in": "path",  "required": true, "schema": { "type": "string" } },
-          { "name": "cursor", "in": "query", "schema": { "type": "integer" } },
-          { "name": "limit",  "in": "query", "schema": { "type": "integer" } }
+          { "name": "cursor", "in": "query", "schema": { "type": "integer" }, "description": "Exclusive lower-bound position; next page starts after this event." },
+          { "name": "from",   "in": "query", "schema": { "type": "integer" }, "description": "Legacy alias for `cursor`. Same semantics; only the response shape was unified (#429)." },
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 500 } }
         ],
-        "responses": { "200": { "description": "Events page" } }
+        "responses": {
+          "200": {
+            "description": "Events page (`{ events, next_cursor, has_more }` — always wrapped per #429).",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "events": { "type": "array", "items": { "type": "object" } }, "next_cursor": { "type": "integer", "nullable": true }, "has_more": { "type": "boolean" } }, "required": ["events", "has_more"] } } }
+          },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/runs/{id}/telemetry": {
+      "get": {
+        "tags": ["Runs", "Observability"],
+        "summary": "Live-aggregated per-run telemetry (provider calls + tool invocations + totals)",
+        "description": "Returns the run state + stuck flag, every provider call with model/tokens/cost/latency, every tool invocation with duration, and running totals suitable for the operator observability panel. Aggregated at read time from the InMemory projection.",
+        "operationId": "getRunTelemetry",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Run telemetry payload" },
+          "404": { "description": "Run not found or not visible to tenant" }
+        }
+      }
+    },
+    "/v1/projects/{tenant}/{workspace}/{project}/costs": {
+      "get": {
+        "tags": ["Costs", "Observability"],
+        "summary": "Lifetime cost rollup for a project (F29 CD-2)",
+        "description": "Returns the lifetime cost, token, and provider-call totals for every session under the given (tenant, workspace, project) triple. Zeros are returned when the project has not emitted any provider calls yet. Time-range slicing is a follow-up; v1 is lifetime-total.",
+        "operationId": "getProjectCosts",
+        "parameters": [
+          { "name": "tenant",    "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "workspace", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "project",   "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Project cost summary" },
+          "403": { "description": "Tenant scope mismatch" }
+        }
+      }
+    },
+    "/v1/workspaces/{tenant}/{workspace}/costs": {
+      "get": {
+        "tags": ["Costs", "Observability"],
+        "summary": "Lifetime cost rollup for a workspace (F29 CD-2)",
+        "description": "Returns the lifetime cost, token, and provider-call totals aggregated across every project in the given (tenant, workspace). Zeros are returned when the workspace has not emitted any provider calls yet.",
+        "operationId": "getWorkspaceCosts",
+        "parameters": [
+          { "name": "tenant",    "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "workspace", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Workspace cost summary" },
+          "403": { "description": "Tenant scope mismatch" }
+        }
       }
     },
     "/v1/runs/{id}/tool-invocations": {
@@ -600,40 +1088,179 @@ pub const OPENAPI_JSON: &str = r##"{
         }
       }
     },
+    "/v1/approvals": {
+      "get": {
+        "tags": ["Approvals"],
+        "summary": "List approvals (unified — plan + tool-call, F45)",
+        "description": "Merged operator inbox across both approval kinds. Every item carries a `kind` discriminator (`plan` | `tool_call`). Plan-approval rows flatten `ApprovalRecord`; tool-call rows flatten `ToolCallApprovalRecord`. Supersedes the pre-F45 `/v1/tool-call-approvals` list, which now 308-redirects here.",
+        "operationId": "listApprovals",
+        "parameters": [
+          { "name": "kind",         "in": "query", "schema": { "type": "string", "enum": ["plan","tool_call"] }, "description": "Narrow to one kind; absent = both." },
+          { "name": "state",        "in": "query", "schema": { "type": "string", "enum": ["pending","approved","rejected","timeout"] } },
+          { "name": "run_id",       "in": "query", "schema": { "type": "string" } },
+          { "name": "session_id",   "in": "query", "schema": { "type": "string" }, "description": "Tool-call native; excludes plan approvals when set." },
+          { "name": "tenant_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",   "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",        "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",       "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Merged approval records, newest first" } }
+      }
+    },
     "/v1/approvals/pending": {
       "get": {
         "tags": ["Approvals"],
-        "summary": "List pending approvals",
+        "summary": "List pending plan approvals (scope-required)",
+        "description": "Returns pending plan approvals for an explicit `(tenant_id, workspace_id, project_id)` triple. The pre-#719 behaviour of falling back to a global cross-tenant scan when the triple was not supplied has been removed; missing scope now returns 400 `bad_request`. Cross-tenant admin inboxes are served by `GET /v1/approvals` (with admin token).",
         "operationId": "listPendingApprovals",
-        "responses": { "200": { "description": "Pending approvals" } }
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "project_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000 } },
+          { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0 } }
+        ],
+        "responses": {
+          "200": { "description": "Pending plan approvals for this project" },
+          "400": { "description": "Missing one of `tenant_id`, `workspace_id`, `project_id`" }
+        }
       }
     },
-    "/v1/approvals/{id}/resolve": {
-      "post": {
+    "/v1/approvals/{id}": {
+      "get": {
         "tags": ["Approvals"],
-        "summary": "Approve or reject an approval",
-        "operationId": "resolveApproval",
+        "summary": "Fetch any approval by id (unified, F45)",
+        "description": "Resolves tool-call first, then plan. Response carries a `kind` discriminator.",
+        "operationId": "getApproval",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "decision": { "type": "string", "enum": ["approved","rejected"] }, "reason": { "type": "string" } }, "required": ["decision"] } } } },
-        "responses": { "200": { "description": "Resolved approval" } }
+        "responses": {
+          "200": { "description": "Unified approval record" },
+          "404": { "description": "Not found (or cross-tenant)" }
+        }
       }
     },
     "/v1/approvals/{id}/approve": {
       "post": {
         "tags": ["Approvals"],
-        "summary": "Approve a pending approval (sugar for resolve with decision=approved)",
+        "summary": "Approve an approval (kind-aware)",
+        "description": "For plan approvals the body is ignored. For tool-call approvals `scope` is required: `{type:\"once\"}` resolves this call only; `{type:\"session\", match_policy?}` widens to matching calls in the same session (omitted `match_policy` inherits the proposal's). A bare-string shorthand `\"once\"` / `\"session\"` is also accepted for curl ergonomics — equivalent to `{type:\"once\"}` / `{type:\"session\"}` with inherited match policy. `approved_tool_args` overrides any prior amendment. `operator_id` in the body must match the authenticated principal when present (else 400 `identity_mismatch`).",
         "operationId": "approveApproval",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Approved", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApprovalRecord" } } } } }
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "properties": {
+          "operator_id": { "type": "string" },
+          "scope": { "oneOf": [
+            { "type": "string", "enum": ["once", "session"], "description": "Shorthand form — `once` and `session` (match_policy inherited from the proposal)." },
+            { "type": "object", "properties": { "type": { "type": "string", "enum": ["once"] } }, "required": ["type"] },
+            { "type": "object", "properties": { "type": { "type": "string", "enum": ["session"] }, "match_policy": { "type": "object" } }, "required": ["type"] }
+          ] },
+          "approved_tool_args": {}
+        } } } } },
+        "responses": {
+          "200": { "description": "Approved" },
+          "400": { "description": "operator_id in body does not match authenticated principal" },
+          "404": { "description": "Unknown id" },
+          "409": { "description": "Approval already resolved" },
+          "422": { "description": "tool-call approval missing required `scope`" }
+        }
       }
     },
     "/v1/approvals/{id}/reject": {
       "post": {
         "tags": ["Approvals"],
-        "summary": "Reject a pending approval (sugar for resolve with decision=rejected)",
+        "summary": "Reject an approval (kind-aware)",
         "operationId": "rejectApproval",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Rejected", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApprovalRecord" } } } } }
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "type": "object", "properties": {
+          "operator_id": { "type": "string" },
+          "reason":      { "type": "string" }
+        } } } } },
+        "responses": {
+          "200": { "description": "Rejected" },
+          "400": { "description": "operator_id mismatch" },
+          "404": { "description": "Unknown id" },
+          "409": { "description": "Approval already resolved" }
+        }
+      }
+    },
+    "/v1/approvals/{id}/deny": {
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Alias of /reject (legacy route)",
+        "operationId": "denyApproval",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Rejected" } }
+      }
+    },
+    "/v1/approvals/{id}/amend": {
+      "patch": {
+        "tags": ["Approvals"],
+        "summary": "Amend tool-call arguments (tool-call kind only)",
+        "description": "Non-resolving — operator must still approve/reject. Returns 422 `unsupported_on_plan_approval` when the id points at a plan approval, and 403 `self_amend_forbidden` if the proposal's `tool_name` is `amend_approval`.",
+        "operationId": "amendApproval",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": {
+          "operator_id":   { "type": "string" },
+          "new_tool_args": {}
+        }, "required": ["new_tool_args"] } } } },
+        "responses": {
+          "200": { "description": "Amended; state remains pending" },
+          "400": { "description": "operator_id mismatch" },
+          "403": { "description": "Cannot amend amend_approval tool calls" },
+          "404": { "description": "Unknown id" },
+          "409": { "description": "Proposal already resolved" },
+          "422": { "description": "Amend not supported on plan approvals" }
+        }
+      }
+    },
+    "/v1/tool-call-approvals": {
+      "get": {
+        "tags": ["Approvals"],
+        "summary": "Deprecated — 308-redirects to /v1/approvals?kind=tool_call",
+        "description": "Deprecated in F45. Clients should call `/v1/approvals?kind=tool_call`. This path 308-redirects (preserves method + body); response carries `Deprecation: true`.",
+        "operationId": "listToolCallApprovals",
+        "deprecated": true,
+        "responses": { "308": { "description": "Permanent Redirect to /v1/approvals" } }
+      }
+    },
+    "/v1/tool-call-approvals/{call_id}": {
+      "get": {
+        "tags": ["Approvals"],
+        "summary": "Deprecated — 308-redirects to /v1/approvals/{id}",
+        "operationId": "getToolCallApproval",
+        "deprecated": true,
+        "parameters": [{ "name": "call_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "308": { "description": "Permanent Redirect" } }
+      }
+    },
+    "/v1/tool-call-approvals/{call_id}/approve": {
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Deprecated — 308-redirects to /v1/approvals/{id}/approve",
+        "operationId": "approveToolCallApproval",
+        "deprecated": true,
+        "parameters": [{ "name": "call_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "308": { "description": "Permanent Redirect" } }
+      }
+    },
+    "/v1/tool-call-approvals/{call_id}/reject": {
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Deprecated — 308-redirects to /v1/approvals/{id}/reject",
+        "operationId": "rejectToolCallApproval",
+        "deprecated": true,
+        "parameters": [{ "name": "call_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "308": { "description": "Permanent Redirect" } }
+      }
+    },
+    "/v1/tool-call-approvals/{call_id}/amend": {
+      "patch": {
+        "tags": ["Approvals"],
+        "summary": "Deprecated — 308-redirects to /v1/approvals/{id}/amend",
+        "operationId": "amendToolCallApproval",
+        "deprecated": true,
+        "parameters": [{ "name": "call_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "308": { "description": "Permanent Redirect" } }
       }
     },
     "/v1/providers": {
@@ -673,6 +1300,58 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": {
           "201": { "description": "Provider connection created" },
           "403": { "description": "Entitlement tier does not allow external provider connections" }
+        }
+      }
+    },
+    "/v1/models/catalog": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "List the bundled model catalog (LiteLLM + cairn overlay)",
+        "description": "Read-only projection of the bundled LiteLLM pricing catalog plus any cairn TOML overlay and operator overrides. Supports filter, search, capability filters, cost ceiling, free-only shortcut, and pagination. Callable by any authenticated operator — the UI provider wizard and cost calculator read from here.",
+        "operationId": "listModelCatalog",
+        "parameters": [
+          { "name": "provider",          "in": "query", "schema": { "type": "string" }, "description": "Exact-match provider family (e.g. openai, anthropic, openrouter)." },
+          { "name": "tier",              "in": "query", "schema": { "type": "string", "enum": ["brain", "mid", "light"] }, "description": "Routing tier." },
+          { "name": "search",            "in": "query", "schema": { "type": "string" }, "description": "Case-insensitive substring across id, display_name, and provider." },
+          { "name": "supports_tools",    "in": "query", "schema": { "type": "boolean" } },
+          { "name": "supports_json_mode","in": "query", "schema": { "type": "boolean" } },
+          { "name": "reasoning",         "in": "query", "schema": { "type": "boolean" } },
+          { "name": "max_cost_per_1m",   "in": "query", "schema": { "type": "number" }, "description": "Upper bound on cost_per_1m_input (USD)." },
+          { "name": "free_only",         "in": "query", "schema": { "type": "boolean" }, "description": "When true, only models with zero input+output cost." },
+          { "name": "limit",             "in": "query", "schema": { "type": "integer", "default": 100, "maximum": 1000 } },
+          { "name": "offset",            "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Filtered, paginated model list",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "items":   { "type": "array", "items": { "type": "object" } },
+              "total":   { "type": "integer" },
+              "hasMore": { "type": "boolean" }
+            }, "required": ["items", "total", "hasMore"] } } }
+          },
+          "422": { "description": "Validation error (invalid limit/offset/tier)" },
+          "503": { "description": "model_catalog_unavailable — bundled catalog is empty" }
+        }
+      }
+    },
+    "/v1/models/catalog/providers": {
+      "get": {
+        "tags": ["Models"],
+        "summary": "Unique provider families in the model catalog, with counts",
+        "description": "Lets the UI build a provider-filter dropdown without a full catalog scan. Cached after the first call for the process lifetime; admin CRUD overrides do NOT invalidate this cache.",
+        "operationId": "listCatalogProviders",
+        "responses": {
+          "200": {
+            "description": "Providers with entry counts",
+            "content": { "application/json": { "schema": { "type": "object", "properties": {
+              "providers": { "type": "array", "items": { "type": "object", "properties": {
+                "name":  { "type": "string" },
+                "count": { "type": "integer" }
+              }, "required": ["name", "count"] } }
+            }, "required": ["providers"] } } }
+          },
+          "503": { "description": "model_catalog_unavailable" }
         }
       }
     },
@@ -774,19 +1453,125 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Events"],
         "summary": "Real-time SSE event stream",
-        "description": "Emits live events. On connect a `connected` event carries the current head position. Reconnect with `Last-Event-ID` to replay up to 1 000 missed events. No auth required.",
-        "security": [],
+        "description": "Emits live events. On connect a `connected` event carries the current head position. Reconnect with `Last-Event-ID` to replay up to 1 000 missed events. Requires bearer token via `Authorization: Bearer <token>` header OR `?token=<token>` query parameter (browsers cannot set custom headers on EventSource).",
+        "security": [{ "bearerAuth": [] }],
         "operationId": "streamEvents",
-        "responses": { "200": { "description": "SSE stream", "content": { "text/event-stream": {} } } }
+        "parameters": [
+          { "name": "token", "in": "query", "required": false, "description": "Bearer token fallback for EventSource clients that cannot set the `Authorization` header (browsers). Accepts the same values as the `Authorization` header.", "schema": { "type": "string" } },
+          { "name": "Last-Event-ID", "in": "header", "required": false, "description": "Replay events since this position. Up to 1 000 missed events are replayed.", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "SSE stream", "content": { "text/event-stream": {} } },
+          "401": { "description": "Missing or invalid bearer token (header absent AND `?token=` absent/invalid)" }
+        }
       }
     },
     "/v1/evals/runs": {
       "get": {
         "tags": ["Evals"],
         "summary": "List eval runs",
+        "description": "Lists eval runs for the active project scope. Archived runs are excluded by default; pass `include_archived=true` to surface soft-deleted runs (issue #244).",
         "operationId": "listEvalRuns",
-        "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } }],
+        "parameters": [
+          { "name": "tenant_id",        "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id",     "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",       "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",            "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",           "in": "query", "schema": { "type": "integer", "default": 0 } },
+          { "name": "include_archived", "in": "query", "schema": { "type": "boolean", "default": false } }
+        ],
         "responses": { "200": { "description": "Eval run list" } }
+      },
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Create an eval run",
+        "description": "Creates a new eval run. Duplicate `eval_run_id` returns 409 Conflict (issue #244).",
+        "operationId": "createEvalRun",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "type": "object" } }
+          }
+        },
+        "responses": {
+          "201": { "description": "Eval run created" },
+          "404": { "description": "Referenced dataset/rubric/baseline not found or not in tenant" },
+          "409": { "description": "Duplicate eval_run_id — the id already exists (same or cross-project)" }
+        }
+      }
+    },
+    "/v1/evals/runs/{id}": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Get an eval run",
+        "operationId": "getEvalRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Eval run record" },
+          "404": { "description": "Eval run not found" }
+        }
+      },
+      "delete": {
+        "tags": ["Evals"],
+        "summary": "Soft-delete an eval run (issue #244)",
+        "description": "Archives the run via an `EvalRunArchived` event so audit trails remain intact. Project scope must match — cross-project DELETE returns 404. Already-archived runs return 204 (idempotent). The default list view hides archived rows; pass `include_archived=true` on `GET /v1/evals/runs` to surface them.",
+        "operationId": "deleteEvalRun",
+        "parameters": [
+          { "name": "id",           "in": "path",  "required": true,  "schema": { "type": "string" } },
+          { "name": "tenant_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",   "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "204": { "description": "Archived (or already archived — idempotent)" },
+          "404": { "description": "Eval run not found in this project scope" }
+        }
+      }
+    },
+    "/v1/evals/scorecards": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "List scorecard summaries (issue #244)",
+        "description": "One row per `(project, prompt_asset_id)` with at least one completed, non-archived eval run whose `prompt_release_id`/`prompt_version_id` are set. Sorted by `best_task_success_rate` descending. Populates the EvalsPage scorecard picker.",
+        "operationId": "listEvalScorecards",
+        "parameters": [
+          { "name": "tenant_id",    "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id",   "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Scorecard summary list" } }
+      }
+    },
+    "/v1/evals/rubrics": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "List rubrics for a tenant (issue #138)",
+        "operationId": "listEvalRubrics",
+        "parameters": [{ "name": "tenant_id", "in": "query", "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Eval rubric list" } }
+      },
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Create a rubric for a tenant",
+        "operationId": "createEvalRubric",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Rubric created" } }
+      }
+    },
+    "/v1/evals/baselines": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "List baselines for a tenant (issue #138)",
+        "operationId": "listEvalBaselines",
+        "parameters": [{ "name": "tenant_id", "in": "query", "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Eval baseline list" } }
+      },
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Create a baseline for a tenant",
+        "operationId": "createEvalBaseline",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Baseline created" } }
       }
     },
     "/v1/traces": {
@@ -796,14 +1581,6 @@ pub const OPENAPI_JSON: &str = r##"{
         "operationId": "listTraces",
         "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "default": 500 } }],
         "responses": { "200": { "description": "LLM call traces" } }
-      }
-    },
-    "/v1/costs": {
-      "get": {
-        "tags": ["Evals"],
-        "summary": "Aggregate cost summary",
-        "operationId": "getCosts",
-        "responses": { "200": { "description": "Cost totals (calls, tokens, USD micros)" } }
       }
     },
     "/v1/admin/audit-log": {
@@ -819,6 +1596,16 @@ pub const OPENAPI_JSON: &str = r##"{
       }
     },
     "/v1/admin/tenants": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List tenants (admin only)",
+        "operationId": "listTenants",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Tenant list" } }
+      },
       "post": {
         "tags": ["Admin"],
         "summary": "Create a new tenant",
@@ -827,12 +1614,159 @@ pub const OPENAPI_JSON: &str = r##"{
         "responses": { "201": { "description": "Created tenant" } }
       }
     },
+    "/v1/admin/tenants/{id}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Fetch a single tenant record",
+        "operationId": "getTenant",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Tenant record" },
+          "404": { "description": "Tenant not found" }
+        }
+      },
+      "patch": {
+        "tags": ["Admin"],
+        "summary": "Edit a tenant (RFC 026 PR-A2)",
+        "description": "PATCH semantics — every field is optional; omitted fields preserve the stored value. An all-`null` body returns 422 `empty_patch`. Guarded by `TenantAdminGuard`: god-token (`CAIRN_ADMIN_TOKEN`) bypasses for cross-tenant bootstrap; real operators require `TenantRole::Admin` on the target tenant (otherwise 403 with the structured `tenant_role_missing` envelope). Emits `TenantUpdated` and an `AuditLogEntryRecorded` entry.",
+        "operationId": "updateTenant",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "properties": { "name": { "type": "string", "nullable": true } } } } }
+        },
+        "responses": {
+          "200": { "description": "Updated tenant record" },
+          "403": { "description": "Structured `tenant_role_missing` body when the caller is a non-admin operator without `TenantRole::Admin` on the target." },
+          "404": { "description": "Tenant not found" },
+          "422": { "description": "Empty patch body" }
+        }
+      }
+    },
+    "/v1/admin/tenants/{tenant_id}/operator-profiles/{id}": {
+      "patch": {
+        "tags": ["Admin"],
+        "summary": "Edit an operator profile (RFC 026 PR-A2)",
+        "description": "PATCH semantics — any subset of `display_name`, `email`, or `role` may be supplied; omitted fields stay as-is. An all-`null` body returns 422 `empty_patch`. Guarded by `TenantAdminGuard`; cross-tenant ids return 404 rather than 403 so operator presence is not revealed to a non-tenant-admin. Emits `OperatorProfileUpdated` plus an `AuditLogEntryRecorded` entry. `role` here is the `WorkspaceRole` carried on the operator profile (default role for workspace assignments); the tenant-scope `TenantRole` has its own endpoint (PR-A0).",
+        "operationId": "updateOperatorProfile",
+        "parameters": [
+          { "name": "tenant_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id",        "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "properties": {
+            "display_name": { "type": "string", "nullable": true },
+            "email":        { "type": "string", "nullable": true },
+            "role":         { "type": "string", "nullable": true, "enum": ["owner", "admin", "member", "viewer"] }
+          } } } }
+        },
+        "responses": {
+          "200": { "description": "Updated operator profile" },
+          "403": { "description": "Structured `tenant_role_missing` body when the caller lacks `TenantRole::Admin` on `:tenant_id`." },
+          "404": { "description": "Operator profile not found for this tenant" },
+          "422": { "description": "Empty patch body or invalid email" }
+        }
+      }
+    },
+    "/v1/admin/tenants/{tenant_id}/runs/{id}/cancel-orphan": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Cancel an orphaned child run (#670 G4 / RFC 027)",
+        "description": "Operator recovery path for a child subagent run that leaked into `Pending` because cairn-app crashed between Phase-1 (child row created) and Phase-2 (task submitted). Transitions the run to `Failed` with `failure_class = \"orphan_child\"`; the standard terminal path fires the descendant-counter decrement against the captured `root_run_id`, releasing the cap slot so the parent can spawn again.\n\nGuarded by `TenantAdminGuard`. The run is resolved by id, then its `project.tenant_id` is verified against the URL's `:tenant_id` — a mistyped tenant path returns 404, not 403, so admin actions cannot be used to probe other tenants' run ids.\n\n**Preconditions (violation returns 404/422; no mutation):**\n- run exists AND belongs to the URL's tenant (else 404)\n- run is a child (`parent_run_id IS NOT NULL`) — roots cannot be orphaned (else 422)\n- run is in `Pending` state — non-pending runs aren't orphans (else 422)\n\nReturns 204 on success (no body; consistent with the admin session-delete terminal-transition pattern).",
+        "operationId": "cancelOrphanRun",
+        "parameters": [
+          { "name": "tenant_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "id",        "in": "path", "required": true, "schema": { "type": "string" }, "description": "Child run id" }
+        ],
+        "responses": {
+          "204": { "description": "Run transitioned to `Failed(OrphanChild)`." },
+          "403": { "description": "Structured `tenant_role_missing` body when the caller lacks `TenantRole::Admin` on `:tenant_id`." },
+          "404": { "description": "Run not found, or exists under a different tenant." },
+          "422": { "description": "Run is a root (not a child) OR run is not in `Pending` state." }
+        }
+      }
+    },
     "/v1/settings": {
       "get": {
         "tags": ["Admin"],
         "summary": "Deployment configuration",
         "operationId": "getSettings",
         "responses": { "200": { "description": "Settings including mode, backend, feature flags" } }
+      }
+    },
+    "/v1/settings/defaults/{scope}/{scope_id}/{key}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Fetch a single stored default setting by exact scope",
+        "description": "Returns the stored default at the exact `(scope, scope_id, key)` triple. This endpoint is exact-lookup — for fallback resolution across the scope cascade use `GET /v1/settings/defaults/resolve/{key}?project=...`. 404 when no value has been persisted at this triple.",
+        "operationId": "getDefaultSetting",
+        "parameters": [
+          { "name": "scope", "in": "path", "required": true, "schema": { "type": "string", "enum": ["system", "tenant", "workspace", "project"] } },
+          { "name": "scope_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "`{ scope, scope_id, key, value, source }`" },
+          "404": { "description": "Setting not set at this scope" }
+        }
+      },
+      "put": {
+        "tags": ["Admin"],
+        "summary": "Set a scoped default setting",
+        "description": "Persists `value` as the default for `key` at the given scope. Scope layers cascade: System < Tenant < Workspace < Project (project overrides tenant overrides system). For `scope=system`, the conventional `scope_id` is `system`. For Tenant/Workspace/Project, `scope_id` is the respective entity id. Model-id keys (`brain_model`, `generate_model`, `stream_model`, `embed_model`) validate only that the value is a non-empty string shorter than 256 chars — forward references (models not yet advertised by any provider connection) are accepted so setup scripts can order `PUT brain_model` before `POST /v1/providers/connections`. The authoritative 'is this model routable' check runs at orchestrate time and returns 503 `preferred_model_unavailable` with the full connection inventory when a configured default has no backing connection.",
+        "operationId": "setDefaultSetting",
+        "parameters": [
+          { "name": "scope", "in": "path", "required": true, "schema": { "type": "string", "enum": ["system", "tenant", "workspace", "project"] } },
+          { "name": "scope_id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Scope entity id (`system` for system scope)." },
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Setting key (e.g. `brain_model`, `generate_model`, `max_tokens`, `temperature`)." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["value"], "properties": { "value": { "description": "Setting value — type depends on the key (string for models, number for tokens/temperature)." } } } } }
+        },
+        "responses": {
+          "200": { "description": "Persisted setting" },
+          "400": { "description": "Invalid scope or malformed body" },
+          "422": { "description": "Value failed per-key validation (unknown model, out-of-range numeric, oversized string)" }
+        }
+      },
+      "delete": {
+        "tags": ["Admin"],
+        "summary": "Clear a scoped default setting",
+        "operationId": "clearDefaultSetting",
+        "parameters": [
+          { "name": "scope", "in": "path", "required": true, "schema": { "type": "string", "enum": ["system", "tenant", "workspace", "project"] } },
+          { "name": "scope_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Cleared; resolution now falls through to the next scope layer or the hardcoded default" } }
+      }
+    },
+    "/v1/settings/defaults/all": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List every persisted default setting across all scopes",
+        "description": "Flat list of all settings explicitly set via `PUT /v1/settings/defaults/...`. Unset keys are omitted. For the effective value of a specific key with fallback resolution, use `GET /v1/settings/defaults/resolve/{key}?project=...`.",
+        "operationId": "listAllDefaultSettings",
+        "responses": { "200": { "description": "`{ settings: [...], total: n }`" } }
+      }
+    },
+    "/v1/settings/defaults/resolve/{key}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Resolve the effective default for a key",
+        "description": "Walks the scope cascade (Project → Workspace → Tenant → System → env → hardcoded) and returns the first layer's value. Requires `?project=<project_id>` to anchor the resolution.",
+        "operationId": "resolveDefaultSetting",
+        "parameters": [
+          { "name": "key", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "project", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Project id anchoring the scope cascade." }
+        ],
+        "responses": { "200": { "description": "`{ key, value }`" } }
       }
     },
     "/v1/db/status": {
@@ -847,8 +1781,48 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Admin"],
         "summary": "JSON request metrics",
+        "description": "**Scope (#428):** process-level (not tenant-scoped) — aggregate latency percentiles, request counts, and error rate across the whole deployment. Not gated with `AdminRoleGuard` because existing Prometheus scrapers depend on unauthenticated-but-token-gated access; adding a workspace-role requirement would break monitoring rigs. Treat as admin-equivalent at the network / token layer.",
         "operationId": "getMetrics",
         "responses": { "200": { "description": "Rolling latency percentiles, request counts, error rate" } }
+      }
+    },
+    "/v1/stats": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Lightweight aggregate counts for the deployment (admin-only)",
+        "description": "**Scope (#428):** cross-tenant — event counts, active-run counts, active-task counts, and session counts are aggregated across every tenant. Gated with `AdminRoleGuard`; non-admin callers get 403. Per-tenant counts are available via `/v1/tenants/:id/stats` or `/v1/fleet`.",
+        "operationId": "getStats",
+        "responses": {
+          "200": { "description": "Deployment-wide aggregate counts" },
+          "403": { "description": "Caller lacks the admin role", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/events/recent": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Recent events across every tenant (admin-only)",
+        "description": "**Scope (#428):** cross-tenant — streams the last N entries from the global event log with no tenant filter. Gated with `AdminRoleGuard`; per-tenant callers should use `GET /v1/stream` (SSE, tenant-scoped) or `GET /v1/runs/:id/events` (run-scoped).",
+        "operationId": "getRecentEvents",
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "default": 50, "minimum": 1, "maximum": 500 } }
+        ],
+        "responses": {
+          "200": { "description": "Recent events across all tenants" },
+          "403": { "description": "Caller lacks the admin role", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/providers/registry": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Cross-tenant snapshot of every provider connection (admin-only)",
+        "description": "**Scope (#428):** cross-tenant — returns `connection_id`, `backend`, and `model` for every provider binding cached in this process, plus the fallback chain and static catalog. Gated with `AdminRoleGuard`; non-admin callers would otherwise learn which providers other tenants have configured.",
+        "operationId": "getProviderRegistry",
+        "responses": {
+          "200": { "description": "All provider connections + fallbacks + catalog" },
+          "403": { "description": "Caller lacks the admin role", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/metrics/prometheus": {
@@ -1158,7 +2132,7 @@ pub const OPENAPI_JSON: &str = r##"{
       "get": {
         "tags": ["Health"],
         "summary": "High-level operator overview",
-        "description": "Combines status and dashboard: store backend, deployment mode, uptime, active counts, cost summary, feature flags.",
+        "description": "Combines status and dashboard: store backend, deployment mode, uptime, active counts, cost summary, feature flags.\n\n**Scope (#428):** cross-deployment (not tenant-scoped) — the response body carries only process-level health and component statuses, no per-tenant data, so it intentionally stays ungated. If a future field is added that carries tenant-specific counts, the handler must adopt `AdminRoleGuard`.",
         "operationId": "getOverview",
         "responses": { "200": { "description": "Overview data" } }
       }
@@ -1173,6 +2147,13 @@ pub const OPENAPI_JSON: &str = r##"{
           { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
         ],
         "responses": { "200": { "description": "Prompt asset list" } }
+      },
+      "post": {
+        "tags": ["Prompts"],
+        "summary": "Create a prompt asset",
+        "operationId": "createPromptAsset",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Prompt asset created" } }
       }
     },
     "/v1/prompts/releases": {
@@ -1185,6 +2166,13 @@ pub const OPENAPI_JSON: &str = r##"{
           { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
         ],
         "responses": { "200": { "description": "Prompt release list" } }
+      },
+      "post": {
+        "tags": ["Prompts"],
+        "summary": "Create a prompt release",
+        "operationId": "createPromptRelease",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Prompt release created" } }
       }
     },
     "/v1/notifications": {
@@ -1298,27 +2286,46 @@ pub const OPENAPI_JSON: &str = r##"{
       "post": {
         "tags": ["Plan Review"],
         "summary": "Approve a plan artifact (RFC 018)",
+        "description": "Records an operator approval for a Plan-mode run. Audit event attributed to the authenticated principal (T6a-H7). Request body is validated against `ApprovePlanRequest` with `deny_unknown_fields` — typos such as `reviewerComments` (camelCase) return 422 (#427).",
         "operationId": "approvePlan",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Approved, next_step: create_execute_run" } }
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApprovePlanRequest" } } } },
+        "responses": {
+          "200": { "description": "Approved, next_step: create_execute_run" },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "422": { "description": "Invalid request body (e.g. unknown field, wrong type)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/runs/{id}/reject": {
       "post": {
         "tags": ["Plan Review"],
         "summary": "Reject a plan artifact",
+        "description": "Records an operator rejection. Request body validated against `RejectPlanRequest` with `deny_unknown_fields` (#427).",
         "operationId": "rejectPlan",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "Rejected" } }
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RejectPlanRequest" } } } },
+        "responses": {
+          "200": { "description": "Rejected" },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "422": { "description": "Invalid request body", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/runs/{id}/revise": {
       "post": {
         "tags": ["Plan Review"],
         "summary": "Request plan revision, creates new Plan-mode run",
+        "description": "Creates a new Plan-mode run seeded from the original. `reviewer_comments` is required — a revise without comments is a client error (400). Body validated against `RevisePlanRequest` with `deny_unknown_fields` (#427).",
         "operationId": "revisePlan",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "201": { "description": "New plan run created" } }
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RevisePlanRequest" } } } },
+        "responses": {
+          "201": { "description": "New plan run created" },
+          "400": { "description": "reviewer_comments missing or empty", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "422": { "description": "Invalid request body", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/v1/sqeq/initialize": {
@@ -1368,6 +2375,1790 @@ pub const OPENAPI_JSON: &str = r##"{
         "operationId": "a2aGetTask",
         "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
         "responses": { "200": { "description": "Task status" } }
+      }
+    },
+    "/v1/projects/{project}/local-paths": {
+      "delete": {
+        "tags": ["Projects"],
+        "summary": "Detach a local_fs path from a project",
+        "description": "Removes a local-filesystem pseudo-repo previously attached via `POST /v1/projects/{project}/repos` with `host=local_fs`. Separate from the `/repos/{owner}/{repo}` endpoint because arbitrary filesystem paths can't be split into two path segments.",
+        "operationId": "detachProjectLocalPath",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": { "path": { "type": "string" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "Detached" },
+          "404": { "description": "No such path attached to this project" }
+        }
+      }
+    },
+    "/v1/integrations/github/verify-installation": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Verify a GitHub App installation",
+        "description": "Mints a JWT from the provided app_id + private_key, exchanges it for an installation access token, and reports the installation's owner and repo count. Does not mutate server state.",
+        "operationId": "verifyGithubInstallation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["app_id", "private_key", "installation_id"],
+                "properties": {
+                  "app_id":          { "type": "integer" },
+                  "private_key":     { "type": "string", "description": "PEM-encoded RSA private key" },
+                  "installation_id": { "type": "integer" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Verification succeeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "verified":   { "type": "boolean" },
+                    "owner":      { "type": "string" },
+                    "repo_count": { "type": "integer" },
+                    "expires_at": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Invalid request (bad PEM, empty key, etc.)" },
+          "502": { "description": "GitHub API error — credentials or installation ID rejected" }
+        }
+      }
+    },
+    "/v1/runs/{id}/orchestrate": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Kick off orchestration for a run (F65)",
+        "description": "Starts the orchestration loop. The request body is an `OrchestrateRequest` (see schema). Returns 202 when the loop has been enqueued.\n\n**Idempotency (#433).** This endpoint honors the optional `Idempotency-Key` request header. When present, the first response is cached per (tenant, endpoint, key) for 5 minutes; retries with the same key + same body replay the first response verbatim (with an `idempotent-replayed: true` response header). Retries with the same key but a DIFFERENT body return 409 `idempotency_key_reuse`. Concurrent retries with the same key while the first is still in flight return 409 `idempotency_in_progress`. Clients should generate a fresh Idempotency-Key per logical submission (UUID v4 works well) and re-use it only on transport retries.\n\n**Strict completion gate (#660).** Before dispatching any `complete_run` action emitted by the LLM, the loop inspects the incremental F47 `completion_verification` accumulator. When the accumulator reports one or more error lines (e.g. a failing `cargo build` / `cargo check`) the `complete_run` is refused, a rejection step is injected into the next DECIDE turn, and the loop re-plans. Three consecutive rejections terminate the run with `termination = \"failed\"` and `failure_class = \"verification_rejected\"` (see the `FailureClass` enum) so operator automation keying on `state == \"completed\"` never sees a completion that lies about a red build. The gate is enabled by default; operators who want the legacy \"LLM calls it done no matter what\" flow can persist `run:<id>:orchestrator_strict_completion_gate = false` via `PUT /v1/settings/defaults/project/{project}/{key}` before the first `/orchestrate` POST.",
+        "operationId": "orchestrateRun",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "description": "Client-supplied key that makes a retry of this request safe. Same key + same body replays the prior response; same key + different body 409s. 1..=255 ASCII chars.",
+            "schema": { "type": "string", "minLength": 1, "maxLength": 255 }
+          }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrchestrateRequest" } } } },
+        "responses": {
+          "202": { "description": "Orchestration enqueued" },
+          "400": { "description": "Invalid request (includes malformed `Idempotency-Key` header)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "409": { "description": "Idempotency-Key conflict — either reused with a different body (`idempotency_key_reuse`) or a request with the same key is still in flight (`idempotency_in_progress`).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/runs/{id}/cancel": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Cancel a run",
+        "operationId": "cancelRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Run cancelled" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/recover": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Force run recovery — no-op legacy",
+        "description": "**Deprecated.** Manual recovery used to drive cairn-side `RecoveryServiceImpl::recover_interrupted_runs`; recovery now runs unconditionally inside FlowFabric's background scanners (14 total). This endpoint is a 202 stub preserved so dashboards that hit it don't break. Scheduled for removal at v2.\n\nDeprecation is signalled via RFC 8594 response headers: `Deprecation` (the day the endpoint was retired), `Sunset` (the planned removal date), and `Link; rel=\"deprecation\"` (docs URL). Pre-#430 this endpoint returned `\"deprecated\": true` in the body; body markers are invisible to SDK generators and API gateways, so the signal moved into headers per spec.",
+        "deprecated": true,
+        "operationId": "recoverRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "202": {
+            "description": "Recovery request accepted (no-op). Inspect `Deprecation` + `Sunset` response headers per RFC 8594.",
+            "headers": {
+              "Deprecation": { "description": "HTTP-date at which this endpoint was deprecated (RFC 8594).", "schema": { "type": "string" } },
+              "Sunset":      { "description": "HTTP-date at which this endpoint will be removed (RFC 8594).",      "schema": { "type": "string" } },
+              "Link":        { "description": "Link header with `rel=\"deprecation\"` pointing at human-readable docs.", "schema": { "type": "string" } }
+            }
+          },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/runs/{id}/spawn": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Spawn a subagent child run",
+        "operationId": "spawnSubagentRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "201": {
+            "description": "Child run created",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "parent_run_id": { "type": "string" }, "child_run_id": { "type": "string" } } } } }
+          },
+          "404": { "description": "Parent run not found" }
+        }
+      }
+    },
+    "/v1/runs/{id}/intervene": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Operator intervention on a run",
+        "operationId": "interveneRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Intervention recorded" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/diagnose": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "Build a diagnosis report for a (potentially stuck) run",
+        "operationId": "diagnoseRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Diagnosis report" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/sla": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "Fetch SLA status for a run",
+        "operationId": "getRunSla",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "SLA status" }, "404": { "description": "Run or SLA not found" } }
+      },
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Configure SLA for a run",
+        "operationId": "setRunSla",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "SLA configured" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/children": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List child (subagent) runs for a parent run",
+        "operationId": "listChildRuns",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Child run list" }, "404": { "description": "Parent run not found" } }
+      }
+    },
+    "/v1/runs/{id}/subagent-spawns": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List subagent-spawn audit rows for a parent run (#670)",
+        "description": "Returns one row per `spawn_subagent` execution from the LLM's `ActionProposal`. Distinct from `/children` which lists child RunRecords — child runs are created by epic #670 G3 (not yet shipped); this endpoint shows the delegation audit (goal + role) immediately when the execute layer fires. Operators use it to see what the parent actually delegated verbatim.",
+        "operationId": "listSubagentSpawns",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 }, "description": "Max rows to return. Effective range is [1, 1000] — values below 1 are treated as 1, values above 1000 are clamped to 1000. Default 100." },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 }, "description": "Zero-based offset into the sorted spawn list." }
+        ],
+        "responses": { "200": { "description": "Subagent spawn audit list (with `hasMore` flag when truncated)" }, "404": { "description": "Parent run not found" } }
+      }
+    },
+    "/v1/runs/{id}/interventions": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List operator interventions recorded against a run",
+        "operationId": "listRunInterventions",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Intervention list" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/cost-alert": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Set a cost alert threshold for a run (RFC 010)",
+        "description": "Configures a cost alert that fires when total run cost crosses `threshold_micros`. Returns the created alert record per #431 so the UI can render the configured threshold without a follow-up GET.",
+        "operationId": "setRunCostAlert",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": {
+          "201": { "description": "Alert configured — returns the created alert record.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunCostAlertResponse" } } } },
+          "404": { "description": "Run not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/runs/{id}/audit": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "Audit trail for a run",
+        "operationId": "getRunAuditTrail",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Audit trail" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/export": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "Export a run as a portable bundle",
+        "operationId": "exportRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Run bundle" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/checkpoint": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Force-capture a checkpoint for a run",
+        "operationId": "createRunCheckpoint",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "201": { "description": "Checkpoint recorded" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/checkpoint-strategy": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Set checkpoint strategy for a run",
+        "operationId": "setCheckpointStrategy",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Strategy set" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/replay": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Replay a run from the event log",
+        "operationId": "replayRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Replay enqueued" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/runs/{id}/replay-to-checkpoint": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Replay a run up to a specific checkpoint",
+        "operationId": "replayRunToCheckpoint",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Replay enqueued" }, "404": { "description": "Run or checkpoint not found" } }
+      }
+    },
+    "/v1/runs/stalled": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List stalled runs with diagnosis reports",
+        "operationId": "listStalledRuns",
+        "parameters": [
+          { "name": "minutes", "in": "query", "schema": { "type": "integer", "default": 30 } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Stalled-run list" } }
+      }
+    },
+    "/v1/runs/escalated": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List recovery-escalated runs for the tenant",
+        "operationId": "listEscalatedRuns",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Escalated-run list" } }
+      }
+    },
+    "/v1/runs/sla-breached": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List SLA-breached runs for the tenant",
+        "operationId": "listSlaBreachedRuns",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "SLA-breach list" } }
+      }
+    },
+    "/v1/runs/cost-alerts": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List triggered run cost alerts",
+        "operationId": "listRunCostAlerts",
+        "responses": { "200": { "description": "Triggered cost alert list" } }
+      }
+    },
+    "/v1/runs/resume-due": {
+      "get": {
+        "tags": ["Runs"],
+        "summary": "List paused runs whose resume time has arrived",
+        "operationId": "listDueRunResumes",
+        "responses": { "200": { "description": "Due-resume run list" } }
+      }
+    },
+    "/v1/runs/process-scheduled-resumes": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Process all paused runs whose resume time has arrived",
+        "operationId": "processScheduledRunResumes",
+        "responses": { "200": { "description": "Resume batch processed" } }
+      }
+    },
+    "/v1/runs/batch": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Batch-create multiple runs in one request",
+        "operationId": "batchCreateRuns",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "array", "items": { "type": "object" } } } } },
+        "responses": { "201": { "description": "Runs created" } }
+      }
+    },
+    "/v1/workers": {
+      "get": {
+        "tags": ["Workers"],
+        "summary": "List registered external workers",
+        "operationId": "listWorkers",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Worker list" } }
+      }
+    },
+    "/v1/workers/register": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Register a new external worker",
+        "operationId": "registerWorker",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["worker_id"], "properties": { "worker_id": { "type": "string" }, "display_name": { "type": "string" } } } } } },
+        "responses": { "201": { "description": "Worker registered" } }
+      }
+    },
+    "/v1/workers/{id}": {
+      "get": {
+        "tags": ["Workers"],
+        "summary": "Get a worker by id",
+        "operationId": "getWorker",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Worker record" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/claim": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Worker claims a task for execution",
+        "operationId": "workerClaimTask",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Task claimed" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/heartbeat": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Worker sends a heartbeat",
+        "operationId": "workerHeartbeat",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Heartbeat accepted" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/report": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Worker reports task outcome",
+        "operationId": "workerReport",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Report accepted" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/suspend": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Suspend an external worker",
+        "operationId": "suspendWorker",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Worker suspended" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/workers/{id}/reactivate": {
+      "post": {
+        "tags": ["Workers"],
+        "summary": "Reactivate a suspended worker",
+        "operationId": "reactivateWorker",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Worker reactivated" }, "404": { "description": "Worker not found" } }
+      }
+    },
+    "/v1/feed": {
+      "get": {
+        "tags": ["Feed"],
+        "summary": "List feed items for the active project scope",
+        "operationId": "listFeedItems",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Feed items" } }
+      }
+    },
+    "/v1/feed/{id}/read": {
+      "post": {
+        "tags": ["Feed"],
+        "summary": "Mark a feed item as read",
+        "operationId": "markFeedItemRead",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Marked read" }, "404": { "description": "Feed item not found" } }
+      }
+    },
+    "/v1/feed/read-all": {
+      "post": {
+        "tags": ["Feed"],
+        "summary": "Mark every feed item in the project scope as read",
+        "operationId": "markAllFeedItemsRead",
+        "responses": { "200": { "description": "Changed count", "content": { "application/json": { "schema": { "type": "object", "properties": { "changed": { "type": "integer" } } } } } } }
+      }
+    },
+    "/v1/skills": {
+      "get": {
+        "tags": ["Skills"],
+        "summary": "List skills available in the active project scope",
+        "operationId": "listSkills",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "project_id", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Skill list" } }
+      },
+      "post": {
+        "tags": ["Skills"],
+        "summary": "Register a skill",
+        "operationId": "createSkill",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Skill created" } }
+      }
+    },
+    "/v1/skills/{id}": {
+      "get": {
+        "tags": ["Skills"],
+        "summary": "Get a skill by id",
+        "operationId": "getSkill",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Skill record" }, "404": { "description": "Skill not found" } }
+      },
+      "delete": {
+        "tags": ["Skills"],
+        "summary": "Delete a skill",
+        "operationId": "deleteSkill",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Skill not found" } }
+      }
+    },
+    "/v1/auth/tokens": {
+      "get": {
+        "tags": ["Auth"],
+        "summary": "List auth tokens for the caller's tenant",
+        "operationId": "listAuthTokens",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Auth token list" } }
+      },
+      "post": {
+        "tags": ["Auth"],
+        "summary": "Mint a new auth token",
+        "operationId": "createAuthToken",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Auth token created" } }
+      }
+    },
+    "/v1/auth/tokens/{id}": {
+      "delete": {
+        "tags": ["Auth"],
+        "summary": "Revoke an auth token",
+        "operationId": "deleteAuthToken",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Revoked" }, "404": { "description": "Token not found" } }
+      }
+    },
+    "/v1/projects/{project}/agent-roles": {
+      "get": {
+        "tags": ["Agent roles"],
+        "summary": "List agent roles for a project (RFC 031)",
+        "description": "Returns the merged set of built-ins + operator-defined custom roles. `source` filter narrows by provenance. No pagination (bounded set per project).",
+        "operationId": "listAgentRoles",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "source", "in": "query", "required": false, "schema": { "type": "string", "enum": ["all", "builtin", "custom", "custom_shadow"] } }
+        ],
+        "responses": {
+          "200": { "description": "Agent role list" },
+          "400": { "description": "Invalid ?source filter" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Cross-tenant access refused" }
+        }
+      },
+      "post": {
+        "tags": ["Agent roles"],
+        "summary": "Create a project-scoped agent role (RFC 031 §D6)",
+        "description": "Create-only: POST with an active (`retracted_at IS NULL`) collision returns 409. POST with a retracted-id clears `retracted_at` atomically and returns 201. Body cap is 128 KiB; individual fields cap per RFC §D4. Response carries `ETag: \"<defined_at>\"`.",
+        "operationId": "createAgentRole",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": {
+          "201": { "description": "Agent role created" },
+          "400": { "description": "Malformed JSON" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Not admin / cross-tenant" },
+          "409": { "description": "Active row already exists for this id" },
+          "413": { "description": "Body or field exceeds §D4 cap" },
+          "422": { "description": "Structural / semantic validation failure" }
+        }
+      }
+    },
+    "/v1/projects/{project}/agent-roles/{role_id}": {
+      "get": {
+        "tags": ["Agent roles"],
+        "summary": "Get a single agent role (RFC 031)",
+        "operationId": "getAgentRole",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "role_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Agent role record; response carries `ETag: \"<defined_at>\"` for active rows" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Cross-tenant access refused" },
+          "404": { "description": "Role id not found for this project and not a built-in" }
+        }
+      },
+      "patch": {
+        "tags": ["Agent roles"],
+        "summary": "Update a project-scoped agent role (RFC 031)",
+        "description": "JSON Merge Patch over `AgentRole` fields. `id` and `tier` are immutable — present in the body returns 422 `ImmutableField`. Optional `If-Match: \"<etag>\"` for lost-update protection; mismatch returns 412.",
+        "operationId": "patchAgentRole",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "role_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "If-Match", "in": "header", "required": false, "schema": { "type": "string" } }
+        ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": {
+          "200": { "description": "Agent role updated; response carries refreshed ETag" },
+          "400": { "description": "Malformed JSON" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Not admin / cross-tenant" },
+          "404": { "description": "Role id not found for this project" },
+          "412": { "description": "Stale If-Match" },
+          "413": { "description": "Body or field exceeds §D4 cap" },
+          "422": { "description": "Immutable field / structural failure" }
+        }
+      },
+      "delete": {
+        "tags": ["Agent roles"],
+        "summary": "Retract a project-scoped agent role (RFC 031 §D7)",
+        "description": "Idempotent: repeat DELETE on an already-retracted role emits no new event and returns the stored `retracted_at`/`retracted_by` verbatim.",
+        "operationId": "deleteAgentRole",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "role_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Retracted (new or idempotent-repeat)" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Not admin / cross-tenant" },
+          "404": { "description": "Role id never defined for this project" }
+        }
+      }
+    },
+    "/v1/projects/{project}/agent-roles/{role_id}/history": {
+      "get": {
+        "tags": ["Agent roles"],
+        "summary": "Per-role event history (RFC 031 PR-D3 §History panel)",
+        "description": "Returns every `AgentRoleDefined` / `AgentRoleRetracted` event on the global event log matching `(project, role_id)`, oldest first. Used by the role-detail UI to render a timeline with prompt diffs between successive `defined` entries. No pagination — bounded by human iteration cadence.",
+        "operationId": "getAgentRoleHistory",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "role_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Ordered history entries (oldest → newest)" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Cross-tenant access refused" }
+        }
+      }
+    },
+    "/v1/projects/{project}/tools": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Per-project tool inventory (closes #799)",
+        "description": "Union of every built-in tool (Core/Registered/Deferred) and every tool advertised by a plugin that is currently enabled for this project (RFC 015). Plugin tools respect each enablement's `tool_allowlist`. Response `items[]` carries `{id, source, tier, description, parameters_schema}` with `source` set to `\"builtin\"` or `\"plugin:<plugin_id>\"`. Powers the RFC 031 role-editor tool autocomplete; no admin guard required.",
+        "operationId": "listProjectTools",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Tool inventory for the project" },
+          "401": { "description": "Missing bearer" },
+          "403": { "description": "Cross-tenant access refused" },
+          "400": { "description": "Invalid project path segment" }
+        }
+      }
+    },
+    "/v1/projects/{project}/triggers": {
+      "get": {
+        "tags": ["Triggers"],
+        "summary": "List triggers for a project",
+        "operationId": "listProjectTriggers",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Trigger list" } }
+      },
+      "post": {
+        "tags": ["Triggers"],
+        "summary": "Create a trigger in a project",
+        "operationId": "createProjectTrigger",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Trigger created" } }
+      }
+    },
+    "/v1/projects/{project}/triggers/{trigger_id}": {
+      "get": {
+        "tags": ["Triggers"],
+        "summary": "Get a trigger by id",
+        "operationId": "getProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Trigger record" }, "404": { "description": "Trigger not found" } }
+      },
+      "delete": {
+        "tags": ["Triggers"],
+        "summary": "Delete a trigger",
+        "operationId": "deleteProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Trigger not found" } }
+      }
+    },
+    "/v1/projects/{project}/triggers/{trigger_id}/enable": {
+      "post": {
+        "tags": ["Triggers"],
+        "summary": "Enable a trigger",
+        "operationId": "enableProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Trigger enabled" }, "404": { "description": "Trigger not found" } }
+      }
+    },
+    "/v1/projects/{project}/triggers/{trigger_id}/disable": {
+      "post": {
+        "tags": ["Triggers"],
+        "summary": "Disable a trigger",
+        "operationId": "disableProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Trigger disabled" }, "404": { "description": "Trigger not found" } }
+      }
+    },
+    "/v1/projects/{project}/triggers/{trigger_id}/resume": {
+      "post": {
+        "tags": ["Triggers"],
+        "summary": "Resume a paused trigger",
+        "operationId": "resumeProjectTrigger",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "trigger_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Trigger resumed" }, "404": { "description": "Trigger not found" } }
+      }
+    },
+    "/v1/projects/{project}/run-templates": {
+      "get": {
+        "tags": ["Run templates"],
+        "summary": "List run templates for a project",
+        "operationId": "listProjectRunTemplates",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Run template list" } }
+      },
+      "post": {
+        "tags": ["Run templates"],
+        "summary": "Create a run template in a project",
+        "operationId": "createProjectRunTemplate",
+        "parameters": [{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Run template created" } }
+      }
+    },
+    "/v1/projects/{project}/run-templates/{template_id}": {
+      "get": {
+        "tags": ["Run templates"],
+        "summary": "Get a run template by id",
+        "operationId": "getProjectRunTemplate",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "template_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Run template" }, "404": { "description": "Template not found" } }
+      },
+      "delete": {
+        "tags": ["Run templates"],
+        "summary": "Delete a run template",
+        "operationId": "deleteProjectRunTemplate",
+        "parameters": [
+          { "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "template_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Template not found" } }
+      }
+    },
+    "/v1/costs": {
+      "get": {
+        "tags": ["Costs"],
+        "summary": "List per-session cost records for the caller's tenant",
+        "description": "Newest-first. The `limit` defaults to 200 and is clamped at 1 000 per page (issue #423); paginate via `offset` + `has_more`. `since_ms` bounds the `updated_at_ms` lower window.",
+        "operationId": "listTenantCosts",
+        "parameters": [
+          { "name": "since_ms", "in": "query", "schema": { "type": "integer", "format": "int64" } },
+          { "name": "limit",    "in": "query", "schema": { "type": "integer", "default": 200, "maximum": 1000 } },
+          { "name": "offset",   "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Per-session cost page" } }
+      }
+    },
+    "/v1/evals/runs/{id}/start": {
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Start an eval run",
+        "operationId": "startEvalRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Run started" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/evals/runs/{id}/complete": {
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Complete an eval run",
+        "operationId": "completeEvalRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Run completed" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/evals/runs/{id}/score": {
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Record a per-entry score for an eval run",
+        "operationId": "scoreEvalRun",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Score recorded" }, "404": { "description": "Run not found" } }
+      }
+    },
+    "/v1/tool-invocations": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "List tool invocations for a run",
+        "operationId": "listToolInvocations",
+        "parameters": [
+          { "name": "run_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "state",  "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Tool invocation page" } }
+      },
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Record a tool invocation start",
+        "operationId": "createToolInvocation",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Invocation recorded" } }
+      }
+    },
+    "/v1/tool-invocations/{id}": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Get a tool invocation by id",
+        "operationId": "getToolInvocation",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Invocation view" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/tool-invocations/{id}/complete": {
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Mark a tool invocation as completed",
+        "operationId": "completeToolInvocation",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Invocation completed" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/tool-invocations/{id}/cancel": {
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Cancel (and record failure for) a tool invocation",
+        "operationId": "cancelToolInvocation",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Invocation cancelled" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/tool-invocations/{id}/progress": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Get latest progress snapshot for a tool invocation",
+        "operationId": "getToolInvocationProgress",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Progress snapshot" }, "404": { "description": "No progress recorded" } }
+      }
+    },
+    "/v1/checkpoints": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "List checkpoints for a run",
+        "operationId": "listCheckpoints",
+        "parameters": [
+          { "name": "run_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } }
+        ],
+        "responses": { "200": { "description": "Checkpoint list" }, "400": { "description": "run_id is required" } }
+      }
+    },
+    "/v1/checkpoints/{id}": {
+      "get": {
+        "tags": ["Tools"],
+        "summary": "Get a checkpoint by id",
+        "operationId": "getCheckpoint",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Checkpoint" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/checkpoints/{id}/restore": {
+      "post": {
+        "tags": ["Tools"],
+        "summary": "Restore run state from a checkpoint",
+        "operationId": "restoreCheckpoint",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Restored" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/memory/deep-search": {
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Deep search across memory documents (rerank + graph expansion)",
+        "operationId": "memoryDeepSearch",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Search results" } }
+      }
+    },
+    "/v1/memory/diagnostics": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "Memory pipeline diagnostics (index health, embedder queue depth, etc.)",
+        "operationId": "getMemoryDiagnostics",
+        "responses": { "200": { "description": "Diagnostics payload" } }
+      }
+    },
+    "/v1/integrations": {
+      "get": {
+        "tags": ["Integrations"],
+        "summary": "List integrations configured for the active project",
+        "operationId": "listIntegrations",
+        "responses": { "200": { "description": "Integration list" } }
+      },
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Register an integration",
+        "operationId": "createIntegration",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Integration created" } }
+      }
+    },
+    "/v1/integrations/{integration_id}": {
+      "get": {
+        "tags": ["Integrations"],
+        "summary": "Get an integration by id",
+        "operationId": "getIntegration",
+        "parameters": [{ "name": "integration_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Integration record" }, "404": { "description": "Not found" } }
+      },
+      "delete": {
+        "tags": ["Integrations"],
+        "summary": "Delete an integration",
+        "operationId": "deleteIntegration",
+        "parameters": [{ "name": "integration_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/providers/connections/{id}/resolve-key": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Resolve the API key for a provider connection (admin only)",
+        "operationId": "resolveProviderConnectionKey",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Resolved key" }, "404": { "description": "Connection not found" } }
+      }
+    },
+    "/v1/providers/connections/{id}/retry-policy": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Set retry policy for a provider connection",
+        "operationId": "setProviderRetryPolicy",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Policy set" }, "404": { "description": "Connection not found" } }
+      }
+    },
+    "/v1/providers/connections/{id}/test": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Test a provider connection by running a synthetic call",
+        "operationId": "testProviderConnection",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Test result" }, "404": { "description": "Connection not found" } }
+      }
+    },
+    "/v1/plugins/catalog": {
+      "get": {
+        "tags": ["Plugins"],
+        "summary": "Browse the plugin marketplace catalog (RFC 015)",
+        "operationId": "listPluginCatalog",
+        "responses": { "200": { "description": "Catalog list" } }
+      }
+    },
+    "/v1/plugins/{id}/install": {
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Install a plugin by id",
+        "operationId": "installPlugin",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Plugin installed" }, "404": { "description": "Plugin not found" } }
+      }
+    },
+    "/v1/plugins/{id}/uninstall": {
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Uninstall a plugin by id",
+        "operationId": "uninstallPlugin",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Plugin uninstalled" }, "404": { "description": "Plugin not found" } }
+      }
+    },
+    "/v1/plugins/{id}/verify": {
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Verify a plugin's manifest signature",
+        "operationId": "verifyPlugin",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Verification result" }, "404": { "description": "Plugin not found" } }
+      }
+    },
+    "/v1/plugins/{id}/credentials": {
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Set credentials for a plugin",
+        "operationId": "setPluginCredentials",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Credentials set" }, "404": { "description": "Plugin not found" } }
+      }
+    },
+    "/v1/webhooks/github/webhook": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "GitHub webhook delivery endpoint",
+        "operationId": "githubWebhook",
+        "responses": { "200": { "description": "Accepted" }, "401": { "description": "Signature mismatch" } }
+      }
+    },
+    "/v1/webhooks/github/queue/concurrency": {
+      "get": {
+        "tags": ["Integrations"],
+        "summary": "Get GitHub webhook queue concurrency configuration",
+        "operationId": "getGithubQueueConcurrency",
+        "responses": { "200": { "description": "Concurrency config" } }
+      },
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Set GitHub webhook queue concurrency",
+        "operationId": "setGithubQueueConcurrency",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Concurrency updated" } }
+      }
+    },
+    "/v1/webhooks/github/queue/pause": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Pause GitHub webhook queue processing",
+        "operationId": "pauseGithubQueue",
+        "responses": { "200": { "description": "Queue paused" } }
+      }
+    },
+    "/v1/webhooks/github/queue/resume": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Resume GitHub webhook queue processing",
+        "operationId": "resumeGithubQueue",
+        "responses": { "200": { "description": "Queue resumed" } }
+      }
+    },
+    "/v1/webhooks/github/queue/{issue}/retry": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Retry a failed webhook delivery for an issue",
+        "operationId": "retryGithubQueueIssue",
+        "parameters": [{ "name": "issue", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Retried" }, "404": { "description": "Issue not found" } }
+      }
+    },
+    "/v1/webhooks/github/queue/{issue}/skip": {
+      "post": {
+        "tags": ["Integrations"],
+        "summary": "Skip a failed webhook delivery for an issue",
+        "operationId": "skipGithubQueueIssue",
+        "parameters": [{ "name": "issue", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Skipped" }, "404": { "description": "Issue not found" } }
+      }
+    },
+    "/v1/admin/capabilities": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List admin-reachable capabilities for the current deployment",
+        "operationId": "getAdminCapabilities",
+        "responses": { "200": { "description": "Capability map" } }
+      }
+    },
+    "/v1/admin/entitlements": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Licensed entitlements and feature flags",
+        "operationId": "getAdminEntitlements",
+        "responses": { "200": { "description": "Entitlements" } }
+      }
+    },
+    "/v1/admin/license": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Current license state",
+        "operationId": "getLicense",
+        "responses": { "200": { "description": "License record" } }
+      }
+    },
+    "/v1/admin/license/activate": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Activate a license key",
+        "operationId": "activateLicense",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Activated" }, "400": { "description": "Invalid license" } }
+      }
+    },
+    "/v1/admin/license/override": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Override the license (admin emergency)",
+        "operationId": "overrideLicense",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Override applied" } }
+      }
+    },
+    "/v1/admin/logs": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Structured request log tail from the in-memory ring buffer",
+        "operationId": "listRequestLogs",
+        "parameters": [
+          { "name": "limit",    "in": "query", "schema": { "type": "integer", "default": 200 } },
+          { "name": "level",    "in": "query", "schema": { "type": "string", "description": "Comma-separated: info,warn,error" } },
+          { "name": "since_ms", "in": "query", "schema": { "type": "integer", "format": "int64" } }
+        ],
+        "responses": { "200": { "description": "Request log entries" } }
+      }
+    },
+    "/v1/admin/notifications/failed": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List failed notification deliveries for the caller's tenant",
+        "operationId": "listFailedNotifications",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Failed notification list" } }
+      }
+    },
+    "/v1/admin/tenants/{tenant_id}/operators/{operator_id}/tenant-roles": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List an operator's tenant-role grants (RFC 026 PR-A4)",
+        "description": "Returns every `(tenant_id, operator_id)` grant ever recorded for the operator — active and revoked — so the OperatorsPage can surface the full grant set per-row. Tenant-scoped under `:tenant_id`; `TenantAdminGuard` authorizes on that tenant. Cross-tenant operator ids return 404 so presence is never revealed. Body items echo the `OperatorTenantRoleRecord` projection shape.",
+        "operationId": "listOperatorTenantRoles",
+        "parameters": [
+          { "name": "tenant_id",   "in": "path", "required": true, "schema": { "type": "string" }, "description": "Tenant the caller is admin on." },
+          { "name": "operator_id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Operator whose grants to list." }
+        ],
+        "responses": {
+          "200": { "description": "Grant list (active + revoked)." },
+          "403": { "description": "Structured `tenant_role_missing` for non-admin callers." },
+          "404": { "description": "Operator profile not found for this tenant." }
+        }
+      }
+    },
+    "/v1/admin/operators/{id}/tenant-roles/{tenant}/promote": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Grant a tenant-scope role to an operator (RFC 026 PR-A0)",
+        "description": "Upserts the (tenant, operator) pair in `operator_tenant_roles`; re-granting an already-granted pair clears any prior revocation. Guarded by `TenantAdminGuard` — accepts god-token (`CAIRN_ADMIN_TOKEN`) for bootstrapping OR an existing `TenantRole::Admin` on the target tenant so tenant-admins can delegate.",
+        "operationId": "promoteTenantRole",
+        "parameters": [
+          { "name": "id",     "in": "path", "required": true, "schema": { "type": "string" }, "description": "Operator id." },
+          { "name": "tenant", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Target tenant id." }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "required": ["role"], "properties": { "role": { "type": "string", "enum": ["admin", "member", "read_only"] } } } } }
+        },
+        "responses": {
+          "201": { "description": "Role granted — body echoes the projected row." },
+          "403": { "description": "Structured `tenant_role_missing` body when the caller is a non-admin operator without TenantRole::Admin on the target." }
+        }
+      }
+    },
+    "/v1/admin/operators/{id}/tenant-roles/{tenant}": {
+      "delete": {
+        "tags": ["Admin"],
+        "summary": "Revoke an operator's tenant-scope role (RFC 026 PR-A0)",
+        "description": "Soft delete — the projection row is retained with `revoked_at_ms` + `revoked_by` set so the audit trail survives. Returns 404 when no grant has ever existed for the (operator, tenant) pair.",
+        "operationId": "revokeTenantRole",
+        "parameters": [
+          { "name": "id",     "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenant", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Revoked — body echoes the updated row with revocation fields populated." },
+          "403": { "description": "Structured `tenant_role_missing` for non-admin callers." },
+          "404": { "description": "No grant exists for this (operator, tenant)." }
+        }
+      }
+    },
+    "/v1/admin/workspaces": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List workspaces across all tenants (admin only)",
+        "operationId": "adminListWorkspaces",
+        "responses": { "200": { "description": "Workspace list" } }
+      }
+    },
+    "/v1/approval-policies": {
+      "get": {
+        "tags": ["Approvals"],
+        "summary": "List approval policies for the caller's tenant",
+        "operationId": "listApprovalPolicies",
+        "responses": { "200": { "description": "Approval policy list" } }
+      },
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Create an approval policy",
+        "operationId": "createApprovalPolicy",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Policy created" } }
+      }
+    },
+    "/v1/approvals/{id}/resolve": {
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Resolve an approval (approve or deny with decision payload)",
+        "operationId": "resolveApproval",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Resolved" }, "404": { "description": "Approval not found" } }
+      }
+    },
+    "/v1/assistant/message": {
+      "post": {
+        "tags": ["Assistant"],
+        "summary": "Send a message to the in-app assistant",
+        "operationId": "sendAssistantMessage",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Assistant reply" } }
+      }
+    },
+    "/v1/assistant/voice": {
+      "post": {
+        "tags": ["Assistant"],
+        "summary": "Submit a voice-formatted message to the assistant",
+        "operationId": "sendAssistantVoice",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Assistant reply" } }
+      }
+    },
+    "/v1/assistant/sessions": {
+      "get": {
+        "tags": ["Assistant"],
+        "summary": "List assistant sessions for the caller",
+        "operationId": "listAssistantSessions",
+        "responses": { "200": { "description": "Assistant session list" } }
+      }
+    },
+    "/v1/assistant/sessions/{sessionId}": {
+      "get": {
+        "tags": ["Assistant"],
+        "summary": "Get an assistant session by id",
+        "operationId": "getAssistantSession",
+        "parameters": [{ "name": "sessionId", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Assistant session" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/channels": {
+      "get": {
+        "tags": ["Channels"],
+        "summary": "List notification channels configured for the caller's tenant",
+        "operationId": "listChannels",
+        "responses": { "200": { "description": "Channel list" } }
+      },
+      "post": {
+        "tags": ["Channels"],
+        "summary": "Register a notification channel",
+        "operationId": "createChannel",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Channel created" } }
+      }
+    },
+    "/v1/config": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Dump server configuration (secrets redacted)",
+        "operationId": "getServerConfig",
+        "responses": { "200": { "description": "Config dump" } }
+      }
+    },
+    "/v1/config/{key}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get a single config value by key",
+        "operationId": "getConfigValue",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Value" }, "404": { "description": "Not found" } }
+      },
+      "put": {
+        "tags": ["Admin"],
+        "summary": "Set a config value",
+        "operationId": "setConfigValue",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Set" } }
+      },
+      "delete": {
+        "tags": ["Admin"],
+        "summary": "Delete a config value",
+        "operationId": "deleteConfigValue",
+        "parameters": [{ "name": "key", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "204": { "description": "Deleted" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/evals/datasets": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "List eval datasets for the caller's tenant",
+        "operationId": "listEvalDatasets",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",     "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",    "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Dataset list" } }
+      },
+      "post": {
+        "tags": ["Evals"],
+        "summary": "Create an eval dataset",
+        "operationId": "createEvalDataset",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Dataset created" } }
+      }
+    },
+    "/v1/evals/matrices/guardrail": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Guardrail matrix (per-release violation counts)",
+        "operationId": "getGuardrailMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/evals/matrices/memory-quality": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Memory-quality matrix",
+        "operationId": "getMemoryQualityMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/evals/matrices/permissions": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Permissions matrix",
+        "operationId": "getPermissionsMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/evals/matrices/prompt-comparison": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Prompt-comparison matrix",
+        "operationId": "getPromptComparisonMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/evals/matrices/skill-health": {
+      "get": {
+        "tags": ["Evals"],
+        "summary": "Skill-health matrix",
+        "operationId": "getSkillHealthMatrix",
+        "responses": { "200": { "description": "Matrix" } }
+      }
+    },
+    "/v1/export/{format}": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Export a portable bundle in the given format",
+        "operationId": "exportBundleByFormat",
+        "parameters": [{ "name": "format", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Export archive" }, "400": { "description": "Unsupported format" } }
+      }
+    },
+    "/v1/fleet": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Fleet overview (hosts, roles, deployment mode)",
+        "description": "**Scope (#428):** tenant-scoped — the `TenantScope` extractor injects the caller's tenant; non-admin callers only see fleet members bound to their own tenant. Admin principals see every tenant. The path stays outside `/v1/admin/` because it's already correctly scoped.",
+        "operationId": "getFleet",
+        "responses": {
+          "200": { "description": "Fleet overview" },
+          "401": { "description": "Missing or invalid bearer token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/graph/trace": {
+      "get": {
+        "tags": ["Graph"],
+        "summary": "Graph trace query",
+        "operationId": "getGraphTrace",
+        "responses": { "200": { "description": "Trace data" } }
+      }
+    },
+    "/v1/import/reports": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List recent import reports",
+        "operationId": "listImportReports",
+        "responses": { "200": { "description": "Import reports" } }
+      }
+    },
+    "/v1/import/preview": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Preview what an import bundle would change",
+        "operationId": "previewImport",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Preview" } }
+      }
+    },
+    "/v1/import/validate": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Validate an import bundle",
+        "operationId": "validateImport",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Validation result" } }
+      }
+    },
+    "/v1/import/apply": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Apply an import bundle",
+        "operationId": "applyImport",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Applied" } }
+      }
+    },
+    "/v1/ingest/jobs": {
+      "get": {
+        "tags": ["Ingest"],
+        "summary": "List ingest jobs for the caller's project",
+        "operationId": "listIngestJobs",
+        "responses": { "200": { "description": "Ingest jobs" } }
+      },
+      "post": {
+        "tags": ["Ingest"],
+        "summary": "Create an ingest job",
+        "operationId": "createIngestJob",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Job created" } }
+      }
+    },
+    "/v1/memories": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "List memory documents",
+        "operationId": "listMemories",
+        "responses": { "200": { "description": "Memory list" } }
+      },
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Create a memory document",
+        "operationId": "createMemory",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Memory created" } }
+      }
+    },
+    "/v1/memories/search": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "Search memory documents",
+        "operationId": "searchMemories",
+        "parameters": [
+          { "name": "q",     "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } }
+        ],
+        "responses": { "200": { "description": "Search results" } }
+      }
+    },
+    "/v1/memories/{id}/accept": {
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Accept a memory document",
+        "operationId": "acceptMemory",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Accepted" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/memories/{id}/reject": {
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Reject a memory document",
+        "operationId": "rejectMemory",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Rejected" }, "404": { "description": "Not found" } }
+      }
+    },
+    "/v1/onboarding/status": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Onboarding status for the caller",
+        "operationId": "getOnboardingStatus",
+        "responses": { "200": { "description": "Onboarding status" } }
+      }
+    },
+    "/v1/onboarding/template": {
+      "post": {
+        "tags": ["Admin"],
+        "summary": "Apply an onboarding template",
+        "operationId": "applyOnboardingTemplate",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Template applied" } }
+      }
+    },
+    "/v1/onboarding/templates": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List available onboarding templates",
+        "operationId": "listOnboardingTemplates",
+        "responses": { "200": { "description": "Onboarding template list" } }
+      }
+    },
+    "/v1/plugins": {
+      "get": {
+        "tags": ["Plugins"],
+        "summary": "List plugins registered with the host",
+        "operationId": "listPlugins",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Plugin list" } }
+      },
+      "post": {
+        "tags": ["Plugins"],
+        "summary": "Register a plugin manifest",
+        "operationId": "createPlugin",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Plugin registered" } }
+      }
+    },
+    "/v1/policies/decisions": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List recent guardrail-policy decisions",
+        "operationId": "listPolicyDecisions",
+        "responses": { "200": { "description": "Decision log" } }
+      }
+    },
+    "/v1/providers/bindings": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "List provider bindings for the caller's tenant",
+        "operationId": "listProviderBindings",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",     "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",    "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Binding list" } }
+      },
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Create a provider binding",
+        "operationId": "createProviderBinding",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Binding created" } }
+      }
+    },
+    "/v1/providers/bindings/cost-ranking": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "Per-binding cost ranking for the tenant",
+        "operationId": "listBindingCostRanking",
+        "parameters": [
+          { "name": "tenant_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit",     "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset",    "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Cost ranking" } }
+      }
+    },
+    "/v1/providers/budget": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "List provider budgets",
+        "operationId": "listProviderBudgets",
+        "responses": { "200": { "description": "Budget list" } }
+      },
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Set a provider budget",
+        "operationId": "setProviderBudget",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Budget set" } }
+      }
+    },
+    "/v1/providers/policies": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "List route policies",
+        "operationId": "listRoutePolicies",
+        "responses": { "200": { "description": "Route policy list" } }
+      },
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Create a route policy",
+        "operationId": "createRoutePolicy",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Policy created" } }
+      }
+    },
+    "/v1/providers/pools": {
+      "get": {
+        "tags": ["Providers"],
+        "summary": "List provider connection pools",
+        "operationId": "listProviderPools",
+        "responses": { "200": { "description": "Pool list" } }
+      },
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Create a provider connection pool",
+        "operationId": "createProviderPool",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Pool created" } }
+      }
+    },
+    "/v1/providers/run-health-checks": {
+      "post": {
+        "tags": ["Providers"],
+        "summary": "Run all due provider health checks now",
+        "operationId": "runProviderHealthChecks",
+        "responses": { "200": { "description": "Records produced by the batch" } }
+      }
+    },
+    "/v1/settings/tls": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "TLS certificate settings",
+        "operationId": "getTlsSettings",
+        "responses": { "200": { "description": "TLS settings" } }
+      }
+    },
+    "/v1/soul": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Get the current soul document",
+        "operationId": "getSoul",
+        "responses": { "200": { "description": "Soul document" } }
+      },
+      "put": {
+        "tags": ["Admin"],
+        "summary": "Replace the soul document",
+        "operationId": "putSoul",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "Soul updated" } }
+      }
+    },
+    "/v1/soul/history": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "Soul document revision history",
+        "operationId": "getSoulHistory",
+        "responses": { "200": { "description": "History" } }
+      }
+    },
+    "/v1/soul/patches": {
+      "get": {
+        "tags": ["Admin"],
+        "summary": "List soul patches pending review",
+        "operationId": "listSoulPatches",
+        "responses": { "200": { "description": "Patch list" } }
+      }
+    },
+    "/v1/sources": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "List knowledge sources for the caller's project",
+        "operationId": "listSources",
+        "responses": { "200": { "description": "Source list" } }
+      },
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Register a knowledge source",
+        "operationId": "createSource",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "201": { "description": "Source created" } }
+      }
+    },
+    "/v1/sources/{id}": {
+      "get": {
+        "tags": ["Memory"],
+        "summary": "Fetch a source detail record",
+        "operationId": "getSource",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "workspace_id", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "project_id", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Source detail" },
+          "404": { "description": "Source not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "patch": {
+        "tags": ["Memory"],
+        "summary": "Partially update a knowledge source (#426)",
+        "description": "Updates an existing source's name and/or description. Absent fields preserve the current value — PATCH semantics per RFC 7231 §4.3.4. The verb was changed from PUT to PATCH in #426 because the handler has never had full-replacement semantics.",
+        "operationId": "patchSource",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PatchSourceRequest" } } } },
+        "responses": {
+          "200": { "description": "Source updated" },
+          "404": { "description": "Source not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "422": { "description": "Unknown or malformed field", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "delete": {
+        "tags": ["Memory"],
+        "summary": "Deactivate a knowledge source",
+        "operationId": "deleteSource",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "Source deactivated" },
+          "404": { "description": "Source not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/sources/process-refresh": {
+      "post": {
+        "tags": ["Memory"],
+        "summary": "Process all due source refreshes now",
+        "operationId": "processSourceRefresh",
+        "responses": { "200": { "description": "Refresh batch processed" } }
+      }
+    },
+    "/v1/streams/runtime": {
+      "get": {
+        "tags": ["Events"],
+        "summary": "Alternate SSE event stream (legacy)",
+        "description": "Supplementary live event stream. Bearer auth required — same contract as `/v1/stream` (`Authorization` header OR `?token=` query parameter).",
+        "operationId": "streamRuntimeEvents",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "token", "in": "query", "required": false, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "SSE stream" }, "401": { "description": "Unauthorized" } }
+      }
+    },
+    "/v1/tasks/expired": {
+      "get": {
+        "tags": ["Tasks"],
+        "summary": "List tasks whose lease has expired",
+        "operationId": "listExpiredTasks",
+        "parameters": [
+          { "name": "limit",  "in": "query", "schema": { "type": "integer", "default": 100 } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": { "200": { "description": "Expired task list" } }
+      }
+    },
+    "/v1/tasks/expire-leases": {
+      "post": {
+        "tags": ["Tasks"],
+        "summary": "Force-expire task leases past their deadline",
+        "operationId": "expireTaskLeases",
+        "responses": { "200": { "description": "Expired task ids" } }
+      }
+    },
+    "/v1/tasks/{id}/cancel": {
+      "post": {
+        "tags": ["Tasks"],
+        "summary": "Cancel a task",
+        "operationId": "cancelTask",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Task cancelled" }, "404": { "description": "Task not found" } }
+      }
+    },
+    "/v1/poll/run": {
+      "post": {
+        "tags": ["Runs"],
+        "summary": "Internal: tick scheduled polling runs",
+        "operationId": "pollRun",
+        "responses": { "200": { "description": "Poll tick accepted" } }
       }
     }
   }

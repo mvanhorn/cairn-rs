@@ -141,6 +141,28 @@ impl InstallationToken {
         }
     }
 
+    /// Create a token that always returns `token` without making any network
+    /// call. Used in integration tests to bypass GitHub App auth.
+    #[doc(hidden)]
+    pub fn with_static_token(token: impl Into<String>) -> Self {
+        use std::time::{Duration, SystemTime};
+        let static_token = token.into();
+        let credentials = AppCredentials {
+            app_id: 0,
+            encoding_key: jsonwebtoken::EncodingKey::from_secret(&[]),
+        };
+        let cache = Arc::new(RwLock::new(Some(CachedToken {
+            token: static_token,
+            expires_at: SystemTime::now() + Duration::from_secs(3600 * 24 * 365),
+        })));
+        Self {
+            credentials,
+            installation_id: 0,
+            token_cache: cache,
+            http: reqwest::Client::new(),
+        }
+    }
+
     /// Get a valid access token, refreshing if expired or missing.
     pub async fn get(&self) -> Result<String, GitHubError> {
         // Check cache first.
@@ -159,8 +181,20 @@ impl InstallationToken {
         self.refresh().await
     }
 
+    /// Force-refresh the installation access token and return both the
+    /// token and the raw ISO-8601 `expires_at` timestamp returned by
+    /// GitHub. Useful for verify flows that want to surface expiry
+    /// metadata without re-minting a second token.
+    pub async fn refresh_with_metadata(&self) -> Result<(String, String), GitHubError> {
+        self.refresh_inner().await
+    }
+
     /// Force-refresh the installation access token.
     pub async fn refresh(&self) -> Result<String, GitHubError> {
+        self.refresh_inner().await.map(|(token, _)| token)
+    }
+
+    async fn refresh_inner(&self) -> Result<(String, String), GitHubError> {
         let jwt = self.credentials.generate_jwt()?;
 
         let url = format!(
@@ -191,6 +225,7 @@ impl InstallationToken {
             .unwrap_or_else(|| SystemTime::now() + Duration::from_secs(3600));
 
         let token = token_resp.token.clone();
+        let expires_at_raw = token_resp.expires_at.clone();
 
         let mut cache = self.token_cache.write().await;
         *cache = Some(CachedToken {
@@ -203,7 +238,7 @@ impl InstallationToken {
             "GitHub installation access token refreshed"
         );
 
-        Ok(token)
+        Ok((token, expires_at_raw))
     }
 }
 

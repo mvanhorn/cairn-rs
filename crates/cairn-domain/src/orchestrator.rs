@@ -3,6 +3,11 @@
 //! The orchestrator's DECIDE phase calls the LLM with a `ContextBundle` and
 //! receives an `ActionProposal` back.  This module defines the proposal shape
 //! and the exhaustive set of action types the orchestrator can execute.
+//!
+//! Also houses [`CompletionVerification`] (F47): an extractor-produced sidecar
+//! that scans tool_result frames at Done and surfaces warning/error lines and
+//! per-command exit codes so operators have an independent signal alongside
+//! the LLM's free-text `complete_run` summary.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +30,13 @@ pub enum ActionType {
     SendNotification,
     /// Mark the current run as successfully completed.
     CompleteRun,
+    /// #825: mark the current run as failed because the agent determined it
+    /// cannot proceed. Distinct from `CompleteRun` (deliverable exists) and
+    /// `EscalateToOperator` (operator input would unblock). Use when a
+    /// precondition is missing, the goal is contradictory, or a dependency
+    /// was not met and no operator intervention would change that outcome.
+    /// Maps to `RunService::fail(FailureClass::ModelReportedFailure)`.
+    FailRun,
     /// Escalate to a human operator when the agent is stuck or uncertain.
     EscalateToOperator,
 }
@@ -104,6 +116,21 @@ impl ActionProposal {
             requires_approval: true,
         }
     }
+
+    /// #825: construct a fail-run proposal. The `reason` lands in
+    /// `description` and flows into the run's terminal record so
+    /// operators see WHY the agent gave up without parsing a free-form
+    /// `complete_run` summary.
+    pub fn fail_run(reason: impl Into<String>, confidence: f64) -> Self {
+        Self {
+            action_type: ActionType::FailRun,
+            description: reason.into(),
+            confidence,
+            tool_name: None,
+            tool_args: None,
+            requires_approval: false,
+        }
+    }
 }
 
 // Manual Eq for f64 field (confidence). Used in tests for equality checks.
@@ -120,6 +147,78 @@ impl PartialEq for ActionProposal {
 
 impl Eq for ActionProposal {}
 
+// ── CompletionVerification (F47 PR1) ──────────────────────────────────────────
+
+/// Independent evidence distilled from tool_result frames at run Done.
+///
+/// F47 motivation: during dogfood M1 (2026-04-26) an LLM produced a Rust crate
+/// that emitted `warning: unused imports: …` in a stored bash tool_result, then
+/// claimed `cargo check must pass with no warnings` in its `complete_run`
+/// summary. Operators had no independent signal that the summary lied. This
+/// type is extracted by a pure scanner over tool_result frames and attached to
+/// `LoopTermination::Completed` so SSE watchers see the evidence alongside the
+/// free-text summary.
+///
+/// Intentionally non-authoritative: the extractor reports what the tool
+/// outputs say, not whether the run "succeeded." The orchestrator's loop
+/// signal is still the source of truth for run state.
+///
+/// `extractor_version` identifies the scanner logic that produced the bucket.
+/// Bump when the regex-set or truncation policy changes so downstream consumers
+/// can distinguish shapes across cairn versions.
+///
+/// PR1 (this change) makes this sidecar visible on the SSE `finished` event.
+/// PR2 adds persistence + REST. PR3 adds UI rendering.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionVerification {
+    /// Tool-output lines matched by the warning signal — lines starting
+    /// with the case-insensitive ASCII prefix `warning:` (e.g. `warning:
+    /// unused import`). Broader forms like `WARN:` / `Warn` are NOT
+    /// currently matched; the scanner is tuned for `rustc`/`cargo`/
+    /// `clippy` plus the generic `warning:` convention, which covers the
+    /// F47 M1 regression. Full matched line, truncated to 500 chars,
+    /// capped at 50 entries.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Tool-output lines matched by the error signal (e.g. Rust
+    /// `error[E0308]: …`, `error: …`). Same truncation / cap rules.
+    #[serde(default)]
+    pub errors: Vec<String>,
+    /// Per-bash-class-tool outcome: the command that ran and its exit
+    /// code if the tool_result carried one. Only bash-class tools
+    /// (`bash`, `shell_exec`, `run_bash`) produce entries here; non-bash
+    /// tools still contribute to `warnings`/`errors` via their text
+    /// output but are not listed in this vector. `exit_code: None` means
+    /// the frame did not structurally expose an exit code; do not infer
+    /// success from its absence.
+    #[serde(default)]
+    pub commands: Vec<CommandOutcome>,
+    /// How many tool_result frames the extractor scanned to produce this
+    /// summary. `0` means "Done reached with no recorded tool_results" —
+    /// distinct from "scanned frames but found nothing."
+    pub tool_results_scanned: usize,
+    /// Version of the extractor logic. Bump when the bucket shape or
+    /// scanning policy changes. v1 = F47 PR1.
+    pub extractor_version: u32,
+}
+
+/// One bash-class tool invocation's command and exit code, as observed in
+/// a tool_result frame. Only bash-class tools produce `CommandOutcome`
+/// entries — non-bash tools contribute to `warnings`/`errors` via their
+/// text output but never appear here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandOutcome {
+    /// Tool name from the proposal (e.g. `"bash"`, `"shell_exec"`).
+    pub tool_name: String,
+    /// The `command` arg from the proposal, truncated to 500 chars. Empty
+    /// when the proposal did not carry a `command` field.
+    pub cmd: String,
+    /// Exit code surfaced by the tool_result, if the structured payload
+    /// carried one. `None` = not present in the frame; callers MUST NOT
+    /// fabricate (e.g. do not default to `0` on success).
+    pub exit_code: Option<i32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +232,13 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ActionType::EscalateToOperator).unwrap(),
             r#""escalate_to_operator""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ActionType::FailRun).unwrap(),
+            r#""fail_run""#,
+            "#825: FailRun must wire as snake_case `fail_run` — this string \
+             is the contract between the LLM's JSON output and the \
+             orchestrator's decide-parser"
         );
     }
 
@@ -166,5 +272,22 @@ mod tests {
         let p = ActionProposal::escalate("stuck on ambiguous requirement", 0.2);
         assert_eq!(p.action_type, ActionType::EscalateToOperator);
         assert!(p.requires_approval);
+    }
+
+    #[test]
+    fn fail_run_builder_sets_no_tool_and_no_approval() {
+        // #825: fail_run is a terminal verb, not a gated operator ask.
+        // It must not trigger the approval path (that's escalate's job)
+        // and must have no tool_name/tool_args (consistent with
+        // complete_run's shape).
+        let p = ActionProposal::fail_run("blocked: src/main.rs missing", 0.9);
+        assert_eq!(p.action_type, ActionType::FailRun);
+        assert_eq!(p.description, "blocked: src/main.rs missing");
+        assert!(p.tool_name.is_none());
+        assert!(p.tool_args.is_none());
+        assert!(
+            !p.requires_approval,
+            "fail_run is terminal — approval is for escalate_to_operator"
+        );
     }
 }

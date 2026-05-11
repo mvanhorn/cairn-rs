@@ -18,6 +18,21 @@ use crate::retrieval::{
     RetrievalQuery, RetrievalResponse, RetrievalResult, RetrievalService, ScoringBreakdown,
 };
 
+/// Sentinel message used by [`InMemoryRetrieval`] when `VectorOnly` is
+/// requested but no embedding provider is configured.
+///
+/// Exported so callers that want to recover (rather than propagate) from this
+/// specific failure mode can match the error text without string-duplicating
+/// the phrase. See `cairn-app::tool_impls::is_missing_embedder_error`.
+///
+/// This is a stop-gap shared constant rather than a dedicated
+/// `RetrievalError::MissingEmbedder` variant because the retrieval stack is
+/// placeholder — the external memory crate replaces it in a future PR, at
+/// which point a proper typed variant is cheap to add.
+pub const MISSING_EMBEDDER_ERROR_MESSAGE: &str =
+    "VectorOnly mode requires an embedding provider on InMemoryRetrieval. \
+     Use LexicalOnly or configure an embedder with with_embedder().";
+
 /// In-memory document store for testing.
 /// A document record suitable for export operations.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -538,9 +553,7 @@ impl RetrievalService for InMemoryRetrieval {
                 }
                 None if query.mode == RetrievalMode::VectorOnly => {
                     return Err(RetrievalError::Internal(
-                        "VectorOnly mode requires an embedding provider on InMemoryRetrieval. \
-                         Use LexicalOnly or configure an embedder with with_embedder()."
-                            .to_owned(),
+                        MISSING_EMBEDDER_ERROR_MESSAGE.to_owned(),
                     ));
                 }
                 None => None, // Hybrid without embedder → lexical fallback
@@ -685,7 +698,7 @@ impl RetrievalService for InMemoryRetrieval {
                 let breakdown = ScoringBreakdown {
                     semantic_relevance: semantic_score,
                     lexical_relevance: lexical_score,
-                    freshness: fresh,
+                    freshness_decay: fresh,
                     staleness_penalty: stale,
                     source_credibility: credibility,
                     corroboration: 0.0,
@@ -845,8 +858,8 @@ impl RetrievalService for InMemoryRetrieval {
         {
             scoring_dims.push("semantic_relevance".to_owned());
         }
-        if results.iter().any(|r| r.breakdown.freshness != 0.0) {
-            scoring_dims.push("freshness".to_owned());
+        if results.iter().any(|r| r.breakdown.freshness_decay != 0.0) {
+            scoring_dims.push("freshness_decay".to_owned());
         }
         if results.iter().any(|r| r.breakdown.staleness_penalty != 0.0) {
             scoring_dims.push("staleness_penalty".to_owned());
@@ -932,6 +945,12 @@ impl RetrievalService for InMemoryRetrieval {
                     policy.staleness_threshold_days,
                     if policy.recency_enabled { "on" } else { "off" },
                 )),
+                // RFC 030: the host-side rescorer stamps the correct
+                // family on the return path; `InMemoryRetrieval` is
+                // called from both knowledge + memory family dispatchers
+                // in the cairn-default rollout, so leave it `None` here
+                // and let the rescorer overwrite.
+                family: None,
             },
             results,
         })
@@ -1444,8 +1463,8 @@ mod tests {
         );
         assert!(
             diag.scoring_dimensions_used
-                .contains(&"freshness".to_owned()),
-            "freshness should be listed for recently-created chunks"
+                .contains(&"freshness_decay".to_owned()),
+            "freshness_decay should be listed for recently-created chunks"
         );
 
         // Effective policy is described.
@@ -1466,7 +1485,7 @@ mod tests {
         // Per-result scoring breakdown is populated.
         for result in &response.results {
             assert!(result.breakdown.lexical_relevance > 0.0);
-            assert!(result.breakdown.freshness > 0.0);
+            assert!(result.breakdown.freshness_decay > 0.0);
             assert!(result.score > 0.0);
         }
     }

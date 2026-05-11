@@ -1,0 +1,30 @@
+[package]
+name = "cairn-api-contracts"
+version = "0.1.0"
+edition = "2021"
+license = "BSL-1.1"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Thin crate holding the HTTP endpoint-trait + request/response DTO
+# contracts that both cairn-api (consumer) and downstream crates such as
+# cairn-memory (implementor) need. Keeping these below cairn-memory in the
+# layer ordering eliminates the historical cairn-memory -> cairn-api
+# inversion (closes #440).
+#
+# Rules for what may live here:
+#   * Pure types: request/response DTOs, query shapes, endpoint traits.
+#   * May depend on cairn-domain (IDs, tenancy types).
+#   * MUST NOT depend on cairn-store, cairn-runtime, or any crate above
+#     cairn-memory in the layer ordering.
+
+[dependencies]
+cairn-domain = { path = "../cairn-domain" }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+utoipa = "5"
+
+[dev-dependencies]

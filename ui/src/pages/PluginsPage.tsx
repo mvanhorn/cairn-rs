@@ -8,11 +8,13 @@ import {
 import { ErrorFallback } from '../components/ErrorFallback';
 import { StatCard } from '../components/StatCard';
 import { useToast } from '../components/Toast';
-import { defaultApi } from '../lib/api';
+import { defaultApi, unwrapList } from '../lib/api';
 import { sectionLabel } from '../lib/design-system';
 import { useFocusTrap } from '../hooks/useFocusTrap';
 import { useScope } from '../hooks/useScope';
 import type { PluginManifest, PluginCapability, PluginDetailResponse, CatalogEntry } from '../lib/types';
+import { EntityExplainer } from '../components/EntityExplainer';
+import { ENTITY_EXPLAINERS } from '../lib/entityExplainers';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -216,6 +218,7 @@ function PluginCard({
         {/* Actions */}
         <div className="flex items-center gap-2 shrink-0">
           <button
+            data-testid={`plugin-unregister-btn-${manifest.id}`}
             onClick={e => { e.stopPropagation(); onUnregister(); }}
             title="Unregister plugin"
             className="flex items-center gap-1 px-2 py-1 rounded bg-gray-100 dark:bg-zinc-800 text-red-500/80 text-[11px] hover:bg-red-500/10 hover:text-red-400 transition-colors"
@@ -251,12 +254,28 @@ function RegisterModal({ onClose }: { onClose: () => void }) {
   const [json, setJson]     = useState(DEFAULT_MANIFEST);
   const [parseErr, setErr]  = useState<string | null>(null);
   const queryClient         = useQueryClient();
+  const toast               = useToast();
 
+  // Issue #374: register was silent on HTTP error — only `mutErr` displayed
+  // the message inline, and if the modal closed optimistically or the error
+  // path ran concurrently with another render, the operator could end up
+  // believing the plugin was registered when it was NOT. Surface a toast on
+  // both success and failure, and keep the modal OPEN on failure so the
+  // operator can edit the manifest and retry without losing their input.
+  //
+  // Invalidate in `onSettled` so a partial-success server state (backend
+  // registered, client disconnected before 2xx) still triggers a refetch
+  // — the plugin list will reconcile to reality regardless.
   const { mutate, isPending, error: mutErr } = useMutation({
     mutationFn: (m: Record<string, unknown>) => defaultApi.registerPlugin(m),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['plugins'] });
+      toast.success('Plugin registered.');
       onClose();
+    },
+    onError: (e: unknown) =>
+      toast.error(`Failed to register plugin: ${e instanceof Error ? e.message : 'try again.'}`),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['plugins'] });
     },
   });
 
@@ -315,6 +334,8 @@ function RegisterModal({ onClose }: { onClose: () => void }) {
               Cancel
             </button>
             <button
+              data-testid="plugin-register-submit-btn"
+              data-pending={isPending ? "true" : "false"}
               onClick={submit}
               disabled={isPending}
               className="px-3 py-1.5 rounded bg-indigo-600 text-white text-[12px] hover:bg-indigo-500 disabled:opacity-50 transition-colors flex items-center gap-1.5"
@@ -340,13 +361,28 @@ function CredentialWizardModal({
 }) {
   const [creds, setCreds] = useState<Record<string, string>>({});
   const queryClient = useQueryClient();
+  const toast = useToast();
   const trapRef = useFocusTrap({ onClose });
 
+  // Issue #374: providePluginCredentials was silent on HTTP error — the
+  // inline <p className="text-red-400">{error.message}</p> covered the happy
+  // re-render path but race-closed on faster errors, and a non-Error throw
+  // (e.g. a custom class) would not render at all. Toast on both paths and
+  // keep the modal open on error so the operator can re-enter / retry
+  // without having to reopen and re-type the secret.
+  //
+  // `onSettled` reconciles the catalog cache even when a partial-success
+  // network error leaves the backend in the new state — we always refetch.
   const { mutate, isPending, error } = useMutation({
     mutationFn: () => defaultApi.providePluginCredentials(pluginId, creds),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['catalog'] });
+      toast.success('Credentials saved.');
       onClose();
+    },
+    onError: (e: unknown) =>
+      toast.error(`Failed to save credentials: ${e instanceof Error ? e.message : 'try again.'}`),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['catalog'] });
     },
   });
 
@@ -395,6 +431,8 @@ function CredentialWizardModal({
               Cancel
             </button>
             <button
+              data-testid="plugin-credentials-save-btn"
+              data-pending={isPending ? "true" : "false"}
               onClick={() => mutate()}
               disabled={isPending || !creds.github_app_id?.trim()}
               className="px-3 py-1.5 rounded bg-amber-600 text-white text-[12px] hover:bg-amber-500 disabled:opacity-50 transition-colors flex items-center gap-1.5"
@@ -574,6 +612,7 @@ export function PluginsPage() {
   const [showModal, setShowModal] = useState(false);
   const [tab, setTab] = useState<'marketplace' | 'registered'>('marketplace');
   const queryClient = useQueryClient();
+  const toast = useToast();
   // Single scope read for the whole page; passed down to each CatalogCard
   // so we avoid one localStorage round-trip per card and keep the page
   // consistent if scope ever changes mid-render.
@@ -591,12 +630,26 @@ export function PluginsPage() {
     refetchInterval: 30_000,
   });
 
+  // Issue #376: unregister was silent on BOTH success and error. A 409
+  // (plugin in use) or 403 (missing role) produced no feedback; a success
+  // also produced no feedback. Destructive action — operator deserves a
+  // clear outcome. Mirror the toastErr pattern used by installMut/verifyMut
+  // elsewhere on this page, and invalidate in `onSettled` to reconcile a
+  // partial-success network error against server state.
   const { mutate: unregister } = useMutation({
     mutationFn: (id: string) => defaultApi.deletePlugin(id),
-    onSuccess:  () => queryClient.invalidateQueries({ queryKey: ['plugins'] }),
+    onSuccess:  () => {
+      toast.success('Plugin unregistered.');
+    },
+    onError: (e: unknown) =>
+      toast.error(`Failed to unregister plugin: ${e instanceof Error ? e.message : 'try again.'}`),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['plugins'] });
+    },
   });
 
-  const plugins = data?.items ?? [];
+  // #425: unwrapList guards against a future shape flip.
+  const plugins = unwrapList<import("../lib/types").PluginManifest>(data);
   const catalogEntries = catalogData?.plugins ?? [];
 
   if (isError) return <ErrorFallback error={error} resource="plugins" onRetry={() => void refetch()} />;
@@ -605,7 +658,7 @@ export function PluginsPage() {
     <div className="flex flex-col h-full bg-gray-50 dark:bg-zinc-900">
       <div className="px-4 pt-4 pb-2 border-b border-gray-200 dark:border-zinc-800 shrink-0 bg-gray-50 dark:bg-zinc-900">
         <p className={`${sectionLabel} mb-0`}>Plugins</p>
-        <p className="mt-1 text-[11px] text-gray-500 dark:text-zinc-400">Implements RFC 015 — Plugin Marketplace &amp; Lifecycle.</p>
+        <EntityExplainer className="mt-1">{ENTITY_EXPLAINERS.plugin}</EntityExplainer>
       </div>
 
       {/* Toolbar */}
@@ -618,6 +671,7 @@ export function PluginsPage() {
           ]).map(t => (
             <button
               key={t.key}
+              data-testid={`plugin-tab-${t.key}`}
               onClick={() => setTab(t.key)}
               className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-[12px] font-medium transition-colors ${
                 tab === t.key
@@ -635,6 +689,7 @@ export function PluginsPage() {
         </div>
         {tab === 'registered' && (
           <button
+            data-testid="plugin-register-open-btn"
             onClick={() => setShowModal(true)}
             className="ml-auto flex items-center gap-1.5 px-2.5 py-1 rounded bg-indigo-600 text-white text-[12px] hover:bg-indigo-500 transition-colors"
           >

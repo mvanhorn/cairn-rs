@@ -7,7 +7,7 @@
  * created by earlier ones (e.g. session_id → create run → claim task).
  */
 
-import { useState, useRef, useCallback, useMemo } from "react";
+import { useState, useRef, useCallback, useMemo, useEffect } from "react";
 import {
   FlaskConical, Play, CheckCircle2, XCircle, Loader2, ChevronDown,
   ChevronRight, Clock, Zap, AlertTriangle,
@@ -16,6 +16,7 @@ import {
 import { clsx } from "clsx";
 import { card as cardPreset } from "../lib/design-system";
 import { defaultApi } from "../lib/api";
+import { PAUSABLE_RUN_STATES, TERMINAL_RUN_STATES, mapRunActionError } from "../lib/runStateErrors";
 import { useScope, type ProjectScope } from "../hooks/useScope";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -34,8 +35,12 @@ interface StepDef {
   id:          string;
   label:       string;
   description: string;
-  /** Receives the shared context bag; returns the request payload logged. */
-  run: (ctx: Record<string, unknown>) => Promise<unknown>;
+  /**
+   * Receives the shared context bag plus a `shouldAbort()` callback the
+   * step can poll if it does any looping/waiting. Returns the response
+   * payload to log in the step card.
+   */
+  run: (ctx: Record<string, unknown>, shouldAbort: () => boolean) => Promise<unknown>;
 }
 
 interface ScenarioDef {
@@ -55,6 +60,61 @@ function makeId(prefix: string): string {
 function fmtMs(ms: number): string {
   if (ms < 1_000) return `${ms}ms`;
   return `${(ms / 1_000).toFixed(2)}s`;
+}
+
+/**
+ * Poll `getRun` until `run.state` is in `PAUSABLE_RUN_STATES` or the
+ * timeout elapses. Returns `{ state, waited_ms }` so the harness step
+ * log shows how long it took to reach a pausable state. On timeout or
+ * terminal state, throws an `Error` with an operator-readable message
+ * rather than letting the downstream pause call surface a raw
+ * state-machine error (issue #257).
+ *
+ * `shouldAbort` is polled before each network call and before each sleep
+ * so clicking Stop/Reset mid-poll tears the helper down within one
+ * `pollIntervalMs` — no late state updates leak after abort.
+ */
+async function waitForPausableState(
+  runId: string,
+  shouldAbort: () => boolean = () => false,
+  timeoutMs = 10_000,
+  pollIntervalMs = 250,
+): Promise<{ state: string; waited_ms: number }> {
+  const started = Date.now();
+  let last = "unknown";
+  while (Date.now() - started < timeoutMs) {
+    if (shouldAbort()) {
+      throw new Error("aborted");
+    }
+    const r = await defaultApi.getRun(runId);
+    last = r.state;
+    if (PAUSABLE_RUN_STATES.has(r.state)) {
+      return { state: r.state, waited_ms: Date.now() - started };
+    }
+    // Terminal states will never reach pausable — fail fast.
+    if (TERMINAL_RUN_STATES.has(r.state)) {
+      throw new Error(`Run reached terminal state '${r.state}' before becoming pausable`);
+    }
+    // Interruptible sleep: resolve early on abort so Stop tears down
+    // within one poll interval instead of sitting on a dead setTimeout.
+    // Clean up both timers on either exit path so we don't leak handles
+    // (React strict-mode warning) or let a stale setTimeout fire after
+    // the loop has moved on.
+    await new Promise<void>(res => {
+      let poll: ReturnType<typeof setInterval> | null = null;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const done = () => {
+        if (poll !== null) clearInterval(poll);
+        if (timer !== null) clearTimeout(timer);
+        res();
+      };
+      poll = setInterval(() => {
+        if (shouldAbort()) done();
+      }, 25);
+      timer = setTimeout(done, pollIntervalMs);
+    });
+  }
+  throw new Error(`Run did not reach pausable state in ${Math.round(timeoutMs / 1000)}s (last state: ${last})`);
 }
 
 // ── Scenario definitions ──────────────────────────────────────────────────────
@@ -128,11 +188,40 @@ function buildScenarios(scope: ProjectScope): ScenarioDef[] {
         },
       },
       {
+        id: "wait_pausable",
+        label: "Wait for pausable state",
+        description: "Poll GET /v1/runs/:id until state is pausable (10s timeout)",
+        run: async (ctx, shouldAbort) => {
+          // Bug #257 — the harness used to call pause immediately after
+          // create_run. Depending on scheduler timing the run could be
+          // in an intermediate state (e.g. `partial_fence_triple`) that
+          // rejects the pause transition with a raw state-machine error.
+          // Poll until the run is in a pausable state or fail with a
+          // human-readable message. Thread `shouldAbort` so Stop/Reset
+          // from the harness UI tears the poll down mid-flight.
+          return waitForPausableState(String(ctx["run_id"]), shouldAbort, 10_000);
+        },
+      },
+      {
         id: "pause_run",
         label: "Pause run",
         description: "POST /v1/runs/:id/pause",
         run: async (ctx) => {
-          const r = await defaultApi.pauseRun(String(ctx["run_id"]), "harness test pause");
+          // Issue #392: a 409 invalid_state_transition from the backend
+          // carries internal state-machine vocabulary (e.g.
+          // `partial_fence_triple -> suspended`) that is not operator-
+          // actionable. Wrap ONLY the network call so the mapper fires on
+          // backend 4xx/5xx; our local post-condition assertions (state
+          // mismatch, version didn't increment) already produce
+          // operator-readable messages and must not be reclassified. The
+          // e2e spec at `ui/e2e/test-harness.spec.ts` asserts this is
+          // what the operator sees when pause hits a 409.
+          let r;
+          try {
+            r = await defaultApi.pauseRun(String(ctx["run_id"]), { detail: "harness test pause" });
+          } catch (e: unknown) {
+            throw new Error(mapRunActionError(e, "Pause failed.", "pause"));
+          }
           if (r.state !== "paused") throw new Error(`expected paused, got ${r.state}`);
           ctx["run_version_paused"] = r.version;
           return r;
@@ -143,7 +232,14 @@ function buildScenarios(scope: ProjectScope): ScenarioDef[] {
         label: "Resume run",
         description: "POST /v1/runs/:id/resume",
         run: async (ctx) => {
-          const r = await defaultApi.resumeRun(String(ctx["run_id"]));
+          // Symmetry with pause_run: network 4xx/5xx gets mapped; post-
+          // condition failures keep their test-specific error text.
+          let r;
+          try {
+            r = await defaultApi.resumeRun(String(ctx["run_id"]));
+          } catch (e: unknown) {
+            throw new Error(mapRunActionError(e, "Resume failed.", "resume"));
+          }
           if (r.state !== "running") throw new Error(`expected running, got ${r.state}`);
           if (Number(r.version) <= Number(ctx["run_version_paused"])) {
             throw new Error("version should increment after resume");
@@ -276,10 +372,17 @@ function buildScenarios(scope: ProjectScope): ScenarioDef[] {
       {
         id: "event_log",
         label: "Event log",
-        description: "GET /v1/events?limit=5",
+        description: "GET /v1/events/recent?limit=5",
         run: async () => {
-          const r = await defaultApi.getRunEvents("__nonexistent__").catch(() => []);
-          return { ok: true, type: Array.isArray(r) ? "array" : typeof r };
+          const r = await defaultApi.getRecentEvents(5);
+          if (!Array.isArray(r)) throw new Error("expected array of recent events");
+          // Assert shape when events exist — each must have a non-empty event_type.
+          for (const ev of r) {
+            if (typeof ev.event_type !== "string" || ev.event_type.length === 0) {
+              throw new Error(`event missing event_type: ${JSON.stringify(ev)}`);
+            }
+          }
+          return { count: r.length, sample: r[0] ?? null };
         },
       },
       {
@@ -326,7 +429,10 @@ function StepRow({
   }[s];
 
   return (
-    <div className={clsx("rounded-lg border overflow-hidden transition-colors",
+    <div
+      data-testid={`step-${step.id}`}
+      data-status={s}
+      className={clsx("rounded-lg border overflow-hidden transition-colors",
       s === "fail"    ? "border-red-900/50"     :
       s === "pass"    ? "border-emerald-900/40"  :
       s === "running" ? "border-indigo-800/40"   :
@@ -351,7 +457,11 @@ function StepRow({
             </span>
           )}
           {result?.status === "fail" && result.error && (
-            <span className="text-[11px] text-red-400 font-mono max-w-[200px] truncate" title={result.error}>
+            <span
+              data-testid={`step-${step.id}-error`}
+              className="text-[11px] text-red-400 font-mono max-w-[200px] truncate"
+              title={result.error}
+            >
               {result.error}
             </span>
           )}
@@ -389,7 +499,17 @@ function StepRow({
 
 type ScenarioResults = Map<string, StepResult>;
 
-function ScenarioCard({ scenario }: { scenario: ScenarioDef }) {
+function ScenarioCard({
+  scenario,
+  runNonce = 0,
+  onComplete,
+}: {
+  scenario:    ScenarioDef;
+  /** When this value changes to a non-zero value, the card runs its scenario. */
+  runNonce?:   number;
+  /** Called once the triggered run finishes, with per-scenario pass/fail + timing. */
+  onComplete?: (result: { pass: boolean; ms: number }) => void;
+}) {
   const [results,  setResults]  = useState<ScenarioResults>(new Map());
   const [running,  setRunning]  = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -409,8 +529,8 @@ function ScenarioCard({ scenario }: { scenario: ScenarioDef }) {
                                                         ? "pass"     :
                                                           "idle";
 
-  const runScenario = useCallback(async () => {
-    if (running) return;
+  const runScenario = useCallback(async (): Promise<{ pass: boolean; ms: number }> => {
+    if (running) return { pass: false, ms: 0 };
     abortRef.current = false;
     setRunning(true);
     setExpanded(true);
@@ -418,6 +538,8 @@ function ScenarioCard({ scenario }: { scenario: ScenarioDef }) {
 
     const ctx: Record<string, unknown> = {};
     const newResults = new Map<string, StepResult>();
+    const suiteT0 = performance.now();
+    let suitePass = true;
 
     for (const step of scenario.steps) {
       if (abortRef.current) {
@@ -436,10 +558,11 @@ function ScenarioCard({ scenario }: { scenario: ScenarioDef }) {
       let status:   StepStatus = "pass";
 
       try {
-        response = await step.run(ctx);
+        response = await step.run(ctx, () => abortRef.current);
       } catch (e: unknown) {
         status = "fail";
         error  = e instanceof Error ? e.message : String(e);
+        suitePass = false;
         // Abort remaining steps on first failure
         abortRef.current = true;
       }
@@ -456,7 +579,23 @@ function ScenarioCard({ scenario }: { scenario: ScenarioDef }) {
     }
 
     setRunning(false);
+    return { pass: suitePass, ms: Math.round(performance.now() - suiteT0) };
   }, [running, scenario.steps]);
+
+  // Drive scenario from parent's "Run All" by watching nonce changes.
+  // Nonce 0 = no trigger yet; any increment fires the scenario once.
+  useEffect(() => {
+    if (runNonce === 0) return;
+    let cancelled = false;
+    (async () => {
+      const result = await runScenario();
+      if (!cancelled) onComplete?.(result);
+    })();
+    return () => { cancelled = true; };
+    // We intentionally key only on runNonce — runScenario/onComplete change by identity
+    // every render and would re-fire the effect otherwise.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runNonce]);
 
   function resetScenario() {
     abortRef.current = true;
@@ -481,7 +620,11 @@ function ScenarioCard({ scenario }: { scenario: ScenarioDef }) {
   }[overallStatus];
 
   return (
-    <div className={clsx("bg-gray-50 dark:bg-zinc-900 rounded-xl border overflow-hidden", borderColor)}>
+    <div
+      data-testid={`scenario-${scenario.id}`}
+      data-status={overallStatus}
+      className={clsx("bg-gray-50 dark:bg-zinc-900 rounded-xl border overflow-hidden", borderColor)}
+    >
       {/* Card header */}
       <div className="flex items-start gap-3 px-4 py-3">
         <div className={clsx(
@@ -557,6 +700,7 @@ function ScenarioCard({ scenario }: { scenario: ScenarioDef }) {
             </button>
           )}
           <button
+            data-testid={`scenario-${scenario.id}-run-btn`}
             onClick={runningCount > 0 ? () => { abortRef.current = true; } : runScenario}
             disabled={running && runningCount === 0}
             className={clsx(
@@ -649,44 +793,47 @@ export function TestHarnessPage() {
   const [suiteResults,  setSuiteResults]  = useState<SuiteResult[]>([]);
   const [runningAll,    setRunningAll]    = useState(false);
   const [groupFilter,   setGroupFilter]   = useState<string>("All");
-  // Expose refs to each scenario card's run fn via a different pattern:
-  // We drive "Run All" by re-mounting with a key, not by calling internal fns.
-  const [runAllKey, setRunAllKey] = useState(0);
-  const [autoRunIds, setAutoRunIds] = useState<Set<string>>(new Set());
+  /**
+   * Per-scenario run nonce. "Run All" bumps the nonce for each visible
+   * scenario in sequence; each card watches its own nonce and actually
+   * invokes its internal runScenario, so step cards reflect live progress.
+   * A nonce of 0 means "never triggered".
+   */
+  const [runNonces, setRunNonces] = useState<Record<string, number>>({});
+  /** Resolver for the currently-awaited scenario run, keyed by scenario id. */
+  const pendingResolverRef = useRef<{ id: string; resolve: (r: { pass: boolean; ms: number }) => void } | null>(null);
 
   const scenarios = useMemo(() => buildScenarios(scope), [scope]);
   const groups = ["All", ...Array.from(new Set(scenarios.map(s => s.group)))];
   const visible = groupFilter === "All" ? scenarios : scenarios.filter(s => s.group === groupFilter);
 
+  const handleScenarioComplete = useCallback((scenarioId: string, result: { pass: boolean; ms: number }) => {
+    const pending = pendingResolverRef.current;
+    if (pending && pending.id === scenarioId) {
+      pendingResolverRef.current = null;
+      pending.resolve(result);
+    }
+  }, []);
+
   async function handleRunAll() {
+    if (runningAll) return;
     setRunningAll(true);
     setSuiteResults([]);
 
     const results: SuiteResult[] = [];
 
     for (const scenario of visible) {
-      setAutoRunIds(prev => new Set([...prev, scenario.id]));
-      // We can't call internal state setters from outside; instead we run the
-      // logic here and show aggregate results.  Individual cards update independently.
-      const ctx: Record<string, unknown> = {};
-      const t0 = performance.now();
-      let pass = true;
-
-      for (const step of scenario.steps) {
-        try {
-          await step.run(ctx);
-        } catch {
-          pass = false;
-          break;
-        }
-      }
-
-      results.push({ scenario: scenario.label.slice(0, 20), pass, ms: Math.round(performance.now() - t0) });
+      // Wait for this scenario's card to finish before starting the next,
+      // so shared-server resources aren't hammered in parallel.
+      const done = new Promise<{ pass: boolean; ms: number }>(resolve => {
+        pendingResolverRef.current = { id: scenario.id, resolve };
+      });
+      setRunNonces(prev => ({ ...prev, [scenario.id]: (prev[scenario.id] ?? 0) + 1 }));
+      const { pass, ms } = await done;
+      results.push({ scenario: scenario.label.slice(0, 20), pass, ms });
       setSuiteResults([...results]);
     }
 
-    setRunAllKey(k => k + 1);
-    setAutoRunIds(new Set());
     setRunningAll(false);
   }
 
@@ -769,8 +916,10 @@ export function TestHarnessPage() {
         {/* Scenario cards */}
         {visible.map(scenario => (
           <ScenarioCard
-            key={`${scenario.id}-${runAllKey}-${autoRunIds.has(scenario.id)}`}
+            key={scenario.id}
             scenario={scenario}
+            runNonce={runNonces[scenario.id] ?? 0}
+            onComplete={r => handleScenarioComplete(scenario.id, r)}
           />
         ))}
       </div>

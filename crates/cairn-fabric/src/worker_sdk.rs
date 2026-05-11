@@ -1,4 +1,4 @@
-//! Thin worker wrapper over `ff_sdk::FlowFabricWorker`.
+//! Thin worker wrapper over `flowfabric::sdk::FlowFabricWorker`.
 //!
 //! Cairn claims run through the in-process scheduler: callers ask
 //! [`FabricSchedulerService::claim_for_worker`] for a `ClaimGrant`
@@ -19,9 +19,9 @@ use std::sync::Arc;
 use cairn_domain::ids::{RunId, SessionId};
 use cairn_domain::lifecycle::{FailureClass, RunState};
 use cairn_domain::tenancy::ProjectKey;
-use ff_core::contracts::ClaimGrant;
-use ff_sdk::task::{ClaimedTask, FailOutcome, ResumeSignal, SuspendOutcome};
-use ff_sdk::{FlowFabricWorker, WorkerConfig};
+use flowfabric::core::contracts::{ClaimGrant, SuspendOutcome};
+use flowfabric::sdk::task::{ClaimedTask, FailOutcome, ResumeSignal};
+use flowfabric::sdk::{FlowFabricWorker, WorkerConfig};
 
 use crate::config::FabricConfig;
 use crate::error::FabricError;
@@ -45,11 +45,22 @@ impl CairnWorker {
         // Collecting preserves that order on the wire.
         let capabilities: Vec<String> = config.worker_capabilities.iter().cloned().collect();
 
+        // `FabricConfig::backend` is the single source of truth for
+        // backend connection shape (host/port/tls/cluster for Valkey,
+        // URL+pool for Postgres). Hand it to `WorkerConfig` as-is —
+        // cairn no longer maintains a parallel derivation here.
+        //
+        // FF 0.12 made `WorkerConfig::backend` `Option<BackendConfig>`
+        // (the backend-agnostic `connect_with` path ignores the field;
+        // only the URL-dialling `connect` path consumes it). Cairn
+        // takes the `connect` path below, so `Some(...)` is required
+        // — a `None` here would surface `SdkError::Config` at runtime.
+        // FF 0.12 also added `partition_config: Option<PartitionConfig>`
+        // as a `connect_with`-only override; `connect` reads
+        // `ff:config:partitions` from Valkey and ignores this field,
+        // so `None` preserves pre-bump behaviour.
         let worker_config = WorkerConfig {
-            host: config.valkey_host.clone(),
-            port: config.valkey_port,
-            tls: config.tls,
-            cluster: config.cluster,
+            backend: Some(config.backend.clone()),
             worker_id: config.worker_id.clone(),
             worker_instance_id: config.worker_instance_id.clone(),
             namespace: config.namespace.clone(),
@@ -58,6 +69,7 @@ impl CairnWorker {
             lease_ttl_ms: config.lease_ttl_ms,
             claim_poll_interval_ms: 1_000,
             max_concurrent_tasks: config.max_concurrent_tasks,
+            partition_config: None,
         };
 
         let inner = FlowFabricWorker::connect(worker_config)
@@ -75,7 +87,7 @@ impl CairnWorker {
     /// [`FabricSchedulerService::claim_for_worker`]: crate::services::scheduler_service::FabricSchedulerService::claim_for_worker
     pub async fn claim_from_grant(
         &self,
-        lane: ff_core::types::LaneId,
+        lane: flowfabric::core::types::LaneId,
         grant: ClaimGrant,
     ) -> Result<CairnTask, FabricError> {
         let task = self
@@ -369,18 +381,25 @@ impl CairnTask {
         approval_id: &str,
         timeout_ms: Option<u64>,
     ) -> Result<SuspendOutcome, FabricError> {
-        let params = suspension::for_approval(approval_id, timeout_ms);
+        // Approval uses two distinct signals: `approval_granted:<id>`
+        // and `approval_rejected:<id>`. Either fires a resume.
+        // `typed_approval` builds the composite n=1 DistinctWaitpoints
+        // condition so either waitpoint satisfies; matches cairn's
+        // pre-0.9 "resume-on-any" semantics. Follow-up: per-branch
+        // bridge events so Rejected surfaces as a distinct state
+        // transition — today both branches land under
+        // `RunState::WaitingApproval` and the worker polls on resume.
+        let (reason, cond, timeout, policy) = suspension::typed_approval(approval_id, timeout_ms);
         let (task, bridge, run_id, project) = self.take_task();
 
-        let outcome = task
-            .suspend(
-                &params.reason_code,
-                &params.condition_matchers,
-                params.timeout_ms,
-                params.timeout_behavior,
-            )
+        let handle = task
+            .suspend(reason, cond, timeout, policy)
             .await
             .map_err(|e| FabricError::Bridge(format!("suspend_for_approval: {e}")))?;
+        let outcome = SuspendOutcome::Suspended {
+            details: handle.details,
+            handle: handle.handle,
+        };
 
         if matches!(outcome, SuspendOutcome::Suspended { .. }) {
             if let (Some(rid), Some(proj)) = (run_id, project) {
@@ -390,6 +409,16 @@ impl CairnTask {
                         project: proj,
                         prev_state: Some(RunState::Running),
                         to: RunState::WaitingApproval,
+                        // Worker-initiated approval suspension: no
+                        // scheduled resume, so `resume_after_ms=None`.
+                        // `PolicyHold` with the approval detail mirrors
+                        // the service-side `enter_waiting_approval`.
+                        pause_reason: Some(cairn_domain::lifecycle::PauseReason {
+                            kind: cairn_domain::lifecycle::PauseReasonKind::PolicyHold,
+                            detail: Some(format!("approval:{approval_id}")),
+                            resume_after_ms: None,
+                            actor: None,
+                        }),
                     })
                     .await;
             }
@@ -403,18 +432,18 @@ impl CairnTask {
         child_task_id: &str,
         deadline_ms: Option<u64>,
     ) -> Result<SuspendOutcome, FabricError> {
-        let params = suspension::for_subagent(child_task_id, deadline_ms);
+        let (reason, cond, timeout, policy) =
+            suspension::typed_subagent(child_task_id, deadline_ms);
         let (task, bridge, run_id, project) = self.take_task();
 
-        let outcome = task
-            .suspend(
-                &params.reason_code,
-                &params.condition_matchers,
-                params.timeout_ms,
-                params.timeout_behavior,
-            )
+        let handle = task
+            .suspend(reason, cond, timeout, policy)
             .await
             .map_err(|e| FabricError::Bridge(format!("suspend_for_subagent: {e}")))?;
+        let outcome = SuspendOutcome::Suspended {
+            details: handle.details,
+            handle: handle.handle,
+        };
 
         if matches!(outcome, SuspendOutcome::Suspended { .. }) {
             if let (Some(rid), Some(proj)) = (run_id, project) {
@@ -427,6 +456,19 @@ impl CairnTask {
                         // `waiting_for_children`; the corresponding cairn
                         // domain state is WaitingDependency.
                         to: RunState::WaitingDependency,
+                        // Subagent suspension: no scheduled resume
+                        // (worker-sdk deadline is signalled via FF
+                        // timeout_behaviour, not via the cairn
+                        // projection). Emit `RuntimeSuspension` with the
+                        // child-task detail so the pause_schedules
+                        // projection correctly filters it out
+                        // (resume_after_ms is None).
+                        pause_reason: Some(cairn_domain::lifecycle::PauseReason {
+                            kind: cairn_domain::lifecycle::PauseReasonKind::RuntimeSuspension,
+                            detail: Some(format!("subagent:{child_task_id}")),
+                            resume_after_ms: None,
+                            actor: None,
+                        }),
                     })
                     .await;
             }
@@ -439,18 +481,18 @@ impl CairnTask {
         invocation_id: &str,
         timeout_ms: Option<u64>,
     ) -> Result<SuspendOutcome, FabricError> {
-        let params = suspension::for_tool_result(invocation_id, timeout_ms);
+        let (reason, cond, timeout, policy) =
+            suspension::typed_tool_result(invocation_id, timeout_ms);
         let (task, bridge, run_id, project) = self.take_task();
 
-        let outcome = task
-            .suspend(
-                &params.reason_code,
-                &params.condition_matchers,
-                params.timeout_ms,
-                params.timeout_behavior,
-            )
+        let handle = task
+            .suspend(reason, cond, timeout, policy)
             .await
             .map_err(|e| FabricError::Bridge(format!("suspend_for_tool_result: {e}")))?;
+        let outcome = SuspendOutcome::Suspended {
+            details: handle.details,
+            handle: handle.handle,
+        };
 
         if matches!(outcome, SuspendOutcome::Suspended { .. }) {
             if let (Some(rid), Some(proj)) = (run_id, project) {
@@ -464,6 +506,19 @@ impl CairnTask {
                         // dedicated state for that today; it collapses to
                         // Paused. See T4-M7 for the tracked follow-up.
                         to: RunState::Paused,
+                        // Worker-initiated tool-result wait: forward
+                        // `timeout_ms` as `resume_after_ms` so the
+                        // projection can still schedule a resume if the
+                        // tool result doesn't arrive. Kind is
+                        // `ToolRequestedSuspension` with the invocation
+                        // id in `detail` (matches the
+                        // `RunService::pause` path).
+                        pause_reason: Some(cairn_domain::lifecycle::PauseReason {
+                            kind: cairn_domain::lifecycle::PauseReasonKind::ToolRequestedSuspension,
+                            detail: Some(invocation_id.to_owned()),
+                            resume_after_ms: timeout_ms,
+                            actor: None,
+                        }),
                     })
                     .await;
             }

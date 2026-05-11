@@ -1,5 +1,5 @@
 use cairn_domain::lifecycle::{FailureClass, RunState, TaskState};
-use ff_core::state::PublicState;
+use flowfabric::core::state::PublicState;
 
 use crate::constants::BLOCKING_WAITING_FOR_APPROVAL;
 
@@ -11,11 +11,27 @@ pub fn ff_public_state_to_run_state(state: PublicState) -> (RunState, Option<Fai
         PublicState::WaitingChildren => (RunState::WaitingDependency, None),
         PublicState::Active => (RunState::Running, None),
         PublicState::Suspended => (RunState::Paused, None),
+        // FF 0.9 (RFC-014 Stage 2) introduced `Resumable` — transient
+        // state where the suspension signal fired but the next attempt
+        // has not yet been claimed. Cairn surfaces it as `Running`: the
+        // run is observably "moving" again from an operator's view.
+        PublicState::Resumable => (RunState::Running, None),
         PublicState::Completed => (RunState::Completed, None),
         PublicState::Failed => (RunState::Failed, Some(FailureClass::ExecutionError)),
-        PublicState::Cancelled => (RunState::Canceled, Some(FailureClass::CanceledByOperator)),
+        // CG-a design decision (user-directed): both `Cancelled` and
+        // `Skipped` map to `RunState::Canceled`. `Skipped` previously
+        // rolled up to `Failed { DependencyFailed }`; treating it as a
+        // cancellation matches operator intent ("the dependency chain
+        // halted, nothing ran") and keeps the failure surface clean
+        // for true execution errors.
+        PublicState::Cancelled | PublicState::Skipped => {
+            (RunState::Canceled, Some(FailureClass::CanceledByOperator))
+        }
         PublicState::Expired => (RunState::Failed, Some(FailureClass::TimedOut)),
-        PublicState::Skipped => (RunState::Failed, Some(FailureClass::DependencyFailed)),
+        // `PublicState` is `#[non_exhaustive]` — external crate forces
+        // the wildcard. Panicking (not silent fallback) lets CI catch
+        // any post-0.9 variant that cairn hasn't audited yet.
+        _ => panic!("unhandled PublicState variant (post-FF-0.9 addition): {state:?}"),
     }
 }
 
@@ -46,6 +62,40 @@ pub fn failure_class_category(failure_class: FailureClass) -> &'static str {
         FailureClass::ExecutionError => "execution",
         FailureClass::LeaseExpired => "lease",
         FailureClass::CanceledByOperator => "operator",
+        FailureClass::TerminalWriteDeadlock => "deadlock",
+        // #660: strict completion gate refused `complete_run` while
+        // `completion_verification.errors` was non-empty, three times in a
+        // row. Treated as a policy-class failure on the FF side — the run
+        // was forcibly stopped by a cairn-level quality gate, not by a
+        // runtime error or operator.
+        FailureClass::VerificationRejected => "policy",
+        // #670 G4 / RFC 027 §Orphan-child: a child whose spawn leaked
+        // between Phase-1 and Phase-2. Bucketed as `execution` because
+        // the failure is an execution-layer plumbing breakage (not a
+        // policy decision and not an operator action), even though an
+        // operator may be the one transitioning the leaked `Pending`
+        // row to `Failed` via the cancel-orphan endpoint.
+        FailureClass::OrphanChild => "execution",
+        // #750: child run terminated because the routed provider chain
+        // ran out of fallback options. Bucketed as `execution` because
+        // the failure is upstream provider availability, not a policy
+        // decision or operator action.
+        FailureClass::AllProvidersExhausted => "execution",
+        // #825: the agent emitted `ActionType::FailRun` — truthful
+        // self-reported failure. Bucketed under "agent" because the
+        // failure originated with the agent's own judgment ("I tried
+        // and I cannot proceed"), distinct from policy refusal,
+        // execution error, or operator cancel.
+        FailureClass::ModelReportedFailure => "agent",
+        // RFC 032: the completion-contract verifier rejected the
+        // agent's `complete_run` because the claimed deliverable
+        // didn't exist (no PR, missing file, insufficient citations,
+        // schema mismatch). Bucketed as "policy" because the
+        // rejection comes from a cairn-level quality gate, same
+        // bucket as `VerificationRejected`. The specific
+        // `ContractRejectionCode` surfaces via the structured
+        // diagnostic in step_history, not via this category.
+        FailureClass::ContractNotMet => "policy",
     }
 }
 
@@ -64,6 +114,12 @@ pub fn failure_class_reason(failure_class: FailureClass) -> &'static str {
         FailureClass::ExecutionError => "execution_error",
         FailureClass::LeaseExpired => "lease_expired",
         FailureClass::CanceledByOperator => "canceled_by_operator",
+        FailureClass::TerminalWriteDeadlock => "terminal_write_deadlock",
+        FailureClass::VerificationRejected => "verification_rejected",
+        FailureClass::OrphanChild => "orphan_child",
+        FailureClass::AllProvidersExhausted => "all_providers_exhausted",
+        FailureClass::ModelReportedFailure => "model_reported_failure",
+        FailureClass::ContractNotMet => "contract_not_met",
     }
 }
 
@@ -79,17 +135,33 @@ pub fn ff_public_state_to_task_state(state: PublicState) -> (TaskState, Option<F
         PublicState::WaitingChildren => (TaskState::WaitingDependency, None),
         PublicState::Active => (TaskState::Running, None),
         PublicState::Suspended => (TaskState::Paused, None),
+        // FF 0.9 (RFC-014 Stage 2) `Resumable`: transient between
+        // Suspended and Active. Cairn surfaces it as `Running` for
+        // task-level views — operator sees the task moving again.
+        PublicState::Resumable => (TaskState::Running, None),
         PublicState::Completed => (TaskState::Completed, None),
         PublicState::Failed => (TaskState::Failed, Some(FailureClass::ExecutionError)),
-        PublicState::Cancelled => (TaskState::Canceled, Some(FailureClass::CanceledByOperator)),
+        // CG-a design decision (user-directed): both `Cancelled` and
+        // `Skipped` map to `TaskState::Canceled` — mirrors the run-level
+        // mapping above. `Skipped` previously surfaced as a dependency
+        // failure; canceled is the cleaner operator signal.
+        PublicState::Cancelled | PublicState::Skipped => {
+            (TaskState::Canceled, Some(FailureClass::CanceledByOperator))
+        }
         PublicState::Expired => (TaskState::Failed, Some(FailureClass::TimedOut)),
-        PublicState::Skipped => (TaskState::Failed, Some(FailureClass::DependencyFailed)),
+        // `PublicState` is `#[non_exhaustive]` — external crate forces
+        // the wildcard. Panicking (not silent fallback) lets CI catch
+        // any post-0.9 variant that cairn hasn't audited yet.
+        _ => panic!("unhandled PublicState variant (post-FF-0.9 addition): {state:?}"),
     }
 }
 
 /// Maps a cairn RunState to the FF PublicState(s) it could correspond to.
 /// WaitingApproval and Paused both map to `[Suspended]` — callers querying
 /// Valkey indexes MUST also filter by `blocking_reason` to distinguish them.
+///
+/// Inverse of [`ff_public_state_to_run_state`]. Keep in sync with that
+/// function — CG-a collapsed `Skipped` into the `Canceled` side.
 pub fn ff_run_state_to_public_states(state: RunState) -> &'static [PublicState] {
     match state {
         RunState::Pending => &[
@@ -97,17 +169,17 @@ pub fn ff_run_state_to_public_states(state: RunState) -> &'static [PublicState] 
             PublicState::Delayed,
             PublicState::RateLimited,
         ],
-        RunState::Running => &[PublicState::Active],
+        // `Resumable` (FF 0.9) also surfaces as Running on the cairn
+        // side. Include it so index queries covering "running" runs
+        // catch executions in the transient post-signal window.
+        RunState::Running => &[PublicState::Active, PublicState::Resumable],
         RunState::WaitingApproval => &[PublicState::Suspended],
         RunState::Paused => &[PublicState::Suspended],
         RunState::WaitingDependency => &[PublicState::WaitingChildren],
         RunState::Completed => &[PublicState::Completed],
-        RunState::Failed => &[
-            PublicState::Failed,
-            PublicState::Expired,
-            PublicState::Skipped,
-        ],
-        RunState::Canceled => &[PublicState::Cancelled],
+        // `Skipped` moved to the Canceled bucket in CG-a.
+        RunState::Failed => &[PublicState::Failed, PublicState::Expired],
+        RunState::Canceled => &[PublicState::Cancelled, PublicState::Skipped],
     }
 }
 
@@ -121,18 +193,16 @@ pub fn ff_task_state_to_public_states(state: TaskState) -> &'static [PublicState
             PublicState::Delayed,
             PublicState::RateLimited,
         ],
-        TaskState::Leased | TaskState::Running => &[PublicState::Active],
+        // FF 0.9 `Resumable` joins `Active` under cairn's Running label.
+        TaskState::Leased | TaskState::Running => &[PublicState::Active, PublicState::Resumable],
         TaskState::WaitingApproval => &[PublicState::Suspended],
         TaskState::Paused => &[PublicState::Suspended],
         TaskState::WaitingDependency => &[PublicState::WaitingChildren],
         TaskState::RetryableFailed => &[PublicState::Delayed],
         TaskState::Completed => &[PublicState::Completed],
-        TaskState::Failed => &[
-            PublicState::Failed,
-            PublicState::Expired,
-            PublicState::Skipped,
-        ],
-        TaskState::Canceled => &[PublicState::Cancelled],
+        // `Skipped` moved to Canceled bucket in CG-a.
+        TaskState::Failed => &[PublicState::Failed, PublicState::Expired],
+        TaskState::Canceled => &[PublicState::Cancelled, PublicState::Skipped],
         TaskState::DeadLettered => &[PublicState::Failed],
     }
 }
@@ -212,10 +282,36 @@ mod tests {
     }
 
     #[test]
-    fn skipped_maps_to_failed_dependency() {
+    fn skipped_maps_to_canceled() {
+        // CG-a (FF 0.9) design decision: `Skipped` + `Cancelled` both
+        // collapse into `RunState::Canceled`. `Skipped` no longer
+        // surfaces as a dependency failure.
         let (run, fc) = ff_public_state_to_run_state(PublicState::Skipped);
-        assert_eq!(run, RunState::Failed);
-        assert_eq!(fc, Some(FailureClass::DependencyFailed));
+        assert_eq!(run, RunState::Canceled);
+        assert_eq!(fc, Some(FailureClass::CanceledByOperator));
+    }
+
+    #[test]
+    fn resumable_maps_to_running() {
+        // FF 0.9 RFC-014 Stage 2 addition — cairn surfaces the
+        // transient resumable state as `Running`.
+        let (run, fc) = ff_public_state_to_run_state(PublicState::Resumable);
+        assert_eq!(run, RunState::Running);
+        assert!(fc.is_none());
+    }
+
+    #[test]
+    fn task_skipped_maps_to_canceled() {
+        let (task, fc) = ff_public_state_to_task_state(PublicState::Skipped);
+        assert_eq!(task, TaskState::Canceled);
+        assert_eq!(fc, Some(FailureClass::CanceledByOperator));
+    }
+
+    #[test]
+    fn task_resumable_maps_to_running() {
+        let (task, fc) = ff_public_state_to_task_state(PublicState::Resumable);
+        assert_eq!(task, TaskState::Running);
+        assert!(fc.is_none());
     }
 
     #[test]
@@ -325,6 +421,7 @@ mod tests {
             PublicState::Cancelled,
             PublicState::Expired,
             PublicState::Skipped,
+            PublicState::Resumable,
         ];
         for state in states {
             let (run_state, _) = ff_public_state_to_run_state(state);
@@ -346,6 +443,7 @@ mod tests {
             PublicState::Cancelled,
             PublicState::Expired,
             PublicState::Skipped,
+            PublicState::Resumable,
         ];
         for state in states {
             let (task_state, _) = ff_public_state_to_task_state(state);
@@ -354,9 +452,9 @@ mod tests {
     }
 
     #[test]
-    fn inverse_running_maps_to_active() {
+    fn inverse_running_maps_to_active_and_resumable() {
         let states = ff_run_state_to_public_states(RunState::Running);
-        assert_eq!(states, &[PublicState::Active]);
+        assert_eq!(states, &[PublicState::Active, PublicState::Resumable]);
     }
 
     #[test]
@@ -375,17 +473,26 @@ mod tests {
     }
 
     #[test]
-    fn inverse_failed_includes_expired_and_skipped() {
+    fn inverse_failed_includes_expired_not_skipped() {
+        // CG-a: `Skipped` moved out of the Failed bucket into Canceled.
         let states = ff_run_state_to_public_states(RunState::Failed);
         assert!(states.contains(&PublicState::Failed));
         assert!(states.contains(&PublicState::Expired));
+        assert!(!states.contains(&PublicState::Skipped));
+    }
+
+    #[test]
+    fn inverse_canceled_includes_cancelled_and_skipped() {
+        let states = ff_run_state_to_public_states(RunState::Canceled);
+        assert!(states.contains(&PublicState::Cancelled));
         assert!(states.contains(&PublicState::Skipped));
     }
 
     #[test]
-    fn inverse_canceled_maps_to_cancelled() {
-        let states = ff_run_state_to_public_states(RunState::Canceled);
-        assert_eq!(states, &[PublicState::Cancelled]);
+    fn inverse_running_includes_resumable() {
+        let states = ff_run_state_to_public_states(RunState::Running);
+        assert!(states.contains(&PublicState::Active));
+        assert!(states.contains(&PublicState::Resumable));
     }
 
     #[test]
@@ -396,9 +503,9 @@ mod tests {
     }
 
     #[test]
-    fn inverse_task_running_maps_to_active() {
+    fn inverse_task_running_maps_to_active_and_resumable() {
         let states = ff_task_state_to_public_states(TaskState::Running);
-        assert_eq!(states, &[PublicState::Active]);
+        assert_eq!(states, &[PublicState::Active, PublicState::Resumable]);
     }
 
     #[test]

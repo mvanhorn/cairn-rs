@@ -14,6 +14,10 @@ pub mod error;
 pub mod webhook;
 
 pub use auth::{AppCredentials, AppInstallation, InstallationToken};
-pub use client::GitHubClient;
+pub use client::{
+    CreatePullRequestReviewRequest, CreateReviewCommentRequest, GitHubClient, PullRequestDetail,
+    PullRequestFile, PullRequestRef, PullRequestRepoRef, PullRequestReview,
+    PullRequestReviewComment, ReviewCommentInput,
+};
 pub use error::GitHubError;
 pub use webhook::{verify_signature, WebhookEvent, WebhookEventPayload};

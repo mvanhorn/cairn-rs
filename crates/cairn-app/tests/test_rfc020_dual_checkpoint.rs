@@ -222,23 +222,41 @@ async fn recovery_summary_event_emitted_on_restart() {
 /// RFC 020 Integration Test #15: checkpoint body compression / diff-based
 /// checkpoints.
 ///
-/// **Skipped by design.** Per the Gap 3 resolution documented in
-/// `project_rfc020_delta_and_gaps.md` Part B, v1 ships full snapshots per
-/// checkpoint — not diffs. The `CheckpointRecorded.message_history_size`
-/// field is populated so operators can monitor checkpoint cost and, if
-/// average size exceeds their policy, a future Track 4b can add diffing.
+/// **Skipped by design — evidence-gated deferral.** Per the Gap 3
+/// resolution in `project_rfc020_delta_and_gaps.md` Part B and the
+/// Q1 resolution in `docs/design/rfcs/020-durable-recovery.md`, v1
+/// ships full snapshots per checkpoint — not diffs. This is an
+/// explicit design decision, not a TODO.
 ///
-/// Un-ignore this test when a diff-based Track 4b lands; the concrete
-/// assertions will be: (a) checkpoint body is smaller than the full
-/// message history, (b) replay reconstructs history from the base +
-/// diffs, (c) `message_history_size` reports the compacted size.
-#[ignore = "Gap 3 resolution: v1 ships full snapshots, not diffs. \
-            Un-ignore when a diff-based Track 4b is adopted."]
+/// **How to resurrect this test.** Diff-based Track 4b is an
+/// evidence-gated follow-up: it ships only when a production workload
+/// demonstrates that the full-snapshot cost exceeds an operator's
+/// policy. The observation path:
+///   1. Operator monitors `CheckpointRecorded.message_history_size`
+///      (populated for exactly this reason).
+///   2. If average size exceeds their policy threshold, the operator
+///      opens a **new, dedicated issue** with the measured numbers
+///      (workload shape, p50/p95 body size, projected event-log
+///      growth rate).
+///   3. That new issue drives the Track 4b design + implementation.
+///   4. When Track 4b lands, un-ignore this test; the concrete
+///      assertions will be (a) body smaller than full history,
+///      (b) replay reconstructs from base + diffs, (c)
+///      `message_history_size` reports the compacted size.
+///
+/// Issue #550 — the original "Track 4b: delta-based checkpoints"
+/// tracker — is closed as `deferred-by-design`. The measurement path
+/// above is the canonical way to reopen the question with evidence.
+/// Do NOT reopen #550 speculatively; open a new issue with numbers.
+#[ignore = "RFC 020 Q1 resolution: v1 ships full snapshots, not diffs. \
+            Deferred by design — measure via CheckpointRecorded.message_history_size \
+            and file a new issue with numbers if cost becomes prohibitive. \
+            #550 is closed as deferred-by-design."]
 #[tokio::test]
 async fn checkpoint_compression_v1_skipped_by_design() {
     unreachable!(
-        "see rustdoc above — Gap 3 resolution defers diff-based checkpoints \
-         to a future Track 4b"
+        "see rustdoc above — RFC 020 Q1 defers diff-based checkpoints \
+         to evidence-gated Track 4b. #550 closed as deferred-by-design."
     );
 }
 

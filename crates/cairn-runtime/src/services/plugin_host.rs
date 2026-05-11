@@ -161,9 +161,32 @@ impl std::error::Error for PluginError {}
 /// Manages the lifecycle of all plugins in the runtime.
 ///
 /// Thread-safe. Each method acquires locks as needed.
+///
+/// # Lock layering (#515)
+///
+/// The inner `Mutex<PluginHandle>` is wrapped in `Arc` so that callers can
+/// *clone the Arc out of the outer `RwLock` read guard and drop the read
+/// guard before locking the inner Mutex*. The prior layout held the outer
+/// `RwLock` read lock across every plugin RPC/kill/health-check, which
+/// serialised all map accesses behind any in-flight plugin call. With the
+/// Arc layer:
+///
+/// 1. Acquire outer read lock,
+/// 2. Look up, `Arc::clone` the inner Mutex,
+/// 3. Drop the outer read lock,
+/// 4. Lock the inner Mutex and do the RPC.
+///
+/// A concurrent `start_plugin` / `stop_plugin` can now take the outer
+/// write lock without waiting for an unrelated plugin's RPC to finish.
+///
+/// We intentionally did NOT reach for `dashmap` — the workspace doesn't
+/// use it today and a new dep for this one spot isn't justified at the
+/// current concurrency level. If profiling ever shows the outer `RwLock`
+/// itself becoming hot, a sharded map (dashmap or hand-rolled) is the
+/// next step.
 pub struct PluginHost {
     /// Running plugin handles, keyed by plugin ID.
-    handles: RwLock<HashMap<String, Mutex<PluginHandle>>>,
+    handles: RwLock<HashMap<String, Arc<Mutex<PluginHandle>>>>,
     /// Shared health monitor.
     pub health: Arc<PluginHealthMonitor>,
     /// Shared capability registry.
@@ -253,34 +276,54 @@ impl PluginHost {
         // Store handle.
         {
             let mut handles = self.handles.write().unwrap_or_else(|e| e.into_inner());
-            handles.insert(plugin_id, Mutex::new(handle));
+            handles.insert(plugin_id, Arc::new(Mutex::new(handle)));
         }
 
         Ok(())
+    }
+
+    /// Clone out the `Arc<Mutex<PluginHandle>>` for `plugin_id`, releasing
+    /// the outer read lock on return. Callers that want to operate on
+    /// the handle should use this helper rather than holding the map's
+    /// read guard across the inner `.lock()` — see the `PluginHost`
+    /// doc-comment on lock layering (#515).
+    fn get_handle(&self, plugin_id: &str) -> Result<Arc<Mutex<PluginHandle>>, PluginError> {
+        let handles = self.handles.read().unwrap_or_else(|e| e.into_inner());
+        handles
+            .get(plugin_id)
+            .cloned()
+            .ok_or_else(|| PluginError::NotRunning(plugin_id.to_owned()))
+    }
+
+    /// Snapshot of `(id, Arc<Mutex<PluginHandle>>)` for every managed
+    /// plugin. Like [`Self::get_handle`], releases the outer read lock
+    /// before returning so iteration happens unlocked.
+    fn snapshot_handles(&self) -> Vec<(String, Arc<Mutex<PluginHandle>>)> {
+        let handles = self.handles.read().unwrap_or_else(|e| e.into_inner());
+        handles
+            .iter()
+            .map(|(id, h)| (id.clone(), Arc::clone(h)))
+            .collect()
     }
 
     /// Stop a running plugin gracefully.
     ///
     /// Sends `shutdown`, waits briefly, then kills if still alive.
     pub fn stop_plugin(&self, plugin_id: &str) -> Result<(), PluginError> {
-        let handles = self.handles.read().unwrap_or_else(|e| e.into_inner());
-        let handle_mutex = handles
-            .get(plugin_id)
-            .ok_or_else(|| PluginError::NotRunning(plugin_id.to_owned()))?;
+        let handle_arc = self.get_handle(plugin_id)?;
 
-        let mut handle = handle_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut handle = handle_arc.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Try graceful shutdown.
-        let _ = handle.rpc_call(wire::methods::SHUTDOWN, serde_json::json!({}));
-        handle.kill()?;
-        handle.state = PluginState::Stopped;
+            // Try graceful shutdown.
+            let _ = handle.rpc_call(wire::methods::SHUTDOWN, serde_json::json!({}));
+            handle.kill()?;
+            handle.state = PluginState::Stopped;
+        }
 
         // Clean up registrations.
         self.capabilities.unregister(plugin_id);
         self.health.remove(plugin_id);
-
-        drop(handle);
-        drop(handles);
 
         // Remove from handles map.
         let mut handles = self.handles.write().unwrap_or_else(|e| e.into_inner());
@@ -291,12 +334,9 @@ impl PluginHost {
 
     /// Restart a plugin: kill the existing process and re-spawn from manifest.
     pub fn restart_plugin(&self, plugin_id: &str) -> Result<(), PluginError> {
+        let handle_arc = self.get_handle(plugin_id)?;
         let manifest = {
-            let handles = self.handles.read().unwrap_or_else(|e| e.into_inner());
-            let handle_mutex = handles
-                .get(plugin_id)
-                .ok_or_else(|| PluginError::NotRunning(plugin_id.to_owned()))?;
-            let mut handle = handle_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            let mut handle = handle_arc.lock().unwrap_or_else(|e| e.into_inner());
             handle.kill()?;
             handle.manifest.clone()
         };
@@ -320,16 +360,16 @@ impl PluginHost {
     /// Call this periodically. Crashed plugins have their state set to
     /// `PluginState::Crashed` and an error recorded in the health monitor.
     pub fn detect_crashes(&self) -> Vec<String> {
-        let handles = self.handles.read().unwrap_or_else(|e| e.into_inner());
+        let handles = self.snapshot_handles();
         let mut crashed = Vec::new();
 
-        for (id, handle_mutex) in handles.iter() {
-            let mut handle = handle_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, handle_arc) in handles {
+            let mut handle = handle_arc.lock().unwrap_or_else(|e| e.into_inner());
             if handle.state == PluginState::Running && !handle.is_alive() {
                 handle.state = PluginState::Crashed;
                 self.health
-                    .record_error(id, "process exited unexpectedly".into());
-                crashed.push(id.clone());
+                    .record_error(&id, "process exited unexpectedly".into());
+                crashed.push(id);
             }
         }
 
@@ -338,12 +378,9 @@ impl PluginHost {
 
     /// Send a health check ping to a plugin and update the health monitor.
     pub fn health_check(&self, plugin_id: &str) -> Result<(), PluginError> {
-        let handles = self.handles.read().unwrap_or_else(|e| e.into_inner());
-        let handle_mutex = handles
-            .get(plugin_id)
-            .ok_or_else(|| PluginError::NotRunning(plugin_id.to_owned()))?;
+        let handle_arc = self.get_handle(plugin_id)?;
 
-        let mut handle = handle_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut handle = handle_arc.lock().unwrap_or_else(|e| e.into_inner());
         match handle.rpc_call(wire::methods::HEALTH_CHECK, serde_json::json!({})) {
             Ok(_) => {
                 self.health.record_heartbeat(plugin_id);
@@ -360,10 +397,9 @@ impl PluginHost {
 
     /// Get the current state of a plugin.
     pub fn plugin_state(&self, plugin_id: &str) -> Option<PluginState> {
-        let handles = self.handles.read().unwrap_or_else(|e| e.into_inner());
-        handles
-            .get(plugin_id)
-            .map(|h| h.lock().unwrap_or_else(|e| e.into_inner()).state)
+        let handle_arc = self.get_handle(plugin_id).ok()?;
+        let state = handle_arc.lock().unwrap_or_else(|e| e.into_inner()).state;
+        Some(state)
     }
 
     /// List all managed plugin IDs.
@@ -397,12 +433,9 @@ impl PluginHost {
         method: &str,
         params: serde_json::Value,
     ) -> Result<(), PluginError> {
-        let handles = self.handles.read().unwrap_or_else(|e| e.into_inner());
-        let handle_mutex = handles
-            .get(plugin_id)
-            .ok_or_else(|| PluginError::NotRunning(plugin_id.to_owned()))?;
+        let handle_arc = self.get_handle(plugin_id)?;
 
-        let mut handle = handle_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut handle = handle_arc.lock().unwrap_or_else(|e| e.into_inner());
         let child = handle
             .child
             .as_mut()
@@ -636,7 +669,7 @@ mod tests {
 
         {
             let mut handles = host.handles.write().unwrap();
-            handles.insert("short-lived".to_owned(), Mutex::new(handle));
+            handles.insert("short-lived".to_owned(), Arc::new(Mutex::new(handle)));
         }
 
         // Wait for the process to exit.
@@ -654,5 +687,107 @@ mod tests {
 
         let err = PluginError::Crashed("p2".into());
         assert_eq!(err.to_string(), "plugin crashed: p2");
+    }
+
+    /// #515: pin the new lock-layering contract.
+    ///
+    /// `get_handle` MUST drop the outer `RwLock` read guard before
+    /// returning — i.e. a long-running operation on the inner `Mutex`
+    /// for plugin A must not block `start_plugin` (write-lock) for an
+    /// unrelated plugin B.
+    ///
+    /// Concretely: thread T1 holds plugin_a's inner Mutex for 500 ms.
+    /// Thread T2 takes the outer write lock and inserts plugin_b while
+    /// T1 still holds the inner Mutex. T2's outer-lock acquisition
+    /// MUST succeed essentially immediately — it must not wait on the
+    /// inner Mutex. Under the previous layout (callers held the outer
+    /// read guard across the inner `.lock()`) the outer write acquire
+    /// would stall for the full 500 ms. Here it completes in
+    /// single-digit µs while T1 sleeps.
+    ///
+    /// ### What the timer covers (#561 review fix)
+    ///
+    /// The wall-clock bound covers ONLY the outer `RwLock::write()`
+    /// acquisition + `HashMap::insert()` — the expensive
+    /// `spawn_sandboxed` call and `PluginHandle` construction happen
+    /// before `t2_start` so runner load doesn't pollute the
+    /// measurement. Earlier revisions of this test ran a real
+    /// `spawn_sandboxed` inside the timed window; on a loaded CI host
+    /// that fork+exec can itself exceed the 250 ms ceiling even when
+    /// the outer write lock is perfectly free, making this regression
+    /// test flaky and no longer isolating the lock-layering property
+    /// it was written to guard. See #561 comment
+    /// discussion_r3157861739.
+    #[test]
+    fn outer_lock_released_before_inner_lock_is_acquired() {
+        use std::time::{Duration, Instant};
+
+        let health = Arc::new(PluginHealthMonitor::new());
+        let caps = Arc::new(CapabilityRegistry::new());
+        let host = Arc::new(PluginHost::new(health, caps));
+
+        // Seed plugin_a directly in the map (spawn_sandboxed +
+        // initialize aren't required for this lock test).
+        let child_a = spawn_sandboxed(&test_manifest("plugin_a")).expect("spawn a");
+        let handle_a = PluginHandle {
+            plugin_id: "plugin_a".to_owned(),
+            manifest: test_manifest("plugin_a"),
+            state: PluginState::Running,
+            child: Some(child_a),
+            next_req_id: 1,
+        };
+        {
+            let mut handles = host.handles.write().unwrap();
+            handles.insert("plugin_a".to_owned(), Arc::new(Mutex::new(handle_a)));
+        }
+
+        // Pre-build plugin_b BEFORE the timed block: spawning a real
+        // child process can itself exceed the 250 ms ceiling on a
+        // loaded CI runner, which would conflate "outer lock is
+        // unblocked" (the property under test) with "fork+exec is
+        // fast" (irrelevant). Building up front means `t2_start ..
+        // t2_elapsed` times only the `RwLock::write()` + `insert()`.
+        let child_b = spawn_sandboxed(&test_manifest("plugin_b")).expect("spawn b");
+        let handle_b = PluginHandle {
+            plugin_id: "plugin_b".to_owned(),
+            manifest: test_manifest("plugin_b"),
+            state: PluginState::Running,
+            child: Some(child_b),
+            next_req_id: 1,
+        };
+        let handle_b_arc = Arc::new(Mutex::new(handle_b));
+
+        // T1: grab plugin_a's Arc<Mutex<_>> via the public path and hold
+        //     the inner lock for 500 ms.
+        let host_t1 = Arc::clone(&host);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let t1 = std::thread::spawn(move || {
+            let handle_arc = host_t1.get_handle("plugin_a").expect("plugin_a get_handle");
+            let _guard = handle_arc.lock().unwrap();
+            b1.wait(); // signal T2 that the inner lock is held
+            std::thread::sleep(Duration::from_millis(500));
+        });
+
+        // T2: wait for T1 to be holding the inner lock, then take the
+        //     outer write lock and insert the pre-built plugin_b. The
+        //     timer covers only the `write()` + `insert()` pair — no
+        //     process spawn, no handle construction.
+        barrier.wait();
+        let t2_start = Instant::now();
+        {
+            let mut handles = host.handles.write().unwrap();
+            handles.insert("plugin_b".to_owned(), handle_b_arc);
+        }
+        let t2_elapsed = t2_start.elapsed();
+
+        t1.join().unwrap();
+
+        assert!(
+            t2_elapsed < Duration::from_millis(250),
+            "outer write lock waited {t2_elapsed:?} for an unrelated inner Mutex — \
+             the inner lock must not gate the outer map (#515)",
+        );
+        assert_eq!(host.len(), 2);
     }
 }

@@ -30,7 +30,7 @@ use cairn_orchestrator::{
     DecidePhase, ExecutePhase, GatherPhase, LoopConfig, OrchestrationContext, OrchestratorError,
     OrchestratorLoop, TaskFrameSink,
 };
-use ff_core::contracts::StreamFrame;
+use flowfabric::core::contracts::StreamFrame;
 
 use crate::TestHarness;
 
@@ -146,10 +146,16 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
         // trip the §1 timeout check before iteration 0 ran.
         run_started_at_ms: now_ms,
         working_dir: PathBuf::from("/tmp"),
+        completion_contract: None,
         run_mode: RunMode::Direct,
         discovered_tool_names: Vec::new(),
         step_history: Vec::new(),
         is_recovery: false,
+        approval_timeout: None,
+        visibility: None,
+        parent_context: None,
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     };
 
     let decide_output = DecideOutput {
@@ -168,6 +174,10 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
         latency_ms: 1_200,
         input_tokens: Some(500),
         output_tokens: Some(200),
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     };
 
     let sink: Arc<dyn TaskFrameSink> = Arc::new(claimed);
@@ -205,11 +215,11 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
         &task_id,
         h.partition_config(),
     );
+    // PR-C4c: `runtime.backend` field access → trait method.
     let frames: Vec<StreamFrame> = cairn_fabric::stream::restore_frames(
-        &h.fabric.runtime.client,
-        h.partition_config(),
+        h.fabric.runtime.backend().as_ref(),
         &eid,
-        ff_core::types::AttemptIndex::new(0),
+        flowfabric::core::types::AttemptIndex::new(0),
         100,
     )
     .await
@@ -335,23 +345,29 @@ async fn orchestrator_loop_emits_four_frames_in_per_iteration_order() {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn worker_config_from(h: &TestHarness) -> FabricConfig {
+    // PR-C4c: `runtime.config` is no longer a field on the trait
+    // object; the concrete `FabricConfig` lives on the Valkey
+    // runtime. Pull through the `valkey_runtime()` helper — this
+    // test harness is Valkey-only by construction.
+    let src = &h.valkey_runtime().config;
     FabricConfig {
-        valkey_host: h.fabric.runtime.config.valkey_host.clone(),
-        valkey_port: h.fabric.runtime.config.valkey_port,
-        tls: h.fabric.runtime.config.tls,
-        cluster: h.fabric.runtime.config.cluster,
-        lane_id: h.fabric.runtime.config.lane_id.clone(),
-        worker_id: ff_core::types::WorkerId::new("orchestrator-stream-worker"),
-        worker_instance_id: ff_core::types::WorkerInstanceId::new(uuid::Uuid::new_v4().to_string()),
-        namespace: h.fabric.runtime.config.namespace.clone(),
-        lease_ttl_ms: h.fabric.runtime.config.lease_ttl_ms,
-        grant_ttl_ms: h.fabric.runtime.config.grant_ttl_ms,
-        max_concurrent_tasks: h.fabric.runtime.config.max_concurrent_tasks,
-        signal_dedup_ttl_ms: h.fabric.runtime.config.signal_dedup_ttl_ms,
-        fcall_timeout_ms: h.fabric.runtime.config.fcall_timeout_ms,
+        backend: src.backend.clone(),
+        lane_id: src.lane_id.clone(),
+        worker_id: flowfabric::core::types::WorkerId::new("orchestrator-stream-worker"),
+        worker_instance_id: flowfabric::core::types::WorkerInstanceId::new(
+            uuid::Uuid::new_v4().to_string(),
+        ),
+        namespace: src.namespace.clone(),
+        lease_ttl_ms: src.lease_ttl_ms,
+        grant_ttl_ms: src.grant_ttl_ms,
+        max_concurrent_tasks: src.max_concurrent_tasks,
+        signal_dedup_ttl_ms: src.signal_dedup_ttl_ms,
+        fcall_timeout_ms: src.fcall_timeout_ms,
         worker_capabilities: BTreeSet::new(),
-        waitpoint_hmac_secret: h.fabric.runtime.config.waitpoint_hmac_secret.clone(),
-        waitpoint_hmac_kid: h.fabric.runtime.config.waitpoint_hmac_kid.clone(),
+        waitpoint_hmac_secret: src.waitpoint_hmac_secret.clone(),
+        waitpoint_hmac_kid: src.waitpoint_hmac_kid.clone(),
+        waitpoint_hmac_bootstrap_kid_reset: false,
+        backend_kind: src.backend_kind,
     }
 }
 

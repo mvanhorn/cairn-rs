@@ -103,6 +103,32 @@ pub trait GraphQueryService: Send + Sync {
         edge_filter: Option<EdgeKind>,
         max_depth: u32,
     ) -> Result<Option<Subgraph>, GraphQueryError>;
+
+    /// RFC 029 PR-B2: batched neighbor lookup for a set of node ids.
+    ///
+    /// Returns each requested node id paired with its immediate edges
+    /// (both incoming and outgoing). Used by the post-hoc rescorer to
+    /// compute `graph_proximity` for every result returned by a
+    /// knowledge provider in a single round-trip instead of N×`neighbors`
+    /// calls. The ordering of the returned vector matches the input
+    /// order; ids that have no graph edges return an empty edge list.
+    ///
+    /// Default implementation calls `neighbors` once per input id (an
+    /// O(N) fallback adequate for correctness). Backend-specific impls
+    /// override with a single `WHERE node_id IN (…)` query.
+    async fn multi_neighbors(
+        &self,
+        node_ids: &[String],
+    ) -> Result<Vec<(String, Vec<GraphEdge>)>, GraphQueryError> {
+        let mut out = Vec::with_capacity(node_ids.len());
+        for id in node_ids {
+            let mut edges = Vec::new();
+            edges.extend(self.find_edges_by_source(id, None, usize::MAX).await?);
+            edges.extend(self.find_edges_by_target(id, None, usize::MAX).await?);
+            out.push((id.clone(), edges));
+        }
+        Ok(out)
+    }
 }
 
 /// Graph query errors.

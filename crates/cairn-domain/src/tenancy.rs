@@ -94,11 +94,42 @@ impl ProjectKey {
         }
     }
 
+    /// The conventional above-project scope used for system-owned
+    /// settings and defaults (e.g. `provider_credential_<id>`,
+    /// `provider_endpoint_<id>`, brain/worker model defaults).
+    ///
+    /// `DefaultsService::resolve` and the system-scope settings API
+    /// both treat `("system", "system", "system")` as the catch-all
+    /// that project-scoped resolve falls back to. Centralising the
+    /// constructor removes three copies of the magic-string triple
+    /// across the app binary and avoids typo-regressions.
+    pub fn system() -> Self {
+        Self::new("system", "system", "system")
+    }
+
     pub fn workspace_key(&self) -> WorkspaceKey {
         WorkspaceKey {
             tenant_id: self.tenant_id.clone(),
             workspace_id: self.workspace_id.clone(),
         }
+    }
+
+    /// Parse a canonical `tenant/workspace/project` triple string.
+    ///
+    /// Returns `None` when the string is malformed — wrong arity
+    /// (must be exactly three `/`-separated segments) or any segment
+    /// is empty / whitespace-only. Segments are trimmed.
+    ///
+    /// Centralised here so every integration that ingests a triple
+    /// from config, env, or the operator API shares one parser and
+    /// one set of rejection rules. Keeps pure-string parsing testable
+    /// without touching process env.
+    pub fn parse_triple(raw: &str) -> Option<Self> {
+        let parts: Vec<&str> = raw.split('/').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.trim().is_empty()) {
+            return None;
+        }
+        Some(Self::new(parts[0].trim(), parts[1].trim(), parts[2].trim()))
     }
 }
 
@@ -194,6 +225,58 @@ pub struct WorkspaceMembership {
     pub role: WorkspaceRole,
 }
 
+/// Tenant-scope role for admin-surface authorization (RFC 026 PR-A0).
+///
+/// Distinct from [`WorkspaceRole`]: a `WorkspaceRole` grants privileges
+/// within a single workspace, while `TenantRole` grants privileges across
+/// every workspace/project owned by a tenant. Admin-UI pages (tenants,
+/// operators, quotas, retention) gate on `TenantRole::Admin` for the
+/// target tenant rather than per-workspace membership.
+///
+/// Stored N-to-M in the `operator_tenant_roles` projection — one operator
+/// can hold distinct roles on multiple tenants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantRole {
+    /// Full tenant-scope admin: can administer tenants, operators,
+    /// quotas, retention, credentials, workspaces, and every other
+    /// handler currently guarded by `AdminRoleGuard`.
+    Admin,
+    /// Default tenant member: read + run-creation across the tenant's
+    /// workspaces, no admin-surface access.
+    Member,
+    /// Read-only observer: list/get across the tenant, no mutations.
+    ReadOnly,
+}
+
+impl TenantRole {
+    /// `true` when the role is `TenantRole::Admin`.
+    ///
+    /// RFC 026 PR-A0: the `TenantAdminGuard` extractor checks this to
+    /// decide whether a non-god-token operator can reach the admin
+    /// surface. Centralised here so future role-hierarchy tweaks (e.g. an
+    /// `Owner` variant above `Admin`) only need to update this helper.
+    pub fn is_admin(self) -> bool {
+        matches!(self, TenantRole::Admin)
+    }
+
+    /// `true` when the role grants read access to the tenant — every
+    /// currently-defined role (Admin/Member/ReadOnly) does.
+    pub fn can_read(self) -> bool {
+        matches!(
+            self,
+            TenantRole::Admin | TenantRole::Member | TenantRole::ReadOnly
+        )
+    }
+
+    /// `true` when the role may mutate non-admin tenant state (run
+    /// creation, task updates, etc.). Admin implies member; ReadOnly
+    /// does not.
+    pub fn can_write(self) -> bool {
+        matches!(self, TenantRole::Admin | TenantRole::Member)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{OwnershipKey, ProjectKey, Scope, TenantKey, WorkspaceKey};
@@ -254,6 +337,29 @@ mod tests {
         assert_eq!(tenant.scope(), Scope::Tenant);
         assert_eq!(workspace.scope(), Scope::Workspace);
         assert_eq!(project.scope(), Scope::Project);
+    }
+
+    #[test]
+    fn parse_triple_rejects_malformed() {
+        // Two-part strings → None.
+        assert!(ProjectKey::parse_triple("only/two").is_none());
+        // Four-part strings → None.
+        assert!(ProjectKey::parse_triple("a/b/c/d").is_none());
+        // Empty segment → None.
+        assert!(ProjectKey::parse_triple("tenant//project").is_none());
+        // Whitespace-only segment → None.
+        assert!(ProjectKey::parse_triple("tenant/ /project").is_none());
+        // Empty string → None.
+        assert!(ProjectKey::parse_triple("").is_none());
+    }
+
+    #[test]
+    fn parse_triple_happy_path_trims_whitespace() {
+        let key =
+            ProjectKey::parse_triple("  tenant / workspace / project ").expect("triple must parse");
+        assert_eq!(key.tenant_id.as_str(), "tenant");
+        assert_eq!(key.workspace_id.as_str(), "workspace");
+        assert_eq!(key.project_id.as_str(), "project");
     }
 }
 
@@ -328,5 +434,52 @@ mod rfc008_tests {
         // But a lower scope cannot override a higher scope
         assert!(!Scope::Project.includes(Scope::Tenant));
         assert!(!Scope::Workspace.includes(Scope::Tenant));
+    }
+}
+
+// ── RFC 026 TenantRole Tests ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod rfc026_tenant_role_tests {
+    use super::TenantRole;
+
+    #[test]
+    fn admin_is_the_only_is_admin_role() {
+        assert!(TenantRole::Admin.is_admin());
+        assert!(!TenantRole::Member.is_admin());
+        assert!(!TenantRole::ReadOnly.is_admin());
+    }
+
+    #[test]
+    fn every_role_can_read() {
+        // RFC 026: an operator with any TenantRole entry can observe the
+        // tenant — read-only is explicit, member/admin implicitly include
+        // read.
+        assert!(TenantRole::Admin.can_read());
+        assert!(TenantRole::Member.can_read());
+        assert!(TenantRole::ReadOnly.can_read());
+    }
+
+    #[test]
+    fn only_admin_and_member_can_write() {
+        assert!(TenantRole::Admin.can_write());
+        assert!(TenantRole::Member.can_write());
+        assert!(!TenantRole::ReadOnly.can_write());
+    }
+
+    #[test]
+    fn serde_uses_snake_case() {
+        // The projection + wire format stores the role as a snake_case
+        // string; changing this silently would corrupt every persisted
+        // `operator_tenant_roles.role` column.
+        let admin = serde_json::to_string(&TenantRole::Admin).unwrap();
+        let member = serde_json::to_string(&TenantRole::Member).unwrap();
+        let read_only = serde_json::to_string(&TenantRole::ReadOnly).unwrap();
+        assert_eq!(admin, "\"admin\"");
+        assert_eq!(member, "\"member\"");
+        assert_eq!(read_only, "\"read_only\"");
+
+        let round_trip: TenantRole = serde_json::from_str("\"read_only\"").unwrap();
+        assert_eq!(round_trip, TenantRole::ReadOnly);
     }
 }

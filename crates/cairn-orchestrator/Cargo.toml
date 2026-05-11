@@ -3,6 +3,13 @@ name = "cairn-orchestrator"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Expose the F30 regression-test hooks (`decide_impl_test_hooks`) so
+# cross-crate integration tests can reach crate-private prompt
+# builders. Never enable on production builds — see
+# `src/lib.rs::decide_impl_test_hooks` for the rationale.
+test-hooks = []
+
 [dependencies]
 cairn-domain   = { path = "../cairn-domain" }
 cairn-store    = { path = "../cairn-store" }
@@ -12,14 +19,30 @@ cairn-memory   = { path = "../cairn-memory" }
 cairn-graph    = { path = "../cairn-graph" }
 cairn-tools    = { path = "../cairn-tools" }
 cairn-harness-tools = { path = "../cairn-harness-tools" }
+# RFC 032 PR-3 contract verifier: PullRequest branch calls the GitHub
+# App client for live PR metadata. All calls are wrapped in a
+# `tokio::time::timeout(Duration::from_secs(5), …)` wall clock inside
+# the verifier; no other orchestrator call sites consume the client
+# today.
+cairn-github   = { path = "../cairn-github" }
 async-trait    = "0.1"
+futures        = "0.3"
+# #697 R5-B: regex-based pseudo-XML tool-call extractor
+# (`crates/cairn-orchestrator/src/content_tool_scan.rs`). Default
+# features kept because the detector uses `(?s)` multiline + standard
+# char classes only — no perf-mode surface needed.
+regex          = "1"
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+# RFC 032 PR-3 contract verifier requires the `time` feature for
+# `tokio::time::timeout` (per-verifier 5 s wall clock).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 tracing        = "0.1"
 uuid = { version = "1", features = ["v4", "v7"] }
 
 [dev-dependencies]
 cairn-providers = { path = "../cairn-providers" }
+httpmock = "0.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tempfile = "3"
 tokio   = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

@@ -94,12 +94,15 @@ impl EvalRunService {
             evaluator_type,
             dataset_id: None,
             dataset_source: None,
+            rubric_id: None,
+            baseline_id: None,
             metrics: EvalMetrics::default(),
             plugin_metrics: Vec::new(),
             cost: None,
             created_by,
             created_at: now,
             completed_at: None,
+            archived_at: None,
         };
 
         let mut state = self.state.lock().unwrap();
@@ -107,6 +110,22 @@ impl EvalRunService {
             .runs
             .insert(eval_run_id.as_str().to_owned(), run.clone());
         run
+    }
+
+    /// Mark an eval run as archived (issue #244). Idempotent: already-archived
+    /// runs are a no-op and do not error. The `archived_at` timestamp comes
+    /// from the caller so replay can reconstruct the original soft-delete
+    /// moment, not "now".
+    pub fn archive(&self, eval_run_id: &EvalRunId, archived_at: u64) -> Result<(), EvalError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let run = state
+            .runs
+            .get_mut(eval_run_id.as_str())
+            .ok_or_else(|| EvalError::NotFound(eval_run_id.to_string()))?;
+        if run.archived_at.is_none() {
+            run.archived_at = Some(archived_at);
+        }
+        Ok(())
     }
 
     /// Start an eval run (Pending -> Running).
@@ -170,19 +189,83 @@ impl EvalRunService {
         Ok(())
     }
 
+    /// Link a rubric to an existing eval run (issue #223).
+    ///
+    /// Uses the poison-tolerant lock pattern (`unwrap_or_else(into_inner)`)
+    /// so a panic on another thread while holding the mutex cannot take down
+    /// the whole eval service. Other methods on this service still use
+    /// `lock().unwrap()` (pre-#223); they are candidates for a future sweep,
+    /// but the non-convergent locking is intentional here — these two
+    /// setters are the only write paths exercised on the hot-restart code
+    /// path (`replay_evals`), so they are the ones where a poisoned-mutex
+    /// cascade is most damaging.
+    pub fn set_rubric_id(
+        &self,
+        eval_run_id: &EvalRunId,
+        rubric_id: String,
+    ) -> Result<(), EvalError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let run = state
+            .runs
+            .get_mut(eval_run_id.as_str())
+            .ok_or_else(|| EvalError::NotFound(eval_run_id.to_string()))?;
+        run.rubric_id = Some(rubric_id);
+        Ok(())
+    }
+
+    /// Link a baseline to an existing eval run (issue #223).
+    ///
+    /// See `set_rubric_id` for the poison-tolerant locking rationale and
+    /// scope (this setter + `set_rubric_id` adopt the pattern; the rest of
+    /// this file intentionally still uses `lock().unwrap()` pending a
+    /// future file-wide sweep).
+    pub fn set_baseline_id(
+        &self,
+        eval_run_id: &EvalRunId,
+        baseline_id: String,
+    ) -> Result<(), EvalError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let run = state
+            .runs
+            .get_mut(eval_run_id.as_str())
+            .ok_or_else(|| EvalError::NotFound(eval_run_id.to_string()))?;
+        run.baseline_id = Some(baseline_id);
+        Ok(())
+    }
+
     /// Get an eval run by ID.
     pub fn get(&self, eval_run_id: &EvalRunId) -> Option<EvalRun> {
         let state = self.state.lock().unwrap();
         state.runs.get(eval_run_id.as_str()).cloned()
     }
 
+    /// Evict an eval run from the in-memory cache without emitting any
+    /// event. Used by handlers to recover from a cache-mutation failure
+    /// after a durable write has already landed: dropping the stale
+    /// entry forces the next read to go through the projection, which
+    /// is the source of truth. Returns `true` when an entry was removed.
+    ///
+    /// Introduced for issue #442 to close the split-brain window where
+    /// a failing cache update after a successful event-log append would
+    /// otherwise leave same-process reads returning pre-update state.
+    pub fn invalidate(&self, eval_run_id: &EvalRunId) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.runs.remove(eval_run_id.as_str()).is_some()
+    }
+
     /// Build a scorecard for a prompt asset, comparing eval results across releases.
+    /// Archived runs are skipped (issue #244): a soft-deleted run must not
+    /// continue to pad `entry_count` or inflate `best_task_success_rate` on
+    /// any scorecard-derived view (handler list + full `GET /v1/evals/scorecard/:id`
+    /// must stay consistent with `list_by_project`).
     pub fn build_scorecard(
         &self,
         project_id: &ProjectId,
         prompt_asset_id: &PromptAssetId,
     ) -> Scorecard {
-        let state = self.state.lock().unwrap();
+        // Poison-tolerant lock — same reasoning as sibling list methods
+        // (Bugbot "poison-tolerant mutex" rule).
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut entries: Vec<ScorecardEntry> = state
             .runs
@@ -191,6 +274,7 @@ impl EvalRunService {
                 r.project_id == *project_id
                     && r.prompt_asset_id.as_ref() == Some(prompt_asset_id)
                     && r.status == EvalRunStatus::Completed
+                    && r.archived_at.is_none()
             })
             .filter_map(|r| {
                 Some(ScorecardEntry {
@@ -218,13 +302,32 @@ impl EvalRunService {
         }
     }
 
-    /// List all eval runs for a project.
+    /// List all active (non-archived) eval runs for a project. Archived runs
+    /// are hidden by default to match the workspace/session soft-delete
+    /// pattern (#218 / #229). Use `list_by_project_include_archived` when the
+    /// caller opts in via `?include_archived=true`.
     pub fn list_by_project(&self, project_id: &ProjectId) -> Vec<EvalRun> {
-        let state = self.state.lock().unwrap();
+        self.list_by_project_include_archived(project_id, false)
+    }
+
+    /// List eval runs for a project with explicit control over archived
+    /// filtering. `include_archived=true` surfaces soft-deleted runs in the
+    /// response (issue #244 parity with `GET /v1/admin/.../workspaces`).
+    pub fn list_by_project_include_archived(
+        &self,
+        project_id: &ProjectId,
+        include_archived: bool,
+    ) -> Vec<EvalRun> {
+        // Poison-tolerant lock: a panic in another thread must not cascade
+        // into "all list calls crash forever". Matches the `archive` method
+        // above (Cursor Bugbot rule: "Use poison-tolerant mutex locking in
+        // cairn-store production paths").
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state
             .runs
             .values()
             .filter(|r| r.project_id == *project_id)
+            .filter(|r| include_archived || r.archived_at.is_none())
             .cloned()
             .collect()
     }
@@ -719,6 +822,33 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidate_drops_cache_entry_and_is_idempotent() {
+        // Issue #442 regression guard: `invalidate` must evict the run so
+        // a subsequent `get` returns None (forcing callers through the
+        // projection). Calling invalidate again must be a clean no-op.
+        let svc = EvalRunService::new();
+        let id = EvalRunId::new("eval_invalidate");
+        svc.create_run(
+            id.clone(),
+            ProjectId::new("proj_invalidate"),
+            EvalSubjectKind::PromptRelease,
+            "auto".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(svc.get(&id).is_some(), "run is cached after create_run");
+
+        assert!(svc.invalidate(&id), "invalidate reports removal");
+        assert!(svc.get(&id).is_none(), "invalidate evicted the cache entry");
+        assert!(
+            !svc.invalidate(&id),
+            "second invalidate is a no-op (returns false)"
+        );
+    }
 
     #[test]
     fn eval_run_lifecycle() {

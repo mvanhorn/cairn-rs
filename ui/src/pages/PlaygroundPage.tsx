@@ -9,7 +9,7 @@ import {
   Plus, X, Copy, Check, PanelLeftClose, PanelLeft, GitCompare, Download,
 } from "lucide-react";
 import { clsx } from "clsx";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import { useToast } from "../components/Toast";
 import { FeatureEmptyState } from "../components/FeatureEmptyState";
 
@@ -991,16 +991,20 @@ export function PlaygroundPage() {
   ].filter((v): v is string => typeof v === "string" && v.length > 0);
 
   // Build model list from available providers in the registry.
-  // Skip "anthropic" (non-OpenAI wire format — needs native adapter).
+  // All adapter types are supported: the backend chat/stream handler routes
+  // through the appropriate native adapter (openai, anthropic, bedrock, ollama).
   const registryModels: string[] = (registryData ?? [])
-    .filter(p => p.available && p.api_format !== "anthropic")
+    .filter(p => p.available)
     .flatMap(p => {
       // If the provider has known models, list them. Otherwise expose the default.
       if (p.models.length > 0) return p.models.map(m => m.id);
       return p.default_model ? [p.default_model] : [];
     });
 
-  const connectionModels: string[] = (connectionsData?.items ?? []).flatMap(c => c.supported_models ?? []);
+  // #425: shared list-shape normalizer.
+  const connectionModels: string[] = unwrapList<import("../lib/types").ProviderConnectionRecord>(
+    connectionsData,
+  ).flatMap(c => c.supported_models ?? []);
 
   // Merge: configured models first, then registry, then connections.
   const allModels = [

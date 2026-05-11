@@ -4,7 +4,7 @@ LLM provider connections, bindings, pools, policies, budget, health scheduling, 
 
 Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes.tsv). Drift from this table against the live router is enforced by `cargo test -p cairn-api --test compat_catalog_sync`.
 
-**Routes: 35**
+**Routes: 37**
 
 | Method | Path | Classification | Notes |
 |---|---|---|---|
@@ -21,6 +21,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `DELETE` | `/v1/providers/connections/:id` | Preserve |  |
 | `PUT` | `/v1/providers/connections/:id` | Preserve |  |
 | `GET` | `/v1/providers/connections/:id/discover-models` | Preserve |  |
+| `POST` | `/v1/providers/connections/discover-preview` | Preserve | ad-hoc discover BEFORE registration |
 | `GET` | `/v1/providers/connections/:id/health-schedule` | Preserve |  |
 | `POST` | `/v1/providers/connections/:id/health-schedule` | Preserve |  |
 | `GET` | `/v1/providers/connections/:id/models` | Preserve |  |
@@ -43,5 +44,7 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `DELETE` | `/v1/providers/pools/:id/connections/:conn_id` | Preserve |  |
 | `GET` | `/v1/providers/registry` | Preserve |  |
 | `POST` | `/v1/providers/run-health-checks` | Preserve |  |
+| `GET` | `/v1/models/catalog` | Preserve | bundled LiteLLM catalog; query: provider?, tier?, search?, supports_tools?, supports_json_mode?, reasoning?, max_cost_per_1m?, free_only?, limit?, offset?; { items, total, hasMore } |
+| `GET` | `/v1/models/catalog/providers` | Preserve | unique providers in catalog with counts; cached |
 
 <!-- TODO: contract bodies (tracked as follow-up) -->

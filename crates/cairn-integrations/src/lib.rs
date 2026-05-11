@@ -15,6 +15,7 @@
 pub mod config;
 pub mod github;
 pub mod linear;
+pub mod local_fs;
 pub mod notion;
 pub mod obsidian;
 pub mod types;
@@ -56,6 +57,20 @@ pub enum IntegrationError {
 /// registered at startup via `IntegrationRegistry::register()`.
 #[async_trait]
 pub trait Integration: Send + Sync + 'static {
+    /// Downcast escape hatch.
+    ///
+    /// Returns a reference to `self` as `&dyn Any` so callers that need the
+    /// concrete plugin type (e.g. the cairn-app GitHub handlers reaching
+    /// into `GitHubPlugin`'s webhook secret, installation-token cache, and
+    /// issue queue) can recover it via
+    /// `IntegrationRegistry::get_typed::<GitHubPlugin>("github")`. Every
+    /// impl just returns `self`.
+    ///
+    /// Prefer trait methods for anything reusable across plugins — this is
+    /// the intentional escape hatch for plugin-specific concerns that do
+    /// not generalise.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Unique identifier (e.g. "github", "linear", "slack").
     fn id(&self) -> &str;
 
@@ -108,12 +123,32 @@ pub trait Integration: Send + Sync + 'static {
     async fn queue_stats(&self) -> QueueStats;
 }
 
+/// Registry slot — holds both views of the same underlying plugin
+/// allocation so a single lock acquisition atomically updates or
+/// reads the trait-object view and the typed-Any view.
+///
+/// The two `Arc`s point at the same heap allocation (the concrete
+/// plugin `T`); the types just differ so `get` can hand back
+/// `Arc<dyn Integration>` while `get_typed` can `Arc::downcast` back
+/// to `Arc<T>`.
+pub(crate) struct RegistrySlot {
+    pub(crate) as_integration: Arc<dyn Integration>,
+    pub(crate) as_any: Arc<dyn std::any::Any + Send + Sync>,
+}
+
 /// Registry of active integrations, keyed by their ID.
 ///
 /// Also holds per-integration operator overrides that take precedence
 /// over the integration's defaults.
+///
+/// Internally stores each integration as a `RegistrySlot` — both the
+/// trait-object view and the typed-`Any` view under the same
+/// `RwLock`, so `get` and `get_typed` can never observe a
+/// half-registered or half-unregistered plugin. Before this change
+/// the two views lived under independent locks with an `await`
+/// boundary between them; that race is closed.
 pub struct IntegrationRegistry {
-    pub(crate) integrations: RwLock<HashMap<String, Arc<dyn Integration>>>,
+    pub(crate) integrations: RwLock<HashMap<String, RegistrySlot>>,
     pub(crate) overrides: RwLock<HashMap<String, IntegrationOverrides>>,
     /// Stored configs for retrieval via the API.
     pub(crate) configs: RwLock<HashMap<String, IntegrationConfig>>,
@@ -128,27 +163,85 @@ impl IntegrationRegistry {
         }
     }
 
-    /// Register an integration. Replaces any existing integration with the same ID.
-    pub async fn register(&self, integration: Arc<dyn Integration>) {
+    /// Register an integration. Replaces any existing integration with
+    /// the same ID in a single atomic write — no observer can see the
+    /// trait-object view and the typed view disagree.
+    ///
+    /// Callers pass a concrete `Arc<T>` — *not* a pre-widened
+    /// `Arc<dyn Integration>` — because the typed view is keyed on
+    /// the concrete type. The `T: Integration + Send + Sync + 'static`
+    /// bound keeps the call sites simple:
+    /// `registry.register(Arc::new(GitHubPlugin::new(...)))`.
+    pub async fn register<T: Integration + Send + Sync + 'static>(&self, integration: Arc<T>) {
         let id = integration.id().to_owned();
-        self.integrations.write().await.insert(id, integration);
+        let slot = RegistrySlot {
+            as_integration: integration.clone(),
+            as_any: integration,
+        };
+        self.integrations.write().await.insert(id, slot);
     }
 
     /// Synchronous registration for startup (before the async runtime is entered).
     /// Only safe when you have exclusive `&mut` access to the registry.
-    pub fn register_sync(&mut self, integration: Arc<dyn Integration>) {
+    ///
+    /// Same atomic-slot guarantee as [`register`](Self::register): both
+    /// the trait-object and typed-`Any` views land in the same slot in
+    /// the same insertion.
+    pub fn register_sync<T: Integration + Send + Sync + 'static>(&mut self, integration: Arc<T>) {
         let id = integration.id().to_owned();
-        self.integrations.get_mut().insert(id, integration);
+        let slot = RegistrySlot {
+            as_integration: integration.clone(),
+            as_any: integration,
+        };
+        self.integrations.get_mut().insert(id, slot);
     }
 
     /// Get an integration by ID.
     pub async fn get(&self, id: &str) -> Option<Arc<dyn Integration>> {
-        self.integrations.read().await.get(id).cloned()
+        self.integrations
+            .read()
+            .await
+            .get(id)
+            .map(|slot| slot.as_integration.clone())
+    }
+
+    /// Get an integration by ID and downcast to a concrete plugin type.
+    ///
+    /// Returns `Some(Arc<T>)` when an integration is registered under
+    /// `id` AND its concrete type is `T`; `None` otherwise (no matching
+    /// id, or registered under that id with a different type).
+    ///
+    /// This is the bridge cairn-app handlers use when they need
+    /// plugin-specific state that the `Integration` trait does not
+    /// surface (e.g. `GitHubPlugin`'s webhook secret, installation
+    /// token cache, `issue_queue`, `event_actions`). Call shape:
+    /// `registry.get_typed::<GitHubPlugin>("github").await`. Returning
+    /// `Arc<T>` — not `&T` — matches how the integrations are stored
+    /// internally and keeps the plugin alive for the duration of the
+    /// handler even after the registry lock drops.
+    ///
+    /// Implementation: every slot holds both a trait-object Arc and a
+    /// typed-`Any` Arc over the same allocation, under a single
+    /// `RwLock`. [`std::sync::Arc::downcast`] recovers the concrete
+    /// type without raw pointers or `unsafe`.
+    pub async fn get_typed<T: Integration + Send + Sync + 'static>(
+        &self,
+        id: &str,
+    ) -> Option<Arc<T>> {
+        let guard = self.integrations.read().await;
+        let any = guard.get(id)?.as_any.clone();
+        drop(guard);
+        any.downcast::<T>().ok()
     }
 
     /// List all registered integrations.
     pub async fn list(&self) -> Vec<Arc<dyn Integration>> {
-        self.integrations.read().await.values().cloned().collect()
+        self.integrations
+            .read()
+            .await
+            .values()
+            .map(|slot| slot.as_integration.clone())
+            .collect()
     }
 
     /// Get the effective agent prompt for an integration (override or default).
@@ -162,7 +255,7 @@ impl IntegrationRegistry {
         let integrations = self.integrations.read().await;
         integrations
             .get(id)
-            .map(|i| i.default_agent_prompt().to_owned())
+            .map(|slot| slot.as_integration.default_agent_prompt().to_owned())
     }
 
     /// Get the effective event→action mappings for an integration.
@@ -176,7 +269,7 @@ impl IntegrationRegistry {
         let integrations = self.integrations.read().await;
         integrations
             .get(id)
-            .map(|i| i.default_event_actions())
+            .map(|slot| slot.as_integration.default_event_actions())
             .unwrap_or_default()
     }
 
@@ -227,7 +320,7 @@ impl IntegrationRegistry {
         let integrations = self.integrations.read().await;
         integrations
             .values()
-            .flat_map(|i| i.auth_exempt_paths())
+            .flat_map(|slot| slot.as_integration.auth_exempt_paths())
             .collect()
     }
 
@@ -236,7 +329,8 @@ impl IntegrationRegistry {
         let integrations = self.integrations.read().await;
         let overrides = self.overrides.read().await;
         let mut statuses = Vec::new();
-        for integration in integrations.values() {
+        for slot in integrations.values() {
+            let integration = &slot.as_integration;
             let id = integration.id().to_owned();
             let o = overrides.get(&id).cloned().unwrap_or_default();
             statuses.push(IntegrationStatus {
@@ -266,6 +360,9 @@ mod tests {
 
     #[async_trait]
     impl Integration for MockIntegration {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
         fn id(&self) -> &str {
             "mock"
         }
@@ -444,5 +541,54 @@ mod tests {
         let actions = registry.effective_event_actions("mock").await;
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].event_pattern, "custom.*");
+    }
+
+    #[tokio::test]
+    async fn get_typed_matches_registered_concrete_type() {
+        let registry = IntegrationRegistry::new();
+        registry.register(Arc::new(MockIntegration)).await;
+
+        // Same-type lookup succeeds.
+        let typed = registry.get_typed::<MockIntegration>("mock").await;
+        assert!(typed.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_and_get_typed_observe_same_slot_atomically() {
+        // Every `register` / `unregister` is a single atomic write on
+        // the slot map, so `get` and `get_typed` can never disagree on
+        // whether an id is present. This test exercises the common
+        // cases; stress-testing under contention is out of scope for a
+        // unit test (the invariant is structural, not probabilistic).
+        let registry = IntegrationRegistry::new();
+
+        // Before any registration: both report None.
+        assert!(registry.get("mock").await.is_none());
+        assert!(
+            registry
+                .get_typed::<MockIntegration>("mock")
+                .await
+                .is_none()
+        );
+
+        // After register: both report Some.
+        registry.register(Arc::new(MockIntegration)).await;
+        assert!(registry.get("mock").await.is_some());
+        assert!(
+            registry
+                .get_typed::<MockIntegration>("mock")
+                .await
+                .is_some()
+        );
+
+        // After unregister: both report None.
+        registry.unregister("mock").await.expect("unregister");
+        assert!(registry.get("mock").await.is_none());
+        assert!(
+            registry
+                .get_typed::<MockIntegration>("mock")
+                .await
+                .is_none()
+        );
     }
 }

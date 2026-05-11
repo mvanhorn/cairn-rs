@@ -47,9 +47,18 @@ where
 
         self.store.append(&[event]).await?;
 
-        SignalReadModel::get(self.store.as_ref(), &signal_id)
+        let record = SignalReadModel::get(self.store.as_ref(), &signal_id)
             .await?
-            .ok_or_else(|| RuntimeError::Internal("signal not found after ingest".into()))
+            .ok_or_else(|| RuntimeError::Internal("signal not found after ingest".into()))?;
+
+        if record.project != *project {
+            return Err(RuntimeError::Conflict {
+                entity: "signal",
+                id: signal_id.as_str().to_owned(),
+            });
+        }
+
+        Ok(record)
     }
 
     async fn get(&self, signal_id: &SignalId) -> Result<Option<SignalRecord>, RuntimeError> {
@@ -71,9 +80,13 @@ mod tests {
     use std::sync::Arc;
 
     use cairn_domain::*;
-    use cairn_store::{EventLog, InMemoryStore};
+    use cairn_store::projections::SignalReadModel;
+    use cairn_store::{EntityRef, EventLog, EventPosition, InMemoryStore, StoredEvent};
 
+    use crate::error::RuntimeError;
     use crate::signals::SignalService;
+
+    use cairn_domain::EventEnvelope;
 
     use super::SignalServiceImpl;
 
@@ -202,5 +215,101 @@ mod tests {
             &events[0].envelope.payload,
             RuntimeEvent::SignalIngested(e) if e.signal_id == SignalId::new("sig_evt")
         ));
+    }
+
+    #[tokio::test]
+    async fn ingest_rejects_cross_project_signal_id_collision() {
+        let attacker_project = ProjectKey::new("tenant_attacker", "ws_attacker", "project_red");
+        let signal_id = SignalId::new("sig_collision");
+        let store = Arc::new(ConflictingSignalStore {
+            record: SignalRecord {
+                id: signal_id.clone(),
+                project: ProjectKey::new("tenant_victim", "ws_victim", "project_secret"),
+                source: "victim-webhook".to_owned(),
+                payload: serde_json::json!({"secret": "victim-only"}),
+                timestamp_ms: 111,
+            },
+        });
+        let svc = SignalServiceImpl::new(store);
+
+        let err = svc
+            .ingest(
+                &attacker_project,
+                signal_id,
+                "attacker-webhook".to_owned(),
+                serde_json::json!({"secret": "attacker"}),
+                222,
+            )
+            .await
+            .expect_err("cross-project collision must fail");
+
+        assert!(matches!(
+            err,
+            RuntimeError::Conflict {
+                entity: "signal",
+                ..
+            }
+        ));
+    }
+
+    struct ConflictingSignalStore {
+        record: SignalRecord,
+    }
+
+    #[async_trait::async_trait]
+    impl EventLog for ConflictingSignalStore {
+        async fn append(
+            &self,
+            _events: &[EventEnvelope<RuntimeEvent>],
+        ) -> Result<Vec<EventPosition>, cairn_store::StoreError> {
+            Ok(vec![EventPosition(1)])
+        }
+
+        async fn read_by_entity(
+            &self,
+            _entity: &EntityRef,
+            _after: Option<EventPosition>,
+            _limit: usize,
+        ) -> Result<Vec<StoredEvent>, cairn_store::StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn read_stream(
+            &self,
+            _after: Option<EventPosition>,
+            _limit: usize,
+        ) -> Result<Vec<StoredEvent>, cairn_store::StoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn head_position(&self) -> Result<Option<EventPosition>, cairn_store::StoreError> {
+            Ok(Some(EventPosition(1)))
+        }
+
+        async fn find_by_causation_id(
+            &self,
+            _causation_id: &str,
+        ) -> Result<Option<EventPosition>, cairn_store::StoreError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SignalReadModel for ConflictingSignalStore {
+        async fn get(
+            &self,
+            _signal_id: &SignalId,
+        ) -> Result<Option<SignalRecord>, cairn_store::StoreError> {
+            Ok(Some(self.record.clone()))
+        }
+
+        async fn list_by_project(
+            &self,
+            _project: &ProjectKey,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<SignalRecord>, cairn_store::StoreError> {
+            Ok(Vec::new())
+        }
     }
 }

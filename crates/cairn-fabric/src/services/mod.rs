@@ -11,7 +11,7 @@ pub mod worker_service;
 pub use budget_service::FabricBudgetService;
 pub use quota_service::FabricQuotaService;
 pub use rotation_service::{FabricRotationService, RotateOutcome, RotationFailure};
-pub use run_service::FabricRunService;
+pub use run_service::{FabricRunService, ReclaimForTerminalWriteOutcome};
 pub use scheduler_service::FabricSchedulerService;
 pub use session_service::FabricSessionService;
 pub use task_service::FabricTaskService;

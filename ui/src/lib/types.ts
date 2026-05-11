@@ -31,14 +31,29 @@ export interface AgentTemplate {
 }
 
 // ── Skills (GET /v1/skills) ─────────────────────────────────────────────────
+//
+// Shape mirrors `cairn-api/src/skills_api.rs::SkillSummary` (wire format) and
+// `cairn-app/src/handlers/skills.rs::ListSkillsResponse`. The `Skill` /
+// `SkillSummary` structs use default serde (snake_case field names). The
+// enclosing `ListSkillsResponse` additionally emits a legacy
+// `currentlyActive` camelCase alias alongside `currently_active` for stub
+// compatibility — see the handler doc comment.
+
+export type SkillLifecycleStatus = "active" | "proposed" | "rejected";
 
 export interface SkillRecord {
-  id?: string;
-  name?: string;
-  description?: string;
-  enabled?: boolean;
-  source?: string;
-  [key: string]: unknown;
+  skill_id: string;
+  name: string;
+  description: string;
+  version: string;
+  tags: string[];
+  enabled: boolean;
+}
+
+export interface SkillDetail extends SkillRecord {
+  entry_point: string;
+  required_permissions: string[];
+  status: SkillLifecycleStatus;
 }
 
 export interface SkillsSummary {
@@ -61,6 +76,7 @@ export type GraphNodeKind =
   | "task"
   | "approval"
   | "checkpoint"
+  | "trigger"
   | "mailbox_message"
   | "tool_invocation"
   | "memory"
@@ -80,6 +96,8 @@ export type GraphNodeKind =
 
 export type GraphEdgeKind =
   | "triggered"
+  | "matched_by"
+  | "fired"
   | "spawned"
   | "depended_on"
   | "approved_by"
@@ -251,6 +269,26 @@ export interface ProjectKey {
   project_id: string;
 }
 
+// ── Tenants / Projects ────────────────────────────────────────────────────────
+
+/** GET /v1/admin/tenants — persisted tenant record. */
+export interface TenantRecord {
+  tenant_id: string;
+  name: string;
+  created_at: number; // unix ms
+  updated_at: number; // unix ms
+}
+
+/** GET /v1/admin/workspaces/:workspace_id/projects — persisted project record. */
+export interface ProjectRecord {
+  project_id: string;
+  workspace_id: string;
+  tenant_id: string;
+  name: string;
+  created_at: number; // unix ms
+  updated_at: number; // unix ms
+}
+
 // ── Workspaces ────────────────────────────────────────────────────────────────
 
 /** GET /v1/admin/tenants/:tenant_id/workspaces — persisted workspace record. */
@@ -260,6 +298,11 @@ export interface WorkspaceRecord {
   name: string;
   created_at: number; // unix ms
   updated_at: number; // unix ms
+  /**
+   * Unix-ms soft-delete timestamp (issue #218). `null` when the workspace is
+   * active. Populated for workspaces returned with `?include_archived=true`.
+   */
+  archived_at?: number | null;
 }
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
@@ -267,7 +310,148 @@ export interface WorkspaceRecord {
 /** Session lifecycle state — mirrors cairn_domain::SessionState */
 export type SessionState = "open" | "completed" | "failed" | "archived";
 
-/** GET /v1/sessions — array of SessionRecord */
+/**
+ * F65 PR-5: response shape for `DELETE /v1/sessions/:id/snapshots`.
+ * Emitted by the admin-only snapshot reap endpoint.
+ */
+export interface SnapshotReapResponse {
+  /** Count of snapshots reaped in this call. */
+  reaped: number;
+  /** Unix-ms timestamp when the reap landed. */
+  at_ms: number;
+}
+
+/**
+ * F65: per-session budget envelope. Every field is optional — null means
+ * "unlimited at this layer"; the orchestrator's circuit breaker (PR-3) falls
+ * back to per-run defaults when a field is absent.
+ */
+export interface IssueBudget {
+  max_tokens?: number | null;
+  /** Cap on total provider cost, in USD micros (1 USD = 1_000_000). */
+  max_cost_micros?: number | null;
+  max_wall_seconds?: number | null;
+}
+
+/** F65: kinds of circuit breakers enforced by the orchestrator in PR-3. */
+export type BreakerKind =
+  | "round"
+  | "tokens"
+  | "no_tool_use_consecutive"
+  | "wall_clock";
+
+/** F65: one circuit-breaker trip event. */
+export interface CircuitBreakerTrip {
+  which: BreakerKind;
+  measured: number;
+  limit: number;
+  /** 0-based iteration number at which the trip was observed. */
+  at_iteration: number;
+}
+
+/**
+ * F65: exhaustive classification of why a session attempt ended.
+ * `kind` is the serde-tag discriminator. Fields beyond `kind` are
+ * only present on the matching variant.
+ */
+export type TerminationReason =
+  | { kind: "complete_run" }
+  | ({ kind: "circuit_breaker_tripped" } & CircuitBreakerTrip)
+  | { kind: "lease_lost" }
+  | { kind: "provider_error"; message: string }
+  | { kind: "operator_cancel" }
+  | { kind: "crashed"; message: string };
+
+/**
+ * F65: rich terminal envelope emitted once per session when it closes.
+ * PR-1 defines the shape; PR-6 wires the LLM summarizer that populates
+ * `compacted_summary` and `next_step_hint`.
+ *
+ * `checkpoint_id` and `workspace_snapshot_id` reference `Checkpoint` /
+ * `WorkspaceSnapshot` records on the backend — see interfaces below.
+ * The union of `SessionOutcome.checkpoint_id` and `Checkpoint.checkpoint_id`
+ * is enforced at compile time by `ui/src/lib/__tests__/sessionOutcomeRefs.test.ts`.
+ */
+export interface SessionOutcome {
+  session_id: string;
+  root_run_id: string;
+  project: ProjectKey;
+  checkpoint_id: Checkpoint["checkpoint_id"];
+  workspace_snapshot_id?: WorkspaceSnapshot["snapshot_id"] | null;
+  termination_reason: TerminationReason;
+  /** JSON-encoded summary produced by the LLM summarizer in PR-6. */
+  compacted_summary: string;
+  next_step_hint?: string | null;
+  /** Total provider cost in USD micros (1 USD = 1_000_000). */
+  cost_micros: number;
+  /** Unix-epoch ms. */
+  emitted_at: number;
+}
+
+// ── Checkpoint & WorkspaceSnapshot (F65) ──────────────────────────────────────
+
+/**
+ * Mirrors `cairn_store::projections::CheckpointRecord` — the current-state
+ * record returned by the checkpoint handlers in `crates/cairn-app/src/handlers/tools.rs`.
+ *
+ *   - `GET /v1/checkpoints/:id`     → `CheckpointRecord`
+ *   - `POST /v1/runs/:id/checkpoint` → `CheckpointRecord`
+ *   - `GET /v1/checkpoints?run_id`  → `{ items: CheckpointRecord[], has_more: boolean }`
+ *
+ * (The handler's generic annotation says `Checkpoint` but the items are
+ * populated via `CheckpointReadModel::list_by_run` which returns
+ * `Vec<CheckpointRecord>` — see `crates/cairn-runtime/src/services/checkpoint_impl.rs`.
+ * Both shapes coincide in the fields the UI observes today, but we name
+ * the TS type for the one actually on the wire.)
+ *
+ * Audit finding #383: SessionOutcome was referring to this type by its
+ * string id before the interface existed anywhere in the UI. Added here
+ * so cross-type references (see `SessionOutcome.checkpoint_id`) have a
+ * real compile-time anchor.
+ */
+export interface Checkpoint {
+  checkpoint_id: string;
+  project: ProjectKey;
+  run_id: string;
+  /** Intentionally narrow in v1 — mirrors `CheckpointDisposition`. */
+  disposition: "latest" | "superseded";
+  /** Opaque JSON state blob. Format is orchestrator-defined and versioned. */
+  data?: unknown | null;
+  version: number;
+  /** Unix-epoch ms when the checkpoint was recorded. */
+  created_at: number;
+}
+
+/**
+ * Mirrors `cairn_domain::session_orchestration::WorkspaceSnapshot` — the
+ * record the workspace backend produces at session-outcome time or on
+ * explicit operator checkpoint. Referenced by `SessionOutcome` via
+ * `workspace_snapshot_id`.
+ *
+ * `snapshot_path` SHOULD be relative to the configured workspace-snapshot
+ * root (per the Rust doc comment on `WorkspaceSnapshot::snapshot_path`).
+ * This is a portability constraint for the backend; the UI should treat
+ * the path as host-local and display-only.
+ */
+export interface WorkspaceSnapshot {
+  snapshot_id: string;
+  workspace_id: string;
+  snapshot_path: string;
+  /** Unix-epoch ms when the snapshot was created. */
+  created_at: number;
+  /** Unix-epoch ms when the snapshot may be reaped. `null` means GC-managed. */
+  expires_at?: number | null;
+  /** If this snapshot was built on top of another, the parent id is recorded. */
+  parent_snapshot_id?: string | null;
+}
+
+/**
+ * GET /v1/sessions — array of SessionRecord.
+ *
+ * F65 PR-1 adds `goal_title`, `issue_budget`, `max_attempts`, and
+ * `attempts_used`. All are additive and optional on responses from servers
+ * predating the PR (serde defaults apply on replay).
+ */
 export interface SessionRecord {
   session_id: string;
   project: ProjectKey;
@@ -275,6 +459,14 @@ export interface SessionRecord {
   version: number;
   created_at: number; // unix ms
   updated_at: number; // unix ms
+  /** F65: operator-visible short title describing the session's goal. */
+  goal_title?: string | null;
+  /** F65: per-session budget envelope. */
+  issue_budget?: IssueBudget | null;
+  /** F65: maximum session attempts. Defaults to 5 on legacy shapes. */
+  max_attempts?: number;
+  /** F65: count of attempts used so far within the session. */
+  attempts_used?: number;
 }
 
 // ── Runs ──────────────────────────────────────────────────────────────────────
@@ -290,13 +482,96 @@ export type RunState =
   | "failed"
   | "canceled";
 
-/** Failure classification */
+/**
+ * Failure classification — MUST match `cairn_domain::lifecycle::FailureClass`
+ * (crates/cairn-domain/src/lifecycle.rs). The Rust enum uses
+ * `#[serde(rename_all = "snake_case")]`, so every variant below is the exact
+ * JSON string that hits the wire on `RunRecord.failure_class` /
+ * `TaskRecord.failure_class`.
+ *
+ * Adding a new variant? Update both sides:
+ *   1. `FailureClass` in `crates/cairn-domain/src/lifecycle.rs`
+ *   2. This union
+ *   3. `FAILURE_CLASS_VALUES` in `ui/src/lib/__tests__/failureClass.test.ts`
+ *      (the compile-time coverage check lives there)
+ *
+ * Source of truth is Rust. If the wire format ever diverges, the TS side
+ * is wrong by construction.
+ */
 export type FailureClass =
-  | "provider_failure"
+  | "timed_out"
+  | "dependency_failed"
+  | "approval_rejected"
   | "policy_denied"
-  | "timeout"
-  | "internal_error"
-  | "approval_rejected";
+  | "execution_error"
+  | "lease_expired"
+  | "canceled_by_operator"
+  /**
+   * F62: terminal FCALL deadlocked against the fabric — the orchestrator
+   * produced artifacts but the fabric rejects both the terminal write and
+   * the lease re-claim. Tracked upstream at
+   * https://github.com/avifenesh/FlowFabric/issues/371.
+   */
+  | "terminal_write_deadlock"
+  /**
+   * #660: orchestrator's strict completion gate refused the LLM's
+   * `complete_run` because the F47 `completion_verification` sidecar
+   * reported errors (typically a failing `cargo build`/`cargo check`).
+   * The loop re-enters DECIDE; after three consecutive rejections the
+   * run terminates with this class so operators can distinguish
+   * "model could not converge past a failing build" from a generic
+   * `execution_error`. Flag: `orchestrator_strict_completion_gate`
+   * (default `true`). See RFC-F47 + issue #660.
+   */
+  | "verification_rejected"
+  /**
+   * #670 G4 / RFC 027 §Orphan-child: child subagent run whose spawn
+   * failed between Phase-1 (child row created) and Phase-2 (task
+   * submitted). Set either automatically by the Child Run Driver
+   * adapter on synchronous Phase-2 failure (PR-1b-3), or manually by
+   * an operator via
+   * `POST /v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan` for
+   * rows that leaked because cairn-app crashed between the two
+   * phases.
+   */
+  | "orphan_child"
+  /**
+   * #750: child subagent run terminated because every binding × model
+   * in the routed provider chain failed with fallback-eligible errors.
+   * Distinguishes child-run providers-exhausted terminations from
+   * generic `execution_error`. Top-level (operator-initiated) runs
+   * still suspend in `WaitingApproval` with an `escalate_to_operator`
+   * approval card per #693 R3-B; this class is reserved for child
+   * runs which short-circuit to terminal so G5's `child_completed`
+   * signal fires and the parent's auto-resume can decide what to do.
+   */
+  | "all_providers_exhausted"
+  /**
+   * #825: the agent emitted `ActionType::FailRun` — a truthful
+   * self-report of "I tried, I cannot proceed." Distinct from
+   * `verification_rejected` (model lied about a passing build) and
+   * `execution_error` (infrastructure fault). R26 dogfood (2026-05-10)
+   * found sub-agents that correctly diagnosed their own blocker but
+   * had no terminal verb for it, so they called `complete_run` with
+   * a "Status: Blocked" summary and the run flipped to `completed`.
+   * This variant lets operator dashboards distinguish agent-declared
+   * failure (missing precondition, contradictory goal, dependency not
+   * met) from the other failure classes.
+   */
+  | "model_reported_failure"
+  /**
+   * RFC 032: the completion-contract verifier rejected the agent's
+   * `complete_run` because the claimed deliverable does not exist
+   * (no PR at the declared URL, file missing, prose too short +
+   * under-cited, JSON Schema mismatch). Distinct from
+   * `verification_rejected` (model lied about tool errors / admitted
+   * failure in the summary) and `model_reported_failure` (model
+   * truthfully called `fail_run`). The specific rejection reason
+   * (a stable `ContractRejectionCode` like `pr_not_found` /
+   * `file_symlink_traversal`) surfaces in the run's step_history
+   * diagnostic, not on the failure_class field.
+   */
+  | "contract_not_met";
 
 /** GET /v1/runs — array of RunRecord */
 export interface RunRecord {
@@ -321,6 +596,17 @@ export interface RunRecord {
   sandbox_id?: string;
   /** RFC 016: sandbox filesystem path */
   sandbox_path?: string;
+  /**
+   * #661: count of child runs (`spawn_subagent` delegations) the
+   * orchestrator spawned under this run. Populated only by
+   * `GET /v1/runs/:id` — list endpoints omit these to keep the
+   * batch shape flat.
+   */
+  subagents_spawned?: number;
+  /** #661: child runs that terminated in `completed`. */
+  subagents_completed?: number;
+  /** #661: child runs that terminated in `failed` or `canceled`. */
+  subagents_failed?: number;
 }
 
 // ── Run sub-resources ─────────────────────────────────────────────────────────
@@ -351,6 +637,130 @@ export interface RunCostRecord {
   provider_calls: number;
 }
 
+// ── Run operator mutations (issues #166/#173) ────────────────────────────────
+
+/** Pause reason categorisation — mirrors `cairn_domain::PauseReasonKind`. */
+export type PauseReasonKind =
+  | "operator_pause"
+  | "runtime_suspension"
+  | "tool_requested_suspension"
+  | "policy_hold";
+
+/** Resume trigger — mirrors `cairn_domain::ResumeTrigger`. */
+export type ResumeTrigger =
+  | "operator_resume"
+  | "resume_after_timer"
+  | "runtime_signal";
+
+/** Resume target state — mirrors `cairn_domain::RunResumeTarget`. */
+export type RunResumeTarget = "pending" | "running";
+
+/** Body for POST /v1/runs/:id/pause */
+export interface PauseRunRequest {
+  reason_kind?: PauseReasonKind;
+  detail?: string;
+  actor?: string;
+  resume_after_ms?: number;
+}
+
+/** Body for POST /v1/runs/:id/resume */
+export interface ResumeRunRequest {
+  trigger?: ResumeTrigger;
+  target?: RunResumeTarget;
+}
+
+/** Body for POST /v1/runs/:id/spawn */
+export interface SpawnSubagentRequest {
+  session_id: string;
+  parent_task_id?: string;
+  child_task_id?: string;
+  child_run_id?: string;
+}
+
+/** Response for POST /v1/runs/:id/spawn */
+export interface SpawnSubagentResponse {
+  parent_run_id: string;
+  child_run_id: string;
+}
+
+/** Operator intervention actions — mirrors `RunInterventionAction`. */
+export type InterventionAction =
+  | "force_complete"
+  | "force_fail"
+  | "force_restart"
+  | "inject_message";
+
+/** Body for POST /v1/runs/:id/intervene */
+export interface InterveneRequest {
+  action: InterventionAction;
+  reason: string;
+  message_body?: string;
+}
+
+/**
+ * Response envelope for POST /v1/runs/:id/intervene.
+ * `ok` is always present; `run` is returned for state-changing actions,
+ * `messageId` is returned when the action is `inject_message`.
+ */
+export interface InterveneResponse {
+  ok: boolean;
+  run?: RunRecord;
+  messageId?: string;
+}
+
+/** One record from GET /v1/runs/:id/interventions */
+export interface InterventionRecord {
+  run_id: string;
+  tenant_id: string;
+  action: string;
+  reason: string;
+  intervened_at_ms: number;
+}
+
+/**
+ * Response for POST /v1/runs/:id/orchestrate. The orchestrator returns a
+ * free-form JSON document whose exact shape depends on the loop termination
+ * mode, so we intentionally type it as a record.
+ */
+export type OrchestrateResult = Record<string, unknown>;
+
+/**
+ * Response for POST /v1/runs/:id/diagnose — a diagnosis report emitted by
+ * `build_diagnosis_report`. Shape varies by run state, so treat as opaque
+ * JSON and render it as pretty-printed JSON in the UI.
+ */
+export type DiagnoseResult = Record<string, unknown>;
+
+/** One entry in `ReplayResult.final_task_states`. */
+export interface ReplayTaskStateView {
+  task_id: string;
+  state: string;
+}
+
+/**
+ * Response for `GET /v1/runs/:id/replay` and
+ * `POST /v1/runs/:id/replay-to-checkpoint` — mirrors `ReplayResult` in
+ * `crates/cairn-app/src/helpers.rs`. This is a compact summary of the
+ * replay (event count, terminal run state, terminal task states, and the
+ * number of checkpoints encountered), not the raw event stream.
+ */
+export interface ReplayResult {
+  events_replayed: number;
+  final_run_state: string | null;
+  final_task_states: ReplayTaskStateView[];
+  checkpoints_found: number;
+}
+
+/**
+ * Response for POST /v1/runs/:id/recover. The endpoint is a 202-Accepted
+ * no-op kept for back-compat; recovery is driven by FlowFabric scanners.
+ */
+export interface RecoverRunResponse {
+  status: string;
+  note?: string;
+  deprecated?: boolean;
+}
+
 /** Task state mirrors cairn_domain::TaskState */
 export type TaskState =
   | 'queued' | 'leased' | 'running' | 'completed'
@@ -364,7 +774,7 @@ export interface TaskRecord {
   parent_run_id: string | null;
   parent_task_id: string | null;
   state: TaskState;
-  failure_class: string | null;
+  failure_class: FailureClass | null;
   lease_owner: string | null;
   lease_expires_at: number | null;
   version: number;
@@ -428,6 +838,35 @@ export interface SessionCostRecord {
   token_out?: number;
 }
 
+/** F29 CD-2: lifetime cost rollup for a project. Returned by
+ *  `GET /v1/projects/:tenant/:workspace/:project/costs`. Zero totals are
+ *  returned for projects that have not emitted any provider calls yet —
+ *  the UI can render the card without special-casing a 404. Shape
+ *  mirrors the Rust `ProjectCostRecord`. */
+export interface ProjectCostSummary {
+  tenant_id: string;
+  workspace_id: string;
+  project_id: string;
+  total_cost_micros: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
+  provider_calls: number;
+  updated_at_ms: number;
+}
+
+/** F29 CD-2: lifetime cost rollup for a workspace. Returned by
+ *  `GET /v1/workspaces/:tenant/:workspace/costs`. Same zero-fallback
+ *  semantics as `ProjectCostSummary`. Mirrors Rust `WorkspaceCostRecord`. */
+export interface WorkspaceCostSummary {
+  tenant_id: string;
+  workspace_id: string;
+  total_cost_micros: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
+  provider_calls: number;
+  updated_at_ms: number;
+}
+
 /** GET /v1/costs response shape — `{ items, hasMore }` list.
  *  The backend's `ListResponse<T>` serialises with
  *  `#[serde(rename_all = "camelCase")]`, so the pagination flag lands
@@ -462,7 +901,69 @@ export interface ApprovalRecord {
   requirement: ApprovalRequirement;
   decision: ApprovalDecision | null;
   created_at: number; // unix ms
+  /** Last mutation timestamp. For resolved approvals this is the resolution time. */
+  updated_at: number; // unix ms
 }
+
+// ── Tool-call approvals (PR BP-6) ────────────────────────────────────────────
+
+/** Match policy captured on a tool-call proposal — decides how a
+ *  `session`-scoped approval widens to future matching calls. */
+export type ApprovalMatchPolicy =
+  | { kind: "exact" }
+  | { kind: "project_scoped_path"; project_root: string }
+  | { kind: "exact_path"; path: string };
+
+/** Scope of an operator decision on a tool-call proposal. */
+export type ApprovalScope =
+  | { kind: "once" }
+  | { kind: "session"; match_policy: ApprovalMatchPolicy };
+
+/** Current state of a tool-call approval record. */
+export type ToolCallApprovalState = "pending" | "approved" | "rejected" | "timeout";
+
+/** Projection row for a tool-call approval (wire shape from
+ *  `cairn_store::projections::ToolCallApprovalRecord`). */
+export interface ToolCallApprovalRecord {
+  call_id: string;
+  session_id: string;
+  run_id: string;
+  project: ProjectKey;
+  tool_name: string;
+  original_tool_args: unknown;
+  amended_tool_args: unknown | null;
+  approved_tool_args: unknown | null;
+  display_summary: string | null;
+  match_policy: ApprovalMatchPolicy;
+  state: ToolCallApprovalState;
+  operator_id: string | null;
+  scope: ApprovalScope | null;
+  reason: string | null;
+  proposed_at_ms: number;
+  approved_at_ms: number | null;
+  rejected_at_ms: number | null;
+  last_amended_at_ms: number | null;
+  version: number;
+  created_at: number;
+  updated_at: number;
+}
+
+// ── Unified approval (F45) ───────────────────────────────────────────────────
+//
+// The server-side `/v1/approvals/*` family returns a discriminated union
+// keyed by `kind`. Plan approvals flatten `ApprovalRecord`; tool-call
+// approvals flatten `ToolCallApprovalRecord`. The UI treats both as one
+// inbox and narrows on `kind` when it needs a kind-specific action.
+
+/** A plan approval row returned by the unified surface. */
+export type UnifiedPlanApproval = ApprovalRecord & { kind: "plan" };
+
+/** A tool-call approval row returned by the unified surface. */
+export type UnifiedToolCallApproval = ToolCallApprovalRecord & { kind: "tool_call" };
+
+/** Discriminated union of both approval kinds — wire shape of
+ *  `GET /v1/approvals` and `GET /v1/approvals/:id`. */
+export type UnifiedApproval = UnifiedPlanApproval | UnifiedToolCallApproval;
 
 // ── Memory / Knowledge ───────────────────────────────────────────────────────
 
@@ -515,6 +1016,99 @@ export interface SourceQualityRecord {
   chunk_count: number;
 }
 
+/** GET /v1/sources/:id — detailed source response. */
+export interface SourceDetailResponse {
+  source_id: string;
+  project: { tenant_id: string; workspace_id: string; project_id: string };
+  active: boolean;
+  document_count: number;
+  chunk_count: number;
+  /**
+   * Epoch milliseconds of the most recent ingest, or null if the source has
+   * never been ingested. The backend field is `last_ingested_at_ms` in the
+   * Rust `SourceSummary`; the HTTP handler drops the `_ms` suffix on this
+   * DTO but the units are still milliseconds since the Unix epoch. Parse
+   * with `new Date(ms)` — never treat this as seconds or an ISO string.
+   */
+  last_ingested_at: number | null;
+  name: string | null;
+  description: string | null;
+}
+
+/** POST /v1/sources — create source request body. */
+export interface CreateSourceRequest {
+  tenant_id: string;
+  workspace_id: string;
+  project_id: string;
+  source_id: string;
+  name?: string;
+  description?: string;
+}
+
+/** PATCH /v1/sources/:id — partial-update source request body (#426).
+ *
+ * Backend (`crates/cairn-app/src/handlers/memory.rs::PatchSourceRequest`)
+ * uses `Option<String>`, so the wire accepts either an explicit string or
+ * omission. Absent fields preserve the existing value — PATCH semantics.
+ * The verb was changed from PUT to PATCH in #426 because partial update
+ * violates PUT's full-replacement contract per RFC 7231 §4.3.4.
+ */
+export interface PatchSourceRequest {
+  tenant_id: string;
+  workspace_id: string;
+  project_id: string;
+  name?: string;
+  description?: string;
+}
+
+/** POST /v1/memory/ingest — response body. */
+export interface MemoryIngestResponse {
+  ok: boolean;
+  document_id: string;
+  source_id: string;
+  chunk_count: number;
+}
+
+/** POST /v1/memory/ingest — ingest a document into a source. */
+export interface MemoryIngestRequest {
+  tenant_id: string;
+  workspace_id: string;
+  project_id: string;
+  source_id: string;
+  document_id: string;
+  content: string;
+  source_type?: string;
+}
+
+/** One entry from GET /v1/sources/:id/chunks. */
+export interface SourceChunkView {
+  chunk_id: string;
+  text_preview: string;
+  credibility_score: number | null;
+}
+
+/** POST /v1/sources/:id/refresh-schedule body. */
+export interface CreateRefreshScheduleRequest {
+  interval_ms: number;
+  refresh_url?: string | null;
+}
+
+/** Response from refresh-schedule GET/POST. */
+export interface RefreshScheduleResponse {
+  schedule_id: string;
+  source_id: string;
+  interval_ms: number;
+  last_refresh_ms: number | null;
+  enabled: boolean;
+  refresh_url: string | null;
+}
+
+/** Response from POST /v1/sources/process-refresh (all due). */
+export interface ProcessRefreshResponse {
+  processed_count: number;
+  schedule_ids: string[];
+}
+
 // ── Recent events ─────────────────────────────────────────────────────────────
 
 /** One entry from GET /v1/events/recent. */
@@ -544,10 +1138,20 @@ export interface SystemStats {
 
 // ── Generic list response ─────────────────────────────────────────────────────
 
-/** Paginated list wrapper used by some endpoints */
+/**
+ * Paginated list wrapper used by preserved endpoints.
+ *
+ * The Rust-side struct (`cairn_api_contracts::http::ListResponse<T>`) is
+ * defined as `#[serde(rename_all = "camelCase")]`, so the wire field is
+ * `hasMore` even though the Rust field is named `has_more`. This TS
+ * interface mirrors the wire format. Callers reading `ListResponse.hasMore`
+ * get the correct flag; callers that reach for `has_more` get `undefined`.
+ * (This previously typed as `has_more` which silently hid the flag — fixed
+ * alongside RFC-026 PR-A1 admin surface coverage.)
+ */
 export interface ListResponse<T> {
   items: T[];
-  has_more: boolean;
+  hasMore: boolean;
 }
 
 // ── LLM Traces ────────────────────────────────────────────────────────────────
@@ -572,14 +1176,45 @@ export interface TracesResponse {
 
 // ── Prompts (RFC 006) ─────────────────────────────────────────────────────────
 
+/**
+ * Mirrors `cairn_evals::prompts::assets::PromptKind`
+ * (serde `rename_all = "snake_case"`).
+ */
+export type PromptKind =
+  | "system"
+  | "user_template"
+  | "tool_prompt"
+  | "critic"
+  | "router";
+
+/**
+ * Mirrors `cairn_evals::prompts::assets::PromptAssetStatus`
+ * (serde `rename_all = "snake_case"`).
+ */
+export type PromptAssetStatus = "active" | "deprecated" | "archived";
+
+/**
+ * Mirrors `cairn_evals::prompts::releases::PromptReleaseState`
+ * (serde `rename_all = "snake_case"`). Single canonical lifecycle
+ * field per RFC 006; V1 does not introduce a parallel
+ * `approval_state`.
+ */
+export type PromptReleaseState =
+  | "draft"
+  | "proposed"
+  | "approved"
+  | "active"
+  | "rejected"
+  | "archived";
+
 /** GET /v1/prompts/assets */
 export interface PromptAssetRecord {
   prompt_asset_id: string;
   project: ProjectKey;
   name: string;
-  kind: string;
+  kind: PromptKind;
   scope?: string;
-  status?: string;
+  status?: PromptAssetStatus;
   created_at: number;
   updated_at?: number;
 }
@@ -610,7 +1245,7 @@ export interface PromptReleaseRecord {
   project: ProjectKey;
   prompt_asset_id: string;
   prompt_version_id: string;
-  state: string;
+  state: PromptReleaseState;
   rollout_percent?: number | null;
   routing_slot?: string | null;
   task_type?: string | null;
@@ -649,7 +1284,11 @@ export interface AuditRecord {
 
 export interface AuditLogResponse {
   items: AuditRecord[];
-  has_more: boolean;
+  // Backend uses `cairn_api::ListResponse<T>` with
+  // `#[serde(rename_all = "camelCase")]`, so the wire field is `hasMore`
+  // even though the Rust struct field is `has_more`. Older-page pagination
+  // on AuditLogPage was permanently disabled because the UI read `has_more`.
+  hasMore: boolean;
 }
 
 // ── Eval Runs ─────────────────────────────────────────────────────────────────
@@ -674,6 +1313,74 @@ export interface EvalRunsResponse {
   items: EvalRunRecord[];
   has_more?: boolean;
   hasMore?: boolean;
+}
+
+// ── Eval artifacts (datasets / rubrics / baselines) ───────────────────────────
+
+/** One record from GET /v1/evals/datasets */
+export interface EvalDatasetRecord {
+  dataset_id: string;
+  tenant_id: string;
+  name: string;
+  subject_kind: string;
+  entries?: unknown[];
+  created_at_ms: number;
+}
+
+/** One record from GET /v1/evals/rubrics */
+export interface EvalRubricRecord {
+  rubric_id: string;
+  tenant_id: string;
+  name: string;
+  dimensions?: Array<{
+    name: string;
+    weight: number;
+    scoring_fn: string;
+    threshold?: number | null;
+  }>;
+  created_at_ms: number;
+}
+
+/** One record from GET /v1/evals/baselines */
+export interface EvalBaselineRecord {
+  baseline_id: string;
+  tenant_id: string;
+  name: string;
+  prompt_asset_id: string;
+  metrics: Record<string, number | null>;
+  created_at_ms: number;
+  locked: boolean;
+}
+
+/** Response from GET /v1/evals/compare?run_ids=a,b */
+export interface EvalCompareResponse {
+  run_ids: string[];
+  rows: Array<{
+    metric: string;
+    values: Record<string, unknown>;
+  }>;
+}
+
+/**
+ * One row from GET /v1/evals/scorecards (issue #244). A scorecard summary
+ * represents one `(project, prompt_asset_id)` pair with at least one eval
+ * run that BOTH (a) has terminated with `status == Completed` and (b) has
+ * `prompt_release_id` and `prompt_version_id` set. Runs missing either id
+ * don't contribute an entry because the scorecard is keyed by release +
+ * version. Archived runs are always excluded. `best_task_success_rate` is
+ * the max `task_success_rate` across the included entries, used by the
+ * EvalsPage modal picker to show a single headline number without
+ * fetching the full scorecard.
+ *
+ * Mirrors `crates/cairn-app/src/handlers/evals.rs::ScorecardSummary` and
+ * `EvalRunService::build_scorecard` predicate. Keep in sync whenever the
+ * server shape changes (CLAUDE.md reminder).
+ */
+export interface ScorecardSummary {
+  project_id: string;
+  prompt_asset_id: string;
+  entry_count: number;
+  best_task_success_rate: number | null;
 }
 
 // ── Plugins ───────────────────────────────────────────────────────────────────
@@ -763,6 +1470,57 @@ export interface StoreCredentialRequest {
   key_id?: string;
 }
 
+// ── Runtime message channels (/v1/channels — ChannelService CRUD) ────────────
+
+/**
+ * A named, capacity-bounded pub/sub channel scoped to a single project.
+ * Mirrors `cairn_domain::ChannelRecord` — distinct from the notification
+ * `NotificationChannel` below. (Issue #139.)
+ */
+export interface Channel {
+  channel_id: string;
+  project: {
+    tenant_id: string;
+    workspace_id: string;
+    project_id: string;
+  };
+  name: string;
+  capacity: number;
+  created_at: number;
+  updated_at: number;
+}
+
+/** One message inside a runtime Channel. Mirrors `cairn_domain::ChannelMessage`. */
+export interface ChannelMessage {
+  channel_id: string;
+  message_id: string;
+  sender_id: string;
+  body: string;
+  sent_at_ms: number;
+  consumed_by: string | null;
+  consumed_at_ms: number | null;
+}
+
+/** POST /v1/channels body. */
+export interface CreateChannelRequest {
+  tenant_id: string;
+  workspace_id: string;
+  project_id: string;
+  name: string;
+  capacity: number;
+}
+
+/** POST /v1/channels/:id/send body. */
+export interface SendChannelMessageRequest {
+  sender_id: string;
+  body: string;
+}
+
+/** POST /v1/channels/:id/send response. */
+export interface SendChannelMessageResponse {
+  message_id: string;
+}
+
 // ── Notification channels (RFC 007/014) ───────────────────────────────────────
 
 /** Channel kind — mirrors cairn_channels::ChannelKind + pagerduty extension */
@@ -817,8 +1575,10 @@ export interface RequestLogEntry {
 
 export interface RequestLogsResponse {
   entries: RequestLogEntry[];
-  total:   number;
+  /** Applied page size — upper bound on `entries.length`. */
   limit:   number;
+  /** Total entries currently held in the in-memory ring buffer. */
+  total:   number;
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
@@ -1004,13 +1764,17 @@ export interface FleetReport {
 /** One entry in a project's repo allowlist. Mirrors
  *  `crates/cairn-app/src/repo_routes.rs :: RepoAllowlistEntryResponse`. */
 export interface ProjectRepoEntry {
-  /** Canonical "owner/repo" identifier. */
+  /** Canonical "owner/repo" identifier for `host == "github"`; an
+   *  absolute filesystem path for `host == "local_fs"`. */
   repo_id: string;
-  /** "present" once the local clone cache has hydrated; "missing" otherwise. */
+  /** "present"/"missing" for GitHub clones; "local" for local_fs. */
   clone_status: string;
   added_by?: string | null;
   added_at?: number | null;
   last_used_at?: number | null;
+  /** Git host — defaults to "github" for backward compat with
+   *  pre-multi-host persisted entries. */
+  host?: string;
 }
 
 /** Response from `POST /v1/projects/:project/repos` (`RepoMutationResponse`). */
@@ -1020,6 +1784,7 @@ export interface ProjectRepoMutation {
   allowlisted: boolean;
   clone_status: string;
   clone_created: boolean;
+  host?: string;
 }
 
 /** Response from `GET /v1/projects/:project/repos/:owner/:repo`
@@ -1034,4 +1799,855 @@ export interface ProjectRepoDetail {
   last_used_at?: number | null;
   recent_sandbox_usage: string[];
   recent_register_repo_decisions: string[];
+  host?: string;
 }
+
+// ── Model catalog (GET /v1/models/catalog) ───────────────────────────────────
+
+/**
+ * Routing tier for a model. Mirrors `cairn_domain::model_catalog::ModelTier`
+ * (serialized snake_case by serde).
+ */
+export type ModelTier = "brain" | "mid" | "light";
+
+/**
+ * Billing model. Mirrors `cairn_domain::providers::ProviderCostType`.
+ * `metered` = pay per token; `free` = zero cost; `flat_rate` = fixed
+ * subscription (cost fields are informational only for flat-rate).
+ */
+export type ModelCostType = "metered" | "free" | "flat_rate";
+
+/**
+ * One row from `GET /v1/models/catalog`. Shape matches
+ * `cairn_domain::model_catalog::ModelEntry` verbatim — DO NOT rename
+ * fields without updating the Rust struct too.
+ */
+export interface ModelCatalogEntry {
+  /** Unique model ID, e.g. `gpt-4o`, `anthropic/claude-sonnet-4-6`. */
+  id: string;
+  /** Provider family (`openai`, `anthropic`, `bedrock`, `openrouter`, ...). */
+  provider: string;
+  /** Human-readable display name. */
+  display_name: string;
+  /** Max total context window (input + output). */
+  context_len: number;
+
+  tier: ModelTier;
+  tags: string[];
+  enabled: boolean;
+
+  cost_type: ModelCostType;
+  /** USD per 1M input tokens. Always 0.0 for free models. */
+  cost_per_1m_input: number;
+  /** USD per 1M output tokens. Always 0.0 for free models. */
+  cost_per_1m_output: number;
+  cache_read_per_1m: number;
+  cache_write_per_1m: number;
+
+  max_tokens: number;
+  min_cacheable_tokens: number;
+  cache_type: string;
+
+  reasoning: boolean;
+  supports_tools: boolean;
+  supports_streaming: boolean;
+  supports_json_mode: boolean;
+  input_modalities: string[];
+  output_modalities: string[];
+}
+
+/** Query parameters accepted by `GET /v1/models/catalog`. */
+export interface ModelCatalogQuery {
+  provider?:           string;
+  tier?:               ModelTier;
+  search?:             string;
+  supports_tools?:     boolean;
+  supports_json_mode?: boolean;
+  reasoning?:          boolean;
+  max_cost_per_1m?:    number;
+  free_only?:          boolean;
+  limit?:              number;
+  offset?:             number;
+}
+
+/** Response shape of `GET /v1/models/catalog`. */
+export interface ModelCatalogResponse {
+  items:   ModelCatalogEntry[];
+  total:   number;
+  hasMore: boolean;
+}
+
+/** One entry in `GET /v1/models/catalog/providers`. */
+export interface ModelCatalogProvider {
+  name:  string;
+  count: number;
+}
+
+/** Response shape of `GET /v1/models/catalog/providers`. */
+export interface ModelCatalogProvidersResponse {
+  providers: ModelCatalogProvider[];
+}
+
+// ── F29 CD: Run Telemetry ──────────────────────────────────────────────────
+// Wire shape of `GET /v1/runs/:run_id/telemetry`. All keys are snake_case on
+// the wire — this matches the JSON the handler emits. CE will build the
+// TanStack Query hook against these types.
+
+export interface RunTelemetryProviderCall {
+  provider_call_id: string;
+  model: string;
+  /** ProviderCallStatus (snake_case): "succeeded" | "failed" | "cancelled". */
+  status: "succeeded" | "failed" | "cancelled";
+  input_tokens: number;
+  output_tokens: number;
+  cost_micros: number;
+  latency_ms: number;
+  started_at_ms: number;
+  finished_at_ms: number;
+  error_class: string | null;
+  error_message: string | null;
+}
+
+/** ToolInvocationState variants (snake_case) as emitted by the API. */
+export type ToolInvocationState =
+  | "requested"
+  | "started"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export interface RunTelemetryToolInvocation {
+  invocation_id: string;
+  tool_name: string;
+  status: ToolInvocationState;
+  started_at_ms: number;
+  finished_at_ms: number;
+  duration_ms: number;
+  /** F55: structured tool args captured at dispatch time. The backend
+   *  always serializes the key — `null` on pre-F55 events, a JSON value
+   *  otherwise. Declared optional to keep existing test fixtures and
+   *  mocks (which predate F55 and don't set the field) compiling. */
+  args?: unknown | null;
+  /** F55: truncated UTF-8 preview of the tool output (capped around
+   *  8 KiB). `null` when the tool produced no output or the event is
+   *  pre-F55; the backend always serializes the key. The trailing
+   *  truncation marker is stripped server-side — clients should rely
+   *  on `output_truncated` instead of parsing the suffix. */
+  output_preview?: string | null;
+  /** F55: true when the preview was truncated at the backend cap.
+   *  UIs that render `output_preview` should use this boolean and avoid
+   *  parsing any sentinel suffix. */
+  output_truncated?: boolean;
+  /** F55: error message from a failed invocation (mirrors the durable
+   *  projection field). `null` for successful invocations. */
+  error_message?: string | null;
+}
+
+export interface RunTelemetryTotals {
+  cost_micros: number;
+  input_tokens: number;
+  output_tokens: number;
+  provider_calls: number;
+  tool_calls: number;
+  errors: number;
+  wall_ms: number;
+}
+
+export interface RunTelemetry {
+  run_id: string;
+  /** RunState variant. */
+  state: string;
+  stuck: boolean;
+  stuck_since_ms: number | null;
+  provider_calls: RunTelemetryProviderCall[];
+  tool_invocations: RunTelemetryToolInvocation[];
+  totals: RunTelemetryTotals;
+  /** Populated by CF. Empty object in CD. */
+  phase_timings: Record<string, unknown>;
+}
+
+// ── F29 CD: Stuck-run diagnosis ────────────────────────────────────────────
+// Wire shape of `GET /v1/runs/stalled` list items — mirrors the Rust
+// `DiagnosisReport` struct in `crates/cairn-app/src/helpers.rs`.
+
+export interface StuckRunTaskActivity {
+  task_id: string;
+  /** TaskState variant (snake_case). */
+  state: string;
+  last_activity_ms: number;
+}
+
+export interface StuckRunReport {
+  run_id: string;
+  /** RunState variant (snake_case). */
+  state: string;
+  duration_ms: number;
+  active_tasks: StuckRunTaskActivity[];
+  stalled_tasks: string[];
+  last_event_type: string;
+  last_event_ms: number;
+  suggested_action: string;
+}
+
+// ── F29 CD: Settings-default GET ───────────────────────────────────────────
+// Wire shape of `GET /v1/settings/defaults/:scope/:scope_id/:key`.
+// The value is whatever JSON was stored — typically a string model ID
+// but numbers and booleans are also valid.
+
+export type SettingsScope = "system" | "tenant" | "workspace" | "project";
+
+export interface SettingDefault {
+  scope: SettingsScope;
+  scope_id: string;
+  key: string;
+  value: unknown;
+  /** Always equals `scope` for the exact-lookup endpoint. */
+  source: SettingsScope;
+}
+
+/** Response shape of `GET /v1/sessions/:id/cost`. The backend flattens
+ *  a `SessionCostRecord` onto the root and appends a per-run breakdown,
+ *  so consumers see every `SessionCostRecord` field directly plus
+ *  `run_breakdown: RunCostRecord[]`. */
+export interface SessionCostResponse extends SessionCostRecord {
+  run_breakdown: RunCostRecord[];
+}
+
+// ── F29 CD-2: Project / Workspace cost rollups ─────────────────────────────
+// These mirror endpoints shipped by PR CD-2
+// (`GET /v1/projects/:tenant/:workspace/:project/costs` and
+// `GET /v1/workspaces/:tenant/:workspace/costs`). CE consumes them
+// defensively — if CD-2 has not merged at runtime, the endpoints
+// return 404 and the UI falls back to the "not available yet" state.
+
+export interface ProjectCostSummary {
+  tenant_id: string;
+  workspace_id: string;
+  project_id: string;
+  total_cost_micros: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
+  provider_calls: number;
+  updated_at_ms: number;
+}
+
+export interface WorkspaceCostSummary {
+  tenant_id: string;
+  workspace_id: string;
+  total_cost_micros: number;
+  total_tokens_in: number;
+  total_tokens_out: number;
+  provider_calls: number;
+  updated_at_ms: number;
+}
+
+
+// ── F47 PR1: CompletionVerification ────────────────────────────────────────
+// Sidecar attached to the `orchestrate_finished` SSE event (and to the
+// persisted run record in PR2) carrying extractor-produced evidence from
+// tool_results observed during the run. Operators cross-check this against
+// the LLM's free-text `summary` so a claim like "cargo check passed" does
+// not silently override a real `warning: unused imports` line in a bash
+// tool_result.
+//
+// Non-authoritative — the extractor reports what tool_outputs contain, not
+// whether the run "succeeded." The orchestrator's termination signal remains
+// the source of truth for run state.
+//
+// PR3 will render this in the run detail view. PR1 keeps the types here so
+// downstream consumers (dashboards, CLI tooling) can consume the SSE event
+// without bespoke inference.
+
+export interface CommandOutcome {
+  /** Tool name from the proposal (e.g. "bash", "shell_exec"). */
+  tool_name: string;
+  /** For bash-class tools, the `command` arg. Truncated to 500 chars. */
+  cmd: string;
+  /**
+   * Exit code surfaced by the tool_result, if present. `null` means not
+   * structurally exposed — do NOT infer success from a missing code.
+   */
+  exit_code: number | null;
+}
+
+export interface CompletionVerification {
+  /**
+   * Tool-output lines matched by the warning signal. Full matched line,
+   * truncated to 500 chars. Capped at 50 entries.
+   */
+  warnings: string[];
+  /**
+   * Tool-output lines matched by the error signal. Same truncation / cap
+   * rules as warnings.
+   */
+  errors: string[];
+  /** Per-bash-class-tool invocations: command text and optional exit code. */
+  commands: CommandOutcome[];
+  /**
+   * How many InvokeTool results were scanned. `0` means Done reached with no
+   * recorded tool calls — distinct from "scanned but found nothing."
+   */
+  tool_results_scanned: number;
+  /**
+   * Version of the extractor logic (1 = F47 PR1). Bumped when matching or
+   * truncation policy changes so consumers can detect shape drift.
+   */
+  extractor_version: number;
+}
+
+/**
+ * F47 PR1: shape of the `orchestrate_finished` SSE frame's data payload
+ * when `termination === "completed"`. Other terminations omit
+ * `completion_verification`. Matches the serde-rename on
+ * `OrchestratorEvent::Finished` in cairn-orchestrator.
+ *
+ * F65 PR-3: `breaker_tripped` added as a terminal-state discriminant.
+ */
+export interface OrchestrateFinishedPayload {
+  event: "orchestrate_finished";
+  run_id: string;
+  termination:
+    | "completed"
+    | "failed"
+    | "max_iterations_reached"
+    | "timed_out"
+    | "waiting_approval"
+    | "waiting_subagent"
+    | "plan_proposed"
+    | "breaker_tripped";
+  detail: string | null;
+  completion_verification?: CompletionVerification;
+}
+
+/**
+ * F65 PR-3: per-run circuit-breaker overrides sent in the request body
+ * of `POST /v1/runs/:id/orchestrate`. All fields optional; every
+ * present field MUST be less than or equal to the operator-configured
+ * default resolved via the server's RuntimeConfig 3-layer fallback.
+ * Loosening requests return HTTP 400 `invalid_breaker_override`.
+ */
+export interface BreakerOverrides {
+  round_cap?: number | null;
+  token_cap?: number | null;
+  no_tool_use_streak?: number | null;
+  wall_clock_ms?: number | null;
+}
+
+/**
+ * F65 PR-3: request body for `POST /v1/runs/:id/orchestrate`. Mirrors
+ * `cairn_app::handlers::runs::OrchestrateRequest`. All fields optional.
+ *
+ * Legacy `max_iterations` and `timeout_ms` are still enforced
+ * independently of `breaker_overrides.round_cap` and
+ * `breaker_overrides.wall_clock_ms`. When both are provided, whichever
+ * cap is tighter fires first, so the termination kind depends on which
+ * one wins (`MaxIterationsReached` / `TimedOut` vs `BreakerTripped`).
+ */
+export interface OrchestrateRequest {
+  goal?: string | null;
+  max_iterations?: number | null;
+  timeout_ms?: number | null;
+  mode?: "direct" | "plan" | "execute" | null;
+  approval_timeout_ms?: number | null;
+  breaker_overrides?: BreakerOverrides | null;
+}
+
+/**
+ * F65 PR-3: response body shape for `termination = "breaker_tripped"`
+ * on `POST /v1/runs/:id/orchestrate`. HTTP 200 — the run was cleanly
+ * terminated by a circuit-breaker trip; the run's `state` is flipped
+ * to terminal `Failed` (`FailureClass::ExecutionError`) before the
+ * response returns.
+ */
+export interface OrchestrateBreakerTrippedResponse {
+  termination: "breaker_tripped";
+  which: BreakerKind;
+  measured: number;
+  limit: number;
+  at_iteration: number;
+}
+
+/**
+ * F47 PR2: operator-visible shape of a run's completion annotation on
+ * GET /v1/runs/:id. Absent for runs that are still running, failed,
+ * canceled, or completed before F47 PR2 shipped (no `RunCompletionAnnotated`
+ * event ever landed on the log). Matches `RunCompletion` in the Rust
+ * handler response; PR3 will render this on the run detail page.
+ */
+export interface RunCompletion {
+  /** LLM free-text summary from the CompleteRun action proposal. */
+  summary: string;
+  /** Extractor-produced evidence (warnings / errors / commands). */
+  verification: CompletionVerification;
+  /** Wall-clock ms at which the orchestrator emitted the annotation. */
+  completed_at: number;
+}
+
+// ── Decisions (policy allow/deny audit) ──────────────────────────────────────
+
+/** Outcome sidecar on a decision row. The backend emits a nested struct
+ *  `{outcome, deny_reason?}` rather than a bare string, so UIs render the
+ *  inner `outcome` string directly and surface `deny_reason` as a tooltip. */
+export interface DecisionOutcome {
+  outcome?: string;
+  deny_reason?: string;
+}
+
+/** `ProjectScope` emitted by the decision-cache endpoint. Keyed by tenant /
+ *  workspace / project rather than `cache_key` so the operator can see which
+ *  scope a cached rule applies to. */
+export interface DecisionCacheScope {
+  level: string;
+  tenant_id: string;
+  workspace_id: string;
+  project_id: string;
+}
+
+/** A single decision row from GET /v1/decisions. */
+export interface Decision {
+  decision_id: string;
+  /** Some rows (e.g. cache-hit rows) omit `kind` entirely; render code must
+   *  handle missing/string/object variants gracefully. */
+  kind?: Record<string, unknown> | string;
+  outcome?: DecisionOutcome;
+  created_at: number;
+}
+
+/** A single cache entry from GET /v1/decisions/cache. */
+export interface DecisionCacheEntry {
+  decision_id: string;
+  outcome?: DecisionOutcome;
+  kind_tag?: string;
+  scope: DecisionCacheScope;
+  expires_at: number;
+  hit_count: number;
+}
+
+// ── RFC-026 admin surface types (PR-A1) ───────────────────────────────────────
+//
+// These mirror the backend shapes for the 29+ admin.rs handlers wired into
+// `ui/src/lib/api.ts` in PR-A1. Every field name is snake_case to match
+// `#[derive(Serialize)]` output; do not rename without also updating the
+// Rust struct.
+
+/**
+ * Workspace role for access control. Mirrors
+ * `cairn_domain::tenancy::WorkspaceRole` — order is ascending privilege.
+ */
+export type WorkspaceRole = "viewer" | "member" | "admin" | "owner";
+
+/**
+ * Tenant-scope role used by RFC-026 PR-A0 admin-surface gating. Mirrors
+ * `cairn_domain::tenancy::TenantRole`.
+ */
+export type TenantRole = "admin" | "member" | "read_only";
+
+/**
+ * GET /v1/admin/tenants/:tenant_id/quota — tenant concurrent-run /
+ * session-per-hour / task-per-run limits + live usage counters. Mirrors
+ * `cairn_domain::quotas::TenantQuota`.
+ */
+export interface TenantQuota {
+  tenant_id: string;
+  max_concurrent_runs: number;
+  max_sessions_per_hour: number;
+  max_tasks_per_run: number;
+  current_active_runs: number;
+  sessions_this_hour: number;
+}
+
+/** POST /v1/admin/tenants/:tenant_id/quota body. */
+export interface SetTenantQuotaRequest {
+  max_concurrent_runs: number;
+  max_sessions_per_hour: number;
+  max_tasks_per_run: number;
+}
+
+/**
+ * GET /v1/admin/tenants/:tenant_id/retention-policy. Mirrors
+ * `cairn_domain::quotas::RetentionPolicy`. Durations are whole-day
+ * integers; `max_events_per_entity` is per-entity event-log cap.
+ */
+export interface RetentionPolicy {
+  policy_id: string;
+  tenant_id: string;
+  full_history_days: number;
+  current_state_days: number;
+  max_events_per_entity: number;
+}
+
+/** POST /v1/admin/tenants/:tenant_id/retention-policy body. */
+export interface SetRetentionPolicyRequest {
+  full_history_days: number;
+  current_state_days: number;
+  max_events_per_entity: number;
+}
+
+/**
+ * POST /v1/admin/tenants/:tenant_id/apply-retention response. Mirrors
+ * `cairn_domain::quotas::RetentionResult`.
+ */
+export interface RetentionResult {
+  events_pruned: number;
+  entities_affected: number;
+}
+
+/**
+ * GET /v1/admin/tenants/:tenant_id/overview — per-workspace roll-up of
+ * membership / projects / active runs for RFC-008 tenant admin surface.
+ */
+export interface TenantOverviewWorkspace {
+  workspace_id: string;
+  name: string;
+  member_count: number;
+  project_count: number;
+  active_runs: number;
+}
+
+export interface TenantOverview {
+  tenant_id: string;
+  workspace_count: number;
+  total_members: number;
+  active_runs: number;
+  workspaces: TenantOverviewWorkspace[];
+}
+
+/**
+ * One entry from GET /v1/admin/workspaces/:workspace_id/members. Mirrors
+ * `cairn_domain::tenancy::WorkspaceMembership`.
+ */
+export interface WorkspaceMember {
+  workspace_id: string;
+  operator_id: string;
+  role: WorkspaceRole;
+}
+
+/** POST /v1/admin/workspaces/:workspace_id/members body. */
+export interface AddWorkspaceMemberRequest {
+  member_id: string;
+  role: WorkspaceRole;
+}
+
+/**
+ * One entry from GET /v1/admin/workspaces/:workspace_id/shares. Mirrors
+ * `cairn_domain::resource_sharing::SharedResource`.
+ */
+export interface WorkspaceShare {
+  share_id: string;
+  tenant_id: string;
+  source_workspace_id: string;
+  target_workspace_id: string;
+  /** One of "prompt_asset", "corpus", or "source". */
+  resource_type: string;
+  resource_id: string;
+  permissions: string[];
+  shared_at_ms: number;
+}
+
+/** POST /v1/admin/workspaces/:workspace_id/shares body. */
+export interface CreateWorkspaceShareRequest {
+  target_workspace_id: string;
+  resource_type: string;
+  resource_id: string;
+  permissions?: string[];
+  tenant_id?: string;
+}
+
+/**
+ * GET / POST /v1/admin/tenants/:tenant_id/operator-profiles. Mirrors
+ * `cairn_domain::org::OperatorProfile`.
+ */
+export interface OperatorProfile {
+  operator_id: string;
+  tenant_id: string;
+  display_name: string;
+  email: string;
+  role: WorkspaceRole;
+  /** Operator-defined preferences blob (JSON). */
+  preferences?: unknown;
+}
+
+/** POST /v1/admin/tenants/:tenant_id/operator-profiles body. */
+export interface CreateOperatorProfileRequest {
+  display_name: string;
+  email: string;
+  role: WorkspaceRole;
+}
+
+/**
+ * One row returned by POST /v1/admin/operators/:id/tenant-roles/:tenant/promote
+ * and DELETE .../:tenant. Mirrors
+ * `cairn_store::projections::OperatorTenantRoleRecord`.
+ */
+export interface TenantRoleGrant {
+  tenant_id: string;
+  operator_id: string;
+  role: TenantRole;
+  granted_at_ms: number;
+  granted_by: string;
+  revoked_at_ms?: number | null;
+  revoked_by?: string | null;
+}
+
+/** POST /v1/admin/operators/:id/tenant-roles/:tenant/promote body. */
+export interface PromoteTenantRoleRequest {
+  role: TenantRole;
+}
+
+/**
+ * One row from GET /v1/admin/tenants/:id/snapshots and the response shape
+ * of POST /v1/admin/tenants/:id/snapshot.
+ */
+export interface Snapshot {
+  snapshot_id: string;
+  tenant_id: string;
+  event_position: number;
+  state_hash: string;
+  created_at_ms: number;
+}
+
+/**
+ * POST /v1/admin/tenants/:id/compact-event-log response and
+ * POST /v1/admin/tenants/:id/restore response. Backend returns a
+ * free-form serde_json object; shape may vary by backend so we keep
+ * this loose. UI displays the entire object for operator inspection.
+ */
+export type CompactEventLogReport = Record<string, unknown>;
+export type RestoreSnapshotReport = Record<string, unknown>;
+
+/** POST /v1/admin/tenants/:id/compact-event-log body. */
+export interface CompactEventLogRequest {
+  retain_last_n: number;
+}
+
+/** POST /v1/admin/tenants/:tenant_id/credentials/rotate-key body. */
+export interface RotateCredentialKeyRequest {
+  old_key_id: string;
+  new_key_id: string;
+}
+
+/**
+ * POST /v1/admin/tenants/:tenant_id/credentials/rotate-key response.
+ * Audit record emitted for each rotation. Mirrors
+ * `cairn_domain::credentials::CredentialRotationRecord`.
+ */
+export interface CredentialRotationRecord {
+  rotation_id: string;
+  tenant_id: string;
+  credential_id: string;
+  rotated_at: number;
+  rotated_by: string | null;
+  started_at_ms: number;
+  completed_at_ms: number | null;
+  old_key_id: string;
+  new_key_id: string;
+  /** Count of credentials rotated in this operation. */
+  rotated_credentials: number;
+}
+
+/**
+ * GET /v1/admin/models entry. The admin-model endpoints return the same
+ * `ModelEntry` shape the public catalog exposes — we reuse
+ * `ModelCatalogEntry` here rather than duplicating fields. An alias so
+ * call sites read naturally.
+ */
+export type ModelEntry = ModelCatalogEntry;
+
+/** POST /v1/admin/models/import-litellm response. */
+export interface ImportLiteLLMResponse {
+  imported: number;
+}
+
+/** POST /v1/admin/rotate-waitpoint-hmac body. */
+export interface RotateWaitpointHmacRequest {
+  new_kid: string;
+  new_secret_hex: string;
+  grace_ms?: number;
+}
+
+/** One partition-level failure entry in the rotate-HMAC response. */
+export interface RotateWaitpointHmacFailure {
+  partition_index: number;
+  code: string | null;
+  detail: string;
+}
+
+/** POST /v1/admin/rotate-waitpoint-hmac response. */
+export interface RotateWaitpointHmacResponse {
+  rotated: number;
+  noop: number;
+  failed: RotateWaitpointHmacFailure[];
+  new_kid: string;
+}
+
+// ── RFC 031: operator-defined agent roles ───────────────────────────────────
+
+export type AgentRoleTier = "standard" | "research" | "orchestrator" | "generic";
+export type ResponseShape = "direct_answer" | "procedural_artifact";
+export type AgentRoleSource = "builtin" | "custom" | "custom_shadow";
+
+/** Wire shape of an `AgentRole` record as returned by
+ *  `GET /v1/projects/:project/agent-roles[/:id]`. Mirrors the Rust
+ *  `cairn_domain::agent_roles::AgentRole` struct. */
+export interface AgentRole {
+  role_id: string;
+  display_name: string;
+  description: string;
+  system_prompt: string | null;
+  tools: string[];
+  forbid_all_tools: boolean;
+  max_context_tokens: number | null;
+  tier: AgentRoleTier;
+  response_shape: ResponseShape;
+}
+
+/** One item in `GET /v1/projects/:project/agent-roles`. `source`
+ *  drives the badge in the list; `defined_at` / `defined_by` are
+ *  populated for custom / custom_shadow rows and null for built-ins. */
+export interface AgentRoleListItem {
+  role: AgentRole;
+  source: AgentRoleSource;
+  shadows_builtin: string | null;
+  defined_at: number | null;
+  defined_by: string | null;
+}
+
+export interface AgentRoleListResponse {
+  items: AgentRoleListItem[];
+  total: number;
+  has_more: boolean;
+}
+
+/** POST body for creating a role. `id` is the wire name; the Rust
+ *  struct field is `role_id`, but the HTTP handler accepts `id`
+ *  (see `CreateAgentRoleRequest`). */
+export interface CreateAgentRoleRequest {
+  id: string;
+  name: string;
+  tier: AgentRoleTier;
+  description?: string;
+  system_prompt: string;
+  tools?: string[];
+  forbid_all_tools?: boolean;
+  max_context_tokens?: number | null;
+  response_shape?: ResponseShape;
+}
+
+/** PATCH body — JSON Merge Patch over mutable fields. `id` and
+ *  `tier` are immutable (422 `ImmutableField` when present). */
+export interface PatchAgentRoleRequest {
+  name?: string;
+  description?: string;
+  system_prompt?: string;
+  tools?: string[];
+  forbid_all_tools?: boolean;
+  max_context_tokens?: number | null;
+  response_shape?: ResponseShape;
+}
+
+/** One entry in the POST / PATCH response `warnings[]` array. */
+export interface AgentRoleAdvisory {
+  code: string;
+  message: string;
+}
+
+/** POST / PATCH success response. */
+export interface DefineAgentRoleResponse {
+  role: AgentRole;
+  source: AgentRoleSource;
+  shadows_builtin: string | null;
+  defined_at: number;
+  defined_by: string;
+  warnings: AgentRoleAdvisory[];
+}
+
+/** DELETE success response (§D7 idempotent). */
+export interface RetractAgentRoleResponse {
+  role_id: string;
+  retracted_at: number;
+  retracted_by: string;
+  warnings: AgentRoleAdvisory[];
+}
+
+/** One entry in `GET /v1/projects/:project/agent-roles/:id/history`.
+ *  `role` + `shadows_builtin` are populated on `defined` entries so
+ *  the UI can diff consecutive snapshots; both are null on `retracted`
+ *  entries. */
+export interface AgentRoleHistoryEntry {
+  kind: "defined" | "retracted";
+  at_ms: number;
+  actor: string;
+  role: AgentRole | null;
+  shadows_builtin: string | null;
+}
+
+export interface AgentRoleHistoryResponse {
+  items: AgentRoleHistoryEntry[];
+  total: number;
+}
+
+// ── #799: per-project tool inventory ───────────────────────────────────────
+
+/** Tier reported on each project-tool row. Plugin-sourced tools are
+ *  always `"registered"`; built-ins report the registry's tier. */
+export type ProjectToolTier = "core" | "registered" | "deferred";
+
+/** One item in `GET /v1/projects/:project/tools`. `source` is
+ *  `"builtin"` or `"plugin:<plugin_id>"`; `parameters_schema` is
+ *  inlined so hover previews don't need a second round-trip. */
+export interface ProjectToolItem {
+  id: string;
+  source: string;
+  tier: ProjectToolTier;
+  description: string;
+  parameters_schema: unknown;
+}
+
+export interface ProjectToolsResponse {
+  items: ProjectToolItem[];
+  total: number;
+  has_more: boolean;
+}
+
+// ── RFC 032: Completion contracts ────────────────────────────────────────────
+
+/** RFC 032 PR-5: operator-declared definition-of-done for a run's
+ *  `complete_run` action. Discriminator is `kind`. Shape mirrors
+ *  `cairn_domain::completion_contracts::CompletionContract` —
+ *  keep them aligned when either side changes. */
+export type CompletionContract =
+  | { kind: "prose_non_empty" }
+  | { kind: "prose"; min_chars: number; min_citations: number }
+  | { kind: "file"; paths: FileRequirement[] }
+  | {
+      kind: "pull_request";
+      expected_repo?: string | null;
+      expected_head_branch?: string | null;
+      must_be_open: boolean;
+    }
+  | { kind: "structured"; schema: unknown }
+  | { kind: "external_state"; check: ExternalStateCheck };
+
+/** One entry in a `file` contract. Path is relative to the run's
+ *  working_dir; absolute / `.` / `..` components reject at
+ *  deserialize time. */
+export interface FileRequirement {
+  path: string;
+  contains_regex?: string | null;
+  max_bytes?: number | null;
+}
+
+/** RFC 032 Phase 3 external-state check. Verifier returns
+ *  `not_implemented` in Phase 1. */
+export type ExternalStateCheck =
+  | { kind: "github_issue_closed"; repo: string; number: number }
+  | { kind: "github_pr_merged"; repo: string; number: number };
+
+/** How a `CompletionContract` arrived at a run. Surfaced on
+ *  `CompletionContractResolved` SSE frames so the operator timeline
+ *  distinguishes inferred contracts from explicitly-declared ones. */
+export type ContractSource =
+  | "explicit_create"
+  | "explicit_spawn"
+  | "inferred"
+  | "re_inferred_on_goal_change";

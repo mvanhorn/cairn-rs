@@ -90,6 +90,10 @@ Do not call complete_run until you have opened a pull request.";
 
 #[async_trait]
 impl Integration for LinearPlugin {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &str {
         "linear"
     }

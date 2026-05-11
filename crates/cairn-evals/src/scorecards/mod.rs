@@ -61,6 +61,14 @@ pub struct EvalRun {
     /// Optional dataset ID used for rubric scoring.
     pub dataset_id: Option<String>,
     pub dataset_source: Option<DatasetSource>,
+    /// Rubric this run is scored against (issue #223). Set at create-time via
+    /// POST /v1/evals/runs; surfaced on the run record so the UI can pin the
+    /// selection without re-reading rubric state.
+    #[serde(default)]
+    pub rubric_id: Option<String>,
+    /// Baseline this run is compared against (issue #223).
+    #[serde(default)]
+    pub baseline_id: Option<String>,
     /// Aggregated metrics from this run.
     pub metrics: EvalMetrics,
     /// Supplemental plugin metrics.
@@ -69,6 +77,11 @@ pub struct EvalRun {
     pub created_by: Option<OperatorId>,
     pub created_at: u64,
     pub completed_at: Option<u64>,
+    /// Issue #244: soft-delete marker. `Some(ts)` when archived via
+    /// `DELETE /v1/evals/runs/:id`; list endpoints filter archived runs out
+    /// by default but surface them when `?include_archived=true` is set.
+    #[serde(default)]
+    pub archived_at: Option<u64>,
 }
 
 /// A scorecard aggregates eval results for a prompt asset across

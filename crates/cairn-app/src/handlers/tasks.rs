@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -22,8 +22,8 @@ use cairn_store::EventLog;
 use utoipa::ToSchema;
 
 use crate::errors::{
-    bad_request_response, parse_task_state, runtime_error_response, store_error_response,
-    validation_error_response, AppApiError,
+    parse_task_state, runtime_error_response, store_error_response, validation_error_response,
+    AppApiError,
 };
 use crate::extractors::{HasProjectScope, ProjectJson, ProjectScope, TenantScope};
 use crate::helpers::resolve_session_for_task_record;
@@ -244,7 +244,7 @@ pub(crate) async fn list_tasks_handler(
     let query = project_scope.into_inner();
     let state_filter = match query.state.as_deref().map(parse_task_state).transpose() {
         Ok(state_filter) => state_filter,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
     let run_id = query.run_id.as_deref().map(RunId::new);
     let limit = query.limit();
@@ -291,7 +291,7 @@ pub(crate) async fn create_task_handler(
     let body = project_scope.into_inner();
     // SEC-002: validate ids before they reach FF key builders.
     if let Err(msg) = body.validate() {
-        return bad_request_response(msg);
+        return validation_error_response(msg);
     }
     let project = CreateTaskRequest::project(&body);
     let mut session_id: Option<cairn_domain::SessionId> = None;
@@ -390,14 +390,17 @@ pub(crate) async fn get_task_handler(
     tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.runtime.tasks.get(&TaskId::new(id)).await {
-        Ok(Some(task)) if task.project.tenant_id == *tenant_scope.tenant_id() => {
-            (StatusCode::OK, Json(task)).into_response()
-        }
-        Ok(Some(_)) | Ok(None) => {
-            AppApiError::new(StatusCode::NOT_FOUND, "not_found", "task not found").into_response()
-        }
-        Err(err) => runtime_error_response(err),
+    // T6a-C3: use the shared helper so admin bypass + cross-tenant 404
+    // match every other task endpoint. The hand-rolled match here used
+    // to miss `is_admin`, causing admin-token cross-tenant reads to 404
+    // even though same-tenant reads, plus `list` and `claim` for the
+    // same id, returned 200. The PR #50 audit applied the helper to
+    // every mutation endpoint but overlooked this read path. See the
+    // sibling `list_task_dependencies_handler`.
+    let task_id = TaskId::new(id);
+    match load_task_visible_to_tenant(state.as_ref(), &tenant_scope, &task_id).await {
+        Ok(task) => (StatusCode::OK, Json(task)).into_response(),
+        Err(response) => response,
     }
 }
 
@@ -485,20 +488,28 @@ pub(crate) async fn set_task_priority_handler(
 
 pub(crate) async fn list_expired_tasks_handler(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<crate::handlers::admin::PaginationQuery>,
 ) -> impl IntoResponse {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // #422: read model returns every expired lease in one shot.
+    // Paginate in-memory and emit an honest `has_more` — expired-lease
+    // storms can produce hundreds of rows at a time.
     match TaskLeaseExpiredReadModel::list_expired(state.runtime.store.as_ref(), now_ms).await {
-        Ok(tasks) => (
-            StatusCode::OK,
-            Json(ListResponse::<TaskRecord> {
-                items: tasks,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<TaskRecord> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (
+                StatusCode::OK,
+                Json(ListResponse::<TaskRecord> { items, has_more }),
+            )
+                .into_response()
+        }
         Err(err) => store_error_response(err),
     }
 }

@@ -124,6 +124,22 @@ pub(crate) async fn publish_runtime_frames_since(
     state: &Arc<AppState>,
     after: Option<EventPosition>,
 ) {
+    // Issue #568: cairn-fabric's EventBridge emits runtime events on a
+    // tokio mpsc; the consumer task appends to the event store
+    // asynchronously. A handler that calls this immediately after a
+    // service method (which does `bridge.emit(...)` internally) can
+    // miss its own event — the store's head hasn't advanced yet.
+    // `EventBridge::flush` enqueues a FIFO marker and awaits the
+    // consumer's ack, so every event emitted before the flush has
+    // reached the event log by the time flush returns.
+    //
+    // Fabric is `None` in no-fabric test fixtures (see
+    // `tests/support/fake_fabric.rs`); the bridge isn't wired there so
+    // there's nothing to flush.
+    if let Some(fabric) = state.fabric.as_ref() {
+        fabric.bridge.flush().await;
+    }
+
     let Ok(events) = state.runtime.store.read_stream(after, 64).await else {
         return;
     };
@@ -132,13 +148,87 @@ pub(crate) async fn publish_runtime_frames_since(
     let _ = projector.project_events(&events).await;
 
     for stored in events {
-        if let cairn_domain::RuntimeEvent::ProviderConnectionRegistered(connection) =
-            &stored.envelope.payload
-        {
-            state
-                .runtime
-                .provider_registry
-                .invalidate(&connection.provider_connection_id);
+        // Invalidate the provider_registry cache on any provider-connection
+        // mutation so subsequent routes don't hit a stale entry. F40: the
+        // old DELETE path masqueraded as a `Registered` event so a single
+        // match arm sufficed; the new `Deleted` variant must invalidate too.
+        match &stored.envelope.payload {
+            cairn_domain::RuntimeEvent::ProviderConnectionRegistered(connection) => {
+                state
+                    .runtime
+                    .provider_registry
+                    .invalidate(&connection.provider_connection_id);
+            }
+            cairn_domain::RuntimeEvent::ProviderConnectionDeleted(connection) => {
+                state
+                    .runtime
+                    .provider_registry
+                    .invalidate(&connection.provider_connection_id);
+            }
+            _ => {}
+        }
+
+        // F50: push a notification on operator-visible events. Until now
+        // the hook only fired on `/v1/events/append` (admin write path);
+        // service-layer appends (approval requested/resolved, run
+        // completed/failed, task stuck) bypassed it so the bell icon +
+        // sidebar badge stayed empty. Running this inside the same
+        // publish loop that already drives the SSE stream guarantees
+        // parity: every event that reaches the SSE frame also reaches
+        // the notification buffer. Notification id + created_at are
+        // derived from the envelope (event_id + stored_at) so replay
+        // of the same event produces an identical notification — no
+        // wall-clock-based duplicates.
+        push_notification_for_event(state, &stored);
+
+        // F49: auto-resume orchestrate kick. When an approval resolves,
+        // check whether any other pending approvals block the run. If
+        // none AND the run is still Running, enqueue a kick for the
+        // background worker to POST /v1/runs/:id/orchestrate again so
+        // the operator doesn't have to.
+        //
+        // #636: tool-call approvals (ToolCallApproved/ToolCallRejected)
+        // also need the kick. Pre-#636 the hook only fired for plan
+        // approvals (ApprovalResolved). Tool-call approvals resolved
+        // via the UI left the run parked in `waiting_approval` forever
+        // because nothing re-entered the orchestrate loop — the operator
+        // had to manually re-POST `/orchestrate` to make progress. For
+        // multi-tool-call runs (10–50 approvals), that made the UI
+        // approval experience unusable.
+        match &stored.envelope.payload {
+            cairn_domain::RuntimeEvent::ApprovalResolved(e) => {
+                maybe_auto_resume_orchestrate_for_plan(state, e).await;
+            }
+            cairn_domain::RuntimeEvent::ApprovalRequested(e) => {
+                // An approval requested mid-suspended-run doesn't need
+                // to kick — the same iteration that proposed it already
+                // parked the loop. No-op here to keep variants explicit
+                // (so a future variant addition at this call site
+                // surfaces a match warning instead of a silent miss).
+                let _ = e;
+            }
+            cairn_domain::RuntimeEvent::ToolCallApproved(e) => {
+                maybe_auto_resume_orchestrate_for_tool_call(
+                    state,
+                    &e.call_id,
+                    "tool_call_approved",
+                )
+                .await;
+            }
+            cairn_domain::RuntimeEvent::ToolCallRejected(e) => {
+                // Rejection also drives the run forward: the loop's
+                // approval-drain path reads the Rejected state row on
+                // the next iteration and emits a synthetic tool-error
+                // so DECIDE can react instead of re-proposing the same
+                // call forever.
+                maybe_auto_resume_orchestrate_for_tool_call(
+                    state,
+                    &e.call_id,
+                    "tool_call_rejected",
+                )
+                .await;
+            }
+            _ => {}
         }
 
         // OTLP export (RFC 021): send each event to the exporter.
@@ -222,6 +312,291 @@ pub fn ws_event_tenant_id(
         cairn_domain::tenancy::OwnershipKey::Tenant(k) => Some(k.tenant_id.as_str()),
         cairn_domain::tenancy::OwnershipKey::Workspace(k) => Some(k.tenant_id.as_str()),
         cairn_domain::tenancy::OwnershipKey::Project(k) => Some(k.tenant_id.as_str()),
+    }
+}
+
+// ── F50: notification projection hook ────────────────────────────────────────
+
+/// F50: push a `Notification` into the in-memory buffer whenever an
+/// operator-relevant event is published. Mirrors the existing hook
+/// inside `bin_events.rs` (which only fires on admin `POST /v1/events/
+/// append` and therefore missed service-layer writes). Kept here so
+/// every store append routed through `publish_runtime_frames_since`
+/// surfaces in the bell icon + sidebar badge.
+fn push_notification_for_event(state: &Arc<AppState>, stored: &cairn_store::StoredEvent) {
+    use crate::state::{OperatorNotification, OperatorNotificationType as T};
+    use cairn_domain::lifecycle::{RunState, TaskState};
+    use cairn_domain::RuntimeEvent as E;
+
+    // Derived from the envelope rather than `SystemTime::now()` so the
+    // same stored event always produces the same notification id +
+    // created_at. Matches the admin `/v1/events/append` hook's
+    // `notif-<event_id_prefix>` strategy and keeps the bell buffer
+    // idempotent under SSE reconnect replay — no duplicates from the
+    // wall-clock stamp drifting across ticks.
+    let event_id = stored.envelope.event_id.as_str();
+    let created_at_ms = stored.stored_at;
+    let trunc: String = event_id.chars().take(16).collect();
+    let make_id = |kind: &str| format!("notif-{kind}-{trunc}");
+    let payload = &stored.envelope.payload;
+    let tenant_id = ws_event_tenant_id(&stored.envelope).map(|s| s.to_owned());
+
+    let maybe_notif: Option<OperatorNotification> = match payload {
+        E::ApprovalRequested(e) => Some(OperatorNotification {
+            id: make_id("appreq"),
+            notif_type: T::ApprovalRequested,
+            message: format!(
+                "Approval requested for {}",
+                e.run_id.as_ref().map(|r| r.as_str()).unwrap_or("a task"),
+            ),
+            entity_id: Some(e.approval_id.as_str().to_owned()),
+            href: "approvals".to_owned(),
+            created_at_ms,
+            tenant_id: tenant_id.clone(),
+        }),
+        E::ApprovalResolved(e) => Some(OperatorNotification {
+            id: make_id("appres"),
+            notif_type: T::ApprovalResolved,
+            message: format!(
+                "Approval {} — decision: {:?}",
+                e.approval_id.as_str(),
+                e.decision,
+            ),
+            entity_id: Some(e.approval_id.as_str().to_owned()),
+            href: "approvals".to_owned(),
+            created_at_ms,
+            tenant_id: tenant_id.clone(),
+        }),
+        E::RunStateChanged(e) => match &e.transition.to {
+            RunState::Completed => Some(OperatorNotification {
+                id: make_id("runok"),
+                notif_type: T::RunCompleted,
+                message: format!("Run {} completed", e.run_id.as_str()),
+                entity_id: Some(e.run_id.as_str().to_owned()),
+                href: format!("run/{}", e.run_id.as_str()),
+                created_at_ms,
+                tenant_id: tenant_id.clone(),
+            }),
+            RunState::Failed => Some(OperatorNotification {
+                id: make_id("runfail"),
+                notif_type: T::RunFailed,
+                message: format!(
+                    "Run {} failed{}",
+                    e.run_id.as_str(),
+                    e.failure_class
+                        .as_ref()
+                        .map(|f| format!(" ({f:?})"))
+                        .unwrap_or_default(),
+                ),
+                entity_id: Some(e.run_id.as_str().to_owned()),
+                href: format!("run/{}", e.run_id.as_str()),
+                created_at_ms,
+                tenant_id: tenant_id.clone(),
+            }),
+            _ => None,
+        },
+        E::TaskStateChanged(e) => match &e.transition.to {
+            TaskState::DeadLettered | TaskState::RetryableFailed => Some(OperatorNotification {
+                id: make_id("stuck"),
+                notif_type: T::TaskStuck,
+                message: format!(
+                    "Task {} is stuck ({:?})",
+                    e.task_id.as_str(),
+                    e.transition.to,
+                ),
+                entity_id: Some(e.task_id.as_str().to_owned()),
+                href: "tasks".to_owned(),
+                created_at_ms,
+                tenant_id: tenant_id.clone(),
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    if let Some(n) = maybe_notif {
+        state.notification_sink.push(n);
+    }
+}
+
+// ── F49: auto-resume orchestrate kick ────────────────────────────────────────
+
+/// F49 + #636: central gate used by both the plan-approval
+/// (`ApprovalResolved`) and the tool-call-approval
+/// (`ToolCallApproved` / `ToolCallRejected`) auto-resume paths.
+///
+/// Fires `orchestrate_kick_tx.kick(run_id)` only when ALL of:
+///
+///   1. No other plan approval is pending on this run.
+///   2. No other tool-call approval is pending on this run.
+///   3. The run record exists and is in state `Running`.
+///
+/// Both pending-check axes are load-bearing: a mid-run loop can have
+/// both a plan approval and several tool-call approvals in flight at
+/// the same time, and kicking before ALL of them resolve would rerun
+/// the orchestrator only to re-park on the next unresolved gate —
+/// wasting an LLM round-trip and an FF lease renewal.
+///
+/// Every check is best-effort. A transient store error or missing
+/// record degrades gracefully to the pre-#636 behaviour (the operator
+/// re-POSTs `/orchestrate` manually). No panics, no 5xxs, no log spam
+/// on the hot path.
+async fn try_kick_auto_resume(
+    state: &Arc<AppState>,
+    run_id: &cairn_domain::RunId,
+    trigger: &'static str,
+) {
+    use cairn_store::projections::{
+        ApprovalReadModel, RunReadModel, ToolCallApprovalReadModel, ToolCallApprovalState,
+    };
+
+    // 1. Plan approvals pending.
+    match ApprovalReadModel::has_pending_for_run(state.runtime.store.as_ref(), run_id).await {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            tracing::debug!(
+                run_id = %run_id,
+                trigger,
+                error = %err,
+                "F49: skip auto-resume (cannot read pending plan approvals)"
+            );
+            return;
+        }
+    }
+
+    // 2. #636: tool-call approvals pending. Use `list_for_run` + filter
+    // by Pending because there is no dedicated `has_pending_for_run`
+    // helper on `ToolCallApprovalReadModel` yet. The per-run list is
+    // expected to stay small (≤ O(iterations × approvals-per-round))
+    // so the short-circuit scan below is cheap.
+    let tool_pending = {
+        let reader: &dyn ToolCallApprovalReadModel = state.runtime.store.as_ref();
+        match reader.list_for_run(run_id).await {
+            Ok(rows) => rows
+                .into_iter()
+                .any(|r| r.state == ToolCallApprovalState::Pending),
+            Err(err) => {
+                tracing::debug!(
+                    run_id = %run_id,
+                    trigger,
+                    error = %err,
+                    "F49: skip auto-resume (cannot read pending tool-call approvals)"
+                );
+                return;
+            }
+        }
+    };
+    if tool_pending {
+        return;
+    }
+
+    // 3. Run must be in a kickable state. `Running` covers the legacy
+    // pre-#756 path (when projection state didn't flip on tool-call
+    // approval suspension). `WaitingApproval` covers the post-#756
+    // path: the run is genuinely suspended, and now that all pending
+    // approvals are resolved (steps 1-2 above), the kick re-drives
+    // the loop. `drive_run_iteration` flips `WaitingApproval ->
+    // Running` on entry, matching the pre-existing `Pending ->
+    // Running` transition.
+    //
+    // Reject `Paused`, `WaitingDependency` (G5 owns parent resume),
+    // and the terminals — all are handled by other paths or are
+    // genuinely non-resumable.
+    let run_rec = match RunReadModel::get(state.runtime.store.as_ref(), run_id).await {
+        Ok(Some(r)) => r,
+        _ => return,
+    };
+    if !matches!(
+        run_rec.state,
+        cairn_domain::RunState::Running | cairn_domain::RunState::WaitingApproval
+    ) {
+        return;
+    }
+
+    // Guard against double-kick — the channel itself is unbounded, but
+    // main.rs's worker applies a 5s per-run dedup window so a burst of
+    // resolutions (e.g. a "approve all" operator click) collapses to
+    // one POST. The `kick` call is best-effort: it returns false when
+    // the channel hasn't been installed (early startup or non-http
+    // roles) — same behaviour as pre-F49.
+    if state.orchestrate_kick_tx.kick(run_id.clone()) {
+        tracing::info!(
+            run_id = %run_id,
+            trigger,
+            "F49/#636: queued auto-resume orchestrate kick"
+        );
+    }
+}
+
+/// F49: plan-approval path. `ApprovalResolved` carries the approval id
+/// but not the run id, so we walk the approval projection first.
+async fn maybe_auto_resume_orchestrate_for_plan(
+    state: &Arc<AppState>,
+    e: &cairn_domain::ApprovalResolved,
+) {
+    let Some(run_id) = resolve_run_for_plan_approval(state, &e.approval_id).await else {
+        return;
+    };
+    try_kick_auto_resume(state, &run_id, "plan_approval_resolved").await;
+}
+
+/// #636: tool-call-approval path. `ToolCallApproved` /
+/// `ToolCallRejected` both carry the `call_id` but not the `run_id`
+/// directly — we look the run up via `ToolCallApprovalReadModel::get`.
+async fn maybe_auto_resume_orchestrate_for_tool_call(
+    state: &Arc<AppState>,
+    call_id: &cairn_domain::ToolCallId,
+    trigger: &'static str,
+) {
+    use cairn_store::projections::ToolCallApprovalReadModel;
+    let reader: &dyn ToolCallApprovalReadModel = state.runtime.store.as_ref();
+    let run_id = match reader.get(call_id).await {
+        Ok(Some(rec)) => rec.run_id,
+        Ok(None) => {
+            tracing::debug!(
+                call_id = %call_id,
+                trigger,
+                "#636: skip auto-resume (tool-call approval record missing)"
+            );
+            return;
+        }
+        Err(err) => {
+            tracing::debug!(
+                call_id = %call_id,
+                trigger,
+                error = %err,
+                "#636: skip auto-resume (cannot read tool-call approval record)"
+            );
+            return;
+        }
+    };
+    try_kick_auto_resume(state, &run_id, trigger).await;
+}
+
+/// Walk from approval_id → run_id via the approval projection. The
+/// `ApprovalResolved` frame only carries the id, so we must look up
+/// the run association in the projection.
+///
+/// Transient store errors are logged at debug and degrade to "no
+/// run_id" so auto-resume is best-effort — operators can always
+/// re-POST `/orchestrate` manually (the pre-F49 behaviour).
+async fn resolve_run_for_plan_approval(
+    state: &Arc<AppState>,
+    approval_id: &cairn_domain::ApprovalId,
+) -> Option<cairn_domain::RunId> {
+    use cairn_store::projections::ApprovalReadModel;
+    match state.runtime.store.get(approval_id).await {
+        Ok(Some(rec)) => rec.run_id,
+        Ok(None) => None,
+        Err(err) => {
+            tracing::debug!(
+                approval_id = %approval_id,
+                error = %err,
+                "F49: skip auto-resume (cannot read approval record from projection)"
+            );
+            None
+        }
     }
 }
 

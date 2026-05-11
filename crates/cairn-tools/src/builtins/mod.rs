@@ -15,9 +15,9 @@
 
 // Note: bash, file_read, file_write, glob_find, grep_search, web_fetch
 // were removed in favor of cairn-harness-tools.
+pub mod agent_description;
 pub mod calculate;
 pub mod cancel_task;
-pub mod create_task;
 pub mod eval_score;
 pub mod get_approvals;
 pub mod get_run;
@@ -26,6 +26,7 @@ pub mod github_api;
 pub mod graph_query;
 pub mod http_request;
 pub mod json_extract;
+pub mod list_agents;
 pub mod list_runs;
 pub mod memory_search;
 pub mod memory_store;
@@ -49,20 +50,21 @@ use cairn_domain::{policy::ExecutionClass, ProjectKey, RuntimeEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use agent_description::AgentDescriptionTool;
 pub use calculate::CalculateTool;
 pub use cancel_task::CancelTaskTool;
-pub use create_task::CreateTaskTool;
 pub use eval_score::EvalScoreTool;
 pub use get_approvals::GetApprovalsTool;
 pub use get_run::GetRunTool;
 pub use get_task::GetTaskTool;
 pub use github_api::{
     GhApiCreateBranchTool, GhApiCreatePrTool, GhApiListContentsTool, GhApiMergePrTool,
-    GhApiReadFileTool, GhApiWriteFileTool, GitHubClientProvider,
+    GhApiReadFileTool, GhApiReviewPrTool, GhApiWriteFileTool, GitHubClientProvider,
 };
 pub use graph_query::GraphQueryTool;
 pub use http_request::HttpRequestTool;
 pub use json_extract::JsonExtractTool;
+pub use list_agents::ListAgentsTool;
 pub use list_runs::ListRunsTool;
 pub use memory_search::MemorySearchTool;
 pub use memory_store::MemoryStoreTool;
@@ -234,6 +236,28 @@ impl ToolContext {
             .and_then(|v| std::sync::Arc::clone(v).downcast::<T>().ok())
     }
 
+    /// #702 follow-up: record the run's `agent_role_id` so tools that
+    /// need role-scoped policy (e.g. the orchestrator-only bash verb
+    /// allowlist) can look it up without a new public field on this
+    /// struct. Stored via the typed-extension map so the struct's
+    /// wire shape stays stable.
+    ///
+    /// Call this once per run from the orchestrator's tool-invocation
+    /// layer after resolving the run's role; every subsequent
+    /// `ToolHandler::execute_with_context` call on the same context
+    /// sees the same role.
+    pub fn set_agent_role_id(&self, role_id: impl Into<String>) {
+        self.insert_extension(AgentRoleIdExt(role_id.into()));
+    }
+
+    /// Read the `agent_role_id` previously recorded via
+    /// `set_agent_role_id`. Returns `None` when the run has no role
+    /// set (back-compat: pre-#702 callers never populate this).
+    pub fn agent_role_id(&self) -> Option<String> {
+        self.get_extension::<AgentRoleIdExt>()
+            .map(|arc| arc.0.clone())
+    }
+
     /// Buffer a runtime event for the caller to append alongside tool completion.
     pub fn buffer_event(&mut self, event: RuntimeEvent) {
         self.buffered_events.push(event);
@@ -255,6 +279,15 @@ impl std::fmt::Debug for ToolContext {
             .finish()
     }
 }
+
+/// Typed extension carrying the run's `agent_role_id` through
+/// `ToolContext::extensions`. See `ToolContext::set_agent_role_id` /
+/// `ToolContext::agent_role_id` for the public accessors.
+///
+/// Not publicly constructible on purpose — callers go through the
+/// `ToolContext` helpers so there's exactly one place that writes
+/// this extension (makes future changes localised).
+struct AgentRoleIdExt(String);
 
 // ── ToolError ─────────────────────────────────────────────────────────────────
 
@@ -668,6 +701,23 @@ impl BuiltinToolRegistry {
         tools
     }
 
+    /// Visibility-filtered variant of [`prompt_tools`]. RFC 029 amends
+    /// RFC 015: a small set of built-ins may be hidden from the agent
+    /// prompt based on the resolved knowledge provider snapshot. The
+    /// filter predicate is injected by the caller to keep this crate
+    /// independent of `cairn-runtime` / `cairn-domain::contexts` — the
+    /// orchestrator wraps the unified `is_tool_visible` check in a
+    /// closure and passes it in.
+    pub fn prompt_tools_filtered(
+        &self,
+        mut visible: impl FnMut(&str) -> bool,
+    ) -> Vec<BuiltinToolDescriptor> {
+        self.prompt_tools()
+            .into_iter()
+            .filter(|d| visible(&d.name))
+            .collect()
+    }
+
     /// Descriptors for Deferred tools matching the given capability query.
     /// Used by the `tool_search` built-in to surface on-demand tools.
     pub fn search_deferred(&self, query: &str) -> Vec<BuiltinToolDescriptor> {
@@ -922,6 +972,20 @@ mod tests {
         assert!(
             !names.contains(&"plugin_tool"),
             "Deferred must NOT be in prompt tools"
+        );
+    }
+
+    #[test]
+    fn prompt_tools_filtered_hides_by_predicate() {
+        // RFC 029: the orchestrator wraps `is_tool_visible` in a closure
+        // and passes it in. Simulate that here by hiding `echo` only.
+        let reg = make_registry();
+        let filtered = reg.prompt_tools_filtered(|name| name != "echo");
+        let names: Vec<&str> = filtered.iter().map(|d| d.name.as_str()).collect();
+        assert!(!names.contains(&"echo"), "echo must be filtered out");
+        assert!(
+            names.contains(&"web_search"),
+            "other registered tools must stay"
         );
     }
 

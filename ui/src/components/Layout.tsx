@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react';
-import { useIsFetching } from '@tanstack/react-query';
+import { useIsFetching, useIsMutating } from '@tanstack/react-query';
 import { clsx } from 'clsx';
 import { Sidebar, type NavPage } from './Sidebar';
 import { TopBar } from './TopBar';
@@ -9,10 +9,10 @@ import { type BreadcrumbItem } from './Breadcrumb';
 
 // All top-level pages — must match NavPage union in Sidebar.tsx
 const VALID_PAGES: NavPage[] = [
-  'dashboard', 'workspaces',
-  'sessions', 'runs', 'tasks', 'workers', 'orchestration', 'approvals', 'triggers', 'decisions', 'prompts', 'agent-templates',
+  'dashboard', 'workspaces', 'tenants', 'operators', 'quotas', 'retention',
+  'sessions', 'runs', 'tasks', 'workers', 'orchestration', 'approvals', 'triggers', 'decisions', 'prompts', 'agent-templates', 'agents',
   'traces', 'memory', 'sources', 'costs', 'cost-calc', 'evals', 'graph', 'audit-log', 'logs', 'metrics',
-  'providers', 'plugins', 'skills', 'credentials', 'integrations', 'project-repos', 'channels', 'deployment', 'playground', 'test-harness', 'api-docs', 'settings', 'profile',
+  'providers', 'plugins', 'skills', 'credentials', 'integrations', 'project-repos', 'channels', 'notifications', 'deployment', 'playground', 'test-harness', 'api-docs', 'settings', 'profile',
 ];
 
 // ── Route descriptor ──────────────────────────────────────────────────────────
@@ -23,11 +23,33 @@ export type Route =
   | { kind: 'run-detail'; runId: string }
   | { kind: 'session-detail'; sessionId: string }
   | { kind: 'eval-compare'; leftId: string; rightId: string }
+  | { kind: 'eval-results'; runId: string }
   | { kind: 'project-dashboard'; projectId: string }
+  | { kind: 'agent-role-detail'; roleId: string }
+  | { kind: 'agent-role-editor'; mode: 'new' | 'edit'; roleId?: string }
   | { kind: 'not-found'; hash: string };
 
 export function parseRoute(hash: string): Route {
   const h = hash.replace(/^#/, '');
+  if (h === 'agent-new') {
+    return { kind: 'agent-role-editor', mode: 'new' };
+  }
+  if (h.startsWith('agent-edit/') && h.length > 'agent-edit/'.length) {
+    const raw = h.slice('agent-edit/'.length);
+    try {
+      return { kind: 'agent-role-editor', mode: 'edit', roleId: decodeURIComponent(raw) };
+    } catch {
+      return { kind: 'not-found', hash: h };
+    }
+  }
+  if (h.startsWith('agent/') && h.length > 'agent/'.length) {
+    const raw = h.slice('agent/'.length);
+    try {
+      return { kind: 'agent-role-detail', roleId: decodeURIComponent(raw) };
+    } catch {
+      return { kind: 'not-found', hash: h };
+    }
+  }
   if (h.startsWith('run/') && h.length > 4) {
     return { kind: 'run-detail', runId: h.slice(4) };
   }
@@ -42,6 +64,19 @@ export function parseRoute(hash: string): Route {
     if (parts.length >= 2) {
       return { kind: 'eval-compare', leftId: parts[0], rightId: parts[1] };
     }
+  }
+  if (h.startsWith('eval-results/') && h.length > 'eval-results/'.length) {
+    // The link in EvalsPage encodes via encodeURIComponent; decode here so
+    // runIds containing reserved characters (/, ?, #, etc.) round-trip.
+    // Guard against malformed percent-escapes (URIError).
+    const raw = h.slice('eval-results/'.length);
+    let runId: string;
+    try {
+      runId = decodeURIComponent(raw);
+    } catch {
+      return { kind: 'not-found', hash: h };
+    }
+    return { kind: 'eval-results', runId };
   }
   // Empty hash → dashboard; known page → page; anything else → 404
   if (h === '') return { kind: 'page', page: 'dashboard' };
@@ -59,6 +94,10 @@ export function currentRoute(): Route {
 export const PAGE_TITLES: Record<NavPage, string> = {
   dashboard:          'Dashboard',
   workspaces:         'Workspaces',
+  tenants:            'Tenants',
+  operators:          'Operators',
+  quotas:             'Quotas',
+  retention:          'Retention',
   sessions:           'Sessions',
   runs:               'Runs',
   tasks:              'Tasks',
@@ -69,6 +108,7 @@ export const PAGE_TITLES: Record<NavPage, string> = {
   decisions:          'Decisions',
   prompts:            'Prompts',
   'agent-templates':  'Agent Templates',
+  agents:             'Agent Roles',
   traces:      'Traces',
   memory:      'Memory',
   sources:     'Sources',
@@ -88,6 +128,7 @@ export const PAGE_TITLES: Record<NavPage, string> = {
   integrations: 'Integrations',
   'project-repos': 'Project Repos',
   channels:    'Channels',
+  notifications: 'Notifications',
   playground:      'Playground',
   'test-harness':  'Test Harness',
   settings:    'Settings',
@@ -96,6 +137,10 @@ export const PAGE_TITLES: Record<NavPage, string> = {
 
 const PAGE_GROUP: Partial<Record<NavPage, string>> = {
   workspaces:  'Overview',
+  tenants:     'Admin',
+  operators:   'Admin',
+  quotas:      'Admin',
+  retention:   'Admin',
   sessions:    'Operations',
   runs:        'Operations',
   tasks:       'Operations',
@@ -106,6 +151,7 @@ const PAGE_GROUP: Partial<Record<NavPage, string>> = {
   decisions:          'Operations',
   prompts:            'Operations',
   'agent-templates':  'Operations',
+  agents:             'Operations',
   traces:      'Observability',
   memory:      'Observability',
   sources:     'Observability',
@@ -123,6 +169,7 @@ const PAGE_GROUP: Partial<Record<NavPage, string>> = {
   deployment:   'Infrastructure',
   'project-repos': 'Infrastructure',
   channels:     'Infrastructure',
+  notifications: 'Infrastructure',
   playground:      'Infrastructure',
   'test-harness':  'Infrastructure',
   'api-docs':  'Infrastructure',
@@ -157,6 +204,20 @@ export function buildBreadcrumbs(route: Route): BreadcrumbItem[] {
       { label: shortId(route.sessionId) },
     ];
   }
+  if (route.kind === 'agent-role-detail') {
+    return [
+      { label: 'Operations' },
+      { label: 'Agent Roles', href: '#agents' },
+      { label: shortId(route.roleId) },
+    ];
+  }
+  if (route.kind === 'agent-role-editor') {
+    return [
+      { label: 'Operations' },
+      { label: 'Agent Roles', href: '#agents' },
+      { label: route.mode === 'new' ? 'New role' : `Edit ${shortId(route.roleId ?? '')}` },
+    ];
+  }
   if (route.kind === 'not-found') return [{ label: 'Not Found' }];
   return [];
 }
@@ -165,7 +226,10 @@ function activePage(route: Route): NavPage {
   if (route.kind === 'run-detail')        return 'runs';
   if (route.kind === 'session-detail')    return 'sessions';
   if (route.kind === 'eval-compare')      return 'evals';
+  if (route.kind === 'eval-results')      return 'evals';
   if (route.kind === 'project-dashboard') return 'dashboard';
+  if (route.kind === 'agent-role-detail') return 'agents';
+  if (route.kind === 'agent-role-editor') return 'agents';
   if (route.kind === 'not-found')         return 'dashboard';
   return route.page;
 }
@@ -181,21 +245,71 @@ function PlaceholderPage({ page }: { page: NavPage }) {
 
 // ── Loading bar ───────────────────────────────────────────────────────────────
 
+// Debounce threshold before showing the top loading bar. Background polling
+// queries (health 15s, stats 5s, queue 3s, etc.) typically complete in well
+// under 500ms on localhost, so gating on this threshold means the bar only
+// appears for genuinely slow fetches + mutations — not every routine poll.
+// Without this, the bar flashes every few seconds and makes the app feel
+// like it's constantly reconnecting (issue #259).
+const LOADING_BAR_SHOW_DELAY_MS = 500;
+
 function LoadingBar() {
-  const isFetching = useIsFetching();
+  // Union of queries + mutations so writes (create session, rotate token,
+  // etc.) still surface the bar even though `useIsFetching` counts only
+  // read-side query activity.
+  const isFetching  = useIsFetching();
+  const isMutating  = useIsMutating();
+  const busyCount   = isFetching + isMutating;
   const [phase, setPhase] = useState<'idle' | 'loading' | 'done'>('idle');
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const finishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (isFetching > 0) {
-      if (timerRef.current) clearTimeout(timerRef.current);
-      setPhase('loading');
-    } else if (phase === 'loading') {
-      setPhase('done');
-      timerRef.current = setTimeout(() => setPhase('idle'), 450);
+    if (busyCount > 0) {
+      if (phase === 'done') {
+        // A finish animation is in flight but new work arrived — the bar is
+        // still on screen, so bounce straight back to 'loading' instead of
+        // debouncing again. Without this we'd stay in the fade-out animation
+        // (often ending at opacity 0) while requests are actively in-flight
+        // and the indicator would disappear mid-fetch.
+        if (finishTimerRef.current) {
+          clearTimeout(finishTimerRef.current);
+          finishTimerRef.current = null;
+        }
+        setPhase('loading');
+      } else if (phase === 'idle' && showTimerRef.current === null) {
+        // Only arm the show-timer if we aren't already displaying the bar
+        // and no show-timer is pending — otherwise overlapping background
+        // fetches would keep resetting the 500ms window and the bar could
+        // never finish debouncing.
+        showTimerRef.current = setTimeout(() => {
+          showTimerRef.current = null;
+          setPhase('loading');
+        }, LOADING_BAR_SHOW_DELAY_MS);
+      }
+    } else {
+      // Fetch finished. If it completed before the debounce elapsed, cancel
+      // the show-timer and the bar never appears at all.
+      if (showTimerRef.current) {
+        clearTimeout(showTimerRef.current);
+        showTimerRef.current = null;
+      }
+      if (phase === 'loading') {
+        setPhase('done');
+        finishTimerRef.current = setTimeout(() => setPhase('idle'), 450);
+      }
     }
-    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
-  }, [isFetching, phase]);
+  }, [busyCount, phase]);
+
+  // Clear any outstanding timers on unmount. Kept separate from the main
+  // effect so normal re-renders (isFetching changes) don't clear the
+  // in-flight debounce timer between ticks.
+  useEffect(() => {
+    return () => {
+      if (showTimerRef.current) clearTimeout(showTimerRef.current);
+      if (finishTimerRef.current) clearTimeout(finishTimerRef.current);
+    };
+  }, []);
 
   if (phase === 'idle') return null;
 

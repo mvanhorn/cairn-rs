@@ -28,13 +28,13 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use ff_core::partition::execution_partition;
+use flowfabric::core::partition::execution_partition;
 
 use cairn_domain::{ProjectKey, RunId, TaskId};
 use cairn_fabric::id_map;
 use cairn_store::projections::{RunReadModel, TaskReadModel};
 
-use crate::errors::{store_error_response, AppApiError};
+use crate::errors::{run_not_found_response, store_error_response, AppApiError};
 use crate::extractors::AdminRoleGuard;
 use crate::state::AppState;
 
@@ -77,7 +77,9 @@ pub(crate) async fn debug_partition_handler(
         )
         .into_response();
     };
-    let partition_config = fabric.runtime.partition_config;
+    // PR-C4c: partition_config is exposed through the trait accessor
+    // now — works on both Valkey and Postgres runtimes.
+    let partition_config = *fabric.runtime.partition_config();
     let store = &state.runtime.store;
 
     match query.kind.as_str() {
@@ -86,8 +88,7 @@ pub(crate) async fn debug_partition_handler(
             let record = match RunReadModel::get(store.as_ref(), &run_id).await {
                 Ok(Some(r)) => r,
                 Ok(None) => {
-                    return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "run not found")
-                        .into_response();
+                    return run_not_found_response();
                 }
                 // SEC-007: route store errors through the shared helper so
                 // the client body carries only the standard opaque shape

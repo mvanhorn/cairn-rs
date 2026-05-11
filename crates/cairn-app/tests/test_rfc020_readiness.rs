@@ -63,8 +63,13 @@ impl DelayedHarness {
             .arg("127.0.0.1")
             .arg("--db")
             .arg("memory")
-            .env("CAIRN_FABRIC_HOST", &valkey_host)
-            .env("CAIRN_FABRIC_PORT", valkey_port.to_string())
+            // F65 PR-5: skip sandbox probe gate on CI (AppArmor blocks
+            // unprivileged userns in default GH runner configuration).
+            .arg("--allow-missing-sandbox-primitives")
+            .env(
+                "CAIRN_FABRIC_URL",
+                format!("valkey://{valkey_host}:{valkey_port}"),
+            )
             .env("CAIRN_FABRIC_LANE", format!("test-{suffix}"))
             .env("CAIRN_FABRIC_WORKER_ID", format!("worker-{suffix}"))
             .env("CAIRN_FABRIC_INSTANCE_ID", format!("instance-{suffix}"))
@@ -74,6 +79,11 @@ impl DelayedHarness {
                 "00000000000000000000000000000000000000000000000000000000000000aa",
             )
             .env("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "cairn-test-k1")
+            // META #461: team mode refuses to start without a master key.
+            .env(
+                "CAIRN_CREDENTIAL_KEY",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
             // The dev-only hook: defer the final readiness flip so the
             // test can observe the 503-with-progress contract.
             .env("CAIRN_TEST_STARTUP_DELAY_MS", STARTUP_DELAY_MS.to_string())

@@ -578,3 +578,90 @@ async fn double_suspend_remains_suspended() {
         .unwrap();
     assert_eq!(r.status, "suspended", "repeated suspension is idempotent");
 }
+
+// ── 12. PR #729 — cross-tenant takeover defence on InMemory store ────────────
+
+/// Regression for #729 expansion. The pg/sqlite projection appliers
+/// were patched to no-op on cross-tenant `worker_id` collisions, but
+/// the in-memory projection — which CLAUDE.md pins as the production
+/// read path under RFC-025 Phase 4 — was left wide open. Without the
+/// in-memory guard, an attacker tenant submitting an
+/// `ExternalWorkerRegistered` event with a colliding `worker_id`
+/// silently rewrites the projection row's `tenant_id`, hijacking
+/// ownership for every downstream tenant-scoped check.
+#[tokio::test]
+async fn external_worker_collision_cannot_move_tenant_inmemory() {
+    let store = InMemoryStore::new();
+    let ts = now_ms();
+
+    // Victim tenant registers `worker_xyz` in tenant_v.
+    store
+        .append(&[register(
+            "ev1",
+            "worker_xyz",
+            "tenant_v",
+            "Victim Worker",
+            ts,
+        )])
+        .await
+        .unwrap();
+
+    // Attacker tenant submits a colliding `worker_id` claiming
+    // tenant_a. Pre-fix: the InMemory projection unconditionally
+    // overwrote tenant_v with tenant_a; the next tenant-scoped
+    // query treated the worker as tenant_a's. Post-fix: this is
+    // a no-op on the read model.
+    store
+        .append(&[register(
+            "ev2",
+            "worker_xyz",
+            "tenant_a",
+            "Attacker Worker",
+            ts + 1,
+        )])
+        .await
+        .unwrap();
+
+    let row = ExternalWorkerReadModel::get(&store, &WorkerId::new("worker_xyz"))
+        .await
+        .unwrap()
+        .expect("row must still exist");
+    assert_eq!(
+        row.tenant_id.as_str(),
+        "tenant_v",
+        "cross-tenant collision must not rewrite the row's tenant_id"
+    );
+    assert_eq!(
+        row.display_name, "Victim Worker",
+        "cross-tenant collision must not overwrite display_name"
+    );
+}
+
+/// Counter-test: a same-tenant re-register IS allowed and refreshes
+/// the display name. Without this assertion, a future tightening
+/// could break legitimate re-registration (e.g. a worker bouncing
+/// after a crash with an updated display name) and the suite
+/// wouldn't catch it.
+#[tokio::test]
+async fn external_worker_same_tenant_reregister_refreshes_display_name() {
+    let store = InMemoryStore::new();
+    let ts = now_ms();
+
+    store
+        .append(&[
+            register("ev1", "worker_xyz", "tenant_v", "Old Name", ts),
+            register("ev2", "worker_xyz", "tenant_v", "New Name", ts + 1),
+        ])
+        .await
+        .unwrap();
+
+    let row = ExternalWorkerReadModel::get(&store, &WorkerId::new("worker_xyz"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.tenant_id.as_str(), "tenant_v");
+    assert_eq!(
+        row.display_name, "New Name",
+        "same-tenant re-register must refresh display_name"
+    );
+}

@@ -9,47 +9,20 @@ import { ErrorFallback } from "../components/ErrorFallback";
 import { useToast } from "../components/Toast";
 import { clsx } from "clsx";
 import { sectionLabel } from "../lib/design-system";
-import { ApiError } from "../lib/api";
+import { defaultApi } from "../lib/api";
+import type { Decision, DecisionCacheEntry, DecisionCacheScope } from "../lib/types";
+import { EmptyScopeHint } from "../components/EmptyScopeHint";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-const authHeaders = () => ({ Authorization: `Bearer ${localStorage.getItem("cairn_token") || ""}` });
-
-/** Fetch wrapper that throws on non-2xx. The raw-`fetch` call sites below
- *  previously ignored HTTP errors entirely — 4xx/5xx returned undefined and
- *  the success toast fired as if the server had honored the request.
- *
- *  Throws `ApiError` (not a generic `Error`) so the global 401 interceptor
- *  in `main.tsx` recognizes auth-expired failures and routes the operator
- *  back to the LoginPage. Mirrors the behavior of `apiFetch` in `api.ts`
- *  so 401 handling stays consistent across the UI. */
-async function assertOk(path: string, init: RequestInit): Promise<Response> {
-  const res = await fetch(path, init);
-  if (!res.ok) {
-    let code = 'unknown_error';
-    let message = `HTTP ${res.status}`;
-    try {
-      const body = await res.json();
-      code = body?.code ?? code;
-      message = body?.message ?? message;
-    } catch {
-      // Non-JSON body — fall back to the default message above.
-    }
-    throw new ApiError(res.status, code, message);
-  }
-  return res;
-}
-
-/** Normalize list responses to `T[]`. Mirrors the `getList` helper used by
- *  `createApiClient` in `api.ts` so DecisionsPage handles both the bare
- *  array and `{items, hasMore}` envelope shapes consistently. */
-function unwrapList<T>(data: unknown): T[] {
-  if (Array.isArray(data)) return data as T[];
-  if (data && typeof data === 'object' && 'items' in data && Array.isArray((data as { items: unknown }).items)) {
-    return (data as { items: T[] }).items;
-  }
-  return [];
-}
+//
+// Issue #387: DecisionsPage used to build its own `authHeaders()` from a
+// raw `localStorage.getItem('cairn_token')` and call bare `fetch` — that
+// bypassed the `getStoredToken` helper, the global 401 interceptor in
+// `api.ts` (which dispatches `cairn:auth-expired`), and the shared
+// env-var fallback (`VITE_API_TOKEN`). All four network calls below now
+// go through `defaultApi`, which centralizes those concerns.
 
 function fmtRelative(ms: number): string {
   const d = Date.now() - ms;
@@ -63,23 +36,11 @@ function mono(s: string, max = 18): string {
   return s.length > max ? `${s.slice(0, max - 3)}…` : s;
 }
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// Types moved to `../lib/types` (Decision, DecisionCacheEntry, DecisionCacheScope)
+// so the same shape is referenced by `defaultApi.listDecisions` / `listDecisionsCache`.
 
-interface Decision {
-  decision_id: string;
-  kind: Record<string, unknown> | string;
-  outcome: { outcome: string; deny_reason?: string };
-  created_at: number;
-}
-
-interface CacheEntry {
-  key: string;
-  decision_id: string;
-  outcome: string;
-  kind_tag: string;
-  scope: string;
-  expires_at: number;
-  hit_count: number;
+function scopeLabel(s: DecisionCacheScope): string {
+  return `${s.tenant_id}/${s.workspace_id}/${s.project_id}`;
 }
 
 // ── Outcome pill (matches session/run state pill pattern) ────────────────────
@@ -87,20 +48,28 @@ interface CacheEntry {
 const OUTCOME_PILL: Record<string, string> = {
   allowed: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
   denied:  "bg-red-500/10 text-red-400 border-red-500/20",
+  pending: "bg-gray-500/10 text-gray-400 border-gray-500/20 dark:bg-zinc-500/10 dark:text-zinc-400 dark:border-zinc-500/20",
 };
 const OUTCOME_DOT: Record<string, string> = {
   allowed: "bg-emerald-400",
   denied:  "bg-red-400",
+  pending: "bg-gray-400 dark:bg-zinc-400",
 };
 
-function OutcomePill({ outcome }: { outcome: string }) {
+/** Renders the decision outcome as a colored pill. Handles missing/empty
+ *  outcome gracefully — the backend occasionally emits rows with an empty
+ *  `outcome` string (e.g. cache-hit rows mid-materialization) and the
+ *  earlier impl leaked the literal "undefined" onto the operator UI. */
+function OutcomePill({ outcome }: { outcome?: string | null }) {
+  const key = outcome && outcome.length > 0 ? outcome : "pending";
+  const label = outcome && outcome.length > 0 ? outcome : "pending";
   return (
     <span className={clsx(
       "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium border whitespace-nowrap",
-      OUTCOME_PILL[outcome] ?? OUTCOME_PILL.denied,
+      OUTCOME_PILL[key] ?? OUTCOME_PILL.pending,
     )}>
-      <span className={clsx("w-1 h-1 rounded-full shrink-0", OUTCOME_DOT[outcome] ?? OUTCOME_DOT.denied)} />
-      {outcome}
+      <span className={clsx("w-1 h-1 rounded-full shrink-0", OUTCOME_DOT[key] ?? OUTCOME_DOT.pending)} />
+      {label}
     </span>
   );
 }
@@ -114,48 +83,34 @@ export function DecisionsPage() {
 
   const decisionsQ = useQuery<Decision[]>({
     queryKey: ["decisions"],
-    queryFn: async () => {
-      const res = await assertOk("/v1/decisions", { headers: authHeaders() });
-      return unwrapList<Decision>(await res.json());
-    },
+    queryFn: () => defaultApi.listDecisions(),
     refetchInterval: 30_000,
   });
 
-  const cacheQ = useQuery<CacheEntry[]>({
+  const cacheQ = useQuery<DecisionCacheEntry[]>({
     queryKey: ["decisions-cache"],
-    queryFn: async () => {
-      const res = await assertOk("/v1/decisions/cache", { headers: authHeaders() });
-      return unwrapList<CacheEntry>(await res.json());
-    },
+    queryFn: () => defaultApi.listDecisionsCache(),
     refetchInterval: 30_000,
   });
 
   const invalidateMut = useMutation({
-    mutationFn: (id: string) => assertOk(`/v1/decisions/${id}/invalidate`, {
-      method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ reason: "operator-invalidated" }),
-    }),
+    mutationFn: (id: string) => defaultApi.invalidateDecision(id, "operator-invalidated"),
     onSuccess: () => { toast.success("Cache entry invalidated."); void qc.invalidateQueries({ queryKey: ["decisions-cache"] }); },
     onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Failed to invalidate cache entry."),
   });
 
   // Bulk-invalidate the decision cache. The real endpoint is the bulk form
   // of `/v1/decisions/invalidate` (see crates/cairn-app/src/router.rs:1271).
-  // The previous URL (`/v1/decisions/cache/invalidate-all`) does not exist;
-  // the raw `fetch` also ignored the 404 and fired the success toast.
   const bulkMut = useMutation({
-    mutationFn: () => assertOk("/v1/decisions/invalidate", {
-      method: "POST", headers: { ...authHeaders(), "Content-Type": "application/json" },
-      body: JSON.stringify({ reason: "operator-bulk-clear" }),
-    }),
+    mutationFn: () => defaultApi.bulkInvalidateDecisions("operator-bulk-clear"),
     onSuccess: () => { toast.success("All cache entries invalidated."); void qc.invalidateQueries({ queryKey: ["decisions-cache"] }); },
     onError: (e: unknown) => toast.error(e instanceof Error ? e.message : "Failed to bulk-invalidate cache."),
   });
 
   const decisions = decisionsQ.data ?? [];
   const cacheEntries = cacheQ.data ?? [];
-  const allowed = decisions.filter(d => d.outcome.outcome === "allowed").length;
-  const denied = decisions.filter(d => d.outcome.outcome === "denied").length;
+  const allowed = decisions.filter(d => d.outcome?.outcome === "allowed").length;
+  const denied = decisions.filter(d => d.outcome?.outcome === "denied").length;
 
   if (decisionsQ.isError) return <ErrorFallback error={decisionsQ.error} resource="decisions" onRetry={() => void decisionsQ.refetch()} />;
 
@@ -166,9 +121,9 @@ export function DecisionsPage() {
         <div className="space-y-1">
           <div className="flex items-center gap-2">
             <p className={clsx(sectionLabel, "mb-0")}>Decisions</p>
-            <HelpTooltip text="Unified decision layer (RFC 019). Every tool invocation, trigger fire, and plugin enablement goes through policy evaluation before proceeding." placement="right" />
+            <HelpTooltip text="Every tool call, trigger, and plugin action is policy-checked before running. Audit the allow/deny decisions below." placement="right" />
           </div>
-          <p className="text-[11px] text-gray-500 dark:text-zinc-400">Implements RFC 019 — Unified Decision Layer.</p>
+          <EntityExplainer>{ENTITY_EXPLAINERS.decision}</EntityExplainer>
         </div>
         <div className="flex items-center gap-2">
           {tab === "cache" && cacheEntries.length > 0 && (
@@ -211,37 +166,48 @@ export function DecisionsPage() {
           getRowId={d => d.decision_id}
           columns={[
             { key: "id", header: "ID", render: r => <span className="flex items-center gap-1 font-mono text-[11px] text-gray-500 dark:text-zinc-400 whitespace-nowrap group/id">{mono(r.decision_id)}<CopyButton text={r.decision_id} label="Copy decision ID" size={10} className="opacity-0 group-hover/id:opacity-100" /></span>, sortValue: r => r.decision_id },
-            { key: "kind", header: "Kind", render: r => { const k = typeof r.kind === "object" && r.kind !== null ? String((r.kind as Record<string, unknown>).type ?? "unknown") : String(r.kind); return <code className="text-[11px] bg-gray-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded font-mono">{k}</code>; } },
-            { key: "outcome", header: "Outcome", render: r => <OutcomePill outcome={r.outcome.outcome} />, sortValue: r => r.outcome.outcome },
+            { key: "kind", header: "Kind", render: r => {
+              // Some rows (e.g. cache-hit rows) omit `kind` entirely —
+              // render an em-dash instead of the literal "undefined".
+              const k = typeof r.kind === "object" && r.kind !== null
+                ? String((r.kind as Record<string, unknown>).type ?? "unknown")
+                : typeof r.kind === "string" && r.kind.length > 0
+                  ? r.kind
+                  : "—";
+              return <code className="text-[11px] bg-gray-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded font-mono">{k}</code>;
+            } },
+            { key: "outcome", header: "Outcome", render: r => <OutcomePill outcome={r.outcome?.outcome} />, sortValue: r => r.outcome?.outcome ?? "" },
             { key: "created", header: "Created", render: r => <span className="text-[11px] text-gray-400 dark:text-zinc-500 tabular-nums">{fmtRelative(r.created_at)}</span>, sortValue: r => r.created_at },
           ]}
-          filterFn={(r, q) => r.decision_id.includes(q) || String(r.kind).includes(q) || r.outcome.outcome.includes(q)}
-          csvRow={r => [r.decision_id, String(r.kind), r.outcome.outcome, r.created_at]}
+          filterFn={(r, q) => r.decision_id.includes(q) || (r.kind !== undefined && String(r.kind).includes(q)) || (r.outcome?.outcome ?? "").includes(q)}
+          csvRow={r => [r.decision_id, r.kind !== undefined ? String(r.kind) : "", r.outcome?.outcome ?? "", r.created_at]}
           csvHeaders={["ID", "Kind", "Outcome", "Created"]}
           filename="decisions"
-          emptyText="No decisions yet — decisions appear when the unified decision layer evaluates tool invocations, trigger fires, or plugin enablements."
+          emptyText="No decisions yet. Decisions appear here when a tool call, trigger, or plugin action is policy-checked."
         />
       ) : (
-        <DataTable<CacheEntry>
+        <DataTable<DecisionCacheEntry>
           data={cacheEntries}
-          getRowId={e => e.key}
+          getRowId={e => e.decision_id}
+          rowClassName="group"
           columns={[
-            { key: "kind", header: "Kind", render: r => <code className="text-[11px] bg-gray-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded font-mono">{r.kind_tag}</code> },
-            { key: "outcome", header: "Outcome", render: r => <OutcomePill outcome={r.outcome} />, sortValue: r => r.outcome },
-            { key: "scope", header: "Scope", render: r => <span className="text-[11px] text-gray-400 dark:text-zinc-500">{r.scope}</span> },
+            { key: "kind", header: "Kind", render: r => <code className="text-[11px] bg-gray-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded font-mono">{r.kind_tag && r.kind_tag.length > 0 ? r.kind_tag : "—"}</code> },
+            { key: "outcome", header: "Outcome", render: r => <OutcomePill outcome={r.outcome?.outcome} />, sortValue: r => r.outcome?.outcome ?? "" },
+            { key: "scope", header: "Scope", render: r => <span className="text-[11px] text-gray-400 dark:text-zinc-500">{scopeLabel(r.scope)}</span>, sortValue: r => scopeLabel(r.scope) },
             { key: "hits", header: "Hits", render: r => <span className="text-[11px] text-gray-400 dark:text-zinc-500 tabular-nums">{r.hit_count}</span>, sortValue: r => r.hit_count },
             { key: "expires", header: "Expires", render: r => <span className="text-[11px] text-gray-400 dark:text-zinc-500 tabular-nums">{fmtRelative(r.expires_at)}</span>, sortValue: r => r.expires_at },
             { key: "actions", header: "", render: r => (
               <button onClick={() => invalidateMut.mutate(r.decision_id)} title="Invalidate" className="p-1 rounded hover:bg-gray-100 dark:hover:bg-zinc-800 text-red-400 opacity-0 group-hover:opacity-100 transition-all"><Trash2 size={12} /></button>
             )},
           ]}
-          filterFn={(r, q) => r.kind_tag.includes(q) || r.outcome.includes(q) || r.scope.includes(q)}
-          csvRow={r => [r.key, r.kind_tag, r.outcome, r.scope, r.hit_count, r.expires_at]}
-          csvHeaders={["Key", "Kind", "Outcome", "Scope", "Hits", "Expires"]}
+          filterFn={(r, q) => (r.kind_tag ?? "").includes(q) || (r.outcome?.outcome ?? "").includes(q) || scopeLabel(r.scope).includes(q)}
+          csvRow={r => [r.decision_id, r.kind_tag ?? "", r.outcome?.outcome ?? "", scopeLabel(r.scope), r.hit_count, r.expires_at]}
+          csvHeaders={["Decision ID", "Kind", "Outcome", "Scope", "Hits", "Expires"]}
           filename="decision-cache"
-          emptyText="Cache is empty — no learned rules yet. Cached decisions reduce operator re-prompts."
+          emptyText="No cached decisions yet. Cached rules skip repeat operator prompts for the same action."
         />
       )}
+      <EmptyScopeHint empty={decisions.length === 0 && cacheEntries.length === 0} />
     </div>
   );
 }

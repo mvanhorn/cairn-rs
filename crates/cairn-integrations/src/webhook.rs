@@ -86,6 +86,10 @@ impl std::fmt::Debug for GenericWebhookPlugin {
 
 #[async_trait]
 impl Integration for GenericWebhookPlugin {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn id(&self) -> &str {
         &self.id
     }

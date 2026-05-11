@@ -18,12 +18,16 @@ use std::time::Duration;
 use cairn_domain::{CredentialId, TenantId};
 use cairn_runtime::credentials::CredentialService;
 use cairn_runtime::error::RuntimeError;
-use cairn_runtime::services::{CredentialServiceImpl, TenantServiceImpl};
+use cairn_runtime::services::{CredentialServiceImpl, MasterKey, TenantServiceImpl};
 use cairn_runtime::tenants::TenantService;
 use cairn_store::InMemoryStore;
 
 fn tenant_id() -> TenantId {
     TenantId::new("tenant_rfc011")
+}
+
+fn test_master_key() -> Arc<MasterKey> {
+    Arc::new(MasterKey::from_bytes([9u8; 32]))
 }
 
 async fn setup() -> (Arc<InMemoryStore>, CredentialServiceImpl<InMemoryStore>) {
@@ -33,7 +37,7 @@ async fn setup() -> (Arc<InMemoryStore>, CredentialServiceImpl<InMemoryStore>) {
         .create(tenant_id(), "RFC 011 Tenant".to_owned())
         .await
         .unwrap();
-    let cred_svc = CredentialServiceImpl::new(store.clone());
+    let cred_svc = CredentialServiceImpl::new(store.clone(), test_master_key());
     (store, cred_svc)
 }
 
@@ -71,8 +75,10 @@ async fn store_credential_encrypts_value_and_tags_key_version() {
         !stored.encrypted_value.is_empty(),
         "encrypted_value must be non-empty"
     );
+    // `encrypted_value` is a `RedactedCiphertext` (#579) that derefs
+    // to `[u8]`; compare through the slice view.
     assert_ne!(
-        stored.encrypted_value,
+        &*stored.encrypted_value,
         plaintext.as_bytes(),
         "RFC 011: stored value must be ciphertext, not plaintext"
     );
@@ -83,10 +89,13 @@ async fn store_credential_encrypts_value_and_tags_key_version() {
         Some("kek-primary-v1"),
         "key_id must be preserved on the record"
     );
+    // Post-#461: stored rows carry "v2" to mark the random-nonce format.
+    // Pre-fix rows carried "v1" and are flagged by `scan_legacy_ciphertexts`
+    // for operator-driven rotation.
     assert_eq!(
         stored.key_version.as_deref(),
-        Some("v1"),
-        "RFC 011: key_version must be set to 'v1' on store"
+        Some("v2"),
+        "META #461: newly-stored credentials must carry key_version=v2"
     );
     assert!(
         stored.encrypted_at_ms.is_some(),
@@ -237,7 +246,7 @@ async fn revoke_is_idempotent() {
 #[tokio::test]
 async fn store_for_nonexistent_tenant_returns_not_found() {
     let store = Arc::new(InMemoryStore::new());
-    let cred_svc = CredentialServiceImpl::new(store);
+    let cred_svc = CredentialServiceImpl::new(store, test_master_key());
 
     let err = cred_svc
         .store(
@@ -439,4 +448,80 @@ async fn key_rotation_reencrypts_credentials_and_records_rotation() {
         1,
         "credential under key_other must not be rotated"
     );
+}
+
+// ── #737: cross-tenant credential ID must not collide ───────────────────────
+
+/// Pre-#737 fix, credential IDs were generated as `cred_{now_ms()}`. On a
+/// fast host two `store` calls landing in the same millisecond produced
+/// identical IDs. The HashMap-backed projection keys on `credential_id`
+/// alone, so the second writer would silently take over the first writer's
+/// entry — except for `tenant_id`, which the apply path intentionally
+/// preserves on re-store. Result: a credential whose `tenant_id` says
+/// tenant_a but whose ciphertext + provider_id reflect tenant_b's request,
+/// breaking the cross-tenant ownership check that gates
+/// `update_provider_connection`.
+///
+/// We write 100 credentials in tight succession across two tenants
+/// (interleaved a/b/a/b…) and assert no two carry the same ID. Pre-fix this
+/// test trips reliably on CI within the first ~30 iterations.
+#[tokio::test]
+async fn store_assigns_unique_ids_across_tenants_under_burst() {
+    use std::collections::HashSet;
+
+    let store = Arc::new(InMemoryStore::new());
+    let tenant_svc = TenantServiceImpl::new(store.clone());
+    let tenant_a = TenantId::new("tenant_burst_a");
+    let tenant_b = TenantId::new("tenant_burst_b");
+    tenant_svc
+        .create(tenant_a.clone(), "Burst A".to_owned())
+        .await
+        .unwrap();
+    tenant_svc
+        .create(tenant_b.clone(), "Burst B".to_owned())
+        .await
+        .unwrap();
+    let cred_svc = CredentialServiceImpl::new(store.clone(), test_master_key());
+
+    let mut ids: HashSet<String> = HashSet::new();
+    for i in 0..50 {
+        // Different `provider_id`s so the same-tenant-same-provider race
+        // resolution path doesn't fire — we want to exercise the ID
+        // generator alone.
+        let provider = format!("p{i}");
+        let a = cred_svc
+            .store(
+                tenant_a.clone(),
+                provider.clone(),
+                format!("sk-a-{i}"),
+                None,
+            )
+            .await
+            .unwrap();
+        let b = cred_svc
+            .store(tenant_b.clone(), provider, format!("sk-b-{i}"), None)
+            .await
+            .unwrap();
+        assert!(
+            ids.insert(a.id.as_str().to_owned()),
+            "#737: tenant_a credential id `{}` collided with a previous credential",
+            a.id.as_str()
+        );
+        assert!(
+            ids.insert(b.id.as_str().to_owned()),
+            "#737: tenant_b credential id `{}` collided with a previous credential",
+            b.id.as_str()
+        );
+        // Cross-tenant ownership must remain intact: a credential stored
+        // for tenant_a must read back with tenant_id == tenant_a.
+        let read_a = cred_svc.get(&a.id).await.unwrap().unwrap();
+        assert_eq!(
+            read_a.tenant_id,
+            tenant_a,
+            "#737: credential {} must remain owned by tenant_a after concurrent tenant_b store",
+            a.id.as_str()
+        );
+        let read_b = cred_svc.get(&b.id).await.unwrap().unwrap();
+        assert_eq!(read_b.tenant_id, tenant_b);
+    }
 }

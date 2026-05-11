@@ -54,6 +54,10 @@ impl RetrievalService for PgRetrievalService {
             candidates_generated: results.len(),
             results_returned: results.len(),
             latency_ms: elapsed,
+            stages_used: Vec::new(),
+            scoring_dimensions_used: Vec::new(),
+            effective_policy: None,
+            family: None,
         };
 
         Ok(RetrievalResponse {

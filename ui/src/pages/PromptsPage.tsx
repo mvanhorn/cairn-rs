@@ -7,12 +7,44 @@ import {
 } from "lucide-react";
 import { clsx } from "clsx";
 import { Card } from "../components/Card";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
+import { errorMessage } from "../lib/errors";
 import { sectionLabel } from "../lib/design-system";
 import { useToast } from "../components/Toast";
+import { useScope } from "../hooks/useScope";
+import { EmptyScopeHint } from "../components/EmptyScopeHint";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 import type {
   PromptAssetRecord, PromptVersionRecord, PromptReleaseRecord, PromptVersionDiff,
+  PromptKind, PromptReleaseState,
 } from "../lib/types";
+
+/** Human-readable label for a `PromptKind`. */
+const KIND_LABEL: Record<PromptKind, string> = {
+  system:        "system",
+  user_template: "user template",
+  tool_prompt:   "tool prompt",
+  critic:        "critic",
+  router:        "router",
+};
+
+const PROMPT_KINDS = Object.keys(KIND_LABEL) as PromptKind[];
+
+/** Runtime guard — DOM `<select>` values are untrusted strings. */
+function isPromptKind(value: string): value is PromptKind {
+  return (PROMPT_KINDS as string[]).includes(value);
+}
+
+/** Human-readable label for a `PromptReleaseState`. */
+const RELEASE_LABEL: Record<PromptReleaseState, string> = {
+  draft:    "draft",
+  proposed: "proposed",
+  approved: "approved",
+  active:   "active",
+  rejected: "rejected",
+  archived: "archived",
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -27,49 +59,79 @@ const shortId = (id: string) =>
 
 const shortHash = (h: string) => h.slice(0, 8);
 
-function makeReleaseId(assetId: string): string {
-  return `rel-${assetId.slice(0, 8)}-${Date.now().toString(36)}`;
+/**
+ * Scope key for TanStack Query cache keys.
+ *
+ * The three prompt endpoints actually scope differently on the backend —
+ * `/v1/prompts/assets` lists by workspace (tenant + workspace),
+ * `/v1/prompts/releases` lists by project (tenant + workspace + project), and
+ * `/v1/prompts/assets/:id/versions` is asset-scoped (the asset itself carries
+ * the workspace). Rather than maintain three sub-keys per endpoint, we key
+ * all three caches on the full `tenant:workspace:project` triple. Over-keying
+ * by `project_id` on the workspace-scoped endpoints is safe: all calls
+ * originating from a given active scope share the same triple, so cache hits
+ * still work within that scope, and switching scope correctly invalidates
+ * every prompt cache — even the over-keyed workspace-level ones — preventing
+ * cross-project bleed-through.
+ */
+function scopeKey(scope: { tenant_id: string; workspace_id: string; project_id: string }): string {
+  return `${scope.tenant_id}:${scope.workspace_id}:${scope.project_id}`;
+}
+
+/**
+ * Prefixed SHA-256 digest via SubtleCrypto.
+ *
+ * Returns `"sha256:<hex>"` to match the backend `content_hash` convention used
+ * by cairn-evals fixtures (see `crates/cairn-store/tests/prompt_lifecycle.rs`).
+ */
+async function sha256ContentHash(text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `sha256:${hex}`;
 }
 
 // ── Kind badge ────────────────────────────────────────────────────────────────
 
-const KIND_STYLE: Record<string, string> = {
-  system:    "bg-blue-950/60 text-blue-300 border-blue-800/40",
-  user:      "bg-indigo-950/60 text-indigo-300 border-indigo-800/40",
-  assistant: "bg-teal-950/60 text-teal-300 border-teal-800/40",
-  tool:      "bg-amber-950/60 text-amber-300 border-amber-800/40",
+const KIND_STYLE: Record<PromptKind, string> = {
+  system:        "bg-blue-950/60 text-blue-300 border-blue-800/40",
+  user_template: "bg-indigo-950/60 text-indigo-300 border-indigo-800/40",
+  tool_prompt:   "bg-amber-950/60 text-amber-300 border-amber-800/40",
+  critic:        "bg-teal-950/60 text-teal-300 border-teal-800/40",
+  router:        "bg-purple-950/60 text-purple-300 border-purple-800/40",
 };
 
-function KindBadge({ kind }: { kind: string }) {
+function KindBadge({ kind }: { kind: PromptKind }) {
   return (
     <span className={clsx(
       "text-[10px] font-mono font-medium rounded px-1.5 py-0.5 border",
       KIND_STYLE[kind] ?? "bg-gray-100/60 dark:bg-zinc-800/60 text-gray-500 dark:text-zinc-400 border-gray-200 dark:border-zinc-700",
     )}>
-      {kind}
+      {KIND_LABEL[kind] ?? kind}
     </span>
   );
 }
 
 // ── Release state badge ───────────────────────────────────────────────────────
 
-const RELEASE_STYLE: Record<string, string> = {
-  draft:              "bg-gray-100/60 dark:bg-zinc-800/60 text-gray-500 dark:text-zinc-400 border-gray-200 dark:border-zinc-700",
-  pending_approval:   "bg-amber-950/60 text-amber-300 border-amber-800/40",
-  approved:           "bg-blue-950/60 text-blue-300 border-blue-800/40",
-  released:           "bg-emerald-950/60 text-emerald-300 border-emerald-800/40",
-  rolling_out:        "bg-indigo-950/60 text-indigo-300 border-indigo-800/40",
-  archived:           "bg-gray-100/40 dark:bg-zinc-800/40 text-gray-400 dark:text-zinc-600 border-gray-200 dark:border-zinc-800",
-  rolled_back:        "bg-red-950/60 text-red-300 border-red-800/40",
+const RELEASE_STYLE: Record<PromptReleaseState, string> = {
+  draft:    "bg-gray-100/60 dark:bg-zinc-800/60 text-gray-500 dark:text-zinc-400 border-gray-200 dark:border-zinc-700",
+  proposed: "bg-amber-950/60 text-amber-300 border-amber-800/40",
+  approved: "bg-blue-950/60 text-blue-300 border-blue-800/40",
+  active:   "bg-emerald-950/60 text-emerald-300 border-emerald-800/40",
+  rejected: "bg-red-950/60 text-red-300 border-red-800/40",
+  archived: "bg-gray-100/40 dark:bg-zinc-800/40 text-gray-400 dark:text-zinc-600 border-gray-200 dark:border-zinc-800",
 };
 
-function ReleaseBadge({ state }: { state: string }) {
+function ReleaseBadge({ state }: { state: PromptReleaseState }) {
   return (
     <span className={clsx(
       "text-[10px] font-medium rounded px-1.5 py-0.5 border whitespace-nowrap",
       RELEASE_STYLE[state] ?? RELEASE_STYLE.draft,
     )}>
-      {state.replace(/_/g, " ")}
+      {RELEASE_LABEL[state] ?? state}
     </span>
   );
 }
@@ -239,27 +301,73 @@ function ReleaseControls({ release }: { release: PromptReleaseRecord }) {
   const toast = useToast();
   const [rollout, setRollout] = useState(release.rollout_percent ?? 0);
 
+  // Match any scope suffix — e.g. `["prompt-releases", "tenant:ws:proj"]`.
+  // Using a predicate instead of a bare key so the control keeps working
+  // if the caller (PromptsPage) switches to a per-tenant key shape later.
   const invalidate = () => {
-    void qc.invalidateQueries({ queryKey: ["prompt-releases"] });
+    void qc.invalidateQueries({
+      predicate: (q) => Array.isArray(q.queryKey) && q.queryKey[0] === "prompt-releases",
+    });
   };
 
+  // Error handlers surface the backend message (e.g. `insufficient role:
+  // requires prompt_admin`, `already in state approved`) — see audit
+  // finding #377. Prior shape `onError: () => toast.error("Failed to X.")`
+  // swallowed the one piece of context the operator actually needs.
   const activate = useMutation({
     mutationFn: () => defaultApi.activatePromptRelease(release.prompt_release_id),
     onSuccess: () => { toast.success("Release activated."); invalidate(); },
-    onError:   () => toast.error("Failed to activate release."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to activate release.")),
   });
 
   const applyRollout = useMutation({
     mutationFn: () => defaultApi.rolloutPromptRelease(release.prompt_release_id, rollout),
     onSuccess: () => { toast.success(`Rollout set to ${rollout}%.`); invalidate(); },
-    onError:   () => toast.error("Failed to update rollout."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to update rollout.")),
   });
 
   const reqApproval = useMutation({
     mutationFn: () => defaultApi.requestPromptReleaseApproval(release.prompt_release_id),
     onSuccess: () => { toast.success("Approval requested."); invalidate(); },
-    onError:   () => toast.error("Failed to request approval."),
+    onError:   (e) => toast.error(errorMessage(e, "Failed to request approval.")),
   });
+
+  const approve = useMutation({
+    mutationFn: () => defaultApi.transitionPromptRelease(release.prompt_release_id, "approved"),
+    onSuccess: () => { toast.success("Release approved."); invalidate(); },
+    onError:   (e) => toast.error(errorMessage(e, "Failed to approve release.")),
+  });
+
+  const reject = useMutation({
+    mutationFn: () => defaultApi.transitionPromptRelease(release.prompt_release_id, "rejected"),
+    onSuccess: () => { toast.success("Release rejected."); invalidate(); },
+    onError:   (e) => toast.error(errorMessage(e, "Failed to reject release.")),
+  });
+
+  const demote = useMutation({
+    mutationFn: () => defaultApi.transitionPromptRelease(release.prompt_release_id, "approved"),
+    onSuccess: () => { toast.success("Release demoted to approved."); invalidate(); },
+    onError:   (e) => toast.error(errorMessage(e, "Failed to demote release.")),
+  });
+
+  const archive = useMutation({
+    mutationFn: () => defaultApi.transitionPromptRelease(release.prompt_release_id, "archived"),
+    onSuccess: () => { toast.success("Release archived."); invalidate(); },
+    onError:   (e) => toast.error(errorMessage(e, "Failed to archive release.")),
+  });
+
+  // Any pending mutation on this release locks out competing buttons
+  // so we never fire overlapping requests into the same release —
+  // including rollout, which shares the `state` field with state
+  // transitions on the server.
+  const anyPending =
+    reqApproval.isPending
+    || approve.isPending
+    || reject.isPending
+    || activate.isPending
+    || demote.isPending
+    || archive.isPending
+    || applyRollout.isPending;
 
   return (
     <div className="flex items-center gap-2 flex-wrap">
@@ -277,24 +385,72 @@ function ReleaseControls({ release }: { release: PromptReleaseRecord }) {
         </span>
       )}
 
-      {/* State-driven action buttons */}
+      {/* State-driven action buttons. Every transition fired here is
+          one `PromptReleaseState::can_transition_to` permits in cairn-evals:
+          draft       -> proposed (Request Approval) / approved (Approve) / archived
+          proposed    -> approved / rejected / archived
+          approved    -> active (Activate) / archived
+          active      -> approved (Demote) / archived
+          rejected    -> archived
+          A single `anyPending` gate prevents overlapping mutations. */}
       {release.state === "draft" && (
-        <button
-          onClick={() => reqApproval.mutate()}
-          disabled={reqApproval.isPending}
-          className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
-                     bg-amber-900/40 text-amber-300 border border-amber-800/40
-                     hover:bg-amber-900/70 transition-colors disabled:opacity-40"
-        >
-          {reqApproval.isPending ? <Loader2 size={9} className="animate-spin" /> : null}
-          Request Approval
-        </button>
+        <>
+          <button
+            data-testid={`prompt-release-request-approval-btn-${release.prompt_release_id}`}
+            data-pending={reqApproval.isPending ? "true" : "false"}
+            onClick={() => reqApproval.mutate()}
+            disabled={anyPending}
+            className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
+                       bg-amber-900/40 text-amber-300 border border-amber-800/40
+                       hover:bg-amber-900/70 transition-colors disabled:opacity-40"
+          >
+            {reqApproval.isPending ? <Loader2 size={9} className="animate-spin" /> : null}
+            Request Approval
+          </button>
+          {/* Rust matrix permits draft -> approved directly; expose it
+              for operators who self-approve without a separate reviewer. */}
+          <button
+            onClick={() => approve.mutate()}
+            disabled={anyPending}
+            className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
+                       bg-blue-900/40 text-blue-300 border border-blue-800/40
+                       hover:bg-blue-900/70 transition-colors disabled:opacity-40"
+          >
+            {approve.isPending ? <Loader2 size={9} className="animate-spin" /> : <Check size={9} />}
+            Approve
+          </button>
+        </>
+      )}
+
+      {release.state === "proposed" && (
+        <>
+          <button
+            onClick={() => approve.mutate()}
+            disabled={anyPending}
+            className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
+                       bg-blue-900/40 text-blue-300 border border-blue-800/40
+                       hover:bg-blue-900/70 transition-colors disabled:opacity-40"
+          >
+            {approve.isPending ? <Loader2 size={9} className="animate-spin" /> : <Check size={9} />}
+            Approve
+          </button>
+          <button
+            onClick={() => reject.mutate()}
+            disabled={anyPending}
+            className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
+                       bg-red-900/40 text-red-300 border border-red-800/40
+                       hover:bg-red-900/70 transition-colors disabled:opacity-40"
+          >
+            {reject.isPending ? <Loader2 size={9} className="animate-spin" /> : <X size={9} />}
+            Reject
+          </button>
+        </>
       )}
 
       {release.state === "approved" && (
         <button
           onClick={() => activate.mutate()}
-          disabled={activate.isPending}
+          disabled={anyPending}
           className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
                      bg-emerald-900/40 text-emerald-300 border border-emerald-800/40
                      hover:bg-emerald-900/70 transition-colors disabled:opacity-40"
@@ -306,28 +462,59 @@ function ReleaseControls({ release }: { release: PromptReleaseRecord }) {
         </button>
       )}
 
-      {(release.state === "released" || release.state === "rolling_out") && (
-        <div className="flex items-center gap-2">
-          <input
-            type="range" min={0} max={100} step={5}
-            value={rollout}
-            onChange={(e) => setRollout(Number(e.target.value))}
-            className="w-24 accent-indigo-500 cursor-pointer"
-          />
-          <span className="text-[10px] font-mono text-gray-500 dark:text-zinc-400 w-8 text-right tabular-nums">
-            {rollout}%
-          </span>
+      {release.state === "active" && (
+        <>
+          <div className="flex items-center gap-2">
+            <input
+              type="range" min={0} max={100} step={5}
+              value={rollout}
+              onChange={(e) => setRollout(Number(e.target.value))}
+              className="w-24 accent-indigo-500 cursor-pointer"
+            />
+            <span className="text-[10px] font-mono text-gray-500 dark:text-zinc-400 w-8 text-right tabular-nums">
+              {rollout}%
+            </span>
+            <button
+              onClick={() => applyRollout.mutate()}
+              disabled={anyPending || rollout === (release.rollout_percent ?? 0)}
+              className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
+                         bg-indigo-900/40 text-indigo-300 border border-indigo-800/40
+                         hover:bg-indigo-900/70 transition-colors disabled:opacity-40"
+            >
+              {applyRollout.isPending ? <Loader2 size={9} className="animate-spin" /> : <Check size={9} />}
+              Apply
+            </button>
+          </div>
+          {/* Rust permits active -> approved to pull a release out of
+              rotation without archiving it. */}
           <button
-            onClick={() => applyRollout.mutate()}
-            disabled={applyRollout.isPending || rollout === (release.rollout_percent ?? 0)}
+            onClick={() => demote.mutate()}
+            disabled={anyPending}
             className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
-                       bg-indigo-900/40 text-indigo-300 border border-indigo-800/40
-                       hover:bg-indigo-900/70 transition-colors disabled:opacity-40"
+                       bg-blue-900/40 text-blue-300 border border-blue-800/40
+                       hover:bg-blue-900/70 transition-colors disabled:opacity-40"
           >
-            {applyRollout.isPending ? <Loader2 size={9} className="animate-spin" /> : <Check size={9} />}
-            Apply
+            {demote.isPending ? <Loader2 size={9} className="animate-spin" /> : <Pause size={9} />}
+            Demote
           </button>
-        </div>
+        </>
+      )}
+
+      {(release.state === "draft"
+        || release.state === "proposed"
+        || release.state === "approved"
+        || release.state === "active"
+        || release.state === "rejected") && (
+        <button
+          onClick={() => archive.mutate()}
+          disabled={anyPending}
+          className="flex items-center gap-1 rounded px-2 py-0.5 text-[10px] font-medium
+                     bg-zinc-800/60 text-zinc-400 border border-zinc-700/40
+                     hover:bg-zinc-800 transition-colors disabled:opacity-40"
+        >
+          {archive.isPending ? <Loader2 size={9} className="animate-spin" /> : <Package size={9} />}
+          Archive
+        </button>
       )}
     </div>
   );
@@ -336,10 +523,11 @@ function ReleaseControls({ release }: { release: PromptReleaseRecord }) {
 // ── Asset item ────────────────────────────────────────────────────────────────
 
 function AssetItem({
-  asset, releases,
+  asset, releases, sk,
 }: {
   asset: PromptAssetRecord;
   releases: PromptReleaseRecord[];
+  sk: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const qc    = useQueryClient();
@@ -352,28 +540,29 @@ function AssetItem({
   const latestRelease = assetReleases[0];
 
   const { data: versionsData, isLoading: versionsLoading } = useQuery({
-    queryKey: ["prompt-versions", asset.prompt_asset_id],
+    queryKey: ["prompt-versions", sk, asset.prompt_asset_id],
     queryFn: () => defaultApi.getPromptVersions(asset.prompt_asset_id, { limit: 20 }),
     enabled: expanded,
     staleTime: 60_000,
   });
 
-  const versions = (versionsData?.items ?? []).sort(
+  // #425: shared list-shape normalizer.
+  const versions = unwrapList<PromptVersionRecord>(versionsData).sort(
     (a, b) => (b.version_number ?? 0) - (a.version_number ?? 0),
   );
 
   const createRelease = useMutation({
     mutationFn: (versionId: string) =>
       defaultApi.createPromptRelease({
-        prompt_release_id: makeReleaseId(asset.prompt_asset_id),
         prompt_asset_id:   asset.prompt_asset_id,
         prompt_version_id: versionId,
       }),
     onSuccess: () => {
       toast.success("Release created.");
-      void qc.invalidateQueries({ queryKey: ["prompt-releases"] });
+      void qc.invalidateQueries({ queryKey: ["prompt-releases", sk] });
     },
-    onError: () => toast.error("Failed to create release."),
+    // Same #377 fix shape as the seven mutations in `ReleaseActions`.
+    onError: (e) => toast.error(errorMessage(e, "Failed to create release.")),
   });
 
   return (
@@ -383,6 +572,7 @@ function AssetItem({
     )}>
       {/* Collapsed header */}
       <button
+        data-testid={`prompt-asset-expand-btn-${asset.prompt_asset_id}`}
         onClick={() => setExpanded((v) => !v)}
         className="w-full flex items-center gap-3 px-4 py-3 text-left"
       >
@@ -473,12 +663,13 @@ function AssetItem({
 
 // ── New Prompt form ───────────────────────────────────────────────────────────
 
-function NewPromptForm({ onClose }: { onClose: () => void }) {
+function NewPromptForm({ onClose, sk }: { onClose: () => void; sk: string }) {
   const qc    = useQueryClient();
   const toast = useToast();
   const [id,   setId]   = useState("");
   const [name, setName] = useState("");
-  const [kind, setKind] = useState("system");
+  const [kind, setKind] = useState<PromptKind>("system");
+  const [initialBody, setInitialBody] = useState("");
 
   // Close on Escape
   useEffect(() => {
@@ -487,14 +678,51 @@ function NewPromptForm({ onClose }: { onClose: () => void }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Single mutation: create asset, then (if body non-empty) create initial version.
+  // Sequential: version depends on the returned asset_id, and a failure mid-flow
+  // must not block asset discovery — we toast a partial-success message.
   const create = useMutation({
-    mutationFn: () => defaultApi.createPromptAsset({ prompt_asset_id: id.trim(), name: name.trim(), kind }),
-    onSuccess: () => {
-      toast.success("Prompt asset created.");
-      void qc.invalidateQueries({ queryKey: ["prompt-assets"] });
+    mutationFn: async () => {
+      const asset = await defaultApi.createPromptAsset({
+        prompt_asset_id: id.trim(),
+        name: name.trim(),
+        kind,
+      });
+      // Only trim for the emptiness check — send the untouched textarea
+      // value so the stored prompt body matches what the author typed,
+      // including any intentional leading/trailing whitespace or newlines.
+      if (initialBody.trim().length === 0) return { asset, version: null as null };
+      try {
+        const content_hash = await sha256ContentHash(initialBody);
+        const version = await defaultApi.createPromptVersion(asset.prompt_asset_id, {
+          content: initialBody,
+          content_hash,
+        });
+        return { asset, version };
+      } catch (err) {
+        // Asset is created; bubble a partial-success so the operator knows.
+        throw Object.assign(new Error("version_failed"), { assetCreated: true, cause: err });
+      }
+    },
+    onSuccess: (result) => {
+      if (result.version) {
+        toast.success(`Prompt asset “${result.asset.prompt_asset_id}” created with initial version.`);
+      } else {
+        toast.success(`Prompt asset “${result.asset.prompt_asset_id}” created.`);
+      }
+      void qc.invalidateQueries({ queryKey: ["prompt-assets", sk] });
+      void qc.invalidateQueries({ queryKey: ["prompt-versions", sk, result.asset.prompt_asset_id] });
       onClose();
     },
-    onError: () => toast.error("Failed to create prompt asset."),
+    onError: (err: unknown) => {
+      if (err && typeof err === "object" && "assetCreated" in err) {
+        toast.error("Asset created, but initial version failed. Add a version from the asset view.");
+        void qc.invalidateQueries({ queryKey: ["prompt-assets", sk] });
+        onClose();
+      } else {
+        toast.error("Failed to create prompt asset.");
+      }
+    },
   });
 
   const valid = id.trim().length > 0 && name.trim().length > 0;
@@ -529,15 +757,32 @@ function NewPromptForm({ onClose }: { onClose: () => void }) {
         <div>
           <label className="text-[10px] text-gray-400 dark:text-zinc-500 block mb-1">Kind</label>
           <select
-            value={kind} onChange={(e) => setKind(e.target.value)}
+            value={kind}
+            onChange={(e) => {
+              const next = e.target.value;
+              if (isPromptKind(next)) setKind(next);
+            }}
             className="w-full rounded border border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 text-[12px] text-gray-700 dark:text-zinc-300
                        px-2 py-1.5 focus:outline-none focus:border-indigo-500 transition-colors"
           >
-            {["system", "user", "assistant", "tool"].map((k) => (
-              <option key={k} value={k}>{k}</option>
+            {PROMPT_KINDS.map((k) => (
+              <option key={k} value={k}>{KIND_LABEL[k]}</option>
             ))}
           </select>
         </div>
+      </div>
+      <div>
+        <label className="text-[10px] text-gray-400 dark:text-zinc-500 block mb-1">
+          Initial version <span className="text-gray-300 dark:text-zinc-600">(optional — leave blank to author later)</span>
+        </label>
+        <textarea
+          value={initialBody}
+          onChange={(e) => setInitialBody(e.target.value)}
+          placeholder="You are a helpful assistant…"
+          rows={5}
+          className="w-full rounded border border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 text-[12px] text-gray-800 dark:text-zinc-200
+                     font-mono px-2 py-1.5 focus:outline-none focus:border-indigo-500 transition-colors resize-y"
+        />
       </div>
       <div className="flex items-center gap-2 justify-end">
         <button onClick={onClose}
@@ -563,26 +808,29 @@ function NewPromptForm({ onClose }: { onClose: () => void }) {
 
 export function PromptsPage() {
   const [showNew, setShowNew] = useState(false);
-  const [filter, setFilter]  = useState<"all" | "released" | "draft">("all");
+  const [filter, setFilter]  = useState<"all" | "active" | "draft">("all");
+  const [scope] = useScope();
+  const sk = scopeKey(scope);
 
   const { data: assetsData, isLoading: assetsLoading, isError, error, refetch, isFetching } = useQuery({
-    queryKey: ["prompt-assets"],
+    queryKey: ["prompt-assets", sk],
     queryFn: () => defaultApi.getPromptAssets({ limit: 100 }),
     refetchInterval: 60_000,
   });
 
   const { data: releasesData } = useQuery({
-    queryKey: ["prompt-releases"],
+    queryKey: ["prompt-releases", sk],
     queryFn: () => defaultApi.getPromptReleases({ limit: 200 }),
     refetchInterval: 60_000,
     retry: false,
   });
 
-  const assets   = assetsData?.items   ?? [];
-  const releases = releasesData?.items ?? [];
+  // #425: shared list-shape normalizer on both payloads.
+  const assets   = unwrapList<PromptAssetRecord>(assetsData);
+  const releases = unwrapList<PromptReleaseRecord>(releasesData);
 
   // Derive latest release state per asset for filtering
-  const latestState = (assetId: string): string | null => {
+  const latestState = (assetId: string): PromptReleaseState | null => {
     const rels = releases
       .filter((r) => r.prompt_asset_id === assetId)
       .sort((a, b) => b.created_at - a.created_at);
@@ -590,9 +838,9 @@ export function PromptsPage() {
   };
 
   const filtered = assets.filter((a) => {
-    if (filter === "all")      return true;
-    if (filter === "released") return latestState(a.prompt_asset_id) === "released" || latestState(a.prompt_asset_id) === "rolling_out";
-    if (filter === "draft")    return !latestState(a.prompt_asset_id) || latestState(a.prompt_asset_id) === "draft";
+    if (filter === "all")    return true;
+    if (filter === "active") return latestState(a.prompt_asset_id) === "active";
+    if (filter === "draft")  return !latestState(a.prompt_asset_id) || latestState(a.prompt_asset_id) === "draft";
     return true;
   });
 
@@ -625,7 +873,7 @@ export function PromptsPage() {
 
         {/* Filter tabs */}
         <div className="flex items-center gap-0 ml-4">
-          {(["all", "released", "draft"] as const).map((f) => (
+          {(["all", "active", "draft"] as const).map((f) => (
             <button
               key={f}
               onClick={() => setFilter(f)}
@@ -660,11 +908,15 @@ export function PromptsPage() {
           </button>
         </div>
       </div>
+      {/* F32 — inline entity explainer. */}
+      <div className="px-5 py-1.5 border-b border-gray-200 dark:border-zinc-800 shrink-0">
+        <EntityExplainer>{ENTITY_EXPLAINERS.prompt}</EntityExplainer>
+      </div>
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3 max-w-4xl mx-auto w-full">
         {/* New Prompt form */}
-        {showNew && <NewPromptForm onClose={() => setShowNew(false)} />}
+        {showNew && <NewPromptForm sk={sk} onClose={() => setShowNew(false)} />}
 
         {/* Asset list */}
         {assetsLoading ? (
@@ -680,6 +932,7 @@ export function PromptsPage() {
                 ? "No prompt assets yet — create one to get started."
                 : `No prompts match the "${filter}" filter.`}
             </p>
+            <EmptyScopeHint empty={assets.length === 0} className="max-w-lg" />
           </div>
         ) : (
           filtered.map((asset) => (
@@ -687,6 +940,7 @@ export function PromptsPage() {
               key={asset.prompt_asset_id}
               asset={asset}
               releases={releases}
+              sk={sk}
             />
           ))
         )}

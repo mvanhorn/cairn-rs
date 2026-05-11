@@ -14,10 +14,7 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "system-status-token";
 
-async fn app_with_token() -> (
-    axum::Router,
-    std::sync::Arc<cairn_runtime::InMemoryServices>,
-) {
+async fn app_with_token() -> (axum::Router, std::sync::Arc<cairn_runtime::RuntimeServices>) {
     let (app, state) = support::build_test_router_fake_fabric(BootstrapConfig::default()).await;
     state.service_tokens.register(
         TOKEN.to_string(),

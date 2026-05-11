@@ -521,7 +521,40 @@ impl<S> MarketplaceService<S> {
             run_id,
             enabled_plugins,
             allowlisted_tools,
+            // RFC 029 / RFC 030: populated by
+            // `build_visibility_context_for_run` at run-start time, once
+            // the resolved provider snapshots are known. The legacy entry
+            // point used by project-level queries leaves both slots
+            // `None`; callers that need `is_tool_visible` gating on
+            // `memory_store` must go through the *_for_run helper.
+            resolved_knowledge_provider: None,
+            resolved_memory_provider: None,
         }
+    }
+
+    /// RFC 029 / RFC 030: run-scoped variant of [`build_visibility_context`]
+    /// that also resolves the project's per-family provider snapshots. The
+    /// caller supplies each snapshot — typically derived from the latest
+    /// `{Memory,Knowledge}ProviderConfigured` event plus the plugin host's
+    /// cached handshake for a `plugin:<id>` ref — because the marketplace
+    /// service has no visibility into the plugin host.
+    ///
+    /// When both snapshots are `None`, behaviour matches
+    /// [`build_visibility_context`] (every built-in stays visible). Use
+    /// this variant on the run-start path so `memory_store` is hidden from
+    /// the prompt for projects whose memory backend auto-extracts or is
+    /// ingest-disabled.
+    pub fn build_visibility_context_for_run(
+        &self,
+        project: &ProjectKey,
+        run_id: RunId,
+        resolved_knowledge_provider: Option<cairn_domain::events::ResolvedProviderSnapshot>,
+        resolved_memory_provider: Option<cairn_domain::events::ResolvedProviderSnapshot>,
+    ) -> VisibilityContext {
+        let mut ctx = self.build_visibility_context(project, Some(run_id));
+        ctx.resolved_knowledge_provider = resolved_knowledge_provider;
+        ctx.resolved_memory_provider = resolved_memory_provider;
+        ctx
     }
 
     // ── Command Handlers ─────────────────────────────────────────────────
@@ -829,6 +862,72 @@ pub fn catalog_entry_to_descriptor(entry: CatalogEntry) -> PluginDescriptor {
 
 // ── Visibility Filtering (RFC 015 §"Per-Run Tool Visibility") ────────────────
 
+/// RFC 029 amends RFC 015: a small set of built-in tools may now be hidden
+/// from the agent prompt depending on visibility context. The set is
+/// compile-time closed on purpose — arbitrary built-ins don't become
+/// gate-able at a distance.
+///
+/// `memory_store` is gated by the resolved memory provider (RFC 030):
+///   - `auto_extract = Some(true)` → hidden (the provider picks up context
+///     from conversation turns itself; an explicit store path is either a
+///     no-op or double-writes). This is mem0's default mode.
+///   - `ingest_capable = false` → hidden (provider doesn't accept
+///     explicit stores, e.g. a read-only memory corpus).
+///   - otherwise → visible.
+///
+/// Back-compat during the RFC 030 rollout: if the memory slot is
+/// unpopulated (pre-PR-G run, legacy serialised context) the check falls
+/// back to the RFC 029 knowledge-snapshot rule so `memory_store` visibility
+/// stays consistent with what the agent saw before the split.
+pub const GATABLE_BUILTINS: &[&str] = &["memory_store"];
+
+/// Unified visibility check for any tool (plugin-provided or built-in).
+///
+/// - For a plugin-provided tool (`plugin_id = Some(id)`) the legacy RFC 015
+///   allowlist rules apply — plugin enabled + tool on allowlist.
+/// - For a built-in tool (`plugin_id = None`) the default is visible; the
+///   exception is entries in [`GATABLE_BUILTINS`], which consult the
+///   resolved memory (preferred) or knowledge (fallback) provider
+///   snapshots.
+pub fn is_tool_visible(ctx: &VisibilityContext, plugin_id: Option<&str>, tool_name: &str) -> bool {
+    match plugin_id {
+        Some(pid) => is_plugin_tool_visible(ctx, pid, tool_name),
+        None => {
+            if GATABLE_BUILTINS.contains(&tool_name) {
+                memory_store_visible(ctx)
+            } else {
+                true
+            }
+        }
+    }
+}
+
+/// Compute `memory_store` visibility per RFC 030. Factored out so the
+/// three-way decision (auto_extract suppression / ingest_capable gate /
+/// RFC 029 fallback) has a single home with a readable control-flow.
+fn memory_store_visible(ctx: &VisibilityContext) -> bool {
+    if let Some(snap) = &ctx.resolved_memory_provider {
+        // RFC 030: memory slot is authoritative when populated.
+        // auto_extract providers suppress memory_store outright; for the
+        // explicit-store backends the ingest_capable flag decides.
+        if snap.auto_extract == Some(true) {
+            return false;
+        }
+        return snap.ingest_capable;
+    }
+    // Pre-RFC-030 fallback: use the knowledge snapshot so runs that never
+    // received the memory slot see the same visibility they did under
+    // RFC 029. auto_extract never appears on knowledge snapshots, so only
+    // ingest_capable matters here.
+    match &ctx.resolved_knowledge_provider {
+        Some(snap) => snap.ingest_capable,
+        // No provider resolved at all → default to visible, matching the
+        // pre-RFC-029 behaviour and cairn-default's ingest_capable = true
+        // posture.
+        None => true,
+    }
+}
+
 /// Check whether a plugin tool is visible in the given VisibilityContext.
 ///
 /// A tool is visible if:
@@ -836,8 +935,9 @@ pub fn catalog_entry_to_descriptor(entry: CatalogEntry) -> PluginDescriptor {
 /// 2. Either the plugin has no tool allowlist (None = all tools visible)
 ///    or the tool name is in the allowlist
 ///
-/// Built-in cairn tools (not from plugins) are always visible — this function
-/// only gates plugin-provided tools.
+/// Built-in cairn tools (not from plugins) are not gated by this function —
+/// see [`is_tool_visible`] for the unified check that also covers the
+/// `GATABLE_BUILTINS` set.
 pub fn is_plugin_tool_visible(ctx: &VisibilityContext, plugin_id: &str, tool_name: &str) -> bool {
     if !ctx.enabled_plugins.contains(plugin_id) {
         return false;
@@ -1453,6 +1553,159 @@ mod tests {
         ));
         // Tool from a non-enabled plugin is not visible
         assert!(!is_plugin_tool_visible(&ctx, "slack", "slack.send_message"));
+    }
+
+    #[test]
+    fn is_tool_visible_falls_back_to_knowledge_snapshot_without_memory_slot() {
+        // Back-compat rule (RFC 030 rollout window): when the memory slot
+        // is unpopulated (pre-PR-G run, legacy serialised context) the
+        // `memory_store` check falls back to the knowledge snapshot's
+        // ingest_capable flag so agent visibility stays consistent.
+        use cairn_domain::events::ResolvedProviderSnapshot;
+
+        let mut ctx = VisibilityContext {
+            project: project_p1(),
+            run_id: None,
+            enabled_plugins: HashSet::new(),
+            allowlisted_tools: HashMap::new(),
+            resolved_knowledge_provider: None,
+            resolved_memory_provider: None,
+        };
+
+        // No resolver at all → visible (parity with pre-RFC-029).
+        assert!(is_tool_visible(&ctx, None, "memory_store"));
+
+        // Knowledge-only snapshot with ingest_capable = true → visible.
+        ctx.resolved_knowledge_provider = Some(ResolvedProviderSnapshot {
+            provider_id: "cairn-default".into(),
+            ingest_capable: true,
+            retrieval_modes: vec!["hybrid".into()],
+            scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+            auto_extract: None,
+        });
+        assert!(is_tool_visible(&ctx, None, "memory_store"));
+
+        // Knowledge-only snapshot with ingest_capable = false → hidden.
+        ctx.resolved_knowledge_provider = Some(ResolvedProviderSnapshot {
+            provider_id: "plugin:bedrock-kb".into(),
+            ingest_capable: false,
+            retrieval_modes: vec!["hybrid".into()],
+            scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+            auto_extract: None,
+        });
+        assert!(!is_tool_visible(&ctx, None, "memory_store"));
+
+        // Other built-ins stay visible regardless.
+        assert!(is_tool_visible(&ctx, None, "memory_search"));
+    }
+
+    #[test]
+    fn is_tool_visible_hides_memory_store_when_memory_backend_auto_extracts() {
+        // RFC 030: mem0-style auto_extract backends suppress memory_store
+        // outright — the provider picks up context from turns itself.
+        use cairn_domain::events::ResolvedProviderSnapshot;
+
+        let ctx = VisibilityContext {
+            project: project_p1(),
+            run_id: None,
+            enabled_plugins: HashSet::new(),
+            allowlisted_tools: HashMap::new(),
+            // Knowledge slot happens to say ingest_capable = true — it must
+            // be ignored when the memory slot is populated.
+            resolved_knowledge_provider: Some(ResolvedProviderSnapshot {
+                provider_id: "cairn-default".into(),
+                ingest_capable: true,
+                retrieval_modes: vec!["hybrid".into()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+                auto_extract: None,
+            }),
+            resolved_memory_provider: Some(ResolvedProviderSnapshot {
+                provider_id: "plugin:mem0".into(),
+                ingest_capable: true,
+                retrieval_modes: vec!["vector_only".into()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+                auto_extract: Some(true),
+            }),
+        };
+
+        assert!(
+            !is_tool_visible(&ctx, None, "memory_store"),
+            "auto_extract memory provider must suppress memory_store"
+        );
+    }
+
+    #[test]
+    fn is_tool_visible_hides_memory_store_when_memory_backend_read_only() {
+        // Non-auto-extract memory backend that still refuses explicit
+        // ingest (e.g. read-only episodic corpus) hides `memory_store`.
+        use cairn_domain::events::ResolvedProviderSnapshot;
+
+        let ctx = VisibilityContext {
+            project: project_p1(),
+            run_id: None,
+            enabled_plugins: HashSet::new(),
+            allowlisted_tools: HashMap::new(),
+            resolved_knowledge_provider: None,
+            resolved_memory_provider: Some(ResolvedProviderSnapshot {
+                provider_id: "plugin:readonly-memory".into(),
+                ingest_capable: false,
+                retrieval_modes: vec!["vector_only".into()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+                auto_extract: Some(false),
+            }),
+        };
+
+        assert!(!is_tool_visible(&ctx, None, "memory_store"));
+    }
+
+    #[test]
+    fn is_tool_visible_shows_memory_store_when_memory_backend_explicit_and_ingest_capable() {
+        use cairn_domain::events::ResolvedProviderSnapshot;
+
+        let ctx = VisibilityContext {
+            project: project_p1(),
+            run_id: None,
+            enabled_plugins: HashSet::new(),
+            allowlisted_tools: HashMap::new(),
+            resolved_knowledge_provider: None,
+            resolved_memory_provider: Some(ResolvedProviderSnapshot {
+                provider_id: "cairn-default".into(),
+                ingest_capable: true,
+                retrieval_modes: vec!["hybrid".into()],
+                scoring_dimensions_surfaced: vec!["semantic_relevance".into()],
+                auto_extract: Some(false),
+            }),
+        };
+
+        assert!(is_tool_visible(&ctx, None, "memory_store"));
+    }
+
+    #[test]
+    fn is_tool_visible_delegates_plugin_tools_to_plugin_check() {
+        let mut svc = MarketplaceService::new(test_store());
+        svc.list_plugin(github_descriptor());
+        svc.handle_command(MarketplaceCommand::InstallPlugin {
+            plugin_id: "github".into(),
+            initiated_by: operator(),
+        })
+        .unwrap();
+        svc.handle_command(MarketplaceCommand::EnablePluginForProject {
+            plugin_id: "github".into(),
+            project: project_p1(),
+            tool_allowlist: Some(vec!["github.get_issue".into()]),
+            signal_allowlist: None,
+            signal_capture_override: None,
+            enabled_by: operator(),
+        })
+        .unwrap();
+
+        let ctx = svc.build_visibility_context(&project_p1(), None);
+        assert!(is_tool_visible(&ctx, Some("github"), "github.get_issue"));
+        assert!(!is_tool_visible(
+            &ctx,
+            Some("github"),
+            "github.create_pull_request"
+        ));
     }
 
     #[test]

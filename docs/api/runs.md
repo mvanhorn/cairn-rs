@@ -4,7 +4,7 @@ Agent run lifecycle: create/list/detail, orchestration, checkpoint, resume, canc
 
 Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes.tsv). Drift from this table against the live router is enforced by `cargo test -p cairn-api --test compat_catalog_sync`.
 
-**Routes: 40**
+**Routes: 41**
 
 | Method | Path | Classification | Notes |
 |---|---|---|---|
@@ -38,8 +38,11 @@ Source of truth: [`tests/compat/http_routes.tsv`](../../tests/compat/http_routes
 | `GET` | `/v1/runs/:id/sla` | Preserve |  |
 | `POST` | `/v1/runs/:id/sla` | Preserve |  |
 | `POST` | `/v1/runs/:id/spawn` | Preserve |  |
+| `GET` | `/v1/runs/:id/subagent-spawns` | Preserve | #670 G1+G2; query: limit?, offset?; `{ items, hasMore }` rows from the `subagent_spawns` projection with LLM-delegated `goal` + `role` |
 | `GET` | `/v1/runs/:id/tasks` | Preserve |  |
 | `POST` | `/v1/runs/:id/tasks` | Preserve |  |
+| `GET` | `/v1/runs/:id/telemetry` | Preserve | F29 CD; live-aggregated `{state, stuck, provider_calls, tool_invocations, totals, phase_timings}` |
+| `GET` | `/v1/runs/:id/trajectory` | Preserve | #789; query: limit?, offset?; chronological per-iteration reasoning steps (chain-of-thought + top-1 proposed action + step-history snapshot + confidence) for post-mortem replay |
 | `GET` | `/v1/runs/:id/tool-invocations` | Preserve |  |
 | `POST` | `/v1/runs/batch` | Preserve |  |
 | `GET` | `/v1/runs/cost-alerts` | Preserve | { items } |

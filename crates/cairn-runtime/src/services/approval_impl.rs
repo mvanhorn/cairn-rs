@@ -1,13 +1,32 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cairn_domain::*;
-use cairn_store::projections::{ApprovalReadModel, ApprovalRecord, RunReadModel};
+use cairn_store::projections::{
+    ApprovalDelegationReadModel, ApprovalDelegationRecord, ApprovalReadModel, ApprovalRecord,
+    RunReadModel,
+};
 use cairn_store::EventLog;
 
 use super::event_helpers::make_envelope;
 use crate::approvals::ApprovalService;
 use crate::error::RuntimeError;
+
+/// Monotonic counter for `delegation_id` mint. Combined with the wall
+/// clock (`delegated_at_ms`) it guarantees uniqueness even when two
+/// delegations of the same approval to the same operator race into
+/// the same millisecond — the PK was previously `(approval_id,
+/// delegated_to, delegated_at_ms)` which silently dropped one of those
+/// rows under `ON CONFLICT DO NOTHING`. Same pattern as
+/// `AUDIT_COUNTER` in `audit_impl.rs`.
+static DELEGATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_delegation_id(approval_id: &ApprovalId, delegated_at_ms: u64) -> String {
+    let seq = DELEGATION_COUNTER.fetch_add(1, Ordering::SeqCst);
+    format!("deleg_{}_{delegated_at_ms}_{seq}", approval_id.as_str())
+}
 
 pub struct ApprovalServiceImpl<S> {
     store: Arc<S>,
@@ -22,7 +41,7 @@ impl<S> ApprovalServiceImpl<S> {
 #[async_trait]
 impl<S> ApprovalService for ApprovalServiceImpl<S>
 where
-    S: EventLog + ApprovalReadModel + RunReadModel + 'static,
+    S: EventLog + ApprovalReadModel + ApprovalDelegationReadModel + RunReadModel + 'static,
 {
     async fn request(
         &self,
@@ -190,5 +209,87 @@ where
         offset: usize,
     ) -> Result<Vec<ApprovalRecord>, RuntimeError> {
         Ok(self.store.list_all(project, limit, offset).await?)
+    }
+
+    async fn delegate(
+        &self,
+        approval_id: &ApprovalId,
+        delegated_to: String,
+    ) -> Result<ApprovalDelegationRecord, RuntimeError> {
+        if delegated_to.trim().is_empty() {
+            return Err(RuntimeError::Validation {
+                reason: "delegated_to must not be empty".to_owned(),
+            });
+        }
+
+        let approval = ApprovalReadModel::get(self.store.as_ref(), approval_id)
+            .await?
+            .ok_or_else(|| RuntimeError::NotFound {
+                entity: "approval",
+                id: approval_id.to_string(),
+            })?;
+
+        if approval.decision.is_some() {
+            return Err(RuntimeError::InvalidTransition {
+                entity: "approval",
+                from: "resolved".into(),
+                to: "delegated".into(),
+            });
+        }
+
+        // Clock safety (Copilot #571): `duration_since(UNIX_EPOCH)` can
+        // fail if the host clock is before the epoch (a mis-configured
+        // VM, a failed NTP sync on cold boot). The prior
+        // `unwrap_or_default()` silently produced ms = 0, which would
+        // both lose audit-trail ordering and create PK collisions with
+        // the earliest possible delegation. The `as_millis()` → `u64`
+        // cast was also unchecked. Fail loudly on either anomaly so
+        // operators see the bad clock rather than a corrupted audit
+        // trail.
+        let delegated_at_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|err| {
+                    RuntimeError::Internal(format!("system clock is before UNIX_EPOCH: {err}"))
+                })?
+                .as_millis(),
+        )
+        .map_err(|_| {
+            RuntimeError::Internal(
+                "delegated_at_ms overflow converting u128 milliseconds to u64".to_owned(),
+            )
+        })?;
+
+        // Copilot #571 round 4: `delegation_id` widens the PK so two
+        // delegations of the same approval to the same operator in the
+        // same millisecond both survive the projection. Previously the
+        // PK was `(approval_id, delegated_to, delegated_at_ms)` which
+        // would silently drop the second row under ON CONFLICT DO NOTHING.
+        let delegation_id = next_delegation_id(approval_id, delegated_at_ms);
+
+        let event = make_envelope(RuntimeEvent::ApprovalDelegated(ApprovalDelegated {
+            approval_id: approval_id.clone(),
+            delegated_to: delegated_to.clone(),
+            delegated_at_ms,
+            delegation_id: delegation_id.clone(),
+        }));
+        self.store.append(&[event]).await?;
+
+        Ok(ApprovalDelegationRecord {
+            approval_id: approval_id.clone(),
+            delegated_to,
+            delegated_at_ms,
+            delegation_id,
+        })
+    }
+
+    async fn list_delegations(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<Vec<ApprovalDelegationRecord>, RuntimeError> {
+        Ok(
+            ApprovalDelegationReadModel::list_for_approval(self.store.as_ref(), approval_id)
+                .await?,
+        )
     }
 }

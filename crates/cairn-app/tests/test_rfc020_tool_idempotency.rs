@@ -69,10 +69,16 @@ fn base_ctx(run_id: &str, is_recovery: bool) -> OrchestrationContext {
         agent_type: "orchestrator".to_owned(),
         run_started_at_ms: 1_000_000,
         working_dir: PathBuf::from("."),
+        completion_contract: None,
         run_mode: RunMode::Direct,
         discovered_tool_names: vec![],
         step_history: vec![],
         is_recovery,
+        approval_timeout: None,
+        visibility: None,
+        parent_context: None,
+        declared_but_missing: OrchestrationContext::empty_declared_but_missing(),
+        agent_role_list_cache: OrchestrationContext::empty_agent_role_list_cache(),
     }
 }
 
@@ -153,6 +159,7 @@ fn build_execute_phase(
         .checkpoint_every_n_tool_calls(1000)
         .tool_result_cache(cache)
         .build()
+        .expect("test fixture supplies all required services")
 }
 
 fn decide_with(proposal: ActionProposal) -> DecideOutput {
@@ -165,6 +172,10 @@ fn decide_with(proposal: ActionProposal) -> DecideOutput {
         latency_ms: 0,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     }
 }
 
@@ -290,6 +301,10 @@ async fn parallel_calls_of_same_tool_get_distinct_ids() {
         latency_ms: 0,
         input_tokens: None,
         output_tokens: None,
+        system_prompt: String::new(),
+        messages_json: "[]".to_owned(),
+        tool_calls_json: "[]".to_owned(),
+        tool_defs_json: "[]".to_owned(),
     };
     execute.execute(&ctx, &decide).await.expect("dispatch");
 
@@ -527,6 +542,7 @@ async fn batched_append_is_atomic_all_or_none() {
             tool_name: "memory_store".to_owned(),
         },
         ExecutionClass::SandboxedProcess,
+        None,
     )
     .await
     .expect("record_start");

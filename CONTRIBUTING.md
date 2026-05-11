@@ -141,6 +141,28 @@ SSE, admin, LLM generation, and more.
 
 ---
 
+## Git hooks
+
+Install the shared git hooks once per checkout:
+
+```bash
+./scripts/install-hooks.sh
+```
+
+This points `git config core.hooksPath` at `.githooks/` so every hook is
+activated and picks up updates on `git pull` without a re-install.
+
+| Hook | What it runs |
+|------|--------------|
+| `.githooks/pre-commit` | `cargo fmt --check`, `cargo clippy`, and the RFC-025 `log_stub` guard (rejects new silent-no-op projections in pg/sqlite). |
+| `.githooks/pre-push`   | workspace lib tests, runtime + orchestrator integration tests, fabric testcontainer suite (if docker is available), UI build, vitest. |
+
+The RFC-025 guard is **also enforced in CI** (`.github/workflows/ci.yml`), so
+skipping local hooks does not bypass it — it only moves the failure from
+your laptop to the PR check. See
+[`docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md`](./docs/design/rfcs/RFC-025-runtime-aggregate-backend-abstraction.md)
+for the projection-registry contract.
+
 ## Code style
 
 ### Rust

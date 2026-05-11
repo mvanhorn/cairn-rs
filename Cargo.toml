@@ -6,6 +6,7 @@ members = [
     "crates/cairn-tools",
     "crates/cairn-tools-derive",
     "crates/cairn-harness-tools",
+    "crates/cairn-skills",
     "crates/cairn-memory",
     "crates/cairn-graph",
     "crates/cairn-agent",
@@ -13,6 +14,7 @@ members = [
     "crates/cairn-signal",
     "crates/cairn-channels",
     "crates/cairn-api",
+    "crates/cairn-api-contracts",
     "crates/cairn-plugin-catalog",
     "crates/cairn-plugin-proto",
     "crates/cairn-app",
@@ -21,6 +23,9 @@ members = [
     "crates/cairn-github",
     "crates/cairn-integrations",
     "crates/cairn-fabric",
+    "crates/cairn-knowledge-compliance",
+    "crates/cairn-memory-compliance",
+    "crates/cairn-provider-compliance-core",
 ]
 resolver = "2"
 

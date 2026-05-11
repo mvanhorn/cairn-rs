@@ -1,0 +1,28 @@
+[package]
+name = "cairn-knowledge-compliance"
+version = "0.1.0"
+edition = "2021"
+license = "BSL-1.1"
+publish = false
+
+# RFC 029 PR-C: shape-only compliance suite for the KnowledgeProvider
+# plugin contract. Runs against any `KnowledgePluginDispatcher` + any
+# in-process `RetrievalService` that round-trips the wire types.
+#
+# Not a production dependency — the suite is test-only. Other crates
+# invoke it via `dev-dependencies` or run its own integration tests.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cairn-domain = { path = "../cairn-domain" }
+cairn-graph = { path = "../cairn-graph" }
+cairn-memory = { path = "../cairn-memory" }
+cairn-plugin-proto = { path = "../cairn-plugin-proto" }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

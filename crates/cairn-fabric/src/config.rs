@@ -1,25 +1,63 @@
 use std::collections::BTreeSet;
 
 use crate::error::FabricError;
-use ff_core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
+use flowfabric::core::backend::{BackendConfig, BackendConnection, ValkeyConnection};
+use flowfabric::core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
 
 #[derive(Clone, Debug)]
 pub struct FabricConfig {
-    pub valkey_host: String,
-    pub valkey_port: u16,
-    pub tls: bool,
-    pub cluster: bool,
+    /// Backend connection config. Single source of truth for the
+    /// Valkey host/port/TLS/cluster knobs (replaces the four flat
+    /// fields that pre-dated FF's `BackendConfig` reshape). Populated
+    /// from the `CAIRN_FABRIC_URL` env var via [`Self::from_env`] —
+    /// see [`parse_fabric_url`] for the scheme table.
+    pub backend: BackendConfig,
     pub lane_id: LaneId,
     pub worker_id: WorkerId,
     pub worker_instance_id: WorkerInstanceId,
     pub namespace: Namespace,
+    /// Lease TTL in milliseconds applied to every FF execution lease
+    /// cairn claims. Overridable via `CAIRN_FABRIC_LEASE_TTL_MS`.
+    ///
+    /// **Default: `180_000` (3 minutes).**
+    ///
+    /// # Tradeoff
+    ///
+    /// * **Shorter TTL** → faster stuck-run recovery. When a worker
+    ///   genuinely crashes, the lease expires sooner and FF's
+    ///   `LeaseExpiryScanner` promotes the execution back to
+    ///   `eligible` for re-claim. Recovery latency ≈ TTL.
+    /// * **Longer TTL** → fewer spurious `lease_expired` failures on
+    ///   pull-mode drivers. `POST /v1/runs/:id/orchestrate` runs one
+    ///   iteration per HTTP call and returns; between calls nobody
+    ///   renews the lease. Operator-paced approval flows + LLM tail
+    ///   latency + tool execution routinely exceed short TTLs.
+    ///
+    /// # Why 180_000 (3 min)
+    ///
+    /// F63 dogfood (2026-04-27) on the F62 binary showed the previous
+    /// `30_000` default routinely expired between orchestrate calls:
+    /// LLM tail (~30 s) + operator approval think-time (~60 s) + tool
+    /// exec (~30 s) easily exceeded 30 s. Every expiry tripped F62's
+    /// `TerminalWriteDeadlock` path and lost the LLM's productive work.
+    ///
+    /// `180_000` covers the typical end-to-end iteration (LLM plus
+    /// human plus tools) with headroom, while keeping recovery latency
+    /// on the rare actual-crash path bounded (3 min vs the 600 s
+    /// workaround previously reverted in F43 triage — that one 20×'d
+    /// zombie recovery and bloated the `worker_leases` index).
+    ///
+    /// FF's dual-door deadlock (the upstream root cause this default
+    /// mitigates) is tracked at
+    /// <https://github.com/avifenesh/FlowFabric/issues/371>. Once FF
+    /// ships the fix we can revisit this default downward.
     pub lease_ttl_ms: u64,
     pub grant_ttl_ms: u64,
     pub max_concurrent_tasks: usize,
     pub signal_dedup_ttl_ms: u64,
     pub fcall_timeout_ms: u64,
     /// Capabilities this worker advertises. Threaded into FF's
-    /// `ff_issue_claim_grant` via `ff_scheduler::Scheduler::claim_for_worker`;
+    /// `ff_issue_claim_grant` via `flowfabric::scheduler::Scheduler::claim_for_worker`;
     /// FF skips executions whose `required_capabilities` are not a subset.
     /// BTreeSet guarantees the CSV FF builds is deterministically ordered.
     /// Empty set = "no capabilities advertised" (FF accepts, matches only
@@ -54,23 +92,95 @@ pub struct FabricConfig {
     /// when `waitpoint_hmac_secret` is `Some`. Arbitrary operator-chosen
     /// string; FF uses it only as a lookup key in its secrets hash.
     pub waitpoint_hmac_kid: Option<String>,
+    /// #743 Part B: opt-in boot-time waitpoint HMAC kid rotation.
+    ///
+    /// When `true`, [`crate::FabricServices::start`] calls
+    /// `ControlPlaneBackend::rotate_waitpoint_hmac` on the operator-
+    /// supplied `(kid, secret)` pair BEFORE the seed step. This is the
+    /// in-process recovery path for the reboot landmine where Valkey
+    /// carries a `current_kid` from a prior run that doesn't match the
+    /// env-supplied one.
+    ///
+    /// **When to set**: only after an operator has read the Part A
+    /// actionable error message (kid mismatch on boot) and decided to
+    /// rotate rather than match the persisted kid. Default-off because
+    /// rotation drains the prior kid's grace window — operators should
+    /// opt in deliberately, not by accident on every boot.
+    ///
+    /// Parsed from `CAIRN_FABRIC_WAITPOINT_HMAC_BOOTSTRAP_KID_RESET` by
+    /// [`Self::from_env`]. The accept-set matches the
+    /// `CAIRN_CHILD_RUN_DRIVER_ENABLED` opt-in convention (`"1"`,
+    /// `"true"`, `"yes"`, `"on"` — case-insensitive).
+    pub waitpoint_hmac_bootstrap_kid_reset: bool,
+    /// Which storage backend the FabricServices aggregate should bring
+    /// up. Parsed from the `CAIRN_FABRIC_BACKEND` env var by
+    /// [`Self::from_env`] (default: [`BackendKind::Valkey`]).
+    ///
+    /// Always-compiled (not behind any Cargo feature) so the field is
+    /// visible to operators regardless of which backend features the
+    /// binary was built with. A mismatch between the requested kind
+    /// and the enabled Cargo features is caught in
+    /// [`Self::validate`] with an actionable error message.
+    ///
+    /// PR-C3 lands the field + parser; the runtime dispatch arm that
+    /// consumes it (`FabricServices::start` matching on `backend_kind`)
+    /// stubs the Postgres branch until PR-C4 wires
+    /// `PostgresFabricRuntime::start`.
+    pub backend_kind: BackendKind,
+}
+
+/// Which storage backend cairn-fabric should bring up.
+///
+/// Orthogonal to the [`BackendConnection`] carried by
+/// [`FabricConfig::backend`]: `BackendConnection` describes the *wire*
+/// (Valkey host/port, Postgres URL) while `BackendKind` selects which
+/// cairn-fabric runtime (valkey / postgres) dispatches the services
+/// on top. Today they agree 1:1 (Valkey wire → Valkey runtime), but
+/// the separate enum lets PR-C4 wire a Postgres runtime without
+/// refactoring the wire-config enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Valkey,
+    Postgres,
+}
+
+impl BackendKind {
+    /// Human-readable token used in env-var parsing and error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valkey => "valkey",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+impl std::str::FromStr for BackendKind {
+    type Err = FabricError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Accept lowercase ASCII only. The env-var parser in
+        // `FabricConfig::from_env` trims + lowercases before calling us.
+        match s {
+            "valkey" => Ok(Self::Valkey),
+            "postgres" => Ok(Self::Postgres),
+            other => Err(FabricError::Config(format!(
+                "CAIRN_FABRIC_BACKEND must be one of [valkey, postgres], got '{other}'"
+            ))),
+        }
+    }
 }
 
 impl FabricConfig {
     pub fn from_env() -> Result<Self, FabricError> {
-        let valkey_host = std::env::var("CAIRN_FABRIC_HOST").unwrap_or_else(|_| "localhost".into());
-        let valkey_port = std::env::var("CAIRN_FABRIC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6379);
-        let tls = std::env::var("CAIRN_FABRIC_TLS")
-            .ok()
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
-        let cluster = std::env::var("CAIRN_FABRIC_CLUSTER")
-            .ok()
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        // Parse `CAIRN_FABRIC_URL`; if unset, fall back to the default
+        // Valkey endpoint (`valkey://localhost:6379`). There is no
+        // legacy env-var fallback — `CAIRN_FABRIC_HOST/PORT/TLS/CLUSTER`
+        // were removed when cairn-rs migrated to `BackendConfig`.
+        let backend = match std::env::var("CAIRN_FABRIC_URL") {
+            Ok(url) if !url.is_empty() => parse_fabric_url(&url)?,
+            _ => BackendConfig::valkey("localhost", 6379),
+        };
+
         let lane_id =
             LaneId::new(std::env::var("CAIRN_FABRIC_LANE").unwrap_or_else(|_| "cairn".into()));
         let worker_id = WorkerId::new(
@@ -83,10 +193,12 @@ impl FabricConfig {
         let namespace = Namespace::new(
             std::env::var("CAIRN_FABRIC_NAMESPACE").unwrap_or_else(|_| "cairn".into()),
         );
+        // Default 180_000 (3 min) — see `lease_ttl_ms` field docs for
+        // the F63 rationale and the upstream FF#371 cross-reference.
         let lease_ttl_ms = std::env::var("CAIRN_FABRIC_LEASE_TTL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(30_000);
+            .unwrap_or(180_000);
         let grant_ttl_ms = std::env::var("CAIRN_FABRIC_GRANT_TTL_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -106,7 +218,7 @@ impl FabricConfig {
         // Comma-separated capability tokens. Empty / unset = no capabilities.
         // FF validates tokens server-side (no commas, no whitespace/control,
         // CAPS_MAX_TOKENS cap); fail-loud validation lives in
-        // ff_scheduler::Scheduler::claim_for_worker.
+        // flowfabric::scheduler::Scheduler::claim_for_worker.
         let worker_capabilities: BTreeSet<String> =
             std::env::var("CAIRN_FABRIC_WORKER_CAPABILITIES")
                 .ok()
@@ -117,20 +229,63 @@ impl FabricConfig {
                         .collect()
                 })
                 .unwrap_or_default();
-        // HMAC secret: hex-encoded 32-byte key. No default — operators must
-        // opt in explicitly. Validation enforces shape in `validate()`.
-        let waitpoint_hmac_secret = std::env::var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET")
-            .ok()
-            .filter(|s| !s.is_empty());
+        // HMAC secret: 32-byte key. No default — operators must opt
+        // in explicitly. Accepts either 64-char lowercase hex OR a
+        // STANDARD-alphabet base64 string that decodes to 32 bytes
+        // (typically 44 chars with padding) — matching the shape
+        // accepted by `CAIRN_CREDENTIAL_KEY` (#742). The decoded
+        // bytes are re-encoded to hex here so the rest of the
+        // pipeline (validate, boot, FF `seed_waitpoint_hmac_secret`)
+        // continues to see only the hex form FF persists.
+        let waitpoint_hmac_secret = match std::env::var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET") {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(parse_32_byte_secret_to_hex(
+                        trimmed,
+                        "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET",
+                    )?)
+                }
+            }
+            Err(_) => None,
+        };
         let waitpoint_hmac_kid = std::env::var("CAIRN_FABRIC_WAITPOINT_HMAC_KID")
             .ok()
             .filter(|s| !s.is_empty());
 
+        // #743 Part B: opt-in boot-time kid rotation. Match the
+        // truthy-value accept-set the rest of cairn uses for opt-ins
+        // (CAIRN_CHILD_RUN_DRIVER_ENABLED etc.) so operators reaching
+        // for whichever truthy value feels natural land on the same
+        // result.
+        let waitpoint_hmac_bootstrap_kid_reset =
+            std::env::var("CAIRN_FABRIC_WAITPOINT_HMAC_BOOTSTRAP_KID_RESET")
+                .ok()
+                .map(|raw| {
+                    let trimmed = raw.trim().to_ascii_lowercase();
+                    matches!(trimmed.as_str(), "1" | "true" | "yes" | "on")
+                })
+                .unwrap_or(false);
+
+        // `CAIRN_FABRIC_BACKEND` (optional). Default to Valkey for
+        // backwards compat with every deployment predating PR-C3.
+        // Whitespace trimmed, ASCII-lowercased, then parsed.
+        let backend_kind = match std::env::var("CAIRN_FABRIC_BACKEND") {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    BackendKind::Valkey
+                } else {
+                    trimmed.to_ascii_lowercase().parse::<BackendKind>()?
+                }
+            }
+            Err(_) => BackendKind::Valkey,
+        };
+
         let config = Self {
-            valkey_host,
-            valkey_port,
-            tls,
-            cluster,
+            backend,
             lane_id,
             worker_id,
             worker_instance_id,
@@ -143,9 +298,29 @@ impl FabricConfig {
             worker_capabilities,
             waitpoint_hmac_secret,
             waitpoint_hmac_kid,
+            waitpoint_hmac_bootstrap_kid_reset,
+            backend_kind,
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Borrow the `ValkeyConnection` out of `backend.connection`, or
+    /// return a typed error when the backend is non-Valkey. Used by
+    /// the host/port-shaped log lines in `FabricRuntime::start` and
+    /// the ferriskey client-builder construction below.
+    pub fn valkey_connection(&self) -> Result<&ValkeyConnection, FabricError> {
+        match &self.backend.connection {
+            BackendConnection::Valkey(vk) => Ok(vk),
+            // Format only the backend *kind* — a `{other:?}` dump
+            // would splice the full `BackendConnection::Postgres`
+            // value (including the Postgres connection URL) into the
+            // error string and thence into boot logs.
+            other => Err(FabricError::Config(format!(
+                "expected Valkey backend, got {}",
+                backend_kind(other)
+            ))),
+        }
     }
 
     /// Resolve the HMAC kid to seed with, falling back to `"k1"` when the
@@ -162,41 +337,159 @@ impl FabricConfig {
     }
 
     pub fn validate(&self) -> Result<(), FabricError> {
-        if self.valkey_port == 0 {
-            return Err(FabricError::Config("port must be > 0".into()));
+        // Cross-check the backend-kind selector against the wire-config
+        // variant. An operator who sets `CAIRN_FABRIC_BACKEND=postgres`
+        // but leaves `CAIRN_FABRIC_URL=valkey://...` (or vice versa) is
+        // in an impossible state — the runtime-dispatch arm selects a
+        // runtime that can't consume the configured connection. Fail
+        // loud here with an actionable message pointing at both env vars.
+        // (Copilot review, PR #600.)
+        //
+        // `BackendConnection` is `#[non_exhaustive]` upstream — we
+        // deliberately list every known variant so a future FF addition
+        // fails the build rather than silently defaulting.
+        match (self.backend_kind, &self.backend.connection) {
+            (BackendKind::Valkey, BackendConnection::Valkey(_)) => {}
+            (BackendKind::Postgres, BackendConnection::Postgres(_)) => {}
+            (kind, conn) => {
+                return Err(FabricError::Config(format!(
+                    "CAIRN_FABRIC_BACKEND={} does not match CAIRN_FABRIC_URL scheme \
+                     (resolved to {}). Align the two env vars: either set \
+                     CAIRN_FABRIC_BACKEND={} to match the URL, or reset \
+                     CAIRN_FABRIC_URL to a {} scheme \
+                     (e.g. `valkey://localhost:6379` or `postgres://user:pw@host/db`).",
+                    kind.as_str(),
+                    backend_kind(conn),
+                    backend_kind(conn),
+                    kind.as_str(),
+                )));
+            }
+        }
+
+        // Cross-check the backend-kind selector against the compiled
+        // Cargo features. Fails loud at boot with an actionable message
+        // when an operator sets `CAIRN_FABRIC_BACKEND=postgres` on a
+        // binary built without the `fabric-postgres` feature (or the
+        // symmetric case). The runtime dispatch arm in
+        // `FabricServices::start` depends on this check to rule out the
+        // "feature disabled" case before matching.
+        match self.backend_kind {
+            BackendKind::Valkey => {
+                #[cfg(not(feature = "fabric-valkey"))]
+                {
+                    return Err(FabricError::Config(
+                        "CAIRN_FABRIC_BACKEND=valkey requires the `fabric-valkey` Cargo feature \
+                         (enabled by default); this binary was built with \
+                         `--no-default-features` and without `--features fabric-valkey`."
+                            .into(),
+                    ));
+                }
+            }
+            BackendKind::Postgres => {
+                #[cfg(not(feature = "fabric-postgres"))]
+                {
+                    return Err(FabricError::Config(
+                        "CAIRN_FABRIC_BACKEND=postgres requires the `fabric-postgres` Cargo \
+                         feature; this binary was built without it. Rebuild with \
+                         `--features fabric-postgres` (or rely on the default `fabric-valkey` \
+                         backend)."
+                            .into(),
+                    ));
+                }
+            }
+        }
+        // `BackendConnection` is `#[non_exhaustive]` upstream — keep a
+        // catch-all arm so a future FF variant cairn doesn't know about
+        // fails loud at boot instead of silently defaulting.
+        match &self.backend.connection {
+            BackendConnection::Valkey(vk) => {
+                if vk.port == 0 {
+                    return Err(FabricError::Config(
+                        "CAIRN_FABRIC_URL has port=0; set a non-zero TCP port \
+                         (e.g. `valkey://localhost:6379`)."
+                            .into(),
+                    ));
+                }
+            }
+            BackendConnection::Postgres(pg) => {
+                if pg.url.is_empty() {
+                    return Err(FabricError::Config(
+                        "CAIRN_FABRIC_URL is empty for a Postgres backend; \
+                         set it to a `postgres://user:pass@host:5432/db` URL."
+                            .into(),
+                    ));
+                }
+            }
+            other => {
+                return Err(FabricError::Config(format!(
+                    "unsupported backend variant: {}",
+                    backend_kind(other)
+                )));
+            }
         }
         if self.lease_ttl_ms < 1000 {
-            return Err(FabricError::Config("lease_ttl_ms must be >= 1000".into()));
+            return Err(FabricError::Config(format!(
+                "CAIRN_FABRIC_LEASE_TTL_MS must be >= 1000 (got {}); \
+                 set it to a millisecond value of 1000 or greater, \
+                 or unset it to accept the 180000 default.",
+                self.lease_ttl_ms
+            )));
         }
         if self.max_concurrent_tasks < 1 {
             return Err(FabricError::Config(
-                "max_concurrent_tasks must be >= 1".into(),
+                "CAIRN_FABRIC_MAX_TASKS must be >= 1; \
+                 set it to a positive integer (e.g. `4`) or unset it to \
+                 accept the 4 default."
+                    .into(),
             ));
         }
         if self.grant_ttl_ms == 0 {
-            return Err(FabricError::Config("grant_ttl_ms must be > 0".into()));
+            return Err(FabricError::Config(
+                "CAIRN_FABRIC_GRANT_TTL_MS must be > 0; \
+                 set it to a positive millisecond value (e.g. `5000`) or \
+                 unset it to accept the 5000 default."
+                    .into(),
+            ));
         }
         if self.fcall_timeout_ms == 0 {
-            return Err(FabricError::Config("fcall_timeout_ms must be > 0".into()));
+            return Err(FabricError::Config(
+                "CAIRN_FABRIC_FCALL_TIMEOUT_MS must be > 0; \
+                 set it to a positive millisecond value (e.g. `5000`) or \
+                 unset it to accept the 5000 default."
+                    .into(),
+            ));
         }
         if self.signal_dedup_ttl_ms == 0 {
             return Err(FabricError::Config(
-                "signal_dedup_ttl_ms must be > 0".into(),
+                "CAIRN_FABRIC_SIGNAL_DEDUP_TTL_MS must be > 0; \
+                 set it to a positive millisecond value (e.g. `86400000`) or \
+                 unset it to accept the 86400000 default."
+                    .into(),
             ));
         }
-        // HMAC secret: if supplied, MUST be exactly 64 hex chars (256-bit
-        // key). Fail loud — a truncated or mis-encoded secret produces an
-        // opaque HMAC failure at runtime that's painful to diagnose.
+        // HMAC secret: if supplied, MUST be exactly 64 hex chars
+        // (32 raw bytes) at this layer. `FabricConfig::from_env`
+        // accepts hex OR base64 and normalises base64 to hex before
+        // populating this field (#742); a caller constructing
+        // FabricConfig directly (e.g. tests) MUST supply hex. Fail
+        // loud — a truncated or mis-encoded secret produces an
+        // opaque HMAC failure at runtime that's painful to
+        // diagnose.
         if let Some(secret) = &self.waitpoint_hmac_secret {
             if secret.len() != 64 {
                 return Err(FabricError::Config(format!(
-                    "waitpoint_hmac_secret must be 64 hex chars (32 bytes), got {}",
+                    "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET must be 64 hex chars (32 bytes), got {}. \
+                     Generate a fresh secret with `openssl rand -hex 32` (or any 32-byte \
+                     base64 — `from_env` normalises). Direct FabricConfig construction \
+                     requires hex.",
                     secret.len()
                 )));
             }
             if !secret.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(FabricError::Config(
-                    "waitpoint_hmac_secret must be hex-encoded (0-9, a-f, A-F only)".into(),
+                    "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET must be hex-encoded (0-9, a-f, A-F only). \
+                     Generate a fresh secret with `openssl rand -hex 32`."
+                        .into(),
                 ));
             }
             // Kid must be present and non-empty iff secret is set. An empty
@@ -205,7 +498,10 @@ impl FabricConfig {
             if let Some(kid) = &self.waitpoint_hmac_kid {
                 if kid.is_empty() {
                     return Err(FabricError::Config(
-                        "waitpoint_hmac_kid must not be empty when waitpoint_hmac_secret is set"
+                        "CAIRN_FABRIC_WAITPOINT_HMAC_KID must not be empty when \
+                         CAIRN_FABRIC_WAITPOINT_HMAC_SECRET is set. \
+                         Set it to a stable operator-chosen identifier (e.g. `k1`) or \
+                         unset it to accept the `k1` default."
                             .into(),
                     ));
                 }
@@ -216,13 +512,19 @@ impl FabricConfig {
                 // the validation path.
                 if kid.contains(':') {
                     return Err(FabricError::Config(format!(
-                        "waitpoint_hmac_kid must not contain ':' (FF field-name delimiter): {kid:?}"
+                        "CAIRN_FABRIC_WAITPOINT_HMAC_KID must not contain ':' \
+                         (FF reserves ':' as a hash-field delimiter): {kid:?}. \
+                         Pick a colon-free identifier (e.g. `k1`, `k-2026-05`)."
                     )));
                 }
             }
         } else if self.waitpoint_hmac_kid.is_some() {
             return Err(FabricError::Config(
-                "waitpoint_hmac_kid set but waitpoint_hmac_secret is None".into(),
+                "CAIRN_FABRIC_WAITPOINT_HMAC_KID is set, but \
+                 CAIRN_FABRIC_WAITPOINT_HMAC_SECRET is missing. \
+                 Generate a 32-byte hex secret with `openssl rand -hex 32` and export it, \
+                 or unset CAIRN_FABRIC_WAITPOINT_HMAC_KID."
+                    .into(),
             ));
         }
         Ok(())
@@ -232,25 +534,253 @@ impl FabricConfig {
     /// fabric's host/port/TLS/cluster settings. Callers call `.build().await`
     /// to get a connected `Client`.
     ///
+    /// Only valid for Valkey-backed configs — returns
+    /// [`FabricError::Config`] when the backend is not Valkey. A real
+    /// backend-agnostic builder lands with the runtime dispatch in PR-C.
+    ///
     /// This replaces the previous `valkey_url()` URL-string path. The
     /// `redis://` scheme was redundant (we never parse a URL — we build one
     /// only to hand it back to ferriskey, which re-parses it) and would
     /// break on non-Redis-cloud hosts that reject the `redis` scheme
     /// prefix. The builder accepts a bare host + port and applies TLS as
     /// an explicit flag, matching the ferriskey 0.2 public API.
-    pub fn valkey_client_builder(&self) -> ferriskey::ClientBuilder {
-        let mut builder = ferriskey::ClientBuilder::new().host(&self.valkey_host, self.valkey_port);
-        if self.tls {
+    ///
+    /// Gated behind `fabric-valkey` because ferriskey is not linked
+    /// under `--no-default-features`.
+    #[cfg(feature = "fabric-valkey")]
+    pub fn client_builder(&self) -> Result<ferriskey::ClientBuilder, FabricError> {
+        let vk = self.valkey_connection()?;
+        let mut builder = ferriskey::ClientBuilder::new().host(&vk.host, vk.port);
+        if vk.tls {
             builder = builder.tls();
         }
-        if self.cluster {
+        if vk.cluster {
             builder = builder.cluster();
         }
-        builder
+        Ok(builder)
+    }
+}
+
+/// Parse a `CAIRN_FABRIC_URL` value into a [`BackendConfig`].
+///
+/// Accepted schemes:
+///
+/// | Scheme     | Mapping                                                         |
+/// |------------|-----------------------------------------------------------------|
+/// | `valkey://host:port`            | `BackendConfig::valkey(host, port)`  |
+/// | `rediss://host:port`            | Valkey + `ValkeyConnection.tls = true` |
+/// | `valkey://host:port?tls=1`      | As above + `tls = true`              |
+/// | `valkey://host:port?cluster=1`  | As above + `cluster = true`          |
+/// | `rediss://host:port?tls=0`      | **Error** — scheme contradicts param |
+/// | `valkey://[::1]:6379`           | IPv6, bracketed host preserved (`"[::1]"`) |
+/// | anything else                   | `FabricError::Config("unknown fabric URL scheme: ...; expected one of: valkey, rediss")` |
+///
+/// Defaults: `valkey://host` (no port) → port `6379`. `redis://` is
+/// **not** an alias; it was intentionally rejected during PR-A's
+/// design review (no legacy users to migrate). `postgres://` URL
+/// parsing lands with the Postgres runtime in PR-C.
+fn parse_fabric_url(raw: &str) -> Result<BackendConfig, FabricError> {
+    // Deliberately do NOT include the raw URL in the parse error —
+    // operators can paste Valkey/Postgres URLs that embed credentials
+    // (password, ACL user, query-string secrets) and the parse error
+    // lands in boot logs. Point at the env var name; operators know
+    // what they set.
+    let url = url::Url::parse(raw)
+        .map_err(|e| FabricError::Config(format!("CAIRN_FABRIC_URL is not a valid URL: {e}")))?;
+
+    // Scheme-match FIRST so an unsupported scheme surfaces the
+    // documented `unknown fabric URL scheme` error rather than a
+    // query-param complaint (e.g. `http://host?x=1` should fail on
+    // `http`, not `x`).
+    match url.scheme() {
+        "valkey" => {
+            let (tls_param, cluster_param) = parse_valkey_query(&url)?;
+            let (host, port) = extract_host_port(&url, 6379)?;
+            let mut cfg = BackendConfig::valkey(host, port);
+            if let BackendConnection::Valkey(ref mut vk) = cfg.connection {
+                if let Some(tls) = tls_param {
+                    vk.tls = tls;
+                }
+                if let Some(cluster) = cluster_param {
+                    vk.cluster = cluster;
+                }
+            }
+            Ok(cfg)
+        }
+        "rediss" => {
+            let (tls_param, cluster_param) = parse_valkey_query(&url)?;
+            // Scheme implies TLS; `?tls=0` contradicts and must fail
+            // loud rather than silently honour one or the other.
+            if let Some(false) = tls_param {
+                return Err(FabricError::Config(
+                    "rediss:// scheme contradicts tls=0 query param".into(),
+                ));
+            }
+            let (host, port) = extract_host_port(&url, 6379)?;
+            let mut cfg = BackendConfig::valkey(host, port);
+            if let BackendConnection::Valkey(ref mut vk) = cfg.connection {
+                vk.tls = true;
+                if let Some(cluster) = cluster_param {
+                    vk.cluster = cluster;
+                }
+            }
+            Ok(cfg)
+        }
+        other => Err(FabricError::Config(format!(
+            "unknown fabric URL scheme: {other}; expected one of: valkey, rediss"
+        ))),
+    }
+}
+
+/// Pull `host` and `port` out of a parsed URL. `url::Url::host_str()`
+/// preserves IPv6 brackets (e.g. `"[::1]"`), which matches what FF's
+/// `ValkeyConnection` stores and what ferriskey's TCP layer expects
+/// for IPv6 endpoints — no re-bracketing required on the cairn side.
+///
+/// Errors embed a redacted `scheme://host[:port]` shape via
+/// [`redact_url_for_error`], never the raw URL, so operators who
+/// paste credentials into their Valkey/Postgres URL do not see them
+/// echoed into boot logs.
+fn extract_host_port(url: &url::Url, default_port: u16) -> Result<(String, u16), FabricError> {
+    let host = url
+        .host_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            FabricError::Config(format!(
+                "fabric URL missing host: {}",
+                redact_url_for_error(url)
+            ))
+        })?
+        .to_owned();
+    let port = url.port().unwrap_or(default_port);
+    if port == 0 {
+        return Err(FabricError::Config(format!(
+            "fabric URL port must be > 0: {}",
+            redact_url_for_error(url)
+        )));
+    }
+    Ok((host, port))
+}
+
+/// Decode the `tls` / `cluster` query params, if present. Accepts
+/// `1`, `0`, `true`, `false` (case-insensitive). Rejects unknown
+/// query params so operator typos (`?tsl=1`) fail loud instead of
+/// silently defaulting.
+fn parse_valkey_query(url: &url::Url) -> Result<(Option<bool>, Option<bool>), FabricError> {
+    let mut tls = None;
+    let mut cluster = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "tls" => tls = Some(parse_bool_param("tls", &value)?),
+            "cluster" => cluster = Some(parse_bool_param("cluster", &value)?),
+            other => {
+                return Err(FabricError::Config(format!(
+                    "unknown fabric URL query param: {other:?}; expected one of: tls, cluster"
+                )));
+            }
+        }
+    }
+    Ok((tls, cluster))
+}
+
+fn parse_bool_param(name: &str, value: &str) -> Result<bool, FabricError> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        other => Err(FabricError::Config(format!(
+            "fabric URL query param {name}={other:?} must be one of: 0, 1, true, false"
+        ))),
+    }
+}
+
+/// Format only the backend *family* for error messages. Critical:
+/// never `Debug`-print a `BackendConnection` into a user-facing
+/// error, because `BackendConnection::Postgres` carries the
+/// connection URL which may embed credentials (user, password,
+/// sslpassword in the query string). This helper keeps the error
+/// message informative while keeping secrets out of boot logs.
+fn backend_kind(conn: &BackendConnection) -> &'static str {
+    match conn {
+        BackendConnection::Valkey(_) => "Valkey",
+        BackendConnection::Postgres(_) => "Postgres",
+        // `#[non_exhaustive]` upstream: future additive variants
+        // cairn hasn't taught this helper about fall back to a
+        // non-leaky placeholder rather than a Debug-print.
+        _ => "unknown",
+    }
+}
+
+/// Redact a parsed URL to `scheme://host[:port]` shape for error
+/// messages. Strips userinfo, path, query, and fragment because
+/// cairn's fabric URLs are Valkey endpoints whose `host` and `port`
+/// are the only fields needed to diagnose a parse/validate failure,
+/// and operators may (especially on Postgres URLs in PR-C) embed
+/// passwords in those omitted components.
+fn redact_url_for_error(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or("<missing-host>");
+    match url.port() {
+        Some(port) => format!("{scheme}://{host}:{port}", scheme = url.scheme()),
+        None => format!("{scheme}://{host}", scheme = url.scheme()),
     }
 }
 
 const INSTANCE_ID_FILE: &str = "/tmp/cairn-fabric-instance-id";
+
+/// #742: parse a 32-byte secret env value as either hex or base64
+/// and return the canonical lowercase-hex form.
+///
+/// Mirrors the shape `MasterKey::decode_material` in cairn-runtime
+/// already accepts for `CAIRN_CREDENTIAL_KEY`. The two adjacent
+/// secret env vars now share an identical input contract:
+///
+///   * 64-char lowercase hex  →  32 bytes
+///   * STANDARD-alphabet base64 (typically 44 chars with padding) →  32 bytes
+///
+/// Returns the lowercase hex form so callers downstream (FF
+/// `seed_waitpoint_hmac_secret`, validate(), etc.) keep seeing the
+/// canonical hex shape they already expect.
+fn parse_32_byte_secret_to_hex(value: &str, var_name: &str) -> Result<String, FabricError> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+
+    // Hex path: 64 lowercase hex chars. Match the case-insensitive
+    // hex test from `decode_material` so an operator who pasted an
+    // uppercase-hex secret isn't bounced to the (correct but
+    // confusing) base64 branch.
+    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Re-encode lowercase to canonicalise. `hex::decode` already
+        // accepts both cases; the only normalising work is the
+        // lowercase form FF expects.
+        let bytes = hex::decode(value).map_err(|_| {
+            FabricError::Config(format!(
+                "{var_name}: 64-char hex value failed to decode (non-hex digit). \
+                 Generate a fresh secret with `openssl rand -hex 32`.",
+            ))
+        })?;
+        return Ok(hex::encode(bytes));
+    }
+
+    // Base64 path. STANDARD alphabet, padding required.
+    if let Ok(decoded) = STANDARD.decode(value) {
+        if decoded.len() == 32 {
+            return Ok(hex::encode(decoded));
+        }
+        return Err(FabricError::Config(format!(
+            "{var_name}: base64 decoded to {} bytes, expected 32. \
+             Generate a fresh secret with `openssl rand -base64 32` \
+             or `openssl rand -hex 32`.",
+            decoded.len(),
+        )));
+    }
+
+    Err(FabricError::Config(format!(
+        "{var_name}: expected 32 raw bytes — either 64-char lowercase hex or a \
+         STANDARD-alphabet base64 string that decodes to 32 bytes (typically 44 \
+         chars with padding). Got {} characters that match neither form. \
+         Generate a fresh secret with `openssl rand -hex 32` or `openssl rand -base64 32`.",
+        value.len(),
+    )))
+}
 
 fn load_or_generate_instance_id() -> String {
     if let Ok(id) = std::fs::read_to_string(INSTANCE_ID_FILE) {
@@ -264,52 +794,512 @@ fn load_or_generate_instance_id() -> String {
     id
 }
 
+/// Shared env-var serialisation lock for cairn-fabric tests.
+///
+/// Both `config::tests` and `aggregate::tests` mutate the same
+/// `CAIRN_FABRIC_*` environment variables. Rust's `#[test]` runner
+/// multithreads across `#[test]`s in a crate by default, and
+/// `std::env::{set_var, remove_var}` is process-global — so two
+/// modules holding different private Mutexes will race with each
+/// other and the non-guarded module may observe the other's
+/// in-flight edits.
+///
+/// Historic flake: `fabric_config_from_env_defaults` (in
+/// `aggregate::tests`) intermittently saw `CAIRN_FABRIC_URL` still
+/// set to a non-Valkey scheme because a concurrent `config::tests`
+/// case was in the middle of an `set_var` → `from_env` → `remove_var`
+/// sequence. Sharing this lock at the crate level forces serial
+/// access to the env across the whole cairn-fabric test binary.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use super::ENV_LOCK;
     use super::*;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    fn clear_fabric_env() {
+        // `CAIRN_FABRIC_HOST/PORT/TLS/CLUSTER` were removed when cairn-rs
+        // migrated to `CAIRN_FABRIC_URL`. Clear anyway so a stale value
+        // in the test runner's env can't leak into the no-URL default
+        // path (the implementation ignores them, but this keeps the
+        // tests hermetic against developer `.env` files).
+        for key in [
+            "CAIRN_FABRIC_URL",
+            "CAIRN_FABRIC_HOST",
+            "CAIRN_FABRIC_PORT",
+            "CAIRN_FABRIC_TLS",
+            "CAIRN_FABRIC_CLUSTER",
+            "CAIRN_FABRIC_LANE",
+            "CAIRN_FABRIC_LEASE_TTL_MS",
+            "CAIRN_FABRIC_MAX_TASKS",
+            "CAIRN_FABRIC_GRANT_TTL_MS",
+            "CAIRN_FABRIC_BACKEND",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn assert_valkey(cfg: &FabricConfig, host: &str, port: u16, tls: bool, cluster: bool) {
+        let vk = cfg.valkey_connection().expect("valkey backend");
+        assert_eq!(vk.host, host);
+        assert_eq!(vk.port, port);
+        assert_eq!(vk.tls, tls);
+        assert_eq!(vk.cluster, cluster);
+    }
 
     #[test]
-    fn default_config_from_env() {
+    fn default_config_from_env_when_url_unset() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CAIRN_FABRIC_HOST");
-        std::env::remove_var("CAIRN_FABRIC_PORT");
-        std::env::remove_var("CAIRN_FABRIC_TLS");
-        std::env::remove_var("CAIRN_FABRIC_CLUSTER");
-        std::env::remove_var("CAIRN_FABRIC_LANE");
-        std::env::remove_var("CAIRN_FABRIC_LEASE_TTL_MS");
-        std::env::remove_var("CAIRN_FABRIC_MAX_TASKS");
-        std::env::remove_var("CAIRN_FABRIC_GRANT_TTL_MS");
+        clear_fabric_env();
 
         let config = FabricConfig::from_env().unwrap();
-        assert_eq!(config.valkey_host, "localhost");
-        assert_eq!(config.valkey_port, 6379);
-        assert!(!config.tls);
-        assert!(!config.cluster);
+        assert_valkey(&config, "localhost", 6379, false, false);
         assert_eq!(config.lane_id.as_str(), "cairn");
-        assert_eq!(config.lease_ttl_ms, 30_000);
+        assert_eq!(config.lease_ttl_ms, 180_000);
         assert_eq!(config.max_concurrent_tasks, 4);
     }
 
     #[test]
-    fn valkey_client_builder_without_tls() {
-        // ferriskey's `ClientBuilder` does not expose public accessors on
-        // its internal `ConnectionRequest`, so we can only assert that the
-        // builder constructs without panicking and that `build_lazy()`
-        // (the synchronous validation path) accepts the address list.
-        // Full wire assertion requires an integration test against a real
-        // Valkey instance; those live under `tests/` and in the downstream
-        // `cairn-app` integration suite.
-        let config = FabricConfig {
-            valkey_host: "myhost".into(),
-            valkey_port: 6380,
-            tls: false,
-            cluster: false,
+    fn cairn_fabric_url_valkey_scheme_populates_backend() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://some-host:7001");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_valkey(&config, "some-host", 7001, false, false);
+
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    #[test]
+    fn cairn_fabric_url_empty_string_falls_back_to_default() {
+        // Matches cairn's existing `.filter(|s| !s.is_empty())`
+        // convention elsewhere in bootstrap: an operator who
+        // `export CAIRN_FABRIC_URL=` shouldn't hit a parse error
+        // downstream of a blank-string URL.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_valkey(&config, "localhost", 6379, false, false);
+
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    // ── CAIRN_FABRIC_BACKEND parser unit tests (PR-C3) ──────────────────
+
+    #[test]
+    fn backend_kind_defaults_to_valkey_when_env_unset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(config.backend_kind, BackendKind::Valkey);
+    }
+
+    #[test]
+    fn backend_kind_empty_string_falls_back_to_valkey() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_BACKEND", "");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(config.backend_kind, BackendKind::Valkey);
+
+        std::env::remove_var("CAIRN_FABRIC_BACKEND");
+    }
+
+    #[test]
+    fn backend_kind_accepts_valkey_explicit() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_BACKEND", "valkey");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(config.backend_kind, BackendKind::Valkey);
+
+        std::env::remove_var("CAIRN_FABRIC_BACKEND");
+    }
+
+    // Note on the "postgres" case: when the `fabric-postgres` Cargo
+    // feature is off (default-features-only test run) `validate()`
+    // rejects `backend_kind = Postgres` with an actionable error.
+    // Built via struct-literal because `parse_fabric_url` today only
+    // accepts `valkey` / `rediss` schemes, so the env path cannot
+    // produce this state (PR-C4 extends the URL parser). The
+    // `base_config()` helper already wires a matching `Postgres`
+    // BackendConnection via `BackendConfig::postgres(...)` so the
+    // wire-mismatch guard passes and the feature-gate arm is reached.
+    #[cfg(not(feature = "fabric-postgres"))]
+    #[test]
+    fn backend_kind_postgres_without_feature_fails_validate() {
+        let mut cfg = base_config();
+        cfg.backend = BackendConfig::postgres("postgres://u:p@h/db");
+        cfg.backend_kind = BackendKind::Postgres;
+
+        let err = cfg.validate().expect_err("validate must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fabric-postgres") && msg.contains("CAIRN_FABRIC_BACKEND=postgres"),
+            "expected feature-gate error pointing at fabric-postgres, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn backend_kind_rejects_unknown_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_BACKEND", "sqlite");
+
+        let err = FabricConfig::from_env().expect_err("unknown token must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CAIRN_FABRIC_BACKEND") && msg.contains("sqlite"),
+            "expected actionable error naming the env var + offending token, got: {msg}"
+        );
+
+        std::env::remove_var("CAIRN_FABRIC_BACKEND");
+    }
+
+    #[test]
+    fn backend_kind_trims_whitespace_and_lowercases() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_BACKEND", "  VALKEY  ");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(config.backend_kind, BackendKind::Valkey);
+
+        std::env::remove_var("CAIRN_FABRIC_BACKEND");
+    }
+
+    #[test]
+    fn backend_kind_mismatch_with_wire_config_is_rejected() {
+        // Covers the validate() cross-check: `backend_kind = Valkey`
+        // paired with a Postgres-variant `BackendConnection` must fail
+        // loud rather than dispatching to the Valkey runtime against
+        // a PG connection.
+        //
+        // Built via struct-literal rather than `from_env` because
+        // today's `parse_fabric_url` only accepts `valkey` / `rediss`
+        // schemes — so an operator cannot actually produce
+        // `BackendConnection::Postgres` through the env path. That
+        // extension lands in PR-C4 when the URL parser grows a
+        // `postgres://` arm; until then the struct-literal path (tests
+        // + any caller that builds `FabricConfig` by hand) is where
+        // this invariant matters.
+        let mut cfg = base_config();
+        cfg.backend = BackendConfig::postgres("postgres://u:p@h/db");
+        // Leave backend_kind as Valkey (from base_config) — this is
+        // the wire-mismatch we're asserting against.
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_BACKEND") && err.contains("CAIRN_FABRIC_URL"),
+            "expected actionable error naming both env vars, got: {err}"
+        );
+    }
+
+    // ── URL parser unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn parse_valkey_url_basic() {
+        let cfg = parse_fabric_url("valkey://example.com:7000").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "example.com");
+                assert_eq!(vk.port, 7000);
+                assert!(!vk.tls);
+                assert!(!vk.cluster);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_valkey_url_default_port() {
+        let cfg = parse_fabric_url("valkey://some-host").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "some-host");
+                assert_eq!(vk.port, 6379, "missing-port defaults to 6379");
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rediss_url_implies_tls() {
+        let cfg = parse_fabric_url("rediss://secure.host:6380").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert!(vk.tls, "rediss:// scheme must set tls=true");
+                assert_eq!(vk.host, "secure.host");
+                assert_eq!(vk.port, 6380);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_with_tls_query_param() {
+        let cfg = parse_fabric_url("valkey://h:6379?tls=1").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => assert!(vk.tls),
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_with_cluster_query_param() {
+        let cfg = parse_fabric_url("valkey://h:6379?cluster=true").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert!(vk.cluster);
+                assert!(!vk.tls);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_with_tls_and_cluster_query_params() {
+        let cfg = parse_fabric_url("valkey://h:6379?tls=1&cluster=1").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert!(vk.tls);
+                assert!(vk.cluster);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rediss_with_tls_0_errors() {
+        let err = parse_fabric_url("rediss://h:6379?tls=0")
+            .expect_err("rediss + tls=0 must fail")
+            .to_string();
+        assert!(
+            err.contains("rediss:// scheme contradicts tls=0"),
+            "expected contradiction error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rediss_with_explicit_tls_1_is_fine() {
+        // Redundant but not contradictory — operators are allowed to be
+        // explicit even when the scheme already implies TLS.
+        let cfg = parse_fabric_url("rediss://h:6379?tls=1").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => assert!(vk.tls),
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    // Guard for the decision locked on 2026-04-27: `redis://` is NOT
+    // an alias. Operators must use `valkey://` or `rediss://`.
+    #[test]
+    fn redis_scheme_rejected_with_named_error() {
+        let err = parse_fabric_url("redis://h:6379")
+            .expect_err("redis:// must not be accepted")
+            .to_string();
+        assert!(
+            err.contains("unknown fabric URL scheme: redis") && err.contains("valkey, rediss"),
+            "expected named unknown-scheme error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn postgres_scheme_rejected_on_pr_a() {
+        // PR-C wires the postgres runtime; PR-A rejects at parse time.
+        let err = parse_fabric_url("postgres://u:p@h:5432/db")
+            .expect_err("postgres:// not accepted on PR-A")
+            .to_string();
+        assert!(
+            err.contains("unknown fabric URL scheme: postgres"),
+            "expected unknown-scheme error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn other_schemes_rejected_with_named_error() {
+        for bad in &[
+            "http://example.com",
+            "mysql://u:p@h/db",
+            "ftp://archive.local",
+        ] {
+            let err = parse_fabric_url(bad)
+                .expect_err("scheme must not be accepted")
+                .to_string();
+            assert!(
+                err.contains("unknown fabric URL scheme"),
+                "expected named error for {bad}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_scheme_with_query_params_errors_on_scheme_not_query() {
+        // Regression guard: parse_fabric_url must match on scheme
+        // BEFORE consulting query params, otherwise an unsupported
+        // scheme with garbage query params surfaces the wrong error
+        // (query-param complaint instead of scheme rejection).
+        let err = parse_fabric_url("http://example.com?tsl=1")
+            .expect_err("http:// must fail on scheme")
+            .to_string();
+        assert!(
+            err.contains("unknown fabric URL scheme"),
+            "expected scheme error before query-param error, got: {err}"
+        );
+        assert!(
+            !err.contains("unknown fabric URL query param"),
+            "scheme error must pre-empt query error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_error_does_not_echo_raw_url() {
+        // Security guard: operators may paste a Valkey URL embedding
+        // an ACL password (e.g. `valkey://user:pw@host:6379`). The
+        // parse error must NOT splice the raw input into its message,
+        // because the error lands in boot logs. The URL crate accepts
+        // userinfo on valkey://, so we exercise the malformed branch.
+        let secret = "super-secret-password-12345";
+        let url = format!("::malformed//user:{secret}@host:6379");
+        let err = parse_fabric_url(&url)
+            .expect_err("malformed URL must not be accepted")
+            .to_string();
+        assert!(
+            !err.contains(secret),
+            "parse error must not echo secret into logs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_host_port_error_does_not_echo_userinfo() {
+        // A valkey:// URL with userinfo and a missing host should
+        // surface the redacted endpoint, not the raw URL (which
+        // carries the password).
+        let secret = "leak-me-into-logs-43211234";
+        // No host between the `@` and the next slash — triggers the
+        // missing-host arm in extract_host_port.
+        let url = format!("valkey://user:{secret}@/path");
+        let err = parse_fabric_url(&url)
+            .expect_err("missing-host URL must fail")
+            .to_string();
+        assert!(
+            !err.contains(secret),
+            "extract_host_port error must not embed credentials, got: {err}"
+        );
+    }
+
+    #[test]
+    fn valkey_connection_error_does_not_echo_postgres_url() {
+        // Postgres URLs embed credentials in userinfo. If an operator
+        // configures a Postgres backend and calls `valkey_connection()`,
+        // the "expected Valkey backend" error must NOT include the
+        // full Postgres URL.
+        let mut cfg = base_config();
+        let secret = "postgres-password-42";
+        let pg_url = format!("postgres://admin:{secret}@dbhost:5432/cairn");
+        cfg.backend = BackendConfig::postgres(pg_url.clone());
+        let err = cfg.valkey_connection().unwrap_err().to_string();
+        assert!(
+            !err.contains(secret),
+            "valkey_connection error must not leak Postgres creds, got: {err}"
+        );
+        assert!(
+            err.contains("Postgres"),
+            "error should name the backend family, got: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_url_rejected() {
+        let err = parse_fabric_url("::not a url::")
+            .expect_err("malformed URL must not be accepted")
+            .to_string();
+        assert!(
+            err.contains("not a valid URL"),
+            "expected parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ipv6_url_preserves_brackets() {
+        // `url::Url::host_str()` keeps the square brackets on IPv6
+        // hosts (e.g. `"[::1]"`). FF's `ValkeyConnection.host` stores
+        // this bracketed form verbatim; ferriskey's TCP layer expects
+        // the bracketed shape for IPv6 endpoints — document by test.
+        let cfg = parse_fabric_url("valkey://[::1]:6379").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "[::1]", "url::Url preserves IPv6 host shape");
+                assert_eq!(vk.port, 6379);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv6_url_with_tls_query_param() {
+        let cfg = parse_fabric_url("valkey://[2001:db8::1]:7001?tls=1").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert_eq!(vk.host, "[2001:db8::1]");
+                assert_eq!(vk.port, 7001);
+                assert!(vk.tls);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rediss_ipv6_sets_tls() {
+        let cfg = parse_fabric_url("rediss://[::1]:6380").unwrap();
+        match cfg.connection {
+            BackendConnection::Valkey(vk) => {
+                assert!(vk.tls);
+                assert_eq!(vk.host, "[::1]");
+                assert_eq!(vk.port, 6380);
+            }
+            other => panic!("expected Valkey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_query_param_rejected() {
+        // Operators who typo `?tsl=1` should fail loud, not silently
+        // get default TLS.
+        let err = parse_fabric_url("valkey://h:6379?tsl=1")
+            .expect_err("unknown query param must fail")
+            .to_string();
+        assert!(
+            err.contains("unknown fabric URL query param"),
+            "expected unknown-query-param error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn query_param_invalid_bool_rejected() {
+        let err = parse_fabric_url("valkey://h:6379?tls=yes")
+            .expect_err("invalid bool must fail")
+            .to_string();
+        assert!(
+            err.contains("must be one of"),
+            "expected bool-format error, got: {err}"
+        );
+    }
+
+    // ── client_builder (renamed from valkey_client_builder) ─────────────
+
+    fn base_config() -> FabricConfig {
+        FabricConfig {
+            backend: BackendConfig::valkey("localhost", 6379),
             lane_id: LaneId::new("test"),
-            worker_id: WorkerId::new("w1"),
-            worker_instance_id: WorkerInstanceId::new("inst1"),
+            worker_id: WorkerId::new("w"),
+            worker_instance_id: WorkerInstanceId::new("i"),
             namespace: Namespace::new("ns"),
             lease_ttl_ms: 30_000,
             grant_ttl_ms: 5_000,
@@ -319,20 +1309,52 @@ mod tests {
             worker_capabilities: BTreeSet::new(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
-        };
+            waitpoint_hmac_bootstrap_kid_reset: false,
+            backend_kind: BackendKind::Valkey,
+        }
+    }
+
+    #[cfg(feature = "fabric-valkey")]
+    #[test]
+    fn client_builder_without_tls() {
+        // ferriskey's `ClientBuilder` does not expose public accessors on
+        // its internal `ConnectionRequest`, so we can only assert that the
+        // builder constructs without panicking and that `build_lazy()`
+        // (the synchronous validation path) accepts the address list.
+        // Full wire assertion requires an integration test against a real
+        // Valkey instance; those live under `tests/` and in the downstream
+        // `cairn-app` integration suite.
+        let mut config = base_config();
+        config.backend = BackendConfig::valkey("myhost", 6380);
         // build_lazy validates the address list synchronously without
         // establishing a TCP connection — any misconfiguration (empty
         // addresses, bad protocol/push_sender combo) surfaces here.
-        assert!(config.valkey_client_builder().build_lazy().is_ok());
+        assert!(config.client_builder().unwrap().build_lazy().is_ok());
     }
 
+    #[cfg(feature = "fabric-valkey")]
+    #[test]
+    fn client_builder_with_tls() {
+        // Same limitation as `client_builder_without_tls`: no public
+        // accessors on `ClientBuilder`/`ConnectionRequest`. We assert
+        // synchronous validation passes with TLS toggled on.
+        let mut config = base_config();
+        let mut cfg = BackendConfig::valkey("secure.host", 6379);
+        if let BackendConnection::Valkey(ref mut vk) = cfg.connection {
+            vk.tls = true;
+        }
+        config.backend = cfg;
+        assert!(config.client_builder().unwrap().build_lazy().is_ok());
+    }
+
+    #[cfg(feature = "fabric-valkey")]
     #[test]
     fn client_builder_build_lazy_rejects_empty_addresses() {
         // Confirms the synchronous validation path we rely on actually
         // catches misconfiguration — otherwise the positive tests above
         // would pass even if `build_lazy()` silently accepted garbage.
-        // `valkey_client_builder()` always pushes a host, so we build a
-        // bare `ClientBuilder` directly to exercise the empty-address
+        // `client_builder()` always pushes a host, so we build a bare
+        // `ClientBuilder` directly to exercise the empty-address
         // rejection branch (see ferriskey ClientBuilder::build_lazy).
         // `LazyClient` does not implement `Debug`, so we can't use
         // `.expect_err(..)`. Match on the result directly.
@@ -347,16 +1369,15 @@ mod tests {
         }
     }
 
+    // ── validate() — backend-shape guard ────────────────────────────────
+
     fn test_config(
         port: u16,
         lease_ttl_ms: u64,
         max_tasks: usize,
     ) -> Result<FabricConfig, FabricError> {
         let config = FabricConfig {
-            valkey_host: "localhost".into(),
-            valkey_port: port,
-            tls: false,
-            cluster: false,
+            backend: BackendConfig::valkey("localhost", port),
             lane_id: LaneId::new("test"),
             worker_id: WorkerId::new("w"),
             worker_instance_id: WorkerInstanceId::new("i"),
@@ -369,6 +1390,8 @@ mod tests {
             worker_capabilities: BTreeSet::new(),
             waitpoint_hmac_secret: None,
             waitpoint_hmac_kid: None,
+            waitpoint_hmac_bootstrap_kid_reset: false,
+            backend_kind: BackendKind::Valkey,
         };
         config.validate()?;
         Ok(config)
@@ -377,49 +1400,79 @@ mod tests {
     #[test]
     fn rejects_zero_port() {
         let result = test_config(0, 30_000, 4);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("port"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_URL") && err.contains("port=0"),
+            "expected env-var-named port error, got: {err}"
+        );
     }
 
     #[test]
     fn rejects_low_lease_ttl() {
         let result = test_config(6379, 500, 4);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("lease_ttl_ms"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_LEASE_TTL_MS"),
+            "expected env-var-named lease-ttl error, got: {err}"
+        );
     }
 
     #[test]
     fn rejects_zero_concurrent_tasks() {
         let result = test_config(6379, 30_000, 0);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("max_concurrent_tasks"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_MAX_TASKS"),
+            "expected env-var-named max-tasks error, got: {err}"
+        );
+    }
+
+    // Gated on `fabric-postgres` because reaching the "postgres url
+    // must not be empty" arm requires `backend_kind = Postgres` (to
+    // satisfy the PR-C3 wire-mismatch cross-check) which itself
+    // requires the feature (to satisfy the feature-gate cross-check
+    // that runs even earlier). Without the feature flag, the test
+    // terminates on the feature-gate arm before the empty-URL arm
+    // ever fires — not useful signal.
+    #[cfg(feature = "fabric-postgres")]
+    #[test]
+    fn rejects_empty_postgres_url_in_validate() {
+        // Smoke-test the Postgres validation arm. Built via struct
+        // literal; `parse_fabric_url` today only accepts valkey/rediss
+        // schemes, so env-driven construction cannot produce this
+        // state (PR-C4 extends the URL parser).
+        let mut cfg = base_config();
+        cfg.backend = BackendConfig::postgres("");
+        cfg.backend_kind = BackendKind::Postgres;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_URL") && err.contains("Postgres backend"),
+            "expected env-var-named empty-url error, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "fabric-valkey")]
+    #[test]
+    fn client_builder_rejects_non_valkey_backend() {
+        // When the backend is not Valkey, `client_builder()` fails
+        // loud instead of lying about a ferriskey connection.
+        // `ClientBuilder` does not impl Debug, so the `Ok` arm is
+        // unreachable by a direct `unwrap_err()` — match explicitly.
+        let mut cfg = base_config();
+        cfg.backend = BackendConfig::postgres("postgres://u:p@h:5432/db");
+        match cfg.client_builder() {
+            Ok(_) => panic!("non-Valkey backend must not return a client builder"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("expected Valkey backend"),
+                    "expected non-valkey error, got: {msg}"
+                );
+            }
+        }
     }
 
     // ── HMAC secret validation ────────────────────────────────────────────
-
-    fn base_config() -> FabricConfig {
-        FabricConfig {
-            valkey_host: "localhost".into(),
-            valkey_port: 6379,
-            tls: false,
-            cluster: false,
-            lane_id: LaneId::new("test"),
-            worker_id: WorkerId::new("w"),
-            worker_instance_id: WorkerInstanceId::new("i"),
-            namespace: Namespace::new("ns"),
-            lease_ttl_ms: 30_000,
-            grant_ttl_ms: 5_000,
-            max_concurrent_tasks: 1,
-            signal_dedup_ttl_ms: 86_400_000,
-            fcall_timeout_ms: 5_000,
-            worker_capabilities: BTreeSet::new(),
-            waitpoint_hmac_secret: None,
-            waitpoint_hmac_kid: None,
-        }
-    }
 
     #[test]
     fn hmac_secret_none_validates() {
@@ -495,8 +1548,9 @@ mod tests {
         config.waitpoint_hmac_kid = Some(String::new());
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("waitpoint_hmac_kid must not be empty"),
-            "expected empty-kid error, got {err}"
+            err.contains("CAIRN_FABRIC_WAITPOINT_HMAC_KID must not be empty")
+                && err.contains("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET is set"),
+            "expected env-var-named empty-kid error, got {err}"
         );
     }
 
@@ -514,39 +1568,302 @@ mod tests {
     #[test]
     fn hmac_kid_without_secret_errors() {
         // Operator set a kid but forgot the secret: fail loud instead of
-        // silently seeding nothing.
+        // silently seeding nothing. Message must name the env var the
+        // operator touched (issue #631) — the internal field name is
+        // ungreppable from the operator's shell.
         let mut config = base_config();
         config.waitpoint_hmac_kid = Some("k1".into());
         let err = config.validate().unwrap_err().to_string();
         assert!(
-            err.contains("waitpoint_hmac_kid set but waitpoint_hmac_secret is None"),
-            "expected missing-secret error, got {err}"
+            err.contains("CAIRN_FABRIC_WAITPOINT_HMAC_KID is set")
+                && err.contains("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET is missing"),
+            "expected env-var-named missing-secret error, got {err}"
+        );
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "expected remediation hint naming the openssl command, got {err}"
+        );
+    }
+
+    // ── #742: from_env normalises hex OR base64 secrets to canonical hex ───
+
+    /// Hex 64-char goes through unchanged (canonical lowercase form).
+    #[test]
+    fn from_env_accepts_hex_hmac_secret() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://localhost:6379");
+        // Clearly-fake repeating-nibble pattern so secret scanners
+        // (GitGuardian, etc.) don't false-positive on this test
+        // fixture. The validator only cares about length + hex
+        // charset shape, not entropy.
+        let hex_secret = "deadbeef".repeat(8);
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET", &hex_secret);
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "k1");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(
+            config.waitpoint_hmac_secret.as_deref(),
+            Some(hex_secret.as_str()),
+            "valid hex passes through unchanged"
+        );
+        assert!(config.validate().is_ok());
+
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET");
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID");
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    /// #742: base64 32-byte secret gets normalised to hex so the rest
+    /// of the pipeline (validate, FF seed) sees the canonical form.
+    #[test]
+    fn from_env_normalises_base64_hmac_secret_to_hex() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://localhost:6379");
+        // 32 zero bytes → predictable hex output for the assertion.
+        let base64_secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET", base64_secret);
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "k1");
+
+        let config = FabricConfig::from_env().unwrap();
+        assert_eq!(
+            config.waitpoint_hmac_secret.as_deref(),
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            "base64-decoded 32 zero bytes re-encoded as lowercase hex",
+        );
+        assert!(
+            config.validate().is_ok(),
+            "normalised hex passes the existing validate() shape check"
+        );
+
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET");
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID");
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    /// #742: a base64 string that decodes to the WRONG number of
+    /// bytes is rejected with a clear, actionable error message.
+    #[test]
+    fn from_env_rejects_base64_decoding_to_wrong_byte_count() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://localhost:6379");
+        // 16 zero bytes → 24-char base64. Decodes valid, wrong size.
+        std::env::set_var(
+            "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET",
+            "AAAAAAAAAAAAAAAAAAAAAA==",
+        );
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "k1");
+
+        let err = FabricConfig::from_env().unwrap_err().to_string();
+        assert!(
+            err.contains("base64 decoded to 16 bytes, expected 32"),
+            "error must name the actual byte count from the decode; got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand"),
+            "error must include a remediation hint; got: {err}"
+        );
+
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET");
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID");
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    /// #742: a value that's neither hex nor valid base64 is rejected
+    /// with an error that names BOTH accepted shapes.
+    #[test]
+    fn from_env_rejects_secret_that_is_neither_hex_nor_base64() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fabric_env();
+        std::env::set_var("CAIRN_FABRIC_URL", "valkey://localhost:6379");
+        // 33 chars that aren't valid base64 (contains spaces) and
+        // don't match the 64-char hex shape.
+        std::env::set_var(
+            "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET",
+            "this is definitely not a secret  ",
+        );
+        std::env::set_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "k1");
+
+        let err = FabricConfig::from_env().unwrap_err().to_string();
+        assert!(
+            err.contains("hex") && err.contains("base64"),
+            "error must name BOTH accepted shapes; got: {err}"
+        );
+
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET");
+        std::env::remove_var("CAIRN_FABRIC_WAITPOINT_HMAC_KID");
+        std::env::remove_var("CAIRN_FABRIC_URL");
+    }
+
+    // ── Issue #631 regression tests: every validate() error names the
+    //    env var the operator must set, never the internal field name. ───────
+
+    /// Collect every error message `validate()` can produce for the HMAC
+    /// pair, by exercising each failure arm. Used by the regression guards
+    /// below to prove no message leaks a Rust field name back to operators.
+    fn hmac_validate_error_messages() -> Vec<String> {
+        let mut out = Vec::new();
+
+        // kid-without-secret (the exact case from issue #631)
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_kid = Some("k1".into());
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // secret too short
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(63));
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // secret too long
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(65));
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // secret non-hex
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("g".repeat(64));
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // kid empty with secret set
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(64));
+        cfg.waitpoint_hmac_kid = Some(String::new());
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        // kid contains colon
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(64));
+        cfg.waitpoint_hmac_kid = Some("bad:kid".into());
+        out.push(cfg.validate().unwrap_err().to_string());
+
+        out
+    }
+
+    #[test]
+    fn hmac_error_messages_name_env_var_not_field_name() {
+        // The original #631 defect: the fatal string spoke "waitpoint_hmac_secret"
+        // (the private Rust field) instead of "CAIRN_FABRIC_WAITPOINT_HMAC_SECRET"
+        // (the env var the operator controls). Lock both invariants:
+        //
+        // 1. Every HMAC validation error message must contain at least one of
+        //    the real env var names. An operator reading the fatal should be
+        //    able to grep their shell config for the symbol named in the log.
+        // 2. No HMAC message may leak the lowercase Rust field names
+        //    `waitpoint_hmac_secret` / `waitpoint_hmac_kid`. Case-sensitive,
+        //    so the uppercased env-var form still passes this guard.
+        for msg in hmac_validate_error_messages() {
+            assert!(
+                msg.contains("CAIRN_FABRIC_WAITPOINT_HMAC_SECRET")
+                    || msg.contains("CAIRN_FABRIC_WAITPOINT_HMAC_KID"),
+                "HMAC validate error must name the env var, got: {msg}"
+            );
+            assert!(
+                !msg.contains("waitpoint_hmac_secret"),
+                "HMAC validate error must not leak the Rust field name \
+                 `waitpoint_hmac_secret`, got: {msg}"
+            );
+            assert!(
+                !msg.contains("waitpoint_hmac_kid"),
+                "HMAC validate error must not leak the Rust field name \
+                 `waitpoint_hmac_kid`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn hmac_kid_without_secret_has_remediation_hint() {
+        // Production-quality fatals point at the fix. The exact case from
+        // #631 (kid set, secret missing) must include the openssl command
+        // the operator can run, plus the unset-alternative.
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_kid = Some("k1".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "expected openssl remediation hint, got: {err}"
+        );
+        assert!(
+            err.contains("unset CAIRN_FABRIC_WAITPOINT_HMAC_KID"),
+            "expected unset-alternative in remediation, got: {err}"
         );
     }
 
     #[test]
-    fn valkey_client_builder_with_tls() {
-        // Same limitation as `valkey_client_builder_without_tls`: no
-        // public accessors on `ClientBuilder`/`ConnectionRequest`. We
-        // assert synchronous validation passes with TLS toggled on.
-        let config = FabricConfig {
-            valkey_host: "secure.host".into(),
-            valkey_port: 6379,
-            tls: true,
-            cluster: false,
-            lane_id: LaneId::new("test"),
-            worker_id: WorkerId::new("w1"),
-            worker_instance_id: WorkerInstanceId::new("inst1"),
-            namespace: Namespace::new("ns"),
-            lease_ttl_ms: 30_000,
-            grant_ttl_ms: 5_000,
-            max_concurrent_tasks: 1,
-            signal_dedup_ttl_ms: 86_400_000,
-            fcall_timeout_ms: 5_000,
-            worker_capabilities: BTreeSet::new(),
-            waitpoint_hmac_secret: None,
-            waitpoint_hmac_kid: None,
-        };
-        assert!(config.valkey_client_builder().build_lazy().is_ok());
+    fn hmac_secret_length_error_has_remediation_hint() {
+        // A truncated / oversized secret is a common paste error; the fatal
+        // must name the command that regenerates a correct one.
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("a".repeat(63));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "expected openssl remediation hint on length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn hmac_secret_non_hex_error_has_remediation_hint() {
+        let mut cfg = base_config();
+        cfg.waitpoint_hmac_secret = Some("g".repeat(64));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "expected openssl remediation hint on non-hex error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn numeric_validate_error_messages_name_env_var() {
+        // Sibling audit to the HMAC regression above: the lease / tasks /
+        // grant / fcall / signal-dedup guards used the same field-name
+        // pattern. Each must name its CAIRN_FABRIC_* env var so operators
+        // can act on the fatal without reading the source.
+
+        // lease_ttl_ms < 1000
+        let mut cfg = base_config();
+        cfg.lease_ttl_ms = 500;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_LEASE_TTL_MS"),
+            "lease-ttl error must name CAIRN_FABRIC_LEASE_TTL_MS, got: {err}"
+        );
+
+        // max_concurrent_tasks = 0
+        let mut cfg = base_config();
+        cfg.max_concurrent_tasks = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_MAX_TASKS"),
+            "max-tasks error must name CAIRN_FABRIC_MAX_TASKS, got: {err}"
+        );
+
+        // grant_ttl_ms = 0
+        let mut cfg = base_config();
+        cfg.grant_ttl_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_GRANT_TTL_MS"),
+            "grant-ttl error must name CAIRN_FABRIC_GRANT_TTL_MS, got: {err}"
+        );
+
+        // fcall_timeout_ms = 0
+        let mut cfg = base_config();
+        cfg.fcall_timeout_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_FCALL_TIMEOUT_MS"),
+            "fcall-timeout error must name CAIRN_FABRIC_FCALL_TIMEOUT_MS, got: {err}"
+        );
+
+        // signal_dedup_ttl_ms = 0
+        let mut cfg = base_config();
+        cfg.signal_dedup_ttl_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("CAIRN_FABRIC_SIGNAL_DEDUP_TTL_MS"),
+            "signal-dedup error must name CAIRN_FABRIC_SIGNAL_DEDUP_TTL_MS, got: {err}"
+        );
     }
 }

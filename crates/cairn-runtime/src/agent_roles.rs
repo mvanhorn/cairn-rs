@@ -26,7 +26,8 @@ impl AgentRoleRegistry {
     }
 
     /// Registry pre-populated with the four built-in default roles:
-    /// `orchestrator`, `researcher`, `executor`, `reviewer`.
+    /// `orchestrator`, `status-checker`, `researcher`, `executor`,
+    /// `reviewer`, `generic`.
     pub fn with_defaults() -> Self {
         let reg = Self::empty();
         for role in default_roles() {
@@ -119,9 +120,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_roles_registry_with_defaults_has_four_roles() {
+    fn agent_roles_registry_with_defaults_has_six_roles() {
+        // #775 added the `generic` role alongside the original four
+        // (orchestrator, executor, researcher, reviewer); #806 added
+        // `status-checker` to absorb the orchestrator's stripped
+        // workspace-inspection surface.
         let reg = AgentRoleRegistry::with_defaults();
-        assert_eq!(reg.len(), 4, "must have exactly 4 default roles");
+        assert_eq!(reg.len(), 6, "must have exactly 6 default roles");
     }
 
     #[test]
@@ -130,9 +135,11 @@ mod tests {
         let all = reg.list_all();
         let ids: Vec<_> = all.iter().map(|r| r.role_id.as_str()).collect();
         assert!(ids.contains(&"orchestrator"));
+        assert!(ids.contains(&"status-checker"));
         assert!(ids.contains(&"researcher"));
         assert!(ids.contains(&"executor"));
         assert!(ids.contains(&"reviewer"));
+        assert!(ids.contains(&"generic"));
     }
 
     #[test]
@@ -171,6 +178,10 @@ mod tests {
         let ids: Vec<_> = standard.iter().map(|r| r.role_id.as_str()).collect();
         assert!(ids.contains(&"executor"), "executor must be Standard");
         assert!(ids.contains(&"reviewer"), "reviewer must be Standard");
+        assert!(
+            ids.contains(&"status-checker"),
+            "status-checker must be Standard tier (#806)"
+        );
     }
 
     #[test]
@@ -183,7 +194,9 @@ mod tests {
         )
         .with_max_context_tokens(999_999);
         reg.register(custom);
-        assert_eq!(reg.len(), 4, "override must not add a new entry");
+        // #775 added `generic` (4→5). #806 added `status-checker`
+        // (5→6). Override must still not add a new entry.
+        assert_eq!(reg.len(), 6, "override must not add a new entry");
         assert_eq!(
             reg.get("orchestrator").unwrap().max_context_tokens,
             Some(999_999)
@@ -195,7 +208,8 @@ mod tests {
         let reg = AgentRoleRegistry::with_defaults();
         let custom = AgentRole::new("tester", "Test Agent", AgentRoleTier::Standard);
         reg.register(custom);
-        assert_eq!(reg.len(), 5);
+        // #775 + #806: 6 defaults + 1 new = 7.
+        assert_eq!(reg.len(), 7);
         assert!(reg.get("tester").is_some());
     }
 

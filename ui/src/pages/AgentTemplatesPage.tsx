@@ -8,6 +8,9 @@ import { clsx } from "clsx";
 import { defaultApi } from "../lib/api";
 import { useToast } from "../components/Toast";
 import type { AgentTemplate } from "../lib/types";
+import { EmptyScopeHint } from "../components/EmptyScopeHint";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -117,7 +120,7 @@ function InstantiateModal({ template, onClose, onDone }: InstantiateModalProps) 
             <button
               onClick={() => mutation.mutate()}
               disabled={mutation.isPending || !goal.trim()}
-              className="flex items-center gap-1.5 px-4 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-100 dark:bg-zinc-800 disabled:text-gray-400 dark:text-zinc-600 text-white text-[12px] font-medium transition-colors"
+              className="flex items-center gap-1.5 px-4 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] font-medium transition-colors shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-950 disabled:bg-gray-300 dark:disabled:bg-zinc-700 disabled:text-gray-500 dark:disabled:text-zinc-500 disabled:cursor-not-allowed disabled:shadow-none"
             >
               {mutation.isPending
                 ? <><Loader2 size={12} className="animate-spin" /> Starting…</>
@@ -212,7 +215,7 @@ function TemplateCard({ template, onInstantiate, recentRunId }: TemplateCardProp
         )}
         <button
           onClick={() => onInstantiate(template)}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] font-medium transition-colors"
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white text-[12px] font-medium transition-colors shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:ring-offset-2 focus-visible:ring-offset-white dark:focus-visible:ring-offset-zinc-950"
         >
           <Play size={11} /> Instantiate
         </button>
@@ -236,8 +239,9 @@ export function AgentTemplatesPage() {
   const handleDone = (templateId: string, runId: string) => {
     setRecentRuns(prev => ({ ...prev, [templateId]: runId }));
     setModal(null);
-    // Navigate to the run detail page
-    setTimeout(() => { window.location.hash = `run/${runId}`; }, 500);
+    // Navigate immediately: `instantiateAgentTemplate` is synchronous and the
+    // 201 response already contains the created run_id (issue #161 — no race).
+    window.location.hash = `run/${runId}`;
   };
 
   return (
@@ -248,6 +252,10 @@ export function AgentTemplatesPage() {
         <span className="text-[11px] text-gray-400 dark:text-zinc-600">
           Pre-configured agents ready to instantiate
         </span>
+      </div>
+      {/* F32 — inline entity explainer. */}
+      <div className="px-5 py-1.5 border-b border-gray-200 dark:border-zinc-800 shrink-0">
+        <EntityExplainer>{ENTITY_EXPLAINERS.agentTemplate}</EntityExplainer>
       </div>
 
       {/* Content */}
@@ -285,6 +293,8 @@ export function AgentTemplatesPage() {
                 />
               ))}
             </div>
+
+            <EmptyScopeHint empty={(templates ?? []).length === 0} />
 
             {/* Custom agent hint */}
             <div className="rounded-lg border border-gray-200/60 dark:border-zinc-800/60 bg-gray-50/40 dark:bg-zinc-900/40 px-5 py-4 flex items-start gap-3">

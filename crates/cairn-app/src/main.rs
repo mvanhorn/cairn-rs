@@ -6,23 +6,20 @@
 //!   cairn-app --port 8080             # custom port
 //!   cairn-app --addr 0.0.0.0          # bind all interfaces
 //!
-mod bin_admin;
-mod bin_events;
-mod bin_export;
-mod bin_frontend;
-mod bin_handlers;
-mod bin_health;
-mod bin_providers;
-mod bin_router;
-mod bin_seed;
-mod bin_state;
-mod bin_types;
-mod bin_websocket;
+// Binary-only modules live under `bin_main/` so the lib/bin boundary is
+// visible at the filesystem level (#445). The legacy `bin_` file-name
+// prefix is retained inside that directory for reader clarity.
+mod bin_main;
 #[allow(dead_code)]
 mod bundles;
 #[allow(dead_code)]
 mod entitlements;
-mod openapi_spec;
+// `openapi_spec` is published via the library (`cairn_app::openapi_spec`)
+// so integration tests (e.g. `tests/openapi_coverage.rs`) can parse the
+// canonical spec. The binary-side `bin_frontend` module references the
+// constants through the full library path, so no re-import is needed
+// here (see Copilot PR review: an unused `use` would trip
+// `#![deny(warnings)]` CI).
 #[allow(dead_code)]
 mod sse_hooks;
 #[allow(dead_code)]
@@ -31,29 +28,29 @@ mod templates;
 mod validate;
 
 #[allow(unused_imports)]
-use bin_admin::*;
+use bin_main::bin_admin::*;
 #[allow(unused_imports)]
-use bin_events::*;
+use bin_main::bin_events::*;
 #[allow(unused_imports)]
-use bin_export::*;
+use bin_main::bin_export::*;
 #[allow(unused_imports)]
-use bin_frontend::*;
+use bin_main::bin_frontend::*;
 #[allow(unused_imports)]
-use bin_handlers::*;
+use bin_main::bin_handlers::*;
 #[allow(unused_imports)]
-use bin_health::*;
+use bin_main::bin_health::*;
 #[allow(unused_imports)]
-use bin_providers::*;
+use bin_main::bin_providers::*;
 #[allow(unused_imports)]
-use bin_router::*;
+use bin_main::bin_router::*;
 #[allow(unused_imports)]
-use bin_seed::*;
+use bin_main::bin_seed::*;
 #[allow(unused_imports)]
-use bin_state::*;
+use bin_main::bin_state::*;
 #[allow(unused_imports)]
-use bin_types::*;
+use bin_main::bin_types::*;
 #[allow(unused_imports)]
-use bin_websocket::*;
+use bin_main::bin_websocket::*;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -80,7 +77,7 @@ use cairn_runtime::provider_health::ProviderHealthService;
 use cairn_runtime::sessions::SessionService;
 use cairn_runtime::{CredentialService, DefaultsService};
 #[allow(unused_imports)]
-use cairn_runtime::{InMemoryServices, OllamaEmbeddingProvider, OllamaModel, OllamaProvider};
+use cairn_runtime::{OllamaEmbeddingProvider, OllamaModel, OllamaProvider, RuntimeServices};
 use cairn_store::pg::PgMigrationRunner;
 use cairn_store::pg::{PgAdapter, PgEventLog};
 use cairn_store::sqlite::{SqliteAdapter, SqliteEventLog};
@@ -90,7 +87,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::SqlitePoolOptions;
 
 // PgBackend, SqliteBackend, RateBucket, AppState, NotificationBuffer,
-// AppMetrics, RequestLogBuffer → bin_state.rs
+// RequestLogBuffer → bin_state.rs
+// HTTP metrics live in lib-side `cairn_app::metrics::AppMetrics`.
 // RequestId, ApiError, pagination_headers, PaginationQuery, ProjectQuery → bin_types.rs
 
 // ── Metrics middleware ────────────────────────────────────────────────────────
@@ -186,6 +184,33 @@ fn parse_args_from(args: &[String]) -> (BootstrapConfig, bool) {
     let storage_explicit =
         db_before_env || std::env::var("CAIRN_DB").is_ok_and(|v| !v.trim().is_empty());
 
+    // If the operator set CAIRN_CREDENTIAL_KEY* in their environment, treat
+    // that as the source of truth for the entitlement gate (`credentials_available`)
+    // regardless of deployment mode. `AppState::new` then loads the actual
+    // key material via `MasterKey::from_env` and errors loudly on malformed
+    // values. We only adjust the config slot here; we do NOT read the key
+    // bytes themselves in the CLI parser.
+    //
+    // Read each env var ONCE into a local and branch on the captured value.
+    // The previous shape read `CAIRN_CREDENTIAL_KEY_FILE` twice (once in the
+    // `is_ok_and` guard, once inside the `if` body to build the path) — if
+    // the env changed between the two reads, the inner body saw a different
+    // value than the guard validated. Cursor review on PR #535 (main.rs:209).
+    let key_file = std::env::var("CAIRN_CREDENTIAL_KEY_FILE")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let key_value_present = std::env::var("CAIRN_CREDENTIAL_KEY")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    if let Some(path) = key_file {
+        config.encryption_key = EncryptionKeySource::File { path };
+    } else if key_value_present {
+        config.encryption_key = EncryptionKeySource::EnvVar {
+            var_name: "CAIRN_CREDENTIAL_KEY".to_owned(),
+        };
+    }
+
     if config.mode == DeploymentMode::SelfHostedTeam {
         if config.listen_addr == "127.0.0.1" {
             config.listen_addr = "0.0.0.0".to_owned();
@@ -244,6 +269,65 @@ fn parse_args() -> BootstrapConfig {
     // refusal point.
     cairn_app::bootstrap::enforce_team_mode_storage_invariant(&config);
     config
+}
+
+/// F65 PR-5: detect the `--allow-missing-sandbox-primitives` CLI flag.
+/// Pulled out of BootstrapConfig because the flag is sandbox-specific
+/// and its presence is only consulted at startup for the probe gate.
+/// Loud startup WARN when set. Locked Q7: no env-var counterpart to
+/// avoid "forgotten in docker-compose" footgun.
+fn allow_missing_sandbox_primitives_flag() -> bool {
+    std::env::args().any(|a| a == "--allow-missing-sandbox-primitives")
+}
+
+/// F65 PR-5: run the kernel-primitive probe and assert the REQUIRED
+/// ones pass. Fail-loud on FAIL unless the operator passed
+/// `--allow-missing-sandbox-primitives`. When the flag is set, emit a
+/// loud WARN + continue (the sandbox is advisory-only in that mode).
+fn assert_sandbox_primitives_or_exit() {
+    // Allow integration tests to inject a fixture markdown path so they
+    // can drive the FAIL path without a real kernel.
+    let findings = if let Ok(path) = std::env::var("CAIRN_F65_PROBE_OVERRIDE_MARKDOWN") {
+        match cairn_workspace::sandbox::confinement::probe::ProbeFindings::load_from_markdown(
+            std::path::Path::new(&path),
+        ) {
+            Ok(f) => f,
+            Err(err) => {
+                eprintln!(
+                    "F65 kernel probe: override markdown load failed: {err}; \
+                     falling back to live probe"
+                );
+                cairn_workspace::sandbox::confinement::probe::run_live_probe()
+            }
+        }
+    } else {
+        cairn_workspace::sandbox::confinement::probe::run_live_probe()
+    };
+    match findings.assert_required() {
+        Ok(()) => {
+            eprintln!(
+                "F65 kernel probe: all REQUIRED primitives pass (kernel {})",
+                findings.kernel_version
+            );
+        }
+        Err(err) => {
+            if allow_missing_sandbox_primitives_flag() {
+                eprintln!(
+                    "⚠ F65 kernel probe: REQUIRED primitive FAIL — continuing because \
+                     `--allow-missing-sandbox-primitives` was set.\n\
+                     Sandbox isolation is NOT enforced in this mode.\n\
+                     Error: {err}"
+                );
+            } else {
+                eprintln!(
+                    "FATAL: F65 kernel probe failed: {err}\n\n\
+                     Pass `--allow-missing-sandbox-primitives` to start anyway with \
+                     sandbox disabled (dev / CI only; sandbox isolation will be a no-op)."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -354,11 +438,84 @@ async fn flush_state_to_disk(state: &AppState) {
 }
 
 // Demo data seeding → bin_seed.rs
+
+/// F65 PR-4 sandboxed-agent mode entrypoint. Runs BEFORE the tokio runtime
+/// because confinement (close_range + Landlock + seccomp) must happen in a
+/// quiescent process; tokio would spawn blocking-pool threads that each need
+/// to inherit the Landlock ruleset, which only works if we restrict_self
+/// before they start.
+///
+/// Returns `Some(exit_code)` when the mode fires (caller should exit with it);
+/// returns `None` when `--sandboxed-agent` is not in argv so the normal cairn-
+/// app boot path runs.
+#[cfg(target_os = "linux")]
+fn maybe_run_sandboxed_agent(args: &[String]) -> Option<std::process::ExitCode> {
+    match bin_main::bin_sandboxed_agent::detect_and_parse(args) {
+        None => None,
+        Some(Ok(parsed)) => Some(bin_main::bin_sandboxed_agent::run(parsed)),
+        Some(Err(err)) => {
+            eprintln!("[sandboxed-agent] bad CLI: {err}");
+            Some(std::process::ExitCode::from(1))
+        }
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    #[cfg(target_os = "linux")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(code) = maybe_run_sandboxed_agent(&args) {
+            return code;
+        }
+    }
+    real_main();
+    std::process::ExitCode::SUCCESS
+}
+
 #[tokio::main]
-async fn main() {
+async fn real_main() {
     // Load .env file if present (dev convenience — not required in production).
     // Silently ignored when the file doesn't exist.
     let _ = dotenvy::dotenv();
+
+    // #773: scrub credential env vars from cairn-app's process
+    // environment before any subprocess spawn. Operator-environment
+    // credentials (`GH_TOKEN`, `AWS_*`, `OPENAI_API_KEY`, …)
+    // inherited from the launching shell would otherwise propagate
+    // into every bash subprocess the harness-tools layer spawns for
+    // sub-agents. R19 dogfood reproduced the wedge: a stale
+    // `GH_TOKEN` shadowed gh CLI's valid hosts.yml credentials,
+    // every `gh` call returned 401, the executor sub-agent looped
+    // for 71 iterations on `unset GH_TOKEN; gh auth status` without
+    // ever writing a file. Removing the var at the cairn-app
+    // process layer covers every spawned bash by inheritance.
+    //
+    // Operator override: `CAIRN_INHERIT_OPERATOR_ENV=1` keeps the
+    // legacy behaviour (used by local dev where the host's env is
+    // intentionally trusted). Tracing is not yet initialised here
+    // — log to stderr.
+    {
+        let report = cairn_app::credential_env_scrub::scrub_credential_env_vars();
+        if report.skipped_via_override {
+            eprintln!(
+                "#773 credential env scrub: SKIPPED (CAIRN_INHERIT_OPERATOR_ENV \
+                 is set). Operator-environment credentials propagate into \
+                 sub-agent bash subprocesses; this is acceptable only for \
+                 trusted local-dev environments."
+            );
+        } else if !report.removed.is_empty() {
+            // Sort for stable log output. Names only; values are
+            // credentials and never logged.
+            let mut names = report.removed.clone();
+            names.sort();
+            eprintln!(
+                "#773 credential env scrub: removed {} operator-inherited \
+                 credential vars before any subprocess spawn (names only): {}",
+                names.len(),
+                names.join(", "),
+            );
+        }
+    }
 
     // Initialise structured request tracing.  Operators can tune verbosity via
     // the RUST_LOG env var (e.g. RUST_LOG=cairn_app=info,tower_http=debug).
@@ -404,6 +561,12 @@ async fn main() {
     }
 
     let config = parse_args();
+
+    // F65 PR-5 locked Q7: refuse to start if REQUIRED sandbox primitives
+    // FAIL unless the operator passed --allow-missing-sandbox-primitives.
+    // Runs BEFORE token registry so an AppArmor-blocked boot surfaces
+    // a named-primitive error instead of a confusing auth failure.
+    assert_sandbox_primitives_or_exit();
 
     // ── Token registry ────────────────────────────────────────────────────────
     // Priority: CAIRN_ADMIN_TOKEN_FILE > CAIRN_ADMIN_TOKEN > default dev token.
@@ -553,11 +716,25 @@ async fn main() {
     }
 
     // ── Lib.rs AppState (catalog-driven router, shared runtime) ─────────────
-    let mut lib_state = Arc::new(
-        cairn_app::AppState::new(config.clone())
-            .await
-            .expect("failed to initialise lib AppState"),
-    );
+    let mut lib_state = Arc::new(match cairn_app::AppState::new(config.clone()).await {
+        Ok(state) => state,
+        Err(e) => {
+            // #470: AppState::new returns the credential-key fatal error
+            // verbatim. Print it on its own line so operators see exactly
+            // one message and follow with a short checklist of the usual
+            // boot-time misconfigurations — DB, admin token, migrations.
+            // Exit non-zero so supervisors (systemd, docker) see the
+            // failure and restart/escalate per their own policy.
+            eprintln!("fatal: failed to initialise AppState: {e}");
+            eprintln!(
+                "hint: verify DATABASE_URL points at a reachable store, \
+                 CAIRN_ADMIN_TOKEN (or CAIRN_ADMIN_TOKEN_FILE) is set, and \
+                 all migrations applied cleanly (\"store: … migration\" \
+                 log lines above)"
+            );
+            std::process::exit(1);
+        }
+    });
     // Register the admin token in the SHARED token registry so both routers
     // authenticate identically.
     lib_state.service_tokens.register(
@@ -623,6 +800,68 @@ async fn main() {
         }
     }
 
+    // ── Descendant-counter reconciliation (#670 G4 PR-1b-4) ──────────────────
+    // The `in_flight_descendants` counter on the `runs` projection is
+    // mutated via direct SQL UPDATE (not event-sourced), so the event-
+    // log replay above did NOT restore its value — it's been rebuilt
+    // back to 0 on every row. The durable backend still holds the
+    // authoritative value; read it back and write it onto the
+    // in-memory projection. Without this, any cairn-app restart
+    // resets every active root's descendant counter to 0 and the
+    // cap-gate stops working until a live decrement underflows
+    // obviously.
+    //
+    // Cheap: the list is capped (10 000 rows by the primitive) and
+    // in practice there are at most a handful of root runs with
+    // active descendants at any given time. Skipped entirely when
+    // there is no durable backend (--db memory).
+    {
+        use cairn_store::projections::RunDescendantsCounter;
+        let durable_counter: Option<Arc<dyn RunDescendantsCounter>> = if let Some(ref backend) = pg
+        {
+            Some(backend.adapter.clone() as Arc<dyn RunDescendantsCounter>)
+        } else if let Some(ref backend) = sqlite {
+            Some(backend.adapter.clone() as Arc<dyn RunDescendantsCounter>)
+        } else {
+            None
+        };
+        if let Some(counter) = durable_counter {
+            match counter.list_nonzero_descendant_counters().await {
+                Ok(rows) => {
+                    let n = rows.len();
+                    for (run_id, value) in rows {
+                        lib_state
+                            .runtime
+                            .store
+                            .restore_descendants_counter(&run_id, value)
+                            .await;
+                    }
+                    if n > 0 {
+                        eprintln!(
+                            "store: reconciled {n} root(s) with non-zero in_flight_descendants \
+                             from durable backend into in-memory projection"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Non-fatal: counters drift to 0 until the next live
+                    // increment, but the cairn-app is still serviceable.
+                    // WARN so production logging pipelines pick it up —
+                    // Gemini review on #680 flagged an eprintln! here
+                    // that wouldn't survive a logs filter (`eprintln!`
+                    // goes to stderr but doesn't carry structured
+                    // severity; tracing::warn! does both).
+                    tracing::warn!(
+                        error = %e,
+                        "store: descendant-counter reconciliation failed. \
+                         Live counters may be inaccurate until a subsequent \
+                         increment/decrement writes.",
+                    );
+                }
+            }
+        }
+    }
+
     // ── Seed the service-layer event ID counter above existing events ─────────
     // The make_envelope() counter starts at 0 on each process startup and
     // generates IDs like "evt_<timestamp>_<n>".  Seeding with the current
@@ -637,6 +876,70 @@ async fn main() {
             .unwrap_or(None);
         let floor = head.map(|p| p.0).unwrap_or(0);
         cairn_runtime::seed_event_counter(floor);
+    }
+
+    // ── RFC 026 PR-A0 tenant-role upgrade backfill ───────────────────────────
+    //
+    // Pre-A0 deployments have `operator_profiles` + `workspace_members`
+    // rows but no `operator_tenant_roles` — every operator would lose
+    // admin-UI access on upgrade because `TenantAdminGuard` rejects
+    // non-god-token operators without a grant. The backfill walks the
+    // existing projections and emits real `TenantRoleGranted` events so
+    // the event log reconstructs the grants on future replay.
+    //
+    // Idempotent: pairs already present in `operator_tenant_roles` (re-
+    // boot, or greenfield deployments that never needed the backfill)
+    // are skipped.
+    //
+    // WARN log per RFC Open Q#4 so the operator sees exactly what the
+    // upgrade attached.
+    {
+        let store = lib_state.runtime.store.as_ref();
+        match cairn_runtime::run_tenant_role_backfill(store, &lib_state.runtime.tenant_roles, 500)
+            .await
+        {
+            Ok(report) => {
+                if report.total_emitted() > 0 {
+                    eprintln!(
+                        "WARN: tenant-role upgrade backfill granted {} pair(s) \
+                         (skipped {} already present)",
+                        report.total_emitted(),
+                        report.skipped_already_present,
+                    );
+                    // Cap the per-boot log at 20 pairs to bound noise
+                    // on large deployments while still giving operators
+                    // a recognizable sample. Full list lives in the
+                    // event log + `operator_tenant_roles` table.
+                    for (tenant, operator, role) in report.granted.iter().take(20) {
+                        eprintln!(
+                            "  tenant-role-backfill: tenant={tenant} operator={operator} \
+                             role={role:?}"
+                        );
+                    }
+                    if report.granted.len() > 20 {
+                        eprintln!(
+                            "  ... and {} more (see operator_tenant_roles + event log)",
+                            report.granted.len() - 20
+                        );
+                    }
+                } else if report.skipped_already_present > 0 {
+                    eprintln!(
+                        "tenant-role upgrade backfill: {} pair(s) already present \
+                         (no-op — replay-safe)",
+                        report.skipped_already_present
+                    );
+                }
+            }
+            Err(e) => {
+                // Do NOT fail boot — the backfill is a safety net, not
+                // a release gate. Log + continue; god-token access
+                // still works for the operator to diagnose.
+                eprintln!(
+                    "WARN: tenant-role upgrade backfill failed: {e} — admin-UI may \
+                     require god-token auth until corrected"
+                );
+            }
+        }
     }
 
     // ── Ollama local LLM provider (optional) ─────────────────────────────────
@@ -775,15 +1078,30 @@ async fn main() {
         .or_else(|| openai_compat_worker.clone())
         .or_else(|| openai_compat_openrouter.clone());
 
-    // Bedrock provider via cairn-providers.
-    let bedrock: Option<Arc<CairnBedrock>> = CairnBedrock::from_env().map(|p| {
-        eprintln!(
-            "bedrock: configured — model={} region={}",
-            p.model_id(),
-            p.region()
-        );
-        Arc::new(p)
-    });
+    // Bedrock provider via cairn-providers. `from_env_async` returns
+    // `Option<Result<_, ProviderError>>` — outer `None` means "no
+    // Bearer key and SigV4 fallback disabled" (boot silently without
+    // Bedrock), inner `Err` means "auth configured but the client
+    // failed to build" (log and continue without Bedrock so operators
+    // can still use whichever other providers they configured). The
+    // async variant is preferred here over `from_env` so Bedrock works
+    // on EC2/ECS/EKS via IMDS without requiring an API key.
+    let bedrock: Option<Arc<CairnBedrock>> = match CairnBedrock::from_env_async().await {
+        Some(Ok(p)) => {
+            eprintln!(
+                "bedrock: configured — model={} region={} auth={}",
+                p.model_id(),
+                p.region(),
+                p.auth_scheme()
+            );
+            Some(Arc::new(p))
+        }
+        Some(Err(err)) => {
+            eprintln!("bedrock: env configured but client build failed: {err}");
+            None
+        }
+        None => None,
+    };
 
     {
         use cairn_domain::providers::{EmbeddingProvider, GenerationProvider};
@@ -888,14 +1206,9 @@ async fn main() {
     }
 
     // ── Wire GitHub App integration into lib_state ────────────────────────────
-    // The integration registry (`IntegrationRegistry`) is the canonical home for
-    // all integrations. We register a `GitHubPlugin` there.
-    //
-    // TODO(integration-migration): The legacy `state.github` (`GitHubIntegration`)
-    // is ALSO set here because the webhook/queue/scan handlers in lib.rs still
-    // access its concrete fields (credentials, installations, issue_queue, etc.)
-    // directly.  Once `Integration` trait exposes those fields (or we add
-    // `as_any()` for downcasting), migrate the handlers and remove `state.github`.
+    // The integration registry (`IntegrationRegistry`) is the single source of
+    // truth for all integrations. Handlers recover the concrete `GitHubPlugin`
+    // via `registry.get_typed::<GitHubPlugin>("github")`.
     {
         let github_app_id = std::env::var("GITHUB_APP_ID").ok();
         let github_key_file = std::env::var("GITHUB_PRIVATE_KEY_FILE").ok();
@@ -908,32 +1221,15 @@ async fn main() {
                 Ok(app_id) => match std::fs::read(&key_file) {
                     Ok(pem_bytes) => match cairn_github::AppCredentials::new(app_id, &pem_bytes) {
                         Ok(credentials) => {
-                            // Legacy shim — kept until handlers are migrated to the registry.
-                            // See TODO(integration-migration) above.
-                            let github = cairn_app::GitHubIntegration {
-                                credentials: credentials.clone(),
-                                webhook_secret: webhook_secret.clone(),
-                                installations: tokio::sync::RwLock::new(
-                                    std::collections::HashMap::new(),
-                                ),
-                                event_actions: tokio::sync::RwLock::new(vec![]),
-                                issue_queue: tokio::sync::RwLock::new(
-                                    std::collections::VecDeque::new(),
-                                ),
-                                queue_paused: std::sync::atomic::AtomicBool::new(false),
-                                queue_running: std::sync::atomic::AtomicBool::new(false),
-                                max_concurrent: std::sync::atomic::AtomicU32::new(3),
-                                run_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(3)),
-                                http: reqwest::Client::new(),
-                            };
-                            // Canonical registration — the integration registry is the
-                            // single source of truth for all integrations.
                             let github_plugin = cairn_integrations::github::GitHubPlugin::new(
                                 credentials,
                                 webhook_secret,
                                 3,
                             );
-                            // T6b-C4: same fail-loud pattern as above.
+                            // T6b-C4: fail-loud — every prior wire-in step
+                            // (brain provider, bedrock provider) uses the
+                            // same Arc::get_mut pattern with an eprintln +
+                            // exit on clone-before-write. Keep the shape.
                             let lib_mut = match Arc::get_mut(&mut lib_state) {
                                 Some(m) => m,
                                 None => {
@@ -943,7 +1239,6 @@ async fn main() {
                                     std::process::exit(1);
                                 }
                             };
-                            lib_mut.github = Some(Arc::new(github));
                             let registry = match Arc::get_mut(&mut lib_mut.integrations) {
                                 Some(r) => r,
                                 None => {
@@ -954,6 +1249,39 @@ async fn main() {
                                 }
                             };
                             registry.register_sync(Arc::new(github_plugin));
+
+                            // #556: install plugin-owned durable persistence
+                            // for the repo allowlist. The allowlist is plugin
+                            // runtime state (the GitHub integration owns
+                            // which repos an operator has granted a given
+                            // project access to) and therefore does not
+                            // travel through the core RuntimeEvent log. The
+                            // plugin persists to
+                            // `<CAIRN_PLUGIN_STATE_DIR>/github/allowlist.json`
+                            // and rehydrates the in-memory access service on
+                            // every boot before HTTP traffic starts.
+                            let plugin_state_dir = cairn_app::state::default_plugin_state_dir();
+                            match cairn_integrations::github::GitHubPlugin::install_allowlist_persistence(
+                                &lib_mut.project_repo_access,
+                                &plugin_state_dir,
+                            ) {
+                                Ok(path) => {
+                                    eprintln!(
+                                        "GitHub App: allowlist persistence installed at {}",
+                                        path.display()
+                                    );
+                                }
+                                Err(e) => {
+                                    // Fail loud — operators would otherwise
+                                    // see an allowlist silently rehydrate-
+                                    // to-empty on every restart.
+                                    eprintln!(
+                                        "fatal: GitHub App allowlist persistence install failed: {e}"
+                                    );
+                                    std::process::exit(1);
+                                }
+                            }
+
                             eprintln!("GitHub App: wired (app_id={app_id})");
                         }
                         Err(e) => {
@@ -978,15 +1306,103 @@ async fn main() {
     }
 
     // ── Wire built-in tool registry into lib_state ───────────────────────────
-    // Build with the real RetrievalService + IngestPipeline so the orchestrator
-    // can actually search and store memory during execution.
+    // RFC 029 PR-B1: memory tools dispatch through MultiProviderRetrieval /
+    // MultiProviderIngest. For projects on cairn-default (the project
+    // creation default, and the only provider with wired in-tree retrieval
+    // right now) this is byte-identical to calling InMemoryRetrieval
+    // directly. Plugin providers (`plugin:<id>`) surface as
+    // `ProviderUnavailable` until the adapter binaries productise the
+    // dispatcher; there is no silent fallback.
+    //
+    // RFC 029 PR-B2: every response flows through `PostHocRescorer` so
+    // runtime-owned scoring dimensions come from cairn regardless of
+    // provider. The rescorer uses `multi_neighbors` for batched graph
+    // lookups and `NoOpCredibilityLookup` as the credibility source
+    // (threading `InMemoryDiagnostics` is deferred until that read
+    // model exposes a batched `list_by_source_ids` surface).
     {
+        use cairn_memory::event_log_resolver::EventLogProviderResolver;
+        use cairn_memory::multi_provider::MultiProviderRetrieval;
+        use cairn_memory::post_hoc_rescorer::{NoOpCredibilityLookup, PostHocRescorer};
         use cairn_memory::{retrieval::RetrievalService, IngestService};
-        let retrieval = lib_state.retrieval.clone() as Arc<dyn RetrievalService>;
-        let ingest = lib_state.ingest.clone() as Arc<dyn IngestService>;
+        use cairn_plugin_proto::CapabilityFamily;
+        let store = lib_state.runtime.store.clone();
+        // RFC 030 PR-F: the knowledge-family rescorer runs the full
+        // pipeline (multi_neighbors + credibility + corroboration). The
+        // memory-family twin is constructed below with
+        // `with_family(CapabilityFamily::MemoryProvider)` — that
+        // instance skips `multi_neighbors` entirely. Both share the same
+        // graph service + credibility lookup because the in-tree
+        // cairn-default backend serves both families today; PR-G
+        // supplies family-specific credibility projections once the
+        // memory-family resolver lands.
+        let rescorer = PostHocRescorer::with_family(
+            CapabilityFamily::KnowledgeProvider,
+            lib_state.graph.clone(),
+            NoOpCredibilityLookup,
+        );
+        let memory_rescorer = PostHocRescorer::with_family(
+            CapabilityFamily::MemoryProvider,
+            lib_state.graph.clone(),
+            NoOpCredibilityLookup,
+        );
+        // Reuse the single StdioKnowledgeDispatcher built during
+        // AppState construction so the JSON-RPC request-id counter
+        // is shared across the agent-memory path and the deep-search
+        // path (preventing id collisions on concurrent in-flight
+        // requests against the same plugin process).
+        let dispatcher = lib_state.knowledge_dispatcher.clone();
+        let knowledge_retrieval = Arc::new(
+            MultiProviderRetrieval::new(
+                lib_state.retrieval.clone(),
+                EventLogProviderResolver::new(store.clone()),
+                dispatcher.clone(),
+            )
+            .with_response_hook(rescorer),
+        ) as Arc<dyn RetrievalService>;
+        // Knowledge-family ingest pipeline is not surfaced through the
+        // tool registry (knowledge tools are retrieval-only today); the
+        // direct bundle import/export flows use `lib_state.ingest`.
+        // A `MultiProviderIngest` wiring for plugin knowledge ingest
+        // will reconstruct this here when the feature lands; `store`
+        // was consumed by the knowledge resolver above, so nothing
+        // here depends on it further.
+
+        // Memory-family wiring: separate `memory_retrieval` +
+        // `memory_ingest` Arcs from lib_state (distinct
+        // `InMemoryDocumentStore` per family so memory chunks and
+        // knowledge chunks never share storage), a memory-family
+        // resolver projecting only `MemoryProviderConfigured` events,
+        // and a single `KnowledgeDispatcherAsMemory` instance shared
+        // across retrieval + ingest dispatch (avoids rebuilding the
+        // bridge for each call path + keeps any future per-dispatcher
+        // state cached).
+        use cairn_memory::event_log_resolver::EventLogMemoryProviderResolver;
+        use cairn_memory::multi_provider_memory::{MultiProviderMemory, MultiProviderMemoryIngest};
+        let memory_dispatcher = Arc::new(cairn_app::main_bridges::KnowledgeDispatcherAsMemory(
+            lib_state.knowledge_dispatcher.clone(),
+        ));
+        let memory_retrieval = Arc::new(
+            MultiProviderMemory::new(
+                lib_state.memory_retrieval.clone(),
+                EventLogMemoryProviderResolver::new(lib_state.runtime.store.clone()),
+                memory_dispatcher.clone(),
+            )
+            .with_response_hook(memory_rescorer),
+        ) as Arc<dyn RetrievalService>;
+        let memory_ingest = Arc::new(MultiProviderMemoryIngest::new(
+            lib_state.memory_ingest.clone(),
+            EventLogMemoryProviderResolver::new(lib_state.runtime.store.clone()),
+            memory_dispatcher,
+        )) as Arc<dyn IngestService>;
+        let auto_extract_resolver: std::sync::Arc<
+            dyn cairn_app::tool_impls::MemoryAutoExtractResolver,
+        > = std::sync::Arc::new(cairn_app::tool_impls::NeverAutoExtract);
         let registry = cairn_app::tool_impls::build_tool_registry(
-            retrieval,
-            ingest,
+            memory_retrieval,
+            memory_ingest,
+            knowledge_retrieval,
+            auto_extract_resolver,
             lib_state.project_repo_access.clone(),
             lib_state.repo_clone_cache.clone(),
         );
@@ -1000,6 +1416,39 @@ async fn main() {
         };
         lib_mut.tool_registry = Some(Arc::new(registry));
         eprintln!("tool registry: memory tools + cairn.registerRepo wired");
+    }
+
+    // ── Boot-time provider-slot backfill + family-mismatch scan ───────────
+    // Emits `cairn-default` bootstrap bindings for projects created
+    // before the dual-family `ProjectCreated` emission, and flags
+    // plugin slots whose handshake-declared family doesn't match
+    // their configured slot. Best-effort: failures log at WARN but
+    // do not block boot. The plugin-family lookup currently has no
+    // cache surface to consult (the plugin host's per-id handshake
+    // snapshot isn't exposed to this crate yet), so the mismatch
+    // scan ships as a no-op for plugin refs today; it activates once
+    // the plugin host exposes a `family_for_plugin_id` surface.
+    // Backfill is active regardless.
+    {
+        let summary = cairn_app::provider_boot_scan::run_provider_boot_scan(
+            lib_state.runtime.store.clone(),
+            |_plugin_id| None,
+        )
+        .await;
+        if summary.backfilled_knowledge > 0
+            || summary.backfilled_memory > 0
+            || summary.knowledge_mismatches > 0
+            || summary.memory_mismatches > 0
+        {
+            eprintln!(
+                "provider boot scan: backfilled_knowledge={} backfilled_memory={} \
+                 knowledge_mismatches={} memory_mismatches={}",
+                summary.backfilled_knowledge,
+                summary.backfilled_memory,
+                summary.knowledge_mismatches,
+                summary.memory_mismatches
+            );
+        }
     }
 
     // ── Binary-specific state (shares runtime + tokens with lib.rs) ────────
@@ -1018,10 +1467,22 @@ async fn main() {
         openai_compat_worker,
         openai_compat_openrouter,
         openai_compat,
-        metrics: Arc::new(std::sync::RwLock::new(AppMetrics::new())),
+        lib_metrics: lib_state.metrics.clone(),
         rate_limits: Arc::new(Mutex::new(HashMap::new())),
         request_log: lib_state.request_log.clone(),
-        notifications: Arc::new(std::sync::RwLock::new(NotificationBuffer::new())),
+        notifications: {
+            let buf = Arc::new(std::sync::RwLock::new(NotificationBuffer::new()));
+            // F50: wire the lib-side NotificationSink so the SSE publish
+            // loop (which fires on every service-layer append, not just
+            // admin /v1/events/append) can push notifications into this
+            // same buffer.
+            lib_state.notification_sink.install(Arc::new(
+                crate::bin_main::bin_state::NotificationBufferSink {
+                    buffer: buf.clone(),
+                },
+            ));
+            buf
+        },
         templates: Arc::new(templates::TemplateRegistry::with_builtins()),
         entitlements: Arc::new(entitlements::EntitlementService::new()),
         bedrock: bedrock.clone(),
@@ -1037,13 +1498,45 @@ async fn main() {
             .runtime
             .store
             .set_secondary_log(pg_backend.event_log.clone());
+        state
+            .runtime
+            .store
+            .set_secondary_descendants_counter(pg_backend.adapter.clone());
         eprintln!("store: service-layer events will dual-write to Postgres");
     } else if let Some(ref sq_backend) = state.sqlite {
         state
             .runtime
             .store
             .set_secondary_log(sq_backend.event_log.clone());
+        state
+            .runtime
+            .store
+            .set_secondary_descendants_counter(sq_backend.adapter.clone());
         eprintln!("store: service-layer events will dual-write to SQLite");
+    }
+
+    // ── #670 G5 parent auto-resume wiring ─────────────────────────────────────
+    // After a child run terminates, the cairn-fabric terminal hook
+    // (FabricRunService::{complete, fail, cancel}) fires a
+    // child_completed signal to the parent's waitpoint and invokes
+    // `ParentAutoResume::resume_parent_run` to re-drive the parent's
+    // orchestrator loop via `drive_run_iteration`. Installing the
+    // wiring here is a no-op when the feature is unused (no
+    // spawn_subagent proposals == no suspensions == no resume
+    // callbacks fire), so the installation is unconditional.
+    if let Some(ref fabric) = lib_state.fabric {
+        let signal_bridge = fabric.signals.clone();
+        let subagent_spawns = lib_state.runtime.store.clone()
+            as Arc<dyn cairn_store::projections::SubagentSpawnReadModel>;
+        let auto_resume = Arc::new(
+            cairn_app::parent_auto_resume_impl::AppStateParentAutoResume::new(Arc::downgrade(
+                &lib_state,
+            )),
+        ) as Arc<dyn cairn_fabric::parent_auto_resume::ParentAutoResume>;
+        fabric
+            .runs
+            .set_subagent_resume_wiring(signal_bridge, subagent_spawns, auto_resume);
+        eprintln!("G5: parent auto-resume wiring installed on FabricRunService");
     }
 
     // ── Demo seed data (local mode only, only when event log is empty) ─────────
@@ -1343,13 +1836,112 @@ async fn main() {
         }
     }
 
-    // ── Startup replays ────────────────────────────────────────────────────────
-    // Replay all store events into in-memory projections so pre-existing data
-    // (seeded above or loaded from a snapshot) is immediately visible without
-    // requiring an SSE connection first.
-    lib_state.replay_graph().await;
-    lib_state.replay_evals().await;
-    lib_state.replay_triggers().await;
+    // ── Child-run driver (RFC 027 / #670 G4 PR-1b-3) ─────────────────────────
+    // Start AFTER `RecoveryService::recover_all` completes (direct
+    // sequential await — no tokio-spawn race window). RFC 027
+    // §contract 3: anything unrecoverable has already transitioned
+    // to `Failed` by this point, so the driver's `Pending +
+    // parent_run_id IS NOT NULL` claim predicate cannot pick up a
+    // crashed run that should be reclaimed by recovery.
+    //
+    // Default-on. Set `CAIRN_CHILD_RUN_DRIVER_ENABLED=false` to
+    // disable (production escape hatch). PR-1b-5 flipped the default
+    // and wired the claim path — the driver now calls
+    // `drive_run_iteration` per pending child via the same
+    // orchestrator pipeline the HTTP `/orchestrate` handler uses.
+    // The task's lifecycle is tied to cairn-app's; graceful shutdown
+    // below calls `.shutdown().await`.
+    let mut child_run_driver =
+        cairn_app::child_run_driver::ChildRunDriver::start(lib_state.clone());
+    tracing::info!(
+        boot_id = %boot_id,
+        "child-run driver started (PR-1b-5 claim path live; opt-out via CAIRN_CHILD_RUN_DRIVER_ENABLED=false)",
+    );
+
+    // ── Startup replays (trigger service only) ───────────────────────────────
+    // Walks the event log at boot to rebuild the in-memory
+    // `TriggerService` cache so pre-existing trigger + template data
+    // (seeded above or loaded from a persistent backend) is immediately
+    // visible to the orchestrator without waiting for an SSE client.
+    //
+    // Historical context — two sibling walkers previously ran here and
+    // have been migrated to sync projections / declared Ephemeral:
+    //
+    //   * RFC-025 Phase 1 (milestone 6) deleted `replay_evals` — the
+    //     `eval_runs` read model is now the canonical source (pg V034
+    //     + sqlite schema). `state.evals` is still populated lazily
+    //     via handler writes on the hot path; a process restart drops
+    //     the in-memory cache but all durable eval state (runs,
+    //     scores, rubric verdicts, archived-at timestamps) reads back
+    //     from the projection tables.
+    //
+    //   * RFC-025 Phase 1.5b (2026-04-28) deleted `replay_graph`. The
+    //     graph read-model is declared Ephemeral;
+    //     `publish_runtime_frames_since` populates it on the live
+    //     write path. Pre-restart node IDs return empty subgraphs on
+    //     persistent backends until those entities participate in new
+    //     events (Ephemeral contract). See state.rs for the in-code
+    //     rationale and RFC-025 for the full decision history.
+    //
+    //   * RFC-025 Phase 1.5a (this commit) deletes `replay_triggers`.
+    //     The `triggers` / `run_templates` / `trigger_fires`
+    //     projections (pg V035 + sqlite/schema.rs) are the canonical
+    //     read model; the async `TriggerService` reads them directly
+    //     and no boot-time event-log walk is needed. With this change
+    //     all three pre-projection walkers are gone, so the whole
+    //     "Startup replays" block collapses to the comment above.
+
+    // ── META #461: legacy credential-format scan ─────────────────────────────
+    // Report rows written under the pre-fix deterministic-nonce format so
+    // operators get an actionable rotation list. The scan is bounded at
+    // 100k rows total (see `LEGACY_SCAN_LIMIT`) and uses the single-pass
+    // projection read. Failures here are advisory — we don't want to block
+    // boot if the projection is transiently unavailable, but the cluster
+    // that motivated this PR is severe enough that the warning MUST land in
+    // ops logs. See CHANGELOG security section and PR #535 reviews.
+    match cairn_runtime::scan_legacy_ciphertexts(lib_state.runtime.store.as_ref()).await {
+        Ok(legacy) if legacy.is_empty() => {
+            tracing::info!("credentials: no pre-fix legacy rows detected");
+        }
+        Ok(legacy) => {
+            let count = legacy.len();
+            tracing::warn!(
+                count,
+                "credentials: {} pre-fix row(s) detected — revoke and re-enter before use; \
+                 `rotate-key` is NOT a valid remediation (see META #461)",
+                count
+            );
+            eprintln!(
+                "⚠ credentials: {count} pre-fix row(s) detected. \
+                 Revoke and re-enter each credential — `rotate-key` is NOT a \
+                 valid remediation because the new binary cannot decrypt these \
+                 rows (it reads the first 12 bytes as a random nonce). See \
+                 CHANGELOG META #461 for the migration runbook."
+            );
+            for entry in legacy.iter().take(20) {
+                tracing::warn!(
+                    tenant = %entry.tenant_id,
+                    credential_id = %entry.credential_id,
+                    provider_id = %entry.provider_id,
+                    key_version = ?entry.key_version,
+                    "legacy credential requires rotation"
+                );
+            }
+            if count > 20 {
+                tracing::warn!(
+                    "...and {} more pre-fix credential(s) (truncated log output)",
+                    count - 20
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "credentials: legacy-format scan failed (boot continues); \
+                 re-run /health/ready once projections warm up"
+            );
+        }
+    }
 
     // RFC 020 Track 3: populate the tool-call result cache from
     // `ToolInvocationCompleted` events that landed before this boot.
@@ -1434,30 +2026,182 @@ async fn main() {
             .unwrap_or_else(|e| panic!("failed to read bound addr: {e}"));
         eprintln!("cairn-app listening on http://{bound}");
 
-        // RFC 020 §"Startup order" step 6: flip readiness to ready in a
-        // background task so the HTTP listener is already accepting
-        // connections (liveness + `/health/ready` responding 503 with the
-        // progress JSON) by the time the final flip happens. In normal
-        // production this races the first client request and wins; under
-        // `CAIRN_TEST_STARTUP_DELAY_MS` (dev/test builds only) we sleep
-        // first so integration tests can observe the 503-with-progress
-        // response the RFC 020 contract promises.
-        let readiness_for_flip = lib_state.readiness.clone();
-        tokio::spawn(async move {
-            #[cfg(debug_assertions)]
-            if let Ok(ms) = std::env::var("CAIRN_TEST_STARTUP_DELAY_MS") {
-                if let Ok(delay) = ms.parse::<u64>() {
-                    tracing::warn!(
-                        delay_ms = delay,
-                        "CAIRN_TEST_STARTUP_DELAY_MS set — delaying readiness flip \
-                         (debug build only; release strips this hook)"
+        // ── F49: auto-resume orchestrate worker ──────────────────────────────
+        //
+        // Drains `AppState::orchestrate_kick_tx`. When the handler on
+        // `POST /v1/approvals/:id/approve|reject` resolves an approval
+        // AND the run has no other pending approvals AND the run is
+        // still Running, the SSE publish loop enqueues the run_id here.
+        // This worker POSTs /v1/runs/:id/orchestrate over loopback with
+        // the admin token so the operator doesn't have to re-kick after
+        // every approval cycle. Best-effort: an HTTP failure logs at
+        // warn and the scanner-based recovery (FF's 14 scanners) still
+        // picks up truly wedged runs.
+        {
+            let (kick_tx, mut kick_rx) =
+                tokio::sync::mpsc::unbounded_channel::<cairn_domain::RunId>();
+            lib_state.orchestrate_kick_tx.install(kick_tx);
+            // Use a loopback host with the bound port: the listener
+            // may have bound 0.0.0.0 or [::] (team mode), which is
+            // not a valid destination for a client POST. The worker
+            // always dials the local process.
+            let kick_url = match bound {
+                std::net::SocketAddr::V4(_) => format!("http://127.0.0.1:{}", bound.port()),
+                std::net::SocketAddr::V6(_) => format!("http://[::1]:{}", bound.port()),
+            };
+            // #636: the admin token can be rotated at runtime via
+            // `POST /v1/admin/rotate-token`, which revokes the old
+            // entry and registers a new one in the shared
+            // `ServiceTokenRegistry`. A stale clone of `admin_token`
+            // here would 401 the worker's loopback POST after the
+            // first rotation (seed-token flow in LiveHarness, or any
+            // real credential-rotation). Read the current admin token
+            // out of the registry on every kick so rotation stays
+            // transparent.
+            //
+            // `find_service_token_by_name` short-circuits on the first
+            // match and avoids the `Vec<(String, AuthPrincipal)>` clone
+            // that `all_entries` would otherwise produce (Gemini review
+            // on PR #646).
+            let service_tokens = lib_state.service_tokens.clone();
+            let current_admin_token =
+                move || -> Option<String> { service_tokens.find_service_token_by_name("admin") };
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(300))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new());
+                // De-dup by run_id with a 5s window: multiple approvals
+                // can resolve in quick succession on a single run and
+                // the SSE publish loop fires one kick per resolution.
+                // Without the window we'd burst several concurrent
+                // `/orchestrate` POSTs per run, wasting LLM budget and
+                // racing on the run's FF lease. The map is pruned on
+                // every iteration so the memory footprint is bounded
+                // by the number of distinct runs hit in the last 5s.
+                use std::collections::HashMap;
+                let dedup_window = std::time::Duration::from_secs(5);
+                let mut last_kick: HashMap<String, std::time::Instant> = HashMap::new();
+                while let Some(run_id) = kick_rx.recv().await {
+                    let now = std::time::Instant::now();
+                    last_kick.retain(|_, t| now.duration_since(*t) < dedup_window);
+                    let key = run_id.as_str().to_owned();
+                    if let Some(prev) = last_kick.get(&key) {
+                        if now.duration_since(*prev) < dedup_window {
+                            tracing::debug!(
+                                run_id = %run_id,
+                                "F49: dropping duplicate auto-resume kick within 5s window"
+                            );
+                            continue;
+                        }
+                    }
+                    last_kick.insert(key, now);
+                    let url = format!("{kick_url}/v1/runs/{}/orchestrate", run_id.as_str());
+                    let Some(kick_token) = current_admin_token() else {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            "F49: no admin token registered; auto-resume kick dropped. \
+                             Operator must re-POST /orchestrate manually."
+                        );
+                        continue;
+                    };
+                    tracing::info!(
+                        run_id = %run_id,
+                        "F49: auto-resume orchestrate worker firing POST"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    match client
+                        .post(&url)
+                        .bearer_auth(&kick_token)
+                        .json(&serde_json::json!({}))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => {
+                            if !resp.status().is_success() {
+                                tracing::warn!(
+                                    run_id = %run_id,
+                                    status = %resp.status(),
+                                    "F49: auto-resume orchestrate returned non-2xx; \
+                                     operator may need to re-POST /orchestrate"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                error = %err,
+                                "F49: auto-resume orchestrate POST failed; \
+                                 operator may need to re-POST /orchestrate"
+                            );
+                        }
+                    }
                 }
-            }
-            readiness_for_flip.mark_ready();
-            tracing::info!("cairn-app readiness: /health/ready now returns 200");
-        });
+            });
+        }
+
+        // RFC 020 §"Startup order" step 6: defer readiness flip until
+        // AFTER `axum::serve` has entered its accept loop.
+        //
+        // Closes #652. The previous implementation spawned `mark_ready`
+        // into an independent `tokio::spawn` task alongside the
+        // awaited-inline `axum::serve(...)`. On a multi-thread runtime
+        // the spawned task could run BEFORE the awaited serve future
+        // was first polled. That produced a window in which:
+        //
+        //   1. `/health/ready` flipped to 200 (atomic set on worker A).
+        //   2. The `cairn-app readiness: /health/ready now returns 200`
+        //      log line emitted.
+        //   3. Operator boot automation (polls `/health/ready` in a
+        //      loop) observed the 200 and immediately fired a PUT/POST.
+        //   4. axum's accept loop had not yet drained the kernel's
+        //      listen backlog, so the request sat in the queue — and
+        //      when the handler chain DID finally receive it, the
+        //      request body and middleware state sometimes failed to
+        //      hydrate, surfacing as 422 `missing field <X>` even for
+        //      well-formed bodies.
+        //
+        // We now SPAWN `axum::serve` instead of inline-awaiting it, then
+        // yield the scheduler twice (belt-and-braces on single-worker
+        // test runtimes) so the serve task is guaranteed to have been
+        // polled — i.e. the listener is actively accepting — before
+        // `mark_ready()` fires. The `CAIRN_TEST_STARTUP_DELAY_MS` hook
+        // (debug builds only) is preserved so RFC-020 integration
+        // tests can still observe the 503-with-progress contract.
+
+        // ── F65 PR-5: snapshot GC sweeper ────────────────────────────────────
+        // Hourly-default TTL sweep over workspace_snapshots. Defaults:
+        // TTL = 7 days (`CAIRN_SNAPSHOT_TTL_DAYS`), cadence = 1 hour
+        // (`CAIRN_SNAPSHOT_GC_CADENCE_MS`). Tests use 50ms cadence +
+        // TestClock. Worker-only + memory-db modes still spawn the
+        // sweeper unless CAIRN_GC_DISABLED is set.
+        let gc_handle: Option<tokio::task::JoinHandle<()>> =
+            if std::env::var("CAIRN_GC_DISABLED").ok().as_deref() == Some("1") {
+                eprintln!("F65 snapshot GC disabled by CAIRN_GC_DISABLED=1");
+                None
+            } else {
+                let svc = lib_state.sandbox_service.clone();
+                let store = lib_state.runtime.store.clone();
+                let source: Arc<dyn cairn_workspace::sandbox::snapshot_gc::SnapshotGcSource> =
+                    Arc::new(cairn_app::sandbox_f65_bridges::StoreSnapshotGcSource::new(
+                        store.clone(),
+                    ));
+                let f65_sink: Arc<dyn cairn_workspace::sandbox::f65::F65SandboxEventSink> =
+                    Arc::new(cairn_app::sandbox_f65_bridges::StoreF65EventSink::new(
+                        store.clone(),
+                    ));
+                let policy =
+                    cairn_workspace::sandbox::snapshot_gc::SnapshotGcPolicy::from_env_or_default(
+                        Arc::new(cairn_workspace::SystemClock),
+                    );
+                eprintln!(
+                    "F65 snapshot GC: TTL={}ms cadence={}ms",
+                    policy.ttl_ms, policy.sweep_cadence_ms
+                );
+                let sweeper = cairn_workspace::sandbox::snapshot_gc::SnapshotGcSweeper::new(
+                    svc, source, f65_sink, policy,
+                );
+                Some(tokio::spawn(sweeper.run_forever()))
+            };
 
         // ── Test-only: SIGUSR1 arms the injected append-failure hook ────────
         // Chaos integration tests send SIGUSR1 after the subprocess is
@@ -1508,15 +2252,125 @@ async fn main() {
             std::process::exit(0);
         });
 
-        axum::serve(listener, app)
+        // `into_make_service_with_connect_info::<SocketAddr>()` populates
+        // `ConnectInfo<SocketAddr>` in the request extensions so the
+        // rate-limit middleware's `resolved_client_ip` can fall back
+        // to the TCP peer when no `X-Forwarded-For` header is set.
+        // Closes #649 (localhost CI traffic no longer trips the limiter).
+        //
+        // #652 boot-readiness race fix: `axum::serve` is spawned into
+        // its own task rather than awaited inline. That lets the main
+        // task yield the scheduler below so the serve task's accept
+        // loop is guaranteed to be polled — and therefore actively
+        // draining the kernel listen backlog — BEFORE readiness flips
+        // to 200. Without this the `/health/ready` 200 flip and the
+        // axum accept loop entering ready-state race, producing the
+        // silent "missing field <X>" 422s the dogfood user's boot
+        // automation hit on every cold boot.
+        let serve_handle = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
             .with_graceful_shutdown(async move {
                 wait_for_shutdown_signal().await;
                 let _ = signal_tx.send(true);
             })
             .await
             .unwrap_or_else(|e| eprintln!("server error: {e}"));
+        });
+
+        // Yield the scheduler so the spawned `serve_handle` task has at
+        // least two chances to be polled by the tokio runtime. On a
+        // multi-threaded runtime this is almost always instant; on a
+        // single-worker test runtime we need the double yield to
+        // guarantee the accept loop is live before we advertise
+        // readiness. `yield_now` is not a sleep — it returns `Pending`
+        // once, which cedes control to the scheduler.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Now — and only now — flip readiness. The accept loop is
+        // active, so a client polling `/health/ready` and then
+        // immediately firing a PUT/POST will hit a fully-running
+        // axum pipeline, not a cold backlog.
+        //
+        // `CAIRN_TEST_STARTUP_DELAY_MS` is cached behind a `OnceLock`
+        // per repo convention (Gemini review on #654) — boot-time
+        // static config is read once, never per-boot-iteration. The
+        // inner `cfg!(debug_assertions)` gate keeps release builds
+        // from ever consulting the variable, same as the previous
+        // `#[cfg(debug_assertions)]` path.
+        {
+            use std::sync::OnceLock;
+            static DELAY_MS: OnceLock<Option<u64>> = OnceLock::new();
+            let delay_override = *DELAY_MS.get_or_init(|| {
+                if cfg!(debug_assertions) {
+                    std::env::var("CAIRN_TEST_STARTUP_DELAY_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                } else {
+                    None
+                }
+            });
+
+            let readiness_for_flip = lib_state.readiness.clone();
+            if let Some(delay) = delay_override {
+                // Defer the flip into a spawned task so the server
+                // keeps processing `/health/ready` during the delay —
+                // that is exactly the window the RFC-020 integration
+                // test asserts against (503-with-progress body).
+                tracing::warn!(
+                    delay_ms = delay,
+                    "CAIRN_TEST_STARTUP_DELAY_MS set — delaying readiness flip \
+                     (debug build only; release strips this hook)"
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    readiness_for_flip.mark_ready();
+                    tracing::info!("cairn-app readiness: /health/ready now returns 200");
+                });
+            } else {
+                readiness_for_flip.mark_ready();
+                tracing::info!("cairn-app readiness: /health/ready now returns 200");
+            }
+        }
+
+        // Wait for the serve task to complete. When `axum::serve`
+        // returns (graceful shutdown or I/O error), the `serve_handle`
+        // join resolves and we fall through to the shutdown cleanup.
+        //
+        // A join error (panic in the serve task, runtime-level abort)
+        // means the HTTP server is dead and the process cannot
+        // function. Exit 1 so the process supervisor (systemd /
+        // Kubernetes) restarts us rather than leaving a zombie
+        // process whose `/health/ready` still reports 200 but which
+        // no longer services requests. Gemini review on #654.
+        if let Err(err) = serve_handle.await {
+            eprintln!("axum serve task join error: {err}");
+            std::process::exit(1);
+        }
 
         watchdog.abort();
+        // F65 PR-5: abort the GC sweeper so graceful shutdown doesn't
+        // hang on a mid-sweep reaper. The sweeper's tokio::time::sleep
+        // is cancel-safe; abort() simply poisons its JoinHandle.
+        if let Some(h) = gc_handle.as_ref() {
+            h.abort();
+        }
+        // #639: drain background lease keepers so their per-run
+        // `RunService` handles don't outlive the fabric connection
+        // pool. `shutdown_all` is idempotent, awaits every keeper,
+        // and returns in <1s on a quiesced system (keepers cancel
+        // out of their sleep via the CancellationToken). The
+        // registry lives on the lib-side `AppState`.
+        lib_state.lease_keepers.shutdown_all().await;
+        // #670 G4 / RFC 027: drain the child-run driver's tokio loop.
+        // Idempotent — just cancels the token and awaits the join
+        // handle. When the driver is gated off the loop's sleep is
+        // interrupted by the cancel token so this returns within one
+        // tick (< 500ms).
+        child_run_driver.shutdown().await;
         eprintln!("shutdown: all connections drained");
         flush_state_to_disk(&state_for_flush).await;
         eprintln!("shutdown: complete");
@@ -1718,11 +2572,19 @@ async fn seed_allowlist_revoked_sandbox_for_test(
     let session_id = SessionId::new(format!("sess-{}", parts[0]));
     let sandbox_id = format!("sbx-{}", parts[0]);
 
-    // Seed an *unrelated* repo into the allowlist so the project is
-    // "authoritative" under the Bugbot high-1 gate in
-    // `SandboxService::recover_all`. The bound repo (`parts[4]`) is
-    // deliberately NOT added; `is_allowed(bound_repo) == false` is
-    // what makes recovery emit `SandboxAllowlistRevoked`.
+    // Seed an *unrelated* repo into the allowlist so the project
+    // has at least one surviving grant. Without this, the
+    // non-authoritative fallback in `SandboxService::recover_all`
+    // (which preserves the pre-#556 conservative semantic when
+    // plugin-layer persistence hasn't installed itself — the GitHub
+    // plugin isn't wired in this test harness) would skip the project
+    // and the integration test would never see the AllowlistRevoked
+    // transition it's asserting.
+    //
+    // In production the GitHub plugin installs persistence at boot
+    // and `is_authoritative()` returns true; an empty project
+    // allowlist is treated as "operator revoked everything" without
+    // needing this sentinel.
     {
         use cairn_domain::{ActorRef, OperatorId, RepoAccessContext};
         let ctx = RepoAccessContext {
@@ -2002,6 +2864,16 @@ async fn seed_base_revision_drift_sandbox_for_test(
     // 1. Ensure the clone exists so `current_head()` returns `Some(head)`.
     //    `ensure_cloned` is idempotent so a second boot after sigkill is a
     //    no-op — HEAD survives from boot 1.
+    //
+    //    Note: we do NOT add `repo_id` to the project allowlist here.
+    //    The integration test deliberately exercises drift-vs-
+    //    allowlist routing without a GitHub plugin wired, so the
+    //    `ProjectRepoAccessService` is non-authoritative
+    //    (`is_authoritative() == false`). `SandboxService::recover_all`
+    //    falls back to the pre-#556 conservative behaviour — a
+    //    project with an empty allowlist is skipped, so drift is the
+    //    sweep that transitions the overlay run and the reflink
+    //    sibling is left alone per RFC 016.
     lib_state
         .repo_clone_cache
         .ensure_cloned(&tenant, &repo_id)

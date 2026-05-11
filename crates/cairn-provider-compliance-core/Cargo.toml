@@ -1,0 +1,28 @@
+[package]
+name = "cairn-provider-compliance-core"
+version = "0.1.0"
+edition = "2021"
+license = "BSL-1.1"
+publish = false
+
+# RFC 030 PR-H: family-neutral compliance checks shared across the
+# knowledge- and memory-family provider compliance suites
+# (`cairn-knowledge-compliance`, `cairn-memory-compliance`).
+#
+# Only checks that apply identically to both families live here:
+# shape-level error Display stability, capability-family exclusivity
+# (dual-family rejection), and the runtime-owned dimension overwrite
+# rule (both families use the same `ScoringBreakdownWire`).
+#
+# Family-specific wire-type round-trips and tri-state matching checks
+# live in each family's own suite so the compliance suite speaks in
+# the family's types and each family's test failure names the family
+# explicitly.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+cairn-plugin-proto = { path = "../cairn-plugin-proto" }
+cairn-memory = { path = "../cairn-memory" }
+serde_json = "1.0"

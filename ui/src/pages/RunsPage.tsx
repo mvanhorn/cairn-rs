@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { X, RefreshCw, ChevronRight, Download, Plus, Loader2, LayoutList, GanttChart } from "lucide-react";
+import { X, RefreshCw, Download, Plus, Loader2, LayoutList, GanttChart } from "lucide-react";
 import { ErrorFallback } from "../components/ErrorFallback";
 import { clsx } from "clsx";
 import { StateBadge } from "../components/StateBadge";
@@ -8,12 +8,14 @@ import { DataTable } from "../components/DataTable";
 import { useTableKeyboard } from "../hooks/useTableKeyboard";
 import { useToast } from "../components/Toast";
 import { CopyButton } from "../components/CopyButton";
-import { defaultApi } from "../lib/api";
-import { sectionLabel, card as cardPreset } from "../lib/design-system";
-import type { RunRecord, RunState } from "../lib/types";
+import { defaultApi, ApiError } from "../lib/api";
+import type { RunRecord, RunState, StuckRunReport } from "../lib/types";
 import { TimelineView, ZoomSelector } from "../components/TimelineView";
 import type { ZoomLevel } from "../components/TimelineView";
 import { useAutoRefresh, REFRESH_OPTIONS } from "../hooks/useAutoRefresh";
+import { EmptyScopeHint } from "../components/EmptyScopeHint";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 
 function fmtTime(ms: number) {
   return new Date(ms).toLocaleString(undefined, {
@@ -32,6 +34,32 @@ function shortId(id: string) {
   return id.length > 20 ? `${id.slice(0, 8)}\u2026${id.slice(-5)}` : id;
 }
 
+/** Synthesise a minimal RunRecord from a stalled-run diagnosis report
+ *  so the Runs table can render rows whose full record lives outside
+ *  the first page of GET /v1/runs. Fields the diagnosis report does
+ *  not carry are filled with safe placeholders; clicking the row
+ *  lands on RunDetailPage which refetches the complete record. */
+function synthStalledRun(s: StuckRunReport): RunRecord {
+  const now = Date.now();
+  const createdAt = Math.max(0, now - (s.duration_ms || 0));
+  return {
+    run_id:            s.run_id,
+    session_id:        "\u2014",
+    parent_run_id:     null,
+    project:           { tenant_id: "", workspace_id: "", project_id: "" },
+    state:             s.state as RunState,
+    prompt_release_id: null,
+    agent_role_id:     null,
+    failure_class:     null,
+    pause_reason:      null,
+    resume_trigger:    null,
+    version:           0,
+    created_at:        createdAt,
+    updated_at:        s.last_event_ms > 0 ? s.last_event_ms : createdAt,
+  };
+}
+
+
 const ALL_STATES: RunState[] = [
   "pending","running","paused","waiting_approval","waiting_dependency",
   "completed","failed","canceled",
@@ -41,74 +69,6 @@ const STATE_LABEL: Record<RunState, string> = {
   waiting_approval:"Awaiting Approval", waiting_dependency:"Waiting",
   completed:"Completed", failed:"Failed", canceled:"Canceled",
 };
-
-// ── Detail panel ──────────────────────────────────────────────────────────────
-
-function FieldRow({ label, value, mono=false }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div className="flex items-start justify-between px-3 py-2 gap-3 border-b border-gray-200 dark:border-zinc-800 last:border-0">
-      <span className="text-[11px] text-gray-400 dark:text-zinc-500 shrink-0">{label}</span>
-      <span className={clsx("text-[11px] text-gray-700 dark:text-zinc-300 text-right break-all", mono && "font-mono")}>{value}</span>
-    </div>
-  );
-}
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return <p className={sectionLabel}>{children}</p>;
-}
-
-function DetailPanel({ run, onClose }: { run: RunRecord; onClose: () => void }) {
-  return (
-    <aside className="flex flex-col w-80 shrink-0 border-l border-gray-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 h-full overflow-y-auto">
-      <div className="flex items-center gap-2 px-4 h-11 border-b border-gray-200 dark:border-zinc-800 sticky top-0 bg-white dark:bg-zinc-950">
-        <span className="text-[13px] font-medium font-mono text-gray-800 dark:text-zinc-200 truncate flex-1">
-          {shortId(run.run_id)}
-        </span>
-        <button onClick={onClose} className="p-1 rounded text-gray-400 dark:text-zinc-600 hover:text-gray-700 dark:hover:text-zinc-300 hover:bg-gray-100 dark:hover:bg-gray-100 dark:bg-zinc-800 transition-colors">
-          <X size={14} />
-        </button>
-      </div>
-      <div className="p-4 space-y-4">
-        <div>
-          <SectionLabel>State</SectionLabel>
-          <StateBadge state={run.state} />
-        </div>
-        <div>
-          <SectionLabel>Identifiers</SectionLabel>
-          <div className={cardPreset.base}>
-            <FieldRow label="Run ID"    value={run.run_id}    mono />
-            <FieldRow label="Session"   value={run.session_id} mono />
-            {run.parent_run_id && <FieldRow label="Parent" value={run.parent_run_id} mono />}
-          </div>
-        </div>
-        <div>
-          <SectionLabel>Project</SectionLabel>
-          <div className={cardPreset.base}>
-            <FieldRow label="Tenant"    value={run.project.tenant_id} />
-            <FieldRow label="Workspace" value={run.project.workspace_id} />
-            <FieldRow label="Project"   value={run.project.project_id} />
-          </div>
-        </div>
-        {(run.failure_class || run.pause_reason) && (
-          <div>
-            <SectionLabel>Details</SectionLabel>
-            <div className={cardPreset.base}>
-              {run.failure_class && <FieldRow label="Failure" value={run.failure_class} />}
-              {run.pause_reason  && <FieldRow label="Paused"  value={run.pause_reason}  />}
-            </div>
-          </div>
-        )}
-        <div>
-          <SectionLabel>Timestamps</SectionLabel>
-          <div className={cardPreset.base}>
-            <FieldRow label="Created" value={fmtTime(run.created_at)} />
-            <FieldRow label="Updated" value={fmtTime(run.updated_at)} />
-          </div>
-        </div>
-      </div>
-    </aside>
-  );
-}
-
 
 function Skeleton() {
   return <div className="divide-y divide-gray-200 dark:divide-zinc-800/40">
@@ -143,41 +103,54 @@ function BatchCreateModal({ onClose, onDone }: BatchCreateModalProps) {
       const sid = sessionId.trim() || `sess_${Date.now()}`;
       const pfx = prefix.trim() || `run-${Date.now()}-`;
 
-      // Ensure session exists before creating runs
+      // Ensure session exists before creating runs. A 409 means the
+      // session already exists — the desired end-state, so swallow it.
+      // Any other failure (auth / scope / validation / network) must
+      // surface through onError so the operator sees the real cause
+      // instead of N confusing "session not found" per-run errors.
       try {
         await defaultApi.createSession({ session_id: sid });
-      } catch {
-        // Session may already exist — that's fine
+      } catch (e) {
+        if (!(e instanceof ApiError && e.status === 409)) throw e;
       }
 
       const runs = Array.from({ length: count }, (_, i) => ({
-        session_id:   sid,
-        run_id:       `${pfx}${i + 1}`,
-        mode:         planMode ? { type: "plan" as const } : undefined,
+        session_id: sid,
+        run_id:     `${pfx}${i + 1}`,
+        mode:       planMode ? { type: "plan" as const } : undefined,
       }));
-      const results = await Promise.all(
-        runs.map(async (run) => {
-          try {
-            const created = await defaultApi.createRun(run);
-            return { ok: true as const, run: created };
-          } catch (error) {
-            return {
-              ok: false as const,
-              error: error instanceof Error ? error.message : "run creation failed",
-            };
-          }
-        }),
-      );
-      return { results };
+      // #174 — issue one POST /v1/runs/batch instead of N createRun calls.
+      return defaultApi.batchCreateRuns(runs);
     },
     onSuccess: result => {
+      // Issue #388: surface partial success explicitly. The batch endpoint
+      // returns per-item `{ok, error}` results (#174), so the inner loop
+      // cannot leak partial state the way the old N-sequential-POST version
+      // did — but we still have to describe the mixed outcome to the
+      // operator. When some succeeded and some failed, use `toast.warning`
+      // (amber) rather than two back-to-back toasts; a mixed batch is
+      // neither a pure success nor a hard failure. On an all-success /
+      // all-fail batch we keep the single-variant toast.
       const ok  = result.results.filter(r => r.ok).length;
-      const bad = result.results.filter(r => !r.ok).length;
-      if (ok > 0)  toast.success(`Created ${ok} run${ok !== 1 ? "s" : ""}.`);
-      if (bad > 0) toast.error(`${bad} run${bad !== 1 ? "s" : ""} failed to create.`);
+      const bad = result.results.filter(r => !r.ok);
+      if (bad.length === 0 && ok > 0) {
+        toast.success(`Created ${ok} run${ok !== 1 ? "s" : ""}.`);
+      } else if (ok === 0 && bad.length > 0) {
+        const sample = bad[0]?.error ?? "run creation failed";
+        toast.error(
+          bad.length === 1
+            ? `1 run failed: ${sample}`
+            : `${bad.length} runs failed (first: ${sample})`,
+        );
+      } else if (ok > 0 && bad.length > 0) {
+        const sample = bad[0]?.error ?? "run creation failed";
+        toast.warning(
+          `Partial: ${ok} of ${ok + bad.length} runs created; ${bad.length} failed (first: ${sample}).`,
+        );
+      }
       onDone();
     },
-    onError: () => toast.error("Batch create failed."),
+    onError: e => toast.error(e instanceof Error ? e.message : "Batch create failed."),
   });
 
   return (
@@ -279,15 +252,37 @@ export function RunsPage() {
   const { ms: refreshMs, setOption: setRefreshOption, interval: refreshInterval } = useAutoRefresh("runs", "15s");
 
   const [filter, setFilter]         = useState<RunState | "all">("all");
-  const [selected, setSelected]     = useState<RunRecord | null>(null);
   const [viewMode, setViewMode]     = useState<"table" | "timeline">("table");
   const [zoom, setZoom]             = useState<ZoomLevel>("6h");
   const [showBatchCreate, setShowBatchCreate] = useState(false);
+  // F29 CE — "Stalled only" toggle. Swaps the query source from
+  // `GET /v1/runs` to `GET /v1/runs/stalled`. Defaults to the URL
+  // hash query so the StuckRunsWidget "view all" link lands here
+  // with the filter already engaged.
+  const [stalledOnly, setStalledOnly] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.location.hash.includes("stalled=1");
+  });
   const qc = useQueryClient();
 
-  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
-    queryKey: ["runs"],
-    queryFn: () => defaultApi.getRuns({ limit: 200 }),
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery<RunRecord[]>({
+    queryKey: ["runs", stalledOnly ? "stalled" : "all"],
+    queryFn: async (): Promise<RunRecord[]> => {
+      if (!stalledOnly) return defaultApi.getRuns({ limit: 200 });
+      // Join stalled-diagnosis reports back against the normal runs list
+      // so the downstream DataTable keeps the full RunRecord shape
+      // (created_at, session_id, parent_run_id, etc.). Falls back to
+      // synthesised minimal RunRecord rows when a stalled run isn't in
+      // the first page of `/v1/runs` (long-running stuck runs past the
+      // default limit of 200).
+      const [stalled, runs] = await Promise.all([
+        defaultApi.getStalledRuns(),
+        defaultApi.getRuns({ limit: 200 }),
+      ]);
+      const byId = new Map<string, RunRecord>();
+      for (const r of runs) byId.set(r.run_id, r);
+      return stalled.map((s: StuckRunReport) => byId.get(s.run_id) ?? synthStalledRun(s));
+    },
     refetchInterval: refreshMs,
   });
 
@@ -297,7 +292,7 @@ export function RunsPage() {
   const kbd = useTableKeyboard({
     items:  filtered,
     getKey: r => r.run_id,
-    onOpen: r => { window.location.hash = `run/${r.run_id}`; },
+    onOpen: r => { window.location.hash = `run/${encodeURIComponent(r.run_id)}`; },
   });
 
   function exportSelected() {
@@ -340,6 +335,30 @@ export function RunsPage() {
           <option value="all">All states</option>
           {ALL_STATES.map(s => <option key={s} value={s}>{STATE_LABEL[s]}</option>)}
         </select>
+        {/* F29 CE — Stalled-only pill. Swaps the query source from
+            /v1/runs to /v1/runs/stalled. Syncs with the URL hash so
+            the StuckRunsWidget "view all" link lands here with the
+            filter engaged. */}
+        <button
+          type="button"
+          aria-pressed={stalledOnly}
+          data-testid="runs-stalled-toggle"
+          onClick={() => {
+            const next = !stalledOnly;
+            setStalledOnly(next);
+            const hash = window.location.hash.replace(/^#/, "").split("?")[0] || "runs";
+            window.location.hash = next ? `${hash}?stalled=1` : hash;
+          }}
+          title="Show only runs stalled for more than the system-default stuck-run threshold."
+          className={clsx(
+            "inline-flex items-center rounded border text-[12px] px-2 py-1 transition-colors",
+            stalledOnly
+              ? "border-amber-500/50 bg-amber-500/10 text-amber-500 dark:text-amber-400"
+              : "border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-900 text-gray-500 dark:text-zinc-400 hover:text-gray-800 dark:hover:text-zinc-200 hover:border-zinc-600",
+          )}
+        >
+          Stalled only
+        </button>
         {/* View toggle */}
         <div className="flex items-center rounded border border-gray-200 dark:border-zinc-700 overflow-hidden">
           <button onClick={() => setViewMode("table")} title="Table view"
@@ -403,6 +422,10 @@ export function RunsPage() {
           </div>
         </div>
       </div>
+      {/* F32 — inline entity explainer. */}
+      <div className="px-4 py-1.5 border-b border-gray-200 dark:border-zinc-800 shrink-0 bg-white dark:bg-zinc-950">
+        <EntityExplainer>{ENTITY_EXPLAINERS.runsList}</EntityExplainer>
+      </div>
       {/* Content */}
       {viewMode === "timeline" ? (
         <div className="flex-1 overflow-y-auto bg-white dark:bg-zinc-950">
@@ -412,7 +435,7 @@ export function RunsPage() {
       <div className="flex flex-1 overflow-hidden">
         <div
           {...kbd.containerProps}
-          className={clsx("flex-1 overflow-y-auto", selected && "border-r border-gray-200 dark:border-zinc-800", kbd.containerProps.className)}
+          className={clsx("flex-1 overflow-y-auto", kbd.containerProps.className)}
         >
           {isLoading ? <Skeleton /> : (
           <DataTable<RunRecord>
@@ -420,9 +443,9 @@ export function RunsPage() {
             activeIndex={kbd.activeIndex}
             selectedIds={kbd.selectedKeys}
             getRowId={r => r.run_id}
-            onRowClick={r => { window.location.hash = `run/${r.run_id}`; kbd.setActiveIndex(filtered.indexOf(r)); }}
+            onRowClick={r => { window.location.hash = `run/${encodeURIComponent(r.run_id)}`; kbd.setActiveIndex(filtered.indexOf(r)); }}
             columns={[
-              { key: 'run_id',    header: 'Run ID',    render: r => <span className="flex items-center gap-1 font-mono text-[12px] text-gray-700 dark:text-zinc-300 whitespace-nowrap group/id" title={r.run_id}>{selected?.run_id===r.run_id&&<ChevronRight size={11} className="text-indigo-400 shrink-0"/>}{shortId(r.run_id)}<CopyButton text={r.run_id} label="Copy run ID" size={10} className="opacity-0 group-hover/id:opacity-100" /></span>, sortValue: r => r.run_id },
+              { key: 'run_id',    header: 'Run ID',    render: r => <span className="flex items-center gap-1 font-mono text-[12px] text-gray-700 dark:text-zinc-300 whitespace-nowrap group/id" title={r.run_id}>{shortId(r.run_id)}<CopyButton text={r.run_id} label="Copy run ID" size={10} className="opacity-0 group-hover/id:opacity-100" /></span>, sortValue: r => r.run_id },
               { key: 'session',   header: 'Session',   render: r => <span className="flex items-center gap-1 font-mono text-[11px] text-gray-400 dark:text-zinc-500 whitespace-nowrap group/id" title={r.session_id}>{shortId(r.session_id)}<CopyButton text={r.session_id} label="Copy session ID" size={10} className="opacity-0 group-hover/id:opacity-100" /></span> },
               { key: 'state',     header: 'State',     render: r => <StateBadge state={r.state} compact />,   sortValue: r => r.state },
               { key: 'created',   header: 'Created',   render: r => <span className="text-[11px] text-gray-400 dark:text-zinc-500 whitespace-nowrap tabular-nums text-right" title={fmtTime(r.created_at)}>{fmtRelative(r.created_at)}</span>, sortValue: r => r.created_at, headClass:'text-right', cellClass:'text-right' },
@@ -435,8 +458,8 @@ export function RunsPage() {
             emptyText="No runs match this filter — try 'All states' or create a session first"
           />
         )}
+        <EmptyScopeHint empty={!isLoading && runs.length === 0} />
         </div>
-        {selected && <DetailPanel run={selected} onClose={() => setSelected(null)} />}
       </div>
       )}
       {showBatchCreate && (

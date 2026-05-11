@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 cairn-agent = { path = "../cairn-agent" }
+cairn-api-contracts = { path = "../cairn-api-contracts" }
 cairn-domain = { path = "../cairn-domain" }
 cairn-tools = { path = "../cairn-tools" }
 cairn-evals = { path = "../cairn-evals" }
@@ -24,7 +25,13 @@ serde_json = "1.0"
 tracing = "0.1"
 utoipa = "5"
 
+# cairn-memory dev-dep intentionally dropped in #440: the integration
+# tests that used it (`tests/memory_wiring.rs`, `tests/feed_wiring.rs`)
+# moved to cairn-memory's own test tree to keep the layer ordering
+# unidirectional (cairn-memory depends on cairn-api-contracts, not the
+# other way around). See `crates/cairn-memory/tests/api_seam_audit.rs`
+# + `crates/cairn-memory/tests/signal_feed_integration.rs` for the
+# migrated coverage.
 [dev-dependencies]
-cairn-memory = { path = "../cairn-memory" }
 tokio = { version = "1", features = ["rt", "macros"] }
 

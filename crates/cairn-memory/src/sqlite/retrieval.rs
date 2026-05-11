@@ -51,6 +51,7 @@ impl RetrievalService for SqliteRetrievalService {
                 stages_used: vec![],
                 scoring_dimensions_used: vec![],
                 effective_policy: None,
+                family: None,
             },
         })
     }

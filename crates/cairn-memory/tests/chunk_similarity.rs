@@ -266,7 +266,7 @@ async fn chunk_similarity_similar_to_text_ranks_correctly() {
 /// Retrieval via MemoryApiImpl search delegates correctly.
 #[tokio::test]
 async fn chunk_similarity_api_search_delegates() {
-    use cairn_api::memory_api::{MemoryEndpoints, MemorySearchQuery};
+    use cairn_api_contracts::memory_api::{MemoryEndpoints, MemorySearchQuery};
     use cairn_memory::api_impl::MemoryApiImpl;
 
     let store = Arc::new(InMemoryDocumentStore::new());
@@ -317,7 +317,7 @@ async fn chunk_similarity_api_search_delegates() {
 /// Retrieval via MemoryApiImpl: searching by text returns scored results.
 #[tokio::test]
 async fn chunk_similarity_api_search_returns_scored() {
-    use cairn_api::memory_api::{MemoryEndpoints, MemorySearchQuery};
+    use cairn_api_contracts::memory_api::{MemoryEndpoints, MemorySearchQuery};
     use cairn_memory::api_impl::MemoryApiImpl;
 
     let store = Arc::new(InMemoryDocumentStore::new());

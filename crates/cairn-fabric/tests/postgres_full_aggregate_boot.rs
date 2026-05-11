@@ -1,0 +1,298 @@
+//! PR-C4c live-integration proof-point: the full `FabricServices`
+//! aggregate boots on Postgres.
+//!
+//! # What this binary proves
+//!
+//! Before PR-C4c, `FabricServices::start` on
+//! `CAIRN_FABRIC_BACKEND=postgres` returned
+//! [`FabricError::Config`] because every service constructor
+//! (`run_service`, `task_service`, `session_service`,
+//! `scheduler_service`, `quota_service`, `signal_bridge`) held a
+//! concrete `Arc<cairn_fabric::boot::FabricRuntime>` — a
+//! Valkey-typed struct. No PG runtime could satisfy those
+//! signatures, so full-app-mode boot failed loud but useless.
+//!
+//! PR-C4c introduces [`cairn_fabric::FabricRuntimeHandle`] — a
+//! trait whose surface is 6 runtime-level config accessors
+//! (`partition_config`, `worker_instance_id`, `lease_ttl_ms`,
+//! `signal_dedup_ttl_ms`, `worker_capabilities`, `backend`) plus
+//! two Valkey-specific escape hatches (`valkey_client`, `fcall`)
+//! that return `None` / `Unavailable` on Postgres. Every service
+//! constructor now holds `Arc<dyn FabricRuntimeHandle>`; the
+//! aggregate is genuinely backend-agnostic at the service-wiring
+//! layer.
+//!
+//! This test spins a real Postgres container, builds a fabric
+//! config with `backend_kind = Postgres`, and asserts
+//! `FabricServices::start` returns `Ok(_)`. A regression that
+//! re-couples any service constructor to Valkey trips this binary.
+//!
+//! # Harness
+//!
+//! - One Postgres container per test-binary invocation, shared via
+//!   [`shared_pg`]. Migrations applied once at container boot.
+//! - The test binary exercises a single boot + shutdown; isolation
+//!   against sibling test binaries is provided by the per-invocation
+//!   container (a fresh PG instance per cargo test run). The
+//!   aggregate construction does not touch per-execution rows, so
+//!   additional parallelism inside this binary is not needed today.
+//!
+//! # Gating
+//!
+//! Requires both `fabric-postgres` (for `PostgresFabricRuntime`)
+//! and `test-harness` (for `testcontainers-modules`).
+//!
+//! Run with:
+//!   cargo test -p cairn-fabric --features "fabric-postgres,test-harness" \
+//!     --test postgres_full_aggregate_boot
+
+#![cfg(all(feature = "fabric-postgres", feature = "test-harness"))]
+
+use std::sync::Arc;
+
+use cairn_fabric::{FabricConfig, FabricServices};
+use cairn_store::event_log::EventLog;
+use cairn_store::InMemoryStore;
+use ff_backend_postgres::{apply_migrations, PgPool};
+use flowfabric::core::backend::BackendConfig;
+use flowfabric::core::types::{LaneId, Namespace, WorkerId, WorkerInstanceId};
+use sqlx::postgres::PgPoolOptions;
+use testcontainers::{runners::AsyncRunner, ContainerAsync, ImageExt};
+use testcontainers_modules::postgres::Postgres as PostgresImage;
+use tokio::sync::OnceCell;
+
+struct SharedPg {
+    _container: ContainerAsync<PostgresImage>,
+    _pool: PgPool,
+    url: String,
+}
+
+static SHARED: OnceCell<Arc<SharedPg>> = OnceCell::const_new();
+
+async fn shared_pg() -> Arc<SharedPg> {
+    SHARED
+        .get_or_init(|| async {
+            let container = PostgresImage::default()
+                .with_db_name("cairn_test")
+                .with_user("cairn")
+                .with_password("cairn")
+                .with_tag("16-alpine")
+                .start()
+                .await
+                .expect("failed to start postgres container");
+
+            let host = container
+                .get_host()
+                .await
+                .expect("container host unavailable");
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("container port unavailable");
+            let url = format!("postgres://cairn:cairn@{host}:{port}/cairn_test");
+
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&url)
+                .await
+                .expect("failed to connect to postgres");
+
+            apply_migrations(&pool)
+                .await
+                .expect("failed to apply FF migrations");
+
+            Arc::new(SharedPg {
+                _container: container,
+                _pool: pool,
+                url,
+            })
+        })
+        .await
+        .clone()
+}
+
+fn pg_fabric_config(pg_url: &str) -> FabricConfig {
+    FabricConfig {
+        backend: BackendConfig::postgres(pg_url.to_string()),
+        lane_id: LaneId::new("cairn"),
+        worker_id: WorkerId::new("test-worker"),
+        worker_instance_id: WorkerInstanceId::new("test-worker-i1"),
+        namespace: Namespace::new("cairn-test"),
+        lease_ttl_ms: 30_000,
+        grant_ttl_ms: 5_000,
+        max_concurrent_tasks: 1,
+        signal_dedup_ttl_ms: 86_400_000,
+        fcall_timeout_ms: 5_000,
+        worker_capabilities: std::collections::BTreeSet::new(),
+        // The PG runtime does not seed HMAC secrets — it has no
+        // Lua suspension path. Passing a secret here is harmless
+        // (ignored by the PG boot path). Keep a deterministic
+        // dev secret present so `FabricConfig::validate` doesn't
+        // trip on a Valkey-only validation rule reaching the PG
+        // arm.
+        waitpoint_hmac_secret: Some(
+            "00000000000000000000000000000000000000000000000000000000000000aa".into(),
+        ),
+        waitpoint_hmac_kid: Some("cairn-test-k1".into()),
+        waitpoint_hmac_bootstrap_kid_reset: false,
+        backend_kind: cairn_fabric::config::BackendKind::Postgres,
+    }
+}
+
+/// Full-aggregate boot on Postgres. Regression guard for PR-C4c.
+///
+/// Before PR-C4c this failed with `FabricError::Config`. Post-refactor
+/// `FabricServices::start` constructs the full service aggregate
+/// against a `PostgresFabricRuntime` and returns `Ok(_)`.
+#[tokio::test]
+async fn pg_full_service_aggregate_boots() {
+    let pg = shared_pg().await;
+    let config = pg_fabric_config(&pg.url);
+
+    let event_log: Arc<dyn EventLog + Send + Sync> = Arc::new(InMemoryStore::default());
+
+    let services = FabricServices::start(config, event_log)
+        .await
+        .expect("FabricServices::start must succeed on Postgres backend");
+
+    // Smoke-level assertion: the four primary business services
+    // (`runs`, `tasks`, `sessions`, `quotas`) are reachable fields on
+    // the aggregate — if any of them failed to construct under the
+    // new `FabricRuntimeHandle` trait the aggregate's builder would
+    // have errored out before we got here. Address-of each field to
+    // prove the move-out worked.
+    let _ = &services.runs;
+    let _ = &services.tasks;
+    let _ = &services.sessions;
+    let _ = &services.quotas;
+    let _ = &services.budgets;
+    let _ = &services.rotation;
+
+    services.shutdown().await;
+}
+
+/// Proves `SignalBridge::deliver_approval_signal` reaches the PG
+/// `EngineBackend::deliver_signal` body (not the pre-0.14.1 Lua FCALL
+/// path that returned `EngineError::Unavailable` on any PG runtime).
+///
+/// Drives a bare delivery against a fabricated execution + waitpoint —
+/// FF's PG impl rejects with an authentic typed error (waitpoint not
+/// found / invalid token) because the state was never set up. That's
+/// exactly the shape a real signal against a missing waitpoint would
+/// take; what we're pinning is the *absence* of the pre-0.14.1
+/// "fcall (Postgres backend has no Lua surface)" `Unavailable` error.
+///
+/// This is a structural regression guard for the SignalBridge → trait
+/// migration. Full waitpoint-round-trip coverage on PG is deferred to
+/// a later harness pass (requires driving the full run lifecycle on
+/// PG, which is a bigger fixture).
+#[tokio::test]
+async fn pg_signal_bridge_deliver_reaches_engine_backend() {
+    use flowfabric::core::types::{ExecutionId, WaitpointId};
+
+    let pg = shared_pg().await;
+    let config = pg_fabric_config(&pg.url);
+    let event_log: Arc<dyn EventLog + Send + Sync> = Arc::new(InMemoryStore::default());
+    let services = FabricServices::start(config, event_log)
+        .await
+        .expect("boot");
+
+    // Fabricate an execution+waitpoint the backend has never seen.
+    // `ExecutionId` carries a partition prefix `{fp:N}:<uuid>`; the
+    // synthetic id below lands on a partition the PG schema accepts
+    // but has no suspend row — FF will reject with a typed error,
+    // NOT `Unavailable`.
+    let eid = ExecutionId::parse(&format!("{{fp:0}}:{}", uuid::Uuid::new_v4())).expect("parse eid");
+    let wp_id = WaitpointId::new();
+
+    // Use the internal deliver_signal path via a public entry point
+    // that takes the Signal directly. Approval-bridge delivers go
+    // through `deliver_approval_signal` but need a live waitpoint to
+    // read the token — on PG with no state, the token read fails
+    // first. Assert on the ERROR KIND: any error EXCEPT
+    // `EngineError::Unavailable { op: "fcall ..." }` means the
+    // migration landed.
+    let err = services
+        .signals
+        .deliver_approval_signal(&eid, &wp_id, true, "nonexistent", None)
+        .await
+        .expect_err("PG with no state must reject, not succeed");
+
+    let rendered = format!("{err}");
+    assert!(
+        !rendered.contains("Postgres backend has no Lua surface"),
+        "PG SignalBridge must NOT hit the pre-0.14.1 fcall Unavailable path; got: {rendered}"
+    );
+    // Positive signal: we reached the backend. The error must be a
+    // waitpoint / validation shape, not an `Unavailable` one.
+    assert!(
+        !rendered.contains("Unavailable"),
+        "PG SignalBridge must reach deliver_signal, got Unavailable: {rendered}"
+    );
+
+    services.shutdown().await;
+}
+
+/// Proves `FabricSchedulerService::claim_for_worker` reaches the
+/// FF 0.15 backend-agnostic scheduler on PG — it no longer returns
+/// `EngineError::Unavailable { op: "scheduler_claim_for_worker ..." }`.
+///
+/// Closes [FF#511](https://github.com/avifenesh/FlowFabric/issues/511):
+/// FF 0.15 added `Scheduler::new_with_backend(Weak<dyn EngineBackend>, _)`,
+/// so cairn's scheduler service now constructs on PG runtimes too.
+///
+/// FF 0.15 kept the partition-scanner path (`ZRANGEBYSCORE` +
+/// `exec_core` `HGET`) Valkey-specialised, so on PG the scheduler
+/// degrades to `Ok(None)` instead of claiming a real execution. That's
+/// the contract this test pins: `Ok(None)` on a fresh PG aggregate with
+/// no submitted executions, and — critically — *not*
+/// `Err(FabricError::Engine(EngineError::Unavailable))`, which was the
+/// pre-FF-0.15 behaviour this bump closes.
+#[tokio::test]
+async fn pg_scheduler_claim_for_worker_does_not_return_unavailable() {
+    let pg = shared_pg().await;
+    let config = pg_fabric_config(&pg.url);
+    let event_log: Arc<dyn EventLog + Send + Sync> = Arc::new(InMemoryStore::default());
+    let services = FabricServices::start(config, event_log)
+        .await
+        .expect("boot");
+
+    let lane = LaneId::new("cairn");
+    let worker = WorkerId::new("test-worker");
+    let instance = WorkerInstanceId::new("test-worker-i1");
+    let grant_ttl_ms = 5_000;
+
+    // PG aggregate has zero submitted executions, so the scheduler's
+    // scanner has nothing to claim. Pre-FF-0.15 this would return
+    // `Err(Unavailable)` at the constructor-gate; post-FF-0.15 it
+    // constructs and the scanner returns `None`.
+    let result = services
+        .scheduler
+        .claim_for_worker(&lane, &worker, &instance, grant_ttl_ms)
+        .await;
+
+    match result {
+        Ok(None) => { /* expected: scanner found nothing */ }
+        Ok(Some(grant)) => panic!(
+            "fresh PG aggregate returned a claim grant without any submitted \
+             executions — scheduler state may be polluted. grant: {grant:?}"
+        ),
+        Err(e) => {
+            let rendered = format!("{e}");
+            assert!(
+                !rendered.contains("Unavailable"),
+                "PG scheduler must NOT return Unavailable after FF 0.15 \
+                 (FF#511 closed); got: {rendered}"
+            );
+            // If FF ever surfaces a different typed error on the
+            // scanner path, assert on THIS message so the regression
+            // reason stays obvious.
+            panic!(
+                "unexpected error from claim_for_worker on an empty PG \
+                 aggregate — expected Ok(None). got: {rendered}"
+            );
+        }
+    }
+
+    services.shutdown().await;
+}

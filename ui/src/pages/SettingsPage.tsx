@@ -5,7 +5,7 @@ import { ErrorFallback } from "../components/ErrorFallback";
 import { StatCard } from "../components/StatCard";
 import { Card } from "../components/Card";
 import { clsx } from "clsx";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import { usePreferences, type Preferences } from "../hooks/usePreferences";
 import { useScope } from "../hooks/useScope";
 import { useWebSocket } from "../hooks/useWebSocket";
@@ -1145,9 +1145,10 @@ function ModelPicker({ local, setLocal }: { local: string; setLocal: (v: string)
   // Disabled connections are ignored. If the tenant has no active
   // connections at all, we fall back to the registry list with a
   // disclaimer so fresh installs can still see what's available.
-  const activeConnections = (connData?.items ?? []).filter(
-    (c) => c.status === "active",
-  );
+  // #425: normalize list shape before filtering.
+  const activeConnections = unwrapList<import("../lib/types").ProviderConnectionRecord>(
+    connData,
+  ).filter((c) => c.status === "active");
   const registeredModels: Set<string> = new Set(
     activeConnections.flatMap((c) =>
       (c.supported_models ?? []).map((m) => m.toLowerCase()),
@@ -1209,7 +1210,8 @@ function ActiveProviderIndicator() {
     staleTime: 30_000,
   });
 
-  const entries = connData?.items ?? [];
+  // #425: shape-flip-safe normalizer.
+  const entries = unwrapList<import("../lib/types").ProviderConnectionRecord>(connData);
   const healthList = Array.isArray(healthData) ? healthData : [];
   const healthMap = new Map(healthList.map(h => [h.connection_id, h]));
   const healthy   = entries.filter(e => healthMap.get(e.provider_connection_id)?.healthy === true).length;

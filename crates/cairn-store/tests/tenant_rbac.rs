@@ -11,11 +11,13 @@
 //!         → RunReadModel isolation verified
 //!           → WorkspaceMemberAdded → membership read model verified
 
+use cairn_domain::lifecycle::RunState;
 use cairn_domain::tenancy::{WorkspaceKey, WorkspaceRole};
 use cairn_domain::{
-    EventEnvelope, EventId, EventSource, OperatorId, ProjectId, ProjectKey, RunCreated, RunId,
-    RuntimeEvent, SessionCreated, SessionId, TenantCreated, TenantId, WorkspaceCreated,
-    WorkspaceId, WorkspaceMemberAdded,
+    EventEnvelope, EventId, EventSource, OperatorId, ProjectId, ProjectKey, RunCompletionAnnotated,
+    RunCreated, RunId, RunStateChanged, RuntimeEvent, SessionCreated, SessionId, StateTransition,
+    TenantCreated, TenantId, TerminalRecoveryAttempted, WorkspaceCreated, WorkspaceId,
+    WorkspaceMemberAdded,
 };
 use cairn_store::{
     projections::{
@@ -316,6 +318,193 @@ async fn cross_tenant_run_query_returns_empty() {
         .await
         .unwrap();
     assert!(sess_y.is_none(), "tenant_y has no sessions");
+}
+
+#[tokio::test]
+async fn completion_annotation_does_not_mutate_cross_tenant_run() {
+    let store = InMemoryStore::new();
+    let victim_project = project("tenant_victim", "ws_victim");
+    let attacker_project = project("tenant_attacker", "ws_attacker");
+    let session_id = SessionId::new("sess_victim");
+    let run_id = RunId::new("run_victim");
+
+    store
+        .append(&[
+            evt(
+                "e1",
+                RuntimeEvent::SessionCreated(SessionCreated {
+                    project: victim_project.clone(),
+                    session_id: session_id.clone(),
+                }),
+            ),
+            evt(
+                "e2",
+                RuntimeEvent::RunCreated(RunCreated {
+                    project: victim_project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    parent_run_id: None,
+                    prompt_release_id: None,
+                    agent_role_id: None,
+                }),
+            ),
+            evt(
+                "e3",
+                RuntimeEvent::RunCompletionAnnotated(RunCompletionAnnotated {
+                    project: attacker_project,
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    summary: "forged-summary".to_owned(),
+                    verification: Default::default(),
+                    occurred_at_ms: now_ms(),
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let run = RunReadModel::get(&store, &run_id).await.unwrap().unwrap();
+    assert!(run.completion_summary.is_none());
+    assert!(run.completion_verification.is_none());
+    assert!(run.completion_annotated_at_ms.is_none());
+}
+
+// ── 4b. RunStateChanged also rejects cross-tenant forgery ────────────────────
+//
+// QA expansion of #732: codex's PR closed the cross-tenant tampering path on
+// `RunCompletionAnnotated` only. The same threat model applies to
+// `RunStateChanged` — and the blast radius is *strictly worse* because this
+// event mutates `state` (Pending → Failed/Cancelled/Completed), `failure_class`,
+// `pause_reason`, and `resume_trigger`. A forged event could push another
+// tenant's still-running run into Failed/Canceled with one append. This test
+// pins the projection-level scope check on all three backends (in-memory here;
+// pg/sqlite share schema and the same WHERE filter).
+//
+// `RunStateChanged` does NOT carry `session_id` (verified in
+// `crates/cairn-domain/src/events.rs`), so the gate is project-only.
+#[tokio::test]
+async fn run_state_change_does_not_mutate_cross_tenant_run() {
+    let store = InMemoryStore::new();
+    let victim_project = project("tenant_victim_rsc", "ws_victim");
+    let attacker_project = project("tenant_attacker_rsc", "ws_attacker");
+    let session_id = SessionId::new("sess_victim_rsc");
+    let run_id = RunId::new("run_victim_rsc");
+
+    store
+        .append(&[
+            evt(
+                "rsc1",
+                RuntimeEvent::SessionCreated(SessionCreated {
+                    project: victim_project.clone(),
+                    session_id: session_id.clone(),
+                }),
+            ),
+            evt(
+                "rsc2",
+                RuntimeEvent::RunCreated(RunCreated {
+                    project: victim_project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    parent_run_id: None,
+                    prompt_release_id: None,
+                    agent_role_id: None,
+                }),
+            ),
+            // Forged RunStateChanged: same run_id, attacker's project.
+            // Must NOT flip the victim's run from Pending to Failed.
+            evt(
+                "rsc3",
+                RuntimeEvent::RunStateChanged(RunStateChanged {
+                    project: attacker_project,
+                    run_id: run_id.clone(),
+                    transition: StateTransition {
+                        from: Some(RunState::Pending),
+                        to: RunState::Failed,
+                    },
+                    failure_class: None,
+                    pause_reason: None,
+                    resume_trigger: None,
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let run = RunReadModel::get(&store, &run_id).await.unwrap().unwrap();
+    assert_eq!(
+        run.state,
+        RunState::Pending,
+        "forged RunStateChanged must not flip victim's run state",
+    );
+    assert!(
+        run.failure_class.is_none(),
+        "forged RunStateChanged must not set failure_class",
+    );
+}
+
+// ── 4c. TerminalRecoveryAttempted also rejects cross-tenant forgery ──────────
+//
+// Same QA expansion: the third event that mutates a run row by `run_id` only.
+// `TerminalRecoveryAttempted` writes the F64 recovery metadata
+// (`fcall`, `attempts`, `wall_time_ms`, `outcome`, `occurred_at_ms`). A forged
+// event could stamp false recovery metadata onto another tenant's run row —
+// less destructive than `RunStateChanged` (no state machine flip) but still a
+// data-integrity violation.
+//
+// `TerminalRecoveryAttempted` does NOT carry `session_id` either, so the gate
+// is project-only.
+#[tokio::test]
+async fn terminal_recovery_attempted_does_not_mutate_cross_tenant_run() {
+    let store = InMemoryStore::new();
+    let victim_project = project("tenant_victim_tra", "ws_victim");
+    let attacker_project = project("tenant_attacker_tra", "ws_attacker");
+    let session_id = SessionId::new("sess_victim_tra");
+    let run_id = RunId::new("run_victim_tra");
+
+    store
+        .append(&[
+            evt(
+                "tra1",
+                RuntimeEvent::SessionCreated(SessionCreated {
+                    project: victim_project.clone(),
+                    session_id: session_id.clone(),
+                }),
+            ),
+            evt(
+                "tra2",
+                RuntimeEvent::RunCreated(RunCreated {
+                    project: victim_project.clone(),
+                    session_id: session_id.clone(),
+                    run_id: run_id.clone(),
+                    parent_run_id: None,
+                    prompt_release_id: None,
+                    agent_role_id: None,
+                }),
+            ),
+            // Forged TerminalRecoveryAttempted: same run_id, attacker's project.
+            // Must NOT stamp any recovery metadata on the victim row.
+            evt(
+                "tra3",
+                RuntimeEvent::TerminalRecoveryAttempted(TerminalRecoveryAttempted {
+                    project: attacker_project,
+                    run_id: run_id.clone(),
+                    fcall: "complete".to_owned(),
+                    attempts: 99,
+                    wall_time_ms: 999_999,
+                    outcome: "forged-deadlocked".to_owned(),
+                    occurred_at_ms: now_ms(),
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    let run = RunReadModel::get(&store, &run_id).await.unwrap().unwrap();
+    assert!(
+        run.terminal_write_recovery.is_none(),
+        "forged TerminalRecoveryAttempted must not stamp recovery metadata; got: {:?}",
+        run.terminal_write_recovery,
+    );
 }
 
 // ── 5. WorkspaceMemberAdded produces membership record ───────────────────────

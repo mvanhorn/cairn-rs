@@ -8,8 +8,9 @@
 
 #![cfg(feature = "metrics-providers")]
 
+mod support;
+
 use std::sync::Arc;
-use std::time::Duration;
 
 use cairn_app::metrics::AppMetrics;
 use cairn_app::metrics_tap::MetricsTap;
@@ -21,18 +22,13 @@ use cairn_domain::{
 };
 use cairn_store::event_log::EventLog;
 use cairn_store::InMemoryStore;
+use support::metrics_wait::{assert_metrics_absent, wait_for_metrics};
 
 async fn setup() -> (Arc<InMemoryStore>, Arc<AppMetrics>, MetricsTap) {
     let store = Arc::new(InMemoryStore::new());
     let metrics = Arc::new(AppMetrics::default());
     let tap = MetricsTap::spawn(store.clone(), metrics.clone());
     (store, metrics, tap)
-}
-
-/// 200ms drain window — same budget as metrics_core. Broadcast delivery
-/// is typically sub-millisecond in-process; the margin absorbs CI noise.
-async fn drain_tap() {
-    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 fn project() -> ProjectKey {
@@ -100,40 +96,25 @@ async fn succeeded_call_bumps_counter_and_histogram_and_tokens() {
         .await
         .unwrap();
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-
-    // Counter
-    assert!(
-        output.contains(
-            r#"cairn_provider_calls_total{provider_connection="openai",model="gpt-4o",operation_kind="generate",status="succeeded"} 1"#
-        ),
-        "missing calls counter row:\n{output}"
-    );
-
-    // Histogram — 840ms falls in the le=1000 bucket and everything above.
-    // Buckets: 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 120000.
-    assert!(output.contains(
-        r#"cairn_provider_call_duration_ms_bucket{provider_connection="openai",model="gpt-4o",operation_kind="generate",le="1000"} 1"#
-    ));
-    assert!(output.contains(
-        r#"cairn_provider_call_duration_ms_bucket{provider_connection="openai",model="gpt-4o",operation_kind="generate",le="500"} 0"#
-    ));
-    assert!(output.contains(
-        r#"cairn_provider_call_duration_ms_sum{provider_connection="openai",model="gpt-4o",operation_kind="generate"} 840"#
-    ));
-    assert!(output.contains(
-        r#"cairn_provider_call_duration_ms_count{provider_connection="openai",model="gpt-4o",operation_kind="generate"} 1"#
-    ));
-
-    // Token counters
-    assert!(output.contains(
-        r#"cairn_provider_tokens_total{provider_connection="openai",model="gpt-4o",kind="input"} 1000"#
-    ));
-    assert!(output.contains(
-        r#"cairn_provider_tokens_total{provider_connection="openai",model="gpt-4o",kind="output"} 500"#
-    ));
+    // Histogram assertion: 840ms falls in the le=1000 bucket (buckets
+    // are 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 120000),
+    // and le=500 stays at 0.
+    wait_for_metrics(
+        &metrics,
+        &[
+            // Counter
+            r#"cairn_provider_calls_total{provider_connection="openai",model="gpt-4o",operation_kind="generate",status="succeeded"} 1"#,
+            // Histogram buckets
+            r#"cairn_provider_call_duration_ms_bucket{provider_connection="openai",model="gpt-4o",operation_kind="generate",le="1000"} 1"#,
+            r#"cairn_provider_call_duration_ms_bucket{provider_connection="openai",model="gpt-4o",operation_kind="generate",le="500"} 0"#,
+            r#"cairn_provider_call_duration_ms_sum{provider_connection="openai",model="gpt-4o",operation_kind="generate"} 840"#,
+            r#"cairn_provider_call_duration_ms_count{provider_connection="openai",model="gpt-4o",operation_kind="generate"} 1"#,
+            // Token counters
+            r#"cairn_provider_tokens_total{provider_connection="openai",model="gpt-4o",kind="input"} 1000"#,
+            r#"cairn_provider_tokens_total{provider_connection="openai",model="gpt-4o",kind="output"} 500"#,
+        ],
+    )
+    .await;
 
     tap.shutdown().await;
 }
@@ -159,15 +140,17 @@ async fn failed_call_without_latency_bumps_counter_but_not_histogram() {
         .await
         .unwrap();
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(output.contains(
-        r#"cairn_provider_calls_total{provider_connection="anthropic",model="claude-3.5-sonnet",operation_kind="generate",status="failed"} 1"#
-    ));
-    assert!(
-        !output.contains(r#"cairn_provider_call_duration_ms_count{provider_connection="anthropic"#),
-        "histogram should not emit for a no-latency failure:\n{output}"
+    // Positive-edge wait on the counter; once present, the tap has
+    // processed our single append — the histogram absence is then a
+    // synchronous assertion.
+    wait_for_metrics(
+        &metrics,
+        &[r#"cairn_provider_calls_total{provider_connection="anthropic",model="claude-3.5-sonnet",operation_kind="generate",status="failed"} 1"#],
+    )
+    .await;
+    assert_metrics_absent(
+        &metrics,
+        &[r#"cairn_provider_call_duration_ms_count{provider_connection="anthropic"#],
     );
 
     tap.shutdown().await;
@@ -206,22 +189,17 @@ async fn embed_operation_separates_from_generate_in_labels() {
         .await
         .unwrap();
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(output.contains(
-        r#"cairn_provider_calls_total{provider_connection="openai",model="gpt-4o",operation_kind="generate",status="succeeded"} 1"#
-    ));
-    assert!(output.contains(
-        r#"cairn_provider_calls_total{provider_connection="openai",model="text-embedding-3-small",operation_kind="embed",status="succeeded"} 1"#
-    ));
-    // Embedding latency should land in the le=250 bucket; generate in le=2500.
-    assert!(output.contains(
-        r#"cairn_provider_call_duration_ms_bucket{provider_connection="openai",model="text-embedding-3-small",operation_kind="embed",le="250"} 1"#
-    ));
-    assert!(output.contains(
-        r#"cairn_provider_call_duration_ms_bucket{provider_connection="openai",model="gpt-4o",operation_kind="generate",le="2500"} 1"#
-    ));
+    // Embedding latency (120ms) lands in le=250; generate (1500ms) in le=2500.
+    wait_for_metrics(
+        &metrics,
+        &[
+            r#"cairn_provider_calls_total{provider_connection="openai",model="gpt-4o",operation_kind="generate",status="succeeded"} 1"#,
+            r#"cairn_provider_calls_total{provider_connection="openai",model="text-embedding-3-small",operation_kind="embed",status="succeeded"} 1"#,
+            r#"cairn_provider_call_duration_ms_bucket{provider_connection="openai",model="text-embedding-3-small",operation_kind="embed",le="250"} 1"#,
+            r#"cairn_provider_call_duration_ms_bucket{provider_connection="openai",model="gpt-4o",operation_kind="generate",le="2500"} 1"#,
+        ],
+    )
+    .await;
 
     tap.shutdown().await;
 }
@@ -245,26 +223,18 @@ async fn multiple_calls_accumulate_in_counter_and_histogram() {
     }
     store.append(&events).await.unwrap();
 
-    drain_tap().await;
-
-    let output = metrics.render_prometheus();
-    assert!(output.contains(
-        r#"cairn_provider_calls_total{provider_connection="openai",model="gpt-4o",operation_kind="generate",status="succeeded"} 3"#
-    ));
-    assert!(output.contains(
-        r#"cairn_provider_call_duration_ms_count{provider_connection="openai",model="gpt-4o",operation_kind="generate"} 3"#
-    ));
-    // sum = 150 + 800 + 2200 = 3150
-    assert!(output.contains(
-        r#"cairn_provider_call_duration_ms_sum{provider_connection="openai",model="gpt-4o",operation_kind="generate"} 3150"#
-    ));
-    // tokens: 100*3 = 300 input, 50*3 = 150 output
-    assert!(output.contains(
-        r#"cairn_provider_tokens_total{provider_connection="openai",model="gpt-4o",kind="input"} 300"#
-    ));
-    assert!(output.contains(
-        r#"cairn_provider_tokens_total{provider_connection="openai",model="gpt-4o",kind="output"} 150"#
-    ));
+    // sum = 150 + 800 + 2200 = 3150; tokens = 100*3 input, 50*3 output.
+    wait_for_metrics(
+        &metrics,
+        &[
+            r#"cairn_provider_calls_total{provider_connection="openai",model="gpt-4o",operation_kind="generate",status="succeeded"} 3"#,
+            r#"cairn_provider_call_duration_ms_count{provider_connection="openai",model="gpt-4o",operation_kind="generate"} 3"#,
+            r#"cairn_provider_call_duration_ms_sum{provider_connection="openai",model="gpt-4o",operation_kind="generate"} 3150"#,
+            r#"cairn_provider_tokens_total{provider_connection="openai",model="gpt-4o",kind="input"} 300"#,
+            r#"cairn_provider_tokens_total{provider_connection="openai",model="gpt-4o",kind="output"} 150"#,
+        ],
+    )
+    .await;
 
     tap.shutdown().await;
 }

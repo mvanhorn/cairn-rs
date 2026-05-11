@@ -153,8 +153,13 @@ where
     async fn list_breached_by_tenant(
         &self,
         tenant_id: &TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<SlaBreach>, RuntimeError> {
-        Ok(RunSlaReadModel::list_breached_by_tenant(self.store.as_ref(), tenant_id).await?)
+        Ok(
+            RunSlaReadModel::list_breached_by_tenant(self.store.as_ref(), tenant_id, limit, offset)
+                .await?,
+        )
     }
 }
 
@@ -219,7 +224,10 @@ mod tests {
         assert!(sla_breached, "RunSlaBreached event must be in event log");
 
         // list_breached_by_tenant returns the run
-        let breaches = service.list_breached_by_tenant(&tenant_id).await.unwrap();
+        let breaches = service
+            .list_breached_by_tenant(&tenant_id, 100, 0)
+            .await
+            .unwrap();
         assert_eq!(breaches.len(), 1);
         assert_eq!(breaches[0].run_id, run_id);
 

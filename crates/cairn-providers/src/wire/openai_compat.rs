@@ -17,7 +17,8 @@ use crate::chat::{
     ChatMessage, ChatProvider, ChatResponse, ChatRole, MessageContent, StreamChoice, StreamChunk,
     StreamDelta, StreamResponse, StructuredOutput, Tool, ToolChoice,
 };
-use crate::error::{ProviderError, truncate_raw_response};
+use crate::error::{ProviderError, safe_raw_response};
+use crate::redact::redact_secrets;
 use crate::{FunctionCall, ToolCall, Usage};
 
 // ── Provider config (runtime, not generic) ───────────────────────────────────
@@ -35,7 +36,23 @@ pub struct ProviderConfig {
     pub supports_parallel_tool_calls: bool,
     pub supports_stream_options: bool,
     pub custom_headers: Vec<(String, String)>,
+    /// Default HTTP client timeout in seconds when the caller does NOT
+    /// supply an explicit `timeout_secs`. Applied both to the reqwest
+    /// `Client::builder` and as a per-request override, so a hung upstream
+    /// can never stall the orchestrator indefinitely (F27 dogfood blocker).
+    ///
+    /// Sensible per-backend defaults: cloud APIs 90s, reasoning-heavy
+    /// backends 120s, Ollama 300s (local, can be slow). Operators can still
+    /// override per-connection via `ProviderBuilder::timeout_secs`.
+    pub default_timeout_secs: u64,
 }
+
+/// Default client timeout for OpenAI-compatible cloud backends (seconds).
+///
+/// Used by most `/chat/completions`-speaking providers. Reasoning-heavy
+/// backends override with a higher value; Ollama overrides lower-frequency
+/// because local inference is slower but connection-bound.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 90;
 
 impl Default for ProviderConfig {
     fn default() -> Self {
@@ -49,6 +66,7 @@ impl Default for ProviderConfig {
             supports_parallel_tool_calls: false,
             supports_stream_options: false,
             custom_headers: Vec::new(),
+            default_timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
 }
@@ -66,6 +84,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: true,
         custom_headers: Vec::new(),
+        default_timeout_secs: 90,
     };
 
     pub const ANTHROPIC: Self = Self {
@@ -78,6 +97,8 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: false,
         custom_headers: Vec::new(),
+        // Claude thinking mode and extended responses can run long.
+        default_timeout_secs: 120,
     };
 
     pub const OLLAMA: Self = Self {
@@ -90,6 +111,8 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: false,
         custom_headers: Vec::new(),
+        // Local inference on CPU can easily exceed cloud defaults.
+        default_timeout_secs: 300,
     };
 
     pub const OPENROUTER: Self = Self {
@@ -102,6 +125,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: true,
         custom_headers: Vec::new(),
+        default_timeout_secs: 120,
     };
 
     pub const GROQ: Self = Self {
@@ -114,6 +138,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: true,
         custom_headers: Vec::new(),
+        default_timeout_secs: 90,
     };
 
     pub const DEEPSEEK: Self = Self {
@@ -126,6 +151,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: true,
         custom_headers: Vec::new(),
+        default_timeout_secs: 90,
     };
 
     pub const XAI: Self = Self {
@@ -138,6 +164,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: true,
         custom_headers: Vec::new(),
+        default_timeout_secs: 90,
     };
 
     pub const GOOGLE: Self = Self {
@@ -150,6 +177,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: false,
         custom_headers: Vec::new(),
+        default_timeout_secs: 90,
     };
 
     pub const AZURE_OPENAI: Self = Self {
@@ -162,6 +190,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: true,
         custom_headers: Vec::new(),
+        default_timeout_secs: 90,
     };
 
     pub const MINIMAX: Self = Self {
@@ -174,6 +203,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: true,
         custom_headers: Vec::new(),
+        default_timeout_secs: 120,
     };
 
     /// Bedrock OpenAI-compatible gateway.  Simpler than Converse but fewer
@@ -189,6 +219,7 @@ impl ProviderConfig {
         supports_parallel_tool_calls: false,
         supports_stream_options: false,
         custom_headers: Vec::new(),
+        default_timeout_secs: 120,
     };
 
     /// Resolve a config from backend name.  Returns the generic default for
@@ -234,6 +265,12 @@ pub struct OpenAiCompat {
     pub embedding_dimensions: Option<u32>,
     pub normalize_response: bool,
     client: Client,
+    /// Optional request signer. When `Some`, every outbound request is
+    /// signed via this handle instead of the default Bearer-token path.
+    /// Used for backends that need AWS SigV4 (Bedrock OpenAI-compat
+    /// gateway) or any other header-based auth scheme that depends on
+    /// the request body.
+    signer: Option<std::sync::Arc<dyn crate::signer::RequestSigner>>,
 }
 
 impl OpenAiCompat {
@@ -248,10 +285,15 @@ impl OpenAiCompat {
         temperature: Option<f32>,
         timeout_secs: Option<u64>,
     ) -> Result<Self, ProviderError> {
-        let mut builder = Client::builder();
-        if let Some(sec) = timeout_secs {
-            builder = builder.timeout(std::time::Duration::from_secs(sec));
-        }
+        // ALWAYS install a client-level timeout. `None` resolves to the
+        // backend-specific default (see `ProviderConfig::default_timeout_secs`).
+        // Previously `None` produced a reqwest client with no request
+        // timeout, meaning a hung TCP connect or stalled upstream would
+        // stall the orchestrator forever — this was F27 on the Z.ai path
+        // and the same code path exists here for every OpenAI-compat
+        // backend. Never accept an unbounded default.
+        let effective_timeout = timeout_secs.unwrap_or(config.default_timeout_secs);
+        let builder = Client::builder().timeout(std::time::Duration::from_secs(effective_timeout));
         let raw_url = base_url.unwrap_or_else(|| config.default_base_url.to_owned());
         let normalized = format!("{}/", raw_url.trim_end_matches('/'));
         let base_url = Url::parse(&normalized).map_err(|err| {
@@ -281,7 +323,20 @@ impl OpenAiCompat {
             embedding_dimensions: None,
             client,
             config,
+            signer: None,
         })
+    }
+
+    /// Install a request signer — replaces the default Bearer-token
+    /// auth. Required for `BedrockCompat` on IAM-authenticated endpoints
+    /// where the operator does not have an API key.
+    ///
+    /// `api_key` is left intact so the struct remains valid for code
+    /// that inspects it for diagnostics, but the signer wins at the
+    /// request layer.
+    pub fn with_signer(mut self, signer: std::sync::Arc<dyn crate::signer::RequestSigner>) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -389,8 +444,11 @@ impl OpenAiCompat {
         let text = resp.text().await?;
         let parsed: WireChatResponse =
             serde_json::from_str(&text).map_err(|e| ProviderError::ResponseFormat {
-                message: format!("failed to decode {} response: {e}", self.config.name),
-                raw_response: truncate_raw_response(&text),
+                message: redact_secrets(&format!(
+                    "failed to decode {} response: {e}",
+                    self.config.name
+                )),
+                raw_response: safe_raw_response(&text),
             })?;
         Ok(Box::new(parsed))
     }
@@ -399,7 +457,9 @@ impl OpenAiCompat {
         &self,
         body: &WireRequest<'_>,
     ) -> Result<reqwest::Response, ProviderError> {
-        if self.api_key.is_empty() {
+        // Signer-less auth requires an API key. Signer-based auth
+        // (SigV4) ignores `api_key` entirely and can run with it empty.
+        if self.signer.is_none() && self.api_key.is_empty() {
             return Err(ProviderError::Auth(format!(
                 "missing {} API key",
                 self.config.name
@@ -408,21 +468,69 @@ impl OpenAiCompat {
         let url = self
             .base_url
             .join(self.config.chat_endpoint)
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
-        let mut req = self.client.post(url).bearer_auth(&self.api_key).json(body);
+            .map_err(|e| ProviderError::Http(redact_secrets(&e.to_string())))?;
+        let url_string = url.as_str().to_owned();
+
+        // Serialize once so the SigV4 path hashes the exact bytes we
+        // send on the wire. `reqwest::RequestBuilder::json` re-encodes
+        // internally which would produce a signature mismatch.
+        let body_bytes: bytes::Bytes = serde_json::to_vec(body)
+            .map_err(|e| ProviderError::InvalidRequest(format!("encode chat request body: {e}")))?
+            .into();
+        let mut req = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            // `Bytes::clone` is cheap (ref-count bump) — no payload copy.
+            .body(body_bytes.clone());
+
         for (k, v) in &self.config.custom_headers {
             req = req.header(k, v);
         }
-        if let Some(timeout) = self.timeout_secs {
-            req = req.timeout(std::time::Duration::from_secs(timeout));
-        }
+        // Per-request timeout: explicit override wins, otherwise fall
+        // back to the backend-specific default. Belt-and-suspenders with
+        // the client-level timeout — reqwest picks the stricter of the
+        // two. Never unbounded.
+        let per_request_timeout = self
+            .timeout_secs
+            .unwrap_or(self.config.default_timeout_secs);
+        req = req.timeout(std::time::Duration::from_secs(per_request_timeout));
+
+        // Auth: signer wins when set; otherwise fall back to Bearer.
+        let req = if let Some(signer) = self.signer.as_ref() {
+            signer.sign(req, "POST", &url_string, &body_bytes).await?
+        } else {
+            req.bearer_auth(&self.api_key)
+        };
+
         let resp = req.send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            if status.as_u16() == 429 {
+            let code = status.as_u16();
+            let body = safe_raw_response(&resp.text().await.unwrap_or_default());
+            if code == 429 {
                 return Err(ProviderError::RateLimited);
             }
-            let body = truncate_raw_response(&resp.text().await.unwrap_or_default());
+            if code == 401 || code == 403 {
+                return Err(ProviderError::Auth(format!(
+                    "{} returned HTTP {status}: {body}",
+                    self.config.name
+                )));
+            }
+            if (400..500).contains(&code) {
+                // 4xx other than 401/403/429 — our request is malformed.
+                return Err(ProviderError::InvalidRequest(format!(
+                    "{} returned HTTP {status}: {body}",
+                    self.config.name
+                )));
+            }
+            if (500..600).contains(&code) {
+                // 5xx — upstream problem. Fallback-eligible.
+                return Err(ProviderError::ServerError {
+                    status: code,
+                    message: format!("{} returned HTTP {status}: {body}", self.config.name),
+                });
+            }
             return Err(ProviderError::ResponseFormat {
                 message: format!("{} returned HTTP {status}", self.config.name),
                 raw_response: body,
@@ -444,6 +552,25 @@ impl ChatProvider for OpenAiCompat {
     ) -> Result<Box<dyn ChatResponse>, ProviderError> {
         self.chat_with_tools_for_model(None, messages, tools, schema)
             .await
+    }
+
+    /// Override the trait's default per-call model routing so DECIDE-phase
+    /// fallback chains (see `cairn_orchestrator::ModelChain`) route each
+    /// attempt to the requested upstream model rather than silently reusing
+    /// the connection's configured default. Without this override the
+    /// fallback loop sends every chain attempt to the same upstream — which
+    /// makes a single 429 on the preferred model produce N consecutive 429s
+    /// across the chain (reproduced in `test_http_dogfood_fallback`).
+    async fn chat_with_tools_for_model(
+        &self,
+        model: Option<&str>,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        schema: Option<StructuredOutput>,
+    ) -> Result<Box<dyn ChatResponse>, ProviderError> {
+        // Inherent method on `OpenAiCompat` takes the model through to the
+        // wire body; delegate here.
+        OpenAiCompat::chat_with_tools_for_model(self, model, messages, tools, schema).await
     }
 
     async fn chat_stream(
@@ -914,8 +1041,12 @@ fn create_sse_stream(
         .bytes_stream()
         .scan(SseParser::new(normalize), |parser, chunk| {
             let results = match chunk {
+                // `From<reqwest::Error> for ProviderError` already runs
+                // the error string through `redact_secrets`, so `.into()`
+                // is enough — an extra `redact_secrets` call here would
+                // be a no-op on already-redacted text.
                 Ok(bytes) => parser.consume(&bytes),
-                Err(e) => vec![Err(ProviderError::Http(e.to_string()))],
+                Err(e) => vec![Err(e.into())],
             };
             futures::future::ready(Some(results))
         })
@@ -956,7 +1087,8 @@ fn create_tool_sse_stream(
                         }
                         out
                     }
-                    Err(e) => vec![Err(ProviderError::Http(e.to_string()))],
+                    // `From<reqwest::Error>` redacts; `.into()` is enough.
+                    Err(e) => vec![Err(e.into())],
                 };
                 async move { Some(results) }
             },
@@ -1031,8 +1163,9 @@ fn parse_tool_chunk(
             arguments: String,
         }
 
-        let chunk: C =
-            serde_json::from_str(data).map_err(|e| ProviderError::Json(e.to_string()))?;
+        // `From<serde_json::Error> for ProviderError` redacts the error
+        // text; `?` propagates through that impl.
+        let chunk: C = serde_json::from_str(data)?;
         let mut usage_opt = chunk.usage;
         for choice in &chunk.choices {
             if let Some(ref text) = choice.delta.content

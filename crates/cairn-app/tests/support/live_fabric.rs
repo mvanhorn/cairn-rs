@@ -86,6 +86,9 @@ pub struct LiveHarness {
     /// would otherwise share `$TMPDIR/cairn-workspace-sandboxes` and
     /// race each other during `recover_all`'s drift sweep.
     sandbox_base_dir: PathBuf,
+    /// Extra env vars (key, value) layered onto the cairn-app subprocess
+    /// on both initial spawn and any `restart()`. Empty by default.
+    extra_env: Vec<(String, String)>,
 }
 
 impl LiveHarness {
@@ -103,7 +106,34 @@ impl LiveHarness {
         Self::setup_with_storage(HarnessStorage::Sqlite(path)).await
     }
 
+    /// Variant that plumbs additional env vars (e.g.
+    /// `CAIRN_FABRIC_LEASE_TTL_MS=1000`) into the cairn-app subprocess.
+    /// Needed by tests that pin FabricConfig values without polluting
+    /// the parent test process's env (which parallel tests share).
+    pub async fn setup_with_env(extra_env: &[(&str, &str)]) -> Self {
+        Self::setup_with_storage_and_env(HarnessStorage::InMemory, extra_env).await
+    }
+
+    /// Combined variant for SIGKILL+recovery tests that need both
+    /// durable storage (so the event log survives the subprocess
+    /// exit) and env-var customization (e.g. shortened lease TTL so
+    /// FF's scanner re-eligibles the dead claim quickly).
+    /// Introduced for PR-1b-4 (#670 G4).
+    pub async fn setup_with_sqlite_and_env(extra_env: &[(&str, &str)]) -> Self {
+        let suffix_hint = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
+        let mut path = std::env::temp_dir();
+        path.push(format!("cairn-liveharness-{suffix_hint}.db"));
+        Self::setup_with_storage_and_env(HarnessStorage::Sqlite(path), extra_env).await
+    }
+
     async fn setup_with_storage(storage: HarnessStorage) -> Self {
+        Self::setup_with_storage_and_env(storage, &[]).await
+    }
+
+    async fn setup_with_storage_and_env(
+        storage: HarnessStorage,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         // 1. Shared Valkey endpoint (first caller boots the container).
         let (valkey_host, valkey_port) = cairn_fabric::test_harness::valkey_endpoint().await;
 
@@ -124,6 +154,11 @@ impl LiveHarness {
         let seed_admin = format!("seed-admin-{suffix}-padding");
         let final_admin = format!("test-admin-{suffix}-{}", uuid::Uuid::new_v4().simple());
 
+        let extra_env: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+
         // 4. Spawn the real binary on port 0 (OS-assigned).
         let child = spawn_subprocess_internal(
             0,
@@ -133,6 +168,7 @@ impl LiveHarness {
             valkey_port,
             &storage,
             &sandbox_base_dir,
+            &extra_env,
         );
         let (child, bound_url) = read_listening_banner(child).await;
 
@@ -150,6 +186,50 @@ impl LiveHarness {
             .timeout(Duration::from_secs(60))
             .build()
             .expect("reqwest client builds");
+
+        // The listener binds before the boot-recovery pass (event-log
+        // replay + FF seed) completes. Until that finishes, state-
+        // mutating admin endpoints return 503 with
+        // `{"status":"recovering", "retry_after_seconds":N}`. Poll
+        // `/health/ready` until the app is out of recovery mode, then
+        // rotate. 30s ceiling is generous for CI; local boots under 5s.
+        //
+        // Per-request timeout is 2s so a hung socket can't stretch
+        // past the 30s overall deadline (the shared `client` has a
+        // 60s request timeout for real-LLM paths — using it directly
+        // here would let one hung probe consume the entire budget).
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let probe = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.get(format!("{base_url}/health/ready")).send(),
+            )
+            .await;
+            match probe {
+                Ok(Ok(ready)) if ready.status().is_success() => break,
+                Ok(Ok(ready)) => {
+                    if std::time::Instant::now() >= ready_deadline {
+                        panic!(
+                            "cairn-app never reached /health/ready within 30s: last status {}",
+                            ready.status()
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    if std::time::Instant::now() >= ready_deadline {
+                        panic!("cairn-app readiness probe kept erroring for 30s: {e}");
+                    }
+                }
+                Err(_elapsed) => {
+                    if std::time::Instant::now() >= ready_deadline {
+                        panic!(
+                            "cairn-app never reached /health/ready within 30s: last probe timed out"
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         let rotate_res = client
             .post(format!("{base_url}/v1/admin/rotate-token"))
@@ -179,6 +259,7 @@ impl LiveHarness {
             valkey_port,
             storage,
             sandbox_base_dir,
+            extra_env,
         }
     }
 
@@ -244,6 +325,7 @@ impl LiveHarness {
             self.valkey_port,
             &self.storage,
             &self.sandbox_base_dir,
+            &self.extra_env,
         );
         let (child, bound_url) = read_listening_banner(child).await;
         let base_url = bound_url.replace("0.0.0.0", "127.0.0.1");
@@ -340,6 +422,7 @@ fn spawn_subprocess_internal(
     valkey_port: u16,
     storage: &HarnessStorage,
     sandbox_base_dir: &std::path::Path,
+    extra_env: &[(String, String)],
 ) -> Child {
     let bin = env!("CARGO_BIN_EXE_cairn-app");
     let mut cmd = Command::new(bin);
@@ -351,8 +434,16 @@ fn spawn_subprocess_internal(
         .arg("127.0.0.1")
         .arg("--db")
         .arg(storage.db_arg())
-        .env("CAIRN_FABRIC_HOST", valkey_host)
-        .env("CAIRN_FABRIC_PORT", valkey_port.to_string())
+        // F65 PR-5: CI runners + integration test hosts typically have
+        // AppArmor blocking unprivileged userns (same posture as the
+        // Graviton production host in docs/design/f65-kernel-probe-findings.md).
+        // LiveHarness subprocesses must skip the boot-probe gate;
+        // sandbox isolation is not under test here.
+        .arg("--allow-missing-sandbox-primitives")
+        .env(
+            "CAIRN_FABRIC_URL",
+            format!("valkey://{valkey_host}:{valkey_port}"),
+        )
         // Unique FF lane so this test's worker queues don't pick up
         // tasks from sibling tests.
         .env("CAIRN_FABRIC_LANE", format!("test-{suffix}"))
@@ -370,17 +461,67 @@ fn spawn_subprocess_internal(
             "00000000000000000000000000000000000000000000000000000000000000aa",
         )
         .env("CAIRN_FABRIC_WAITPOINT_HMAC_KID", "cairn-test-k1")
+        // META #461: cairn-app refuses to boot in team mode without
+        // `CAIRN_CREDENTIAL_KEY`. Use a deterministic test key so every
+        // LiveHarness subprocess in this test run shares the same key —
+        // the test asserts against ciphertexts the subprocess itself
+        // writes, so the key doesn't need to match any external fixture.
+        .env(
+            "CAIRN_CREDENTIAL_KEY",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
         // Silence noisy tracing so stderr is dominated by structured
         // startup lines; integration tests don't need debug spam.
-        .env("RUST_LOG", "warn,cairn_app=info")
+        // Tests can override via `CAIRN_TEST_RUST_LOG` when they need
+        // to trace a failure through orchestrator/runtime spans.
+        .env(
+            "RUST_LOG",
+            std::env::var("CAIRN_TEST_RUST_LOG")
+                .unwrap_or_else(|_| "warn,cairn_app=info".to_owned()),
+        )
         // Avoid inheriting the parent test process's log-dir setting.
         .env_remove("CAIRN_LOG_DIR")
-        .stdout(Stdio::null())
+        .stdout(if std::env::var("CAIRN_TEST_LOG_FILE").is_ok() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    // Caller-supplied env overrides. Applied last so a test can override
+    // any of the defaults above (e.g. CAIRN_FABRIC_LEASE_TTL_MS) without
+    // touching the parent process env (shared by parallel tests).
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
     cmd.spawn()
         .expect("failed to spawn cairn-app binary — did cargo build it?")
+}
+
+/// Shared bare-bones `cairn-app` subprocess spawner for tests that
+/// deliberately cannot use [`LiveHarness`] (e.g. tests that assert the
+/// binary *refuses* to start and therefore never prints the listening
+/// banner — see `test_rfc020_independent.rs`).
+///
+/// Returns a [`Command`] pre-configured with:
+///   * the correct `cairn-app` binary path (`env!("CARGO_BIN_EXE_cairn-app")`)
+///   * `kill_on_drop(true)` (so a hung or still-running subprocess dies
+///     with the test)
+///   * stdout/stderr piped (callers capture or drain as needed)
+///
+/// Caller layers args and env vars on top. This is the minimum contract
+/// shared between [`LiveHarness`] and startup-refusal tests — centralising
+/// it here (per issue #446) protects against silent drift if the binary
+/// path env var or the kill-on-drop discipline ever changes.
+pub fn raw_cairn_app_command() -> Command {
+    let bin = env!("CARGO_BIN_EXE_cairn-app");
+    let mut cmd = Command::new(bin);
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd
 }
 
 /// Take `stderr` off the child, scan for the listening banner, return the
@@ -391,6 +532,32 @@ async fn read_listening_banner(mut child: Child) -> (Child, String) {
         .await
         .expect("cairn-app did not print listening banner within timeout")
         .expect("cairn-app exited before printing listening banner");
+    // Drain stdout too when a log file is requested — cairn-app's
+    // default tracing-subscriber writes to stdout, not stderr.
+    if let Some(stdout) = child.stdout.take() {
+        let log_file = std::env::var("CAIRN_TEST_LOG_FILE").ok();
+        tokio::spawn(async move {
+            use tokio::fs::OpenOptions;
+            use tokio::io::AsyncBufReadExt;
+            use tokio::io::AsyncWriteExt;
+            let mut writer = match log_file {
+                Some(p) => OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(p)
+                    .await
+                    .ok(),
+                None => None,
+            };
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(w) = writer.as_mut() {
+                    let _ = w.write_all(format!("[app-out] {line}\n").as_bytes()).await;
+                    let _ = w.flush().await;
+                }
+            }
+        });
+    }
     (child, bound_url)
 }
 
@@ -408,10 +575,32 @@ async fn wait_for_listening(stderr: tokio::process::ChildStderr) -> Option<Strin
             // test stderr — invaluable when a test triggers server-side
             // behavior you want to see (claim contention, FF rejections).
             let echo = std::env::var("CAIRN_TEST_ECHO_SERVER_STDERR").is_ok();
+            // When `CAIRN_TEST_LOG_FILE` is set, tee stderr to that path
+            // too — useful under `cargo test` where the harness eats
+            // plain eprintln. Path is shared across subprocesses in the
+            // same test invocation (append mode).
+            let log_file = std::env::var("CAIRN_TEST_LOG_FILE").ok();
             tokio::spawn(async move {
+                use tokio::fs::OpenOptions;
+                use tokio::io::AsyncWriteExt;
+                let mut writer = match log_file {
+                    Some(p) => OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(p)
+                        .await
+                        .ok(),
+                    None => None,
+                };
                 while let Ok(Some(line)) = lines.next_line().await {
                     if echo {
                         eprintln!("[cairn-app] {line}");
+                    }
+                    if let Some(w) = writer.as_mut() {
+                        let _ = w
+                            .write_all(format!("[cairn-app] {line}\n").as_bytes())
+                            .await;
+                        let _ = w.flush().await;
                     }
                 }
             });

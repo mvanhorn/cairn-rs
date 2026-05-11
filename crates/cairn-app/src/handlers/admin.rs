@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{rejection::JsonRejection, Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -19,20 +19,27 @@ use utoipa::ToSchema;
 use cairn_api::auth::AuthPrincipal;
 use cairn_api::http::{ApiError, ListResponse};
 use cairn_domain::credentials::CredentialRecord;
+use cairn_domain::tenancy::TenantRole;
+use cairn_domain::OperatorId;
 use cairn_domain::{
     AuditLogEntry, AuditOutcome, CredentialId, ProjectKey, TenantId, WorkspaceId, WorkspaceKey,
     WorkspaceRole, CREDENTIAL_MANAGEMENT,
 };
 use cairn_runtime::{
     AuditService, CredentialService, NotificationService, OperatorProfileService, ProjectService,
-    QuotaService, RetentionService, TenantService, WorkspaceMembershipService, WorkspaceService,
+    QuotaService, RetentionService, TenantRoleService, TenantService, WorkspaceMembershipService,
+    WorkspaceService,
 };
 use cairn_store::projections::{AuditLogReadModel, QuotaReadModel, RetentionPolicyReadModel};
 
-use crate::errors::{require_feature, runtime_error_response, store_error_response, AppApiError};
-use crate::extractors::{AdminRoleGuard, TenantScope};
+use crate::errors::{
+    api_error_with_details, json_rejection_response, require_feature, runtime_error_response,
+    store_error_response, validation_error_response, AppApiError,
+};
+use crate::extractors::{AdminRoleGuard, TenantAdminGuard, TenantScope};
 use crate::state::AppState;
 use crate::tokens::RequestLogEntry;
+use crate::webhook_validation::{validate_channels, WebhookValidationPolicy};
 #[allow(unused_imports)]
 use crate::{ProjectRecordDoc, RunListResponseDoc, TenantRecordDoc, WorkspaceRecordDoc};
 
@@ -48,9 +55,18 @@ pub(crate) fn audit_actor_id(principal: &AuthPrincipal) -> String {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct AuditLogQuery {
+    /// Inclusive lower bound on `occurred_at_ms`.
     pub since_ms: Option<u64>,
+    /// Exclusive upper bound on `occurred_at_ms` — used for
+    /// "older than X" cursor pagination from the UI.
+    pub before_ms: Option<u64>,
+    /// Max entries to return (capped at [`MAX_AUDIT_LIMIT`],
+    /// default [`DEFAULT_AUDIT_LIMIT`]).
     pub limit: Option<usize>,
 }
+
+pub(crate) const DEFAULT_AUDIT_LIMIT: usize = 100;
+pub(crate) const MAX_AUDIT_LIMIT: usize = 1000;
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct CreateOperatorProfileRequest {
@@ -102,8 +118,19 @@ pub(crate) struct PaginationQuery {
 }
 
 impl PaginationQuery {
+    /// Default per-page cap when the client doesn't supply one.
+    pub const DEFAULT_LIMIT: usize = 100;
+
+    /// Maximum per-page cap (Copilot review on #589). Requests with
+    /// `limit` above this are clamped silently so `limit + 1` overflow
+    /// fetches can't wrap `usize` or force unbounded reads. Matches
+    /// the cap already applied to `TenantCostQuery::MAX_LIMIT`.
+    pub const MAX_LIMIT: usize = 1_000;
+
     pub fn limit(&self) -> usize {
-        self.limit.unwrap_or(100)
+        self.limit
+            .unwrap_or(Self::DEFAULT_LIMIT)
+            .min(Self::MAX_LIMIT)
     }
 
     pub fn offset(&self) -> usize {
@@ -131,11 +158,43 @@ pub(crate) struct SetTenantQuotaRequest {
     pub max_tasks_per_run: u32,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, ToSchema)]
+/// Closes #492: the plaintext value must never survive in logs, `Debug`,
+/// or the OpenAPI example.
+///
+/// The struct itself is crate-private (`pub(crate)`) and `plaintext_value`
+/// is exposed through a narrow accessor (`into_plaintext_value`) so the
+/// handler can move it into the credential service call without exposing
+/// the field to unrelated code. The manual `Debug` impl prints
+/// `[redacted]` so future `tracing::debug!("{body:?}")` additions cannot
+/// leak the secret.
+///
+/// Per Copilot review on PR #535: the field was previously `pub` with a
+/// comment claiming it was private; tightening now so the comment and
+/// the access pattern match.
+#[derive(Clone, serde::Deserialize, ToSchema)]
 pub(crate) struct StoreCredentialRequest {
     pub provider_id: String,
-    pub plaintext_value: String,
+    plaintext_value: String,
     pub key_id: Option<String>,
+}
+
+impl StoreCredentialRequest {
+    /// Move the plaintext value out for the encrypt call. The caller is
+    /// expected to hand this straight to the credential service, which
+    /// wraps it in `Zeroizing<String>` for the remainder of its lifetime.
+    pub(crate) fn into_plaintext_value(self) -> String {
+        self.plaintext_value
+    }
+}
+
+impl std::fmt::Debug for StoreCredentialRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreCredentialRequest")
+            .field("provider_id", &self.provider_id)
+            .field("plaintext_value", &"[redacted]")
+            .field("key_id", &self.key_id)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -144,6 +203,16 @@ pub(crate) struct TenantScopedQuery {
     pub tenant_id: String,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+impl TenantScopedQuery {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(100)
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
 }
 
 // ── Admin DTOs ───────────────────────────────────────────────────────────────
@@ -177,11 +246,16 @@ pub(crate) struct RequestLogsQuery {
     #[serde(default = "default_logs_limit")]
     limit: usize,
     level: Option<String>,
+    /// Lower bound on `start_time_unix_ns` (millis × 1_000_000). Entries older
+    /// than this are excluded — used by the UI "last hour / last 24h" filter.
+    since_ms: Option<u64>,
 }
 
 fn default_logs_limit() -> usize {
     200
 }
+
+const MAX_REQUEST_LOGS_LIMIT: usize = 500;
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub(crate) struct SetNotificationPreferencesRequest {
@@ -254,20 +328,17 @@ pub(crate) async fn list_tenants_handler(
     // T6a-H3 + T6a-C4: listing every tenant is an admin-only operation.
     // Non-admins enumerating the tenant topology is a cross-tenant
     // metadata leak.
-    match state
-        .runtime
-        .tenants
-        .list(query.limit(), query.offset())
-        .await
-    {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+    //
+    // #422: honest pagination — fetch `limit + 1`, compute `has_more`,
+    // truncate. The previous unconditional `has_more: false` silently
+    // hid extra rows past the first page.
+    let limit = query.limit();
+    match state.runtime.tenants.list(limit + 1, query.offset()).await {
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -320,9 +391,21 @@ pub(crate) async fn create_tenant_handler(
 
 pub(crate) async fn get_tenant_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.runtime.tenants.get(&TenantId::new(id)).await {
+    // RFC 026 PR-A7b: scope the read. Admin service account keeps
+    // cross-tenant visibility; a same-tenant operator can GET their
+    // own tenant record (needed for basic UI bootstrap). A foreign-
+    // tenant operator gets 404 — never 403 — so tenant existence is
+    // not leaked (mirrors the oracle-avoidance pattern in
+    // `list_credentials_handler` #447).
+    let target = TenantId::new(id);
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found")
+            .into_response();
+    }
+    match state.runtime.tenants.get(&target).await {
         Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
         Ok(None) => {
             AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found").into_response()
@@ -331,11 +414,92 @@ pub(crate) async fn get_tenant_handler(
     }
 }
 
+/// `PATCH /v1/admin/tenants/:id` — edit tenant name. RFC 026 PR-A2.
+///
+/// PATCH semantics: every field is optional; omitted fields are
+/// preserved. The handler rejects an all-`None` body with 422
+/// (`empty_patch`) at the service layer so UI callers get a clear
+/// signal rather than a silent success.
+///
+/// Guard: `TenantAdminGuard` — god-token bypasses for cross-tenant
+/// bootstrap; real operators need `TenantRole::Admin` for the target
+/// tenant (attached by `attach_tenant_role` middleware). A tenant-
+/// admin on `T` issuing PATCH against `T'` receives the structured
+/// `tenant_role_missing` 403 body from the guard.
+#[derive(Clone, Debug, serde::Deserialize, ToSchema)]
+pub(crate) struct PatchTenantRequest {
+    /// New display name. Optional — omit to leave the stored name
+    /// unchanged.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+pub(crate) async fn patch_tenant_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path(id): Path<String>,
+    body: Result<Json<PatchTenantRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(err) => return json_rejection_response(err),
+    };
+    let tenant_id = TenantId::new(id);
+    let updated_by = audit_actor_id(&principal);
+
+    let patch = cairn_runtime::TenantUpdatePatch {
+        name: body.name.clone(),
+    };
+
+    match state
+        .runtime
+        .tenants
+        .update(tenant_id.clone(), patch, updated_by.clone())
+        .await
+    {
+        Ok(record) => {
+            // Audit every successful PATCH so operators can trace
+            // rename history. Failures also emit an audit entry in
+            // the service-layer path via `audits.record` pattern; we
+            // mirror the `create_tenant_handler` shape here.
+            match state
+                .runtime
+                .audits
+                .record(
+                    record.tenant_id.clone(),
+                    updated_by,
+                    "update_tenant".to_owned(),
+                    "tenant".to_owned(),
+                    record.tenant_id.to_string(),
+                    AuditOutcome::Success,
+                    serde_json::json!({ "name": record.name }),
+                )
+                .await
+            {
+                Ok(_) => (StatusCode::OK, Json(record)).into_response(),
+                Err(err) => runtime_error_response(err),
+            }
+        }
+        Err(err) => runtime_error_response(err),
+    }
+}
+
 pub(crate) async fn get_tenant_overview_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let tenant_id = TenantId::new(id);
+
+    // RFC 026 PR-A7b: scope the read. Admin bypass preserved for
+    // cross-tenant observability; same-tenant operator sees their
+    // own overview (needed by the UI dashboard); foreign-tenant
+    // operator gets 404 to avoid leaking tenant existence.
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &tenant_id {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found")
+            .into_response();
+    }
 
     match state.runtime.tenants.get(&tenant_id).await {
         Ok(None) => {
@@ -349,7 +513,7 @@ pub(crate) async fn get_tenant_overview_handler(
     let workspaces = match state
         .runtime
         .workspaces
-        .list_by_tenant(&tenant_id, usize::MAX, 0)
+        .list_by_tenant(&tenant_id, usize::MAX, 0, false)
         .await
     {
         Ok(ws) => ws,
@@ -424,6 +588,10 @@ pub(crate) async fn get_tenant_overview_handler(
 
 pub(crate) async fn get_tenant_quota_handler(
     State(state): State<Arc<AppState>>,
+    // RFC 026 PR-A7b: quota values (ceilings, burn rate, limits) are
+    // admin-sensitive. Gate strictly on `TenantAdminGuard` so only
+    // god-token or tenant-admin role on THIS tenant can read.
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
 ) -> impl IntoResponse {
     match QuotaReadModel::get_quota(state.runtime.store.as_ref(), &TenantId::new(tenant_id)).await {
@@ -436,7 +604,7 @@ pub(crate) async fn get_tenant_quota_handler(
 
 pub(crate) async fn set_tenant_quota_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<SetTenantQuotaRequest>,
 ) -> impl IntoResponse {
@@ -458,6 +626,11 @@ pub(crate) async fn set_tenant_quota_handler(
 
 pub(crate) async fn get_retention_policy_handler(
     State(state): State<Arc<AppState>>,
+    // RFC 026 PR-A7b: retention policy (data lifetime / purge
+    // windows) is admin-sensitive. Gate strictly on
+    // `TenantAdminGuard` — god-token or tenant-admin role on THIS
+    // tenant only.
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
 ) -> impl IntoResponse {
     match RetentionPolicyReadModel::get_by_tenant(
@@ -479,7 +652,7 @@ pub(crate) async fn get_retention_policy_handler(
 
 pub(crate) async fn set_retention_policy_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<SetRetentionPolicyRequest>,
 ) -> impl IntoResponse {
@@ -501,7 +674,7 @@ pub(crate) async fn set_retention_policy_handler(
 
 pub(crate) async fn apply_retention_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
 ) -> impl IntoResponse {
     match state
@@ -522,7 +695,13 @@ pub(crate) async fn list_audit_log_handler(
     tenant_scope: TenantScope,
     Query(query): Query<AuditLogQuery>,
 ) -> impl IntoResponse {
-    let limit = query.limit.unwrap_or(50);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_AUDIT_LIMIT)
+        .clamp(1, MAX_AUDIT_LIMIT);
+    // Fetch one extra so we can accurately report `has_more` without needing
+    // a separate count query.
+    let fetch_limit = limit.saturating_add(1);
     // Admin users see all audit entries (scan all known tenants).
     // Non-admin users only see their own tenant's entries.
     if tenant_scope.is_admin {
@@ -537,7 +716,8 @@ pub(crate) async fn list_audit_log_handler(
                 state.runtime.store.as_ref(),
                 &tenant.tenant_id,
                 query.since_ms,
-                limit,
+                query.before_ms,
+                fetch_limit,
             )
             .await
             {
@@ -545,10 +725,10 @@ pub(crate) async fn list_audit_log_handler(
                 Err(err) => return runtime_error_response(err.into()),
             }
         }
-        // Sort by occurred_at_ms descending (most recent first) and cap at limit.
+        // Sort by occurred_at_ms descending (most recent first).
         all_items.sort_by_key(|r| std::cmp::Reverse(r.occurred_at_ms));
+        let has_more = all_items.len() > limit;
         all_items.truncate(limit);
-        let has_more = all_items.len() >= limit;
         (
             StatusCode::OK,
             Json(ListResponse {
@@ -562,18 +742,16 @@ pub(crate) async fn list_audit_log_handler(
             state.runtime.store.as_ref(),
             tenant_scope.tenant_id(),
             query.since_ms,
-            limit,
+            query.before_ms,
+            fetch_limit,
         )
         .await
         {
-            Ok(items) => (
-                StatusCode::OK,
-                Json(ListResponse {
-                    has_more: items.len() >= limit,
-                    items,
-                }),
-            )
-                .into_response(),
+            Ok(mut items) => {
+                let has_more = items.len() > limit;
+                items.truncate(limit);
+                (StatusCode::OK, Json(ListResponse { has_more, items })).into_response()
+            }
             Err(err) => runtime_error_response(err.into()),
         }
     }
@@ -583,7 +761,15 @@ pub(crate) async fn list_audit_log_for_resource_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
     Path((resource_type, resource_id)): Path<(String, String)>,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination. `list_by_resource` does not push
+    // limit/offset into the store today (the backing data is naturally
+    // bounded per resource-id — audit entries per run are single-digit
+    // on average, three-digit for pathological flows). Apply the page
+    // in-memory after the tenant filter, and compute `has_more` against
+    // the filtered total so callers see honest flags even when the
+    // page ends exactly at the list tail.
     match AuditLogReadModel::list_by_resource(
         state.runtime.store.as_ref(),
         &resource_type,
@@ -596,14 +782,12 @@ pub(crate) async fn list_audit_log_for_resource_handler(
                 .into_iter()
                 .filter(|entry| entry.tenant_id == *tenant_scope.tenant_id())
                 .collect();
-            (
-                StatusCode::OK,
-                Json(ListResponse {
-                    has_more: false,
-                    items: filtered,
-                }),
-            )
-                .into_response()
+            let total = filtered.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<AuditLogEntry> = filtered.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { has_more, items })).into_response()
         }
         Err(err) => runtime_error_response(err.into()),
     }
@@ -619,7 +803,7 @@ pub(crate) async fn list_request_logs_handler(
     Query(q): Query<RequestLogsQuery>,
 ) -> impl IntoResponse {
     // T6a-H3: request logs span every tenant — admin-only.
-    let limit = q.limit.min(500);
+    let limit = q.limit.clamp(1, MAX_REQUEST_LOGS_LIMIT);
     let level_filter: Vec<&'static str> = q
         .level
         .as_deref()
@@ -634,28 +818,39 @@ pub(crate) async fn list_request_logs_handler(
                 .collect()
         })
         .unwrap_or_default();
+    // UI sends millis since epoch; buffer stores nanos.
+    let since_ns = q.since_ms.map(|ms| ms.saturating_mul(1_000_000));
 
-    let entries: Vec<RequestLogEntry> = match state.request_log.read() {
-        Ok(log) => log
-            .tail(limit, &level_filter)
-            .into_iter()
-            .cloned()
-            .collect(),
-        Err(poisoned) => poisoned
-            .into_inner()
-            .tail(limit, &level_filter)
-            .into_iter()
-            .cloned()
-            .collect(),
+    let (entries, buffered): (Vec<RequestLogEntry>, usize) = match state.request_log.read() {
+        Ok(log) => (
+            log.tail(limit, &level_filter, since_ns)
+                .into_iter()
+                .cloned()
+                .collect(),
+            log.len(),
+        ),
+        Err(poisoned) => {
+            let log = poisoned.into_inner();
+            (
+                log.tail(limit, &level_filter, since_ns)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+                log.len(),
+            )
+        }
     };
 
-    let total = entries.len();
+    // `total` is the total number of entries currently held in the ring
+    // buffer (useful for the "Showing N of M buffered" footer). `limit`
+    // echoes the applied page size so clients can derive whether they
+    // hit the pagination ceiling (entries.len() == limit && limit < total).
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "entries": entries,
-            "total":   total,
             "limit":   limit,
+            "total":   buffered,
         })),
     )
 }
@@ -664,7 +859,7 @@ pub(crate) async fn list_request_logs_handler(
 
 pub(crate) async fn compact_event_log_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(id): Path<String>,
     Json(body): Json<CompactEventLogRequest>,
 ) -> impl IntoResponse {
@@ -678,21 +873,31 @@ pub(crate) async fn compact_event_log_handler(
 
 pub(crate) async fn create_snapshot_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(id): Path<String>,
 ) -> axum::response::Response {
     let tenant_id = TenantId::new(id);
     let snapshot = match state.runtime.store.create_snapshot(&tenant_id) {
         Ok(s) => s,
         Err(e) => {
-            return (
+            // Closes #418 + SEC-007: the snapshot backend surfaces raw
+            // driver strings (connection paths, SQL fragments, tenant
+            // row data in some arms). Log the full chain server-side
+            // and return a stable opaque message — operators correlate
+            // via `x-request-id`. The envelope is the canonical
+            // `AppApiError` shape so UI parsers keyed on `code`/
+            // `message` no longer see `undefined`.
+            tracing::error!(
+                tenant_id = %tenant_id.as_str(),
+                error = %e,
+                "snapshot_failed: create_snapshot backend error"
+            );
+            return AppApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "snapshot_failed",
-                    "message": e.to_string(),
-                })),
+                "snapshot_failed",
+                "failed to create tenant snapshot",
             )
-                .into_response();
+            .into_response();
         }
     };
     (
@@ -710,14 +915,27 @@ pub(crate) async fn create_snapshot_handler(
 
 pub(crate) async fn list_snapshots_handler(
     State(state): State<Arc<AppState>>,
+    // RFC 026 PR-A7b: snapshot catalogue exposes backup identifiers
+    // and timing — admin-sensitive. Gate strictly on
+    // `TenantAdminGuard`.
+    _role: TenantAdminGuard,
     Path(id): Path<String>,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     use cairn_store::projections::SnapshotReadModel;
     let tenant_id = TenantId::new(id);
     match SnapshotReadModel::list_by_tenant(state.runtime.store.as_ref(), &tenant_id).await {
         Ok(snapshots) => {
+            // #422: honest pagination. Snapshots per tenant are bounded
+            // (typically <30), but callers still get a truthful
+            // `has_more` so the UI "load more" control works.
+            let total = snapshots.len();
+            let offset = query.offset();
+            let limit = query.limit();
             let items: Vec<_> = snapshots
                 .iter()
+                .skip(offset)
+                .take(limit)
                 .map(|s| {
                     serde_json::json!({
                         "snapshot_id": s.snapshot_id,
@@ -728,14 +946,8 @@ pub(crate) async fn list_snapshots_handler(
                     })
                 })
                 .collect();
-            (
-                StatusCode::OK,
-                Json(ListResponse {
-                    items,
-                    has_more: false,
-                }),
-            )
-                .into_response()
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
         Err(err) => store_error_response(err),
     }
@@ -743,7 +955,7 @@ pub(crate) async fn list_snapshots_handler(
 
 pub(crate) async fn restore_from_snapshot_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     use cairn_store::projections::SnapshotReadModel;
@@ -786,7 +998,7 @@ pub(crate) async fn restore_from_snapshot_handler(
 )]
 pub(crate) async fn create_workspace_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateWorkspaceRequest>,
 ) -> impl IntoResponse {
@@ -805,25 +1017,86 @@ pub(crate) async fn create_workspace_handler(
     }
 }
 
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct ListWorkspacesQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    /// When true, soft-deleted (archived) workspaces are included in the
+    /// response. Defaults to false so operator lists show only active
+    /// workspaces.
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+impl ListWorkspacesQuery {
+    pub fn limit(&self) -> usize {
+        self.limit.unwrap_or(100)
+    }
+    pub fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
+}
+
 pub(crate) async fn list_workspaces_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(tenant_id): Path<String>,
-    Query(query): Query<PaginationQuery>,
+    Query(query): Query<ListWorkspacesQuery>,
+) -> impl IntoResponse {
+    // RFC 026 PR-A7b: workspace navigation is not admin-sensitive —
+    // any operator on the tenant needs to see their workspaces to
+    // use the UI. Admin bypass keeps cross-tenant visibility;
+    // foreign-tenant operator gets an empty-equivalent 404 (rather
+    // than an enumeration oracle).
+    let target = TenantId::new(tenant_id);
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "tenant not found")
+            .into_response();
+    }
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
+    match state
+        .runtime
+        .workspaces
+        .list_by_tenant(&target, limit + 1, query.offset(), query.include_archived)
+        .await
+    {
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
+        Err(err) => runtime_error_response(err),
+    }
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/admin/tenants/{tenant_id}/workspaces/{workspace_id}",
+    tag = "admin",
+    params(
+        ("tenant_id" = String, Path, description = "Tenant identifier"),
+        ("workspace_id" = String, Path, description = "Workspace identifier")
+    ),
+    responses(
+        (status = 204, description = "Workspace archived"),
+        (status = 401, description = "Unauthorized", body = ApiError),
+        (status = 404, description = "Workspace not found for tenant", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError)
+    )
+)]
+pub(crate) async fn delete_workspace_handler(
+    State(state): State<Arc<AppState>>,
+    _role: TenantAdminGuard,
+    Path((tenant_id, workspace_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
     match state
         .runtime
         .workspaces
-        .list_by_tenant(&TenantId::new(tenant_id), query.limit(), query.offset())
+        .archive(&TenantId::new(tenant_id), &WorkspaceId::new(workspace_id))
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => runtime_error_response(err),
     }
 }
@@ -876,6 +1149,7 @@ pub(crate) async fn create_project_handler(
 
 pub(crate) async fn list_projects_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(workspace_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
@@ -888,26 +1162,35 @@ pub(crate) async fn list_projects_handler(
         }
         Err(err) => return runtime_error_response(err),
     };
+    // #734: tenant-scope check mirrors `list_workspaces_handler`.
+    // A non-admin operator may only enumerate projects in a
+    // workspace belonging to their own tenant — without this guard,
+    // any authenticated caller could enumerate every project in
+    // every workspace via a 1-step traversal of the workspace id
+    // space.
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &workspace.tenant_id {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "workspace not found")
+            .into_response();
+    }
 
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .projects
         .list_by_workspace(
             &workspace.tenant_id,
             &workspace.workspace_id,
-            query.limit(),
+            limit + 1,
             query.offset(),
         )
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -938,35 +1221,55 @@ pub(crate) async fn add_workspace_member_handler(
 
 pub(crate) async fn list_workspace_members_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(workspace_id): Path<String>,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
     let workspace_key = match workspace_key_for_id(&state, &WorkspaceId::new(workspace_id)).await {
         Ok(workspace_key) => workspace_key,
         Err(err) => return runtime_error_response(err),
     };
+    // #734: tenant-scope check mirrors `list_workspaces_handler` —
+    // a non-admin operator may only enumerate the membership of a
+    // workspace belonging to their own tenant. Foreign-tenant
+    // operators get a 404 (rather than an enumeration oracle); admin
+    // tokens bypass for cross-tenant inspection.
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &workspace_key.tenant_id {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "workspace not found")
+            .into_response();
+    }
 
+    // #422: the service returns every member in one shot. Membership
+    // per workspace is bounded (typically <100), so pagination happens
+    // in-memory after the service call.
     match state
         .runtime
         .workspace_memberships
         .list_members(&workspace_key)
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
 
 pub(crate) async fn remove_workspace_member_handler(
     State(state): State<Arc<AppState>>,
+    _role: AdminRoleGuard,
     Path((workspace_id, member_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // #734: prior to this guard, any authenticated bearer token was
+    // sufficient to remove a member from any workspace. The
+    // `add_workspace_member_handler` and `create_workspace_share_handler`
+    // siblings already had `AdminRoleGuard`; the remove path was
+    // inconsistent and exploitable. Mirror the sibling guard.
     let workspace_key = match workspace_key_for_id(&state, &WorkspaceId::new(workspace_id)).await {
         Ok(workspace_key) => workspace_key,
         Err(err) => return runtime_error_response(err),
@@ -1013,27 +1316,52 @@ pub(crate) async fn create_workspace_share_handler(
 
 pub(crate) async fn list_workspace_shares_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(workspace_id): Path<String>,
     Query(query): Query<TenantScopedQuery>,
 ) -> impl IntoResponse {
     use cairn_runtime::ResourceSharingService;
+    // #734: prior to this guard, any authenticated bearer token
+    // could enumerate shares in any workspace by passing the
+    // workspace's tenant_id in the query. Two checks now apply:
+    //   1. The query-supplied tenant_id MUST match the caller's
+    //      auth-derived `TenantScope` (admin tokens bypass) —
+    //      otherwise an operator in tenant A could pass
+    //      `tenant_id=tenant_b` to list tenant_b's shares.
+    //   2. The workspace itself must belong to that same tenant —
+    //      `workspace_key_for_id` confirms the binding.
+    let target_tenant = TenantId::new(query.tenant_id.clone());
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target_tenant {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "workspace not found")
+            .into_response();
+    }
+    let workspace_key =
+        match workspace_key_for_id(&state, &WorkspaceId::new(workspace_id.clone())).await {
+            Ok(workspace_key) => workspace_key,
+            Err(err) => return runtime_error_response(err),
+        };
+    if workspace_key.tenant_id != target_tenant {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "workspace not found")
+            .into_response();
+    }
+
+    // #422: shares per workspace are bounded (admin-curated), but the
+    // service returns the full list. Apply limit/offset in-memory and
+    // compute `has_more` against the filtered total.
+    let offset = query.offset();
+    let limit = query.limit();
     match state
         .runtime
         .resource_sharing
-        .list_shares(
-            &TenantId::new(query.tenant_id),
-            &WorkspaceId::new(workspace_id),
-        )
+        .list_shares(&target_tenant, &WorkspaceId::new(workspace_id))
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1052,55 +1380,104 @@ pub(crate) async fn revoke_workspace_share_handler(
 
 // ── Credentials ──────────────────────────────────────────────────────────────
 
+/// Upper bound for `plaintext_value`. API keys/secrets across
+/// supported providers (OpenAI, Anthropic, Bedrock signed tokens,
+/// Vertex service accounts JSON) sit well under 4 KiB. A caller that
+/// submits more has almost certainly mis-pasted the value — reject
+/// early rather than encrypt a 4 KiB garbage string and burn storage.
+const MAX_PLAINTEXT_VALUE_LEN: usize = 4096;
+
 pub(crate) async fn store_credential_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<StoreCredentialRequest>,
 ) -> impl IntoResponse {
     if let Some(denied) = require_feature(&state.config, CREDENTIAL_MANAGEMENT) {
         return denied;
     }
+    // Closes #403: validation before any credential work. Empty
+    // provider_id / plaintext_value and oversized plaintext_value
+    // were previously 201-accepted, leading to a tenant accumulating
+    // unusable or suspicious credential rows.
+    if body.provider_id.trim().is_empty() {
+        return validation_error_response("provider_id must not be empty");
+    }
+    if body.plaintext_value.is_empty() {
+        return validation_error_response("plaintext_value must not be empty");
+    }
+    if body.plaintext_value.len() > MAX_PLAINTEXT_VALUE_LEN {
+        return validation_error_response(format!(
+            "plaintext_value exceeds {MAX_PLAINTEXT_VALUE_LEN} bytes (got {})",
+            body.plaintext_value.len()
+        ));
+    }
+    let tenant = TenantId::new(tenant_id);
+    let provider_id = body.provider_id.clone();
+    let key_id = body.key_id.clone();
+    // `into_plaintext_value` moves the secret out so it does NOT stay
+    // accessible on the `body` stack frame after this call. The service
+    // wraps it in `Zeroizing<String>` for the rest of its lifetime.
+    let plaintext_value = body.into_plaintext_value();
     match state
         .runtime
         .credentials
-        .store(
-            TenantId::new(tenant_id),
-            body.provider_id,
-            body.plaintext_value,
-            body.key_id,
-        )
+        .store(tenant.clone(), provider_id.clone(), plaintext_value, key_id)
         .await
     {
         Ok(record) => (StatusCode::CREATED, Json(credential_summary(record))).into_response(),
+        // Closes #217: duplicate `(tenant_id, provider_id)` is a
+        // typed conflict from the credential service. Re-shape the
+        // generic `Conflict` 409 into the `credential_exists` code so
+        // clients can dispatch on it without string-sniffing the
+        // message.
+        Err(cairn_runtime::RuntimeError::Conflict {
+            entity: "credential",
+            ..
+        }) => AppApiError::new(
+            StatusCode::CONFLICT,
+            "credential_exists",
+            format!(
+                "credential for provider '{provider_id}' already exists for tenant '{}'",
+                tenant.as_str()
+            ),
+        )
+        .into_response(),
         Err(err) => runtime_error_response(err),
     }
 }
 
 pub(crate) async fn list_credentials_handler(
     State(state): State<Arc<AppState>>,
+    tenant_scope: TenantScope,
     Path(tenant_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // Closes #447: enforce the same tenant/admin scoping that every other
+    // tenant-scoped list endpoint uses. A non-admin caller asking for a
+    // tenant that is not their own gets a 404 so the endpoint does not
+    // leak tenant-id existence.
+    let target = TenantId::new(tenant_id);
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "credential not found")
+            .into_response();
+    }
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .credentials
-        .list(&TenantId::new(tenant_id), query.limit(), query.offset())
+        .list(&target, limit + 1, query.offset())
         .await
     {
-        Ok(items) => {
-            let items = items
+        Ok(records) => {
+            let has_more = records.len() > limit;
+            let items = records
                 .into_iter()
+                .take(limit)
                 .map(credential_summary)
                 .collect::<Vec<_>>();
-            (
-                StatusCode::OK,
-                Json(ListResponse {
-                    items,
-                    has_more: false,
-                }),
-            )
-                .into_response()
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
         }
         Err(err) => runtime_error_response(err),
     }
@@ -1108,9 +1485,35 @@ pub(crate) async fn list_credentials_handler(
 
 pub(crate) async fn revoke_credential_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
+    tenant_scope: TenantScope,
     Path((tenant_id, id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // Closes #494: align with the canonical tenant-check shape used by
+    // `list_credentials_handler`, `get_session_handler`, `delete_session_admin_handler`,
+    // etc. Two layers, both return 404 (NEVER 403) to avoid the
+    // id-enumeration oracle documented on PR #337 / PR #537:
+    //
+    //   1. Path-tenant vs caller-tenant — a caller that crafted a URL
+    //      for a foreign tenant gets 404 unless `scope.is_admin` (which
+    //      is true only for the admin service account / System
+    //      principal; see `is_admin_principal`). Workspace-admin-role
+    //      operators PASS `AdminRoleGuard` but do NOT set
+    //      `tenant_scope.is_admin`, so they remain tenant-scoped here —
+    //      they can revoke only within their own tenant. Only the
+    //      admin service account can cross tenants.
+    //   2. Record-tenant vs path-tenant — the record's own tenant_id
+    //      must match the `:tenant_id` path segment. Protects against
+    //      typos in admin tooling and keeps the URL contract honest.
+    //
+    // Non-admin operators without workspace-admin role are rejected
+    // earlier by `AdminRoleGuard` with 403 (role-level refusal).
+    let target = TenantId::new(tenant_id);
+    if !tenant_scope.is_admin && tenant_scope.tenant_id() != &target {
+        return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "credential not found")
+            .into_response();
+    }
+
     let credential_id = CredentialId::new(id);
     let existing = match state.runtime.credentials.get(&credential_id).await {
         Ok(Some(record)) => record,
@@ -1121,7 +1524,7 @@ pub(crate) async fn revoke_credential_handler(
         Err(err) => return runtime_error_response(err),
     };
 
-    if existing.tenant_id != TenantId::new(tenant_id) {
+    if existing.tenant_id != target {
         return AppApiError::new(StatusCode::NOT_FOUND, "not_found", "credential not found")
             .into_response();
     }
@@ -1134,7 +1537,7 @@ pub(crate) async fn revoke_credential_handler(
 
 pub(crate) async fn rotate_credential_key_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<RotateCredentialKeyRequest>,
 ) -> impl IntoResponse {
@@ -1153,7 +1556,7 @@ pub(crate) async fn rotate_credential_key_handler(
 
 pub(crate) async fn create_operator_profile_handler(
     State(state): State<Arc<AppState>>,
-    _role: AdminRoleGuard,
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Json(body): Json<CreateOperatorProfileRequest>,
 ) -> impl IntoResponse {
@@ -1175,23 +1578,292 @@ pub(crate) async fn create_operator_profile_handler(
 
 pub(crate) async fn list_operator_profiles_handler(
     State(state): State<Arc<AppState>>,
+    // Closes #404 negative-path: the /v1/admin/* prefix signals
+    // admin-only. Operator profiles are roster-sensitive (operator
+    // ids, display names, permissions) — non-admins, including
+    // same-tenant operators, must not list. RFC-026 flip: still
+    // admin-only, but a tenant-admin on THIS tenant now clears the
+    // guard (god-token no longer required to list their own roster).
+    _role: TenantAdminGuard,
     Path(tenant_id): Path<String>,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .operator_profiles
-        .list(&TenantId::new(tenant_id), query.limit(), query.offset())
+        .list(&TenantId::new(tenant_id), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
+        Err(err) => runtime_error_response(err),
+    }
+}
+
+/// `PATCH /v1/admin/tenants/:tenant_id/operator-profiles/:id` —
+/// edit an operator profile's display_name, email, or role. RFC 026
+/// PR-A2.
+///
+/// PATCH semantics (same shape as `PatchTenantRequest`): each field
+/// is optional; `None` preserves the stored value. An all-`None` body
+/// returns 422 `empty_patch`. 404 when the operator id has no row.
+/// The route is tenant-scoped so `TenantAdminGuard` authorizes on
+/// `:tenant_id` without having to look up the operator's tenant first
+/// — matches the existing `/operator-profiles` create/list routes.
+///
+/// Note: `role` here is the `WorkspaceRole` carried on the operator's
+/// profile record (the *default* role when they join a new workspace).
+/// The tenant-scope `TenantRole` lives in a separate grant table and
+/// is edited via `/v1/admin/operators/:id/tenant-roles/:tenant`
+/// (PR-A0).
+#[derive(Clone, Debug, serde::Deserialize, ToSchema)]
+pub(crate) struct PatchOperatorProfileRequest {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    #[schema(value_type = String)]
+    pub role: Option<WorkspaceRole>,
+}
+
+/// Minimal email validator shared by admin PATCH paths. Rejects
+/// blank strings and anything missing the `<local>@<domain>` split.
+/// Matches the handler's original create-time validation surface so
+/// PATCH doesn't introduce a softer contract.
+fn validate_admin_email(email: &str) -> Result<(), String> {
+    let trimmed = email.trim();
+    if trimmed.is_empty() {
+        return Err("email must not be empty".to_owned());
+    }
+    let (local, domain) = trimmed
+        .split_once('@')
+        .ok_or_else(|| "email must be of the form <local>@<domain>".to_owned())?;
+    if local.is_empty() || domain.is_empty() || !domain.contains('.') {
+        return Err("email must be of the form <local>@<domain>".to_owned());
+    }
+    Ok(())
+}
+
+pub(crate) async fn patch_operator_profile_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path((tenant_id, operator_id)): Path<(String, String)>,
+    body: Result<Json<PatchOperatorProfileRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(err) => return json_rejection_response(err),
+    };
+    // Validate email up-front so typos round-trip as a 422 rather than
+    // landing in the event log.
+    if let Some(email) = body.email.as_deref() {
+        if let Err(msg) = validate_admin_email(email) {
+            return validation_error_response(msg);
+        }
+    }
+    // Resolve the operator first so we can enforce cross-tenant
+    // isolation: a tenant-admin on `T` must not edit an operator that
+    // belongs to `T'`. `TenantAdminGuard` already proves the caller
+    // has Admin on `:tenant_id`; we just need the operator's tenant
+    // to match.
+    let tenant_id = TenantId::new(tenant_id);
+    let operator_id = OperatorId::new(operator_id);
+
+    match state.runtime.operator_profiles.get(&operator_id).await {
+        Ok(Some(existing)) if existing.tenant_id != tenant_id => {
+            return AppApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "operator profile not found for this tenant",
+            )
+            .into_response();
+        }
+        Ok(None) => {
+            return AppApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "operator profile not found",
+            )
+            .into_response();
+        }
+        Ok(Some(_)) => {}
+        Err(err) => return runtime_error_response(err),
+    }
+
+    let updated_by = audit_actor_id(&principal);
+    let patch = cairn_runtime::OperatorProfilePatch {
+        display_name: body.display_name,
+        email: body.email,
+        role: body.role,
+    };
+
+    match state
+        .runtime
+        .operator_profiles
+        .patch_profile(&operator_id, patch)
+        .await
+    {
+        Ok(profile) => match state
+            .runtime
+            .audits
+            .record(
+                profile.tenant_id.clone(),
+                updated_by,
+                "update_operator_profile".to_owned(),
+                "operator_profile".to_owned(),
+                profile.operator_id.to_string(),
+                AuditOutcome::Success,
+                serde_json::json!({
+                    "display_name": profile.display_name,
+                    "email": profile.email,
+                    "role": profile.role,
+                }),
+            )
+            .await
+        {
+            Ok(_) => (StatusCode::OK, Json(profile)).into_response(),
+            Err(err) => runtime_error_response(err),
+        },
+        Err(err) => runtime_error_response(err),
+    }
+}
+
+// ── Tenant-admin role grants (RFC 026 PR-A0) ────────────────────────────────
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub(crate) struct PromoteTenantRoleRequest {
+    /// Role to grant on the target tenant. Snake-case on the wire:
+    /// `"admin"`, `"member"`, or `"read_only"`.
+    pub role: TenantRole,
+}
+
+/// `POST /v1/admin/operators/:id/tenant-roles/:tenant/promote` — grant
+/// `role` on `tenant` to operator `:id`.
+///
+/// Guard: `TenantAdminGuard` — accepts the deployment admin service
+/// account (`CAIRN_ADMIN_TOKEN`) for bootstrapping AND tenant-admins on
+/// the target tenant (so one admin can delegate). `granted_by` on the
+/// emitted event is the authenticated principal id so the audit trail
+/// records who authorized the grant.
+pub(crate) async fn promote_tenant_role_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path((operator_id, tenant_id)): Path<(String, String)>,
+    Json(body): Json<PromoteTenantRoleRequest>,
+) -> impl IntoResponse {
+    let granted_by = audit_actor_id(&principal);
+    match state
+        .runtime
+        .tenant_roles
+        .grant(
+            TenantId::new(tenant_id),
+            OperatorId::new(operator_id),
+            body.role,
+            granted_by,
         )
-            .into_response(),
+        .await
+    {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Err(err) => runtime_error_response(err),
+    }
+}
+
+/// `GET /v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles`
+/// — list every tenant-role grant currently held (or revoked) by an
+/// operator.
+///
+/// Guard: `TenantAdminGuard` — tenant-scoped under `:tenant_id` so the
+/// caller must hold `TenantRole::Admin` on that tenant (or god-token).
+/// We intentionally return the operator's grants across *all* tenants,
+/// not just the URL tenant, so the OperatorsPage can surface the full
+/// grant set per-row without a second round-trip. Cross-tenant
+/// isolation is preserved at revoke-time (each revoke requires admin
+/// on the target tenant), so surfacing a read-only view on this path
+/// does not enable escalation.
+///
+/// The handler also enforces the same cross-tenant 404 policy as
+/// `patch_operator_profile_handler`: the URL's `:tenant_id` must be
+/// the operator's home tenant or the response is 404 — a tenant-admin
+/// on T cannot enumerate operators belonging to T'.
+pub(crate) async fn list_operator_tenant_roles_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Path((tenant_id, operator_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let tenant_id = TenantId::new(tenant_id);
+    let operator_id = OperatorId::new(operator_id);
+
+    // Cross-tenant isolation: the operator's home tenant must match the
+    // URL tenant. Both the "doesn't exist" and "exists in another tenant"
+    // branches return the SAME 404 body — differing messages would leak
+    // existence across tenants (SEC-007). Returns 404 (not 403) so the
+    // tenant boundary itself isn't probed.
+    match state.runtime.operator_profiles.get(&operator_id).await {
+        Ok(Some(existing)) if existing.tenant_id == tenant_id => {}
+        Ok(_) => {
+            return AppApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "operator profile not found",
+            )
+            .into_response();
+        }
+        Err(err) => return runtime_error_response(err),
+    }
+
+    match state
+        .runtime
+        .tenant_roles
+        .list_by_operator(&operator_id)
+        .await
+    {
+        Ok(items) => {
+            let has_more = false;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
+        Err(err) => runtime_error_response(err),
+    }
+}
+
+/// `DELETE /v1/admin/operators/:id/tenant-roles/:tenant` — revoke the
+/// active `(tenant, operator)` role.
+///
+/// Soft delete: the projection row is retained with `revoked_at_ms` +
+/// `revoked_by` set so the audit trail survives. Returns 404 when the
+/// pair has no row at all (distinct from "was revoked before" — the
+/// service returns `Some(revoked_row)` for that case).
+pub(crate) async fn revoke_tenant_role_handler(
+    State(state): State<Arc<AppState>>,
+    _guard: TenantAdminGuard,
+    Extension(principal): Extension<AuthPrincipal>,
+    Path((operator_id, tenant_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let revoked_by = audit_actor_id(&principal);
+    match state
+        .runtime
+        .tenant_roles
+        .revoke(
+            TenantId::new(tenant_id),
+            OperatorId::new(operator_id),
+            revoked_by,
+        )
+        .await
+    {
+        Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(None) => AppApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "tenant role grant not found",
+        )
+        .into_response(),
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1204,6 +1876,19 @@ pub(crate) async fn set_operator_notifications_handler(
     Path(operator_id): Path<String>,
     Json(body): Json<SetNotificationPreferencesRequest>,
 ) -> impl IntoResponse {
+    // Validate channel targets up front so typos (`not-a-url`) round-trip as
+    // an actionable 422, not a latent delivery failure (#235). The dispatcher
+    // layer would otherwise happily persist the preference and silently drop
+    // every future delivery attempt.
+    //
+    // #451 / #452: the policy now also governs SSRF — webhooks must not be
+    // allowed to target IMDS, RFC 1918, or loopback unless the operator
+    // explicitly opts in via `CAIRN_ALLOW_INTERNAL_WEBHOOKS=1` (or Local
+    // mode).
+    let policy = WebhookValidationPolicy::from_config(&state.config);
+    if let Err(msg) = validate_channels(&body.channels, policy).await {
+        return validation_error_response(msg);
+    }
     let tenant_id = TenantId::new(body.tenant_id.as_deref().unwrap_or(DEFAULT_TENANT_ID));
     match state
         .runtime
@@ -1248,21 +1933,25 @@ pub(crate) async fn get_operator_notifications_handler(
 pub(crate) async fn list_failed_notifications_handler(
     State(state): State<Arc<AppState>>,
     tenant_scope: TenantScope,
+    Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: service returns every failed record for the tenant. Apply
+    // limit/offset in-memory; this list is naturally small (most
+    // tenants have 0-10 failed notifications at a time).
     match state
         .runtime
         .notifications
         .list_failed(tenant_scope.tenant_id())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(all) => {
+            let total = all.len();
+            let offset = query.offset();
+            let limit = query.limit();
+            let items: Vec<_> = all.into_iter().skip(offset).take(limit).collect();
+            let has_more = offset.saturating_add(items.len()) < total;
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -1333,23 +2022,45 @@ pub(crate) async fn delete_model_handler(
 
 /// `POST /v1/admin/models/import-litellm` — Import models from LiteLLM JSON body.
 ///
-/// Returns 400 if the body is not valid JSON (a HashMap of model objects).
+/// Error contract:
+/// - Extractor-level JSON failures return the extractor's native 4xx
+///   status (e.g. 400 for syntactically invalid JSON, 415 for a missing
+///   / invalid `Content-Type` header) with `{code:"validation_error"}`.
+///   Routed through the shared `json_rejection_response` helper so the
+///   response shape matches the rest of the admin surface.
+/// - 400 (with `{code:"invalid_json"}`) when the payload is syntactically
+///   valid JSON but not a top-level object.
+/// - 413 Payload Too Large (with `{code:"payload_too_large"}`) when the
+///   body exceeds the per-route 1,000,000-byte cap. Same
+///   `json_rejection_response` path — `BytesRejection::LengthLimitError`'s
+///   native status is `PAYLOAD_TOO_LARGE`.
+///
+/// #493: the route layers a `DefaultBodyLimit::max(1_000_000)` (1 MB
+/// decimal, ≈ 0.95 MiB) overriding the global 10 MB default. LiteLLM's
+/// real catalog is O(100 KB); anything near the cap is attacker-crafted.
+/// The handler parses the body exactly once via `Json<serde_json::Value>`
+/// and passes the inner
+/// `Map<String, Value>` straight to `import_litellm_map` — no re-parse
+/// and no `HashMap` intermediate.
 pub(crate) async fn import_litellm_handler(
     State(state): State<Arc<AppState>>,
     _role: AdminRoleGuard,
-    body: String,
+    body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> impl IntoResponse {
-    // Pre-validate: body must parse as a JSON object (HashMap).
-    if serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&body).is_err()
-    {
+    let Json(value) = match body {
+        Ok(v) => v,
+        Err(rej) => return json_rejection_response(rej),
+    };
+    // The LiteLLM format is a top-level JSON object keyed by model id.
+    let serde_json::Value::Object(obj) = value else {
         return AppApiError::new(
             StatusCode::BAD_REQUEST,
             "invalid_json",
             "request body is not valid LiteLLM JSON (expected a JSON object)",
         )
         .into_response();
-    }
-    let count = state.model_registry.import_litellm(&body);
+    };
+    let count = state.model_registry.import_litellm_map(&obj);
     (
         StatusCode::OK,
         Json(serde_json::json!({ "imported": count })),
@@ -1452,13 +2163,23 @@ pub(crate) async fn rotate_waitpoint_hmac_handler(
         .rotate_waitpoint_hmac(&body.new_kid, &body.new_secret_hex, grace_ms)
         .await;
 
+    // SEC-007 defense-in-depth (Gemini review on PR #540): the fabric
+    // `RotationFailure::detail` contract today is an opaque
+    // classification hint (`"lua_rejected"`, `"transport_error"`,
+    // `"unparseable_envelope"`) and `RotationFailure::code` is a typed
+    // FF sentinel. But if the engine-level implementation later drifts
+    // and stuffs a raw driver string into `detail`, that would leak
+    // through this handler. Allowlist `detail` values to the known
+    // classifiers here so the HTTP body cannot surface anything
+    // unexpected even if the engine regresses. Raw failure strings
+    // are already logged at `debug` level in the engine.
     let failed: Vec<RotateWaitpointHmacFailure> = outcome
         .failed
         .iter()
         .map(|f| RotateWaitpointHmacFailure {
             partition_index: f.partition_index,
             code: f.code.clone(),
-            detail: f.detail.clone(),
+            detail: sanitize_rotation_detail(&f.detail),
         })
         .collect();
 
@@ -1469,32 +2190,41 @@ pub(crate) async fn rotate_waitpoint_hmac_handler(
         new_kid: outcome.new_kid.clone(),
     };
 
+    // Closes #418: canonical envelope (`status_code`, `code`,
+    // `message`, `request_id`) on both failure paths. The per-
+    // partition breakdown (rotated/noop/failed counts + per-failure
+    // codes) lives under `details` so operators keep the diagnostic
+    // richness without the envelope drifting from the shape every SDK
+    // parser keys on.
+    //
     // All partitions failed with the same Lua-level input-validation
     // code → 400. This is the "operator typo" path (empty kid, bad
     // hex, etc.) and the rotation never did anything useful anywhere.
     if outcome.rotated == 0 && outcome.noop == 0 {
+        // Fallback to an empty object (not `null`) when serialization
+        // fails — keeps the OpenAPI contract clean for clients that
+        // treat `details: null` ambiguously. Serialization of a
+        // `RotateWaitpointHmacResponse` cannot actually fail given
+        // the derived `Serialize` impl, but the fallback is cheap
+        // defence against future refactors.
+        let details = serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(code) = unanimous_input_error_code(&outcome.failed) {
-            return (
+            return api_error_with_details(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "rotation rejected by every partition",
-                    "code": code,
-                    "outcome": resp,
-                })),
-            )
-                .into_response();
+                code,
+                "rotation rejected by every partition",
+                details,
+            );
         }
         // Every partition failed but not with a unanimous input code →
         // transport or mixed failure. 500 so the operator sees this
         // as a service fault rather than a validation issue.
-        return (
+        return api_error_with_details(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "rotation failed on every partition",
-                "outcome": resp,
-            })),
-        )
-            .into_response();
+            "rotation_failed",
+            "rotation failed on every partition",
+            details,
+        );
     }
 
     // Any success (rotated or noop) → 200 with the full outcome
@@ -1503,6 +2233,31 @@ pub(crate) async fn rotate_waitpoint_hmac_handler(
     // operators retry with the same (new_kid, new_secret_hex) to
     // converge.
     (StatusCode::OK, Json(resp)).into_response()
+}
+
+/// SEC-007 defense-in-depth: map a fabric `RotationFailure::detail`
+/// string to the allowlisted classification sentinel the HTTP body
+/// may carry. Unknown values collapse to `"unspecified"` so any
+/// future engine regression that stuffs a raw driver string into
+/// `detail` cannot leak through the response body.
+///
+/// The allowlist mirrors the `ROTATION_DETAIL_*` constants the
+/// `valkey_control_plane_impl` engine emits today. Any new classifier
+/// added upstream must be added here explicitly — a deliberate
+/// breakage surface so review catches the envelope-drift.
+fn sanitize_rotation_detail(raw: &str) -> String {
+    const ALLOWED: &[&str] = &["lua_rejected", "transport_error", "unparseable_envelope"];
+    if ALLOWED.contains(&raw) {
+        raw.to_owned()
+    } else {
+        // Log the drift so operators see the upstream contract has
+        // changed; return a safe sentinel to the caller.
+        tracing::warn!(
+            raw_detail = %raw,
+            "unexpected rotation failure detail — falling back to `unspecified` for SEC-007"
+        );
+        "unspecified".to_owned()
+    }
 }
 
 /// If every partition failed with the same FF input-validation code,
@@ -1527,5 +2282,75 @@ fn unanimous_input_error_code(
         Some(first.to_owned())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sanitize_rotation_detail, StoreCredentialRequest};
+
+    /// SEC-007 defense-in-depth (Gemini review on PR #540):
+    /// `sanitize_rotation_detail` must pass through only the allowlist
+    /// of classification sentinels and collapse anything else to the
+    /// opaque `unspecified` sentinel — including what would be a raw
+    /// driver string if the upstream engine ever regressed.
+    #[test]
+    fn rotation_detail_sanitizer_passes_known_classifiers_and_redacts_unknown() {
+        // Known allowlist — must pass through verbatim.
+        for ok in ["lua_rejected", "transport_error", "unparseable_envelope"] {
+            assert_eq!(
+                sanitize_rotation_detail(ok),
+                ok,
+                "allowlisted classifier must pass through: {ok}"
+            );
+        }
+
+        // Simulated engine-regression values — must collapse to
+        // `unspecified` so the caller's body never surfaces raw driver
+        // content.
+        for leaky in [
+            "connection refused: host=internal-db.prod.example.com port=5432",
+            "NOSCRIPT No matching script. SHA1=abcdef...",
+            "FCALL args=['cairn.lease_fence=0xDEADBEEF']",
+            "", // empty detail still collapses — contract says allowlist-only.
+            "timeout waiting for cluster-reply from cairn-valkey-prod:7001",
+        ] {
+            assert_eq!(
+                sanitize_rotation_detail(leaky),
+                "unspecified",
+                "non-allowlist input must collapse to `unspecified`: {leaky}"
+            );
+        }
+    }
+
+    /// Closes #492: `{body:?}` must not leak the plaintext. The handler
+    /// does not print the body today, but `StoreCredentialRequest` is
+    /// derived-Clone and public within the crate, so any future
+    /// `tracing::debug!("body = {body:?}")` MUST redact. This pins the
+    /// Debug shape so the invariant can't silently regress.
+    #[test]
+    fn store_credential_request_debug_redacts_plaintext() {
+        let body = StoreCredentialRequest {
+            provider_id: "openai".to_owned(),
+            plaintext_value: "sk-SHOULD-BE-REDACTED-9f8e7d".to_owned(),
+            key_id: Some("primary".to_owned()),
+        };
+        let formatted = format!("{body:?}");
+        assert!(
+            !formatted.contains("sk-SHOULD-BE-REDACTED"),
+            "Debug leaked plaintext: {formatted}"
+        );
+        assert!(
+            formatted.contains("[redacted]"),
+            "Debug must mark plaintext_value as [redacted]; got: {formatted}"
+        );
+        assert!(
+            formatted.contains("openai"),
+            "non-secret fields should still be visible: {formatted}"
+        );
+        assert!(
+            formatted.contains("primary"),
+            "key_id should still be visible: {formatted}"
+        );
     }
 }

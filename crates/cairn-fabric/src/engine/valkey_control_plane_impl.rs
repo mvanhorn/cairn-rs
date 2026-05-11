@@ -4,7 +4,7 @@
 //! `FabricBudgetService`, `FabricQuotaService`, and
 //! `FabricRotationService`. Those services now delegate to this impl
 //! through the [`ControlPlaneBackend`] trait; the FF imports
-//! (`ff_core::keys`, `ff_core::partition`, `ff_core::contracts`) live
+//! (`flowfabric::core::keys`, `flowfabric::core::partition`, `flowfabric::core::contracts`) live
 //! here only.
 //!
 //! When FF 0.3 ships `describe_*` + control-plane primitives upstream
@@ -15,20 +15,16 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use ff_core::contracts::ReportUsageResult;
-use ff_core::keys::{
-    budget_policies_index, budget_resets_key, quota_policies_index, usage_dedup_key,
-    BudgetKeyContext, ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys, QuotaKeyContext,
+use flowfabric::core::contracts::ReportUsageResult;
+use flowfabric::core::keys::{
+    budget_policies_index, budget_resets_key, quota_policies_index, BudgetKeyContext,
+    ExecKeyContext, FlowIndexKeys, FlowKeyContext, IndexKeys, QuotaKeyContext,
 };
-use ff_core::partition::{
+use flowfabric::core::partition::{
     budget_partition, execution_partition, flow_partition, quota_partition, Partition,
     PartitionFamily,
 };
-use ff_core::types::{
-    AttemptId, AttemptIndex, BudgetId, ExecutionId, LeaseId, QuotaPolicyId, SignalId, SuspensionId,
-    TimestampMs, WaitpointId,
-};
-use ff_sdk::task::parse_report_usage_result;
+use flowfabric::core::types::{BudgetId, ExecutionId, QuotaPolicyId, TimestampMs};
 
 use crate::error::FabricError;
 use crate::fcall;
@@ -42,9 +38,11 @@ use super::control_plane_types::{
     AddExecutionToFlowInput, ApplyDependencyToChildInput, BudgetSpendOutcome, BudgetStatusSnapshot,
     CancelFlowInput, CancelRunInput, ClaimGrantOutcome, CompleteRunInput, CreateFlowInput,
     CreateRunExecutionInput, DeliverApprovalSignalInput, EligibilityResult, ExecutionCreated,
-    FailExecutionOutcome, FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput, QuotaAdmission,
-    RenewLeaseInput, ResumeRunInput, RotationFailure, RotationOutcome, StageDependencyEdgeInput,
-    StageDependencyOutcome, SubmitTaskInput, SuspendRunInput,
+    FailExecutionOutcome, FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput,
+    IssueReclaimGrantInput, IssueReclaimGrantOutcome, QuotaAdmission, ReclaimExecutionInput,
+    ReclaimExecutionOutcome, ReclaimGrantHandle, ReclaimedHandle, RenewLeaseInput, ResumeRunInput,
+    RotationFailure, RotationOutcome, StageDependencyEdgeInput, StageDependencyOutcome,
+    SubmitTaskInput,
 };
 use super::valkey_impl::ValkeyEngine;
 
@@ -101,12 +99,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             hard_limits,
             soft_limits,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_BUDGET, &key_refs, &argv_refs)
+            .fcall(fcall::names::FF_CREATE_BUDGET, &keys, &argv)
             .await?;
         check_fcall_success(&raw, fcall::names::FF_CREATE_BUDGET)?;
 
@@ -125,54 +121,65 @@ impl ControlPlaneBackend for ValkeyEngine {
                 reason: "record_spend: at least one dimension_delta is required".to_owned(),
             });
         }
-        let _ = execution_id; // part of the idempotency_key caller-side; kept for
-                              // future backends that want to log per-execution.
 
-        let partition = budget_partition(budget_id, &self.runtime().partition_config);
-        let ctx = BudgetKeyContext::new(&partition, budget_id);
-        let now = TimestampMs::now();
-
-        // Prefix with the budget's `{b:N}` hash tag so FF's SET lands
-        // on the same slot as the budget itself.
-        let dedup_key = usage_dedup_key(ctx.hash_tag(), idempotency_key);
-
-        let (keys, argv) =
-            fcall::budget::build_report_usage(&ctx, dimension_deltas, now, &dedup_key);
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-
-        let raw: ferriskey::Value = self
+        // Route through FF 0.13's typed `EngineBackend::record_spend`
+        // (cairn #454 Phase 3a, `ff-core-0.13.0/src/engine_backend.rs:1714`).
+        // The backend owns partition/key derivation, dedup-slot keying,
+        // and per-execution attribution — cairn supplies the typed
+        // args and branches on the same `ReportUsageResult` variants.
+        //
+        // Copilot #599 review: `BTreeMap::collect()` silently
+        // last-writer-wins on duplicate keys; the old FCALL ARGV path
+        // passed duplicates through as-is (which FF's Lua summed). Reject
+        // them explicitly here so spend attribution never depends on
+        // iteration order. Callers building the slice can dedup upstream
+        // if they want additive semantics.
+        let mut deltas: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        for (dim, delta) in dimension_deltas {
+            if deltas.insert((*dim).to_owned(), *delta).is_some() {
+                return Err(FabricError::Validation {
+                    reason: format!(
+                        "record_spend: duplicate dimension `{dim}` in dimension_deltas — \
+                         caller must dedup upstream (additive semantics not implied)"
+                    ),
+                });
+            }
+        }
+        let args = flowfabric::core::contracts::RecordSpendArgs::new(
+            budget_id.clone(),
+            execution_id.clone(),
+            deltas,
+            idempotency_key,
+        );
+        let outcome = self
             .runtime()
-            .fcall(
-                fcall::names::FF_REPORT_USAGE_AND_CHECK,
-                &key_refs,
-                &argv_refs,
-            )
-            .await?;
-
-        let ff_outcome: ReportUsageResult =
-            parse_report_usage_result(&raw).map_err(|e| FabricError::Internal(e.to_string()))?;
-        Ok(map_report_usage_result(ff_outcome))
+            .backend()
+            .record_spend(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+        Ok(map_report_usage_result(outcome))
     }
 
-    async fn release_budget(&self, budget_id: &BudgetId) -> Result<(), FabricError> {
-        let partition = budget_partition(budget_id, &self.runtime().partition_config);
-        let ctx = BudgetKeyContext::new(&partition, budget_id);
-        let resets_zset = budget_resets_key(&partition.hash_tag());
-        let now = TimestampMs::now();
-
-        let keys: Vec<String> = vec![ctx.definition(), ctx.usage(), resets_zset];
-        let argv: Vec<String> = vec![budget_id.to_string(), now.to_string()];
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-
-        let raw: ferriskey::Value = self
-            .runtime()
-            .fcall(fcall::names::FF_RESET_BUDGET, &key_refs, &argv_refs)
-            .await?;
-        check_fcall_success(&raw, fcall::names::FF_RESET_BUDGET)?;
-
+    async fn release_budget(
+        &self,
+        budget_id: &BudgetId,
+        execution_id: &ExecutionId,
+    ) -> Result<(), FabricError> {
+        // Route through FF 0.13's typed
+        // `EngineBackend::release_budget(ReleaseBudgetArgs)` method
+        // (cairn #454 Phase 3b, `ff-core-0.13.0/src/engine_backend.rs:1732`).
+        // Per-execution attribution release — reverses this
+        // execution's contribution on the aggregate usage counter
+        // without touching other executions' attribution.
+        let args = flowfabric::core::contracts::ReleaseBudgetArgs::new(
+            budget_id.clone(),
+            execution_id.clone(),
+        );
+        self.runtime()
+            .backend()
+            .release_budget(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
         Ok(())
     }
 
@@ -285,12 +292,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             now,
             dimension,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_QUOTA_POLICY, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CREATE_QUOTA_POLICY, &keys, &args)
             .await?;
         check_fcall_success(&raw, fcall::names::FF_CREATE_QUOTA_POLICY)?;
 
@@ -333,16 +338,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             concurrency_cap,
             dimension,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_CHECK_ADMISSION_AND_RECORD,
-                &key_refs,
-                &arg_refs,
-            )
+            .fcall(fcall::names::FF_CHECK_ADMISSION_AND_RECORD, &keys, &args)
             .await?;
 
         parse_admission_result(&raw)
@@ -373,16 +372,10 @@ impl ControlPlaneBackend for ValkeyEngine {
                 new_secret_hex,
                 grace_ms,
             );
-            let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
             match self
                 .runtime()
-                .fcall(
-                    fcall::names::FF_ROTATE_WAITPOINT_HMAC_SECRET,
-                    &key_refs,
-                    &arg_refs,
-                )
+                .fcall(fcall::names::FF_ROTATE_WAITPOINT_HMAC_SECRET, &keys, &args)
                 .await
             {
                 Ok(raw) => {
@@ -478,12 +471,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &tags_json,
             partition.index,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CREATE_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_create_execution: {e}")))?;
 
@@ -517,13 +508,12 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.lease.lease_id,
             &input.lease.lease_epoch,
             &input.lease.attempt_id,
+            &input.lease.source,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_COMPLETE_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_COMPLETE_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_complete_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_COMPLETE_EXECUTION)?;
@@ -565,13 +555,12 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.reason,
             &input.category,
             &retry_policy_json,
+            &input.lease.source,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_FAIL_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_FAIL_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_fail_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_FAIL_EXECUTION)?;
@@ -601,57 +590,20 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.lease.lease_id,
             &input.lease.lease_epoch,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CANCEL_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CANCEL_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_cancel_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_CANCEL_EXECUTION)?;
         Ok(())
     }
 
-    async fn suspend_run_execution(&self, input: SuspendRunInput) -> Result<(), FabricError> {
-        let partition = execution_partition(&input.execution_id, &self.runtime().partition_config);
-        let ctx = ExecKeyContext::new(&partition, &input.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        let suspension_id = SuspensionId::new();
-        let waitpoint_id = WaitpointId::new();
-        let waitpoint_key = format!("wpk:{waitpoint_id}");
-
-        let (keys, args) = fcall::suspension::build_suspend_execution(
-            &ctx,
-            &idx,
-            input.lease.attempt_index,
-            &input.lease.worker_instance_id,
-            &input.lease.lane_id,
-            &waitpoint_id,
-            &input.execution_id,
-            &input.lease.attempt_id,
-            &input.lease.lease_id,
-            &input.lease.lease_epoch,
-            &suspension_id,
-            &waitpoint_key,
-            &input.reason_code,
-            &input.timeout_at,
-            &input.resume_condition_json,
-            &input.resume_policy_json,
-            &input.timeout_behavior,
-        );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: ferriskey::Value = self
-            .runtime()
-            .fcall(fcall::names::FF_SUSPEND_EXECUTION, &key_refs, &arg_refs)
-            .await
-            .map_err(|e| FabricError::Internal(format!("ff_suspend_execution: {e}")))?;
-        check_fcall_success(&raw, fcall::names::FF_SUSPEND_EXECUTION)?;
-        Ok(())
-    }
+    // `suspend_run_execution` retired in CG-c (FF#322). Service-layer
+    // suspend calls now route through
+    // `crate::suspension::suspend_by_triple` → `EngineBackend::suspend_by_triple`
+    // directly; no Lua-ARGV glue remains on cairn's side.
 
     async fn resume_run_execution(&self, input: ResumeRunInput) -> Result<(), FabricError> {
         let partition = execution_partition(&input.execution_id, &self.runtime().partition_config);
@@ -669,12 +621,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.resume_source,
             "0",
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_RESUME_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_RESUME_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_resume_execution: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_RESUME_EXECUTION)?;
@@ -685,57 +635,28 @@ impl ControlPlaneBackend for ValkeyEngine {
         &self,
         input: DeliverApprovalSignalInput,
     ) -> Result<(), FabricError> {
-        let partition = execution_partition(&input.execution_id, &self.runtime().partition_config);
-        let ctx = ExecKeyContext::new(&partition, &input.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        let signal_id = SignalId::new();
-        let now = TimestampMs::now();
-
-        let idem_str = input.idempotency_suffix.clone();
-        let idem_key = ctx.signal_dedup(&input.waitpoint_id, &idem_str);
-
-        // HMAC waitpoint token — FF owns it, cairn never caches. Missing
-        // token surfaces as `Validation` up the stack.
-        let waitpoint_token = crate::signal_bridge::read_waitpoint_token(
-            &self.runtime().client,
-            &ctx,
-            &input.waitpoint_id,
-        )
-        .await?;
-
-        let signal_maxlen = input.maxlen.to_string();
-        let max_signals = input.max_signals_per_execution.to_string();
-
-        let (keys, args) = fcall::suspension::build_deliver_signal(
-            &ctx,
-            &idx,
-            &input.lane_id,
-            &signal_id,
-            &input.waitpoint_id,
-            idem_key,
-            &input.execution_id,
+        // Route through FF 0.13's typed
+        // `EngineBackend::deliver_approval_signal(DeliverApprovalSignalArgs)`
+        // method (`ff-core-0.13.0/src/engine_backend.rs:1754`). The backend
+        // reads the HMAC waitpoint token from `ff_waitpoint_pending`
+        // server-side, HMAC-verifies, and dispatches — cairn never
+        // handles the token bytes. This drops the pre-call HGET on
+        // `signal_bridge::read_waitpoint_token` the old path required.
+        let args = flowfabric::core::contracts::DeliverApprovalSignalArgs::new(
+            input.execution_id,
+            input.lane_id,
+            input.waitpoint_id,
             input.signal_name,
-            "approval".to_owned(),
-            crate::constants::SOURCE_TYPE_APPROVAL_OPERATOR.to_owned(),
-            crate::constants::SOURCE_IDENTITY.to_owned(),
-            String::new(),
-            idem_str,
-            now,
+            input.idempotency_suffix,
             input.signal_dedup_ttl_ms,
-            &signal_maxlen,
-            &max_signals,
-            waitpoint_token.as_str(),
+            Some(input.maxlen),
+            Some(input.max_signals_per_execution),
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: ferriskey::Value = self
-            .runtime()
-            .fcall(fcall::names::FF_DELIVER_SIGNAL, &key_refs, &arg_refs)
+        self.runtime()
+            .backend()
+            .deliver_approval_signal(args)
             .await
-            .map_err(|e| FabricError::Internal(format!("ff_deliver_signal: {e}")))?;
-        check_fcall_success(&raw, fcall::names::FF_DELIVER_SIGNAL)?;
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
         Ok(())
     }
 
@@ -754,12 +675,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.namespace,
             now,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_FLOW, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CREATE_FLOW, &keys, &args)
             .await?;
         check_fcall_success(&raw, fcall::names::FF_CREATE_FLOW)?;
         Ok(())
@@ -777,12 +696,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.cancel_mode,
             now,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CANCEL_FLOW, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CANCEL_FLOW, &keys, &args)
             .await?;
 
         // `flow_already_terminal` is acceptable — the flow may already
@@ -813,126 +730,32 @@ impl ControlPlaneBackend for ValkeyEngine {
         &self,
         input: IssueGrantAndClaimInput,
     ) -> Result<ClaimGrantOutcome, FabricError> {
-        let partition = execution_partition(&input.execution_id, &self.runtime().partition_config);
-        let ctx = ExecKeyContext::new(&partition, &input.execution_id);
-        let idx = IndexKeys::new(&partition);
-
-        // ── Step 1: issue claim grant ─────────────────────────────────────
-        let grant_ttl = self.runtime().config.grant_ttl_ms;
-        let grant_keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.claim_grant(),
-            idx.lane_eligible(&input.lane_id),
-        ];
-        let grant_args: Vec<String> = vec![
-            input.execution_id.to_string(),
-            self.runtime().config.worker_id.to_string(),
-            self.runtime().config.worker_instance_id.to_string(),
-            input.lane_id.to_string(),
-            String::new(),
-            grant_ttl.to_string(),
-            String::new(),
-            String::new(),
-        ];
-        let grant_key_refs: Vec<&str> = grant_keys.iter().map(|s| s.as_str()).collect();
-        let grant_arg_refs: Vec<&str> = grant_args.iter().map(|s| s.as_str()).collect();
-
-        let raw_grant: ferriskey::Value = self
+        // Route through FF 0.13's typed
+        // `EngineBackend::issue_grant_and_claim(IssueGrantAndClaimArgs)`
+        // method (`ff-core-0.13.0/src/engine_backend.rs:1775`, cairn #454 Q4).
+        // Backend-atomic composition of `issue_claim_grant` +
+        // `claim_execution`: fuses the pair so a `claim_execution`
+        // failure after a successful `issue_claim_grant` cannot leak
+        // the grant (what the old caller-chained path risked). The
+        // backend also transparently dispatches into
+        // `claim_resumed_execution` when the target execution is in
+        // `attempt_interrupted` — we don't need a cairn-side
+        // `USE_CLAIM_RESUMED_EXECUTION` sentinel check anymore.
+        let args = flowfabric::core::contracts::IssueGrantAndClaimArgs::new(
+            input.execution_id,
+            input.lane_id,
+            input.lease_duration_ms,
+        );
+        let outcome = self
             .runtime()
-            .fcall(
-                fcall::names::FF_ISSUE_CLAIM_GRANT,
-                &grant_key_refs,
-                &grant_arg_refs,
-            )
+            .backend()
+            .issue_grant_and_claim(args)
             .await
-            .map_err(|e| FabricError::Internal(format!("ff_issue_claim_grant: {e}")))?;
-        check_fcall_success(&raw_grant, fcall::names::FF_ISSUE_CLAIM_GRANT)?;
-
-        // ── Step 2: claim execution ───────────────────────────────────────
-        let total_str: Option<String> = self
-            .runtime()
-            .client
-            .hget(&ctx.core(), "total_attempt_count")
-            .await
-            .unwrap_or(None);
-        let next_idx = total_str
-            .as_deref()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        let att_idx = AttemptIndex::new(next_idx);
-
-        let lease_id = LeaseId::new();
-        let attempt_id = AttemptId::new();
-        let renew_before_ms = input.lease_duration_ms / 3;
-
-        let claim_keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.claim_grant(),
-            idx.lane_eligible(&input.lane_id),
-            idx.lease_expiry(),
-            idx.worker_leases(&self.runtime().config.worker_instance_id),
-            ctx.attempt_hash(att_idx),
-            ctx.attempt_usage(att_idx),
-            ctx.attempt_policy(att_idx),
-            ctx.attempts(),
-            ctx.lease_current(),
-            ctx.lease_history(),
-            idx.lane_active(&input.lane_id),
-            idx.attempt_timeout(),
-            idx.execution_deadline(),
-        ];
-        let claim_args: Vec<String> = vec![
-            input.execution_id.to_string(),
-            self.runtime().config.worker_id.to_string(),
-            self.runtime().config.worker_instance_id.to_string(),
-            input.lane_id.to_string(),
-            String::new(),
-            lease_id.to_string(),
-            input.lease_duration_ms.to_string(),
-            renew_before_ms.to_string(),
-            attempt_id.to_string(),
-            "{}".to_owned(),
-            String::new(),
-            String::new(),
-        ];
-        let claim_key_refs: Vec<&str> = claim_keys.iter().map(|s| s.as_str()).collect();
-        let claim_arg_refs: Vec<&str> = claim_args.iter().map(|s| s.as_str()).collect();
-
-        let raw_claim: ferriskey::Value = self
-            .runtime()
-            .fcall(
-                fcall::names::FF_CLAIM_EXECUTION,
-                &claim_key_refs,
-                &claim_arg_refs,
-            )
-            .await
-            .map_err(|e| FabricError::Internal(format!("ff_claim_execution: {e}")))?;
-
-        // Dispatch: if FF returns `use_claim_resumed_execution` the
-        // execution is in `attempt_interrupted` (resumed from suspension)
-        // and must go through `ff_claim_resumed_execution` — which
-        // resumes the SAME attempt instead of allocating a new one. The
-        // grant is still live: FF's dispatch guard runs BEFORE grant
-        // consumption, so we do NOT re-issue it.
-        if fcall_error_code(&raw_claim).as_deref() == Some(USE_CLAIM_RESUMED_EXECUTION) {
-            return self
-                .claim_resumed_execution(
-                    &ctx,
-                    &idx,
-                    &input.execution_id,
-                    &input.lane_id,
-                    input.lease_duration_ms,
-                )
-                .await;
-        }
-
-        check_fcall_success(&raw_claim, fcall::names::FF_CLAIM_EXECUTION)?;
-        let lease_epoch = parse_claim_lease_epoch(&raw_claim)?;
-
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
         Ok(ClaimGrantOutcome {
-            lease_id,
-            lease_epoch,
-            attempt_index: att_idx,
+            lease_id: outcome.lease_id,
+            lease_epoch: outcome.lease_epoch,
+            attempt_index: outcome.attempt_index,
         })
     }
 
@@ -978,12 +801,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &tags_json,
             partition.index,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_CREATE_EXECUTION, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_CREATE_EXECUTION, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_create_execution: {e}")))?;
 
@@ -1019,15 +840,9 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.namespace,
             now,
         );
-        let create_key_refs: Vec<&str> = create_keys.iter().map(|s| s.as_str()).collect();
-        let create_arg_refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
         let create_raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_CREATE_FLOW,
-                &create_key_refs,
-                &create_arg_refs,
-            )
+            .fcall(fcall::names::FF_CREATE_FLOW, &create_keys, &create_args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_create_flow: {e}")))?;
         check_fcall_success(&create_raw, fcall::names::FF_CREATE_FLOW)?;
@@ -1042,12 +857,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.execution_id,
             now_ms,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_ADD_EXECUTION_TO_FLOW, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_ADD_EXECUTION_TO_FLOW, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_add_execution_to_flow: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_ADD_EXECUTION_TO_FLOW)?;
@@ -1073,12 +886,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             input.expected_graph_revision,
             now_ms,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_STAGE_DEPENDENCY_EDGE, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_STAGE_DEPENDENCY_EDGE, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_stage_dependency_edge: {e}")))?;
 
@@ -1133,16 +944,10 @@ impl ControlPlaneBackend for ValkeyEngine {
             &input.data_passing_ref,
             now_ms,
         );
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_APPLY_DEPENDENCY_TO_CHILD,
-                &key_refs,
-                &arg_refs,
-            )
+            .fcall(fcall::names::FF_APPLY_DEPENDENCY_TO_CHILD, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_apply_dependency_to_child: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_APPLY_DEPENDENCY_TO_CHILD)?;
@@ -1157,16 +962,10 @@ impl ControlPlaneBackend for ValkeyEngine {
         let ctx = ExecKeyContext::new(&partition, execution_id);
 
         let (keys, args) = fcall::flow_edges::build_evaluate_flow_eligibility(&ctx);
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(
-                fcall::names::FF_EVALUATE_FLOW_ELIGIBILITY,
-                &key_refs,
-                &arg_refs,
-            )
+            .fcall(fcall::names::FF_EVALUATE_FLOW_ELIGIBILITY, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_evaluate_flow_eligibility: {e}")))?;
 
@@ -1208,120 +1007,186 @@ impl ControlPlaneBackend for ValkeyEngine {
             crate::constants::DEFAULT_LEASE_HISTORY_GRACE_MS.to_owned(),
         ];
 
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
         let raw: ferriskey::Value = self
             .runtime()
-            .fcall(fcall::names::FF_RENEW_LEASE, &key_refs, &arg_refs)
+            .fcall(fcall::names::FF_RENEW_LEASE, &keys, &args)
             .await
             .map_err(|e| FabricError::Internal(format!("ff_renew_lease: {e}")))?;
         check_fcall_success(&raw, fcall::names::FF_RENEW_LEASE)?;
         Ok(())
     }
-}
 
-// ── Claim-resumed (Phase D PR 2a) ───────────────────────────────────────
+    // ── #710: FF 0.15 reclaim-grant path ─────────────────────────────────
+    //
+    // RFC-024 §3.2 — admit `lease_expired_reclaimable` / `lease_revoked`
+    // executions into a fresh attempt. Replaces the unrecoverable
+    // `execution_not_eligible` wall the pre-FF-0.15 path hit when the
+    // F62/F64 terminal-write recovery loop fired.
+    //
+    // The bodies forward to `EngineBackend::issue_reclaim_grant` /
+    // `reclaim_execution` (real Valkey FCALLs in ff-backend-valkey 0.15)
+    // and translate ff-core's typed args ↔ outcomes ↔ cairn's mirrors.
+    // Worker identity comes from the caller (cairn's recovery loop in
+    // PR-5 supplies the `cairn-control-plane` synthetic worker per
+    // RFC-024 §4.4 control-plane carve-out) — this layer is identity-
+    // agnostic so future direct-worker callers can use the same path.
 
-/// FF's typed dispatch error: the execution's `attempt_state` is
-/// `attempt_interrupted` (resume-from-suspension claim), so the caller
-/// must use `ff_claim_resumed_execution`. See `lua/execution.lua`.
-const USE_CLAIM_RESUMED_EXECUTION: &str = "use_claim_resumed_execution";
-
-impl ValkeyEngine {
-    async fn claim_resumed_execution(
+    async fn issue_reclaim_grant(
         &self,
-        ctx: &ExecKeyContext,
-        idx: &IndexKeys,
-        eid: &ExecutionId,
-        lane_id: &ff_core::types::LaneId,
-        lease_duration_ms: u64,
-    ) -> Result<ClaimGrantOutcome, FabricError> {
-        // FF requires the existing attempt_hash as KEYS[6]; re-read the
-        // attempt index from exec_core so the key points at the live
-        // attempt.
-        let att_idx_str: Option<String> = self
-            .runtime()
-            .client
-            .hget(&ctx.core(), "current_attempt_index")
-            .await
-            .unwrap_or(None);
-        let att_idx = AttemptIndex::new(
-            att_idx_str
-                .as_deref()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(0),
+        input: IssueReclaimGrantInput,
+    ) -> Result<IssueReclaimGrantOutcome, FabricError> {
+        // FF's `IssueReclaimGrantArgs::new` takes ten params — populate
+        // every one rather than relying on `Default` (the struct is
+        // `#[non_exhaustive]` and has no Default). cairn never sets
+        // route_snapshot_json or admission_summary on the recovery
+        // path; worker_capabilities stays empty (FF's Lua reads
+        // ARGV[9]'s CSV — empty CSV means "no capability gating").
+        //
+        // `input` is consumed by-value, so move its owned fields
+        // directly into the FF args constructor — cloning would
+        // allocate fresh `String` / `Option<String>` / id wrappers
+        // for each call on a hot path the recovery loop will hit
+        // repeatedly.
+        let args = flowfabric::core::contracts::IssueReclaimGrantArgs::new(
+            input.execution_id,
+            input.worker_id,
+            input.worker_instance_id,
+            input.lane_id,
+            input.capability_hash,
+            input.grant_ttl_ms,
+            None,                              // route_snapshot_json
+            None,                              // admission_summary
+            std::collections::BTreeSet::new(), // worker_capabilities
+            flowfabric::core::types::TimestampMs::now(),
         );
 
-        let lease_id = LeaseId::new();
-
-        let keys: Vec<String> = vec![
-            ctx.core(),
-            ctx.claim_grant(),
-            idx.lane_eligible(lane_id),
-            idx.lease_expiry(),
-            idx.worker_leases(&self.runtime().config.worker_instance_id),
-            ctx.attempt_hash(att_idx),
-            ctx.lease_current(),
-            ctx.lease_history(),
-            idx.lane_active(lane_id),
-            idx.attempt_timeout(),
-            idx.execution_deadline(),
-        ];
-        let args: Vec<String> = vec![
-            eid.to_string(),
-            self.runtime().config.worker_id.to_string(),
-            self.runtime().config.worker_instance_id.to_string(),
-            lane_id.to_string(),
-            String::new(),
-            lease_id.to_string(),
-            lease_duration_ms.to_string(),
-            String::new(),
-        ];
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-        let raw: ferriskey::Value = self
+        let outcome = self
             .runtime()
-            .fcall(
-                fcall::names::FF_CLAIM_RESUMED_EXECUTION,
-                &key_refs,
-                &arg_refs,
-            )
+            .backend()
+            .issue_reclaim_grant(args)
             .await
-            .map_err(|e| FabricError::Internal(format!("ff_claim_resumed_execution: {e}")))?;
-        check_fcall_success(&raw, fcall::names::FF_CLAIM_RESUMED_EXECUTION)?;
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
 
-        let lease_epoch = parse_claim_lease_epoch(&raw)?;
-        Ok(ClaimGrantOutcome {
-            lease_id,
-            lease_epoch,
-            attempt_index: att_idx,
-        })
-    }
-}
-
-/// Parse the `lease_epoch` slot of `ff_claim_execution`'s reply:
-/// `{1, "OK", <lease_id>, <lease_epoch>}`. Previously lived inside
-/// `services::claim_common`; lifted here with the rest of the claim
-/// machinery.
-fn parse_claim_lease_epoch(
-    raw: &ferriskey::Value,
-) -> Result<ff_core::types::LeaseEpoch, FabricError> {
-    if let ferriskey::Value::Array(arr) = raw {
-        if let Some(Ok(ferriskey::Value::BulkString(b))) = arr.get(3) {
-            if let Ok(n) = String::from_utf8_lossy(b).parse::<u64>() {
-                return Ok(ff_core::types::LeaseEpoch::new(n));
+        match outcome {
+            flowfabric::core::contracts::IssueReclaimGrantOutcome::Granted(grant) => {
+                Ok(IssueReclaimGrantOutcome::Granted(ReclaimGrantHandle {
+                    inner: grant,
+                }))
             }
-        }
-        if let Some(Ok(ferriskey::Value::Int(n))) = arr.get(3) {
-            return Ok(ff_core::types::LeaseEpoch::new(*n as u64));
+            flowfabric::core::contracts::IssueReclaimGrantOutcome::NotReclaimable {
+                detail,
+                ..
+            } => Ok(IssueReclaimGrantOutcome::NotReclaimable { detail }),
+            flowfabric::core::contracts::IssueReclaimGrantOutcome::ReclaimCapExceeded {
+                reclaim_count,
+                ..
+            } => Ok(IssueReclaimGrantOutcome::ReclaimCapExceeded { reclaim_count }),
+            // FF's enum is `#[non_exhaustive]`; surface any future
+            // variant we don't know how to interpret as a typed
+            // FabricError rather than silently coercing it to
+            // `NotReclaimable`. The recovery loop must NOT advance
+            // past an unknown outcome.
+            other => Err(FabricError::Internal(format!(
+                "ff_issue_reclaim_grant returned unknown variant: {other:?}"
+            ))),
         }
     }
-    Err(FabricError::Internal(
-        "ff_claim_execution: missing lease_epoch in response".to_owned(),
-    ))
+
+    async fn reclaim_execution(
+        &self,
+        input: ReclaimExecutionInput,
+    ) -> Result<ReclaimExecutionOutcome, FabricError> {
+        // Cross-validate the supplied grant against the input's
+        // `execution_id` before invoking FF. The FF Valkey backend
+        // locates the grant via the partition-derived
+        // `claim_grant_id` key (see `ff-backend-valkey-0.15.0`
+        // `reclaim_execution_impl` — KEYS[2] = `ctx.claim_grant()`,
+        // derived from `args.execution_id`), so a caller mismatching
+        // the grant's exec_id with the execution_id arg would still
+        // hit the right grant key but logically be reclaiming a
+        // *different* execution than the one the grant was issued
+        // for. Compile-time the type-system already forces callers
+        // to obtain a `ReclaimGrantHandle` (its `inner` is
+        // `pub(crate)` — only the backend impl can construct one),
+        // but cross-checking the `execution_id` field defends
+        // against a caller threading a stale handle from a previous
+        // run. Cheap and turns the otherwise-passive grant
+        // parameter into a load-bearing safety check.
+        if input.grant.inner.execution_id != input.execution_id {
+            return Err(FabricError::Validation {
+                reason: format!(
+                    "reclaim_execution: grant.execution_id ({}) does not match input.execution_id ({})",
+                    input.grant.inner.execution_id, input.execution_id,
+                ),
+            });
+        }
+
+        // `input` is consumed by-value; move its fields into the
+        // FF args. Same rationale as `issue_reclaim_grant`.
+        let args = flowfabric::core::contracts::ReclaimExecutionArgs::new(
+            input.execution_id,
+            input.worker_id,
+            input.worker_instance_id,
+            input.lane_id,
+            input.capability_hash,
+            input.lease_id,
+            input.lease_ttl_ms,
+            input.attempt_id,
+            input.attempt_policy_json,
+            input.max_reclaim_count,
+            input.old_worker_instance_id,
+            input.current_attempt_index,
+        );
+
+        let outcome = self
+            .runtime()
+            .backend()
+            .reclaim_execution(args)
+            .await
+            .map_err(|e| FabricError::Engine(Box::new(e)))?;
+
+        match outcome {
+            flowfabric::core::contracts::ReclaimExecutionOutcome::Claimed(handle) => {
+                Ok(ReclaimExecutionOutcome::Claimed(ReclaimedHandle {
+                    inner: handle,
+                }))
+            }
+            flowfabric::core::contracts::ReclaimExecutionOutcome::NotReclaimable {
+                detail, ..
+            } => Ok(ReclaimExecutionOutcome::NotReclaimable { detail }),
+            flowfabric::core::contracts::ReclaimExecutionOutcome::ReclaimCapExceeded {
+                reclaim_count,
+                ..
+            } => Ok(ReclaimExecutionOutcome::ReclaimCapExceeded { reclaim_count }),
+            flowfabric::core::contracts::ReclaimExecutionOutcome::GrantNotFound { .. } => {
+                Ok(ReclaimExecutionOutcome::GrantNotFound)
+            }
+            // Same rationale as `issue_reclaim_grant`: surface unknown
+            // future FF variants as an error rather than silently
+            // coercing.
+            other => Err(FabricError::Internal(format!(
+                "ff_reclaim_execution returned unknown variant: {other:?}"
+            ))),
+        }
+    }
 }
+
+// ── Claim-resumed (Phase D PR 2a → PR-C2 M6) ────────────────────────────
+//
+// The private `ValkeyEngine::claim_resumed_execution` helper (HGET
+// `current_attempt_index` + `FCALL FF_CLAIM_RESUMED_EXECUTION`) was
+// the cairn-side dispatch branch for `use_claim_resumed_execution`
+// replies from `ff_claim_execution`. PR-C2 M4 routed the outer
+// `issue_grant_and_claim` through FF 0.13's atomic trait method, which
+// internally composes `read_current_attempt_index` (trait) +
+// `claim_resumed_execution` (trait) when the target execution is in
+// `attempt_interrupted`. The private helper therefore became dead
+// code; deleting it removes the orphaned `HGET` + `FCALL` path and
+// the `parse_claim_lease_epoch` helper, plus the
+// `USE_CLAIM_RESUMED_EXECUTION` sentinel constant. See
+// `ff-core-0.13.0/src/engine_backend.rs:474` (read_current_attempt_index)
+// and `ff-core-0.13.0/src/engine_backend.rs:1043`
+// (claim_resumed_execution).
 
 // ── Helpers (free functions, kept file-local) ──────────────────────────
 
@@ -1347,6 +1212,11 @@ fn map_report_usage_result(r: ReportUsageResult) -> BudgetSpendOutcome {
             current_usage,
             hard_limit,
         },
+        // `ReportUsageResult` is `#[non_exhaustive]`. All known FF 0.9
+        // variants are handled above; a new variant added upstream
+        // (e.g. RFC-015 quota-scoped breach) should fail loud so cairn
+        // audits the mapping rather than silently dropping the result.
+        other => panic!("unhandled ReportUsageResult variant (post-FF-0.9 addition): {other:?}"),
     }
 }
 

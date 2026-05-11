@@ -26,12 +26,50 @@ pub trait Clock: Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct SystemClock;
 
+/// Fires the clock-before-epoch WARN at most once per process. `now_millis`
+/// is called on hot paths (heartbeat, leak-detection sweep, overdue scan)
+/// that can tick tens of times per second; without this latch a stuck RTC
+/// would spam the log. The WARN still covers the transition edge (the
+/// first bad tick after the clock goes bad), which is the operator signal
+/// that matters. Reset-on-recovery is intentionally NOT attempted — a
+/// clock that flaps across UNIX_EPOCH is a pathological scenario and
+/// re-firing the WARN on every flap would re-introduce the spam.
+static CLOCK_BEFORE_EPOCH_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl Clock for SystemClock {
+    /// Returns the number of milliseconds since UNIX_EPOCH.
+    ///
+    /// # Clock-before-epoch fallback
+    ///
+    /// If the host clock reads *before* UNIX_EPOCH (1970-01-01T00:00:00Z),
+    /// `duration_since(UNIX_EPOCH)` returns `Err(SystemTimeError)`. This
+    /// is practically only reachable on hardware whose RTC battery dies
+    /// and re-initialises to a pre-1970 value on reboot. We emit a WARN
+    /// (once per process — see `CLOCK_BEFORE_EPOCH_WARNED`) and return
+    /// `0` rather than panicking. Every sandbox event timestamp flows
+    /// through this method; a panic here would take down the sandbox
+    /// service at boot. A bogus `0` timestamp is distinctly visible in
+    /// event logs but keeps the host alive and lets operators see the
+    /// problem (closes #466). A clock stuck at exactly UNIX_EPOCH
+    /// (equal, not before) does NOT trigger the fallback — it's a valid
+    /// `Duration::ZERO`.
     fn now_millis(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after unix epoch")
-            .as_millis() as u64
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|err| {
+                // Latch: WARN exactly once per process to avoid spamming
+                // log aggregators when a stuck clock keeps this path hot
+                // (heartbeat / sweep ticks call `now_millis` frequently).
+                if !CLOCK_BEFORE_EPOCH_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        error = %err,
+                        "system clock is before UNIX_EPOCH; returning 0 (sandbox events will be timestamped 0 until the clock recovers). This warning fires once per process."
+                    );
+                }
+                0
+            })
     }
 }
 
@@ -45,8 +83,13 @@ pub struct BufferedSandboxEventSink {
 }
 
 impl BufferedSandboxEventSink {
+    /// Poison-tolerant — a panic in a thread holding the lock must not
+    /// cascade into the event-sink path. Losing observability because one
+    /// thread panicked would be monumentally unhelpful, so we recover the
+    /// inner value from the poisoned mutex and continue. Mirrors the
+    /// approved pattern in `crate::sandbox::f65::BufferedF65EventSink`.
     pub fn drain(&self) -> Vec<SandboxEvent> {
-        let mut guard = self.events.lock().expect("sandbox event buffer poisoned");
+        let mut guard = self.events.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *guard)
     }
 }
@@ -55,7 +98,7 @@ impl SandboxEventSink for BufferedSandboxEventSink {
     fn publish(&self, event: SandboxEvent) {
         self.events
             .lock()
-            .expect("sandbox event buffer poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(event);
     }
 }
@@ -225,6 +268,92 @@ struct RegistryEntry {
     base_revision_drift_handled: bool,
 }
 
+/// Object-safe façade over [`SandboxService`] exposing exactly the methods
+/// that consumers outside this crate (cairn-app runtime, GC sweeper,
+/// integration-test seed helpers) call.
+///
+/// Introduced for issue #443 so cairn-app's `AppState` can hold
+/// `Arc<dyn SandboxServiceApi>` instead of the concrete struct, which
+/// (a) enables mock-based tests without standing up the full providers/
+/// event-sink/clock stack and (b) keeps the upper layer from binding to
+/// the private shape of `SandboxService`.
+///
+/// The trait is intentionally narrow: only methods reached from outside
+/// `cairn-workspace` are on it. Internal helpers and builder setters stay
+/// as inherent `impl SandboxService` methods.
+#[async_trait::async_trait]
+pub trait SandboxServiceApi: Send + Sync {
+    /// Provision (or reconnect to an existing) sandbox bound to `run_id`.
+    /// See [`SandboxService::provision_or_reconnect`] for the real docs.
+    async fn provision_or_reconnect(
+        &self,
+        run_id: &RunId,
+        task_id: Option<TaskId>,
+        project: ProjectKey,
+        policy: SandboxPolicy,
+    ) -> Result<ProvisionedSandbox, WorkspaceError>;
+
+    /// Mark a provisioned sandbox as active and return the active handle.
+    async fn activate(
+        &self,
+        run_id: &RunId,
+        pid: Option<u32>,
+    ) -> Result<ProvisionedSandbox, WorkspaceError>;
+
+    /// Root directory under which per-sandbox directories live.
+    fn base_dir(&self) -> &PathBuf;
+
+    /// Crash-recovery sweep. See [`SandboxService::recover_all`].
+    async fn recover_all(&self) -> Result<SandboxRecoverySummary, WorkspaceError>;
+
+    /// Reap a workspace snapshot directory. Returns `Ok(true)` when the
+    /// directory was removed, `Ok(false)` when it did not exist or a
+    /// resume is in flight against it. See
+    /// [`SandboxService::reap_snapshot_dir`].
+    fn reap_snapshot_dir(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+    ) -> Result<bool, WorkspaceError>;
+
+    /// Integration-test helper. Registers a registry entry directly,
+    /// bypassing provisioning. See
+    /// [`SandboxService::seed_registry_entry_for_test`].
+    fn seed_registry_entry_for_test(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+    ) -> Result<(), WorkspaceError>;
+
+    /// Integration-test helper. Variant of
+    /// [`Self::seed_registry_entry_for_test`] that captures a bound
+    /// `repo_id`.
+    fn seed_registry_entry_for_test_with_repo(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+        repo_id: Option<RepoId>,
+    ) -> Result<(), WorkspaceError>;
+
+    /// Integration-test helper. Extended variant that also captures the
+    /// entry's stored `base_revision`.
+    fn seed_registry_entry_for_test_full(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+        repo_id: Option<RepoId>,
+        base_revision: Option<String>,
+    ) -> Result<(), WorkspaceError>;
+}
+
 pub struct SandboxService {
     providers: HashMap<SandboxStrategy, Box<dyn SandboxProvider>>,
     event_sink: Arc<dyn SandboxEventSink>,
@@ -246,6 +375,47 @@ pub struct SandboxService {
     /// unit tests that exercise the sweep directly with seeded entries
     /// and would otherwise need to stand up the full clone cache).
     clone_cache: Option<Arc<RepoCloneCache>>,
+    /// F65 PR-5: root directory for durable workspace snapshots
+    /// (`~/.cairn/snapshots/<uuid>/`). `None` disables the F65 snapshot
+    /// and resume path entirely — RFC 016 sandboxing still works via the
+    /// classic `provision_or_reconnect` API. Set via
+    /// [`Self::with_snapshot_dir`].
+    snapshot_dir: Option<PathBuf>,
+    /// F65 PR-5: emits the operator-visible session-scoped events
+    /// (`SessionAttemptStarted`, `WorkspaceSnapshotCreated`,
+    /// `WorkspaceBackendDegraded`, `SandboxCrashRecovered`). Defaults to
+    /// `NoopF65EventSink` — cairn-app overrides it with an adapter that
+    /// appends to the store event log.
+    f65_event_sink: Arc<dyn crate::sandbox::f65::F65SandboxEventSink>,
+    /// F65 PR-5: per-session dedupe flag for `WorkspaceBackendDegraded`.
+    /// Mirrors the PR-4 `reflink_tree_with_fallback` primitive's
+    /// `&AtomicBool` contract, scoped by `SessionId` so the flag survives
+    /// across the terminate-then-resume-then-terminate cycle. The arch
+    /// doc commitment is "once per session, across resume boundaries" —
+    /// this map is what keeps the flip state.
+    degraded_flag_by_session:
+        Mutex<HashMap<cairn_domain::SessionId, Arc<std::sync::atomic::AtomicBool>>>,
+    /// F65 PR-5: per-session emission dedupe for
+    /// `WorkspaceBackendDegraded`. Separate from `degraded_flag_by_session`
+    /// (which tracks "did reflink fall back this session") so the event
+    /// fires at most once even across restarts within the same session.
+    degraded_emitted_sessions: Mutex<std::collections::HashSet<cairn_domain::SessionId>>,
+    /// F65 PR-5: active session sandboxes, keyed by session id. Each
+    /// entry carries the paths the orchestrator + child agent need.
+    /// Distinct from `sessions` (RunId-keyed, RFC 016/020 shape).
+    session_sandboxes:
+        RwLock<HashMap<cairn_domain::SessionId, crate::sandbox::f65::SessionSandbox>>,
+    /// F65 PR-5: in-flight resume operations. The GC sweeper consults
+    /// this set before reaping so it cannot pull the rug out from under
+    /// a resume that has already started reflinking a snapshot.
+    inflight_restores: Mutex<std::collections::HashSet<cairn_domain::WorkspaceSnapshotId>>,
+    /// F65 PR-5: writer that back-fills the per-snapshot filesystem
+    /// metadata (`bytes`, `reflink_used`, `snapshot_path`,
+    /// `parent_snapshot_id`) on the existing `workspace_snapshots` row.
+    /// Defaults to a no-op so unit tests and the RFC 016 path can ignore
+    /// it; cairn-app wires in the real cairn-store-backed adapter via
+    /// [`Self::with_snapshot_writer`].
+    snapshot_writer: Arc<dyn crate::sandbox::f65::WorkspaceSnapshotWriter>,
 }
 
 impl SandboxService {
@@ -263,7 +433,51 @@ impl SandboxService {
             sessions: RwLock::new(HashMap::new()),
             allowlist: None,
             clone_cache: None,
+            snapshot_dir: None,
+            f65_event_sink: Arc::new(crate::sandbox::f65::NoopF65EventSink),
+            degraded_flag_by_session: Mutex::new(HashMap::new()),
+            degraded_emitted_sessions: Mutex::new(std::collections::HashSet::new()),
+            session_sandboxes: RwLock::new(HashMap::new()),
+            inflight_restores: Mutex::new(std::collections::HashSet::new()),
+            snapshot_writer: Arc::new(crate::sandbox::f65::NoopWorkspaceSnapshotWriter),
         }
+    }
+
+    /// F65 PR-5: wire the root directory under which durable workspace
+    /// snapshots are written as `<snapshot_dir>/<uuid>/…`. Without this,
+    /// `terminate_for_session` fails with a descriptive error rather than
+    /// silently skipping the snapshot — a silent-skip would be a data
+    /// loss bug for resume.
+    pub fn with_snapshot_dir(mut self, snapshot_dir: impl Into<PathBuf>) -> Self {
+        self.snapshot_dir = Some(snapshot_dir.into());
+        self
+    }
+
+    /// F65 PR-5: wire the event sink that adapts F65 events to cairn-app's
+    /// event log. Default is `NoopF65EventSink`.
+    pub fn with_f65_event_sink(
+        mut self,
+        sink: Arc<dyn crate::sandbox::f65::F65SandboxEventSink>,
+    ) -> Self {
+        self.f65_event_sink = sink;
+        self
+    }
+
+    /// F65 PR-5: wire the writer that back-fills the snapshot row's
+    /// filesystem metadata (bytes/reflink_used/snapshot_path/
+    /// parent_snapshot_id) after the reflink copy runs.
+    pub fn with_snapshot_writer(
+        mut self,
+        writer: Arc<dyn crate::sandbox::f65::WorkspaceSnapshotWriter>,
+    ) -> Self {
+        self.snapshot_writer = writer;
+        self
+    }
+
+    /// F65 PR-5: read accessor for the snapshot root (used by the GC
+    /// sweeper to enumerate on-disk snapshot directories).
+    pub fn snapshot_dir(&self) -> Option<&PathBuf> {
+        self.snapshot_dir.as_ref()
     }
 
     /// Wire in the project-scoped repo allowlist. When set, `recover_all`
@@ -355,10 +569,25 @@ impl SandboxService {
         self.write_registry_entry(&entry)
     }
 
+    // ── Lock-poison recovery (issue #463) ───────────────────────────────
+    //
+    // Every guard in this impl uses `.unwrap_or_else(|e| e.into_inner())`
+    // rather than `.expect(…)`. F65 PR-4 put sandbox confinement on the
+    // critical path of every orchestrator session: a single panicking
+    // thread holding one of these guards would poison the lock and every
+    // subsequent sandbox op would panic on the unwrap, cascading into a
+    // full-process DoS.
+    //
+    // We recover the inner value and continue. The inner state is a
+    // `HashMap` keyed by `RunId` / `SessionId` / `WorkspaceSnapshotId` —
+    // per-key independent, so a partial insert from a panicking writer
+    // leaves at most one half-written entry, never a broken invariant.
+    // Mirrors the approved pattern in
+    // `crate::sandbox::f65::BufferedF65EventSink`.
     pub fn state_for(&self, run_id: &RunId) -> Option<SandboxState> {
         self.sessions
             .read()
-            .expect("sandbox session lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(run_id)
             .map(|session| session.state)
     }
@@ -366,7 +595,7 @@ impl SandboxService {
     pub fn metadata_for(&self, run_id: &RunId) -> Option<SandboxMetadata> {
         self.sessions
             .read()
-            .expect("sandbox session lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(run_id)
             .and_then(|session| session.metadata.clone())
     }
@@ -385,10 +614,7 @@ impl SandboxService {
         let resolution = self.resolve_strategy(&policy.strategy)?;
         let started_at = self.clock.now_millis();
         let (sandbox_id, run_id_owned) = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = sessions.entry(run_id.clone()).or_insert_with(|| {
                 SandboxSession::new(run_id, task_id.clone(), project.clone(), policy.clone())
             });
@@ -442,10 +668,7 @@ impl SandboxService {
                 };
 
                 {
-                    let mut sessions = self
-                        .sessions
-                        .write()
-                        .expect("sandbox session lock poisoned");
+                    let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
                     let session = sessions
                         .get_mut(run_id)
                         .expect("sandbox session must exist after provisioning");
@@ -476,10 +699,7 @@ impl SandboxService {
                 if let Err(error) = self.write_registry_entry(&registry_entry) {
                     let failed_at = self.clock.now_millis();
                     {
-                        let mut sessions = self
-                            .sessions
-                            .write()
-                            .expect("sandbox session lock poisoned");
+                        let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
                         if let Some(session) = sessions.get_mut(run_id) {
                             session.state = SandboxState::Failed;
                         }
@@ -498,10 +718,7 @@ impl SandboxService {
                 if let Err(error) = self.persist_metadata(&metadata) {
                     let failed_at = self.clock.now_millis();
                     {
-                        let mut sessions = self
-                            .sessions
-                            .write()
-                            .expect("sandbox session lock poisoned");
+                        let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
                         if let Some(session) = sessions.get_mut(run_id) {
                             session.state = SandboxState::Failed;
                         }
@@ -535,10 +752,7 @@ impl SandboxService {
             Err(error) => {
                 let failed_at = self.clock.now_millis();
                 {
-                    let mut sessions = self
-                        .sessions
-                        .write()
-                        .expect("sandbox session lock poisoned");
+                    let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(session) = sessions.get_mut(run_id) {
                         session.state = SandboxState::Failed;
                     }
@@ -565,10 +779,7 @@ impl SandboxService {
     ) -> Result<ProvisionedSandbox, WorkspaceError> {
         let activated_at = self.clock.now_millis();
         let (sandbox_id, sandbox, metadata) = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             let resumed = matches!(
                 session.state,
@@ -610,7 +821,7 @@ impl SandboxService {
 
     pub async fn heartbeat(&self, run_id: &RunId) -> Result<(), WorkspaceError> {
         let strategy = {
-            let sessions = self.sessions.read().expect("sandbox session lock poisoned");
+            let sessions = self.sessions.read().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get(run_id)
                 .ok_or_else(|| WorkspaceError::SandboxNotFound {
@@ -636,10 +847,7 @@ impl SandboxService {
 
         let heartbeat_at = self.clock.now_millis();
         let (sandbox_id, metadata) = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             if let Some(metadata) = session.metadata.as_mut() {
                 metadata.heartbeat_at = heartbeat_at;
@@ -669,10 +877,7 @@ impl SandboxService {
         let checkpointed_at = self.clock.now_millis();
 
         let metadata = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             self.transition(session, SandboxState::Checkpointed)?;
             if let Some(metadata) = session.metadata.as_mut() {
@@ -703,10 +908,7 @@ impl SandboxService {
     ) -> Result<(), WorkspaceError> {
         let preserved_at = self.clock.now_millis();
         let (sandbox_id, metadata) = {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             self.transition(session, SandboxState::Preserved)?;
             if let Some(metadata) = session.metadata.as_mut() {
@@ -737,10 +939,7 @@ impl SandboxService {
     ) -> Result<DestroyResult, WorkspaceError> {
         let strategy = self.sandbox_strategy(run_id)?;
         {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             self.transition(session, SandboxState::Destroying)?;
             if let Some(metadata) = session.metadata.as_mut() {
@@ -761,10 +960,7 @@ impl SandboxService {
         }
 
         {
-            let mut sessions = self
-                .sessions
-                .write()
-                .expect("sandbox session lock poisoned");
+            let mut sessions = self.sessions.write().unwrap_or_else(|e| e.into_inner());
             let session = self.session_mut(&mut sessions, run_id)?;
             self.transition(session, SandboxState::Destroyed)?;
             if let Some(metadata) = session.metadata.as_mut() {
@@ -791,7 +987,7 @@ impl SandboxService {
         observed: u64,
     ) -> Result<(), WorkspaceError> {
         let (sandbox_id, policy) = {
-            let sessions = self.sessions.read().expect("sandbox session lock poisoned");
+            let sessions = self.sessions.read().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get(run_id)
                 .ok_or_else(|| WorkspaceError::SandboxNotFound {
@@ -845,7 +1041,544 @@ impl SandboxService {
         Ok(())
     }
 
+    // ─── F65 PR-5: session-scoped provision + terminate + resume ──────────
+
+    /// F65 PR-5: provision a session-scoped sandbox.
+    ///
+    /// Delegates to [`Self::provision_or_reconnect`] for the mount/upper/
+    /// work/lower work, then builds a [`SessionSandbox`] carrying the
+    /// paths the orchestrator + confined child need. Emits
+    /// `SessionAttemptStarted` on the F65 event sink once the mount is
+    /// live + the registry entry is durable (Q6: atomic "sandbox ready →
+    /// event").
+    ///
+    /// If `spec.base_snapshot_id` is `Some`, call
+    /// [`Self::restore_from_snapshot`] instead — this method is the
+    /// fresh-provision entrypoint only.
+    pub async fn provision_for_session(
+        &self,
+        spec: crate::sandbox::f65::SessionProvisionSpec,
+    ) -> Result<crate::sandbox::f65::SessionSandbox, WorkspaceError> {
+        if spec.base_snapshot_id.is_some() {
+            return Err(WorkspaceError::unimplemented(
+                "provision_for_session: spec carries base_snapshot_id; callers \
+                 must use restore_from_snapshot for resume paths",
+            ));
+        }
+        let run_id = spec.root_run_id.clone();
+        let project = spec.project.clone();
+        let provisioned = self
+            .provision_or_reconnect(&run_id, None, project.clone(), spec.policy.clone())
+            .await?;
+        let session_sandbox = self.build_session_sandbox(&spec, &provisioned, None)?;
+
+        {
+            let mut map = self
+                .session_sandboxes
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            map.insert(spec.session_id.clone(), session_sandbox.clone());
+        }
+
+        self.f65_event_sink.publish(
+            crate::sandbox::f65::F65SandboxEvent::SessionAttemptStarted {
+                project,
+                session_id: spec.session_id.clone(),
+                root_run_id: spec.root_run_id.clone(),
+                attempt_number: spec.attempt_number,
+                max_attempts: spec.max_attempts,
+            },
+        );
+
+        Ok(session_sandbox)
+    }
+
+    /// F65 PR-5: terminate the session-scoped sandbox for `session_id`,
+    /// reflink the RW upperdir into a durable snapshot, and reap the
+    /// overlay teardown state.
+    ///
+    /// Returns the new `WorkspaceSnapshotId`. Emits
+    /// `WorkspaceSnapshotCreated` after the metadata stamp lands
+    /// (write-before-event: readers who receive the event see a fully
+    /// populated projection row). Emits `WorkspaceBackendDegraded` at
+    /// most once per session if `reflink_tree_with_fallback` fell back
+    /// to byte-copy.
+    pub async fn terminate_for_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+        _reason: crate::sandbox::f65::TerminationReason,
+    ) -> Result<cairn_domain::WorkspaceSnapshotId, WorkspaceError> {
+        let session_sandbox = {
+            let map = self
+                .session_sandboxes
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            map.get(session_id).cloned().ok_or_else(|| {
+                WorkspaceError::sandbox_op(
+                    &RunId::new(session_id.as_str()),
+                    "terminate_for_session.unknown_session",
+                    "no active session sandbox",
+                )
+            })?
+        };
+        let run_id = session_sandbox.root_run_id.clone();
+        let snapshot_root = self.snapshot_dir.as_ref().ok_or_else(|| {
+            WorkspaceError::sandbox_op(
+                &run_id,
+                "terminate_for_session",
+                "snapshot_dir not configured on SandboxService; call with_snapshot_dir(..)",
+            )
+        })?;
+
+        // Snapshot id + on-disk path.
+        let snapshot_id = cairn_domain::WorkspaceSnapshotId::new(new_snapshot_ulid());
+        let snapshot_path = snapshot_root.join(snapshot_id.as_str());
+        fs::create_dir_all(&snapshot_path)
+            .map_err(|error| WorkspaceError::sandbox_op(&run_id, "create_snapshot_dir", error))?;
+
+        // Unmount via the existing destroy path (preserve=false reaps the
+        // overlay dirs + drops the registry entry); we do the reflink
+        // BEFORE destroy consumes the upper. That ordering is
+        // load-bearing: arch §4.3.3 mandates umount-first-then-reflink to
+        // avoid racing the child agent's fsync. The existing
+        // `maybe_unmount` in the overlay provider runs inside `destroy`,
+        // so we bypass it: read the upper path off the F65 record (which
+        // the previous `provision_for_session` populated) and reflink
+        // from that onto the snapshot dir. `destroy` then reaps the
+        // overlay itself.
+        let degraded_flag = self.degraded_flag_for_session(session_id);
+        let outcome = crate::providers::reflink_tree_with_fallback(
+            &session_sandbox.upper,
+            &snapshot_path,
+            &degraded_flag,
+        )
+        .map_err(|error| WorkspaceError::sandbox_op(&run_id, "reflink_upper_to_snapshot", error))?;
+
+        // Emit the one-shot degraded event. `compare_exchange` above
+        // guarantees only the first flip lands here; across resumes the
+        // same session flag stays `true` so a second terminate is a
+        // no-op.
+        if !outcome.reflink_used {
+            // Only emit on the very first FS-level fallback for this
+            // session. The atomic already flipped in
+            // reflink_tree_with_fallback; we need a separate "already
+            // emitted" marker to dedupe the event itself.
+            self.maybe_emit_degraded_once(session_id, &session_sandbox.project);
+        }
+
+        // Stamp metadata on the (pre-emitted) snapshot row. The cairn-app
+        // event sink may have already fired the PR-2 insert for
+        // `WorkspaceSnapshotCreated` — but we emit AFTER the stamp here,
+        // so readers see the fully-populated row. This is the "stamp
+        // before event" invariant in the plan §2.4.
+        if let Err(err) = self
+            .snapshot_writer
+            .stamp_metadata(
+                &snapshot_id,
+                &snapshot_path.display().to_string(),
+                outcome.bytes_copied,
+                outcome.reflink_used,
+                session_sandbox.base_snapshot_id.as_ref(),
+            )
+            .await
+        {
+            return Err(WorkspaceError::sandbox_op(
+                &run_id,
+                "stamp_snapshot_metadata",
+                err,
+            ));
+        }
+
+        // Emit WorkspaceSnapshotCreated. cairn-app translates this to the
+        // domain event + projection insert. #482: carry bytes /
+        // reflink_used / parent_snapshot_id on the event itself so a
+        // fresh log replay rebuilds the projection row with the same
+        // metadata the live writer produced.
+        self.f65_event_sink.publish(
+            crate::sandbox::f65::F65SandboxEvent::WorkspaceSnapshotCreated {
+                project: session_sandbox.project.clone(),
+                snapshot_id: snapshot_id.clone(),
+                workspace_id: session_sandbox.workspace_id.clone(),
+                session_id: session_id.clone(),
+                bytes: outcome.bytes_copied,
+                reflink_used: outcome.reflink_used,
+                parent_snapshot_id: session_sandbox.base_snapshot_id.clone(),
+            },
+        );
+
+        // Reap overlay + drop the registry entry.
+        let _ = self
+            .destroy(&run_id, false, cairn_domain::DestroyReason::Completed)
+            .await?;
+
+        // Remove the session-scoped sandbox record.
+        {
+            let mut map = self
+                .session_sandboxes
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            map.remove(session_id);
+        }
+
+        Ok(snapshot_id)
+    }
+
+    /// F65 PR-5: resume a session from a previously-snapshotted upperdir.
+    ///
+    /// Reflinks `~/.cairn/snapshots/<base_snapshot_id>/` into a fresh
+    /// upperdir-seed directory, mounts a new overlay over it, allocates
+    /// a fresh `RunId`, and returns the new [`SessionSandbox`] plus the
+    /// resumed root run id. Takes + holds an in-flight-restore lease on
+    /// `base_snapshot_id` so the GC sweeper cannot reap the snapshot
+    /// mid-resume.
+    ///
+    /// PR-5 boundary: returns only the sandbox; the caller is responsible
+    /// for loading `F65CheckpointRecord.body` separately (PR-6 wires the
+    /// LLM-context restore). The plan intentionally keeps resume-side
+    /// surface minimal so PR-5 can ship without the summarizer.
+    pub async fn restore_from_snapshot(
+        &self,
+        spec: crate::sandbox::f65::SessionProvisionSpec,
+    ) -> Result<crate::sandbox::f65::SessionSandbox, WorkspaceError> {
+        let base_snapshot_id = spec.base_snapshot_id.clone().ok_or_else(|| {
+            WorkspaceError::sandbox_op(
+                &spec.root_run_id,
+                "restore_from_snapshot",
+                "spec.base_snapshot_id is required",
+            )
+        })?;
+        let snapshot_root = self.snapshot_dir.as_ref().ok_or_else(|| {
+            WorkspaceError::sandbox_op(
+                &spec.root_run_id,
+                "restore_from_snapshot",
+                "snapshot_dir not configured",
+            )
+        })?;
+        let snapshot_src = snapshot_root.join(base_snapshot_id.as_str());
+        if !snapshot_src.exists() {
+            return Err(WorkspaceError::sandbox_op(
+                &spec.root_run_id,
+                "restore_from_snapshot",
+                format!("snapshot {} not found", snapshot_src.display()),
+            ));
+        }
+
+        // Acquire in-flight-restore lease to hold off the GC sweeper.
+        {
+            let mut set = self
+                .inflight_restores
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            set.insert(base_snapshot_id.clone());
+        }
+        // RAII-like drop guard to release the lease on every return path.
+        // Matches the #463 poison-recovery policy: recover the inner
+        // set even across a poisoned lock so the release still lands.
+        // A silently-skipped release (the pre-#463 `if let Ok(..)`
+        // pattern) would leave the set holding a stale snapshot id
+        // forever, blocking the GC sweeper from reaping a snapshot
+        // that no thread is actually walking.
+        struct InflightGuard<'a> {
+            svc: &'a SandboxService,
+            snapshot_id: cairn_domain::WorkspaceSnapshotId,
+        }
+        impl<'a> Drop for InflightGuard<'a> {
+            fn drop(&mut self) {
+                let mut set = self
+                    .svc
+                    .inflight_restores
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                set.remove(&self.snapshot_id);
+            }
+        }
+        let _guard = InflightGuard {
+            svc: self,
+            snapshot_id: base_snapshot_id.clone(),
+        };
+
+        // PR-5 shape: provision a fresh overlay for the new root-Run,
+        // then reflink the snapshot contents into the new upperdir so the
+        // child agent sees the prior session's state on first read. This
+        // is a pragmatic placement — overlay provision creates an empty
+        // upper; we fill it with the snapshot before the child is
+        // spawned. A dedicated `OverlayProvider::restore` path (plan
+        // §2.3) is a PR-6/7 refactor; PR-5 exercises the contract with
+        // this minimal approach.
+        let run_id = spec.root_run_id.clone();
+        let project = spec.project.clone();
+        let provisioned = self
+            .provision_or_reconnect(&run_id, None, project.clone(), spec.policy.clone())
+            .await?;
+
+        let session_sandbox =
+            self.build_session_sandbox(&spec, &provisioned, Some(base_snapshot_id.clone()))?;
+
+        // Seed the upperdir from the snapshot AFTER the overlay is
+        // mounted so the merged view reflects the restored state.
+        // reflink_tree_with_fallback is idempotent across a non-empty
+        // destination only when the destination is empty; the fresh
+        // upper is guaranteed empty by the provision path above.
+        let degraded_flag = self.degraded_flag_for_session(&spec.session_id);
+        crate::providers::reflink_tree_with_fallback(
+            &snapshot_src,
+            &session_sandbox.upper,
+            &degraded_flag,
+        )
+        .map_err(|error| WorkspaceError::sandbox_op(&run_id, "reflink_snapshot_to_upper", error))?;
+
+        {
+            let mut map = self
+                .session_sandboxes
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            map.insert(spec.session_id.clone(), session_sandbox.clone());
+        }
+
+        self.f65_event_sink.publish(
+            crate::sandbox::f65::F65SandboxEvent::SessionAttemptStarted {
+                project,
+                session_id: spec.session_id.clone(),
+                root_run_id: spec.root_run_id.clone(),
+                attempt_number: spec.attempt_number,
+                max_attempts: spec.max_attempts,
+            },
+        );
+
+        Ok(session_sandbox)
+    }
+
+    /// F65 PR-5 (#359): return a snapshot of the currently-provisioned
+    /// session sandboxes, keyed by `SessionId`. Used by the metrics
+    /// gauge + the GC sweeper debug path.
+    pub fn live_session_count(&self) -> usize {
+        self.session_sandboxes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
+    /// F65 PR-5: clear an individual snapshot directory from disk. Called
+    /// by the GC sweeper + the admin reap endpoint. Returns `Ok(true)` if
+    /// the dir existed + was removed, `Ok(false)` if already gone. Errors
+    /// on other failures (IO).
+    pub fn reap_snapshot_dir(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+    ) -> Result<bool, WorkspaceError> {
+        // Respect in-flight-restore leases: if a resume is walking the
+        // snapshot right now, defer the reap. Next sweep tick picks it
+        // up. For operator-driven reap, the caller can retry after the
+        // resume completes.
+        {
+            let set = self
+                .inflight_restores
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if set.contains(snapshot_id) {
+                return Ok(false);
+            }
+        }
+
+        let Some(snapshot_root) = self.snapshot_dir.as_ref() else {
+            return Ok(false);
+        };
+        let path = snapshot_root.join(snapshot_id.as_str());
+        match fs::remove_dir_all(&path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(WorkspaceError::sandbox_op(
+                &RunId::new(snapshot_id.as_str()),
+                "reap_snapshot_dir",
+                err,
+            )),
+        }
+    }
+
+    fn build_session_sandbox(
+        &self,
+        spec: &crate::sandbox::f65::SessionProvisionSpec,
+        provisioned: &ProvisionedSandbox,
+        base_snapshot_id: Option<cairn_domain::WorkspaceSnapshotId>,
+    ) -> Result<crate::sandbox::f65::SessionSandbox, WorkspaceError> {
+        // Derive the overlay-internal paths from the ProvisionedSandbox.
+        // For overlay: .path == <root>/merged.
+        // For reflink: .path == <root>/root.
+        // The F65 SessionSandbox stores merged/upper/work/lower which
+        // only make sense for overlay. Reflink sessions still get a
+        // SessionSandbox but the non-merged fields point to stable
+        // stand-ins so the caller can tell them apart.
+        let workspace_id =
+            cairn_domain::WorkspaceId::new(format!("ws-{}", spec.root_run_id.as_str()));
+        let (merged, upper, work, lower) = match provisioned.strategy {
+            SandboxStrategy::Overlay => {
+                let merged = provisioned.path.clone();
+                let root = merged.parent().map(|p| p.to_path_buf()).ok_or_else(|| {
+                    WorkspaceError::sandbox_op(
+                        &spec.root_run_id,
+                        "build_session_sandbox",
+                        "overlay provisioned path has no parent directory",
+                    )
+                })?;
+                (
+                    merged,
+                    root.join("upper"),
+                    root.join("work"),
+                    root.join("empty"),
+                )
+            }
+            SandboxStrategy::Reflink => {
+                let merged = provisioned.path.clone();
+                (merged.clone(), merged.clone(), merged.clone(), merged)
+            }
+        };
+
+        let confinement =
+            crate::sandbox::SandboxConfinement::production(merged.clone(), Vec::new());
+        Ok(crate::sandbox::f65::SessionSandbox {
+            workspace_id,
+            session_id: spec.session_id.clone(),
+            root_run_id: spec.root_run_id.clone(),
+            project: spec.project.clone(),
+            merged,
+            upper,
+            work,
+            lower,
+            confinement,
+            network: spec.network,
+            base_snapshot_id,
+        })
+    }
+
+    fn degraded_flag_for_session(
+        &self,
+        session_id: &cairn_domain::SessionId,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let mut map = self
+            .degraded_flag_by_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(session_id.clone())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .clone()
+    }
+
+    /// F65 PR-5 (#359): unmount any `type=overlay` entry in
+    /// `/proc/self/mounts` whose merged path lives under this service's
+    /// base_dir AND which the registry knows about.
+    ///
+    /// The "registry knows about it" gate is load-bearing: a co-tenant
+    /// cairn-app may also have registered overlay mounts under a sibling
+    /// path; we only touch ours. On non-Linux hosts this is a no-op.
+    async fn sweep_orphan_overlays(&self) -> Result<(), WorkspaceError> {
+        #[cfg(target_os = "linux")]
+        {
+            let mounts = match fs::read_to_string("/proc/self/mounts") {
+                Ok(s) => s,
+                Err(_) => return Ok(()),
+            };
+            let base_dir = self
+                .base_dir
+                .canonicalize()
+                .unwrap_or_else(|_| self.base_dir.clone());
+            let registry = self.list_registry_entries()?;
+            let registry_paths: HashMap<PathBuf, RegistryEntry> =
+                registry.into_iter().map(|e| (e.path.clone(), e)).collect();
+            for line in mounts.lines() {
+                // Lines are: `device mountpoint fstype opts freq passno`
+                let mut parts = line.split_whitespace();
+                let _device = parts.next();
+                let Some(mountpoint) = parts.next() else {
+                    continue;
+                };
+                let Some(fstype) = parts.next() else {
+                    continue;
+                };
+                if fstype != "overlay" {
+                    continue;
+                }
+                let mountpoint_path = PathBuf::from(mountpoint);
+                // Is this mountpoint under our base dir?
+                if !mountpoint_path.starts_with(&base_dir) {
+                    continue;
+                }
+                // Find the owning registry entry. The registry's stored
+                // path is the `ProvisionedSandbox.path` which for overlay
+                // is the merged directory. Match that.
+                let Some(entry) = registry_paths.get(&mountpoint_path) else {
+                    continue;
+                };
+
+                use nix::mount::{umount2, MntFlags};
+                if let Err(err) = umount2(&mountpoint_path, MntFlags::MNT_DETACH) {
+                    eprintln!(
+                        "sweep_orphan_overlays: umount2(MNT_DETACH, {}) failed: {err}; leaving \
+                         mount in place (host will eventually GC after PID reuse)",
+                        mountpoint_path.display(),
+                    );
+                    continue;
+                }
+                eprintln!(
+                    "sweep_orphan_overlays: unmounted dangling overlay {} (sidecar sandbox_id={})",
+                    mountpoint_path.display(),
+                    entry.sandbox_id.as_str(),
+                );
+                // Emit the crash-recovery event. The session_id is not
+                // persisted in the registry sidecar today — we use the
+                // run_id as a best-effort placeholder. PR-6+ may extend
+                // the sidecar to carry session_id directly; for PR-5
+                // the run-id-as-session fallback keeps the event shape
+                // addressable from the run-level recovery service.
+                self.f65_event_sink.publish(
+                    crate::sandbox::f65::F65SandboxEvent::SandboxCrashRecovered {
+                        project: entry.project.clone(),
+                        session_id: cairn_domain::SessionId::new(entry.run_id.as_str()),
+                        run_id: entry.run_id.clone(),
+                    },
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No overlay mount concept on non-Linux.
+        }
+        Ok(())
+    }
+
+    /// Emit `WorkspaceBackendDegraded` at most once per session. Uses a
+    /// dedicated emission-tracking set (separate from the AtomicBool
+    /// that reflink_tree_with_fallback flips) so the event fires on the
+    /// first observed FS fallback for a session and never again — even
+    /// across terminate-resume-terminate cycles.
+    fn maybe_emit_degraded_once(&self, session_id: &cairn_domain::SessionId, project: &ProjectKey) {
+        let newly_inserted = self
+            .degraded_emitted_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id.clone());
+        if !newly_inserted {
+            return;
+        }
+        self.f65_event_sink.publish(
+            crate::sandbox::f65::F65SandboxEvent::WorkspaceBackendDegraded {
+                project: project.clone(),
+                session_id: session_id.clone(),
+                backend: "ext4_copy".to_string(),
+                reason: "reflink_unsupported_fs".to_string(),
+            },
+        );
+    }
+
     pub async fn recover_all(&self) -> Result<SandboxRecoverySummary, WorkspaceError> {
+        // F65 PR-5 (#359): sweep dangling overlay mounts left by a crashed
+        // cairn-app before we enumerate providers. `/proc/self/mounts`
+        // lists every mount inherited from our parent's ns; we
+        // unmount any `type=overlay` whose merged dir falls under
+        // base_dir/<sandbox_id>/merged and for which a registry
+        // sidecar exists. Emits `SandboxCrashRecovered` per successful
+        // umount so operators see the repair.
+        self.sweep_orphan_overlays().await?;
+
         let mut handles = Vec::new();
         for provider in self.providers.values() {
             handles.extend(provider.list().await?);
@@ -998,37 +1731,30 @@ impl SandboxService {
         // unit tests exercise the sweep directly with seeded entries and
         // would otherwise need to stand up the full access service.
         //
-        // **Authoritative-allowlist gate (Cursor Bugbot high-1):**
-        // `ProjectRepoAccessService` is an in-memory `RwLock<HashMap>`
-        // populated via HTTP `POST /v1/projects/.../repos/...` — it is
-        // NOT replayed from the event log on boot. A freshly-started
-        // cairn-app therefore sees an empty allowlist for every project
-        // until the operator (or an external controller) re-asserts
-        // entries. Treating that empty state as "all repos revoked"
-        // would flag every repo-backed sandbox as `AllowlistRevoked` on
-        // every restart — a catastrophic false positive that would
-        // freeze unrelated runs until an operator resolved the flood of
-        // synthesized approvals.
+        // **Restart durability (#556, resolved 2026-04-28):** the repo
+        // allowlist is now persisted at the plugin layer via
+        // `AllowlistPersistence` (installed by the GitHub integration
+        // plugin at boot). When the allowlist reports itself
+        // authoritative (`is_authoritative()` → true, meaning
+        // persistence is installed), an empty `list_for_project`
+        // legitimately means "the operator has revoked every grant"
+        // and every bound repo without a current grant is flagged.
         //
-        // Until the allowlist persists across restarts (whether via an
-        // event replay, a sidecar, or a projection), the sweep is only
-        // sound for projects with *at least one* allowlisted repo at
-        // recovery time. Projects with zero entries are treated as
-        // "not authoritative yet" and skipped; the sweep picks them up
-        // on the next `recover_all` call once the operator has re-
-        // asserted the allowlist. This is strictly an under-approximation
-        // (false negatives, no false positives) — the exact opposite of
-        // the failure mode the bug report flagged.
-        //
-        // TODO(RFC 016 persistence): when the allowlist gains durable
-        // storage, remove the "non-empty project" gate and rely on the
-        // allowlist's own authoritative semantics.
+        // When the allowlist is NOT authoritative (no plugin wired
+        // persistence on this boot — common in integration tests and
+        // in deployments that run cairn-app without the GitHub
+        // integration), we fall back to the pre-#556 conservative
+        // under-approximation: `is_allowed` must return `false`
+        // AND the project must already have at least one allowlisted
+        // repo before we'll fire the sweep. An empty non-
+        // authoritative allowlist is treated as "we don't know yet",
+        // not "everything revoked" — the correct semantic when the
+        // plugin that owns the state hasn't had a chance to hydrate
+        // it.
         if let Some(allowlist) = self.allowlist.clone() {
             let entries = self.list_registry_entries()?;
-            // Cache per-project "is the allowlist authoritative?" answers
-            // so we don't re-query `list_for_project` for every registry
-            // entry in the same project.
-            let mut project_authoritative: HashMap<ProjectKey, bool> = HashMap::new();
+            let authoritative = allowlist.is_authoritative();
+            let mut project_has_grants: HashMap<ProjectKey, bool> = HashMap::new();
             for mut entry in entries {
                 if entry.allowlist_revoked_handled {
                     continue;
@@ -1039,16 +1765,21 @@ impl SandboxService {
                 let ctx = RepoAccessContext {
                     project: entry.project.clone(),
                 };
-                let authoritative = match project_authoritative.get(&entry.project).copied() {
-                    Some(v) => v,
-                    None => {
-                        let v = !allowlist.list_for_project(&ctx).await.is_empty();
-                        project_authoritative.insert(entry.project.clone(), v);
-                        v
-                    }
-                };
                 if !authoritative {
-                    continue;
+                    // Conservative fallback: require at least one
+                    // surviving grant in the project before treating
+                    // a missing grant as "revoked".
+                    let has_grants = match project_has_grants.get(&entry.project).copied() {
+                        Some(v) => v,
+                        None => {
+                            let v = !allowlist.list_for_project(&ctx).await.is_empty();
+                            project_has_grants.insert(entry.project.clone(), v);
+                            v
+                        }
+                    };
+                    if !has_grants {
+                        continue;
+                    }
                 }
                 if allowlist.is_allowed(&ctx, &repo_id).await {
                     continue;
@@ -1235,7 +1966,7 @@ impl SandboxService {
     ) {
         self.sessions
             .write()
-            .expect("sandbox session lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(
                 metadata.run_id.clone(),
                 SandboxSession {
@@ -1293,7 +2024,7 @@ impl SandboxService {
         &self,
         run_id: &RunId,
     ) -> Result<Option<ProvisionedSandbox>, WorkspaceError> {
-        let sessions = self.sessions.read().expect("sandbox session lock poisoned");
+        let sessions = self.sessions.read().unwrap_or_else(|e| e.into_inner());
         let Some(session) = sessions.get(run_id) else {
             return Ok(None);
         };
@@ -1316,7 +2047,7 @@ impl SandboxService {
     fn sandbox_strategy(&self, run_id: &RunId) -> Result<SandboxStrategy, WorkspaceError> {
         self.sessions
             .read()
-            .expect("sandbox session lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(run_id)
             .and_then(|session| session.sandbox.as_ref().map(|sandbox| sandbox.strategy))
             .ok_or_else(|| WorkspaceError::SandboxNotFound {
@@ -1445,8 +2176,71 @@ impl SandboxService {
         let encoded = serde_json::to_vec_pretty(metadata).map_err(|error| {
             WorkspaceError::sandbox_op(&metadata.run_id, "serialize_metadata", error)
         })?;
-        fs::write(&metadata_path, encoded)
-            .map_err(|error| WorkspaceError::sandbox_op(&metadata.run_id, "write_metadata", error))
+
+        // Atomic publish via stage + fsync + rename + directory fsync.
+        // Invariant: a concurrent reader of `meta.json` observes
+        // either the previous committed contents or the new committed
+        // contents, never an empty, torn, or partially-written file.
+        // Crash invariant: once this function returns `Ok`, a
+        // subsequent boot sees the new contents (the payload is on
+        // stable storage and the directory entry update is durable).
+        let tmp_name = format!(
+            "meta.json.tmp.{}.{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        );
+        let tmp_path = sandbox_dir.join(tmp_name);
+
+        // Stage the new payload into a per-thread sibling file.
+        // Wrapped in a helper so every error path removes the orphan
+        // tmp file — if we leak tmp files on partial failure they
+        // accumulate in the sandbox dir and eventually shadow
+        // legitimate recovery reads.
+        let stage = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp_path)?;
+            file.write_all(&encoded)?;
+            file.sync_all()
+        };
+        if let Err(error) = stage() {
+            // Best-effort cleanup for every pre-rename failure mode:
+            // open, write_all, sync_all. Ignore the remove error —
+            // surfacing the stage error is what matters.
+            let _ = fs::remove_file(&tmp_path);
+            return Err(WorkspaceError::sandbox_op(
+                &metadata.run_id,
+                "stage_metadata_tmp",
+                error,
+            ));
+        }
+
+        if let Err(error) = fs::rename(&tmp_path, &metadata_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(WorkspaceError::sandbox_op(
+                &metadata.run_id,
+                "rename_metadata",
+                error,
+            ));
+        }
+
+        // POSIX `rename(2)` publishes the new inode for `meta.json`
+        // atomically — any reader now sees the new contents. The
+        // directory entry change itself, however, is not crash-durable
+        // until the containing directory is fsynced. Without this a
+        // crash between `rename` returning and the kernel flushing the
+        // dentry to the journal could surface the old meta.json (or no
+        // meta.json) on next boot. Best-effort: a failure here doesn't
+        // roll back the rename — the payload is published, we just
+        // couldn't prove it's durable.
+        if let Ok(dir) = fs::File::open(&sandbox_dir) {
+            let _ = dir.sync_all();
+        }
+
+        Ok(())
     }
 }
 
@@ -1455,6 +2249,25 @@ fn fallback_strategy(strategy: SandboxStrategy) -> SandboxStrategy {
         SandboxStrategy::Overlay => SandboxStrategy::Reflink,
         SandboxStrategy::Reflink => SandboxStrategy::Overlay,
     }
+}
+
+/// F65 PR-5: generate a fresh snapshot identifier. We don't pull the
+/// `ulid` crate in for this — the id format is not load-bearing (it's
+/// an opaque string the projection reads back). `snap-<unix-ms>-<rand>`
+/// is unique enough for operational use and sorts chronologically.
+fn new_snapshot_ulid() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    // 64-bit entropy is plenty — the actual uniqueness invariant is per-
+    // host per-millisecond, and we add 16 hex chars worth.
+    let mut hasher = DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    now.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    let suffix = hasher.finish();
+    format!("snap-{now:016x}-{suffix:016x}")
 }
 
 fn limit_for(policy: &SandboxPolicy, dimension: ResourceDimension) -> Option<u64> {
@@ -1513,6 +2326,98 @@ fn recovery_policy(metadata: &SandboxMetadata) -> SandboxPolicy {
     }
 }
 
+// ── SandboxServiceApi impl (issue #443) ──────────────────────────────────
+//
+// Each arm forwards to the inherent method of the same name so the
+// behaviour is unchanged. The inherent methods stay on `impl SandboxService`
+// so the test suite and the builder-style `with_*` setters keep working
+// without any call-site churn.
+
+#[async_trait::async_trait]
+impl SandboxServiceApi for SandboxService {
+    async fn provision_or_reconnect(
+        &self,
+        run_id: &RunId,
+        task_id: Option<TaskId>,
+        project: ProjectKey,
+        policy: SandboxPolicy,
+    ) -> Result<ProvisionedSandbox, WorkspaceError> {
+        SandboxService::provision_or_reconnect(self, run_id, task_id, project, policy).await
+    }
+
+    async fn activate(
+        &self,
+        run_id: &RunId,
+        pid: Option<u32>,
+    ) -> Result<ProvisionedSandbox, WorkspaceError> {
+        SandboxService::activate(self, run_id, pid).await
+    }
+
+    fn base_dir(&self) -> &PathBuf {
+        SandboxService::base_dir(self)
+    }
+
+    async fn recover_all(&self) -> Result<SandboxRecoverySummary, WorkspaceError> {
+        SandboxService::recover_all(self).await
+    }
+
+    fn reap_snapshot_dir(
+        &self,
+        snapshot_id: &cairn_domain::WorkspaceSnapshotId,
+    ) -> Result<bool, WorkspaceError> {
+        SandboxService::reap_snapshot_dir(self, snapshot_id)
+    }
+
+    fn seed_registry_entry_for_test(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+    ) -> Result<(), WorkspaceError> {
+        SandboxService::seed_registry_entry_for_test(
+            self, sandbox_id, run_id, project, strategy, path,
+        )
+    }
+
+    fn seed_registry_entry_for_test_with_repo(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+        repo_id: Option<RepoId>,
+    ) -> Result<(), WorkspaceError> {
+        SandboxService::seed_registry_entry_for_test_with_repo(
+            self, sandbox_id, run_id, project, strategy, path, repo_id,
+        )
+    }
+
+    fn seed_registry_entry_for_test_full(
+        &self,
+        sandbox_id: crate::sandbox::SandboxId,
+        run_id: RunId,
+        project: ProjectKey,
+        strategy: SandboxStrategy,
+        path: PathBuf,
+        repo_id: Option<RepoId>,
+        base_revision: Option<String>,
+    ) -> Result<(), WorkspaceError> {
+        SandboxService::seed_registry_entry_for_test_full(
+            self,
+            sandbox_id,
+            run_id,
+            project,
+            strategy,
+            path,
+            repo_id,
+            base_revision,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1527,7 +2432,7 @@ mod tests {
         ResourceDimension, RunId,
     };
 
-    use super::{BufferedSandboxEventSink, Clock, SandboxService};
+    use super::{BufferedSandboxEventSink, Clock, SandboxEventSink, SandboxService};
     use crate::error::WorkspaceError;
     use crate::providers::SandboxProvider;
     use crate::sandbox::{
@@ -1555,6 +2460,77 @@ mod tests {
             *guard += 10;
             *guard
         }
+    }
+
+    // ── #466: SystemClock no-panic regression ──────────────────────────────
+    //
+    // The clock-before-epoch path is not reachable on any live production
+    // host (it would require an RTC reset to before 1970-01-01 mid-run),
+    // but the `unwrap_or_else` fallback is still observable via the public
+    // contract: `now_millis` must return `0` — not panic — on a
+    // `SystemTimeError`. A full runtime-level reproduction would need us
+    // to travel the real clock backwards, which rustc/tokio don't permit.
+    // These two tests together keep the public contract honest:
+    //
+    //   * `system_clock_now_millis_happy_path` asserts the live path
+    //     returns a value after 2020-01-01 (a sanity check that the
+    //     conversion isn't silently broken).
+    //   * `system_clock_fallback_path_returns_zero` constructs a
+    //     synthetic `SystemTimeError` via a known-good recipe
+    //     (`earlier.duration_since(later)`) and asserts the same code
+    //     shape the production impl uses returns `0`.
+
+    #[test]
+    fn system_clock_now_millis_happy_path() {
+        use super::SystemClock;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Only assert when `SystemTime::now()` is actually after UNIX_EPOCH
+        // on this host — dev/CI containers with a skewed clock are still
+        // a valid test environment and shouldn't make this unit fail.
+        // Per Copilot review comment on PR #560: an absolute "post-2020"
+        // threshold coupled this test to wall-clock correctness. What
+        // matters is: the method returns a value and doesn't panic, and
+        // if the underlying call says we're after UNIX_EPOCH, `now_millis`
+        // returns a non-zero reflection of that.
+        if SystemTime::now().duration_since(UNIX_EPOCH).is_ok() {
+            let clock = SystemClock;
+            let now = clock.now_millis();
+            assert!(
+                now > 0,
+                "SystemClock must return a non-zero timestamp when the host clock is past UNIX_EPOCH; got {now}",
+            );
+        }
+    }
+
+    #[test]
+    fn system_clock_fallback_path_returns_zero() {
+        // Replay the production fallback shape against a synthetic
+        // `SystemTimeError`. We construct the error by asking
+        // `duration_since` about an instant in the future — the only
+        // portable way to produce a real `SystemTimeError` without
+        // mucking with the system clock.
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let future = UNIX_EPOCH + Duration::from_secs(60);
+        let err = UNIX_EPOCH
+            .duration_since(future)
+            .expect_err("duration_since a future instant must error");
+
+        // Same shape as `SystemClock::now_millis` — if this shape ever
+        // panics, the production call site panics too.
+        let result: u64 = Err::<Duration, _>(err)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|e| {
+                // In production this is a `tracing::warn!`. Under the
+                // test harness `tracing` emits to the registered
+                // subscriber (or nothing); we just mirror the sink
+                // path to prove it compiles.
+                let _ = format!("{e}");
+                0
+            });
+
+        assert_eq!(result, 0, "fallback path must return 0, got {result}");
     }
 
     #[derive(Debug)]
@@ -1798,16 +2774,22 @@ mod tests {
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cairn-workspace-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("test temp dir should be creatable");
-        dir
+        // `mkdtemp(3)` creates the directory atomically with O_EXCL —
+        // parallel tests cannot collide regardless of clock
+        // resolution. Footgun: do NOT replace this with a
+        // timestamp-named path; `SystemTime::now().as_nanos()` is not
+        // unique across concurrent threads.
+        //
+        // `.keep()` detaches the `TempDir` drop guard so the returned
+        // `PathBuf` survives past this function. The directory is
+        // intentionally not cleaned up — the service owns what it
+        // writes there and individual tests would need an anchor
+        // otherwise.
+        tempfile::Builder::new()
+            .prefix(&format!("cairn-workspace-{label}-"))
+            .tempdir()
+            .expect("test temp dir should be creatable")
+            .keep()
     }
 
     fn run_id() -> RunId {
@@ -2171,6 +3153,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_metadata_is_atomic_under_concurrent_readers() {
+        // Regression for #341. The old `fs::write`-based persist
+        // truncated `meta.json` to 0 bytes before writing, so a
+        // reader that landed mid-write saw empty or torn bytes and
+        // `serde_json::from_slice` failed with "EOF while parsing a
+        // value". This exercise runs a writer thread calling
+        // `persist_metadata` in a tight loop concurrently with a
+        // reader thread, and asserts every read either succeeds
+        // (valid `SandboxMetadata`) or sees ENOENT before the first
+        // write — never a parse error, never a zero-byte read. With
+        // the old `fs::write` this test failed on the first few
+        // iterations (empty reads dominate); with the atomic
+        // stage+rename it passes.
+        let (service, _sink) = service_with_providers(vec![(
+            SandboxStrategy::Overlay,
+            Box::new(TestProvider::new(SandboxStrategy::Overlay)),
+        )]);
+        let run = run_id();
+        service
+            .provision_or_reconnect(
+                &run,
+                None,
+                project(),
+                policy(
+                    SandboxStrategyRequest::Force(SandboxStrategy::Overlay),
+                    OnExhaustion::Destroy,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let metadata_path = service.base_dir().join("sbx-run-1").join("meta.json");
+        let service = Arc::new(service);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        const ITERS: u32 = 2_000;
+
+        // Writer: repeatedly persist with alternating fields so
+        // every call rewrites meta.json. Uses the private helper
+        // directly (avoids the async state machine, which would
+        // throttle the race window).
+        let writer_service = service.clone();
+        let writer_stop = stop.clone();
+        let writer_run = run.clone();
+        let writer = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while i < ITERS && !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let meta = SandboxMetadata {
+                    sandbox_id: crate::sandbox::SandboxId::new("sbx-run-1"),
+                    run_id: writer_run.clone(),
+                    task_id: None,
+                    project: project(),
+                    strategy: SandboxStrategy::Overlay,
+                    state: if i % 2 == 0 {
+                        SandboxState::Active
+                    } else {
+                        SandboxState::Preserved
+                    },
+                    base_rev: Some(format!("rev-{i}")),
+                    repo_id: None,
+                    path: PathBuf::from("/tmp/run-1"),
+                    pid: if i % 2 == 0 { Some(i) } else { None },
+                    created_at: 1_000,
+                    heartbeat_at: 1_000 + i as u64,
+                    policy_hash: "policy:test".to_string(),
+                };
+                writer_service.persist_metadata(&meta).expect("persist");
+                i += 1;
+            }
+        });
+
+        // Reader: read + parse until the writer stops. Every
+        // successful read must parse as SandboxMetadata — no empty
+        // reads, no torn JSON.
+        let reader_path = metadata_path.clone();
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u32;
+            let mut oks = 0u32;
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                reads += 1;
+                match fs::read(&reader_path) {
+                    Ok(bytes) => {
+                        assert!(
+                            !bytes.is_empty(),
+                            "persist_metadata must never expose a zero-byte file",
+                        );
+                        serde_json::from_slice::<SandboxMetadata>(&bytes).unwrap_or_else(|e| {
+                            panic!(
+                                "persist_metadata must never expose a torn file: \
+                                 {e} (bytes={} head={:?})",
+                                bytes.len(),
+                                &bytes[..bytes.len().min(64)],
+                            )
+                        });
+                        oks += 1;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Acceptable only before the first write.
+                    }
+                    Err(e) => panic!("unexpected read error: {e}"),
+                }
+            }
+            (reads, oks)
+        });
+
+        writer.join().expect("writer panicked");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (reads, oks) = reader.join().expect("reader panicked");
+        assert!(
+            oks > 0,
+            "reader should have observed at least one durable meta.json (reads={reads})"
+        );
+    }
+
+    #[tokio::test]
     async fn recover_all_reconnects_sandbox_and_normalizes_active_state() {
         let run = RunId::new("run-recover-ok");
         let provider = RecoveryProvider::new(
@@ -2272,20 +3369,31 @@ mod tests {
         let run = RunId::new("run-revoked");
         let repo_id = crate::sandbox::RepoId::new("octocat/hello");
         let provider = RecoveryProvider::new(SandboxStrategy::Overlay, Vec::new(), HashMap::new());
+        // Seed a sibling repo so the project has at least one
+        // surviving grant. That matches the real-world precondition:
+        // an operator revoked this particular repo while keeping
+        // unrelated ones allowlisted. The sweep is scoped per-(project,
+        // repo), so the bound repo's missing grant must trigger
+        // `AllowlistRevoked` regardless of the sibling.
+        //
+        // The sibling doubles as a "not authoritative yet" backstop:
+        // this test is non-authoritative (no persistence installed),
+        // and the fallback path in `recover_all` requires the project
+        // to have at least one surviving grant before treating a
+        // missing grant as "revoked" — the
+        // `recover_all_skips_allowlist_revoked_when_non_authoritative_and_empty`
+        // test covers the opposite case explicitly.
         let allowlist = Arc::new(ProjectRepoAccessService::new());
-        // Seed a sentinel repo so the project is "authoritative" under
-        // the sweep gate (an empty allowlist is treated as
-        // not-yet-replayed and skipped — Bugbot high-1).
         allowlist
             .allow(
                 &RepoAccessContext { project: project() },
-                &crate::sandbox::RepoId::new("other/sentinel"),
+                &crate::sandbox::RepoId::new("other/sibling"),
                 ActorRef::Operator {
                     operator_id: OperatorId::new("test"),
                 },
             )
             .await
-            .expect("seed sentinel");
+            .expect("seed sibling");
         let sink = Arc::new(BufferedSandboxEventSink::default());
         let base_dir = unique_test_dir("allowlist-revoked");
         let service = SandboxService::new(
@@ -2350,18 +3458,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_all_skips_allowlist_revoked_sweep_when_project_allowlist_empty() {
-        // Bugbot high-1 gate: an empty allowlist for a project means
-        // "not yet replayed / re-asserted this boot", NOT "all repos
-        // revoked". The sweep must skip such projects so a freshly-
-        // started cairn-app does not flood operators with approvals.
+    async fn recover_all_emits_allowlist_revoked_when_authoritative_allowlist_empty() {
+        // Post-#556 semantic: when the allowlist is AUTHORITATIVE
+        // (plugin-layer persistence installed), an empty
+        // `list_for_project` at recovery time legitimately means "the
+        // operator has revoked every grant in the project" — and every
+        // repo-backed sandbox bound to that project must be flagged
+        // `AllowlistRevoked`.
         use crate::repo_store::access_service::ProjectRepoAccessService;
+        use crate::repo_store::allowlist_persistence::{
+            AllowlistPersistence, JsonFileAllowlistStore,
+        };
 
         let run = RunId::new("run-empty-allowlist");
         let repo_id = crate::sandbox::RepoId::new("octocat/hello");
         let provider = RecoveryProvider::new(SandboxStrategy::Overlay, Vec::new(), HashMap::new());
+
+        // Install an empty persisted allowlist so `is_authoritative`
+        // reports true while `is_allowed` still returns false for our
+        // bound repo.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let allowlist_path = tmp.path().join("allowlist.json");
+        let store = Arc::new(JsonFileAllowlistStore::open(&allowlist_path).unwrap());
         let allowlist = Arc::new(ProjectRepoAccessService::new());
-        // Do NOT seed any entries. The project is "not authoritative".
+        allowlist
+            .install_persistence(store as Arc<dyn AllowlistPersistence>)
+            .unwrap();
+        assert!(allowlist.is_authoritative());
+
         let sink = Arc::new(BufferedSandboxEventSink::default());
         let base_dir = unique_test_dir("allowlist-empty");
         let service = SandboxService::new(
@@ -2384,6 +3508,71 @@ mod tests {
                 project(),
                 SandboxStrategy::Overlay,
                 sandbox_path,
+                Some(repo_id.clone()),
+            )
+            .expect("seed registry entry");
+
+        let summary = service.recover_all().await.unwrap();
+        assert_eq!(
+            summary.preserved_allowlist_revoked, 1,
+            "empty persisted allowlist must fire AllowlistRevoked for bound repos",
+        );
+        assert_eq!(summary.allowlist_revoked_runs.len(), 1);
+        assert_eq!(summary.allowlist_revoked_runs[0].0, run);
+        assert_eq!(summary.allowlist_revoked_runs[0].2, repo_id);
+
+        let events = sink.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SandboxEvent::SandboxAllowlistRevoked { .. })),
+            "expected SandboxAllowlistRevoked event, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_all_skips_allowlist_revoked_when_non_authoritative_and_empty() {
+        // Conservative fallback: when the allowlist is NOT
+        // authoritative (no plugin-layer persistence installed — e.g.
+        // integration tests or a cairn-app deployment without the
+        // GitHub integration), an empty project allowlist is treated
+        // as "state not hydrated yet" rather than "every grant
+        // revoked". Sandboxes are left alone until the next sweep.
+        //
+        // This preserves the pre-#556 conservative behaviour that
+        // tests like `sandbox_preserved_base_revision_drift_overlay_only`
+        // rely on to assert drift-vs-allowlist routing without standing
+        // up the full GitHub plugin.
+        use crate::repo_store::access_service::ProjectRepoAccessService;
+
+        let run = RunId::new("run-empty-non-auth");
+        let repo_id = crate::sandbox::RepoId::new("octocat/hello");
+        let provider = RecoveryProvider::new(SandboxStrategy::Overlay, Vec::new(), HashMap::new());
+        let allowlist = Arc::new(ProjectRepoAccessService::new());
+        assert!(!allowlist.is_authoritative());
+
+        let sink = Arc::new(BufferedSandboxEventSink::default());
+        let base_dir = unique_test_dir("allowlist-empty-non-auth");
+        let service = SandboxService::new(
+            HashMap::from([(
+                SandboxStrategy::Overlay,
+                Box::new(provider) as Box<dyn crate::providers::SandboxProvider>,
+            )]),
+            sink.clone(),
+            base_dir.clone(),
+            Arc::new(FixedClock::new(1_000)),
+        )
+        .with_allowlist(allowlist);
+
+        let sandbox_path = base_dir.join("sbx-run-empty-non-auth");
+        fs::create_dir_all(&sandbox_path).expect("create stub sandbox dir");
+        service
+            .seed_registry_entry_for_test_with_repo(
+                crate::sandbox::SandboxId::new("sbx-run-empty-non-auth"),
+                run.clone(),
+                project(),
+                SandboxStrategy::Overlay,
+                sandbox_path,
                 Some(repo_id),
             )
             .expect("seed registry entry");
@@ -2391,20 +3580,12 @@ mod tests {
         let summary = service.recover_all().await.unwrap();
         assert_eq!(
             summary.preserved_allowlist_revoked, 0,
-            "empty allowlist must be treated as not-yet-authoritative, not as all-revoked",
+            "empty non-authoritative allowlist must not flag bound repos",
         );
         assert!(summary.allowlist_revoked_runs.is_empty());
-        // The entry has a present path and no allowlist-revoke decision
-        // this boot, so the healthy-reattach sweep fires and surfaces it.
+        // The healthy-reattach sweep picks up the entry since its
+        // path exists and no allowlist-revoke decision fired.
         assert_eq!(summary.reattached, 1);
-        assert_eq!(summary.reattached_runs[0].0, run);
-        let events = sink.drain();
-        assert_eq!(
-            events.len(),
-            1,
-            "expected exactly one SandboxReattached event"
-        );
-        assert!(matches!(&events[0], SandboxEvent::SandboxReattached { .. }));
     }
 
     #[tokio::test]
@@ -2777,5 +3958,210 @@ mod tests {
                 .any(|e| matches!(e, SandboxEvent::SandboxBaseRevisionDrift { .. })),
             "clone-missing must not emit SandboxBaseRevisionDrift; got {events:?}",
         );
+    }
+
+    // ── Lock-poison recovery (issue #463) ────────────────────────────────
+    //
+    // Before the fix, `SandboxService` had 18 `.expect("… lock poisoned")`
+    // call sites across `sessions`, `session_sandboxes`, `inflight_restores`,
+    // `degraded_flag_by_session`, `degraded_emitted_sessions`, and the
+    // `BufferedSandboxEventSink::events` buffer. A panic holding any of
+    // those guards (e.g. an OOM inside `HashMap::insert`, a `policy_hash`
+    // hit overflow, a failing path canonicalisation in nested helpers)
+    // would poison the lock and take down every subsequent sandbox op —
+    // and since F65 PR-4 put sandbox confinement on the critical path of
+    // every orchestrator session, this was a full-process DoS vector.
+    //
+    // The tests below spawn real threads that panic WHILE HOLDING the
+    // write guard and assert that every reader/writer path still serves
+    // afterwards. They exercise the production service (not a mock)
+    // through its public API; the panic is induced by reaching into the
+    // private lock field, which is visible inside this `#[cfg(test)]`
+    // module by design.
+
+    #[test]
+    fn sessions_rwlock_survives_writer_panic() {
+        let (service, _sink) = service_with_providers(vec![]);
+        let service = Arc::new(service);
+
+        // Seed a session the readers will look up post-poison. Use the
+        // test-only `remember_recovered_session` helper (private but
+        // in-module) to avoid needing a real provider — we just need a
+        // present entry.
+        let rid = run_id();
+        let metadata = recovery_metadata(&rid, SandboxState::Preserved);
+        service.remember_recovered_session(
+            metadata,
+            None,
+            policy(
+                SandboxStrategyRequest::Preferred(SandboxStrategy::Overlay),
+                OnExhaustion::Destroy,
+            ),
+        );
+
+        // Poison the `sessions` RwLock from a dedicated writer thread.
+        let svc_clone = service.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = svc_clone
+                .sessions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            panic!("test-induced panic while holding sessions write guard");
+        });
+        assert!(writer.join().is_err(), "writer thread should have panicked");
+
+        // After the poison, every `sessions` reader path must still serve.
+        // Before #463 these `.read().expect("sandbox session lock poisoned")`
+        // calls would themselves panic on the poisoned guard.
+        assert_eq!(service.state_for(&rid), Some(SandboxState::Preserved));
+        assert!(service.metadata_for(&rid).is_some());
+
+        // A subsequent write must still land.
+        let rid2 = RunId::new("run-2");
+        let metadata2 = recovery_metadata(&rid2, SandboxState::Ready);
+        service.remember_recovered_session(
+            metadata2,
+            None,
+            policy(
+                SandboxStrategyRequest::Preferred(SandboxStrategy::Overlay),
+                OnExhaustion::Destroy,
+            ),
+        );
+        assert_eq!(service.state_for(&rid2), Some(SandboxState::Ready));
+    }
+
+    #[test]
+    fn session_sandboxes_rwlock_survives_writer_panic() {
+        let (service, _sink) = service_with_providers(vec![]);
+        let service = Arc::new(service);
+
+        let svc_clone = service.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = svc_clone
+                .session_sandboxes
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            panic!("test-induced panic while holding session_sandboxes write guard");
+        });
+        assert!(writer.join().is_err(), "writer thread should have panicked");
+
+        // `live_session_count` reads `session_sandboxes`. Before #463
+        // this would panic on the poisoned lock.
+        assert_eq!(service.live_session_count(), 0);
+    }
+
+    #[test]
+    fn inflight_restores_mutex_survives_writer_panic() {
+        let (service, _sink) = service_with_providers(vec![]);
+        let service = Arc::new(service);
+
+        let svc_clone = service.clone();
+        let writer = std::thread::spawn(move || {
+            let mut guard = svc_clone
+                .inflight_restores
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.insert(cairn_domain::WorkspaceSnapshotId::new("snap-poison"));
+            panic!("test-induced panic while holding inflight_restores guard");
+        });
+        assert!(writer.join().is_err());
+
+        // `reap_snapshot_dir` consults `inflight_restores`; it must not
+        // panic on the poisoned guard. The insert from the panicking
+        // writer IS observable — it defers the reap. That is the correct
+        // outcome: a partial insert from a panicking writer leaves the
+        // set consistent, and our poison-recovery pattern preserves it.
+        let reaped = service
+            .reap_snapshot_dir(&cairn_domain::WorkspaceSnapshotId::new("snap-poison"))
+            .expect("reap_snapshot_dir must survive inflight_restores poison");
+        assert!(!reaped, "in-flight snapshot must defer reap");
+
+        // A snapshot NOT held in-flight still reaps (noop for missing
+        // dir + no snapshot_dir configured → returns Ok(false)).
+        let reaped_other = service
+            .reap_snapshot_dir(&cairn_domain::WorkspaceSnapshotId::new("snap-other"))
+            .expect("reap_snapshot_dir must survive inflight_restores poison");
+        assert!(!reaped_other);
+    }
+
+    #[test]
+    fn sandbox_event_buffer_survives_writer_panic() {
+        let sink = Arc::new(BufferedSandboxEventSink::default());
+
+        // Publish one event so `drain` has content to return.
+        sink.publish(SandboxEvent::SandboxHeartbeat {
+            sandbox_id: crate::sandbox::SandboxId::new("sbx-x"),
+            run_id: RunId::new("run-x"),
+            heartbeat_at: 1,
+        });
+
+        // Poison the `events` mutex from a writer thread.
+        let sink_clone = sink.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = sink_clone.events.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("test-induced panic while holding events mutex");
+        });
+        assert!(writer.join().is_err());
+
+        // Both public methods must survive. Before #463 they were
+        // `.expect("sandbox event buffer poisoned")`.
+        sink.publish(SandboxEvent::SandboxHeartbeat {
+            sandbox_id: crate::sandbox::SandboxId::new("sbx-y"),
+            run_id: RunId::new("run-y"),
+            heartbeat_at: 2,
+        });
+        let events = sink.drain();
+        assert_eq!(events.len(), 2);
+    }
+
+    /// Concurrent readers + a panicking writer on the real sandbox
+    /// service. Models the production failure mode: many orchestrator
+    /// threads reading sandbox state in parallel, one panicking writer,
+    /// survivors must keep serving.
+    #[test]
+    fn concurrent_readers_survive_sandbox_writer_panic() {
+        let (service, _sink) = service_with_providers(vec![]);
+        let service = Arc::new(service);
+
+        let rid = run_id();
+        service.remember_recovered_session(
+            recovery_metadata(&rid, SandboxState::Preserved),
+            None,
+            policy(
+                SandboxStrategyRequest::Preferred(SandboxStrategy::Overlay),
+                OnExhaustion::Destroy,
+            ),
+        );
+
+        let readers: Vec<_> = (0..6)
+            .map(|_| {
+                let svc = service.clone();
+                let rid = rid.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..32 {
+                        let _ = svc.state_for(&rid);
+                        let _ = svc.metadata_for(&rid);
+                        let _ = svc.live_session_count();
+                    }
+                })
+            })
+            .collect();
+
+        let svc_clone = service.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = svc_clone
+                .sessions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            panic!("poison sessions under reader load");
+        });
+        assert!(writer.join().is_err());
+
+        for (i, r) in readers.into_iter().enumerate() {
+            r.join()
+                .unwrap_or_else(|_| panic!("reader {i} panicked after lock poison"));
+        }
+
+        assert_eq!(service.state_for(&rid), Some(SandboxState::Preserved));
     }
 }

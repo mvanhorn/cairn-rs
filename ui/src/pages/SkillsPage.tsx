@@ -3,11 +3,14 @@ import { Activity, BookOpen, Loader2, Wrench } from "lucide-react";
 import { ErrorFallback } from "../components/ErrorFallback";
 import { StatCard } from "../components/StatCard";
 import { FeatureEmptyState } from "../components/FeatureEmptyState";
-import { defaultApi, ApiError } from "../lib/api";
+import { defaultApi, ApiError, unwrapList } from "../lib/api";
+import type { SkillRecord } from "../lib/types";
 import { Card } from "../components/Card";
+import { EntityExplainer } from "../components/EntityExplainer";
+import { ENTITY_EXPLAINERS } from "../lib/entityExplainers";
 
-function displayName(skill: { id?: string; name?: string }) {
-  return skill.name?.trim() || skill.id?.trim() || "Unnamed skill";
+function displayName(skill: { skill_id?: string; name?: string }) {
+  return skill.name?.trim() || skill.skill_id?.trim() || "Unnamed skill";
 }
 
 export function SkillsPage() {
@@ -43,7 +46,9 @@ export function SkillsPage() {
     return <ErrorFallback error={error} resource="skills" onRetry={() => void refetch()} />;
   }
 
-  const items = data?.items ?? [];
+  // #425: use the shared list-shape normalizer so a future flip from
+  // `{items, ...}` to a bare array doesn't crash the page.
+  const items = unwrapList<SkillRecord>(data);
   const summary = data?.summary ?? { total: 0, enabled: 0, disabled: 0 };
   const active = data?.currently_active ?? [];
 
@@ -53,9 +58,7 @@ export function SkillsPage() {
         <div>
           <p className="text-[11px] text-gray-400 dark:text-zinc-500 uppercase tracking-widest">Infrastructure / Skills</p>
           <h1 className="text-[24px] font-semibold text-gray-900 dark:text-zinc-100 mt-1">Skills</h1>
-          <p className="text-[13px] text-gray-400 dark:text-zinc-500 mt-1">
-            Operator-visible inventory of installed and currently active skills.
-          </p>
+          <EntityExplainer className="mt-1">{ENTITY_EXPLAINERS.skill}</EntityExplainer>
         </div>
         <button
           onClick={() => void refetch()}
@@ -86,15 +89,15 @@ export function SkillsPage() {
           {items.length === 0 ? (
             <FeatureEmptyState
               icon={<BookOpen size={20} className="text-gray-400 dark:text-zinc-500" />}
-              title="No skills discovered"
-              description="Skills are auto-discovered from agent execution. Run an agent workflow to populate skills."
+              title="No skills registered"
+              description="cairn-sdk workers register skills on startup. Start a worker with a skills bundle to populate this catalog."
               actionLabel="Go to Runs"
               actionHref="#runs"
             />
           ) : (
             <div className="divide-y divide-gray-200 dark:divide-zinc-800">
               {items.map((skill, index) => (
-                <div key={`${skill.id ?? skill.name ?? "skill"}-${index}`} className="px-4 py-3">
+                <div key={`${skill.skill_id ?? skill.name ?? "skill"}-${index}`} className="px-4 py-3">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
                       <p className="text-[13px] font-medium text-gray-900 dark:text-zinc-100 truncate">
@@ -104,6 +107,18 @@ export function SkillsPage() {
                         <p className="text-[12px] text-gray-400 dark:text-zinc-500 mt-0.5 leading-relaxed">
                           {skill.description}
                         </p>
+                      )}
+                      {Array.isArray(skill.tags) && skill.tags.length > 0 && (
+                        <div className="mt-1.5 flex flex-wrap gap-1">
+                          {skill.tags.map((tag) => (
+                            <span
+                              key={tag}
+                              className="rounded border border-gray-200 dark:border-zinc-800 px-1.5 py-0.5 text-[10px] font-mono text-gray-500 dark:text-zinc-500"
+                            >
+                              {tag}
+                            </span>
+                          ))}
+                        </div>
                       )}
                     </div>
                     <span
@@ -116,9 +131,12 @@ export function SkillsPage() {
                       {skill.enabled === false ? "disabled" : "enabled"}
                     </span>
                   </div>
-                  {typeof skill.id === "string" && skill.id.length > 0 && (
-                    <p className="mt-2 text-[11px] font-mono text-gray-400 dark:text-zinc-600">{skill.id}</p>
-                  )}
+                  <p className="mt-2 text-[11px] font-mono text-gray-400 dark:text-zinc-600">
+                    {skill.skill_id}
+                    {typeof skill.version === "string" && skill.version.length > 0 && (
+                      <span className="ml-2 text-gray-400 dark:text-zinc-700">v{skill.version}</span>
+                    )}
+                  </p>
                 </div>
               ))}
             </div>

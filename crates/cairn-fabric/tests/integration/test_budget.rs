@@ -1,7 +1,7 @@
 use cairn_domain::RunId;
 
 use cairn_fabric::engine::BudgetSpendOutcome;
-use ff_core::types::{ExecutionId, LaneId};
+use flowfabric::core::types::{ExecutionId, LaneId};
 
 use crate::TestHarness;
 
@@ -112,9 +112,11 @@ async fn test_budget_release_resets_usage() {
         .await
         .expect("spend failed");
 
+    // Per-execution release (FF 0.13 / cairn #454) — reverses the
+    // attribution of `eid_pre` specifically, not a whole-budget flush.
     h.fabric
         .budgets
-        .release_budget(&budget_id)
+        .release_budget(&budget_id, &eid_pre)
         .await
         .expect("release failed");
 

@@ -24,9 +24,14 @@ pub trait RunCostAlertService: Send + Sync {
     /// Get the alert record for a run (None if no threshold set).
     async fn get_alert(&self, run_id: &RunId) -> Result<Option<RunCostAlert>, RuntimeError>;
 
-    /// List all triggered alerts for a tenant.
+    /// List triggered alerts for a tenant with storage-layer
+    /// pagination (issue #570). Callers pass `limit + 1` to detect
+    /// `has_more` on the wire without re-scanning; results are
+    /// ordered newest-first.
     async fn list_triggered_by_tenant(
         &self,
         tenant_id: &TenantId,
+        limit: usize,
+        offset: usize,
     ) -> Result<Vec<RunCostAlert>, RuntimeError>;
 }

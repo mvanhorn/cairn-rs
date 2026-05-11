@@ -1,21 +1,28 @@
 method	route	classification	query_or_body_detail	minimum_contract
 DELETE	/v1/admin/models/:id	preserve	-	-
+DELETE	/v1/admin/operators/:id/tenant-roles/:tenant	preserve	RFC 026 PR-A0: soft-revoke tenant role	{ revoked_at_ms, revoked_by, ... }
 DELETE	/v1/admin/tenants/:tenant_id/credentials/:id	preserve	-	-
+DELETE	/v1/admin/tenants/:tenant_id/sessions/:session_id	preserve	-	-
+DELETE	/v1/admin/tenants/:tenant_id/workspaces/:workspace_id	preserve	-	-
 DELETE	/v1/admin/workspaces/:id/shares/:share_id	preserve	-	-
 DELETE	/v1/admin/workspaces/:workspace_id/members/:id	preserve	-	-
 DELETE	/v1/auth/tokens/:id	preserve	-	-
 DELETE	/v1/config/:key	preserve	path param: key	{ ok }
+DELETE	/v1/evals/runs/:id	preserve	-	-
 DELETE	/v1/integrations/:integration_id	preserve	-	-
 DELETE	/v1/integrations/:integration_id/overrides	preserve	-	-
 DELETE	/v1/mailbox/:id	preserve	-	-
 DELETE	/v1/plugins/:id	preserve	-	-
 DELETE	/v1/plugins/:id/uninstall	preserve	-	-
 DELETE	/v1/projects/:proj/plugins/:id	preserve	-	-
+DELETE	/v1/projects/:project/agent-roles/:role_id	preserve	-	-
+DELETE	/v1/projects/:project/local-paths	preserve	-	-
 DELETE	/v1/projects/:project/repos/:owner/:repo	preserve	-	-
 DELETE	/v1/projects/:project/run-templates/:template_id	preserve	-	-
 DELETE	/v1/projects/:project/triggers/:trigger_id	preserve	-	-
 DELETE	/v1/providers/connections/:id	preserve	-	-
 DELETE	/v1/providers/pools/:id/connections/:conn_id	preserve	-	-
+DELETE	/v1/sessions/:id/snapshots	preserve	-	-
 DELETE	/v1/settings/defaults/:scope/:scope_id/:key	preserve	-	-
 DELETE	/v1/signals/subscriptions/:id	preserve	-	-
 DELETE	/v1/sources/:id	preserve	-	-
@@ -28,6 +35,7 @@ GET	/metrics	preserve	-	-
 GET	/openapi.json	preserve	-	-
 GET	/ready	preserve	-	-
 GET	/v1/a2a/tasks/:id	preserve	-	A2A task status
+GET	/v1/admin/agents/live	preserve	-	-
 GET	/v1/admin/audit-log	preserve	-	audit log entries
 GET	/v1/admin/audit-log/:resource_type/:resource_id	preserve	-	-
 GET	/v1/admin/capabilities	preserve	-	feature capability map
@@ -46,6 +54,7 @@ GET	/v1/admin/tenants/:id/overview	preserve	-	-
 GET	/v1/admin/tenants/:id/snapshots	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/credentials	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/operator-profiles	preserve	-	-
+GET	/v1/admin/tenants/:tenant_id/operators/:operator_id/tenant-roles	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/quota	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/retention-policy	preserve	-	-
 GET	/v1/admin/tenants/:tenant_id/workspaces	preserve	-	-
@@ -56,6 +65,7 @@ GET	/v1/admin/workspaces/:workspace_id/projects	preserve	-	-
 GET	/v1/agent-templates	preserve	-	-
 GET	/v1/approval-policies	preserve	-	{ items }
 GET	/v1/approvals	preserve	query: status?	{ items, hasMore }
+GET	/v1/approvals/:id	preserve	-	-
 GET	/v1/approvals/pending	preserve	-	-
 GET	/v1/assistant/sessions	preserve	-	{ items }
 GET	/v1/assistant/sessions/:sessionId	preserve	path param: sessionId	{ items } chat messages
@@ -83,6 +93,7 @@ GET	/v1/evals/assets/:asset_id/export	preserve	-	-
 GET	/v1/evals/assets/:asset_id/report	preserve	-	-
 GET	/v1/evals/assets/:asset_id/trend	preserve	-	-
 GET	/v1/evals/assets/:asset_id/winner	preserve	-	-
+GET	/v1/evals/baselines	preserve	query: tenant_id?	{ items, has_more }
 GET	/v1/evals/baselines/:id	preserve	-	-
 GET	/v1/evals/compare	preserve	-	-
 GET	/v1/evals/dashboard	preserve	-	-
@@ -94,10 +105,12 @@ GET	/v1/evals/matrices/permissions	preserve	-	{ rows }
 GET	/v1/evals/matrices/prompt-comparison	preserve	-	{ rows }
 GET	/v1/evals/matrices/provider-routing	preserve	-	-
 GET	/v1/evals/matrices/skill-health	preserve	-	{ rows }
+GET	/v1/evals/rubrics	preserve	query: tenant_id?	{ items, has_more }
 GET	/v1/evals/rubrics/:id	preserve	-	-
 GET	/v1/evals/runs	preserve	query: limit?	{ items }
 GET	/v1/evals/runs/:id	preserve	-	-
 GET	/v1/evals/scorecard/:asset_id	preserve	-	-
+GET	/v1/evals/scorecards	preserve	-	-
 GET	/v1/events	preserve	-	-
 GET	/v1/events/recent	preserve	-	-
 GET	/v1/export/:format	preserve	path param: format	exported bundle
@@ -128,6 +141,8 @@ GET	/v1/memory/related/:document_id	preserve	-	-
 GET	/v1/memory/search	preserve	query: q, limit?	{ results }
 GET	/v1/metrics	preserve	-	metrics read model
 GET	/v1/metrics/prometheus	preserve	-	-
+GET	/v1/models/catalog	preserve	-	-
+GET	/v1/models/catalog/providers	preserve	-	-
 GET	/v1/notifications	preserve	-	-
 GET	/v1/onboarding/status	preserve	-	onboarding progress
 GET	/v1/onboarding/templates	preserve	-	{ items }
@@ -144,12 +159,23 @@ GET	/v1/plugins/:id/tools	preserve	-	-
 GET	/v1/plugins/catalog	preserve	-	-
 GET	/v1/plugins/tools/search	preserve	-	-
 GET	/v1/policies/decisions	preserve	query: limit?	{ items }
+GET	/v1/projects/:project/agent-roles	preserve	-	-
+GET	/v1/projects/:project/agent-roles/:role_id	preserve	-	-
+GET	/v1/projects/:project/agent-roles/:role_id/history	preserve	-	-
+GET	/v1/projects/:project/ingest-jobs	preserve	-	-
+GET	/v1/projects/:project/knowledge-scoring-policy	preserve	-	-
+GET	/v1/projects/:project/knowledge-scoring-policy/valid-dimensions	preserve	-	-
+GET	/v1/projects/:project/memory-scoring-policy	preserve	-	-
+GET	/v1/projects/:project/memory-scoring-policy/valid-dimensions	preserve	-	-
+GET	/v1/projects/:project/providers	preserve	-	-
 GET	/v1/projects/:project/repos	preserve	-	-
 GET	/v1/projects/:project/repos/:owner/:repo	preserve	-	-
 GET	/v1/projects/:project/run-templates	preserve	-	-
 GET	/v1/projects/:project/run-templates/:template_id	preserve	-	-
+GET	/v1/projects/:project/tools	preserve	-	-
 GET	/v1/projects/:project/triggers	preserve	-	-
 GET	/v1/projects/:project/triggers/:trigger_id	preserve	-	-
+GET	/v1/projects/:tenant/:workspace/:project/costs	preserve	-	{ total_cost_micros, total_tokens_in, total_tokens_out, provider_calls }
 GET	/v1/prompts/assets	preserve	query: limit?	{ items }
 GET	/v1/prompts/assets/:id/versions	preserve	-	-
 GET	/v1/prompts/assets/:id/versions/:version_id/diff	preserve	-	-
@@ -185,8 +211,11 @@ GET	/v1/runs/:id/export	preserve	-	-
 GET	/v1/runs/:id/interventions	preserve	-	-
 GET	/v1/runs/:id/replay	preserve	-	-
 GET	/v1/runs/:id/sla	preserve	-	-
+GET	/v1/runs/:id/subagent-spawns	preserve	-	-
 GET	/v1/runs/:id/tasks	preserve	-	-
+GET	/v1/runs/:id/telemetry	preserve	-	-
 GET	/v1/runs/:id/tool-invocations	preserve	-	-
+GET	/v1/runs/:id/trajectory	preserve	-	-
 GET	/v1/runs/cost-alerts	preserve	-	{ items }
 GET	/v1/runs/escalated	preserve	-	{ items }
 GET	/v1/runs/resume-due	preserve	-	{ items }
@@ -201,13 +230,16 @@ GET	/v1/sessions/:id/events	preserve	-	-
 GET	/v1/sessions/:id/export	preserve	-	-
 GET	/v1/sessions/:id/llm-traces	preserve	path param: id	LLM call traces for session
 GET	/v1/sessions/:id/runs	preserve	-	-
+GET	/v1/sessions/:session_id/llm-traces/:trace_id/body	preserve	-	-
 GET	/v1/settings	preserve	-	deployment settings
+GET	/v1/settings/defaults/:scope/:scope_id/:key	preserve	-	-
 GET	/v1/settings/defaults/all	preserve	-	-
 GET	/v1/settings/defaults/resolve/:key	preserve	-	-
 GET	/v1/settings/tls	preserve	-	TLS config
 GET	/v1/signals	preserve	-	-
 GET	/v1/signals/subscriptions	preserve	-	-
 GET	/v1/skills	preserve	-	{ items, summary, currentlyActive? }
+GET	/v1/skills/:id	preserve	-	-
 GET	/v1/soul	transitional	-	current singleton asset wrapper
 GET	/v1/soul/history	transitional	-	{ items }
 GET	/v1/soul/patches	transitional	-	{ items }
@@ -230,6 +262,8 @@ GET	/v1/tasks/expired	preserve	-	{ items }
 GET	/v1/telemetry/usage	preserve	-	-
 GET	/v1/templates	preserve	-	-
 GET	/v1/templates/:id	preserve	-	-
+GET	/v1/tool-call-approvals	preserve	-	-
+GET	/v1/tool-call-approvals/:call_id	preserve	-	-
 GET	/v1/tool-invocations	preserve	query: run_id?, limit?	{ items }
 GET	/v1/tool-invocations/:id	preserve	-	-
 GET	/v1/tool-invocations/:id/progress	preserve	-	-
@@ -241,8 +275,15 @@ GET	/v1/webhooks/github/installations	preserve	-	-
 GET	/v1/webhooks/github/queue	preserve	-	-
 GET	/v1/workers	preserve	-	-
 GET	/v1/workers/:id	preserve	-	-
+GET	/v1/workspaces/:tenant/:workspace/costs	preserve	-	{ total_cost_micros, total_tokens_in, total_tokens_out, provider_calls }
 GET	/v1/ws	preserve	-	-
 GET	/version	preserve	-	-
+PATCH	/v1/admin/tenants/:id	preserve	-	-
+PATCH	/v1/admin/tenants/:tenant_id/operator-profiles/:id	preserve	-	-
+PATCH	/v1/approvals/:id/amend	preserve	-	-
+PATCH	/v1/projects/:project/agent-roles/:role_id	preserve	-	-
+PATCH	/v1/sources/:id	preserve	-	-
+PATCH	/v1/tool-call-approvals/:call_id/amend	preserve	-	-
 POST	/v1/a2a/tasks	preserve	body: A2A task shape	A2A task submission
 POST	/v1/admin/backup	preserve	-	-
 POST	/v1/admin/license/activate	preserve	body: { license_key }	{ ok }
@@ -250,6 +291,7 @@ POST	/v1/admin/license/override	preserve	-	-
 POST	/v1/admin/models/import-litellm	preserve	-	-
 POST	/v1/admin/notifications/:id/retry	preserve	-	-
 POST	/v1/admin/operators/:id/notifications	preserve	-	-
+POST	/v1/admin/operators/:id/tenant-roles/:tenant/promote	preserve	RFC 026 PR-A0: grant tenant role	{ role, granted_by, at_ms, ... }
 POST	/v1/admin/rebuild-projections	preserve	-	-
 POST	/v1/admin/restore	preserve	-	-
 POST	/v1/admin/rotate-token	preserve	-	-
@@ -265,6 +307,7 @@ POST	/v1/admin/tenants/:tenant_id/credentials/rotate-key	preserve	-	-
 POST	/v1/admin/tenants/:tenant_id/operator-profiles	preserve	-	-
 POST	/v1/admin/tenants/:tenant_id/quota	preserve	-	-
 POST	/v1/admin/tenants/:tenant_id/retention-policy	preserve	-	-
+POST	/v1/admin/tenants/:tenant_id/runs/:id/cancel-orphan	preserve	-	-
 POST	/v1/admin/tenants/:tenant_id/workspaces	preserve	-	-
 POST	/v1/admin/workspaces/:id/shares	preserve	-	-
 POST	/v1/admin/workspaces/:workspace_id/members	preserve	-	-
@@ -314,6 +357,7 @@ POST	/v1/ingest/jobs	preserve	-	-
 POST	/v1/ingest/jobs/:id/complete	preserve	-	-
 POST	/v1/ingest/jobs/:id/fail	preserve	-	-
 POST	/v1/integrations	preserve	-	-
+POST	/v1/integrations/github/verify-installation	preserve	-	-
 POST	/v1/mailbox	preserve	-	-
 POST	/v1/memories	preserve	body: { content, category }	create memory response object
 POST	/v1/memories/:id/accept	preserve	path param: id	{ ok }
@@ -334,6 +378,7 @@ POST	/v1/policies	preserve	-	-
 POST	/v1/policies/evaluate	preserve	-	-
 POST	/v1/poll/run	preserve	-	{ ok }
 POST	/v1/projects/:proj/plugins/:id	preserve	-	-
+POST	/v1/projects/:project/agent-roles	preserve	-	-
 POST	/v1/projects/:project/repos	preserve	-	-
 POST	/v1/projects/:project/run-templates	preserve	-	-
 POST	/v1/projects/:project/triggers	preserve	-	-
@@ -357,6 +402,7 @@ POST	/v1/providers/budget	preserve	-	-
 POST	/v1/providers/connections	preserve	-	-
 POST	/v1/providers/connections/:id/health-schedule	preserve	-	-
 POST	/v1/providers/connections/:id/models	preserve	-	-
+POST	/v1/providers/connections/discover-preview	preserve	-	-
 POST	/v1/providers/ollama/delete	preserve	-	-
 POST	/v1/providers/ollama/generate	preserve	-	-
 POST	/v1/providers/ollama/pull	preserve	-	-
@@ -409,6 +455,8 @@ POST	/v1/tasks/batch/cancel	preserve	-	-
 POST	/v1/tasks/expire-leases	preserve	-	-
 POST	/v1/templates/:id/apply	preserve	-	-
 POST	/v1/test/webhook	preserve	-	-
+POST	/v1/tool-call-approvals/:call_id/approve	preserve	-	-
+POST	/v1/tool-call-approvals/:call_id/reject	preserve	-	-
 POST	/v1/tool-invocations	preserve	-	-
 POST	/v1/tool-invocations/:id/cancel	preserve	-	-
 POST	/v1/tool-invocations/:id/complete	preserve	-	-
@@ -428,10 +476,14 @@ POST	/v1/workers/register	preserve	-	-
 PUT	/v1/admin/models/:id	preserve	-	-
 PUT	/v1/config/:key	preserve	path param: key, body: value	{ ok }
 PUT	/v1/integrations/:integration_id/overrides	preserve	-	-
+PUT	/v1/projects/:project/knowledge-provider	preserve	-	-
+PUT	/v1/projects/:project/knowledge-scoring-policy	preserve	-	-
+PUT	/v1/projects/:project/memory-provider	preserve	-	-
+PUT	/v1/projects/:project/memory-scoring-policy	preserve	-	-
+PUT	/v1/projects/:project/scoring-policy	preserve	-	-
 PUT	/v1/providers/connections/:id	preserve	-	-
 PUT	/v1/providers/connections/:id/retry-policy	preserve	-	-
 PUT	/v1/settings/defaults/:scope/:scope_id/:key	preserve	-	-
 PUT	/v1/soul	transitional	body: { content }	{ ok, sha }
-PUT	/v1/sources/:id	preserve	-	-
 PUT	/v1/webhooks/github/actions	preserve	-	-
 PUT	/v1/webhooks/github/queue/concurrency	preserve	-	-

@@ -8,12 +8,9 @@
  * and a live LLM provider (Bedrock or OpenRouter) for orchestration tests.
  */
 import { test, expect, type Page, type APIRequestContext } from "@playwright/test";
+import { BASE, TOKEN, HDR } from "./helpers";
 
 test.use({ actionTimeout: 10_000 });
-
-const TOKEN = "dev-admin-token";
-const BASE = "http://localhost:3000";
-const HDR = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
 const scope = { tenant_id: "default_tenant", workspace_id: "default_workspace", project_id: "default_project" };
 const projectRef = `${scope.tenant_id}/${scope.workspace_id}/${scope.project_id}`;
 
@@ -434,6 +431,52 @@ test.describe("9. Evaluations", () => {
     await nav(page, "evals");
     expect((await page.textContent("body"))!.length).toBeGreaterThan(10);
   });
+
+  // Issue #244 — the EvalsPage New Eval Run modal must expose a scorecard
+  // picker populated from GET /v1/evals/scorecards. Before #244 there was
+  // no picker at all; operators had to type `prompt_asset_id` by hand.
+  //
+  // The test both asserts the picker is wired AND that the
+  // /v1/evals/scorecards request reaches the server successfully, so a
+  // regression that silently 404s the endpoint is caught. The "— none —"
+  // default option is always present — counting options >= 1 would pass
+  // even when the endpoint is broken — so we additionally listen for the
+  // scorecards request and assert a 2xx response before expanding the
+  // <select> cardinality check.
+  test("new eval run modal shows scorecard picker populated from server (issue #244)", async ({ page }) => {
+    await signIn(page);
+    await nav(page, "evals");
+
+    // Prime: wait until the scorecards fetch succeeds so we know the
+    // endpoint is live before asserting the UI. `waitForResponse` is
+    // matched against the URL pattern that `listEvalScorecards()` builds
+    // (it appends tenant/workspace/project as querystring).
+    const scorecardsResponse = page.waitForResponse(
+      (resp) => resp.url().includes("/v1/evals/scorecards") && resp.request().method() === "GET",
+      { timeout: 10_000 },
+    );
+
+    // Click "+ New" to open the modal. The button copy varies across
+    // themes, so locate it by role+text fragment.
+    const newBtn = page.getByRole("button", { name: /new/i }).first();
+    await newBtn.click({ timeout: 5_000 });
+
+    // Scorecards endpoint must have returned 200 — a regression that
+    // silently 404s the route is caught here (would have sneaked past the
+    // old "options >= 1" check because the hard-coded `— none —` option
+    // keeps the count ≥ 1 regardless of the server response).
+    const resp = await scorecardsResponse;
+    expect(resp.status()).toBe(200);
+
+    const picker = page.getByTestId("scorecard-select");
+    await expect(picker).toBeVisible({ timeout: 5_000 });
+
+    // At minimum the `— none —` default is present. On a fresh project
+    // the server list may be empty so we don't assert options > 1, but we
+    // do assert the fallback exists so the field is actually optional.
+    const noneOption = picker.locator('option[value=""]');
+    await expect(noneOption).toHaveCount(1);
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -564,6 +607,41 @@ test.describe("13. Provider Performance", () => {
     await signIn(page);
     await nav(page, "metrics");
     expect((await page.textContent("body"))!.length).toBeGreaterThan(20);
+  });
+
+  // Invariant: browser anchor navigation does not attach the
+  // `Authorization: Bearer` header, so the Prometheus button must embed
+  // the stored token as a `?token=<encoded>` query-param. The auth
+  // middleware falls back to that query-param (same trick used by the SSE
+  // EventSource + useWebSocket). Regression for #256.
+  test("#256 Prometheus button embeds token query param and returns exposition text", async ({
+    page,
+    request,
+  }) => {
+    await signIn(page);
+    await nav(page, "metrics");
+
+    const prom = page.getByRole("link", { name: /Prometheus/i });
+    await expect(prom).toBeVisible({ timeout: 10_000 });
+
+    // The link must point at /v1/metrics/prometheus with a URL-encoded token.
+    const href = await prom.getAttribute("href");
+    expect(href).toBeTruthy();
+    expect(href!).toContain("/v1/metrics/prometheus");
+    expect(href!).toContain(`token=${encodeURIComponent(TOKEN)}`);
+    await expect(prom).toHaveAttribute("target", "_blank");
+
+    // Hitting that URL without any auth header must return 200 + Prometheus
+    // exposition (the `?token=` fallback stands in for the missing header).
+    const url = href!.startsWith("http") ? href! : `${BASE}${href}`;
+    const resp = await request.get(url);
+    expect(resp.status()).toBe(200);
+    const body = await resp.text();
+    // `cairn_http_requests_total` is the counter emitted by
+    // `metrics_prometheus_handler` in crates/cairn-app/src/bin_handlers.rs.
+    expect(body).toContain("cairn_http_requests_total");
+    const ct = resp.headers()["content-type"] ?? "";
+    expect(ct.toLowerCase()).toContain("text/plain");
   });
 });
 
@@ -811,14 +889,21 @@ test.describe("24. Real LLM Calls", () => {
     }
   });
 
+  // Local-only: gated on PLAYWRIGHT_LIVE_LLM=1. CI deliberately does not
+  // run this — burning provider tokens on every PR is both costly and
+  // noisy. Local run:
+  //   CAIRN_BRAIN_URL=https://api.z.ai/api/coding/paas/v4/ \
+  //   CAIRN_BRAIN_KEY=$ZAI_API_KEY CAIRN_BRAIN_MODEL=glm-4.7 \
+  //   PLAYWRIGHT_LIVE_LLM=1 npx playwright test operator-journey
   test("orchestrate: real model completes a run", async ({ request }) => {
+    test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
     const sid = `orch_sess_${id()}`, rid = `orch_run_${id()}`;
     await post(request, "/v1/sessions", { session_id: sid, ...scope });
     await post(request, "/v1/runs", { run_id: rid, session_id: sid, ...scope });
 
     const resp = await request.post(`${BASE}/v1/runs/${rid}/orchestrate`, {
       headers: HDR,
-      data: { input: "Say hello", max_steps: 1 },
+      data: { goal: "Say hello", max_iterations: 1 },
       timeout: 30_000,
     });
 
@@ -833,7 +918,9 @@ test.describe("24. Real LLM Calls", () => {
     }
   });
 
+  // Local-only: gated on PLAYWRIGHT_LIVE_LLM=1 — see sibling test above for run command.
   test("orchestrate with memory: model can search ingested knowledge", async ({ request }) => {
+    test.skip(!process.env.PLAYWRIGHT_LIVE_LLM, "PLAYWRIGHT_LIVE_LLM=1 not set (local-only)");
     // Ingest a document
     await post(request, "/v1/memory/ingest", {
       document_id: `llm_doc_${id()}`,
@@ -850,7 +937,7 @@ test.describe("24. Real LLM Calls", () => {
     // Orchestrate asking about the ingested knowledge
     const resp = await request.post(`${BASE}/v1/runs/${rid}/orchestrate`, {
       headers: HDR,
-      data: { input: "How many LLM providers does Cairn support?", max_steps: 2 },
+      data: { goal: "How many LLM providers does Cairn support?", max_iterations: 2 },
       timeout: 30_000,
     });
 
@@ -933,7 +1020,7 @@ test("FULL JOURNEY: health → connect → session → orchestrate (real LLM) �
   await test.step("4. Orchestrate with real LLM", async () => {
     const orchResp = await request.post(`${BASE}/v1/runs/${rid}/orchestrate`, {
       headers: HDR,
-      data: { input: "Summarize what Cairn does in one sentence.", max_steps: 1 },
+      data: { goal: "Summarize what Cairn does in one sentence.", max_iterations: 1 },
       timeout: 30_000,
     });
     if (orchResp.status() === 200) {

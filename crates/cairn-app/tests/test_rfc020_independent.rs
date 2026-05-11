@@ -15,19 +15,20 @@
 //! Per project policy (`feedback_integration_tests_only`), both tests
 //! drive a real `cairn-app` subprocess. Test #7 uses `LiveHarness` so it
 //! can sigkill+restart the running process. Test #12 spawns the binary
-//! directly via `tokio::process::Command` because it is testing *refusal
-//! to start* — LiveHarness would try to scrape a listening banner that
-//! never gets printed.
+//! via [`support::live_fabric::raw_cairn_app_command`] (issue #446) —
+//! the shared bare-bones spawner that sets the binary path, stdio
+//! piping, and `kill_on_drop` without the readiness probe LiveHarness
+//! requires. Both paths therefore share those invariants even though
+//! Test #12 is deliberately testing *refusal to start*, where the
+//! listening banner LiveHarness scrapes never gets printed.
 
 mod support;
 
-use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::process::Command;
 use tokio::time::timeout;
 
-use support::live_fabric::LiveHarness;
+use support::live_fabric::{raw_cairn_app_command, LiveHarness};
 
 // ── Test #7: decision cache survives restart ─────────────────────────────────
 
@@ -173,10 +174,13 @@ async fn decision_cache_survives_restart() {
 /// failure of this test — RFC 020 requires startup *refusal*, so a wrong
 /// configuration never reaches traffic.
 ///
-/// This test deliberately does NOT use `LiveHarness`: LiveHarness scrapes a
-/// "cairn-app listening on ..." startup banner off stderr, which a correct
-/// implementation of this contract will never print. We spawn the binary
-/// directly and assert on its exit status and diagnostic output.
+/// This test deliberately does NOT use the full `LiveHarness`: LiveHarness
+/// scrapes a "cairn-app listening on ..." startup banner off stderr,
+/// which a correct implementation of this contract will never print.
+/// We instead spawn the binary via `raw_cairn_app_command()` — the
+/// LiveHarness-adjacent helper (#446) that shares the binary path,
+/// stdio piping and `kill_on_drop` discipline without the readiness
+/// probe — and assert on its exit status and diagnostic output.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn team_mode_refuses_sqlite() {
     // Unique path so parallel test runs don't collide on the SQLite file
@@ -192,8 +196,10 @@ async fn team_mode_refuses_sqlite() {
         path: sqlite_path.clone(),
     };
 
-    let bin = env!("CARGO_BIN_EXE_cairn-app");
-    let mut cmd = Command::new(bin);
+    // Issue #446: use the shared bare-bones spawner (binary path +
+    // kill_on_drop + stdio piped) so any future change to those knobs
+    // stays in lockstep with `LiveHarness`. Args and env are test-specific.
+    let mut cmd = raw_cairn_app_command();
     cmd.arg("--mode")
         .arg("team")
         .arg("--port")
@@ -208,10 +214,7 @@ async fn team_mode_refuses_sqlite() {
         // RFC 020 refusal we're testing for.
         .env("CAIRN_ADMIN_TOKEN", "seed-admin-team-refuse-sqlite")
         .env("RUST_LOG", "warn")
-        .env_remove("CAIRN_LOG_DIR")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .env_remove("CAIRN_LOG_DIR");
 
     // The refusal is a `std::process::exit(1)` at CLI parse time, well
     // before any network or DB init. A healthy failure exits in <1s;
@@ -283,8 +286,8 @@ async fn team_mode_refuses_sqlite_via_database_url_env() {
         path: sqlite_path.clone(),
     };
 
-    let bin = env!("CARGO_BIN_EXE_cairn-app");
-    let mut cmd = Command::new(bin);
+    // Issue #446: share the bare-bones spawner with LiveHarness.
+    let mut cmd = raw_cairn_app_command();
     cmd.arg("--mode")
         .arg("team")
         .arg("--port")
@@ -298,10 +301,7 @@ async fn team_mode_refuses_sqlite_via_database_url_env() {
         )
         .env("CAIRN_ADMIN_TOKEN", "seed-admin-team-refuse-sqlite-env")
         .env("RUST_LOG", "warn")
-        .env_remove("CAIRN_LOG_DIR")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .env_remove("CAIRN_LOG_DIR");
 
     let output = timeout(Duration::from_secs(10), cmd.output())
         .await

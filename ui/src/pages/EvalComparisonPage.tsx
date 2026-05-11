@@ -7,6 +7,7 @@
 
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useScope } from "../hooks/useScope";
 import {
   ArrowLeft,
   FlaskConical,
@@ -20,7 +21,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { clsx } from "clsx";
-import { defaultApi } from "../lib/api";
+import { defaultApi, unwrapList } from "../lib/api";
 import type { EvalRunRecord, EvalRunStatus } from "../lib/types";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -302,13 +303,32 @@ export interface EvalComparisonPageProps {
 }
 
 export function EvalComparisonPage({ leftId, rightId }: EvalComparisonPageProps) {
+  // Single-run results view when both ids match (linked from the EvalsPage
+  // "Results" column). Keeps this page as the single home for eval display.
+  const singleRunMode = leftId === rightId;
+  const [scope] = useScope();
+  const scopeKey = [scope.tenant_id, scope.workspace_id, scope.project_id] as const;
+
   const { data, isLoading, isError, error } = useQuery({
-    queryKey: ["evals-compare", leftId, rightId],
+    queryKey: ["evals-compare", leftId, rightId, ...scopeKey],
     queryFn:  () => defaultApi.getEvalRuns(500),
     staleTime: 15_000,
   });
 
-  const runs = data?.items ?? [];
+  // Backend-authoritative metric rows for single-run mode.  Skipped when
+  // diffing two runs because the two-run view builds its table locally from
+  // fields already present on EvalRunRecord (no extra round-trip needed).
+  const backendCompare = useQuery({
+    queryKey: ["evals-compare-backend", leftId, ...scopeKey],
+    queryFn:  () => defaultApi.getEvalComparison([leftId]),
+    enabled:  singleRunMode,
+    staleTime: 15_000,
+    retry:    false,
+  });
+
+  // #425: normalize through the shared helper so a future shape flip
+  // (`T[]` instead of `{items, ...}`) doesn't crash this widget.
+  const runs = unwrapList<import("../lib/types").EvalRunRecord>(data);
   const left  = runs.find((r) => r.eval_run_id === leftId);
   const right = runs.find((r) => r.eval_run_id === rightId);
 
@@ -427,7 +447,15 @@ export function EvalComparisonPage({ leftId, rightId }: EvalComparisonPageProps)
             <p className="text-[13px] text-gray-700 dark:text-zinc-300">Failed to load eval runs</p>
             <p className="text-[12px] text-gray-400 dark:text-zinc-500">{error instanceof Error ? error.message : "Unknown error"}</p>
           </div>
-        ) : !left || !right ? (
+        ) : singleRunMode && !left ? (
+          <div className="flex flex-col items-center justify-center py-16 gap-2 text-center">
+            <AlertTriangle size={24} className="text-amber-500" />
+            <p className="text-[13px] text-gray-700 dark:text-zinc-300">Run not found: {leftId}</p>
+            <button onClick={handleBack} className="mt-2 text-[12px] text-indigo-400 hover:text-indigo-300 transition-colors">
+              ← Back to Evaluations
+            </button>
+          </div>
+        ) : !singleRunMode && (!left || !right) ? (
           <div className="flex flex-col items-center justify-center py-16 gap-2 text-center">
             <AlertTriangle size={24} className="text-amber-500" />
             <p className="text-[13px] text-gray-700 dark:text-zinc-300">
@@ -439,7 +467,30 @@ export function EvalComparisonPage({ leftId, rightId }: EvalComparisonPageProps)
               ← Back to Evaluations
             </button>
           </div>
-        ) : (
+        ) : singleRunMode ? (
+          left ? (
+          <>
+            <RunPanel run={left} side="left" highlight="tie" />
+            {backendCompare.data && backendCompare.data.rows.length > 0 && (
+              <div>
+                <p className="text-[11px] font-medium text-gray-400 dark:text-zinc-500 uppercase tracking-wider mb-3">
+                  Metrics (from /v1/evals/compare)
+                </p>
+                <ul className="divide-y divide-gray-200 dark:divide-zinc-800 rounded-lg border border-gray-200 dark:border-zinc-800 bg-gray-50 dark:bg-zinc-900">
+                  {backendCompare.data.rows.map((row) => (
+                    <li key={row.metric} className="flex justify-between px-4 py-2 text-[12px]">
+                      <span className="text-gray-500 dark:text-zinc-400 font-mono">{row.metric}</span>
+                      <span className="text-gray-800 dark:text-zinc-200 font-mono">
+                        {JSON.stringify(row.values[leftId] ?? null)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </>
+          ) : null
+        ) : !left || !right ? null : (
           <>
             {/* Score delta headline */}
             {comparison && comparison.scoreDelta !== null && (

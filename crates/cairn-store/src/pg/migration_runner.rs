@@ -130,6 +130,381 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         "harden_prompt_schema",
         include_str!("migrations/V023__harden_prompt_schema.sql"),
     ),
+    (
+        24,
+        "create_tool_call_approvals",
+        include_str!("migrations/V024__create_tool_call_approvals.sql"),
+    ),
+    (
+        25,
+        "create_cost_projections",
+        include_str!("migrations/V025__create_cost_projections.sql"),
+    ),
+    (
+        26,
+        "create_recovery_and_decision_projections",
+        include_str!("migrations/V026__create_recovery_and_decision_projections.sql"),
+    ),
+    (
+        27,
+        "add_run_completion_annotation",
+        include_str!("migrations/V027__add_run_completion_annotation.sql"),
+    ),
+    (
+        28,
+        "create_tool_invocation_cache_hits",
+        include_str!("migrations/V028__create_tool_invocation_cache_hits.sql"),
+    ),
+    (
+        29,
+        "tool_invocation_args_output",
+        include_str!("migrations/V029__tool_invocation_args_output.sql"),
+    ),
+    (
+        30,
+        "add_terminal_write_recovery",
+        include_str!("migrations/V030__add_terminal_write_recovery.sql"),
+    ),
+    (
+        31,
+        "f65_session_extensions",
+        include_str!("migrations/V031__f65_session_extensions.sql"),
+    ),
+    (
+        32,
+        "f65_orchestrator_projections",
+        include_str!("migrations/V032__f65_orchestrator_projections.sql"),
+    ),
+    (
+        33,
+        "create_tool_invocation_progress",
+        include_str!("migrations/V033__create_tool_invocation_progress.sql"),
+    ),
+    (
+        34,
+        "create_eval_runs",
+        include_str!("migrations/V034__create_eval_runs.sql"),
+    ),
+    // RFC-025 Phase 2a.1 milestone 1 (credentials): durable credentials +
+    // credential_rotations projection.
+    (
+        35,
+        "create_credentials",
+        include_str!("migrations/V035__create_credentials.sql"),
+    ),
+    // RFC-025 Phase 2a.1 milestone 2 (tenant quotas): tenant_quotas +
+    // tenant_quota_violations.
+    (
+        36,
+        "create_tenant_quotas",
+        include_str!("migrations/V036__create_tenant_quotas.sql"),
+    ),
+    // RFC-025 Phase 2a.1 milestone 3 (provider budgets): provider_budgets.
+    (
+        37,
+        "create_provider_budgets",
+        include_str!("migrations/V037__create_provider_budgets.sql"),
+    ),
+    // RFC-025 Phase 2a.1 milestone 4 (licenses).
+    (
+        38,
+        "create_licenses",
+        include_str!("migrations/V038__create_licenses.sql"),
+    ),
+    // RFC-025 Phase 1.5a (triggers): triggers + run_templates +
+    // trigger_fires. Renamed from V035 in Phase 3 to resolve a version
+    // collision with the credentials migration above. The underlying DDL
+    // is unchanged — this is a rename only; the governance + trigger
+    // migrations were never wired into the runner before Phase 3.
+    (
+        39,
+        "create_trigger_projections",
+        include_str!("migrations/V039__create_trigger_projections.sql"),
+    ),
+    // RFC-025 Phase 3 (provider bindings + connections): projection
+    // tables so operator-configured provider state survives restart.
+    (
+        40,
+        "create_provider_bindings_and_connections",
+        include_str!("migrations/V040__create_provider_bindings_and_connections.sql"),
+    ),
+    // RFC-025 Phase 2b.1: read-model table for `AuditLogEntryRecorded`
+    // so audit records survive a pg/sqlite restart (previously `log_stub`
+    // on both SQL backends — silent loss on restart). Landed on main in
+    // #573 while Phase 2a.2 (#571) was in review.
+    (
+        41,
+        "create_audit_log_entries",
+        include_str!("migrations/V041__create_audit_log_entries.sql"),
+    ),
+    // RFC-025 Phase 2b.1 milestone 2: scheduled_tasks projection so the
+    // runtime recovery sweep can rehydrate due-task state on boot.
+    (
+        42,
+        "create_scheduled_tasks",
+        include_str!("migrations/V042__create_scheduled_tasks.sql"),
+    ),
+    // RFC-025 Phase 2b.1 milestone 3: outcomes projection so the
+    // evaluator-optimizer feedback loop keeps calibration inputs
+    // across restart.
+    (
+        43,
+        "create_outcomes",
+        include_str!("migrations/V043__create_outcomes.sql"),
+    ),
+    // RFC-025 Phase 2b.1 milestone 4: plan_reviews projection (RFC 018)
+    // so plan-mode artifacts + operator resolutions survive restart.
+    (
+        44,
+        "create_plan_reviews",
+        include_str!("migrations/V044__create_plan_reviews.sql"),
+    ),
+    // RFC-025 Phase 2a.2 milestone 1 (approval delegations): one audit
+    // row per `ApprovalDelegated` event. Renumbered V039 → V041 → V045
+    // as main published new migrations during this PR's review cycle
+    // (trigger projections at V039; Phase 2b.1 audits/scheduled_tasks/
+    // outcomes/plan_reviews at V041-V044).
+    (
+        45,
+        "create_approval_delegations",
+        include_str!("migrations/V045__create_approval_delegations.sql"),
+    ),
+    // RFC-025 Phase 2a.2 milestone 2 (guardrails): guardrail_policies +
+    // guardrail_evaluations. Renumbered V040 → V042 → V046.
+    (
+        46,
+        "create_guardrails",
+        include_str!("migrations/V046__create_guardrails.sql"),
+    ),
+    // RFC-025 Phase 2a.2 milestone 3 (retention policies). Renumbered
+    // V041 → V043 → V047.
+    (
+        47,
+        "create_retention_policies",
+        include_str!("migrations/V047__create_retention_policies.sql"),
+    ),
+    // RFC-025 Phase 2a.2 milestone 4 (entitlement overrides). Renumbered
+    // V042 → V044 → V048.
+    (
+        48,
+        "create_entitlement_overrides",
+        include_str!("migrations/V048__create_entitlement_overrides.sql"),
+    ),
+    // RFC-025 Phase 2b.2 milestone 1: external_workers projection
+    // (GAP-005). The four `ExternalWorker*` event variants projected
+    // into `InMemoryStore.external_workers` but `log_stub`-ed on pg/
+    // sqlite — restart wiped the fleet catalog. `worker_id` is the PK
+    // with a tenant_id index for the list-by-tenant hot path.
+    // Renumbered V045 → V049 after main published Phase 2a.2
+    // (V045-V048) during this PR's review cycle.
+    (
+        49,
+        "create_external_workers",
+        include_str!("migrations/V049__create_external_workers.sql"),
+    ),
+    // Issue #578: add `workspaces.archived_at` on Postgres. The column
+    // backs the soft-delete flow shipped in #225 (issue #218). The
+    // original migration landed as `V020__workspace_archived_at.sql`
+    // under `crates/cairn-store/migrations/` but was never wired into
+    // this registry (the V020 slot was taken by
+    // `add_checkpoint_data_json`). Fresh Postgres installs therefore
+    // ran `UPDATE workspaces SET archived_at = …` against a non-existent
+    // column. SQLite sidestepped the bug via an inline pragma-gated
+    // ALTER in `sqlite/adapter.rs`. Renumbered V045 → V050 after main
+    // published Phase 2a.2 (V045-V048) and Phase 2b.2 (V049) during
+    // this PR's review cycle.
+    (
+        50,
+        "add_workspace_archived_at",
+        include_str!("migrations/V050__add_workspace_archived_at.sql"),
+    ),
+    // RFC-025 Phase 2b.2b (PR #593) and 2b.3 (PR #594) together
+    // landed eleven migration SQL files on disk — V051..V061 — but
+    // failed to register them here, so fresh Postgres installs would
+    // hit `relation "resource_shares" does not exist` (etc.) on the
+    // first projection write. The `sequential no gaps` contract test
+    // only hard-checks V001..V017, so the omission slipped through
+    // review on both PRs. Wiring them in here (introduced by PR #595
+    // alongside V062 = pause_schedules and extended by this PR's
+    // V063..V065).
+    (
+        51,
+        "create_resource_shares",
+        include_str!("migrations/V051__create_resource_shares.sql"),
+    ),
+    (
+        52,
+        "create_signal_ingestions",
+        include_str!("migrations/V052__create_signal_ingestions.sql"),
+    ),
+    (
+        53,
+        "create_subagent_spawns",
+        include_str!("migrations/V053__create_subagent_spawns.sql"),
+    ),
+    (
+        54,
+        "create_user_messages",
+        include_str!("migrations/V054__create_user_messages.sql"),
+    ),
+    (
+        55,
+        "create_soul_patches",
+        include_str!("migrations/V055__create_soul_patches.sql"),
+    ),
+    (
+        56,
+        "create_tool_recovery_pauses",
+        include_str!("migrations/V056__create_tool_recovery_pauses.sql"),
+    ),
+    (
+        57,
+        "create_ingest_jobs",
+        include_str!("migrations/V057__create_ingest_jobs.sql"),
+    ),
+    (
+        58,
+        "create_default_settings",
+        include_str!("migrations/V058__create_default_settings.sql"),
+    ),
+    (
+        59,
+        "create_channels",
+        include_str!("migrations/V059__create_channels.sql"),
+    ),
+    (
+        60,
+        "create_notifications",
+        include_str!("migrations/V060__create_notifications.sql"),
+    ),
+    (
+        61,
+        "create_checkpoint_strategies",
+        include_str!("migrations/V061__create_checkpoint_strategies.sql"),
+    ),
+    // PR #595 (issue #592): pause_schedules projection. Replaces the
+    // event-log walker in `PauseScheduleReadModel::list_due` with
+    // an evict-on-resume table — `RunStateChanged(→Paused)` with a
+    // `resume_after_ms` INSERTs a row, and any transition away from
+    // Paused DELETEs it.
+    (
+        62,
+        "create_pause_schedules",
+        include_str!("migrations/V062__create_pause_schedules.sql"),
+    ),
+    // RFC-025 Phase 2b.4 milestone 2: eval datasets + rubrics +
+    // baselines. Renumbered V062 → V063 after PR #595 took V062.
+    (
+        63,
+        "create_eval_projections",
+        include_str!("migrations/V063__create_eval_projections.sql"),
+    ),
+    // RFC-025 Phase 2b.4 milestone 3: operator_profiles projection.
+    // Renumbered V063 → V064.
+    (
+        64,
+        "create_operator_profiles",
+        include_str!("migrations/V064__create_operator_profiles.sql"),
+    ),
+    // RFC-025 Phase 2b.4 milestone 4: run_costs + run_cost_alerts.
+    // Renumbered V064 → V065.
+    (
+        65,
+        "create_run_cost_projections",
+        include_str!("migrations/V065__create_run_cost_projections.sql"),
+    ),
+    // RFC 026 PR-A0: operator_tenant_roles projection for the
+    // tenant-admin role model (blocker for admin-UI series A1..A6).
+    (
+        66,
+        "create_operator_tenant_roles",
+        include_str!("migrations/V066__create_operator_tenant_roles.sql"),
+    ),
+    // Epic #670 G2: extend the subagent_spawns projection with
+    // the LLM's delegation intent (goal + role). The G1 emitter
+    // writes these columns on every spawn; without this migration
+    // the INSERT fails with "column \"goal\" of relation does not
+    // exist" on existing pg installs that already have
+    // subagent_spawns from V049.
+    (
+        67,
+        "subagent_spawns_goal_role",
+        include_str!("migrations/V067__subagent_spawns_goal_role.sql"),
+    ),
+    // Issue #668: LLM chain-of-thought body projection. Sibling
+    // to provider_calls — stores system prompt, messages, response
+    // text, and tool calls for every successful LLM call.
+    (
+        68,
+        "create_llm_completions",
+        include_str!("migrations/V068__create_llm_completions.sql"),
+    ),
+    // Issue #670 G4 PR-1b-1: concurrent-descendants counter on runs.
+    // Adds `in_flight_descendants BIGINT NOT NULL DEFAULT 0` and
+    // `root_run_id TEXT` (nullable) so the subagent driver can bound
+    // per-root fan-out atomically via compare-and-increment. Backfills
+    // `root_run_id = run_id` on existing root runs.
+    (
+        69,
+        "runs_descendants_counter",
+        include_str!("migrations/V069__runs_descendants_counter.sql"),
+    ),
+    // #670 G5: partial index on `subagent_spawns.child_run_id` for
+    // the parent-auto-resume terminal-hook lookup. The SQL file has
+    // existed on disk since G5 shipped; it was not wired into the
+    // runner registry, meaning fresh pg boots did not apply the
+    // index and the terminal-hook lookup degraded to a full-scan
+    // once `subagent_spawns` grew. Picking it up here alongside
+    // V071 — CREATE INDEX IF NOT EXISTS is idempotent so operators
+    // who manually applied V070 out-of-band are unaffected.
+    (
+        70,
+        "subagent_spawns_child_run_id_index",
+        include_str!("migrations/V070__subagent_spawns_child_run_id_index.sql"),
+    ),
+    // Dogfood R7 observability: `tool_defs_json` column on
+    // `llm_completions`. See the migration file for the full
+    // motivation + back-compat contract.
+    (
+        71,
+        "add_tool_defs_to_llm_completions",
+        include_str!("migrations/V071__add_tool_defs_to_llm_completions.sql"),
+    ),
+    // RFC 030 PR-B: memory-provider projection tables + retroactive
+    // knowledge-provider pg wiring + cross-family view + scoring-policy
+    // key rename. PR-B1 (RFC 029) shipped the sqlite knowledge schema
+    // inline but its top-level `migrations/V018__*.sql` file was never
+    // wired into this pg runner — V072 closes the gap defensively
+    // (CREATE TABLE IF NOT EXISTS is idempotent for operators who
+    // applied V018.sql manually).
+    (
+        72,
+        "create_provider_projections",
+        include_str!("migrations/V072__create_provider_projections.sql"),
+    ),
+    // #791: projection-backed iteration counter on runs. The SQL file
+    // shipped in #792 but was never added to this registry (the
+    // in-memory + sqlite paths carried the column via their monolithic
+    // schema modules). Wiring it here keeps pg operators who boot via
+    // the migration runner in lockstep with the reader-side column
+    // the applier expects. `CHECK (iteration >= 0)` is idempotent on
+    // re-run, and `ADD COLUMN … DEFAULT 0` is a no-op when the column
+    // already exists.
+    (
+        73,
+        "runs_iteration_counter",
+        include_str!("migrations/V073__runs_iteration_counter.sql"),
+    ),
+    // RFC 031 PR-B2: `project_agent_roles` projection table. PR-B wired
+    // the InMemoryStore applier + HTTP surface + tests; PR-B2 closes
+    // the durable-backend gap so pg serves the handler directly rather
+    // than via the boot-time replay into `InMemoryStore`. Mirrored in
+    // `sqlite/schema.rs` (same table shape).
+    (
+        74,
+        "create_project_agent_roles",
+        include_str!("migrations/V074__create_project_agent_roles.sql"),
+    ),
 ];
 
 /// Return the compile-time migration registry as (version, name, sql) triples.

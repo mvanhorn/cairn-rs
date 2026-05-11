@@ -118,7 +118,27 @@ async fn rotate_waitpoint_hmac_end_to_end() {
     .await;
     assert_eq!(res.status().as_u16(), 400, "stage 3 conflict → 400");
     let body: Value = res.json().await.expect("stage 3 json");
+    // Closes #418: canonical envelope with `code` at the top level
+    // and per-partition breakdown folded under `details` (previously
+    // `outcome` was a peer of `error`). Keep both assertions so a
+    // future refactor cannot silently swap the sidecar field name.
     assert_eq!(body["code"].as_str().unwrap(), "rotation_conflict");
+    assert_eq!(body["status_code"].as_u64().unwrap(), 400, "body={body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "message must be non-empty: {body}"
+    );
+    assert!(
+        body.get("details").is_some(),
+        "per-partition outcome must live under `details` sidecar: {body}"
+    );
+    assert!(
+        body.get("error").is_none() && body.get("outcome").is_none(),
+        "legacy `error`/`outcome` peers must not reappear: {body}"
+    );
 
     // ── Stage 4: fresh kid + new secret still rotates after conflict ─
     let kid_b = format!("{base_kid}-b");

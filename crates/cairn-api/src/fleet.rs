@@ -118,6 +118,12 @@ mod tests {
             version: 1,
             created_at: 1000,
             updated_at,
+            // F65 PR-1: default the additive fields in test fixtures so they
+            // match what serde applies on legacy-shape replay.
+            goal_title: None,
+            issue_budget: None,
+            max_attempts: cairn_store::projections::session::DEFAULT_MAX_ATTEMPTS,
+            attempts_used: 0,
         }
     }
 
@@ -136,6 +142,13 @@ mod tests {
             version: 1,
             created_at: 1000,
             updated_at: 2000,
+            completion_summary: None,
+            completion_verification: None,
+            completion_annotated_at_ms: None,
+            terminal_write_recovery: None,
+            in_flight_descendants: 0,
+            root_run_id: None,
+            iteration: 0,
         }
     }
 

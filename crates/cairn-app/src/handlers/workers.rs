@@ -18,7 +18,7 @@ use cairn_domain::{ProjectKey, RunId, TaskId, WorkerId};
 use cairn_runtime::ExternalWorkerService;
 
 use crate::errors::{
-    bad_request_response, now_ms, runtime_error_response, tenant_scope_mismatch_error,
+    now_ms, runtime_error_response, tenant_scope_mismatch_error, validation_error_response,
 };
 use crate::extractors::TenantScope;
 use crate::helpers::{build_external_worker_report, scoped_worker};
@@ -137,20 +137,19 @@ pub(crate) async fn list_workers_handler(
     tenant_scope: TenantScope,
     Query(query): Query<PaginationQuery>,
 ) -> impl IntoResponse {
+    // #422: honest pagination — fetch `limit + 1`, derive `has_more`.
+    let limit = query.limit();
     match state
         .runtime
         .external_workers
-        .list(tenant_scope.tenant_id(), query.limit(), query.offset())
+        .list(tenant_scope.tenant_id(), limit + 1, query.offset())
         .await
     {
-        Ok(items) => (
-            StatusCode::OK,
-            Json(ListResponse {
-                items,
-                has_more: false,
-            }),
-        )
-            .into_response(),
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            (StatusCode::OK, Json(ListResponse { items, has_more })).into_response()
+        }
         Err(err) => runtime_error_response(err),
     }
 }
@@ -277,7 +276,7 @@ pub(crate) async fn worker_report_handler(
         body.outcome.as_deref(),
     ) {
         Ok(report) => report,
-        Err(err) => return bad_request_response(err),
+        Err(err) => return validation_error_response(err),
     };
 
     match state.runtime.external_workers.report(report).await {

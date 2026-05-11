@@ -40,7 +40,7 @@
 //!
 //! [`control_plane_types`]: super::control_plane_types
 use async_trait::async_trait;
-use ff_core::types::{BudgetId, ExecutionId, QuotaPolicyId};
+use flowfabric::core::types::{BudgetId, ExecutionId, QuotaPolicyId};
 
 use crate::error::FabricError;
 
@@ -48,9 +48,10 @@ use super::control_plane_types::{
     AddExecutionToFlowInput, ApplyDependencyToChildInput, BudgetSpendOutcome, BudgetStatusSnapshot,
     CancelFlowInput, CancelRunInput, ClaimGrantOutcome, CompleteRunInput, CreateFlowInput,
     CreateRunExecutionInput, DeliverApprovalSignalInput, EligibilityResult, ExecutionCreated,
-    FailExecutionOutcome, FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput, QuotaAdmission,
-    RenewLeaseInput, ResumeRunInput, RotationOutcome, StageDependencyEdgeInput,
-    StageDependencyOutcome, SubmitTaskInput, SuspendRunInput,
+    FailExecutionOutcome, FailRunInput, FlowCancelOutcome, IssueGrantAndClaimInput,
+    IssueReclaimGrantInput, IssueReclaimGrantOutcome, QuotaAdmission, ReclaimExecutionInput,
+    ReclaimExecutionOutcome, RenewLeaseInput, ResumeRunInput, RotationOutcome,
+    StageDependencyEdgeInput, StageDependencyOutcome, SubmitTaskInput,
 };
 
 /// Cairn-side FCALL backend for budget, quota, and rotation
@@ -92,8 +93,18 @@ pub trait ControlPlaneBackend: Send + Sync {
         idempotency_key: &str,
     ) -> Result<BudgetSpendOutcome, FabricError>;
 
-    /// Release (reset) a budget's usage counters.
-    async fn release_budget(&self, budget_id: &BudgetId) -> Result<(), FabricError>;
+    /// Release this execution's attribution against a budget.
+    ///
+    /// Per FF 0.13 / cairn #454 clarification, this is **per-execution**
+    /// (not a whole-budget flush). The backend reads the per-execution
+    /// `by_exec` ledger written during [`Self::record_spend`] and
+    /// negates each dimension on the aggregate `usage` counter. The
+    /// budget itself persists across executions.
+    async fn release_budget(
+        &self,
+        budget_id: &BudgetId,
+        execution_id: &ExecutionId,
+    ) -> Result<(), FabricError>;
 
     /// Read a budget's current definition + usage. Returns `Ok(None)`
     /// when the budget does not exist in FF.
@@ -175,11 +186,14 @@ pub trait ControlPlaneBackend: Send + Sync {
     /// Cancel an execution (operator-initiated terminal).
     async fn cancel_run_execution(&self, input: CancelRunInput) -> Result<(), FabricError>;
 
-    /// Suspend an execution. Shared by run-pause and
-    /// enter-waiting-approval; the difference is entirely in the
-    /// `SuspendRunInput` fields the caller fills in (reason_code,
-    /// resume_condition_json, timeout_at).
-    async fn suspend_run_execution(&self, input: SuspendRunInput) -> Result<(), FabricError>;
+    // `suspend_*` is NOT on this trait. CG-c (2026-04-26, FF#322) moved
+    // the service-layer suspend path off the Lua-ARGV glue and onto
+    // `EngineBackend::suspend_by_triple` directly — see
+    // `crate::suspension::suspend_by_triple`. Service code builds a
+    // `LeaseFence` + `SuspendArgs` from the lease context and calls
+    // the FF trait without a cairn-side translation layer. Keeping
+    // `suspend_run_execution` on `ControlPlaneBackend` would require
+    // carrying the old Lua JSON translator indefinitely.
 
     /// Resume a suspended execution.
     async fn resume_run_execution(&self, input: ResumeRunInput) -> Result<(), FabricError>;
@@ -225,11 +239,59 @@ pub trait ControlPlaneBackend: Send + Sync {
         input: IssueGrantAndClaimInput,
     ) -> Result<ClaimGrantOutcome, FabricError>;
 
+    // ── #710: FF 0.15 reclaim-grant path ────────────────────────────────
+    //
+    // Default impls return `EngineUnavailable("<op>")` so backends that
+    // don't ship the reclaim primitive (pre-FF-0.15, in-memory stubs,
+    // test fakes) surface a clean "not supported on this backend"
+    // error rather than silently failing. The Valkey + PG + SQLite
+    // real backends override with actual bodies in follow-up PRs —
+    // this PR only adds the trait surface + cairn-side types.
+
+    /// Issue a reclaim grant for an execution whose lease expired
+    /// mid-terminal-FCALL. RFC-024 §3.2.
+    ///
+    /// Admits `lease_expired_reclaimable` / `lease_revoked`
+    /// executions into the reclaim path. Returned grant is handed
+    /// to [`Self::reclaim_execution`] to mint a fresh attempt.
+    ///
+    /// See the `ControlPlaneBackend` module docstring for the
+    /// control-plane vs worker-path rationale.
+    async fn issue_reclaim_grant(
+        &self,
+        _input: IssueReclaimGrantInput,
+    ) -> Result<IssueReclaimGrantOutcome, FabricError> {
+        Err(FabricError::Engine(Box::new(
+            flowfabric::core::engine_error::EngineError::Unavailable {
+                op: "issue_reclaim_grant",
+            },
+        )))
+    }
+
+    /// Consume a `ReclaimGrantHandle` (from [`Self::issue_reclaim_grant`])
+    /// to mint a fresh attempt on a previously lease-expired
+    /// execution. RFC-024 §3.2.
+    ///
+    /// The new attempt's `HandleKind::Reclaimed` signals to downstream
+    /// observability that the recovery path fired. Cairn emits
+    /// `BridgeEvent::TerminalWriteRecovered` when the grant+reclaim
+    /// pair succeeds.
+    async fn reclaim_execution(
+        &self,
+        _input: ReclaimExecutionInput,
+    ) -> Result<ReclaimExecutionOutcome, FabricError> {
+        Err(FabricError::Engine(Box::new(
+            flowfabric::core::engine_error::EngineError::Unavailable {
+                op: "reclaim_execution",
+            },
+        )))
+    }
+
     // ── Task lifecycle (Phase D PR 2b) ──────────────────────────────────
     //
     // The `complete_run_execution`, `fail_run_execution`,
-    // `cancel_run_execution`, `suspend_run_execution`, and
-    // `resume_run_execution` methods above are kind-neutral — they
+    // `cancel_run_execution`, and `resume_run_execution` methods above
+    // are kind-neutral — they
     // operate on an `ExecutionId` and don't care whether cairn
     // originally minted it as a run or a task. [`FabricTaskService`]
     // reuses them verbatim; the "_run_" in the name is historical and

@@ -11,6 +11,7 @@
 //! The `SyncProjection` trait in this module defines the write-side
 //! contract: applying stored events to update current state.
 
+pub mod agent_role;
 pub mod approval;
 pub mod approval_policy;
 pub mod audit;
@@ -28,18 +29,22 @@ pub mod external_worker;
 pub mod ff_lease_history_cursor;
 pub mod guardrail;
 pub mod ingest_job;
+pub mod llm_completion_body;
 pub mod llm_traces;
 pub mod mailbox;
 pub mod model_comparison;
 pub mod notification;
 pub mod operator_intervention;
 pub mod operator_profile;
+pub mod operator_tenant_role;
 pub mod org;
 pub mod outcome;
 pub mod pause_schedule;
+pub mod plan_review;
 pub mod prompt;
 pub mod provider;
 pub mod quota;
+pub mod reasoning_step;
 pub mod recovery;
 pub mod retention;
 pub mod routing;
@@ -47,23 +52,34 @@ pub mod run;
 pub mod run_sla;
 pub mod scheduled_task;
 pub mod session;
+pub mod session_outcome;
 pub mod sharing;
 pub mod signal;
 pub mod signal_subscription;
 pub mod snapshot;
+pub mod soul_patch;
+pub mod subagent;
 pub mod task;
+pub mod tool_call_approval;
 pub mod tool_invocation;
+pub mod tool_recovery;
+pub mod trigger;
+pub mod user_message;
 pub mod workspace_membership;
 
+pub use agent_role::*;
 pub use approval::*;
 pub use approval_policy::*;
 pub use audit::*;
 pub use channel::*;
 pub use checkpoint::*;
-pub use checkpoint_strategy::*;
+pub use checkpoint_strategy::{
+    checkpoint_strategy_sentinel_project, CheckpointStrategyReadModel,
+    CHECKPOINT_STRATEGY_DEFAULT_MAX_CHECKPOINTS,
+};
 pub use commercial::*;
 pub use credential::*;
-pub use defaults::*;
+pub use defaults::{defaults_scope_str, rehydrate_defaults_scope, DefaultsReadModel};
 pub use eval_baseline::*;
 pub use eval_dataset::*;
 pub use eval_rubric::*;
@@ -71,16 +87,19 @@ pub use eval_run::*;
 pub use external_worker::*;
 pub use ff_lease_history_cursor::{FfLeaseHistoryCursor, FfLeaseHistoryCursorStore};
 pub use guardrail::*;
-pub use ingest_job::*;
+pub use ingest_job::{ingest_job_state_str, rehydrate_ingest_job_state, IngestJobReadModel};
+pub use llm_completion_body::{LlmCompletionBodyReadModel, LlmCompletionBodyRecord};
 pub use llm_traces::LlmCallTraceReadModel;
 pub use mailbox::*;
 pub use model_comparison::*;
 pub use notification::*;
 pub use operator_intervention::*;
 pub use operator_profile::{OperatorProfileReadModel, OperatorProfileRecord};
+pub use operator_tenant_role::{OperatorTenantRoleReadModel, OperatorTenantRoleRecord};
 pub use org::*;
 pub use outcome::*;
 pub use pause_schedule::*;
+pub use plan_review::{PlanReviewReadModel, PlanReviewRecord, PlanReviewState};
 pub use prompt::*;
 pub use provider::*;
 pub use quota::*;
@@ -91,12 +110,30 @@ pub use run::*;
 pub use run_sla::*;
 pub use scheduled_task::ScheduledTaskReadModel;
 pub use session::*;
+pub use session_outcome::{
+    rehydrate_termination_reason, termination_reason_kind, F65CheckpointReadModel,
+    F65CheckpointRecord, SessionOutcomeReadModel, SessionOutcomeRecord, WorkspaceRegistryReadModel,
+    WorkspaceRegistryRecord, WorkspaceRegistryStatus, WorkspaceSnapshotReadModel,
+    WorkspaceSnapshotRecord, WorkspaceSnapshotWriter,
+};
 pub use sharing::*;
 pub use signal::*;
 pub use signal_subscription::{SignalSubscriptionReadModel, SignalSubscriptionRecord};
 pub use snapshot::*;
+pub use soul_patch::{SoulPatchReadModel, SoulPatchRecord, SoulPatchState};
+pub use subagent::{SubagentSpawnReadModel, SubagentSpawnRecord};
 pub use task::*;
+pub use tool_call_approval::{
+    ToolCallApprovalReadModel, ToolCallApprovalRecord, ToolCallApprovalState,
+};
 pub use tool_invocation::*;
+pub use tool_recovery::{ToolRecoveryPauseReadModel, ToolRecoveryPauseRecord};
+pub use trigger::{
+    skip_reason_discriminant, suspension_reason_discriminant, RunTemplateReadModel,
+    RunTemplateRecord, TriggerFireOutcome, TriggerFireReadModel, TriggerFireRecord,
+    TriggerReadModel, TriggerRecord, TriggerStateKind,
+};
+pub use user_message::{UserMessageReadModel, UserMessageRecord};
 pub use workspace_membership::{WorkspaceMemberRecord, WorkspaceMembershipReadModel};
 
 use crate::error::StoreError;
