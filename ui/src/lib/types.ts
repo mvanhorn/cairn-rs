@@ -2608,3 +2608,46 @@ export interface ProjectToolsResponse {
   total: number;
   has_more: boolean;
 }
+
+// ── RFC 032: Completion contracts ────────────────────────────────────────────
+
+/** RFC 032 PR-5: operator-declared definition-of-done for a run's
+ *  `complete_run` action. Discriminator is `kind`. Shape mirrors
+ *  `cairn_domain::completion_contracts::CompletionContract` —
+ *  keep them aligned when either side changes. */
+export type CompletionContract =
+  | { kind: "prose_non_empty" }
+  | { kind: "prose"; min_chars: number; min_citations: number }
+  | { kind: "file"; paths: FileRequirement[] }
+  | {
+      kind: "pull_request";
+      expected_repo?: string | null;
+      expected_head_branch?: string | null;
+      must_be_open: boolean;
+    }
+  | { kind: "structured"; schema: unknown }
+  | { kind: "external_state"; check: ExternalStateCheck };
+
+/** One entry in a `file` contract. Path is relative to the run's
+ *  working_dir; absolute / `.` / `..` components reject at
+ *  deserialize time. */
+export interface FileRequirement {
+  path: string;
+  contains_regex?: string | null;
+  max_bytes?: number | null;
+}
+
+/** RFC 032 Phase 3 external-state check. Verifier returns
+ *  `not_implemented` in Phase 1. */
+export type ExternalStateCheck =
+  | { kind: "github_issue_closed"; repo: string; number: number }
+  | { kind: "github_pr_merged"; repo: string; number: number };
+
+/** How a `CompletionContract` arrived at a run. Surfaced on
+ *  `CompletionContractResolved` SSE frames so the operator timeline
+ *  distinguishes inferred contracts from explicitly-declared ones. */
+export type ContractSource =
+  | "explicit_create"
+  | "explicit_spawn"
+  | "inferred"
+  | "re_inferred_on_goal_change";

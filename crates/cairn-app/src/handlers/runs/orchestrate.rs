@@ -1126,6 +1126,177 @@ pub(crate) async fn drive_run_iteration(
         }
     };
 
+    // RFC 032 PR-5: resolve the completion contract for this run.
+    //
+    // Three paths (§2.1 + §2.3):
+    //
+    //   1. Persisted explicit contract (source = ExplicitCreate or
+    //      ExplicitSpawn): use it unchanged. Goal pivots NEVER auto-
+    //      re-infer an explicit contract (invariant #1); the mismatch
+    //      is logged for operator visibility but never touches the
+    //      persisted row.
+    //
+    //   2. Persisted inferred contract + goal changed: re-infer from
+    //      the current goal, persist the new contract + hash, emit
+    //      `ReInferredOnGoalChange`.
+    //
+    //   3. No persisted contract: infer from goal, persist, emit
+    //      `Inferred`.
+    //
+    // Emission is one-shot per resolution — we read the persisted
+    // contract first and only emit `CompletionContractResolved` when
+    // we actually wrote (cases 2 and 3). A persisted contract re-read
+    // on every orchestrate boot does NOT re-emit (invariant keeping
+    // the operator timeline readable).
+    let persisted_contract = match crate::resolve_run_struct_default::<
+        cairn_domain::completion_contracts::CompletionContract,
+    >(
+        state.as_ref(),
+        &run.project,
+        &run.run_id,
+        "completion_contract",
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::info!(
+                run_id = %run.run_id,
+                error = %err,
+                "RFC 032: persisted completion_contract failed to deserialize; \
+                 falling through to inference as if no contract was declared"
+            );
+            None
+        }
+    };
+    let persisted_source = crate::resolve_run_struct_default::<
+        cairn_domain::completion_contracts::ContractSource,
+    >(state.as_ref(), &run.project, &run.run_id, "contract_source")
+    .await
+    .ok()
+    .flatten();
+    let persisted_goal_hash = crate::resolve_run_string_default(
+        state.as_ref(),
+        &run.project,
+        &run.run_id,
+        "contract_source_goal_hash",
+    )
+    .await;
+    let current_goal_hash = cairn_domain::completion_contracts::goal_hash(&goal_value);
+
+    let (resolved_contract, resolution_event): (
+        Option<cairn_domain::completion_contracts::CompletionContract>,
+        Option<(
+            cairn_domain::completion_contracts::CompletionContract,
+            cairn_domain::completion_contracts::ContractSource,
+        )>,
+    ) = match (persisted_contract, persisted_source) {
+        (Some(_), Some(cairn_domain::completion_contracts::ContractSource::Inferred))
+            if persisted_goal_hash.as_deref() != Some(current_goal_hash.as_str()) =>
+        {
+            // Case 2: goal drifted; re-infer. The prior contract is
+            // dropped — we persist the fresh one unconditionally.
+            let fresh = cairn_domain::completion_contracts::infer_contract(&goal_value);
+            (
+                Some(fresh.clone()),
+                Some((
+                    fresh,
+                    cairn_domain::completion_contracts::ContractSource::ReInferredOnGoalChange,
+                )),
+            )
+        }
+        (Some(contract), _) => {
+            // Case 1: explicit or matched-hash inferred — no re-emit.
+            (Some(contract), None)
+        }
+        (None, _) => {
+            // Case 3: nothing persisted — infer now.
+            let fresh = cairn_domain::completion_contracts::infer_contract(&goal_value);
+            (
+                Some(fresh.clone()),
+                Some((
+                    fresh,
+                    cairn_domain::completion_contracts::ContractSource::Inferred,
+                )),
+            )
+        }
+    };
+
+    if let Some((contract_to_persist, source)) = resolution_event.as_ref() {
+        if let Err(err) = crate::persist_run_struct_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "completion_contract",
+            contract_to_persist,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = %run.run_id,
+                error = %err,
+                "RFC 032: failed to persist resolved completion_contract default; \
+                 gate will fall through to pre-RFC-032 behaviour on this run"
+            );
+        }
+        if let Err(err) = crate::persist_run_string_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "contract_source_goal_hash",
+            &current_goal_hash,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = %run.run_id,
+                error = %err,
+                "RFC 032: failed to persist contract_source_goal_hash"
+            );
+        }
+        if let Err(err) = crate::persist_run_struct_default(
+            state.as_ref(),
+            &run.project,
+            &run.run_id,
+            "contract_source",
+            source,
+        )
+        .await
+        {
+            tracing::warn!(
+                run_id = %run.run_id,
+                error = %err,
+                "RFC 032: failed to persist contract_source"
+            );
+        }
+        // Emit CompletionContractResolved (Ephemeral per PR-2 —
+        // lands in the event log + SSE stream, no read-model).
+        use cairn_domain::{CompletionContractResolved, RuntimeEvent};
+        use cairn_runtime::make_envelope;
+        let occurred_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis().min(i64::MAX as u128)).unwrap_or(0))
+            .unwrap_or(0);
+        let envelope = make_envelope(RuntimeEvent::CompletionContractResolved(
+            CompletionContractResolved {
+                project: run.project.clone(),
+                session_id: run.session_id.clone(),
+                run_id: run.run_id.clone(),
+                contract: contract_to_persist.clone(),
+                source: *source,
+                goal_hash: current_goal_hash.clone(),
+                occurred_at_ms,
+            },
+        ));
+        if let Err(e) = state.runtime.store.append(&[envelope]).await {
+            tracing::warn!(
+                run_id = %run.run_id,
+                error = %e,
+                "RFC 032: failed to append CompletionContractResolved event"
+            );
+        }
+    }
+
     let ctx = OrchestrationContext {
         project: run.project.clone(),
         session_id: run.session_id.clone(),
@@ -1140,7 +1311,7 @@ pub(crate) async fn drive_run_iteration(
             .unwrap_or_else(|| "orchestrator".to_owned()),
         run_started_at_ms: now_ms,
         working_dir: working_dir.clone(),
-        completion_contract: None,
+        completion_contract: resolved_contract,
         run_mode: body.mode.clone().or(default_run_mode).unwrap_or_default(),
         discovered_tool_names: vec![],
         step_history: seeded_steps,
@@ -2159,10 +2330,21 @@ pub(crate) async fn drive_run_iteration(
     // loop's own clean-shutdown path. Full rationale in the PR
     // description.
     let watchdog_ms = cfg.timeout_ms.saturating_add(60_000);
+    // RFC 032 PR-5: install the contract verifier adapter. The gate
+    // calls this at most once per `complete_run` proposal AND only
+    // when `ctx.completion_contract.is_some()` (populated above for
+    // every non-legacy run); the builder handoff is always safe to
+    // install unconditionally — `None`-contract runs pay no cost.
+    let contract_verifier_adapter: Arc<dyn cairn_orchestrator::ContractVerifier> =
+        Arc::new(crate::contract_verifier_adapter::ContractVerifierAdapter {
+            project_repo_access: state.project_repo_access.clone(),
+            github_client: None,
+        });
     let orchestrator = OrchestratorLoop::new(gather, decide, execute, cfg)
         .with_emitter(emitter)
         .with_checkpoint_hook(dual_ckpt_hook)
-        .with_approval_reader(tool_call_approval_reader_for_drain);
+        .with_approval_reader(tool_call_approval_reader_for_drain)
+        .with_contract_verifier(contract_verifier_adapter);
     let loop_outcome = match tokio::time::timeout(
         std::time::Duration::from_millis(watchdog_ms),
         orchestrator.run(ctx),

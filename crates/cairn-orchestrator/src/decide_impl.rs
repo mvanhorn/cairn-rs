@@ -1226,6 +1226,101 @@ fn build_user_message(
     build_user_message_with_role(ctx, gather, budget, append_stuck_nudge, None)
 }
 
+/// RFC 032 §4.1: render the resolved `CompletionContract` as a
+/// sub-agent-role user-message section. The rendered text names the
+/// contract's `kind()` and a one-line per-variant summary — just
+/// enough for the LLM to know what it is being graded on without
+/// burning prompt budget on the full JSON envelope (the verifier
+/// already has that; the LLM only needs the shape).
+///
+/// Invariants:
+///   * The wording MUST end with "The gate will reject with a
+///     structured code if it doesn't." — R38-style "complete without
+///     the deliverable" failures are the exact reason this section
+///     exists, and the directive is load-bearing.
+///   * Sub-agent roles only; orchestrator-tier roles skip the render
+///     (§4.1 rationale — the orchestrator is not the actor producing
+///     the final_answer the contract grades).
+fn render_completion_contract_section(
+    contract: &cairn_domain::completion_contracts::CompletionContract,
+) -> String {
+    use cairn_domain::completion_contracts::{CompletionContract as Cc, ExternalStateCheck};
+    let body = match contract {
+        Cc::ProseNonEmpty => "Any non-empty text.".to_owned(),
+        Cc::Prose {
+            min_chars,
+            min_citations,
+        } => format!("min_chars: {min_chars}, min_citations: {min_citations}"),
+        Cc::File { paths } => {
+            let list = paths
+                .iter()
+                .map(|r| r.path.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("paths: {list}")
+        }
+        Cc::PullRequest {
+            expected_repo,
+            expected_head_branch,
+            must_be_open,
+        } => {
+            let repo = expected_repo.as_deref().unwrap_or("<any allowlisted>");
+            let branch = expected_head_branch
+                .as_ref()
+                .map(|r| r.as_str().to_owned())
+                .unwrap_or_else(|| "<any>".to_owned());
+            format!(
+                "expected_repo: {repo}, expected_head_branch: {branch}, must_be_open: {must_be_open}"
+            )
+        }
+        Cc::Structured { schema } => {
+            // A ContractSchema can hold up to 32 KiB of JSON. Full
+            // serialization + chars().take(100) would mean every
+            // prompt-build iteration serializes the whole blob just to
+            // throw 99% of the bytes away — wasteful when the render
+            // is on the critical path (Gemini PR-5 review). Walk the
+            // document surface instead: the schema is either an
+            // object (list top-level keys) or a boolean (render
+            // inline); `type` gets a dedicated line when present.
+            let inner = schema.as_value();
+            let summary = match inner {
+                serde_json::Value::Bool(b) => format!("boolean: {b}"),
+                serde_json::Value::Object(map) => {
+                    let top_type = map
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<unset>");
+                    let keys: Vec<&str> = map.keys().map(String::as_str).take(8).collect();
+                    format!("type: {top_type}, keys: [{}]", keys.join(", "))
+                }
+                // `ContractSchema::try_new` refuses anything else at
+                // deserialize time, so this arm is unreachable on
+                // valid data — defensive fallback so a corrupt
+                // persisted row doesn't panic the prompt.
+                _ => "<opaque>".to_owned(),
+            };
+            format!("schema: {summary}")
+        }
+        Cc::ExternalState { check } => match check {
+            ExternalStateCheck::GitHubIssueClosed { repo, number } => {
+                format!("check: GitHubIssueClosed({repo}#{number})")
+            }
+            ExternalStateCheck::GitHubPrMerged { repo, number } => {
+                format!("check: GitHubPrMerged({repo}#{number})")
+            }
+        },
+    };
+    format!(
+        "## Completion contract\n\
+         kind: {kind}\n\
+         {body}\n\
+         \n\
+         Your complete_run's final_answer must match the above. The gate \
+         will reject with a structured code if it doesn't.",
+        kind = contract.kind(),
+    )
+}
+
 /// RFC 031 PR-C sites 3+4: accept an optional resolved `AgentRole` so
 /// the memory hint + footer read `role.response_shape` directly rather
 /// than via the static `response_shape_for(&ctx.agent_type)` fallback.
@@ -1250,6 +1345,22 @@ fn build_user_message_with_role(
         .parent_context
         .as_ref()
         .map(|c| format!("## Parent context\n{c}"));
+    // RFC 032 §4.1: render the resolved contract's SHAPE as a user-message
+    // section for sub-agent roles. Orchestrator-tier roles do not get it
+    // (the orchestrator's own complete_run grades against the orchestrator
+    // run's contract — not the child's). Rendered between Parent context
+    // and Run state so the child sees the binding direction before any
+    // retrieved context. Orchestrator-tier check uses structural tier
+    // (same pattern as the Run-state workspace-path block below).
+    let completion_contract_part: Option<String> = ctx.completion_contract.as_ref().and_then(|c| {
+        let tier_for_contract: AgentRoleTier = role
+            .map(|r| r.tier)
+            .unwrap_or_else(|| tier_for(&ctx.agent_type));
+        if matches!(tier_for_contract, AgentRoleTier::Orchestrator) {
+            return None;
+        }
+        Some(render_completion_contract_section(c))
+    });
     // #797: iteration counter is intentionally hidden from the
     // model. R21 dogfood surfaced that sub-agents read `iteration: 3`
     // and self-bailed with partial-completion reports thinking they
@@ -1396,8 +1507,13 @@ fn build_user_message_with_role(
             .as_deref()
             .map(estimate_tokens)
             .unwrap_or(0);
+        let contract_cost = completion_contract_part
+            .as_deref()
+            .map(estimate_tokens)
+            .unwrap_or(0);
         let fixed_cost = estimate_tokens(&goal_part)
             + parent_ctx_cost
+            + contract_cost
             + estimate_tokens(&run_state_part)
             + estimate_tokens(&footer)
             + nudge_cost
@@ -1536,12 +1652,17 @@ fn build_user_message_with_role(
     };
 
     // ── Assemble ──────────────────────────────────────────────────────────────
-    // Order: Goal → Parent context (optional) → Run state → optional
-    // sections (memory, step history, …) → footer. Parent context
-    // sits adjacent to the goal so the child reads the parent's
-    // binding direction before any retrieved context.
+    // Order: Goal → Parent context (optional) → Completion contract
+    // (optional, sub-agent roles only — RFC 032 §4.1) → Run state →
+    // optional sections (memory, step history, …) → footer. Contract
+    // sits between Parent context and Run state so the child reads the
+    // binding direction, then sees what it is being graded on, before
+    // any retrieved context.
     let mut parts: Vec<String> = vec![goal_part];
     if let Some(s) = parent_context_part {
+        parts.push(s);
+    }
+    if let Some(s) = completion_contract_part {
         parts.push(s);
     }
     parts.push(run_state_part);
@@ -1777,6 +1898,10 @@ fn spawn_subagent_tool_def_with_enum(role_enum: Vec<String>) -> serde_json::Valu
                     "reuse_sandbox_from": {
                         "type": "string",
                         "description": "OPTIONAL. Run id of a prior sibling under the same root whose sandbox should be reused. When set, the new child inherits that run's working_dir — use it to let a replacement sub-agent continue from a dead sibling's partial on-disk work (e.g. a first attempt cloned the repo and applied half the changes before the completion gate rejected it; a second attempt with `reuse_sandbox_from` set to the first's run_id picks up from that on-disk state instead of re-cloning into an empty dir). Leave unset for a fresh sandbox (today's default behaviour). The referenced run MUST be a sibling of this spawn under the same root (same parent chain) and same project — any other value is rejected and the rejection surfaces back into step_history on the next DECIDE."
+                    },
+                    "completion_contract": {
+                        "type": "object",
+                        "description": "OPTIONAL (RFC 032). Declare the child's definition-of-done. When set, cairn grades the child's complete_run against this contract before accepting it; when omitted the child's goal is inferred. Supported kinds: `prose_non_empty`, `prose` ({min_chars, min_citations}), `file` ({paths: [{path, contains_regex?, max_bytes?}]}), `pull_request` ({expected_repo?, expected_head_branch?, must_be_open}), `structured` ({schema}), and `external_state` ({check}). `structured` (Phase 2) and `external_state` (Phase 3) are accepted on the wire but their verifiers return `not_implemented` in Phase 1 — pin the shape today, grade later. Use `pull_request` when the child MUST ship a PR (cairn re-reads GitHub to confirm); use `file` when a specific artifact path must exist; use `prose` with min_citations when the child must cite sources. Invalid contracts reject the spawn with a malformed_spawn_proposal error so the next DECIDE can correct."
                     }
                 },
                 "required": ["role", "goal"],
@@ -2078,6 +2203,25 @@ fn tool_calls_to_proposals(
                 if let Some(reuse) = reuse_sandbox_opt {
                     forwarded["reuse_sandbox_from"] = serde_json::Value::String(reuse);
                 }
+                // RFC 032 PR-5: forward `completion_contract` verbatim on
+                // the native path. The execute-side branch calls the
+                // validating extractor to reject malformed shapes; here
+                // we just pass the raw object through so that extractor
+                // sees exactly what the LLM emitted (including nested-
+                // legacy-shape callers that put it under `tool_args`).
+                // We look at BOTH the flat top level and the nested
+                // legacy tool_args map so the downstream extractor
+                // can route either shape.
+                if let Some(raw_obj) = raw_args.as_object() {
+                    if let Some(contract) = raw_obj.get("completion_contract") {
+                        forwarded["completion_contract"] = contract.clone();
+                    } else if let Some(inner) = raw_obj.get("tool_args").and_then(|v| v.as_object())
+                    {
+                        if let Some(contract) = inner.get("completion_contract") {
+                            forwarded["completion_contract"] = contract.clone();
+                        }
+                    }
+                }
                 return Some(ActionProposal {
                     action_type: ActionType::SpawnSubagent,
                     description: format!("spawn {role}"),
@@ -2288,6 +2432,63 @@ fn parse_spawn_subagent_args(args: &serde_json::Value) -> (String, String) {
 /// declares `string`, and a malformed shape is better dropped than
 /// propagated to `TaskService::spawn_subagent` which would reject it
 /// with a less-specific error.
+/// RFC 032 PR-5: extraction outcome for the `spawn_subagent`
+/// `completion_contract` field. Mirrors the malformed-spawn
+/// pattern used elsewhere in the extraction layer: a structurally
+/// present-but-broken field is surfaced as `Malformed` so the
+/// execute-side caller can reject with
+/// `MALFORMED_SPAWN_PROPOSAL_PREFIX` and let the LLM retry. Absent /
+/// null / object-with-valid-shape → `Absent` / `Valid`.
+pub(crate) enum ContractArg {
+    Absent,
+    Valid(cairn_domain::completion_contracts::CompletionContract),
+    Malformed(String),
+}
+
+/// RFC 032 PR-5: extract the optional `completion_contract` object from
+/// a `spawn_subagent` tool-call's `arguments`. Accepts the same two
+/// shapes as [`parse_spawn_subagent_args`]:
+///
+///   1. Flat (native): `args.completion_contract`
+///   2. Legacy nested: `args.tool_args.completion_contract`
+///
+/// `serde_json::from_value::<CompletionContract>` runs the full type
+/// validation chain (RelPath, BoundedRegex, ContractSchema TooLarge),
+/// and then `contract.validate()` enforces the structural caps (paths
+/// non-empty, Prose constraints not both zero, etc). Any failure
+/// surfaces as `Malformed` with a short reason string — the caller
+/// wraps it in the standard MALFORMED_SPAWN_PROPOSAL_PREFIX so the
+/// LLM gets a correct-and-retry signal on the next DECIDE turn.
+pub(crate) fn extract_spawn_subagent_completion_contract(args: &serde_json::Value) -> ContractArg {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return ContractArg::Absent,
+    };
+    let source: &serde_json::Map<String, serde_json::Value> =
+        if obj.contains_key("completion_contract") {
+            obj
+        } else if let Some(inner) = obj.get("tool_args").and_then(|v| v.as_object()) {
+            inner
+        } else {
+            obj
+        };
+    let Some(raw) = source.get("completion_contract") else {
+        return ContractArg::Absent;
+    };
+    if raw.is_null() {
+        return ContractArg::Absent;
+    }
+    match serde_json::from_value::<cairn_domain::completion_contracts::CompletionContract>(
+        raw.clone(),
+    ) {
+        Ok(contract) => match contract.validate() {
+            Ok(()) => ContractArg::Valid(contract),
+            Err(e) => ContractArg::Malformed(format!("contract_invalid: {e}")),
+        },
+        Err(e) => ContractArg::Malformed(format!("contract_not_parseable: {e}")),
+    }
+}
+
 pub(crate) fn extract_spawn_subagent_optionals(
     args: &serde_json::Value,
 ) -> (Option<String>, Option<String>) {
@@ -3749,6 +3950,173 @@ mod tests {
             "step history must appear"
         );
         assert!(msg.contains("invoke_tool"), "action kind must appear");
+    }
+
+    // ── RFC 032 PR-5: completion-contract user-message rendering ─────────────
+
+    #[test]
+    fn completion_contract_section_renders_for_sub_agent_role() {
+        let mut c = ctx();
+        c.agent_type = "executor".to_owned();
+        c.completion_contract = Some(
+            cairn_domain::completion_contracts::CompletionContract::Prose {
+                min_chars: 500,
+                min_citations: 2,
+            },
+        );
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            msg.contains("## Completion contract"),
+            "sub-agent role must see the contract section"
+        );
+        assert!(msg.contains("kind: prose"), "kind line must render");
+        assert!(
+            msg.contains("min_chars: 500, min_citations: 2"),
+            "per-variant summary must render"
+        );
+        assert!(
+            msg.contains("gate will reject"),
+            "footer directive must be present"
+        );
+    }
+
+    #[test]
+    fn completion_contract_section_skipped_for_orchestrator_role() {
+        let mut c = ctx();
+        c.agent_type = "orchestrator".to_owned();
+        c.completion_contract = Some(
+            cairn_domain::completion_contracts::CompletionContract::Prose {
+                min_chars: 500,
+                min_citations: 2,
+            },
+        );
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            !msg.contains("## Completion contract"),
+            "orchestrator-tier role must not render the contract section (RFC 032 §4.1)"
+        );
+    }
+
+    #[test]
+    fn completion_contract_section_renders_pull_request_shape() {
+        let mut c = ctx();
+        c.agent_type = "executor".to_owned();
+        c.completion_contract = Some(
+            cairn_domain::completion_contracts::CompletionContract::PullRequest {
+                expected_repo: Some("avifenesh/cairn-dogfood".to_owned()),
+                expected_head_branch: None,
+                must_be_open: true,
+            },
+        );
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(msg.contains("kind: pull_request"));
+        assert!(msg.contains("expected_repo: avifenesh/cairn-dogfood"));
+        assert!(msg.contains("must_be_open: true"));
+    }
+
+    #[test]
+    fn completion_contract_section_renders_file_shape() {
+        let mut c = ctx();
+        c.agent_type = "executor".to_owned();
+        let path = cairn_domain::completion_contracts::RelPath::try_new("src/main.rs").unwrap();
+        c.completion_contract = Some(
+            cairn_domain::completion_contracts::CompletionContract::File {
+                paths: vec![cairn_domain::completion_contracts::FileRequirement {
+                    path,
+                    contains_regex: None,
+                    max_bytes: None,
+                }],
+            },
+        );
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(msg.contains("kind: file"));
+        assert!(msg.contains("paths: src/main.rs"));
+    }
+
+    #[test]
+    fn completion_contract_section_renders_prose_non_empty_floor() {
+        let mut c = ctx();
+        c.agent_type = "executor".to_owned();
+        c.completion_contract =
+            Some(cairn_domain::completion_contracts::CompletionContract::ProseNonEmpty);
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(msg.contains("kind: prose_non_empty"));
+        assert!(msg.contains("Any non-empty text"));
+    }
+
+    #[test]
+    fn completion_contract_section_absent_when_contract_unset() {
+        let mut c = ctx();
+        c.agent_type = "executor".to_owned();
+        c.completion_contract = None;
+        let msg = build_user_message(&c, &empty_gather(), None, false);
+        assert!(
+            !msg.contains("## Completion contract"),
+            "no contract → no section (backward compat)"
+        );
+    }
+
+    #[test]
+    fn extract_spawn_subagent_completion_contract_valid_flat_shape() {
+        let args = serde_json::json!({
+            "role": "executor",
+            "goal": "ship PR",
+            "completion_contract": {
+                "kind": "prose_non_empty"
+            }
+        });
+        match super::extract_spawn_subagent_completion_contract(&args) {
+            super::ContractArg::Valid(c) => {
+                assert!(matches!(
+                    c,
+                    cairn_domain::completion_contracts::CompletionContract::ProseNonEmpty
+                ));
+            }
+            other => panic!("expected Valid, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn extract_spawn_subagent_completion_contract_absent_when_omitted() {
+        let args = serde_json::json!({ "role": "executor", "goal": "ship PR" });
+        assert!(matches!(
+            super::extract_spawn_subagent_completion_contract(&args),
+            super::ContractArg::Absent
+        ));
+    }
+
+    #[test]
+    fn extract_spawn_subagent_completion_contract_malformed_rejects() {
+        let args = serde_json::json!({
+            "role": "executor",
+            "goal": "ship PR",
+            "completion_contract": { "kind": "file", "paths": [] }
+        });
+        match super::extract_spawn_subagent_completion_contract(&args) {
+            super::ContractArg::Malformed(reason) => {
+                assert!(reason.contains("contract_invalid"));
+            }
+            other => panic!(
+                "expected Malformed (empty paths violates validate()), got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn extract_spawn_subagent_completion_contract_nested_legacy_shape() {
+        let args = serde_json::json!({
+            "tool_name": "spawn_subagent",
+            "tool_args": {
+                "role": "executor",
+                "goal": "ship PR",
+                "completion_contract": { "kind": "prose_non_empty" }
+            }
+        });
+        assert!(matches!(
+            super::extract_spawn_subagent_completion_contract(&args),
+            super::ContractArg::Valid(_)
+        ));
     }
 
     // ── Response parser tests ─────────────────────────────────────────────────

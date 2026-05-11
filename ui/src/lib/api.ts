@@ -1193,6 +1193,9 @@ export function createApiClient(config: ApiClientConfig) {
       parent_run_id?: string;
       mode?: RunModeRequest;
       prompt?: string;
+      /** RFC 032: optional operator-declared contract. Omitted → cairn
+       *  infers from `prompt` at the first orchestrate boot. */
+      completion_contract?: import("./types").CompletionContract;
     }): Promise<RunRecord> => post("/v1/runs", withScope(body)),
 
     /** POST /v1/runs/batch — create multiple runs at once. */

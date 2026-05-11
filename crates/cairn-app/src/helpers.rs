@@ -532,6 +532,62 @@ pub(crate) async fn persist_run_bool_default(
         .map(|_| ())
 }
 
+/// RFC 032 PR-5: persist a typed struct under a per-run defaults key
+/// via [`cairn_runtime::DefaultsService::set_struct`]. Enforces the
+/// 64 KiB [`cairn_runtime::TYPED_DEFAULT_MAX_BYTES`] cap before the
+/// write, so an oversized contract (or similarly-shaped typed default)
+/// never reaches the event log.
+///
+/// Wraps the typed-defaults path used for
+/// `CompletionContract` + `ContractSource` + any future typed run-scope
+/// default. Untyped string / bool / u32 / u64 helpers stay on their
+/// existing paths — those serialize to a single JSON primitive without
+/// a round-trip through typed serialization.
+pub(crate) async fn persist_run_struct_default<T>(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+    value: &T,
+) -> Result<(), cairn_runtime::TypedDefaultError>
+where
+    T: serde::Serialize + Send + Sync + ?Sized,
+{
+    state
+        .runtime
+        .defaults
+        .set_struct(
+            cairn_domain::tenancy::Scope::Project,
+            project.project_id.to_string(),
+            run_default_key(run_id, suffix),
+            value,
+        )
+        .await
+        .map(|_| ())
+}
+
+/// RFC 032 PR-5: read a typed struct from a per-run defaults key via
+/// [`cairn_runtime::DefaultsService::get_struct`]. `Ok(None)` when no
+/// value is present at any layer; `Err(TypedDefaultError::Corrupt)`
+/// when a value exists but does not deserialize into `T` (caller
+/// decides whether to fall back or propagate — the orchestrate handler
+/// logs + treats it as "no contract resolved").
+pub(crate) async fn resolve_run_struct_default<T>(
+    state: &AppState,
+    project: &ProjectKey,
+    run_id: &RunId,
+    suffix: &str,
+) -> Result<Option<T>, cairn_runtime::TypedDefaultError>
+where
+    T: serde::de::DeserializeOwned + Send,
+{
+    state
+        .runtime
+        .defaults
+        .get_struct(project, &run_default_key(run_id, suffix))
+        .await
+}
+
 /// Resolve a task's session_id.
 ///
 /// Returns the `session_id` already persisted on the task record when present.

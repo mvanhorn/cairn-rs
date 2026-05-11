@@ -144,7 +144,7 @@ pub use audits::AuditService;
 pub use budgets::BudgetService;
 pub use channels::ChannelService;
 pub use credentials::CredentialService;
-pub use defaults::DefaultsService;
+pub use defaults::{DefaultsService, TypedDefaultError, TYPED_DEFAULT_MAX_BYTES};
 pub use guardrails::GuardrailService;
 pub use licenses::LicenseService;
 pub use notification_prefs::NotificationService;

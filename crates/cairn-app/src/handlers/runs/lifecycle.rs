@@ -25,6 +25,7 @@ use axum::{
 use cairn_api::auth::AuthPrincipal;
 use cairn_api::http::{ApiError, ListResponse};
 use cairn_domain::{
+    completion_contracts::{CompletionContract, ContractSource},
     FailureClass, PauseReason, PauseReasonKind, ProjectKey, ResumeTrigger, RunId, RunResumeTarget,
     RunState, SessionId, TaskId, WorkspaceRole,
 };
@@ -182,6 +183,28 @@ pub(crate) struct CreateRunRequest {
     /// per-invocation override beats the run default).
     #[serde(default)]
     pub(crate) prompt: Option<String>,
+    /// RFC 032 PR-5: operator-declared completion contract for this run.
+    ///
+    /// When present, `create_run_handler` validates the contract and
+    /// persists it under `run:<run_id>:completion_contract` so the first
+    /// orchestrate boot reads it back and threads it into
+    /// `OrchestrationContext.completion_contract`. Invalid contracts
+    /// (oversized, traversal paths, pathological regex, …) reject at
+    /// this boundary with `400 contract_invalid` — no event-log rows
+    /// for a contract the verifier would later refuse to grade.
+    ///
+    /// `File` contracts additionally require a persistent workspace
+    /// (an allowlisted repo OR a local-fs path under `project_local_paths`);
+    /// otherwise the handler returns `400 contract_invalid:
+    /// file_contract_requires_persistent_workspace` per RFC 032 §2.4 —
+    /// rejecting a doomed contract early beats burning tokens and
+    /// surprising operators at gate time.
+    ///
+    /// Omitted → the first orchestrate boot runs `infer_contract` from
+    /// the goal text (source = `Inferred`) and persists the result.
+    #[serde(default)]
+    #[schema(value_type = Option<serde_json::Value>)]
+    pub(crate) completion_contract: Option<CompletionContract>,
 }
 
 impl CreateRunRequest {
@@ -387,6 +410,14 @@ pub(crate) async fn create_run_handler(
         return validation_error_response(msg);
     }
     let project = CreateRunRequest::project(&body);
+    // Authorization FIRST — RFC 032 §2.4's contract-shape check consults
+    // the project's repo allowlist and local_paths, which means a
+    // caller-visible `contract_invalid: file_contract_requires_persistent_workspace`
+    // vs plain `contract_invalid: ...` response would leak whether the
+    // project has a persistent workspace configured. Gate the read behind
+    // workspace-role check so an unauthorized caller sees a uniform 403
+    // before any per-project state influences the response (Copilot PR-5
+    // review).
     if let Err(response) = ensure_workspace_role_for_project(
         state.as_ref(),
         &principal,
@@ -396,6 +427,42 @@ pub(crate) async fn create_run_handler(
     .await
     {
         return response;
+    }
+
+    // RFC 032 §2.4 + §1: validate the caller-supplied contract BEFORE
+    // any run-row side effect so a malformed contract never creates a
+    // run the verifier would later refuse to grade.
+    //
+    // Two stages:
+    //   1. `contract.validate()` — structural + size caps (defined in
+    //      cairn-domain). Every caller must run this.
+    //   2. `File`-variant-specific workspace-shape check — a File
+    //      contract on a run whose project has neither an allowlisted
+    //      repo NOR a registered local_fs path is doomed; the verifier
+    //      walks `working_dir` and there is no persistent workspace
+    //      to walk. Reject early with a dedicated code so the operator
+    //      knows WHICH precondition is missing.
+    //
+    // Both branches map to `4xx contract_invalid` per RFC §2.2.
+    if let Some(contract) = body.completion_contract.as_ref() {
+        if let Err(e) = contract.validate() {
+            return validation_error_response(format!("contract_invalid: {e}"));
+        }
+        if matches!(contract, CompletionContract::File { .. }) {
+            let has_repo = !state
+                .project_repo_access
+                .list_for_project(&cairn_domain::RepoAccessContext {
+                    project: project.clone(),
+                })
+                .await
+                .is_empty();
+            let has_local = !state.project_local_paths.list(&project).is_empty();
+            if !has_repo && !has_local {
+                return validation_error_response(
+                    "contract_invalid: file_contract_requires_persistent_workspace",
+                );
+            }
+        }
     }
     let session_id = SessionId::new(body.session_id.clone());
     // Scoped get (#439): `project` is already known from the request
@@ -490,6 +557,63 @@ pub(crate) async fn create_run_handler(
                 .await
                 {
                     return runtime_error_response(err);
+                }
+            }
+            // RFC 032 §2.2 PR-5: persist the caller-supplied contract
+            // under the three run-default slots the orchestrate handler
+            // reads on every boot:
+            //   * `run:<id>:completion_contract` — typed payload.
+            //   * `run:<id>:contract_source_goal_hash` — hash of the
+            //     goal this contract was resolved against, used by the
+            //     re-inference guard at §2.3.
+            //   * `run:<id>:contract_source` — how the contract
+            //     arrived; `ExplicitCreate` here so a goal pivot never
+            //     auto-re-infers (invariant #1).
+            //
+            // Hash key uses `body.prompt` when supplied, else the empty
+            // string — the hash is only load-bearing for re-inference,
+            // which only fires on `Inferred`/`ReInferredOnGoalChange`
+            // sources, so an explicit contract's hash is recorded but
+            // never compared.
+            if let Some(contract) = body.completion_contract.as_ref() {
+                if let Err(err) = crate::persist_run_struct_default(
+                    state.as_ref(),
+                    &project,
+                    &run.run_id,
+                    "completion_contract",
+                    contract,
+                )
+                .await
+                {
+                    return runtime_error_response(cairn_runtime::RuntimeError::Internal(format!(
+                        "persist completion_contract: {err}"
+                    )));
+                }
+                let goal_for_hash = body.prompt.as_deref().unwrap_or("");
+                let hash = cairn_domain::completion_contracts::goal_hash(goal_for_hash);
+                if let Err(err) = persist_run_string_default(
+                    state.as_ref(),
+                    &project,
+                    &run.run_id,
+                    "contract_source_goal_hash",
+                    &hash,
+                )
+                .await
+                {
+                    return runtime_error_response(err);
+                }
+                if let Err(err) = crate::persist_run_struct_default(
+                    state.as_ref(),
+                    &project,
+                    &run.run_id,
+                    "contract_source",
+                    &ContractSource::ExplicitCreate,
+                )
+                .await
+                {
+                    return runtime_error_response(cairn_runtime::RuntimeError::Internal(format!(
+                        "persist contract_source: {err}"
+                    )));
                 }
             }
             publish_runtime_frames_since(&state, before).await;
@@ -1221,6 +1345,7 @@ mod tests {
             parent_run_id: None,
             mode: None,
             prompt: None,
+            completion_contract: None,
         }
     }
 

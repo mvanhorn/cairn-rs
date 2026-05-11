@@ -278,6 +278,7 @@ pub trait TaskService: Send + Sync {
         _role: String,
         _parent_context: Option<String>,
         _reuse_sandbox_from: Option<RunId>,
+        _completion_contract: Option<cairn_domain::completion_contracts::CompletionContract>,
     ) -> Result<TaskRecord, RuntimeError> {
         Err(RuntimeError::Internal(
             "TaskService::spawn_subagent default impl called — impls must \

@@ -60,7 +60,7 @@ pub use cairn_runtime::{
 pub use execute::ExecutePhase;
 pub use gather::GatherPhase;
 pub use loop_runner::{
-    CheckpointHook, DualCheckpointHook, NoOpCheckpointHook, OrchestratorLoop,
+    CheckpointHook, ContractVerifier, DualCheckpointHook, NoOpCheckpointHook, OrchestratorLoop,
     LEASE_UNHEALTHY_REASON,
 };
 pub use task_sink::{NoOpTaskSink, TaskFrameSink};

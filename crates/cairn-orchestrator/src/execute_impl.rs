@@ -1325,6 +1325,46 @@ impl RuntimeExecutePhase {
                 let reuse_sandbox_from: Option<cairn_domain::RunId> =
                     reuse_sandbox_from_str.map(cairn_domain::RunId::new);
 
+                // RFC 032 PR-5: extract + validate the optional
+                // `completion_contract` field. The extractor runs the
+                // typed deserialization chain (RelPath traversal,
+                // BoundedRegex, ContractSchema size) AND calls
+                // `contract.validate()` for structural caps. Malformed
+                // inputs surface through the MALFORMED_SPAWN_PROPOSAL_PREFIX
+                // pattern so the LLM sees a specific feedback line
+                // in step_history and can correct on the next DECIDE.
+                let completion_contract: Option<
+                    cairn_domain::completion_contracts::CompletionContract,
+                > = match proposal
+                    .tool_args
+                    .as_ref()
+                    .map(crate::decide_impl::extract_spawn_subagent_completion_contract)
+                    .unwrap_or(crate::decide_impl::ContractArg::Absent)
+                {
+                    crate::decide_impl::ContractArg::Absent => None,
+                    crate::decide_impl::ContractArg::Valid(c) => Some(c),
+                    crate::decide_impl::ContractArg::Malformed(reason) => {
+                        return Ok(ActionResult {
+                            proposal: proposal.clone(),
+                            status: ActionStatus::Failed {
+                                reason: format!(
+                                    "{MALFORMED_SPAWN_PROPOSAL_PREFIX}spawn_subagent: \
+                                     tool_args[\"completion_contract\"] is not a valid \
+                                     CompletionContract ({reason}). Re-emit with a valid \
+                                     contract shape (kind = prose_non_empty | prose | file | \
+                                     pull_request | structured | external_state — structured \
+                                     and external_state verifiers return `not_implemented` \
+                                     today; they accept the wire shape but don't grade) or \
+                                     omit the field to let cairn infer."
+                                ),
+                            },
+                            tool_output: None,
+                            invocation_id: None,
+                            duration_ms: 0,
+                        });
+                    }
+                };
+
                 // R35 (2026-05-10) dogfood: the orchestrator correctly
                 // re-spawned fresh sub-agents after predecessors failed
                 // the completion gate, but each child started with
@@ -1441,6 +1481,14 @@ impl RuntimeExecutePhase {
                         // surface into step_history via the `Err(e)`
                         // branch below so the LLM can correct.
                         reuse_sandbox_from,
+                        // RFC 032 PR-5: forward the optional
+                        // `completion_contract` for the child's
+                        // `run:<id>:completion_contract` default. The
+                        // adapter persists it with source =
+                        // ExplicitSpawn so the child's first orchestrate
+                        // boot reads it back and the gate grades the
+                        // child's complete_run against it.
+                        completion_contract,
                     )
                     .await
                 {

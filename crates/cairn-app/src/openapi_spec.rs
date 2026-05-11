@@ -214,6 +214,120 @@ pub const OPENAPI_JSON: &str = r##"{
         },
         "required": ["session_id", "root_run_id", "project", "checkpoint_id", "termination_reason", "compacted_summary", "cost_micros", "emitted_at"]
       },
+      "CreateRunRequest": {
+        "type": "object",
+        "description": "Body for POST /v1/runs. RFC 032 PR-5 adds the optional `completion_contract` field — the operator-declared definition-of-done for the run. When present the handler validates the contract, rejects File-variant contracts on runs with no persistent workspace (allowlisted repo OR registered local_fs path), and persists the contract under the run's per-run defaults so the first orchestrate boot grades `complete_run` against it. Omitted → cairn infers a contract from the goal text on the first orchestrate boot.",
+        "properties": {
+          "tenant_id":      { "type": "string" },
+          "workspace_id":   { "type": "string" },
+          "project_id":     { "type": "string" },
+          "session_id":     { "type": "string" },
+          "run_id":         { "type": "string" },
+          "parent_run_id":  { "type": "string", "nullable": true },
+          "mode":           { "type": "string", "nullable": true, "description": "RFC 018 execution mode: `direct` | `plan` | `execute`." },
+          "prompt":         { "type": "string", "nullable": true, "description": "F42: operator-supplied natural-language objective for this run. Persisted as the run's `goal` default." },
+          "completion_contract": {
+            "$ref": "#/components/schemas/CompletionContract",
+            "nullable": true,
+            "description": "RFC 032: optional operator-declared contract. When omitted, the gate infers from `prompt` at the first orchestrate boot."
+          }
+        },
+        "required": ["tenant_id", "workspace_id", "project_id", "session_id", "run_id"]
+      },
+      "CompletionContract": {
+        "type": "object",
+        "description": "RFC 032: operator-declared definition-of-done for a run's `complete_run` action. Uses the `tag = kind` discriminator convention. Six variants ship in Phase 1 (`prose_non_empty`, `prose`, `file`, `pull_request`, plus Phase-2 `structured` and Phase-3 `external_state` variants whose verifiers currently return `not_implemented`). See RFC 032 §1 for full shape.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": { "kind": { "const": "prose_non_empty" } },
+            "required": ["kind"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "prose" },
+              "min_chars": { "type": "integer" },
+              "min_citations": { "type": "integer" }
+            },
+            "required": ["kind", "min_chars", "min_citations"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "file" },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "path": { "type": "string", "description": "Relative path under working_dir. Absolute paths, `.`, and `..` components reject at deserialize time." },
+                    "contains_regex": { "type": "string", "nullable": true, "description": "Optional contains-regex applied to file contents via BoundedRegex (64 KiB / 256 KiB compile-memory caps)." },
+                    "max_bytes": { "type": "integer", "nullable": true, "description": "Optional size cap. Absent = no size check. Ceiling 1 GiB." }
+                  },
+                  "required": ["path"]
+                }
+              }
+            },
+            "required": ["kind", "paths"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "pull_request" },
+              "expected_repo": { "type": "string", "nullable": true, "description": "owner/repo. When set, MUST be on the run's project allowlist — cairn rejects cross-tenant reads." },
+              "expected_head_branch": { "type": "string", "nullable": true, "description": "BoundedRegex matched against the PR's head branch." },
+              "must_be_open": { "type": "boolean", "description": "Default true. Set false to accept merged PRs." }
+            },
+            "required": ["kind", "must_be_open"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "structured" },
+              "schema": {
+                "anyOf": [
+                  { "type": "object" },
+                  { "type": "boolean" }
+                ],
+                "description": "Operator-supplied JSON Schema (cap 32 KiB). Per JSON Schema Draft-7 root-type rules the document must be an object OR a boolean; both shapes deserialize. Verifier is Phase 2; Phase 1 returns `not_implemented`."
+              }
+            },
+            "required": ["kind", "schema"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "external_state" },
+              "check": { "$ref": "#/components/schemas/ExternalStateCheck" }
+            },
+            "required": ["kind", "check"]
+          }
+        ]
+      },
+      "ExternalStateCheck": {
+        "description": "RFC 032 Phase 3: external-system check the `external_state` verifier grades against. Tagged union on `kind`. Phase 1 returns `not_implemented` for all variants; the wire shape is defined so operator/LLM declarations validate up front.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "github_issue_closed" },
+              "repo": { "type": "string", "description": "owner/repo" },
+              "number": { "type": "integer", "description": "Issue number (>= 1)." }
+            },
+            "required": ["kind", "repo", "number"]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": { "const": "github_pr_merged" },
+              "repo": { "type": "string" },
+              "number": { "type": "integer" }
+            },
+            "required": ["kind", "repo", "number"]
+          }
+        ]
+      },
       "RunRecord": {
         "type": "object",
         "properties": {
@@ -743,9 +857,10 @@ pub const OPENAPI_JSON: &str = r##"{
         "tags": ["Runs"],
         "summary": "Start a new run",
         "operationId": "createRun",
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateRunRequest" } } } },
         "responses": {
-          "201": { "description": "Created run", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunRecord" } } } }
+          "201": { "description": "Created run", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RunRecord" } } } },
+          "422": { "description": "Invalid request — e.g. `contract_invalid: file_contract_requires_persistent_workspace` (RFC 032 §2.4) or `contract_invalid: <structural validation error>`. Cairn-rs uses 422 (`validation_error`) for body-level validation rejections; generated clients should key on the `contract_invalid:` message prefix, not the HTTP code alone.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },

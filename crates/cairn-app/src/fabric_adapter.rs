@@ -2187,6 +2187,7 @@ impl TaskService for FabricTaskServiceAdapter {
         role: String,
         parent_context: Option<String>,
         reuse_sandbox_from: Option<RunId>,
+        completion_contract: Option<cairn_domain::completion_contracts::CompletionContract>,
     ) -> Result<TaskRecord, RuntimeError> {
         // #670 G4 PR-1a cross-tenant contract: derive the child's
         // project from the parent run row. No caller-supplied project
@@ -2408,6 +2409,74 @@ impl TaskService for FabricTaskServiceAdapter {
             // the authoritative projection, so the row written here is
             // known-good at write time. `None` → no row, no default,
             // fresh sandbox (today's behaviour, byte-identical).
+            // RFC 032 PR-5: persist the orchestrator-declared
+            // `completion_contract` onto the child's per-run defaults
+            // so the child's first orchestrate boot reads it back via
+            // `resolve_run_struct_default(..., "completion_contract")`
+            // and the gate grades the child's `complete_run` against it.
+            // `None` → no row; the child's orchestrate boot will then
+            // run `infer_contract` on the child's goal text per §2.3.
+            //
+            // Source is persisted as `ExplicitSpawn` so a goal pivot
+            // does NOT auto-re-infer (invariant #1). `contract_source_goal_hash`
+            // is set for symmetry with `ExplicitCreate` — it never
+            // re-compares for an explicit contract.
+            if let Some(ref contract) = completion_contract {
+                use cairn_domain::completion_contracts::{goal_hash, ContractSource};
+                let key = format!("run:{}:completion_contract", child_run_id.as_str());
+                if let Err(err) = defaults
+                    .set_struct(
+                        cairn_domain::tenancy::Scope::Project,
+                        parent_project.project_id.to_string(),
+                        key,
+                        contract,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        parent_run_id = %parent_run_id,
+                        child_run_id = %child_run_id,
+                        "RFC 032 PR-5: failed to persist child run completion_contract default; \
+                         child's gate will fall through to pre-RFC-032 behaviour"
+                    );
+                }
+                let hash_key = format!("run:{}:contract_source_goal_hash", child_run_id.as_str());
+                if let Err(err) = defaults
+                    .set(
+                        cairn_domain::tenancy::Scope::Project,
+                        parent_project.project_id.to_string(),
+                        hash_key,
+                        serde_json::Value::String(goal_hash(&goal)),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        parent_run_id = %parent_run_id,
+                        child_run_id = %child_run_id,
+                        "RFC 032 PR-5: failed to persist child run contract_source_goal_hash"
+                    );
+                }
+                let source_key = format!("run:{}:contract_source", child_run_id.as_str());
+                if let Err(err) = defaults
+                    .set_struct(
+                        cairn_domain::tenancy::Scope::Project,
+                        parent_project.project_id.to_string(),
+                        source_key,
+                        &ContractSource::ExplicitSpawn,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        parent_run_id = %parent_run_id,
+                        child_run_id = %child_run_id,
+                        "RFC 032 PR-5: failed to persist child run contract_source"
+                    );
+                }
+            }
+
             if let Some(ref reuse_id) = reuse_sandbox_from {
                 let reuse_key = format!("run:{}:reuse_sandbox_from", child_run_id.as_str());
                 if let Err(err) = defaults
