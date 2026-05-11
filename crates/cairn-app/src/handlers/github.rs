@@ -355,7 +355,33 @@ pub(crate) async fn process_webhook_orchestrate(
         }
     }
 
-    webhook_trigger_orchestration(state, &run, &goal, None, None).await
+    // Synthesize a WorkItem so `webhook_trigger_orchestration` hands the
+    // GitHub plugin's `prepare_tool_registry` a real context. Without a
+    // WorkItem the orchestration path skips integration-specific tool
+    // registration entirely — the agent boots with only the Core builtins
+    // and loses `github_api.review_pr` + the `GhApi*` family, turning a
+    // PR reviewer into a read-only explorer that can't post. Every field
+    // is derived from data we already have; nothing is fabricated.
+    let title = goal.lines().next().unwrap_or("").to_owned();
+    let work_item = cairn_integrations::WorkItem {
+        integration_id: "github".to_owned(),
+        source_id: installation_id.to_string(),
+        external_id: issue_number.map(|n| n.to_string()).unwrap_or_default(),
+        repo: repo_full.to_owned(),
+        title,
+        body: goal,
+        run_id: run_id_str.clone(),
+        session_id: session_id_str.clone(),
+        status: cairn_integrations::WorkItemStatus::Processing,
+    };
+    webhook_trigger_orchestration(
+        state,
+        &run,
+        &work_item.body,
+        Some(installation_id),
+        Some(&work_item),
+    )
+    .await
 }
 
 pub(crate) async fn webhook_trigger_orchestration(
